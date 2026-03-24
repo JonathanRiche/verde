@@ -274,14 +274,18 @@ fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, 
         return;
     }
 
-    const bubble_height = transcriptBubbleHeight(Impl, author, body, image);
+    const bubble_height = transcriptBubbleHeight(Impl, role, author, body, image);
     const bubble_theme = transcriptBubbleTheme(role);
+    const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.TRANSCRIPT_BUBBLE_PADDING_X, theme.TRANSCRIPT_BUBBLE_PADDING_Y } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = bubble_theme.background });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = bubble_theme.border });
+    if (shouldRightAlignBubble(role)) {
+        zgui.setCursorPosX(zgui.getCursorPosX() + zgui.getContentRegionAvail()[0] - bubble_width);
+    }
     _ = zgui.beginChildId(id, .{
-        .w = 0.0,
+        .w = bubbleWidthForChild(role, bubble_width),
         .h = bubble_height,
         .child_flags = .{ .border = true },
         .window_flags = .{
@@ -313,14 +317,18 @@ fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, 
 
 /// Draws a generic transcript bubble with optional muted body text.
 fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, author: []const u8, body: []const u8, image: anytype, muted_body: bool) void {
-    const bubble_height = transcriptBubbleHeightGeneric(author, body, image);
+    const bubble_height = transcriptBubbleHeightGeneric(role, author, body, image);
     const bubble_theme = transcriptBubbleTheme(role);
+    const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.TRANSCRIPT_BUBBLE_PADDING_X, theme.TRANSCRIPT_BUBBLE_PADDING_Y } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = bubble_theme.background });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = bubble_theme.border });
+    if (shouldRightAlignBubble(role)) {
+        zgui.setCursorPosX(zgui.getCursorPosX() + zgui.getContentRegionAvail()[0] - bubble_width);
+    }
     _ = zgui.beginChild(id, .{
-        .w = 0.0,
+        .w = bubbleWidthForChild(role, bubble_width),
         .h = bubble_height,
         .child_flags = .{ .border = true },
         .window_flags = .{
@@ -878,15 +886,15 @@ fn transcriptShouldAutoFollow(state: anytype) bool {
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
-fn transcriptBubbleHeight(comptime Impl: type, author: []const u8, body: []const u8, image: ?Impl.ChatImageAttachment) f32 {
-    return transcriptBubbleHeightGeneric(author, body, image);
+fn transcriptBubbleHeight(comptime Impl: type, role: Impl.ChatRole, author: []const u8, body: []const u8, image: ?Impl.ChatImageAttachment) f32 {
+    return transcriptBubbleHeightGeneric(role, author, body, image);
 }
 
 /// Measures the height needed for a transcript bubble.
-fn transcriptBubbleHeightGeneric(author: []const u8, body: []const u8, image: anytype) f32 {
+fn transcriptBubbleHeightGeneric(role: anytype, author: []const u8, body: []const u8, image: anytype) f32 {
     const style = zgui.getStyle();
-    const avail = zgui.getContentRegionAvail();
-    const inner_width = @max(avail[0] - (theme.TRANSCRIPT_BUBBLE_PADDING_X * 2.0), 64.0);
+    const bubble_width = transcriptBubbleWidth(role);
+    const inner_width = @max(bubble_width - (theme.TRANSCRIPT_BUBBLE_PADDING_X * 2.0), 64.0);
     const author_size = if (shouldShowBubbleAuthor(author)) zgui.calcTextSize(author, .{}) else .{ 0.0, 0.0 };
     const body_size = zgui.calcTextSize(body, .{ .wrap_width = inner_width });
     const image_height: f32 = if (image != null) theme.clampf(inner_width * 0.46, theme.scaledUi(132.0), theme.scaledUi(220.0)) else 0.0;
@@ -895,6 +903,21 @@ fn transcriptBubbleHeightGeneric(author: []const u8, body: []const u8, image: an
     const text_gap = if (shouldShowBubbleAuthor(author)) 2.0 + style.item_spacing[1] else 0.0;
     const border_allowance = 4.0;
     return @max(author_size[1] + body_size[1] + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
+}
+
+fn transcriptBubbleWidth(role: anytype) f32 {
+    const avail = zgui.getContentRegionAvail();
+    if (role == .user) return avail[0] * 0.5;
+    return avail[0];
+}
+
+fn bubbleWidthForChild(role: anytype, bubble_width: f32) f32 {
+    if (role == .user) return bubble_width;
+    return 0.0;
+}
+
+fn shouldRightAlignBubble(role: anytype) bool {
+    return role == .user;
 }
 
 fn shouldShowBubbleAuthor(author: []const u8) bool {
