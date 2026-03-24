@@ -8,7 +8,7 @@ const log = std.log.scoped(.native_codex);
 const OVERLOAD_ERROR_CODE = -32001;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
-const MAX_WS_MESSAGE_BYTES = 1024 * 1024;
+const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 

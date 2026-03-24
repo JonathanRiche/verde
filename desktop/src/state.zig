@@ -14,8 +14,6 @@ pub const APP_NAME: [:0]const u8 = "Native";
 pub const STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
-pub const MAX_THREAD_MESSAGES: usize = 24;
-
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
@@ -1113,14 +1111,9 @@ pub const AppState = struct {
     }
 
     fn trimThreadMessages(self: *AppState, thread: *ChatThread, incoming_count: usize) void {
-        if (incoming_count >= MAX_THREAD_MESSAGES) {
-            self.clearThreadMessages(thread);
-            return;
-        }
-
-        while (thread.messages.items.len + incoming_count > MAX_THREAD_MESSAGES) {
-            self.releaseMessage(thread.messages.orderedRemove(0));
-        }
+        _ = self;
+        _ = thread;
+        _ = incoming_count;
     }
 
     fn clearThreadMessages(self: *AppState, thread: *ChatThread) void {
@@ -1371,6 +1364,8 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         self.finishPickerThread();
         self.finishSendThread();
+        self.pollSend();
+        self.flushIfDirty();
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
@@ -1433,6 +1428,8 @@ pub const AppState = struct {
         var next_status: SendStatus = .idle;
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
+        var failed_project_index: ?usize = null;
+        var failed_thread_index: ?usize = null;
 
         self.send_state.mutex.lock();
         switch (self.send_state.status) {
@@ -1456,8 +1453,12 @@ pub const AppState = struct {
                 failed_message = self.send_state.error_message;
                 self.send_state.error_message = null;
                 self.send_state.partial_text.clearRetainingCapacity();
-                freePendingTimelineEventsLocked(std.heap.page_allocator, &self.send_state.pending_events);
-                freePendingDiffFilesLocked(std.heap.page_allocator, &self.send_state.pending_diff_files);
+                completed_events = self.send_state.pending_events;
+                self.send_state.pending_events = .empty;
+                completed_diff_files = self.send_state.pending_diff_files;
+                self.send_state.pending_diff_files = .empty;
+                failed_project_index = self.send_state.project_index;
+                failed_thread_index = self.send_state.thread_index;
                 freePendingApprovalLocked(std.heap.page_allocator, &self.send_state.pending_approval);
                 self.send_state.approval_decision = null;
                 self.send_state.provider = null;
@@ -1493,8 +1494,18 @@ pub const AppState = struct {
                 }
             },
             .failed => {
+                defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
+                defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
+                appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
                 if (failed_message) |message| {
                     defer std.heap.page_allocator.free(message);
+                    if (failed_project_index) |project_index| {
+                        if (failed_thread_index) |thread_index| {
+                            self.applySendFailure(project_index, thread_index, &completed_events, message) catch |err| {
+                                log.err("failed to apply send failure: {s}", .{@errorName(err)});
+                            };
+                        }
+                    }
                     self.setSidebarNotice(message);
                 } else {
                     self.setSidebarNotice("Provider request failed.");
@@ -1622,6 +1633,37 @@ pub const AppState = struct {
                 .image = null,
             });
         }
+        thread.touch();
+        self.markDirty();
+    }
+
+    fn applySendFailure(
+        self: *AppState,
+        project_index: usize,
+        thread_index: usize,
+        events: *std.ArrayListUnmanaged(PendingTimelineEvent),
+        failure_message: []const u8,
+    ) !void {
+        if (project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        const thread = &project.threads.items[thread_index];
+
+        self.trimThreadMessages(thread, events.items.len + 1);
+        for (events.items) |event| {
+            try thread.messages.append(self.allocator, .{
+                .role = event.role,
+                .author = try self.dupeZ(event.author),
+                .body = try self.dupeZ(event.body),
+                .image = null,
+            });
+        }
+        try thread.messages.append(self.allocator, .{
+            .role = .system,
+            .author = try self.dupeZ("System"),
+            .body = try self.dupeZ(failure_message),
+            .image = null,
+        });
         thread.touch();
         self.markDirty();
     }
