@@ -11,11 +11,14 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(20.0), theme.scaledUi(20.0) } });
     defer zgui.popStyleVar(.{ .count = 2 });
-    const overscan = theme.scaledUi(12.0);
+    // const overscan = theme.scaledUi(12.0);
     zgui.setCursorPos(.{ 0.0, 0.0 });
     _ = zgui.beginChild("ProjectsRail", .{
-        .w = width + overscan,
-        .h = zgui.getContentRegionAvail()[1] + overscan,
+        // .w = width + overscan,
+
+        .w = width,
+        // .h = zgui.getContentRegionAvail()[1] + overscan,
+        .h = zgui.getContentRegionAvail()[1],
         .child_flags = .{ .border = false },
         .window_flags = .{ .no_scrollbar = true },
     });
@@ -33,8 +36,8 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         draw_list.addLine(.{
             .p1 = .{ pos[0] + size[0] - 1.0, pos[1] },
             .p2 = .{ pos[0] + size[0] - 1.0, pos[1] + size[1] },
-            .col = zgui.colorConvertFloat4ToU32(colors.rgba(48, 50, 56, 255)),
-            .thickness = 1.0,
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(90, 96, 108, 255)),
+            .thickness = 2.0,
         });
     }
 

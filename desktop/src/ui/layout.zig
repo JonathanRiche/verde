@@ -20,16 +20,18 @@ pub fn renderRoot(comptime Impl: type, state: *Impl.AppState, width: f32, height
         .no_bring_to_front_on_focus = true,
     };
 
-    _ = zgui.begin("Native Chat Shell", .{ .flags = root_flags });
-    defer zgui.end();
-
-    const content = zgui.getContentRegionAvail();
-    const gap = theme.clampf(content[0] * 0.012, theme.scaledUi(10.0), theme.scaledUi(18.0));
-    const sidebar_width = theme.clampf(content[0] * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), content[0] * 0.38));
-    const workspace_width = @max(content[0] - sidebar_width - gap, theme.scaledUi(320.0));
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
     defer zgui.popStyleVar(.{ .count = 2 });
+
+    _ = zgui.begin("Verde Chat Shell", .{ .flags = root_flags });
+    defer zgui.end();
+
+    const content = zgui.getContentRegionAvail();
+    // const gap = theme.clampf(content[0] * 0.012, theme.scaledUi(10.0), theme.scaledUi(18.0));
+    const gap = 0;
+    const sidebar_width = theme.clampf(content[0] * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), content[0] * 0.38));
+    const workspace_width = @max(content[0] - sidebar_width - gap, theme.scaledUi(320.0));
     zgui.setCursorPos(.{ 0.0, 0.0 });
     sidebar.render(Impl, state, sidebar_width, 0.0);
     zgui.sameLine(.{ .spacing = gap });
