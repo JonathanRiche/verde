@@ -2,6 +2,10 @@
 
 const std = @import("std");
 const zgui = @import("zgui");
+const colors = @import("colors.zig");
+const app_state = @import("../state.zig");
+const rgba = colors.rgba;
+const rgb = colors.rgb;
 
 pub const DEFAULT_FONT_SIZE: f32 = 22.0;
 pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
@@ -9,7 +13,7 @@ pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
 pub const COLOR_GREEN = rgb(0x50, 0xc8, 0x78);
 pub const COLOR_SECONDARY_GREEN = rgb(0x37, 0x58, 0x46);
 pub const COLOR_YELLOW = rgb(0xfb, 0xbf, 0x24);
-pub const COLOR_NAV_CHAT_BG = rgba(0x20, 0x27, 0x2A, 255);
+pub const COLOR_NAV_CHAT_BG = colors.BLACK_SECONDARY;
 pub const COLOR_BLACK = COLOR_NAV_CHAT_BG;
 pub const COLOR_WHITE = rgba(240, 240, 245, 255);
 pub const COLOR_PANEL = COLOR_NAV_CHAT_BG;
@@ -28,7 +32,9 @@ pub const TRANSCRIPT_BUBBLE_PADDING_Y: f32 = 14.0;
 pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
 
 pub var heading_font: ?zgui.Font = null;
-pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
+// pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
+
+pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 2.22;
 
 /// Clamps a float into a safe UI range.
 pub fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
@@ -39,7 +45,11 @@ pub fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
 pub fn uiScaleFactor() f32 {
     const font_size = zgui.getFontSize();
     if (!std.math.isFinite(font_size) or font_size <= 0.0) return 1.0;
-    return clampf(font_size / RESPONSIVE_BASE_FONT_SIZE, 0.9, 2.4);
+
+    const clamped = clampf(font_size / RESPONSIVE_BASE_FONT_SIZE, 0.9, 2.4);
+
+    // app_state.log.info("font_size made it here : {d}", .{clamped});
+    return clamped;
 }
 
 /// Scales a design token into the current UI size.
@@ -92,21 +102,6 @@ pub fn applyTheme(ui_scale: f32) void {
     style.setColor(.scrollbar_grab, rgba(60, 62, 68, 200));
     style.setColor(.scrollbar_grab_hovered, rgba(80, 82, 90, 255));
     style.setColor(.scrollbar_grab_active, COLOR_GREEN);
-}
-
-/// Builds an opaque RGB color.
-pub fn rgb(r: u8, g: u8, b: u8) [4]f32 {
-    return rgba(r, g, b, 255);
-}
-
-/// Builds an RGBA color in ImGui float space.
-pub fn rgba(r: u8, g: u8, b: u8, a: u8) [4]f32 {
-    return .{
-        @as(f32, @floatFromInt(r)) / 255.0,
-        @as(f32, @floatFromInt(g)) / 255.0,
-        @as(f32, @floatFromInt(b)) / 255.0,
-        @as(f32, @floatFromInt(a)) / 255.0,
-    };
 }
 
 /// Nudges a color toward a lighter variant.
