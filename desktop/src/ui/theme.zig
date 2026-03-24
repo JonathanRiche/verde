@@ -7,7 +7,7 @@ const app_state = @import("../state.zig");
 const rgba = colors.rgba;
 const rgb = colors.rgb;
 
-pub const DEFAULT_FONT_SIZE: f32 = 22.0;
+pub const DEFAULT_FONT_SIZE: f32 = 24.0;
 pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
 
 pub const COLOR_GREEN = rgb(0x50, 0xc8, 0x78);
