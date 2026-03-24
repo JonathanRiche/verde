@@ -7,7 +7,17 @@ const colors = @import("colors.zig");
 
 fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(240.0), theme.scaledUi(18.0) } });
+    const available_width = zgui.getContentRegionAvail();
+    const inner_pad_x =
+        if (available_width[0] > theme.scaledUi(1400.0))
+            theme.scaledUi(220.0)
+        else
+            theme.clampf(available_width[0] * 0.10, theme.scaledUi(24.0), theme.scaledUi(180.0));
+
+    // const inner_pad_x = theme.clampf(available_width[0] * 0.14, theme.scaledUi(24.0), theme.scaledUi(200.0));
+    const inner_pad_y = theme.scaledUi(18.0);
+
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ inner_pad_x, inner_pad_y } });
 
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
 

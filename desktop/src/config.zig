@@ -1,15 +1,15 @@
 //! Shared user config loading for the native Verde shell.
 
 const std = @import("std");
+const theme = @import("./ui/theme.zig");
 
 const log = std.log.scoped(.native_config);
 const VERDE_CONFIG_RELATIVE_PATH = ".config/verde/verde.json";
-const DEFAULT_FONT_SIZE: f32 = 18.0;
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 32.0;
 
 pub const AppConfig = struct {
-    font_size: f32 = DEFAULT_FONT_SIZE,
+    font_size: f32 = theme.DEFAULT_FONT_SIZE,
 };
 
 pub fn loadAppConfig(allocator: std.mem.Allocator) !AppConfig {
@@ -138,5 +138,5 @@ test "app config ignores out-of-range ui.font_size" {
     var config: AppConfig = .{};
     applyAppOverrides(&config, root);
 
-    try std.testing.expectEqual(DEFAULT_FONT_SIZE, config.font_size);
+    try std.testing.expectEqual(theme.DEFAULT_FONT_SIZE, config.font_size);
 }
