@@ -41,7 +41,7 @@ fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     }
 
     // renderHeader(state);
-    zgui.separator();
+    // zgui.separator();
 
     const content = zgui.getContentRegionAvail();
     const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
@@ -54,11 +54,7 @@ fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
 pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
     _ = width;
     _ = height;
-    const overscan = theme.scaledUi(12.0);
-    zgui.setCursorPos(.{
-        @max(0.0, zgui.getCursorPosX() - overscan),
-        0.0,
-    });
+    zgui.setCursorPos(.{ zgui.getCursorPosX(), 0.0 });
     //OUTER UI FOR CHAT WORKSPACE
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
     // zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(30.0), theme.scaledUi(18.0) } });
@@ -68,8 +64,8 @@ pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, h
     defer zgui.popStyleColor(.{ .count = 1 });
     defer zgui.popStyleVar(.{ .count = 2 });
     _ = zgui.beginChild("ChatWorkspace", .{
-        .w = zgui.getContentRegionAvail()[0] + overscan,
-        .h = zgui.getContentRegionAvail()[1] + overscan,
+        .w = zgui.getContentRegionAvail()[0],
+        .h = zgui.getContentRegionAvail()[1],
         .child_flags = .{ .border = false },
     });
     defer zgui.endChild();
