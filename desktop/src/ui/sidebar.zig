@@ -36,7 +36,9 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         draw_list.addLine(.{
             .p1 = .{ pos[0] + size[0] - 1.0, pos[1] },
             .p2 = .{ pos[0] + size[0] - 1.0, pos[1] + size[1] },
-            .col = zgui.colorConvertFloat4ToU32(colors.rgba(90, 96, 108, 255)),
+            // .col = zgui.colorConvertFloat4ToU32(colors.rgba(90, 96, 108, 255)),
+
+            .col = zgui.colorConvertFloat4ToU32(colors.DARK_BLUE),
             .thickness = 2.0,
         });
     }
@@ -78,7 +80,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.05) });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.10) });
-        zgui.pushStyleColor4f(.{ .idx = .border, .c = theme.lighten(theme.COLOR_PANEL_MUTED, 0.08) });
+        zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
         if (zgui.button("[]  Browse for folder", .{ .w = rail_inner_width, .h = theme.scaledUi(40.0) })) {
             state.browseForProjectDirectory();
         }

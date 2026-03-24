@@ -1,18 +1,22 @@
 //! Chat workspace rendering for the native shell.
 
 const std = @import("std");
+
 const zgui = @import("zgui");
-const theme = @import("theme.zig");
+
 const colors = @import("colors.zig");
+const theme = @import("theme.zig");
+const app_state = @import("../state.zig");
 
 fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
     const available_width = zgui.getContentRegionAvail();
+    // app_state.log.debug("available width: {d}", .{available_width[0]});
     const inner_pad_x =
-        if (available_width[0] > theme.scaledUi(1400.0))
-            theme.scaledUi(220.0)
+        if (available_width[0] < theme.scaledUi(1900.0))
+            theme.scaledUi(160.0)
         else
-            theme.clampf(available_width[0] * 0.10, theme.scaledUi(24.0), theme.scaledUi(180.0));
+            theme.clampf(available_width[0] * 0.32, theme.scaledUi(24.0), theme.scaledUi(480.0));
 
     // const inner_pad_x = theme.clampf(available_width[0] * 0.14, theme.scaledUi(24.0), theme.scaledUi(200.0));
     const inner_pad_y = theme.scaledUi(18.0);
@@ -209,7 +213,7 @@ fn renderPendingDiffCardLocked(files: anytype) void {
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 12.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(58, 60, 68, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChild("pending-diff-card", .{
         .w = 0.0,
         .h = card_height,
@@ -292,8 +296,10 @@ fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, 
         zgui.popStyleVar(.{ .count = 2 });
     }
 
-    zgui.textColored(bubble_theme.author, "{s}", .{author});
-    zgui.dummy(.{ .w = 0.0, .h = 2.0 });
+    if (shouldShowBubbleAuthor(author)) {
+        zgui.textColored(bubble_theme.author, "{s}", .{author});
+        zgui.dummy(.{ .w = 0.0, .h = 2.0 });
+    }
     if (image) |attachment| {
         renderImageAttachmentCard(Impl, state, attachment, false);
         if (body.len > 0) {
@@ -329,8 +335,10 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
         zgui.popStyleVar(.{ .count = 2 });
     }
 
-    zgui.textColored(bubble_theme.author, "{s}", .{author});
-    zgui.dummy(.{ .w = 0.0, .h = 2.0 });
+    if (shouldShowBubbleAuthor(author)) {
+        zgui.textColored(bubble_theme.author, "{s}", .{author});
+        zgui.dummy(.{ .w = 0.0, .h = 2.0 });
+    }
     if (image) |attachment| {
         renderImageAttachmentCard(@TypeOf(state.*), state, attachment, false);
         if (body.len > 0) {
@@ -352,7 +360,7 @@ fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 9.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(28, 29, 34, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(46, 48, 56, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = row_height,
@@ -392,7 +400,7 @@ fn renderChangedFilesCardId(comptime Impl: type, id: u32, body: []const u8) void
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 12.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(58, 60, 68, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = card_height,
@@ -559,7 +567,7 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 10.0, 10.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(52, 52, 52, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(@intCast(80_000 + index), .{
         .w = 0.0,
         .h = patch_height,
@@ -607,15 +615,11 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
         .child_flags = .{ .border = true },
     });
     defer {
-        const focused = zgui.isWindowFocused(.{ .child_windows = true });
         zgui.endChild();
         zgui.popStyleColor(.{ .count = 2 });
         zgui.popStyleVar(.{ .count = 2 });
 
-        const border_color = if (focused)
-            colors.rgba(124, 221, 94, 140)
-        else
-            colors.rgba(58, 62, 78, 255);
+        const border_color = colors.DARK_BLUE;
         const draw_list = zgui.getWindowDrawList();
         draw_list.addRect(.{
             .pmin = composer_screen_pos,
@@ -774,7 +778,7 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
     draw_list.addRect(.{
         .pmin = start,
         .pmax = .{ start[0] + card_width, start[1] + card_height },
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(68, 71, 82, 255)),
+        .col = zgui.colorConvertFloat4ToU32(colors.DARK_BLUE),
         .rounding = theme.scaledUi(12.0),
         .thickness = 1.0,
     });
@@ -811,7 +815,7 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
             draw_list.addRect(.{
                 .pmin = .{ image_pos[0], image_pos[1] },
                 .pmax = .{ image_pos[0] + dims[0], image_pos[1] + dims[1] },
-                .col = zgui.colorConvertFloat4ToU32(colors.rgba(120, 124, 136, 180)),
+                .col = zgui.colorConvertFloat4ToU32(colors.DARK_BLUE),
                 .rounding = theme.scaledUi(8.0),
                 .thickness = 1.0,
             });
@@ -844,20 +848,22 @@ const TranscriptBubbleTheme = struct {
 /// Returns the bubble colors for a transcript role.
 fn transcriptBubbleTheme(role: anytype) TranscriptBubbleTheme {
     if (role == .user) return .{
-        .background = colors.rgba(18, 62, 42, 255),
-        .border = colors.rgba(28, 140, 80, 180),
+        // .background = colors.rgba(18, 62, 42, 255),
+        .background = colors.rgba(0x20, 0x27, 0x2A, 255),
+        .border = colors.DARK_BLUE,
         .author = colors.rgba(130, 255, 180, 255),
     };
     if (role == .assistant) return .{
         // .background = colors.rgba(38, 39, 44, 255),
 
         .background = colors.rgba(0x0D, 0x12, 0x13, 255),
-        .border = colors.rgba(62, 64, 72, 255),
+        // .border = colors.DARK_BLUE,
+        .border = colors.rgba(0, 0, 0, 0),
         .author = colors.rgba(180, 185, 200, 255),
     };
     return .{
         .background = colors.rgba(52, 42, 18, 255),
-        .border = colors.rgba(140, 112, 28, 180),
+        .border = colors.DARK_BLUE,
         .author = colors.rgba(255, 230, 150, 255),
     };
 }
@@ -881,14 +887,18 @@ fn transcriptBubbleHeightGeneric(author: []const u8, body: []const u8, image: an
     const style = zgui.getStyle();
     const avail = zgui.getContentRegionAvail();
     const inner_width = @max(avail[0] - (theme.TRANSCRIPT_BUBBLE_PADDING_X * 2.0), 64.0);
-    const author_size = zgui.calcTextSize(author, .{});
+    const author_size = if (shouldShowBubbleAuthor(author)) zgui.calcTextSize(author, .{}) else .{ 0.0, 0.0 };
     const body_size = zgui.calcTextSize(body, .{ .wrap_width = inner_width });
     const image_height: f32 = if (image != null) theme.clampf(inner_width * 0.46, theme.scaledUi(132.0), theme.scaledUi(220.0)) else 0.0;
     const image_gap: f32 = if (image != null and body.len > 0) theme.scaledUi(8.0) else 0.0;
     const vertical_padding = theme.TRANSCRIPT_BUBBLE_PADDING_Y * 2.0;
-    const text_gap = 2.0 + style.item_spacing[1];
+    const text_gap = if (shouldShowBubbleAuthor(author)) 2.0 + style.item_spacing[1] else 0.0;
     const border_allowance = 4.0;
     return @max(author_size[1] + body_size[1] + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
+}
+
+fn shouldShowBubbleAuthor(author: []const u8) bool {
+    return !std.mem.eql(u8, author, "You") and !std.mem.eql(u8, author, "Codex");
 }
 
 /// Returns the compact height for a simple changed-files card.
