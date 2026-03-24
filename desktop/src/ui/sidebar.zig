@@ -3,6 +3,7 @@
 const std = @import("std");
 const zgui = @import("zgui");
 const theme = @import("theme.zig");
+const colors = @import("colors.zig");
 
 /// Renders the full project rail and thread list.
 pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
@@ -32,7 +33,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         draw_list.addLine(.{
             .p1 = .{ pos[0] + size[0] - 1.0, pos[1] },
             .p2 = .{ pos[0] + size[0] - 1.0, pos[1] + size[1] },
-            .col = zgui.colorConvertFloat4ToU32(theme.rgba(48, 50, 56, 255)),
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(48, 50, 56, 255)),
             .thickness = 1.0,
         });
     }
@@ -123,11 +124,11 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
             if (is_selected or hovered) {
                 const bg_col = if (is_selected and hovered)
-                    theme.rgba(44, 46, 54, 255)
+                    colors.rgba(44, 46, 54, 255)
                 else if (is_selected)
-                    theme.rgba(38, 40, 48, 255)
+                    colors.rgba(38, 40, 48, 255)
                 else
-                    theme.rgba(36, 38, 44, 255);
+                    colors.rgba(36, 38, 44, 255);
                 dl.addRectFilled(.{
                     .pmin = row_pos,
                     .pmax = .{ row_pos[0] + row_width, row_pos[1] + row_height },
@@ -327,9 +328,9 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
     defer zgui.popId();
 
     if (thread_selected) {
-        zgui.pushStyleColor4f(.{ .idx = .header, .c = theme.rgba(36, 38, 44, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = theme.rgba(42, 44, 50, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .header_active, .c = theme.rgba(48, 50, 56, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(36, 38, 44, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(42, 44, 50, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(48, 50, 56, 255) });
     }
 
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(6.0) } });

@@ -3,6 +3,42 @@
 const std = @import("std");
 const zgui = @import("zgui");
 const theme = @import("theme.zig");
+const colors = @import("colors.zig");
+
+fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
+    //INNER UI FOR CHAT WORKSPACE
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(240.0), theme.scaledUi(18.0) } });
+
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+
+    defer zgui.popStyleVar(.{ .count = 1 });
+    defer zgui.popStyleColor(.{ .count = 1 });
+    _ = zgui.beginChild("ChatWorkspaceInner", .{
+        .w = 0.0,
+        .h = 0.0,
+        .child_flags = .{
+            .border = false,
+            .always_use_window_padding = true,
+        },
+    });
+
+    defer zgui.endChild();
+
+    if (state.projects.items.len == 0) {
+        zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
+        zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
+        return;
+    }
+
+    // renderHeader(state);
+    zgui.separator();
+
+    const content = zgui.getContentRegionAvail();
+    const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
+    const transcript_height = @max(content[1] - composer_height - theme.scaledUi(8.0), theme.scaledUi(120.0));
+    renderTranscript(Impl, state, content[0], transcript_height);
+    renderComposer(Impl, state, content[0], @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+}
 
 /// Renders the chat workspace shell beside the sidebar.
 pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
@@ -13,8 +49,13 @@ pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, h
         @max(0.0, zgui.getCursorPosX() - overscan),
         0.0,
     });
+    //OUTER UI FOR CHAT WORKSPACE
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(30.0), theme.scaledUi(18.0) } });
+    // zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(30.0), theme.scaledUi(18.0) } });
+
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, 0 } });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.CHAT_BLACK });
+    defer zgui.popStyleColor(.{ .count = 1 });
     defer zgui.popStyleVar(.{ .count = 2 });
     _ = zgui.beginChild("ChatWorkspace", .{
         .w = zgui.getContentRegionAvail()[0] + overscan,
@@ -23,30 +64,44 @@ pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, h
     });
     defer zgui.endChild();
 
-    if (state.projects.items.len == 0) {
-        zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
-        zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
-        return;
-    }
-
     renderHeader(state);
     zgui.separator();
-
-    const content = zgui.getContentRegionAvail();
-    const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
-    const transcript_height = @max(content[1] - composer_height - theme.scaledUi(8.0), theme.scaledUi(120.0));
-    renderTranscript(Impl, state, content[0], transcript_height);
-    renderComposer(Impl, state, content[0], @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(5.0) });
+    //END OUTER UI FOR CHAT WORKSPACE
+    inner_workspace(Impl, state);
 }
 
 /// Renders the current thread title block.
 fn renderHeader(state: anytype) void {
     const thread = state.currentThread();
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
-    zgui.textColored(theme.COLOR_WHITE, "{s}", .{if (thread.committed) thread.title else "New chat"});
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
-    zgui.separator();
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
+    const header_height = theme.scaledUi(60.0);
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(28.0), theme.scaledUi(18.0) } });
+
+    defer zgui.popStyleVar(.{ .count = 1 });
+    defer zgui.popStyleColor(.{ .count = 1 });
+
+    _ = zgui.beginChild("ChatHeader", .{
+        .w = 0.0,
+        .h = header_height,
+        .child_flags = .{
+            .border = false,
+            .always_use_window_padding = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+            .no_saved_settings = true,
+        },
+    });
+    defer zgui.endChild();
+    if (theme.heading_font) |font| {
+        zgui.pushFont(font, 18);
+        defer zgui.popFont();
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{if (thread.committed) thread.title else "New chat"});
+    } else {
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{if (thread.committed) thread.title else "New chat"});
+    }
 }
 
 /// Renders transcript history plus any in-flight stream state.
@@ -100,9 +155,9 @@ fn renderPendingApproval(state: anytype) void {
             state.resolvePendingApproval(.approve);
         }
         zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
-        zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.rgba(52, 54, 60, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.rgba(64, 66, 74, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.rgba(44, 46, 52, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(52, 54, 60, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(64, 66, 74, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = colors.rgba(44, 46, 52, 255) });
         if (zgui.button("Deny", .{ .w = button_width, .h = theme.scaledUi(34.0) })) {
             state.resolvePendingApproval(.deny);
         }
@@ -147,8 +202,8 @@ fn renderPendingDiffCardLocked(files: anytype) void {
 
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 12.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = theme.rgba(32, 33, 38, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = theme.rgba(58, 60, 68, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(58, 60, 68, 255) });
     _ = zgui.beginChild("pending-diff-card", .{
         .w = 0.0,
         .h = card_height,
@@ -290,8 +345,8 @@ fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
     const row_height: f32 = 38.0;
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 9.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = theme.rgba(28, 29, 34, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = theme.rgba(46, 48, 56, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(28, 29, 34, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(46, 48, 56, 255) });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = row_height,
@@ -330,8 +385,8 @@ fn renderChangedFilesCardId(comptime Impl: type, id: u32, body: []const u8) void
 
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 12.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = theme.rgba(32, 33, 38, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = theme.rgba(58, 60, 68, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(58, 60, 68, 255) });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = card_height,
@@ -397,9 +452,9 @@ fn renderChangedFilesHeader(file_count: usize, additions: i64, deletions: i64) v
 fn renderChangedFilesAction(label: [:0]const u8) bool {
     zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 8.0 });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ 10.0, 4.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.rgba(52, 54, 60, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.rgba(62, 64, 72, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.rgba(68, 70, 78, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(52, 54, 60, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(62, 64, 72, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = colors.rgba(68, 70, 78, 255) });
     defer {
         zgui.popStyleColor(.{ .count = 3 });
         zgui.popStyleVar(.{ .count = 2 });
@@ -497,8 +552,8 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 10.0, 10.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = theme.rgba(24, 24, 24, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = theme.rgba(52, 52, 52, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(52, 52, 52, 255) });
     _ = zgui.beginChildId(@intCast(80_000 + index), .{
         .w = 0.0,
         .h = patch_height,
@@ -530,13 +585,15 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
 
 /// Renders the composer card, input, pickers, and send button.
 fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
-    const composer_bg = theme.rgba(30, 31, 36, 255);
+    const composer_bg = colors.GREEN_600;
     const composer_rounding = theme.scaledUi(18.0);
     state.composer_focused = false;
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = composer_rounding });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(12.0) } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = composer_bg });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
+    // zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
+
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     const composer_screen_pos = zgui.getCursorScreenPos();
     _ = zgui.beginChild("Composer", .{
         .w = width,
@@ -550,9 +607,9 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
         zgui.popStyleVar(.{ .count = 2 });
 
         const border_color = if (focused)
-            theme.rgba(124, 221, 94, 140)
+            colors.rgba(124, 221, 94, 140)
         else
-            theme.rgba(58, 62, 78, 255);
+            colors.rgba(58, 62, 78, 255);
         const draw_list = zgui.getWindowDrawList();
         draw_list.addRect(.{
             .pmin = composer_screen_pos,
@@ -596,7 +653,7 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
     if (buf[0] == 0) {
         const hint_pos = .{ cursor_before[0] + theme.scaledUi(4.0), cursor_before[1] + theme.scaledUi(6.0) };
         const fg_draw_list = zgui.getForegroundDrawList();
-        fg_draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(theme.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
+        fg_draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(colors.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
     }
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
@@ -620,7 +677,7 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
         const r = send_btn_size * 0.5;
 
         const circle_color = if (pending)
-            theme.rgba(80, 72, 24, 255)
+            colors.rgba(80, 72, 24, 255)
         else if (hovered)
             theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12)
         else
@@ -673,9 +730,9 @@ fn renderComposerAttachmentPreview(comptime Impl: type, state: *Impl.AppState, i
 
     renderImageAttachmentCard(Impl, state, image, true);
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.rgba(52, 54, 61, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.rgba(74, 76, 84, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.rgba(92, 94, 102, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(52, 54, 61, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(74, 76, 84, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = colors.rgba(92, 94, 102, 255) });
     if (zgui.button("x", .{ .w = theme.scaledUi(26.0), .h = theme.scaledUi(26.0) })) {
         state.clearCurrentDraftImage();
     }
@@ -705,20 +762,20 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
     draw_list.addRectFilled(.{
         .pmin = start,
         .pmax = .{ start[0] + card_width, start[1] + card_height },
-        .col = zgui.colorConvertFloat4ToU32(theme.rgba(42, 43, 50, 255)),
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(42, 43, 50, 255)),
         .rounding = theme.scaledUi(12.0),
     });
     draw_list.addRect(.{
         .pmin = start,
         .pmax = .{ start[0] + card_width, start[1] + card_height },
-        .col = zgui.colorConvertFloat4ToU32(theme.rgba(68, 71, 82, 255)),
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(68, 71, 82, 255)),
         .rounding = theme.scaledUi(12.0),
         .thickness = 1.0,
     });
     draw_list.addRectFilled(.{
         .pmin = .{ start[0] + card_padding, start[1] + card_padding },
         .pmax = .{ start[0] + card_padding + preview_width, start[1] + card_padding + preview_height },
-        .col = zgui.colorConvertFloat4ToU32(theme.rgba(24, 25, 31, 255)),
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(24, 25, 31, 255)),
         .rounding = theme.scaledUi(10.0),
     });
 
@@ -748,7 +805,7 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
             draw_list.addRect(.{
                 .pmin = .{ image_pos[0], image_pos[1] },
                 .pmax = .{ image_pos[0] + dims[0], image_pos[1] + dims[1] },
-                .col = zgui.colorConvertFloat4ToU32(theme.rgba(120, 124, 136, 180)),
+                .col = zgui.colorConvertFloat4ToU32(colors.rgba(120, 124, 136, 180)),
                 .rounding = theme.scaledUi(8.0),
                 .thickness = 1.0,
             });
@@ -781,19 +838,21 @@ const TranscriptBubbleTheme = struct {
 /// Returns the bubble colors for a transcript role.
 fn transcriptBubbleTheme(role: anytype) TranscriptBubbleTheme {
     if (role == .user) return .{
-        .background = theme.rgba(18, 62, 42, 255),
-        .border = theme.rgba(28, 140, 80, 180),
-        .author = theme.rgba(130, 255, 180, 255),
+        .background = colors.rgba(18, 62, 42, 255),
+        .border = colors.rgba(28, 140, 80, 180),
+        .author = colors.rgba(130, 255, 180, 255),
     };
     if (role == .assistant) return .{
-        .background = theme.rgba(38, 39, 44, 255),
-        .border = theme.rgba(62, 64, 72, 255),
-        .author = theme.rgba(180, 185, 200, 255),
+        // .background = colors.rgba(38, 39, 44, 255),
+
+        .background = colors.rgba(0x0D, 0x12, 0x13, 255),
+        .border = colors.rgba(62, 64, 72, 255),
+        .author = colors.rgba(180, 185, 200, 255),
     };
     return .{
-        .background = theme.rgba(52, 42, 18, 255),
-        .border = theme.rgba(140, 112, 28, 180),
-        .author = theme.rgba(255, 230, 150, 255),
+        .background = colors.rgba(52, 42, 18, 255),
+        .border = colors.rgba(140, 112, 28, 180),
+        .author = colors.rgba(255, 230, 150, 255),
     };
 }
 

@@ -11,6 +11,7 @@ const keybinds = @import("keybinds.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
 const ui_theme = @import("ui/theme.zig");
+const colors = @import("ui/colors.zig");
 
 // Re-export the state-owned types that the generic UI modules expect on `Impl`.
 const native_state = @import("state.zig");
@@ -320,20 +321,20 @@ pub fn formatByteSize(buffer: *[32:0]u8, size: usize) [:0]const u8 {
 pub fn renderComposerPickers(state: *AppState) void {
     const thread = state.currentThreadMutable();
 
-    const transparent = ui_theme.rgba(0, 0, 0, 0);
-    const picker_text_color = ui_theme.rgba(160, 164, 180, 255);
-    const picker_hover_bg = ui_theme.rgba(50, 52, 60, 255);
-    const separator_color = ui_theme.rgba(60, 62, 72, 255);
+    const transparent = colors.rgba(0, 0, 0, 0);
+    const picker_text_color = colors.rgba(160, 164, 180, 255);
+    const picker_hover_bg = colors.rgba(50, 52, 60, 255);
+    const separator_color = colors.rgba(60, 62, 72, 255);
 
     zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 8.0 });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ 8.0, 6.0 } });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = transparent });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = picker_hover_bg });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = picker_hover_bg });
-    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = ui_theme.rgba(26, 27, 32, 250) });
-    zgui.pushStyleColor4f(.{ .idx = .header, .c = ui_theme.rgba(42, 44, 52, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = ui_theme.rgba(52, 54, 64, 255) });
-    zgui.pushStyleColor4f(.{ .idx = .header_active, .c = ui_theme.rgba(58, 60, 70, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = colors.rgba(26, 27, 32, 250) });
+    zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(42, 44, 52, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(52, 54, 64, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(58, 60, 70, 255) });
     zgui.pushStyleColor4f(.{ .idx = .text, .c = picker_text_color });
     defer {
         zgui.popStyleColor(.{ .count = 8 });

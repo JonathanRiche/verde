@@ -3,6 +3,7 @@
 const std = @import("std");
 const zgui = @import("zgui");
 const theme = @import("theme.zig");
+const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const chat_panel = @import("chat_panel.zig");
 
@@ -100,9 +101,9 @@ fn renderImageModal(comptime Impl: type, state: *Impl.AppState, width: f32, heig
     const header_text_width = @max(header_avail[0] - close_size - header_gap, 160.0);
     const close_x = header_start[0] + header_avail[0] - close_size;
     zgui.setCursorScreenPos(.{ close_x, header_start[1] });
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.rgba(46, 48, 56, 220) });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.rgba(68, 70, 79, 240) });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.rgba(90, 92, 102, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(46, 48, 56, 220) });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(68, 70, 79, 240) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = colors.rgba(90, 92, 102, 255) });
     if (zgui.button("x", .{ .w = close_size, .h = close_size })) {
         state.closeImageModal();
         zgui.closeCurrentPopup();
