@@ -1,0 +1,20 @@
+.{
+    .name = .verde,
+    .version = "0.0.0",
+    .dependencies = .{
+        .zgui = .{
+            .url = "git+https://github.com/zig-gamedev/zgui#d6c4f53c2fbd54673790dc2a5208160a3586ef29",
+            .hash = "zgui-0.6.0-dev--L6sZCJKbgBZGCzVMcwD0bNGmpK6yO-UoIESHX5JiRet",
+        },
+        .zsdl = .{
+            .url = "git+https://github.com/zig-gamedev/zsdl#537de39b5719f39dcd612df2923607f3aedaf147",
+            .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
+        },
+    },
+    .fingerprint = 0xd77462097ec03b8f,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

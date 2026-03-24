@@ -1,0 +1,70 @@
+//! Shared AI harness interface for native provider integrations.
+
+const std = @import("std");
+pub const types = @import("provider_types.zig");
+const opencode = @import("providers/opencode.zig");
+const codex = @import("providers/codex.zig");
+
+pub const Provider = types.Provider;
+pub const HarnessKind = types.HarnessKind;
+pub const AuthState = types.AuthState;
+pub const MessageRole = types.MessageRole;
+pub const ChatMessage = types.ChatMessage;
+pub const ChatThreadSummary = types.ChatThreadSummary;
+pub const ReasoningEffort = types.ReasoningEffort;
+pub const ApprovalPolicy = types.ApprovalPolicy;
+pub const SandboxMode = types.SandboxMode;
+pub const ApprovalDecision = types.ApprovalDecision;
+pub const ApprovalRequest = types.ApprovalRequest;
+pub const StreamDiffFile = types.StreamDiffFile;
+pub const StreamEvent = types.StreamEvent;
+pub const SendPromptRequest = types.SendPromptRequest;
+pub const SendPromptResult = types.SendPromptResult;
+
+pub const ProviderConfig = union(Provider) {
+    opencode: opencode.Config,
+    codex: codex.Config,
+};
+
+pub const ProviderClient = union(Provider) {
+    opencode: opencode.Client,
+    codex: codex.Client,
+
+    pub fn deinit(self: *ProviderClient) void {
+        switch (self.*) {
+            .opencode => |*client| client.deinit(),
+            .codex => |*client| client.deinit(),
+        }
+    }
+
+    pub fn authState(self: *ProviderClient) !AuthState {
+        return switch (self.*) {
+            .opencode => |*client| client.authState(),
+            .codex => |*client| client.authState(),
+        };
+    }
+
+    pub fn listThreads(self: *ProviderClient, allocator: std.mem.Allocator) ![]ChatThreadSummary {
+        return switch (self.*) {
+            .opencode => |*client| client.listThreads(allocator),
+            .codex => |*client| client.listThreads(allocator),
+        };
+    }
+
+    pub fn sendPrompt(self: *ProviderClient, allocator: std.mem.Allocator, request: SendPromptRequest) !SendPromptResult {
+        return switch (self.*) {
+            .opencode => |*client| client.sendPrompt(allocator, request),
+            .codex => |*client| client.sendPrompt(allocator, request),
+        };
+    }
+};
+
+pub fn connect(
+    allocator: std.mem.Allocator,
+    provider: ProviderConfig,
+) !ProviderClient {
+    return switch (provider) {
+        .opencode => |config| .{ .opencode = try opencode.Client.init(allocator, config) },
+        .codex => |config| .{ .codex = try codex.Client.init(allocator, config) },
+    };
+}
