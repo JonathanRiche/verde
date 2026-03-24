@@ -88,7 +88,7 @@ pub fn applyTheme(ui_scale: f32) void {
     style.setColor(.button, COLOR_SECONDARY_GREEN);
     style.setColor(.button_hovered, lighten(COLOR_SECONDARY_GREEN, 0.12));
     style.setColor(.button_active, darken(COLOR_SECONDARY_GREEN, 0.08));
-    style.setColor(.border, rgba(48, 50, 56, 255));
+    style.setColor(.border, colors.DARK_BLUE);
     style.setColor(.separator, rgba(48, 50, 56, 255));
     style.setColor(.check_mark, COLOR_WHITE);
     style.setColor(.text, COLOR_WHITE);
