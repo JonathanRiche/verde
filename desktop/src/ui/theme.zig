@@ -1,0 +1,130 @@
+//! Shared native UI theme tokens and helpers.
+
+const std = @import("std");
+const zgui = @import("zgui");
+
+pub const DEFAULT_FONT_SIZE: f32 = 22.0;
+pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
+
+pub const COLOR_GREEN = rgb(0x50, 0xc8, 0x78);
+pub const COLOR_SECONDARY_GREEN = rgb(0x37, 0x58, 0x46);
+pub const COLOR_YELLOW = rgb(0xfb, 0xbf, 0x24);
+pub const COLOR_NAV_CHAT_BG = rgba(0x20, 0x27, 0x2A, 255);
+pub const COLOR_BLACK = COLOR_NAV_CHAT_BG;
+pub const COLOR_WHITE = rgba(240, 240, 245, 255);
+pub const COLOR_PANEL = COLOR_NAV_CHAT_BG;
+//0D1213
+pub const COLOR_PANEL_ALT = rgba(40, 41, 46, 255);
+
+pub const COLOR_PANEL_MUTED = rgba(56, 57, 62, 255);
+
+pub const COLOR_TEXT_MUTED = rgba(185, 187, 195, 255);
+pub const COLOR_TEXT_SUBTLE = rgba(120, 122, 135, 255);
+pub const COLOR_DIFF_ADD = rgba(52, 224, 148, 255);
+pub const COLOR_DIFF_REMOVE = rgba(255, 100, 100, 255);
+pub const COLOR_ACCENT_DIM = rgba(124, 221, 94, 48);
+pub const TRANSCRIPT_BUBBLE_PADDING_X: f32 = 18.0;
+pub const TRANSCRIPT_BUBBLE_PADDING_Y: f32 = 14.0;
+pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
+
+pub var heading_font: ?zgui.Font = null;
+pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
+
+/// Clamps a float into a safe UI range.
+pub fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
+    return @max(min_value, @min(value, max_value));
+}
+
+/// Derives the active UI scale from the current font size.
+pub fn uiScaleFactor() f32 {
+    const font_size = zgui.getFontSize();
+    if (!std.math.isFinite(font_size) or font_size <= 0.0) return 1.0;
+    return clampf(font_size / RESPONSIVE_BASE_FONT_SIZE, 0.9, 2.4);
+}
+
+/// Scales a design token into the current UI size.
+pub fn scaledUi(value: f32) f32 {
+    return value * uiScaleFactor();
+}
+
+/// Installs the default and heading fonts for the native UI.
+pub fn installFonts(font_bytes: []const u8, font_size: f32) void {
+    const font = zgui.io.addFontFromMemory(font_bytes, font_size);
+    zgui.io.setDefaultFont(font);
+    heading_font_size = font_size * 1.28;
+    heading_font = zgui.io.addFontFromMemory(font_bytes, heading_font_size);
+}
+
+/// Applies the shared ImGui theme colors and spacing.
+pub fn applyTheme(ui_scale: f32) void {
+    const scale = if (std.math.isFinite(ui_scale) and ui_scale > 0.0) ui_scale else 1.0;
+    const style = zgui.getStyle();
+    style.window_padding = .{ 0.0, 0.0 };
+    zgui.styleColorsDark(style);
+
+    style.font_scale_main = scale;
+    style.window_rounding = 12.0 * scale;
+    style.child_rounding = 12.0 * scale;
+    style.frame_rounding = 10.0 * scale;
+    style.grab_rounding = 10.0 * scale;
+    style.window_padding = .{ 14.0 * scale, 12.0 * scale };
+    style.item_spacing = .{ 10.0 * scale, 8.0 * scale };
+
+    style.setColor(.window_bg, COLOR_BLACK);
+    style.setColor(.child_bg, COLOR_PANEL);
+    style.setColor(.frame_bg, COLOR_PANEL_ALT);
+    style.setColor(.frame_bg_hovered, lighten(COLOR_PANEL_ALT, 0.10));
+    style.setColor(.frame_bg_active, lighten(COLOR_PANEL_ALT, 0.16));
+    style.setColor(.button, COLOR_SECONDARY_GREEN);
+    style.setColor(.button_hovered, lighten(COLOR_SECONDARY_GREEN, 0.12));
+    style.setColor(.button_active, darken(COLOR_SECONDARY_GREEN, 0.08));
+    style.setColor(.border, rgba(48, 50, 56, 255));
+    style.setColor(.separator, rgba(48, 50, 56, 255));
+    style.setColor(.check_mark, COLOR_WHITE);
+    style.setColor(.text, COLOR_WHITE);
+    style.setColor(.text_selected_bg, rgba(124, 221, 94, 80));
+    style.setColor(.title_bg, COLOR_PANEL);
+    style.setColor(.title_bg_active, COLOR_PANEL_ALT);
+    style.setColor(.header, COLOR_PANEL_ALT);
+    style.setColor(.header_hovered, lighten(COLOR_PANEL_ALT, 0.08));
+    style.setColor(.header_active, COLOR_GREEN);
+    style.setColor(.scrollbar_bg, rgba(22, 22, 26, 64));
+    style.setColor(.scrollbar_grab, rgba(60, 62, 68, 200));
+    style.setColor(.scrollbar_grab_hovered, rgba(80, 82, 90, 255));
+    style.setColor(.scrollbar_grab_active, COLOR_GREEN);
+}
+
+/// Builds an opaque RGB color.
+pub fn rgb(r: u8, g: u8, b: u8) [4]f32 {
+    return rgba(r, g, b, 255);
+}
+
+/// Builds an RGBA color in ImGui float space.
+pub fn rgba(r: u8, g: u8, b: u8, a: u8) [4]f32 {
+    return .{
+        @as(f32, @floatFromInt(r)) / 255.0,
+        @as(f32, @floatFromInt(g)) / 255.0,
+        @as(f32, @floatFromInt(b)) / 255.0,
+        @as(f32, @floatFromInt(a)) / 255.0,
+    };
+}
+
+/// Nudges a color toward a lighter variant.
+pub fn lighten(color: [4]f32, amount: f32) [4]f32 {
+    return .{
+        clampf(color[0] + amount, 0.0, 1.0),
+        clampf(color[1] + amount, 0.0, 1.0),
+        clampf(color[2] + amount, 0.0, 1.0),
+        color[3],
+    };
+}
+
+/// Nudges a color toward a darker variant.
+pub fn darken(color: [4]f32, amount: f32) [4]f32 {
+    return .{
+        clampf(color[0] - amount, 0.0, 1.0),
+        clampf(color[1] - amount, 0.0, 1.0),
+        clampf(color[2] - amount, 0.0, 1.0),
+        color[3],
+    };
+}
