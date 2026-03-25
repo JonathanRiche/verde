@@ -14,6 +14,7 @@ const GL_TEXTURE_WRAP_S = 0x2802;
 const GL_TEXTURE_WRAP_T = 0x2803;
 const GL_CLAMP_TO_EDGE = 0x812F;
 const GL_UNPACK_ALIGNMENT = 0x0CF5;
+const GL_LINEAR_MIPMAP_LINEAR = 0x2703;
 
 // Shared runtime constants live here so state and the UI shell can import them
 // without creating a cycle back through `main.zig`.
@@ -41,6 +42,7 @@ extern fn glBindTexture(target: c_uint, texture: c_uint) void;
 extern fn glPixelStorei(pname: c_uint, param: c_int) void;
 extern fn glTexParameteri(target: c_uint, pname: c_uint, param: c_int) void;
 extern fn glTexImage2D(target: c_uint, level: c_int, internalformat: c_int, width: c_int, height: c_int, border: c_int, format: c_uint, type_: c_uint, pixels: ?*const anyopaque) void;
+extern fn glGenerateMipmap(target: c_uint) void;
 
 pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTexture {
     var textures = [_]c_uint{0};
@@ -50,7 +52,7 @@ pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTextur
 
     glBindTexture(GL_TEXTURE_2D, texture_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -65,6 +67,7 @@ pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTextur
         GL_UNSIGNED_BYTE,
         loaded.pixels,
     );
+    glGenerateMipmap(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, 0);
 
     return .{

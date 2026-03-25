@@ -8,26 +8,27 @@ const colors = @import("colors.zig");
 /// Renders the full project rail and thread list.
 pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
     _ = height;
+    const horiz_pad = theme.scaledUi(25.0);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(20.0), theme.scaledUi(20.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     defer zgui.popStyleVar(.{ .count = 2 });
-    // const overscan = theme.scaledUi(12.0);
     zgui.setCursorPos(.{ 0.0, 0.0 });
     _ = zgui.beginChild("ProjectsRail", .{
-        // .w = width + overscan,
-
         .w = width,
-        // .h = zgui.getContentRegionAvail()[1] + overscan,
         .h = zgui.getContentRegionAvail()[1],
         .child_flags = .{ .border = false },
         .window_flags = .{ .no_scrollbar = true },
     });
     defer zgui.endChild();
 
-    // Explicit top-left inset so brand/content doesn't feel cramped
-    const pad_left = theme.scaledUi(24.0);
-    const pad_top = theme.scaledUi(28.0);
-    zgui.setCursorPos(.{ pad_left, pad_top });
+    // Use explicit indent for left padding — window_padding doesn't
+    // propagate reliably to child window auto-layout in this zgui version.
+    zgui.indent(.{ .indent_w = horiz_pad });
+    defer zgui.unindent(.{ .indent_w = horiz_pad });
+
+    const pad_top = theme.scaledUi(20.0);
+    const rail_width = @max(width - 2 * horiz_pad, theme.scaledUi(100.0));
+    zgui.setCursorPos(.{ horiz_pad, pad_top });
 
     {
         const draw_list = zgui.getWindowDrawList();
@@ -43,13 +44,13 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         });
     }
 
-    const project_header_button_width = theme.clampf(width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
-    const rail_inner_width = @max(width - theme.scaledUi(36.0), theme.scaledUi(140.0));
-    renderBrand(Impl, state);
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
+    const project_header_button_width = theme.clampf(rail_width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
+    const rail_inner_width = @max(rail_width, theme.scaledUi(140.0));
+    renderBrand(Impl, state, width);
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(18.0) });
     zgui.textColored(theme.COLOR_TEXT_MUTED, "PROJECTS", .{});
     zgui.sameLine(.{ .spacing = 0.0 });
-    zgui.setCursorPosX(@max(zgui.getCursorPosX(), width - project_header_button_width - theme.scaledUi(10.0)));
+    zgui.setCursorPosX(@max(zgui.getCursorPosX(), width - horiz_pad - project_header_button_width));
     if (state.show_project_creator) {
         zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.06) });
@@ -110,14 +111,16 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
     }
 
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
+
     for (state.projects.items, 0..) |project, index| {
         zgui.pushIntId(@intCast(index));
         defer zgui.popId();
 
         const is_selected = state.selected_project_index == index;
         const is_collapsed = state.projects.items[index].collapsed;
-        const project_action_width = theme.clampf(width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
-        const row_width = @max(width - project_action_width - theme.scaledUi(22.0), theme.scaledUi(100.0));
+        const project_action_width = theme.clampf(rail_width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
+        const row_width = @max(rail_width - project_action_width - theme.scaledUi(6.0), theme.scaledUi(100.0));
         const row_height = theme.scaledUi(28.0);
 
         {
@@ -143,7 +146,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             }
 
             const cy = row_pos[1] + row_height * 0.5;
-            var x = row_pos[0] + theme.scaledUi(8.0);
+            var x = row_pos[0] + theme.scaledUi(2.0);
             const chevron_col = zgui.colorConvertFloat4ToU32(if (hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);
             const cs: f32 = theme.scaledUi(3.5);
             if (is_collapsed) {
@@ -161,7 +164,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
                     .col = chevron_col,
                 });
             }
-            x += theme.scaledUi(12.0);
+            x += theme.scaledUi(8.0);
 
             const folder_col = zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_SUBTLE);
             const fw = theme.scaledUi(13.0);
@@ -178,7 +181,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
                 .col = folder_col,
                 .rounding = theme.scaledUi(1.5),
             });
-            x += fw + theme.scaledUi(6.0);
+            x += fw + theme.scaledUi(4.0);
 
             const text_col = zgui.colorConvertFloat4ToU32(if (is_selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
             dl.addText(.{ x, cy - zgui.getFontSize() * 0.5 }, text_col, "{s}", .{project.label});
@@ -209,7 +212,8 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             }
         }
 
-        zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
+        zgui.sameLine(.{});
+        zgui.setCursorPosX(width - horiz_pad - project_action_width);
         zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
@@ -224,11 +228,12 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         zgui.popStyleColor(.{ .count = 3 });
 
         const active_thread = state.projects.items[index].currentThread();
+        const sub_indent = theme.scaledUi(20.0);
+        if (!is_collapsed) zgui.indent(.{ .indent_w = sub_indent });
         if (!is_collapsed) {
             zgui.textDisabled("{d} saved chats", .{project.committedThreadCount()});
         }
         if (is_selected and !is_collapsed) {
-            zgui.indent(.{ .indent_w = theme.scaledUi(12.0) });
             var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &project) catch blk: {
                 break :blk std.ArrayList(usize).empty;
             };
@@ -239,13 +244,13 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
             for (sorted_indices.items[0..visible_count]) |thread_index| {
                 const thread = &project.threads.items[thread_index];
-                renderThreadRow(state, index, width, thread, thread_index);
+                renderThreadRow(state, index, rail_width - sub_indent, thread, thread_index);
             }
 
             if (sorted_indices.items.len > Impl.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
                 if (zgui.button(if (project.thread_list_expanded) "Show less" else "Show more", .{
-                    .w = @max(width - theme.scaledUi(36.0), theme.scaledUi(110.0)),
+                    .w = @max(rail_width - sub_indent, theme.scaledUi(110.0)),
                     .h = theme.scaledUi(28.0),
                 })) {
                     state.projects.items[index].thread_list_expanded = !state.projects.items[index].thread_list_expanded;
@@ -256,7 +261,6 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             if (!active_thread.committed) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "New chat will appear here after the first prompt.", .{});
             }
-            zgui.unindent(.{ .indent_w = theme.scaledUi(12.0) });
         } else if (!is_collapsed and active_thread.messages.items.len > 0) {
             var time_buf: [24]u8 = undefined;
             const relative_time = formatRelativeTime(&time_buf, active_thread.last_activity_at);
@@ -271,12 +275,13 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
             zgui.textColored(theme.COLOR_YELLOW, "{d} pending", .{project.unread_count});
         }
+        if (!is_collapsed) zgui.unindent(.{ .indent_w = sub_indent });
         zgui.spacing();
     }
 }
 
-/// Draws the sidebar brand row with logo and title.
-fn renderBrand(comptime Impl: type, state: anytype) void {
+/// Draws the sidebar brand row with logo and title, centered horizontally.
+fn renderBrand(comptime Impl: type, state: anytype, sidebar_width: f32) void {
     const start = zgui.getCursorPos();
     const spacing = theme.scaledUi(10.0);
     const fallback_logo_size = theme.scaledUi(28.0);
@@ -289,15 +294,23 @@ fn renderBrand(comptime Impl: type, state: anytype) void {
         zgui.popFont();
     }
 
+    // Measure logo dimensions without rendering
     var logo_width: f32 = 0.0;
     var logo_height: f32 = 0.0;
     if (state.logo_texture) |cached| {
-        const target_height = @max(text_size[1] * 1.15, fallback_logo_size);
+        const target_height = @max(text_size[1] * 1.6, fallback_logo_size);
         const aspect_ratio = @as(f32, @floatFromInt(cached.width)) / @as(f32, @floatFromInt(cached.height));
         logo_height = target_height;
         logo_width = logo_height * aspect_ratio;
+    }
 
-        zgui.setCursorPos(start);
+    // Left-align the logo+text group with sidebar content
+    _ = sidebar_width;
+    const brand_x = start[0];
+    const row_height = @max(logo_height, text_size[1]);
+
+    if (state.logo_texture) |cached| {
+        zgui.setCursorPos(.{ brand_x, start[1] });
         zgui.image(Impl.textureRefFromGlId(cached.texture_id), .{
             .w = logo_width,
             .h = logo_height,
@@ -305,8 +318,7 @@ fn renderBrand(comptime Impl: type, state: anytype) void {
         zgui.sameLine(.{ .spacing = spacing });
     }
 
-    const row_height = @max(logo_height, text_size[1]);
-    const text_x = start[0] + if (logo_width > 0.0) logo_width + spacing else 0.0;
+    const text_x = brand_x + if (logo_width > 0.0) logo_width + spacing else 0.0;
     const text_y = start[1] + (row_height - text_size[1]) * 0.5;
     zgui.setCursorPos(.{ text_x, text_y });
     if (theme.heading_font) |font| {
@@ -316,6 +328,7 @@ fn renderBrand(comptime Impl: type, state: anytype) void {
     } else {
         zgui.textColored(theme.COLOR_WHITE, title_text, .{});
     }
+    // Restore cursor for left-aligned content below
     zgui.setCursorPos(.{ start[0], start[1] + row_height });
 }
 
