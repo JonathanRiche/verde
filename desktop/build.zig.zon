@@ -10,6 +10,10 @@
             .url = "git+https://github.com/zig-gamedev/zsdl#537de39b5719f39dcd612df2923607f3aedaf147",
             .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
         },
+        .zqlite = .{
+            .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#05a88d6758753e1c63fdd45b211dde2057094b0c",
+            .hash = "zqlite-0.0.1-RWLaYz6bmAAT7E_jxopXf-j5Ea8VQldnxsd6TU8sa0Bb",
+        },
     },
     .fingerprint = 0xd77462097ec03b8f,
     .paths = .{

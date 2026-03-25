@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
         .shared = false,
     });
     const zsdl = b.dependency("zsdl", .{});
+    const zqlite = b.dependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const imgui = zgui.artifact("imgui");
 
     // zgui's sdl3_opengl3 backend currently adds the nested SDL3 include dir,
@@ -26,6 +30,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
+                .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
     });
@@ -87,6 +92,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zqlite", .module = zqlite.module("zqlite") },
+            },
         }),
     });
     exe_tests.root_module.addIncludePath(b.path("src/vendor"));
