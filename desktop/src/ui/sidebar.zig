@@ -214,10 +214,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
         zgui.sameLine(.{});
         zgui.setCursorPosX(width - horiz_pad - project_action_width);
-        zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
-        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
-        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
-        if (zgui.button("+", .{ .w = project_action_width, .h = row_height })) {
+        if (renderThreadEditButton(Impl, state, project_action_width, row_height)) {
             state.createThreadForProject(index);
         }
         if (zgui.isItemHovered(.{ .delay_normal = true })) {
@@ -225,7 +222,6 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             zgui.textUnformatted("Start a new chat");
             zgui.endTooltip();
         }
-        zgui.popStyleColor(.{ .count = 3 });
 
         const active_thread = state.projects.items[index].currentThread();
         const sub_indent = theme.scaledUi(20.0);
@@ -278,6 +274,38 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         if (!is_collapsed) zgui.unindent(.{ .indent_w = sub_indent });
         zgui.spacing();
     }
+}
+
+fn renderThreadEditButton(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) bool {
+    const start = zgui.getCursorScreenPos();
+    const clicked = zgui.invisibleButton("##thread-edit-button", .{ .w = width, .h = height });
+    const hovered = zgui.isItemHovered(.{});
+    const draw_list = zgui.getWindowDrawList();
+    const bg_color = if (hovered)
+        theme.lighten(theme.COLOR_PANEL_ALT, 0.08)
+    else
+        theme.COLOR_PANEL_ALT;
+
+    draw_list.addRectFilled(.{
+        .pmin = start,
+        .pmax = .{ start[0] + width, start[1] + height },
+        .col = zgui.colorConvertFloat4ToU32(bg_color),
+        .rounding = theme.scaledUi(6.0),
+    });
+
+    if (state.thread_edit_texture) |cached| {
+        const icon_size = theme.clampf(@min(width, height) - theme.scaledUi(8.0), theme.scaledUi(14.0), theme.scaledUi(18.0));
+        const image_min = .{
+            start[0] + (width - icon_size) * 0.5,
+            start[1] + (height - icon_size) * 0.5,
+        };
+        draw_list.addImage(Impl.textureRefFromGlId(cached.texture_id), .{
+            .pmin = image_min,
+            .pmax = .{ image_min[0] + icon_size, image_min[1] + icon_size },
+        });
+    }
+
+    return clicked;
 }
 
 /// Draws the sidebar brand row with logo and title, centered horizontally.
