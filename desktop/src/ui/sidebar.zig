@@ -132,9 +132,9 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
             if (is_selected or hovered) {
                 const bg_col = if (is_selected and hovered)
-                    colors.rgba(44, 46, 54, 255)
+                    theme.lighten(colors.CHAT_BLACK, 0.06)
                 else if (is_selected)
-                    colors.rgba(38, 40, 48, 255)
+                    colors.CHAT_BLACK
                 else
                     colors.rgba(36, 38, 44, 255);
                 dl.addRectFilled(.{
@@ -229,7 +229,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         if (!is_collapsed) {
             zgui.textDisabled("{d} saved chats", .{project.committedThreadCount()});
         }
-        if (is_selected and !is_collapsed) {
+        if (!is_collapsed) {
             var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &project) catch blk: {
                 break :blk std.ArrayList(usize).empty;
             };
@@ -254,18 +254,11 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
                 }
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
             }
-            if (!active_thread.committed) {
+            if (sorted_indices.items.len == 0 and is_selected and !active_thread.committed) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "New chat will appear here after the first prompt.", .{});
+            } else if (sorted_indices.items.len == 0) {
+                zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No saved threads yet", .{});
             }
-        } else if (!is_collapsed and active_thread.messages.items.len > 0) {
-            var time_buf: [24]u8 = undefined;
-            const relative_time = formatRelativeTime(&time_buf, active_thread.last_activity_at);
-            zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{lastMessagePreview(&project)});
-            zgui.textDisabled("{s}", .{relative_time});
-        } else if (!is_collapsed and active_thread.committed) {
-            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{active_thread.title});
-        } else if (!is_collapsed) {
-            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No saved threads yet", .{});
         }
         if (project.unread_count > 0) {
             zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
@@ -363,7 +356,7 @@ fn renderBrand(comptime Impl: type, state: anytype, sidebar_width: f32) void {
 /// Draws one saved thread row under the active project.
 fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: anytype, thread_index: usize) void {
     const project = &state.projects.items[project_index];
-    const thread_selected = project.selected_thread_index == thread_index;
+    const thread_selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
     const row_width = @max(width - theme.scaledUi(42.0), theme.scaledUi(120.0));
     var time_buf: [24]u8 = undefined;
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
@@ -374,9 +367,9 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
     defer zgui.popId();
 
     if (thread_selected) {
-        zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(36, 38, 44, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(42, 44, 50, 255) });
-        zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(48, 50, 56, 255) });
+        zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.DARK_BLUE });
+        zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = theme.lighten(colors.DARK_BLUE, 0.06) });
+        zgui.pushStyleColor4f(.{ .idx = .header_active, .c = theme.lighten(colors.DARK_BLUE, 0.12) });
     }
 
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(6.0) } });
@@ -396,13 +389,7 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
     zgui.popStyleVar(.{ .count = 1 });
 
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
-    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{relative_time});
-
-    var preview_buf = std.mem.zeroes([72:0]u8);
-    const preview = formatThreadPreview(&preview_buf, thread);
-    if (preview.len > 0) {
-        zgui.textColored(if (thread_selected) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE, "{s}", .{preview});
-    }
+    zgui.textColored(colors.TIME_LABEL, "{s}", .{relative_time});
 
     if (thread_selected) {
         zgui.popStyleColor(.{ .count = 3 });
