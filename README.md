@@ -7,7 +7,7 @@ This repo currently contains the desktop app in [`desktop/`](desktop). If you cl
 ## Quick start
 
 ```bash
-git clone <repo-url> verde
+git clone https://github.com/JonathanRiche/verde
 cd verde
 zig build run
 ```
