@@ -22,3 +22,6 @@ pub const DARK_BLUE = rgba(0x3C, 0x47, 0x4C, 255);
 pub const BLACK_SECONDARY = rgba(0x20, 0x27, 0x2A, 255);
 /// Chat BG BLACKG #0d1213
 pub const CHAT_BLACK = rgba(0x0D, 0x12, 0x13, 255);
+
+/// Color for time lable on chat thread #9CB5C0
+pub const TIME_LABEL = rgba(0x9C, 0xB5, 0xC0, 255);
