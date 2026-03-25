@@ -15,6 +15,7 @@ pub const STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
+pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
 const SendWorkerRequest = utils.SendWorkerRequest;
@@ -612,6 +613,7 @@ pub const AppState = struct {
     composer_focused: bool,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
+    thread_edit_texture: ?CachedImageTexture,
     modal_image_path: ?[:0]const u8,
     rename_project_index: ?usize,
     show_project_creator: bool,
@@ -633,6 +635,7 @@ pub const AppState = struct {
             .composer_focused = false,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
+            .thread_edit_texture = null,
             .modal_image_path = null,
             .rename_project_index = null,
             .show_project_creator = false,
@@ -649,6 +652,7 @@ pub const AppState = struct {
             try state.seedDefaultState();
         }
         state.logo_texture = utils.loadEmbeddedTexture(VERDE_LOGO_BYTES);
+        state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
         return state;
     }
 
@@ -1181,6 +1185,10 @@ pub const AppState = struct {
         if (self.logo_texture) |cached| {
             cached.deinit();
             self.logo_texture = null;
+        }
+        if (self.thread_edit_texture) |cached| {
+            cached.deinit();
+            self.thread_edit_texture = null;
         }
         self.image_texture_cache.deinit();
     }
