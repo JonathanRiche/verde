@@ -2,20 +2,35 @@ const std = @import("std");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const ai_harness = @import("harness.zig");
-pub const ReasoningEffort = ai_harness.ReasoningEffort;
 const chat_threads = @import("chat/threads.zig");
+const db_client = @import("db/client.zig");
+const db_types = @import("db/types.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
+
+pub const ReasoningEffort = db_types.ReasoningEffort;
+pub const FastMode = db_types.FastMode;
+pub const AccessMode = db_types.AccessMode;
+pub const ChatRole = db_types.ChatRole;
+pub const Provider = db_types.Provider;
+pub const Harness = db_types.Harness;
 
 pub const log = std.log.scoped(.native_shell);
 
 pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
-pub const STATE_FILE_NAME = "state.json";
+pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
+
+const LoadedPersistedState = db_types.LoadedState;
+const PersistedImageAttachment = db_types.PersistedImageAttachment;
+const PersistedMessage = db_types.PersistedMessage;
+const PersistedProject = db_types.PersistedProject;
+const PersistedState = db_types.PersistedState;
+const PersistedThread = db_types.PersistedThread;
 
 // `utils.zig` owns the cross-cutting runtime helpers that are shared with the UI shell.
 const SendWorkerRequest = utils.SendWorkerRequest;
@@ -35,32 +50,6 @@ const pickerWorker = utils.pickerWorker;
 const sandboxModeForMode = utils.sandboxModeForMode;
 const sendWorker = utils.sendWorker;
 const uploadTexture = utils.uploadTexture;
-
-pub const FastMode = enum(u8) {
-    off,
-    on,
-};
-
-pub const AccessMode = enum(u8) {
-    full_access,
-    supervised,
-};
-
-pub const ChatRole = enum(u8) {
-    user,
-    assistant,
-    system,
-};
-
-pub const Provider = enum(u8) {
-    opencode,
-    codex,
-};
-
-pub const Harness = enum(u8) {
-    local_cli,
-    remote_session,
-};
 
 pub const ModelOption = struct {
     label: [:0]const u8,
@@ -116,59 +105,6 @@ pub const CODEX_FAST_MODE_OPTIONS = [_]FastModeOption{
 pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Full access", .value = .full_access },
     .{ .label = "Supervised", .value = .supervised },
-};
-
-const PersistedThread = struct {
-    title: []const u8,
-    committed: bool = true,
-    last_activity_at: ?i64 = null,
-    provider_thread_id: ?[]const u8 = null,
-    model_ref: ?[]const u8 = null,
-    reasoning_effort: ?ReasoningEffort = null,
-    fast_mode: ?FastMode = null,
-    access_mode: ?AccessMode = null,
-    provider: Provider = .opencode,
-    harness: Harness = .local_cli,
-    draft: []const u8 = "",
-    draft_image: ?PersistedImageAttachment = null,
-    messages: []const PersistedMessage = &.{},
-};
-
-const PersistedMessage = struct {
-    role: ChatRole,
-    author: []const u8,
-    body: []const u8,
-    image: ?PersistedImageAttachment = null,
-};
-
-const PersistedImageAttachment = struct {
-    path: []const u8,
-    mime: []const u8,
-    byte_size: usize = 0,
-};
-
-const PersistedProject = struct {
-    id: ?[]const u8 = null,
-    label: []const u8,
-    path: []const u8,
-    unread_count: u8 = 0,
-    collapsed: ?bool = null,
-    thread_list_expanded: ?bool = null,
-    selected_thread_index: usize = 0,
-    threads: ?[]const PersistedThread = null,
-    provider: Provider = .opencode,
-    harness: Harness = .local_cli,
-    draft: []const u8 = "",
-    messages: []const PersistedMessage = &.{},
-};
-
-pub const PersistedState = struct {
-    selected_project_index: usize = 0,
-    projects: []const PersistedProject = &.{},
-    provider: ?Provider = null,
-    harness: ?Harness = null,
-    draft: ?[]const u8 = null,
-    messages: ?[]const PersistedMessage = null,
 };
 
 const ChatMessage = struct {
@@ -409,149 +345,67 @@ pub const Project = struct {
 pub const Storage = struct {
     allocator: std.mem.Allocator,
     pref_path: []const u8,
+    client: db_client.Client,
 
     pub fn init(allocator: std.mem.Allocator) !Storage {
         const pref_path = sdl.getPrefPath(ORG_NAME, APP_NAME) orelse return error.SdlError;
         try std.fs.cwd().makePath(pref_path);
+        const owned_pref_path = try allocator.dupe(u8, pref_path);
+        errdefer allocator.free(owned_pref_path);
+        const client = try db_client.Client.init(allocator, owned_pref_path);
+        errdefer {
+            var owned_client = client;
+            owned_client.deinit();
+        }
         return .{
             .allocator = allocator,
-            .pref_path = try allocator.dupe(u8, pref_path),
+            .pref_path = owned_pref_path,
+            .client = client,
         };
     }
 
     pub fn deinit(self: *Storage) void {
+        self.client.deinit();
         self.allocator.free(self.pref_path);
     }
 
-    fn load(self: *const Storage, allocator: std.mem.Allocator) !?std.json.Parsed(PersistedState) {
+    fn load(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
+        if (try self.client.load(allocator)) |loaded| {
+            return loaded;
+        }
+        if (try self.loadLegacyJson(allocator)) |loaded| {
+            errdefer {
+                var owned_loaded = loaded;
+                owned_loaded.deinit();
+            }
+            try self.client.save(loaded.value);
+            return loaded;
+        }
+        return null;
+    }
+
+    fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
         var dir = try std.fs.openDirAbsolute(self.pref_path, .{});
         defer dir.close();
 
-        const bytes = dir.readFileAlloc(allocator, STATE_FILE_NAME, 1024 * 1024) catch |err| switch (err) {
+        const bytes = dir.readFileAlloc(allocator, LEGACY_STATE_FILE_NAME, 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         defer allocator.free(bytes);
 
-        return try std.json.parseFromSlice(PersistedState, allocator, bytes, .{
+        var loaded = LoadedPersistedState.init(allocator);
+        errdefer loaded.deinit();
+        loaded.value = try std.json.parseFromSliceLeaky(PersistedState, loaded.allocator(), bytes, .{
             .allocate = .alloc_always,
         });
+        return loaded;
     }
 
     fn save(self: *const Storage, state: *const AppState) !void {
-        var buffer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer buffer.deinit();
-
-        var stringify: std.json.Stringify = .{
-            .writer = &buffer.writer,
-            .options = .{ .whitespace = .indent_2 },
-        };
-        try stringify.beginObject();
-        try stringify.objectField("selected_project_index");
-        try stringify.write(state.selected_project_index);
-        try stringify.objectField("projects");
-        try stringify.beginArray();
-        for (state.projects.items) |project| {
-            const selected_save_index = chat_threads.selectedCommittedThreadIndex(&project);
-            try stringify.beginObject();
-            try stringify.objectField("id");
-            try stringify.write(project.id);
-            try stringify.objectField("label");
-            try stringify.write(project.label);
-            try stringify.objectField("path");
-            try stringify.write(project.path);
-            try stringify.objectField("unread_count");
-            try stringify.write(project.unread_count);
-            try stringify.objectField("collapsed");
-            try stringify.write(project.collapsed);
-            try stringify.objectField("thread_list_expanded");
-            try stringify.write(project.thread_list_expanded);
-            try stringify.objectField("selected_thread_index");
-            try stringify.write(selected_save_index);
-            try stringify.objectField("threads");
-            try stringify.beginArray();
-            for (project.threads.items) |thread| {
-                if (!thread.committed) continue;
-                try stringify.beginObject();
-                try stringify.objectField("title");
-                try stringify.write(thread.title);
-                try stringify.objectField("committed");
-                try stringify.write(thread.committed);
-                try stringify.objectField("last_activity_at");
-                try stringify.write(thread.last_activity_at);
-                try stringify.objectField("provider_thread_id");
-                try stringify.write(thread.provider_thread_id);
-                try stringify.objectField("model_ref");
-                try stringify.write(thread.model_ref);
-                try stringify.objectField("reasoning_effort");
-                try stringify.write(thread.reasoning_effort);
-                try stringify.objectField("fast_mode");
-                try stringify.write(thread.fast_mode);
-                try stringify.objectField("access_mode");
-                try stringify.write(thread.access_mode);
-                try stringify.objectField("provider");
-                try stringify.write(thread.provider);
-                try stringify.objectField("harness");
-                try stringify.write(thread.harness);
-                try stringify.objectField("draft");
-                try stringify.write(thread.currentDraft());
-                try stringify.objectField("draft_image");
-                if (thread.draft_image) |image| {
-                    try stringify.beginObject();
-                    try stringify.objectField("path");
-                    try stringify.write(image.path);
-                    try stringify.objectField("mime");
-                    try stringify.write(image.mime);
-                    try stringify.objectField("byte_size");
-                    try stringify.write(image.byte_size);
-                    try stringify.endObject();
-                } else {
-                    try stringify.write(null);
-                }
-                try stringify.objectField("messages");
-                try stringify.beginArray();
-                for (thread.messages.items) |message| {
-                    try stringify.beginObject();
-                    try stringify.objectField("role");
-                    try stringify.write(message.role);
-                    try stringify.objectField("author");
-                    try stringify.write(message.author);
-                    try stringify.objectField("body");
-                    try stringify.write(message.body);
-                    try stringify.objectField("image");
-                    if (message.image) |image| {
-                        try stringify.beginObject();
-                        try stringify.objectField("path");
-                        try stringify.write(image.path);
-                        try stringify.objectField("mime");
-                        try stringify.write(image.mime);
-                        try stringify.objectField("byte_size");
-                        try stringify.write(image.byte_size);
-                        try stringify.endObject();
-                    } else {
-                        try stringify.write(null);
-                    }
-                    try stringify.endObject();
-                }
-                try stringify.endArray();
-                try stringify.endObject();
-            }
-            try stringify.endArray();
-            try stringify.endObject();
-        }
-        try stringify.endArray();
-        try stringify.endObject();
-
-        const json_bytes = try buffer.toOwnedSlice();
-        defer self.allocator.free(json_bytes);
-
-        var dir = try std.fs.openDirAbsolute(self.pref_path, .{});
-        defer dir.close();
-        try dir.writeFile(.{
-            .sub_path = STATE_FILE_NAME,
-            .data = json_bytes,
-            .flags = .{},
-        });
+        var persisted = try state.buildPersistedState(self.allocator);
+        defer persisted.deinit();
+        try self.client.save(persisted.value);
     }
 };
 pub const SendStatus = enum {
@@ -645,7 +499,8 @@ pub const AppState = struct {
             .dirty = false,
         };
 
-        if (try storage.load(allocator)) |persisted| {
+        if (try storage.load(allocator)) |persisted_value| {
+            var persisted = persisted_value;
             defer persisted.deinit();
             try state.applyPersisted(persisted.value);
         } else {
@@ -1051,6 +906,81 @@ pub const AppState = struct {
         self.dirty = false;
     }
 
+    fn buildPersistedState(self: *const AppState, backing_allocator: std.mem.Allocator) !LoadedPersistedState {
+        var loaded = LoadedPersistedState.init(backing_allocator);
+        errdefer loaded.deinit();
+
+        const arena = loaded.allocator();
+        var projects: std.ArrayList(PersistedProject) = .empty;
+        defer projects.deinit(arena);
+
+        for (self.projects.items) |project| {
+            try projects.append(arena, try self.persistedProjectSnapshot(arena, &project));
+        }
+
+        loaded.value = .{
+            .selected_project_index = self.selected_project_index,
+            .projects = try projects.toOwnedSlice(arena),
+        };
+        return loaded;
+    }
+
+    fn persistedProjectSnapshot(self: *const AppState, allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
+        var threads: std.ArrayList(PersistedThread) = .empty;
+        defer threads.deinit(allocator);
+
+        for (project.threads.items) |thread| {
+            if (!thread.committed) continue;
+            try threads.append(allocator, try self.persistedThreadSnapshot(allocator, &thread));
+        }
+
+        return .{
+            .id = try allocator.dupe(u8, project.id),
+            .label = try allocator.dupe(u8, project.label),
+            .path = try allocator.dupe(u8, project.path),
+            .unread_count = project.unread_count,
+            .collapsed = project.collapsed,
+            .thread_list_expanded = project.thread_list_expanded,
+            .selected_thread_index = chat_threads.selectedCommittedThreadIndex(project),
+            .threads = try threads.toOwnedSlice(allocator),
+        };
+    }
+
+    fn persistedThreadSnapshot(self: *const AppState, allocator: std.mem.Allocator, thread: *const ChatThread) !PersistedThread {
+        var messages: std.ArrayList(PersistedMessage) = .empty;
+        defer messages.deinit(allocator);
+
+        for (thread.messages.items) |message| {
+            try messages.append(allocator, try self.persistedMessageSnapshot(allocator, &message));
+        }
+
+        return .{
+            .title = try allocator.dupe(u8, thread.title),
+            .committed = thread.committed,
+            .last_activity_at = if (thread.last_activity_at == 0) null else thread.last_activity_at,
+            .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
+            .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
+            .reasoning_effort = thread.reasoning_effort,
+            .fast_mode = thread.fast_mode,
+            .access_mode = thread.access_mode,
+            .provider = thread.provider,
+            .harness = thread.harness,
+            .draft = try allocator.dupe(u8, thread.currentDraft()),
+            .draft_image = try persistedImageSnapshot(allocator, thread.draft_image),
+            .messages = try messages.toOwnedSlice(allocator),
+        };
+    }
+
+    fn persistedMessageSnapshot(self: *const AppState, allocator: std.mem.Allocator, message: *const ChatMessage) !PersistedMessage {
+        _ = self;
+        return .{
+            .role = message.role,
+            .author = try allocator.dupe(u8, message.author),
+            .body = try allocator.dupe(u8, message.body),
+            .image = try persistedImageSnapshot(allocator, message.image),
+        };
+    }
+
     fn seedDefaultState(self: *AppState) !void {
         self.selected_project_index = 0;
         self.next_project_number = 1;
@@ -1354,7 +1284,8 @@ pub const AppState = struct {
         self.flushIfDirty();
         self.clearProjects();
 
-        if (try self.storage.load(self.allocator)) |persisted| {
+        if (try self.storage.load(self.allocator)) |persisted_value| {
+            var persisted = persisted_value;
             defer persisted.deinit();
             try self.applyPersisted(persisted.value);
         } else {
@@ -1706,6 +1637,20 @@ pub const AppState = struct {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(path);
         return std.fmt.allocPrint(self.allocator, "{x}", .{hasher.final()});
+    }
+
+    fn persistedImageSnapshot(allocator: std.mem.Allocator, image: ?ChatImageAttachment) !?PersistedImageAttachment {
+        const attachment = image orelse return null;
+        return .{
+            .path = try allocator.dupe(u8, attachment.path),
+            .mime = try allocator.dupe(u8, attachment.mime),
+            .byte_size = attachment.byte_size,
+        };
+    }
+
+    fn dupeOptionalSlice(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+        const slice = value orelse return null;
+        return try allocator.dupe(u8, slice);
     }
 
     fn clearProjects(self: *AppState) void {
