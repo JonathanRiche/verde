@@ -21,7 +21,8 @@ fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     // const inner_pad_x = theme.clampf(available_width[0] * 0.14, theme.scaledUi(24.0), theme.scaledUi(200.0));
     const inner_pad_y = theme.scaledUi(18.0);
 
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ inner_pad_x, inner_pad_y } });
+    // No horizontal padding here so the transcript scrollbar reaches the far right edge.
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, inner_pad_y } });
 
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
 
@@ -39,19 +40,22 @@ fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     defer zgui.endChild();
 
     if (state.projects.items.len == 0) {
+        zgui.indent(.{ .indent_w = inner_pad_x });
         zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
+        zgui.unindent(.{ .indent_w = inner_pad_x });
         return;
     }
-
-    // renderHeader(state);
-    // zgui.separator();
 
     const content = zgui.getContentRegionAvail();
     const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
     const transcript_height = @max(content[1] - composer_height - theme.scaledUi(8.0), theme.scaledUi(120.0));
-    renderTranscript(Impl, state, content[0], transcript_height);
-    renderComposer(Impl, state, content[0], @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+    renderTranscript(Impl, state, content[0], transcript_height, inner_pad_x);
+    // Indent composer so it stays centered while transcript scrollbar is at far right.
+    zgui.indent(.{ .indent_w = inner_pad_x });
+    const composer_width = @max(content[0] - 2 * inner_pad_x, theme.scaledUi(120.0));
+    renderComposer(Impl, state, composer_width, @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+    zgui.unindent(.{ .indent_w = inner_pad_x });
 }
 
 /// Renders the chat workspace shell beside the sidebar.
@@ -115,7 +119,8 @@ fn renderHeader(state: anytype) void {
 }
 
 /// Renders transcript history plus any in-flight stream state.
-fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32, pad_x: f32) void {
+    // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     _ = zgui.beginChild("Transcript", .{
         .w = width,
         .h = height,
@@ -125,25 +130,45 @@ fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, heig
 
     const should_follow_stream = transcriptShouldAutoFollow(state);
     const has_pending_stream = Impl.isSendPending(state);
+
+    // Inner content wrapper with horizontal padding; auto-resizes vertically so the
+    // outer Transcript child handles scrolling while content stays centered.
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ pad_x, 0 } });
+    _ = zgui.beginChild("TranscriptContent", .{
+        .w = 0.0,
+        .h = 0.0,
+        .child_flags = .{
+            .auto_resize_y = true,
+            .always_use_window_padding = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+        },
+    });
+
     if (state.currentThread().messages.items.len == 0 and !has_pending_stream) {
         zgui.textColored(theme.COLOR_WHITE, "No messages yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
-        return;
+    } else {
+        for (state.currentThread().messages.items, 0..) |message, index| {
+            renderTranscriptMessage(Impl, state, @intCast(index + 1), message.role, message.author, message.body, message.image);
+            zgui.dummy(.{ .w = 0.0, .h = 10.0 });
+        }
+
+        if (has_pending_stream) {
+            renderPendingApproval(state);
+            renderPendingDiffCard(Impl, state);
+            renderPendingTimelineEvents(Impl, state);
+            renderPendingTranscriptBubble(Impl, state);
+            zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+        }
     }
 
-    for (state.currentThread().messages.items, 0..) |message, index| {
-        renderTranscriptMessage(Impl, state, @intCast(index + 1), message.role, message.author, message.body, message.image);
-        zgui.dummy(.{ .w = 0.0, .h = 10.0 });
-    }
+    zgui.endChild();
+    zgui.popStyleVar(.{ .count = 1 });
 
-    if (has_pending_stream) {
-        renderPendingApproval(state);
-        renderPendingDiffCard(Impl, state);
-        renderPendingTimelineEvents(Impl, state);
-        renderPendingTranscriptBubble(Impl, state);
-        zgui.dummy(.{ .w = 0.0, .h = 6.0 });
-    }
-
+    // Scroll control stays in the outer Transcript context.
     if (state.scroll_transcript_to_bottom) {
         zgui.setScrollHereY(.{ .center_y_ratio = 1.0 });
         state.scroll_transcript_to_bottom = false;
