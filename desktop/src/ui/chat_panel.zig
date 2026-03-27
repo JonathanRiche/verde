@@ -788,9 +788,18 @@ fn renderComposerFileSearchResults(
     const results = state.fileSearchResults();
     const row_height = theme.scaledUi(28.0);
     const visible_rows = @max(@as(usize, 1), @min(results.len, 6));
+    const visible_rows_height = row_height * @as(f32, @floatFromInt(visible_rows));
     const top_padding = theme.scaledUi(16.0);
     const bottom_padding = theme.scaledUi(12.0);
-    const card_height = top_padding + bottom_padding + row_height * @as(f32, @floatFromInt(visible_rows));
+    const popup_gap = theme.scaledUi(8.0);
+    const top_safe_margin = theme.scaledUi(72.0);
+    const available_above = @max(input_rect_min[1] - top_safe_margin - popup_gap, row_height + top_padding + bottom_padding);
+    const list_height = theme.clampf(
+        available_above - top_padding - bottom_padding,
+        row_height,
+        visible_rows_height,
+    );
+    const card_height = top_padding + bottom_padding + list_height;
     const horizontal_margin = theme.scaledUi(12.0);
     const card_width = theme.clampf(
         input_rect_max[0] - input_rect_min[0],
@@ -803,8 +812,8 @@ fn renderComposerFileSearchResults(
         composer_screen_pos[0] + composer_width - horizontal_margin - card_width,
     );
     const popup_y = @max(
-        composer_screen_pos[1] + horizontal_margin,
-        input_rect_min[1] - card_height - theme.scaledUi(8.0),
+        top_safe_margin,
+        input_rect_min[1] - card_height - popup_gap,
     );
 
     zgui.setNextWindowPos(.{
@@ -849,7 +858,7 @@ fn renderComposerFileSearchResults(
     const ensure_selected_visible = state.consumeFileSearchEnsureSelectionVisible();
     _ = zgui.beginChild("ComposerFileSearchResults", .{
         .w = 0.0,
-        .h = row_height * @as(f32, @floatFromInt(visible_rows)),
+        .h = list_height,
         .child_flags = .{ .border = false },
         .window_flags = .{ .no_saved_settings = true },
     });
