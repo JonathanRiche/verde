@@ -79,7 +79,7 @@ Example config:
 
 Verde uses and distributes third-party software. The main components in the desktop app are:
 
-- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko for fast file indexing and file search. Vendored in [`third_party/fff`](third_party/fff). License: MIT.
+- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko for fast file indexing and file search. Vendored in [`vendor/fff`](vendor/fff). License: MIT.
 - Codicon by Microsoft for file-type glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/Codicon.ttf`](desktop/src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
 - Symbols Nerd Font Mono by Nerd Fonts for language-specific file glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
 - `nvim-web-devicons` for the file-type icon mapping reference used by Verde's native picker. License: MIT.
@@ -88,7 +88,7 @@ Verde uses and distributes third-party software. The main components in the desk
 - `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
 - SDL3 from libsdl-org for windowing, input, display integration, and OpenGL context management at runtime.
 - `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT-style.
-- `stb_image` by Sean Barrett and contributors for image decoding in the native app. Vendored in [`desktop/src/vendor/stb_image.h`](desktop/src/vendor/stb_image.h). License: public domain or MIT.
+- `stb_image` by Sean Barrett and contributors for image decoding in the native app. Vendored in [`vendor/stb_image.h`](vendor/stb_image.h). License: public domain or MIT.
 
 If you redistribute Verde, keep the relevant upstream notices and license texts with the distributed app and any vendored source.
 
