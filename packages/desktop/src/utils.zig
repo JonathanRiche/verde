@@ -186,6 +186,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.free(request.prompt);
         if (request.image_path) |image_path| page_alloc.free(image_path);
         if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
+        page_alloc.free(request.thread_title);
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         page_alloc.destroy(request);
     }
@@ -216,6 +217,7 @@ pub const SendWorkerRequest = struct {
     prompt: []u8,
     image_path: ?[]u8,
     provider_thread_id: ?[]u8,
+    thread_title: []u8,
     model_ref: ?[]u8,
     reasoning_effort: ?app_state.ReasoningEffort,
     fast_mode: app_state.FastMode,
@@ -250,6 +252,7 @@ pub fn runSendWorker(
 
     const result = try client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
+        .thread_title = request.thread_title,
         .prompt = request.prompt,
         .image = if (request.image_path) |image_path| .{ .path = image_path } else null,
         .cwd = request.project_path,
@@ -354,8 +357,7 @@ fn commandExists(name: []const u8) bool {
     }
     return false;
 }
-pub fn approvalPolicyForMode(provider: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.ApprovalPolicy {
-    if (provider != .codex) return null;
+pub fn approvalPolicyForMode(_: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.ApprovalPolicy {
     return switch (mode) {
         .full_access => .never,
         .supervised => .on_request,

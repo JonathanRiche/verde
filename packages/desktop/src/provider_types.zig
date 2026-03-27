@@ -85,6 +85,7 @@ pub const StreamEvent = union(enum) {
 
 pub const SendPromptRequest = struct {
     thread_id: ?[]const u8 = null,
+    thread_title: ?[]const u8 = null,
     prompt: []const u8,
     image: ?ImageAttachment = null,
     cwd: ?[]const u8 = null,

@@ -459,8 +459,6 @@ pub fn renderComposerPickers(state: *AppState) void {
         }
     }
 
-    if (thread.provider != .codex) return;
-
     zgui.sameLine(.{ .spacing = 6.0 });
     zgui.textColored(separator_color, "|", .{});
 
@@ -483,27 +481,33 @@ pub fn renderComposerPickers(state: *AppState) void {
             const row_label = comboRowLabel(&row_buf, option.label, is_selected);
             if (zgui.selectable(row_label, .{ .selected = is_selected, .h = 28.0 })) {
                 thread.reasoning_effort = option.value;
+                if (thread.provider_thread_id) |thread_id| {
+                    state.allocator.free(thread_id);
+                }
+                thread.provider_thread_id = null;
                 state.markDirty();
             }
         }
     }
 
-    zgui.sameLine(.{ .spacing = 6.0 });
-    zgui.textColored(separator_color, "|", .{});
+    if (thread.provider == .codex) {
+        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.textColored(separator_color, "|", .{});
 
-    zgui.sameLine(.{ .spacing = 6.0 });
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
-    const fast_label: [:0]const u8 = if (thread.fast_mode == .on) "Fast" else "Chat";
-    if (zgui.button(fast_label, .{ .w = 0.0, .h = 0.0 })) {
-        thread.fast_mode = if (thread.fast_mode == .on) .off else .on;
-        state.markDirty();
+        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
+        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
+        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
+        const fast_label: [:0]const u8 = if (thread.fast_mode == .on) "Fast" else "Chat";
+        if (zgui.button(fast_label, .{ .w = 0.0, .h = 0.0 })) {
+            thread.fast_mode = if (thread.fast_mode == .on) .off else .on;
+            state.markDirty();
+        }
+        zgui.popStyleColor(.{ .count = 3 });
+
+        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.textColored(separator_color, "|", .{});
     }
-    zgui.popStyleColor(.{ .count = 3 });
-
-    zgui.sameLine(.{ .spacing = 6.0 });
-    zgui.textColored(separator_color, "|", .{});
 
     zgui.sameLine(.{ .spacing = 6.0 });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
