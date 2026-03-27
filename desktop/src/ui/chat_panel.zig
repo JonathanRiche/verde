@@ -5,6 +5,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const colors = @import("colors.zig");
+const file_icons = @import("file_icons.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
@@ -845,16 +846,49 @@ fn renderComposerFileSearchResults(
         return;
     }
 
+    const ensure_selected_visible = state.consumeFileSearchEnsureSelectionVisible();
+    _ = zgui.beginChild("ComposerFileSearchResults", .{
+        .w = 0.0,
+        .h = row_height * @as(f32, @floatFromInt(visible_rows)),
+        .child_flags = .{ .border = false },
+        .window_flags = .{ .no_saved_settings = true },
+    });
+    defer zgui.endChild();
+
     for (results, 0..) |result, index| {
-        var label_buf = std.mem.zeroes([512:0]u8);
-        const label = std.fmt.bufPrintZ(&label_buf, "{s}    {s}", .{ result.relative_path, result.file_name }) catch "file";
-        if (zgui.selectable(label, .{
-            .selected = index == state.fileSearchSelectedIndex(),
+        zgui.pushIntId(@intCast(index));
+
+        const selected = index == state.fileSearchSelectedIndex();
+        if (zgui.selectable("##file-search-row", .{
+            .selected = selected,
             .h = row_height,
         })) {
+            zgui.popId();
             _ = state.selectFileSearchResult(index);
             return;
         }
+
+        const icon = file_icons.forFile(result.file_name);
+        const row_min = zgui.getItemRectMin();
+        const row_max = zgui.getItemRectMax();
+        const draw_list = zgui.getWindowDrawList();
+        const row_center_y = row_min[1] + (row_max[1] - row_min[1]) * 0.5;
+        const icon_size = zgui.calcTextSize(icon.glyph, .{});
+        const text_size = zgui.calcTextSize(result.relative_path, .{});
+        const icon_pos = .{
+            row_min[0] + theme.scaledUi(8.0),
+            row_center_y - icon_size[1] * 0.5,
+        };
+        const name_pos = .{
+            row_min[0] + theme.scaledUi(34.0),
+            row_center_y - text_size[1] * 0.5,
+        };
+        draw_list.addTextUnformatted(icon_pos, zgui.colorConvertFloat4ToU32(icon.color), icon.glyph);
+        draw_list.addTextUnformatted(name_pos, zgui.colorConvertFloat4ToU32(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), result.relative_path);
+        if (selected and ensure_selected_visible) {
+            zgui.setScrollHereY(.{ .center_y_ratio = 0.5 });
+        }
+        zgui.popId();
     }
 }
 

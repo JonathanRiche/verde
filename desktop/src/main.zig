@@ -55,6 +55,8 @@ const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
+const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
+const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 extern fn SDL_GetPrimaryDisplay() sdl.DisplayId;
 extern fn SDL_GetDisplayUsableBounds(display_id: sdl.DisplayId, rect: *SdlRect) bool;
@@ -125,7 +127,12 @@ pub fn main() !void {
 
     zgui.init(allocator);
     defer zgui.deinit();
-    ui_theme.installFonts(CAL_SANS_BYTES[0..CAL_SANS_BYTES.len], ui_config.font_size);
+    ui_theme.installFonts(
+        CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
+        CODICON_BYTES[0..CODICON_BYTES.len],
+        NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
+        ui_config.font_size,
+    );
     zgui.backend.init(window, gl_context);
     defer zgui.backend.deinit();
 
