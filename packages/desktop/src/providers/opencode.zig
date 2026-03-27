@@ -111,9 +111,15 @@ pub const Client = struct {
         var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id);
         defer baseline.deinit(allocator);
 
+        const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
+            log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer if (event_stream) |handle| signalEventStreamStop(handle);
+
         try self.startPromptAsync(session_id, request);
 
-        const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, true);
+        const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, event_stream == null);
         errdefer allocator.free(reply_text);
 
         return .{
@@ -666,7 +672,8 @@ const AssistantSnapshot = struct {
 };
 
 const EventStreamHandle = struct {
-    shared: *EventStreamShared,
+    worker: std.Thread,
+    context: *EventStreamContext,
 };
 
 const EventStreamOpenState = enum {
@@ -675,23 +682,17 @@ const EventStreamOpenState = enum {
     failed,
 };
 
-const EventStreamShared = struct {
-    allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    ref_count: usize = 2,
-    stop_requested: bool = false,
-};
-
 const EventStreamContext = struct {
     allocator: std.mem.Allocator,
     config: Config,
     session_id: []u8,
     baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
-    shared: *EventStreamShared,
+    child: ?std.process.Child = null,
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     open_state: EventStreamOpenState = .starting,
+    stop_requested: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
@@ -775,11 +776,6 @@ fn extractAssistantFinishAlloc(allocator: std.mem.Allocator, value: std.json.Val
 fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []const u8, baseline_assistant_id: ?[]const u8, request: provider_types.SendPromptRequest) !?EventStreamHandle {
     if (request.on_stream_delta == null and request.on_stream_event == null) return null;
 
-    const shared = try allocator.create(EventStreamShared);
-    shared.* = .{
-        .allocator = allocator,
-    };
-
     const owned_session_id = try allocator.dupe(u8, session_id);
     errdefer allocator.free(owned_session_id);
 
@@ -791,7 +787,6 @@ fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []c
 
     const context = try allocator.create(EventStreamContext);
     errdefer allocator.destroy(context);
-    errdefer allocator.destroy(shared);
 
     context.* = .{
         .allocator = allocator,
@@ -799,7 +794,6 @@ fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []c
         .session_id = owned_session_id,
         .baseline_assistant_id = owned_baseline_assistant_id,
         .request = request,
-        .shared = shared,
     };
     errdefer context.deinit();
 
@@ -812,21 +806,19 @@ fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []c
     context.mutex.unlock();
 
     if (open_state == .failed) {
-        signalEventStreamStop(.{ .shared = shared });
+        worker.join();
+        context.deinit();
+        allocator.destroy(context);
         return null;
     }
 
-    worker.detach();
-    return .{ .shared = shared };
+    return .{
+        .worker = worker,
+        .context = context,
+    };
 }
 
 fn runEventStream(context: *EventStreamContext) void {
-    defer {
-        releaseEventStreamShared(context.shared);
-        context.deinit();
-        context.allocator.destroy(context);
-    }
-
     streamSessionEvents(context) catch |err| {
         log.warn("OpenCode event stream ended: {s}", .{@errorName(err)});
     };
@@ -836,49 +828,55 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     var opened = false;
     errdefer if (!opened) signalEventStreamOpenState(context, .failed);
 
-    var client: std.http.Client = .{ .allocator = context.allocator };
-    defer client.deinit();
-
-    const auth_header = try makeAuthorizationHeaderAlloc(context.allocator, context.config);
-    defer if (auth_header) |header| context.allocator.free(header.value);
-
     const url = try std.fmt.allocPrint(context.allocator, "{s}/event", .{context.config.base_url});
     defer context.allocator.free(url);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(context.allocator);
 
-    var headers_storage: [3]std.http.Header = undefined;
-    var header_count: usize = 0;
-    headers_storage[header_count] = .{ .name = "accept", .value = "text/event-stream" };
-    header_count += 1;
-    if (context.config.working_directory) |dir| {
-        headers_storage[header_count] = .{ .name = "x-opencode-directory", .value = dir };
-        header_count += 1;
-    }
-    if (auth_header) |header| {
-        headers_storage[header_count] = header;
-        header_count += 1;
-    }
-
-    const uri = try std.Uri.parse(url);
-    var req = try client.request(.GET, uri, .{
-        .headers = .{
-            .user_agent = .{ .override = "verde/desktop" },
-        },
-        .extra_headers = headers_storage[0..header_count],
-        .keep_alive = false,
+    try argv.appendSlice(context.allocator, &.{
+        "curl",
+        "--no-buffer",
+        "--silent",
+        "--show-error",
+        "-H",
+        "accept: text/event-stream",
     });
-    defer req.deinit();
 
-    try req.sendBodiless();
-    var response = try req.receiveHead(&.{});
-    if (response.head.status != .ok) return error.OpencodeRequestFailed;
+    var owned_auth_header: ?[]u8 = null;
+    defer if (owned_auth_header) |header| context.allocator.free(header);
+    if (try makeAuthorizationHeaderAlloc(context.allocator, context.config)) |header| {
+        defer context.allocator.free(header.value);
+        owned_auth_header = try std.fmt.allocPrint(context.allocator, "{s}: {s}", .{ header.name, header.value });
+        try argv.appendSlice(context.allocator, &.{ "-H", owned_auth_header.? });
+    }
+
+    var owned_directory_header: ?[]u8 = null;
+    defer if (owned_directory_header) |header| context.allocator.free(header);
+    if (context.config.working_directory) |dir| {
+        owned_directory_header = try std.fmt.allocPrint(context.allocator, "x-opencode-directory: {s}", .{dir});
+        try argv.appendSlice(context.allocator, &.{ "-H", owned_directory_header.? });
+    }
+
+    try argv.append(context.allocator, url);
+
+    var child = std.process.Child.init(argv.items, context.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    child.argv = &.{};
+
+    context.mutex.lock();
+    context.child = child;
+    context.mutex.unlock();
+    defer cleanupEventStreamChild(context);
 
     opened = true;
     signalEventStreamOpenState(context, .ready);
 
-    var transfer_buffer: [256 * 1024]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    var decompress_buffer: [64 * 1024]u8 = undefined;
-    var reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+    const stdout = context.child.?.stdout.?;
+    var read_buffer: [64 * 1024]u8 = undefined;
+    var file_reader = stdout.reader(&read_buffer);
 
     var event_name: std.ArrayList(u8) = .empty;
     defer event_name.deinit(context.allocator);
@@ -887,7 +885,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
     while (true) {
         if (isEventStreamStopRequested(context)) return;
-        const maybe_line = try reader.takeDelimiter('\n');
+        const maybe_line = try file_reader.interface.takeDelimiter('\n');
         if (maybe_line == null) break;
 
         const raw_line = maybe_line.?;
@@ -933,27 +931,35 @@ fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpe
 }
 
 fn signalEventStreamStop(handle: EventStreamHandle) void {
-    handle.shared.mutex.lock();
-    handle.shared.stop_requested = true;
-    handle.shared.mutex.unlock();
-    releaseEventStreamShared(handle.shared);
+    handle.context.mutex.lock();
+    handle.context.stop_requested = true;
+    if (handle.context.child) |*child| {
+        if (@import("builtin").os.tag == .windows) {
+            _ = child.kill() catch {};
+        } else {
+            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+        }
+    }
+    handle.context.mutex.unlock();
+    handle.worker.join();
+    handle.context.deinit();
+    handle.context.allocator.destroy(handle.context);
 }
 
 fn isEventStreamStopRequested(context: *EventStreamContext) bool {
-    context.shared.mutex.lock();
-    defer context.shared.mutex.unlock();
-    return context.shared.stop_requested;
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    return context.stop_requested;
 }
 
-fn releaseEventStreamShared(shared: *EventStreamShared) void {
-    shared.mutex.lock();
-    std.debug.assert(shared.ref_count > 0);
-    shared.ref_count -= 1;
-    const should_destroy = shared.ref_count == 0;
-    shared.mutex.unlock();
+fn cleanupEventStreamChild(context: *EventStreamContext) void {
+    context.mutex.lock();
+    var maybe_child = context.child;
+    context.child = null;
+    context.mutex.unlock();
 
-    if (should_destroy) {
-        shared.allocator.destroy(shared);
+    if (maybe_child) |*owned_child| {
+        _ = owned_child.wait() catch {};
     }
 }
 
@@ -966,14 +972,11 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
     const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return false;
 
     if (std.mem.eql(u8, envelope.event_type, "session.idle")) {
-        return eventTargetsSession(envelope.properties, context.session_id);
+        return false;
     }
 
     if (std.mem.eql(u8, envelope.event_type, "session.status")) {
-        if (!eventTargetsSession(envelope.properties, context.session_id)) return false;
-        const status = getObjectField(envelope.properties, "status") orelse envelope.properties;
-        const type_name = getOptionalObjectString(status, "type") orelse return false;
-        return std.mem.eql(u8, type_name, "idle");
+        return false;
     }
 
     if (std.mem.eql(u8, envelope.event_type, "message.part.delta")) {
