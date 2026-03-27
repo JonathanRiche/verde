@@ -25,7 +25,6 @@ pub const Config = struct {
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    http_client: std.http.Client,
     child: ?std.process.Child = null,
     owns_child: bool = false,
 
@@ -33,7 +32,6 @@ pub const Client = struct {
         var client: Client = .{
             .allocator = allocator,
             .config = config,
-            .http_client = .{ .allocator = allocator },
         };
         try client.ensureServer();
         return client;
@@ -48,7 +46,6 @@ pub const Client = struct {
             self.child = null;
             self.owns_child = false;
         }
-        self.http_client.deinit();
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
@@ -114,15 +111,9 @@ pub const Client = struct {
         var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id);
         defer baseline.deinit(allocator);
 
-        const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
-            log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
-            break :blk null;
-        };
-        defer if (event_stream) |handle| signalEventStreamStop(handle);
-
         try self.startPromptAsync(session_id, request);
 
-        const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, event_stream == null);
+        const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, true);
         errdefer allocator.free(reply_text);
 
         return .{
@@ -614,7 +605,10 @@ pub const Client = struct {
             header_count += 1;
         }
 
-        const result = try self.http_client.fetch(.{
+        var http_client: std.http.Client = .{ .allocator = self.allocator };
+        defer http_client.deinit();
+
+        const result = try http_client.fetch(.{
             .location = .{ .url = url },
             .method = method,
             .payload = payload,
