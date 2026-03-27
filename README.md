@@ -47,6 +47,50 @@ The built binary is written to:
 packages/desktop/zig-out/bin/verde
 ```
 
+## Install on Linux or macOS
+
+The root build now forwards Zig install prefixes into `packages/desktop`, so you can build and install from the repo root with one command.
+
+User-local install:
+
+```bash
+zig build --release=safe -p ~/.local
+```
+
+System-wide install:
+
+```bash
+zig build --release=safe -p /usr/local
+```
+
+That requires write access to `/usr/local`.
+
+That installs:
+
+- `verde` into `bin/`
+- `libfff_c.so` on Linux or `libfff_c.dylib` on macOS into `bin/`
+- `verde.desktop` into `share/applications/` on Linux
+- `verde.png` into `share/pixmaps/` on Linux
+- `SDL3.framework` into `bin/SDL3.framework` on macOS
+
+After a user-local install, make sure `~/.local/bin` is on your `PATH`.
+
+## Release builds
+
+GitHub Actions builds release artifacts from tags that start with `v`.
+
+- Linux: `verde-<version>-linux-x86_64.tar.gz`
+- macOS Intel: `verde-<version>-macos-x86_64.zip`
+- macOS Apple Silicon: `verde-<version>-macos-arm64.zip`
+
+The Linux archive contains a local install helper:
+
+```bash
+./install-local.sh
+```
+
+That installs the archive contents into `~/.local` by default.
+
 ## Provider runtime notes
 
 The desktop app talks to local provider CLIs rather than bundling its own backend:

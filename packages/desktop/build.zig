@@ -91,6 +91,35 @@ pub fn build(b: *std.Build) void {
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
     install_fff.step.dependOn(&build_fff.step);
     b.getInstallStep().dependOn(&install_fff.step);
+    if (target.result.os.tag == .linux) {
+        const desktop_entry = b.addWriteFiles();
+        const desktop_entry_path = desktop_entry.add("verde.desktop", b.fmt(
+            \\[Desktop Entry]
+            \\Version=1.0
+            \\Type=Application
+            \\Name=Verde
+            \\Comment=Desktop chat app for Codex and OpenCode
+            \\Exec={s}
+            \\Icon={s}
+            \\Terminal=false
+            \\Categories=Development;
+            \\StartupNotify=true
+            \\
+        , .{
+            b.getInstallPath(.bin, "verde"),
+            b.getInstallPath(.{ .custom = "share/pixmaps" }, "verde.png"),
+        }));
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            desktop_entry_path,
+            .{ .custom = "share/applications" },
+            "verde.desktop",
+        ).step);
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            b.path("src/assets/verde_logo.png"),
+            .{ .custom = "share/pixmaps" },
+            "verde.png",
+        ).step);
+    }
     if (target.result.os.tag == .macos) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
             b.getInstallStep().dependOn(&b.addInstallDirectory(.{
