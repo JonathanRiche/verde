@@ -699,8 +699,8 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
 
     if (buf[0] == 0) {
         const hint_pos = .{ cursor_before[0] + theme.scaledUi(4.0), cursor_before[1] + theme.scaledUi(6.0) };
-        const fg_draw_list = zgui.getForegroundDrawList();
-        fg_draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(colors.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
+        const draw_list = zgui.getWindowDrawList();
+        draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(colors.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
     }
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });

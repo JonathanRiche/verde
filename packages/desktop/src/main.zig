@@ -390,6 +390,7 @@ pub fn renderComposerPickers(state: *AppState) void {
     const transparent = colors.rgba(0, 0, 0, 0);
     const picker_text_color = colors.rgba(160, 164, 180, 255);
     const picker_hover_bg = colors.rgba(50, 52, 60, 255);
+    const picker_popup_bg = colors.rgba(26, 27, 32, 255);
     const separator_color = colors.rgba(60, 62, 72, 255);
 
     zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 8.0 });
@@ -397,13 +398,14 @@ pub fn renderComposerPickers(state: *AppState) void {
     zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = transparent });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = picker_hover_bg });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = picker_hover_bg });
-    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = colors.rgba(26, 27, 32, 250) });
+    zgui.pushStyleColor4f(.{ .idx = .window_bg, .c = picker_popup_bg });
+    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = picker_popup_bg });
     zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(42, 44, 52, 255) });
     zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(52, 54, 64, 255) });
     zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(58, 60, 70, 255) });
     zgui.pushStyleColor4f(.{ .idx = .text, .c = picker_text_color });
     defer {
-        zgui.popStyleColor(.{ .count = 8 });
+        zgui.popStyleColor(.{ .count = 9 });
         zgui.popStyleVar(.{ .count = 2 });
     }
 
