@@ -114,13 +114,13 @@ pub const Client = struct {
         var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id);
         defer baseline.deinit(allocator);
 
-        try self.startPromptAsync(session_id, request);
-
         const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
             log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
             break :blk null;
         };
         defer if (event_stream) |handle| handle.worker.join();
+
+        try self.startPromptAsync(session_id, request);
 
         const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, event_stream == null);
         errdefer allocator.free(reply_text);
@@ -649,12 +649,21 @@ const EventStreamHandle = struct {
     worker: std.Thread,
 };
 
+const EventStreamOpenState = enum {
+    starting,
+    ready,
+    failed,
+};
+
 const EventStreamContext = struct {
     allocator: std.mem.Allocator,
     config: Config,
     session_id: []u8,
     baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    open_state: EventStreamOpenState = .starting,
 
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
@@ -745,6 +754,18 @@ fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []c
     errdefer context.deinit();
 
     const worker = try std.Thread.spawn(.{}, runEventStream, .{context});
+    context.mutex.lock();
+    while (context.open_state == .starting) {
+        context.condition.wait(&context.mutex);
+    }
+    const open_state = context.open_state;
+    context.mutex.unlock();
+
+    if (open_state == .failed) {
+        worker.join();
+        return null;
+    }
+
     return .{ .worker = worker };
 }
 
@@ -760,6 +781,9 @@ fn runEventStream(context: *EventStreamContext) void {
 }
 
 fn streamSessionEvents(context: *EventStreamContext) !void {
+    var opened = false;
+    errdefer if (!opened) signalEventStreamOpenState(context, .failed);
+
     var client: std.http.Client = .{ .allocator = context.allocator };
     defer client.deinit();
 
@@ -795,6 +819,9 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     try req.sendBodiless();
     var response = try req.receiveHead(&.{});
     if (response.head.status != .ok) return error.OpencodeRequestFailed;
+
+    opened = true;
+    signalEventStreamOpenState(context, .ready);
 
     var transfer_buffer: [256 * 1024]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
@@ -841,6 +868,14 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     if (event_data.items.len > 0) {
         _ = try processEventStreamMessage(context, event_name.items, event_data.items);
     }
+}
+
+fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpenState) void {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    if (context.open_state != .starting) return;
+    context.open_state = next;
+    context.condition.broadcast();
 }
 
 fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !bool {
