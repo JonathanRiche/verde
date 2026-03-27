@@ -809,6 +809,7 @@ pub const AppState = struct {
 
         return client.sendPrompt(self.allocator, .{
             .thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
+            .thread_title = thread.title,
             .prompt = prompt,
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
@@ -835,6 +836,7 @@ pub const AppState = struct {
             .prompt = try page_alloc.dupe(u8, prompt),
             .image_path = if (thread.draft_image) |image| try page_alloc.dupe(u8, image.path) else null,
             .provider_thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
+            .thread_title = try page_alloc.dupe(u8, thread.title),
             .model_ref = if (thread.model_ref) |model_ref| try page_alloc.dupe(u8, model_ref) else null,
             .reasoning_effort = thread.reasoning_effort,
             .fast_mode = thread.fast_mode,
@@ -845,6 +847,7 @@ pub const AppState = struct {
             page_alloc.free(request.prompt);
             if (request.image_path) |image_path| page_alloc.free(image_path);
             if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
+            page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         }
 
