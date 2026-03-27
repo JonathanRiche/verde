@@ -3,13 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const fff_root = b.path("../vendor/fff");
+    const fff_root = b.path("../../vendor/fff");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
         .macos => "libfff_c.dylib",
         else => "libfff_c.so",
     };
-    const fff_lib_path = b.path(b.pathJoin(&.{ "../vendor/fff/target/release", fff_lib_name }));
+    const fff_lib_path = b.path(b.pathJoin(&.{ "../../vendor/fff/target/release", fff_lib_name }));
 
     const zgui = b.dependency("zgui", .{
         .backend = .sdl3_opengl3,
@@ -54,12 +54,12 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&build_fff.step);
     exe.linkLibrary(imgui);
     exe.linkLibC();
-    exe.root_module.addIncludePath(b.path("../vendor"));
-    exe.root_module.addIncludePath(b.path("../vendor/fff/crates/fff-c/include"));
-    exe.addLibraryPath(b.path("../vendor/fff/target/release"));
+    exe.root_module.addIncludePath(b.path("../../vendor"));
+    exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    exe.addLibraryPath(b.path("../../vendor/fff/target/release"));
     exe.linkSystemLibrary("fff_c");
     exe.addCSourceFile(.{
-        .file = b.path("../vendor/stb_image_impl.c"),
+        .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
     });
     switch (target.result.os.tag) {
@@ -124,12 +124,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe_tests.step.dependOn(&build_fff.step);
-    exe_tests.root_module.addIncludePath(b.path("../vendor"));
-    exe_tests.root_module.addIncludePath(b.path("../vendor/fff/crates/fff-c/include"));
-    exe_tests.addLibraryPath(b.path("../vendor/fff/target/release"));
+    exe_tests.root_module.addIncludePath(b.path("../../vendor"));
+    exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
+    exe_tests.addLibraryPath(b.path("../../vendor/fff/target/release"));
     exe_tests.linkSystemLibrary("fff_c");
     exe_tests.addCSourceFile(.{
-        .file = b.path("../vendor/stb_image_impl.c"),
+        .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
     });
     exe_tests.linkLibC();

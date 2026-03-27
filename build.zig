@@ -33,7 +33,7 @@ fn addDesktopCommand(
     }
 
     const cmd = b.addSystemCommand(argv.items);
-    cmd.setCwd(b.path("desktop"));
+    cmd.setCwd(b.path("packages/desktop"));
 
     if (forward_runtime_args) {
         if (b.args) |args| {
