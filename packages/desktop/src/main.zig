@@ -8,6 +8,7 @@ const zgui = @import("zgui");
 const app_config = @import("config.zig");
 const chat_threads = @import("chat/threads.zig");
 const keybinds = @import("keybinds.zig");
+const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
 const ui_theme = @import("ui/theme.zig");
@@ -59,6 +60,14 @@ const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 extern fn SDL_GetPrimaryDisplay() sdl.DisplayId;
+extern fn SDL_CreateSurfaceFrom(
+    width: c_int,
+    height: c_int,
+    format: sdl.PixelFormatEnum,
+    pixels: ?*anyopaque,
+    pitch: c_int,
+) ?*sdl.Surface;
+extern fn SDL_SetWindowIcon(window: *sdl.Window, icon: *sdl.Surface) bool;
 extern fn SDL_GetDisplayUsableBounds(display_id: sdl.DisplayId, rect: *SdlRect) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeoutMS: c_int) bool;
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
@@ -114,6 +123,7 @@ pub fn main() !void {
     );
     defer window.destroy();
     _ = SDL_SetWindowPosition(window, initial_window_frame.x, initial_window_frame.y);
+    installWindowIcon(window);
 
     const gl_context = try sdl.gl.createContext(window);
     defer sdl.gl.destroyContext(gl_context);
@@ -168,6 +178,34 @@ pub fn main() !void {
         glClear(GL_COLOR_BUFFER_BIT);
         zgui.backend.draw();
         try sdl.gl.swapWindow(window);
+    }
+}
+
+fn installWindowIcon(window: *sdl.Window) void {
+    const loaded = stb_image.loadFromMemory(native_state.VERDE_LOGO_BYTES) catch |err| {
+        log.warn("failed to decode window icon: {s}", .{@errorName(err)});
+        return;
+    };
+    defer loaded.deinit();
+
+    const pitch = std.math.mul(c_int, loaded.width, loaded.channels) catch {
+        log.warn("failed to compute window icon pitch", .{});
+        return;
+    };
+    const surface = SDL_CreateSurfaceFrom(
+        loaded.width,
+        loaded.height,
+        .abgr8888,
+        @ptrCast(loaded.pixels),
+        pitch,
+    ) orelse {
+        log.warn("failed to create SDL surface for window icon", .{});
+        return;
+    };
+    defer surface.destroy();
+
+    if (!SDL_SetWindowIcon(window, surface)) {
+        log.warn("failed to set window icon", .{});
     }
 }
 

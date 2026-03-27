@@ -27,6 +27,7 @@ zig build run
 zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
+zig build --release=safe -p ~/.local
 ```
 
 These root commands delegate into `packages/desktop/`.
@@ -52,6 +53,20 @@ The built executable is:
 ```bash
 zig-out/bin/verde
 ```
+
+From the repo root, `zig build -p <prefix>` now forwards the install prefix into this package. On Linux and macOS, that gives you a one-command install such as:
+
+```bash
+zig build --release=safe -p ~/.local
+zig build --release=safe -p /usr/local
+```
+
+The `/usr/local` example requires write access to that prefix.
+
+On Linux, the install step also writes:
+
+- `share/applications/verde.desktop`
+- `share/pixmaps/verde.png`
 
 ## Typical development loop
 
