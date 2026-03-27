@@ -268,6 +268,7 @@ const FileSearchState = struct {
     total_files: usize = 0,
     visible: bool = false,
     selected_index: usize = 0,
+    ensure_selection_visible: bool = false,
 
     fn clearResults(self: *FileSearchState, allocator: std.mem.Allocator) void {
         for (self.results.items) |item| item.deinit(allocator);
@@ -275,6 +276,7 @@ const FileSearchState = struct {
         self.total_matched = 0;
         self.total_files = 0;
         self.selected_index = 0;
+        self.ensure_selection_visible = false;
     }
 
     fn setResults(self: *FileSearchState, allocator: std.mem.Allocator, search_results: *fff.SearchResults) !void {
@@ -296,6 +298,7 @@ const FileSearchState = struct {
         self.total_matched = search_results.total_matched;
         self.total_files = search_results.total_files;
         self.selected_index = 0;
+        self.ensure_selection_visible = true;
     }
 
     fn clearQuery(self: *FileSearchState, allocator: std.mem.Allocator) void {
@@ -1365,8 +1368,16 @@ pub const AppState = struct {
         const current: i32 = @intCast(self.fileSearchSelectedIndex());
         const max_index: i32 = @intCast(count - 1);
         const next = std.math.clamp(current + delta, 0, max_index);
+        if (next == current) return true;
         self.file_search_state.selected_index = @intCast(next);
+        self.file_search_state.ensure_selection_visible = true;
         return true;
+    }
+
+    pub fn consumeFileSearchEnsureSelectionVisible(self: *AppState) bool {
+        const should_scroll = self.file_search_state.ensure_selection_visible;
+        self.file_search_state.ensure_selection_visible = false;
+        return should_scroll;
     }
 
     pub fn acceptPrimaryFileSearchResult(self: *AppState) bool {
@@ -1510,6 +1521,7 @@ pub const AppState = struct {
     fn clearFileSearch(self: *AppState) void {
         self.file_search_state.visible = false;
         self.file_search_state.token = null;
+        self.file_search_state.ensure_selection_visible = false;
         self.file_search_state.clearQuery(self.allocator);
         self.file_search_state.clearResults(self.allocator);
     }

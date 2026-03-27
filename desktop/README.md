@@ -128,6 +128,9 @@ Zig fetches them automatically during build.
 The desktop app depends on the following upstream projects:
 
 - `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko. Used for project-scoped file indexing and the chat composer `@` file search. Vendored in [`../third_party/fff`](../third_party/fff). License: MIT.
+- Codicon by Microsoft. Used for file-type glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/Codicon.ttf`](src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
+- Symbols Nerd Font Mono by Nerd Fonts. Used for language-specific file glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
+- `nvim-web-devicons`. Used as the reference mapping for many file-type glyph choices in the native picker. License: MIT.
 - Dear ImGui by Omar Cornut. Used as the immediate-mode UI library underneath the native shell. Brought in through `zgui`. License: MIT.
 - `zgui` from `zig-gamedev`. Used for Zig bindings and SDL/OpenGL backend integration for Dear ImGui. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
 - `zsdl` from `zig-gamedev`. Used for Zig bindings to SDL3. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.

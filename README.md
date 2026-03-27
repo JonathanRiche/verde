@@ -80,6 +80,9 @@ Example config:
 Verde uses and distributes third-party software. The main components in the desktop app are:
 
 - `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko for fast file indexing and file search. Vendored in [`third_party/fff`](third_party/fff). License: MIT.
+- Codicon by Microsoft for file-type glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/Codicon.ttf`](desktop/src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
+- Symbols Nerd Font Mono by Nerd Fonts for language-specific file glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
+- `nvim-web-devicons` for the file-type icon mapping reference used by Verde's native picker. License: MIT.
 - Dear ImGui by Omar Cornut for the immediate-mode UI layer used by the native app. Pulled in through `zgui`. License: MIT.
 - `zgui` from `zig-gamedev` for Zig bindings and backend integration around Dear ImGui. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
 - `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.

@@ -1,0 +1,15 @@
+Codicon font
+
+Source:
+https://microsoft.github.io/vscode-codicons/
+
+Downloaded asset:
+https://microsoft.github.io/vscode-codicons/dist/codicon.ttf
+
+Upstream project:
+https://github.com/microsoft/vscode-codicons
+
+License:
+Creative Commons Attribution 4.0 International
+
+This font is vendored for Verde's native file-search type icons.

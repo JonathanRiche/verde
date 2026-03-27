@@ -7,6 +7,20 @@ const app_state = @import("../state.zig");
 const rgba = colors.rgba;
 const rgb = colors.rgb;
 
+const codicon_glyph_ranges = [_:0]zgui.Wchar{
+    0xea60,
+    0xecff,
+    0,
+};
+
+const nerd_font_glyph_ranges = [_:0]zgui.Wchar{
+    0xe5fa,
+    0xe7ff,
+    0xf000,
+    0xf8ff,
+    0,
+};
+
 pub const DEFAULT_FONT_SIZE: f32 = 24.0;
 pub const RESPONSIVE_BASE_FONT_SIZE: f32 = 22.0;
 
@@ -57,12 +71,24 @@ pub fn scaledUi(value: f32) f32 {
     return value * uiScaleFactor();
 }
 
-/// Installs the default and heading fonts for the native UI.
-pub fn installFonts(font_bytes: []const u8, font_size: f32) void {
+fn mergeIconFont(font_bytes: []const u8, font_size: f32, ranges: []const zgui.Wchar) void {
+    var config = zgui.FontConfig.init();
+    config.merge_mode = true;
+    config.pixel_snap_h = true;
+    config.glyph_min_advance_x = font_size;
+    _ = zgui.io.addFontFromMemoryWithConfig(font_bytes, font_size, config, ranges.ptr);
+}
+
+/// Installs the default, icon, and heading fonts for the native UI.
+pub fn installFonts(font_bytes: []const u8, codicon_font_bytes: []const u8, nerd_font_bytes: []const u8, font_size: f32) void {
     const font = zgui.io.addFontFromMemory(font_bytes, font_size);
+    mergeIconFont(codicon_font_bytes, font_size, codicon_glyph_ranges[0..]);
+    mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
     zgui.io.setDefaultFont(font);
     heading_font_size = font_size * 1.28;
     heading_font = zgui.io.addFontFromMemory(font_bytes, heading_font_size);
+    mergeIconFont(codicon_font_bytes, heading_font_size, codicon_glyph_ranges[0..]);
+    mergeIconFont(nerd_font_bytes, heading_font_size, nerd_font_glyph_ranges[0..]);
 }
 
 /// Applies the shared ImGui theme colors and spacing.
