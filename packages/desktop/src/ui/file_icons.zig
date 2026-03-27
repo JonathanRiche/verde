@@ -1,3 +1,4 @@
+/// File icons for FFF file search
 const std = @import("std");
 
 const colors = @import("colors.zig");

@@ -29,7 +29,7 @@ zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
 ```
 
-These root commands delegate into `desktop/`.
+These root commands delegate into `packages/desktop/`.
 
 From this directory directly:
 
@@ -127,7 +127,7 @@ Zig fetches them automatically during build.
 
 The desktop app depends on the following upstream projects:
 
-- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko. Used for project-scoped file indexing and the chat composer `@` file search. Vendored in [`../vendor/fff`](../vendor/fff). License: MIT.
+- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko. Used for project-scoped file indexing and the chat composer `@` file search. Vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
 - Codicon by Microsoft. Used for file-type glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/Codicon.ttf`](src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
 - Symbols Nerd Font Mono by Nerd Fonts. Used for language-specific file glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
 - `nvim-web-devicons`. Used as the reference mapping for many file-type glyph choices in the native picker. License: MIT.
@@ -136,10 +136,10 @@ The desktop app depends on the following upstream projects:
 - `zsdl` from `zig-gamedev`. Used for Zig bindings to SDL3. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
 - SDL3 from libsdl-org. Used for window creation, events, monitor/display integration, and OpenGL context setup.
 - `zqlite` by Karl Seguin. Used for SQLite-backed state and persistence. Declared in [`build.zig.zon`](build.zig.zon). License: MIT-style.
-- `stb_image` by Sean Barrett and contributors. Used for image decoding. Vendored in [`../vendor/stb_image.h`](../vendor/stb_image.h). License: public domain or MIT.
+- `stb_image` by Sean Barrett and contributors. Used for image decoding. Vendored in [`../../vendor/stb_image.h`](../../vendor/stb_image.h). License: public domain or MIT.
 
 When distributing the desktop app, keep the applicable upstream licenses and notices for vendored or bundled components.
 
 ## Notes
 
-- From the repo root, the desktop app lives in `desktop/`.
+- From the repo root, the desktop app lives in `packages/desktop/`.

@@ -2,7 +2,7 @@
 
 `verde` is a desktop chat app built in Zig with SDL3, OpenGL, and zgui.
 
-This repo currently contains the desktop app in [`desktop/`](desktop). If you clone the repo and want to run the app locally in development, that is the directory you want.
+This repo currently contains the desktop app in [`packages/desktop/`](packages/desktop). If you clone the repo and want to run the app locally in development, that is the directory you want.
 
 ## Quick start
 
@@ -44,7 +44,7 @@ zig build -Doptimize=ReleaseFast
 The built binary is written to:
 
 ```bash
-desktop/zig-out/bin/verde
+packages/desktop/zig-out/bin/verde
 ```
 
 ## Provider runtime notes
@@ -80,18 +80,18 @@ Example config:
 Verde uses and distributes third-party software. The main components in the desktop app are:
 
 - `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko for fast file indexing and file search. Vendored in [`vendor/fff`](vendor/fff). License: MIT.
-- Codicon by Microsoft for file-type glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/Codicon.ttf`](desktop/src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
-- Symbols Nerd Font Mono by Nerd Fonts for language-specific file glyphs in the composer file search UI. Vendored in [`desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
+- Codicon by Microsoft for file-type glyphs in the composer file search UI. Vendored in [`packages/desktop/src/assets/fonts/Codicon.ttf`](packages/desktop/src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
+- Symbols Nerd Font Mono by Nerd Fonts for language-specific file glyphs in the composer file search UI. Vendored in [`packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
 - `nvim-web-devicons` for the file-type icon mapping reference used by Verde's native picker. License: MIT.
 - Dear ImGui by Omar Cornut for the immediate-mode UI layer used by the native app. Pulled in through `zgui`. License: MIT.
-- `zgui` from `zig-gamedev` for Zig bindings and backend integration around Dear ImGui. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
-- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
+- `zgui` from `zig-gamedev` for Zig bindings and backend integration around Dear ImGui. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT.
+- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT.
 - SDL3 from libsdl-org for windowing, input, display integration, and OpenGL context management at runtime.
-- `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT-style.
+- `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT-style.
 - `stb_image` by Sean Barrett and contributors for image decoding in the native app. Vendored in [`vendor/stb_image.h`](vendor/stb_image.h). License: public domain or MIT.
 
 If you redistribute Verde, keep the relevant upstream notices and license texts with the distributed app and any vendored source.
 
 ## More detail
 
-See [`desktop/README.md`](desktop/README.md) for the desktop app's build details, runtime notes, and current config behavior.
+See [`packages/desktop/README.md`](packages/desktop/README.md) for the desktop app's build details, runtime notes, and current config behavior.
