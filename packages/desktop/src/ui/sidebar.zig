@@ -113,7 +113,9 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
 
-    for (state.projects.items, 0..) |project, index| {
+    var index: usize = 0;
+    while (index < state.projects.items.len) : (index += 1) {
+        const project = &state.projects.items[index];
         zgui.pushIntId(@intCast(index));
         defer zgui.popId();
 
@@ -208,6 +210,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
                 if (zgui.menuItem("Remove project", .{})) {
                     state.removeProjectAtIndex(index);
                     zgui.closeCurrentPopup();
+                    break;
                 }
             }
         }
@@ -216,6 +219,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         zgui.setCursorPosX(width - horiz_pad - project_action_width);
         if (renderThreadEditButton(Impl, state, project_action_width, row_height)) {
             state.createThreadForProject(index);
+            break;
         }
         if (zgui.isItemHovered(.{ .delay_normal = true })) {
             _ = zgui.beginTooltip();
@@ -227,25 +231,25 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
         const sub_indent = theme.scaledUi(20.0);
         if (!is_collapsed) zgui.indent(.{ .indent_w = sub_indent });
         if (!is_collapsed) {
-            zgui.textDisabled("{d} saved chats", .{project.committedThreadCount()});
+            zgui.textDisabled("{d} saved chats", .{state.projects.items[index].committedThreadCount()});
         }
         if (!is_collapsed) {
-            var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &project) catch blk: {
+            var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &state.projects.items[index]) catch blk: {
                 break :blk std.ArrayList(usize).empty;
             };
             defer sorted_indices.deinit(state.allocator);
 
-            const show_all_threads = project.thread_list_expanded or sorted_indices.items.len <= Impl.SIDEBAR_VISIBLE_THREAD_LIMIT;
+            const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.items.len <= Impl.SIDEBAR_VISIBLE_THREAD_LIMIT;
             const visible_count = if (show_all_threads) sorted_indices.items.len else @min(sorted_indices.items.len, Impl.SIDEBAR_VISIBLE_THREAD_LIMIT);
 
             for (sorted_indices.items[0..visible_count]) |thread_index| {
-                const thread = &project.threads.items[thread_index];
+                const thread = &state.projects.items[index].threads.items[thread_index];
                 renderThreadRow(state, index, rail_width - sub_indent, thread, thread_index);
             }
 
             if (sorted_indices.items.len > Impl.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
-                if (zgui.button(if (project.thread_list_expanded) "Show less" else "Show more", .{
+                if (zgui.button(if (state.projects.items[index].thread_list_expanded) "Show less" else "Show more", .{
                     .w = @max(rail_width - sub_indent, theme.scaledUi(110.0)),
                     .h = theme.scaledUi(28.0),
                 })) {
@@ -260,9 +264,9 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No saved threads yet", .{});
             }
         }
-        if (project.unread_count > 0) {
+        if (state.projects.items[index].unread_count > 0) {
             zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
-            zgui.textColored(theme.COLOR_YELLOW, "{d} pending", .{project.unread_count});
+            zgui.textColored(theme.COLOR_YELLOW, "{d} pending", .{state.projects.items[index].unread_count});
         }
         if (!is_collapsed) zgui.unindent(.{ .indent_w = sub_indent });
         zgui.spacing();
