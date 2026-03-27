@@ -247,6 +247,9 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
                 state.attachClipboardImageToCurrentDraft();
                 return true;
             }
+            if (handleFileSearchNavigation(state, &event.key)) {
+                return true;
+            }
             const action = keyboard.actionForEvent(&event.key) orelse return true;
             handleKeyboardAction(state, keyboard, action);
         },
@@ -259,6 +262,24 @@ fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardE
     if (!state.composer_focused) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v) return false;
+    return isCtrlPressed();
+}
+
+fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.composer_focused) return false;
+    if (!state.hasActiveFileSearch()) return false;
+    if (!event.down or event.repeat) return false;
+
+    if (event.scancode == .up or (event.scancode == .p and isCtrlPressed())) {
+        return state.moveFileSearchSelection(-1);
+    }
+    if (event.scancode == .down or (event.scancode == .n and isCtrlPressed())) {
+        return state.moveFileSearchSelection(1);
+    }
+    return false;
+}
+
+fn isCtrlPressed() bool {
     const keyboard_state = sdl.getKeyboardState();
     return keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
 }

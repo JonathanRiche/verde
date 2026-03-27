@@ -3,6 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const fff_root = b.path("../third_party/fff");
+    const fff_lib_name = switch (target.result.os.tag) {
+        .windows => "fff_c.dll",
+        .macos => "libfff_c.dylib",
+        else => "libfff_c.so",
+    };
+    const fff_lib_path = b.path(b.pathJoin(&.{ "../third_party/fff/target/release", fff_lib_name }));
 
     const zgui = b.dependency("zgui", .{
         .backend = .sdl3_opengl3,
@@ -34,9 +41,23 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const build_fff = b.addSystemCommand(&.{
+        "cargo",
+        "build",
+        "--release",
+        "--package",
+        "fff-c",
+        "--features",
+        "zlob",
+    });
+    build_fff.setCwd(fff_root);
+    exe.step.dependOn(&build_fff.step);
     exe.linkLibrary(imgui);
     exe.linkLibC();
     exe.root_module.addIncludePath(b.path("src/vendor"));
+    exe.root_module.addIncludePath(b.path("../third_party/fff/crates/fff-c/include"));
+    exe.addLibraryPath(b.path("../third_party/fff/target/release"));
+    exe.linkSystemLibrary("fff_c");
     exe.addCSourceFile(.{
         .file = b.path("src/vendor/stb_image_impl.c"),
         .flags = &.{},
@@ -67,6 +88,9 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
+    install_fff.step.dependOn(&build_fff.step);
+    b.getInstallStep().dependOn(&install_fff.step);
     if (target.result.os.tag == .macos) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
             b.getInstallStep().dependOn(&b.addInstallDirectory(.{
@@ -93,11 +117,17 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "zgui", .module = zgui.module("root") },
+                .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
         }),
     });
+    exe_tests.step.dependOn(&build_fff.step);
     exe_tests.root_module.addIncludePath(b.path("src/vendor"));
+    exe_tests.root_module.addIncludePath(b.path("../third_party/fff/crates/fff-c/include"));
+    exe_tests.addLibraryPath(b.path("../third_party/fff/target/release"));
+    exe_tests.linkSystemLibrary("fff_c");
     exe_tests.addCSourceFile(.{
         .file = b.path("src/vendor/stb_image_impl.c"),
         .flags = &.{},

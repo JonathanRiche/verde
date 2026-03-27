@@ -75,6 +75,20 @@ Example config:
 }
 ```
 
+## Third-Party Components
+
+Verde uses and distributes third-party software. The main components in the desktop app are:
+
+- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko for fast file indexing and file search. Vendored in [`third_party/fff`](third_party/fff). License: MIT.
+- Dear ImGui by Omar Cornut for the immediate-mode UI layer used by the native app. Pulled in through `zgui`. License: MIT.
+- `zgui` from `zig-gamedev` for Zig bindings and backend integration around Dear ImGui. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
+- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT.
+- SDL3 from libsdl-org for windowing, input, display integration, and OpenGL context management at runtime.
+- `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`desktop/build.zig.zon`](desktop/build.zig.zon). License: MIT-style.
+- `stb_image` by Sean Barrett and contributors for image decoding in the native app. Vendored in [`desktop/src/vendor/stb_image.h`](desktop/src/vendor/stb_image.h). License: public domain or MIT.
+
+If you redistribute Verde, keep the relevant upstream notices and license texts with the distributed app and any vendored source.
+
 ## More detail
 
 See [`desktop/README.md`](desktop/README.md) for the desktop app's build details, runtime notes, and current config behavior.

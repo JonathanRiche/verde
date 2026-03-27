@@ -1,0 +1,5 @@
+Vendored for Verde desktop integration.
+
+Upstream repository: https://github.com/dmtrKovalenko/fff.nvim
+Pinned tag: v0.4.2
+Pinned commit: 85130958bdd15549278298b40e6a9728b0eb555f
