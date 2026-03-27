@@ -118,7 +118,7 @@ pub const Client = struct {
             log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
             break :blk null;
         };
-        defer if (event_stream) |handle| handle.worker.join();
+        defer if (event_stream) |handle| signalEventStreamStop(handle);
 
         try self.startPromptAsync(session_id, request);
 
@@ -284,8 +284,10 @@ pub const Client = struct {
         var attempt: usize = 0;
         while (attempt < MAX_POLL_ATTEMPTS) : (attempt += 1) {
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
+            var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
+            defer latest_snapshot.deinit(self.allocator);
             if (stream_assistant_snapshots) {
-                try self.emitAssistantProgress(session_id, baseline_assistant_id, request, &streamed_text);
+                try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
             }
             try self.emitDiffProgress(session_id, request, &last_diff_payload);
 
@@ -314,7 +316,9 @@ pub const Client = struct {
                 },
             }
 
-            if (status == .idle and !has_pending_permissions) {
+            if (!has_pending_permissions and
+                (status == .idle or latest_snapshot.isTerminalForPrompt(baseline_assistant_id)))
+            {
                 break;
             }
 
@@ -351,10 +355,19 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
         streamed_text: *[]u8,
     ) !void {
-        const on_stream_delta = request.on_stream_delta orelse return;
-
         var snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
         defer snapshot.deinit(self.allocator);
+        try self.emitAssistantProgressFromSnapshot(&snapshot, baseline_assistant_id, request, streamed_text);
+    }
+
+    fn emitAssistantProgressFromSnapshot(
+        self: *Client,
+        snapshot: *const AssistantSnapshot,
+        baseline_assistant_id: ?[]const u8,
+        request: provider_types.SendPromptRequest,
+        streamed_text: *[]u8,
+    ) !void {
+        const on_stream_delta = request.on_stream_delta orelse return;
 
         const message_id = snapshot.message_id orelse return;
         if (baseline_assistant_id) |baseline_id| {
@@ -541,6 +554,7 @@ pub const Client = struct {
             .message_id = if (message_id) |id| try allocator.dupe(u8, id) else null,
             .text = try extractAssistantTextAlloc(allocator, latest),
             .error_message = try extractAssistantErrorMessageAlloc(allocator, latest),
+            .finish = try extractAssistantFinishAlloc(allocator, latest),
         };
     }
 
@@ -637,16 +651,28 @@ const AssistantSnapshot = struct {
     message_id: ?[]u8 = null,
     text: []u8,
     error_message: ?[]u8 = null,
+    finish: ?[]u8 = null,
 
     fn deinit(self: *AssistantSnapshot, allocator: std.mem.Allocator) void {
         if (self.message_id) |id| allocator.free(id);
         allocator.free(self.text);
         if (self.error_message) |message| allocator.free(message);
+        if (self.finish) |finish| allocator.free(finish);
+    }
+
+    fn isTerminalForPrompt(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
+        const message_id = self.message_id orelse return false;
+        if (baseline_assistant_id) |baseline_id| {
+            if (std.mem.eql(u8, message_id, baseline_id)) return false;
+        }
+
+        const finish = self.finish orelse return false;
+        return !std.mem.eql(u8, finish, "tool-calls");
     }
 };
 
 const EventStreamHandle = struct {
-    worker: std.Thread,
+    shared: *EventStreamShared,
 };
 
 const EventStreamOpenState = enum {
@@ -655,12 +681,20 @@ const EventStreamOpenState = enum {
     failed,
 };
 
+const EventStreamShared = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    ref_count: usize = 2,
+    stop_requested: bool = false,
+};
+
 const EventStreamContext = struct {
     allocator: std.mem.Allocator,
     config: Config,
     session_id: []u8,
     baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
+    shared: *EventStreamShared,
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -738,18 +772,40 @@ fn extractAssistantErrorMessageAlloc(allocator: std.mem.Allocator, value: std.js
     return try allocator.dupe(u8, message);
 }
 
+fn extractAssistantFinishAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    const info = getObjectField(value, "info") orelse return null;
+    const finish = getOptionalObjectString(info, "finish") orelse return null;
+    return try allocator.dupe(u8, finish);
+}
+
 fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []const u8, baseline_assistant_id: ?[]const u8, request: provider_types.SendPromptRequest) !?EventStreamHandle {
     if (request.on_stream_delta == null and request.on_stream_event == null) return null;
 
+    const shared = try allocator.create(EventStreamShared);
+    shared.* = .{
+        .allocator = allocator,
+    };
+
+    const owned_session_id = try allocator.dupe(u8, session_id);
+    errdefer allocator.free(owned_session_id);
+
+    const owned_baseline_assistant_id = if (baseline_assistant_id) |message_id|
+        try allocator.dupe(u8, message_id)
+    else
+        null;
+    errdefer if (owned_baseline_assistant_id) |message_id| allocator.free(message_id);
+
     const context = try allocator.create(EventStreamContext);
     errdefer allocator.destroy(context);
+    errdefer allocator.destroy(shared);
 
     context.* = .{
         .allocator = allocator,
         .config = self.config,
-        .session_id = try allocator.dupe(u8, session_id),
-        .baseline_assistant_id = if (baseline_assistant_id) |message_id| try allocator.dupe(u8, message_id) else null,
+        .session_id = owned_session_id,
+        .baseline_assistant_id = owned_baseline_assistant_id,
         .request = request,
+        .shared = shared,
     };
     errdefer context.deinit();
 
@@ -762,15 +818,17 @@ fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []c
     context.mutex.unlock();
 
     if (open_state == .failed) {
-        worker.join();
+        signalEventStreamStop(.{ .shared = shared });
         return null;
     }
 
-    return .{ .worker = worker };
+    worker.detach();
+    return .{ .shared = shared };
 }
 
 fn runEventStream(context: *EventStreamContext) void {
     defer {
+        releaseEventStreamShared(context.shared);
         context.deinit();
         context.allocator.destroy(context);
     }
@@ -834,6 +892,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     defer event_data.deinit(context.allocator);
 
     while (true) {
+        if (isEventStreamStopRequested(context)) return;
         const maybe_line = try reader.takeDelimiter('\n');
         if (maybe_line == null) break;
 
@@ -844,6 +903,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
             if (event_data.items.len > 0 and try processEventStreamMessage(context, event_name.items, event_data.items)) {
                 return;
             }
+            if (isEventStreamStopRequested(context)) return;
             event_name.clearRetainingCapacity();
             event_data.clearRetainingCapacity();
             continue;
@@ -876,6 +936,31 @@ fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpe
     if (context.open_state != .starting) return;
     context.open_state = next;
     context.condition.broadcast();
+}
+
+fn signalEventStreamStop(handle: EventStreamHandle) void {
+    handle.shared.mutex.lock();
+    handle.shared.stop_requested = true;
+    handle.shared.mutex.unlock();
+    releaseEventStreamShared(handle.shared);
+}
+
+fn isEventStreamStopRequested(context: *EventStreamContext) bool {
+    context.shared.mutex.lock();
+    defer context.shared.mutex.unlock();
+    return context.shared.stop_requested;
+}
+
+fn releaseEventStreamShared(shared: *EventStreamShared) void {
+    shared.mutex.lock();
+    std.debug.assert(shared.ref_count > 0);
+    shared.ref_count -= 1;
+    const should_destroy = shared.ref_count == 0;
+    shared.mutex.unlock();
+
+    if (should_destroy) {
+        shared.allocator.destroy(shared);
+    }
 }
 
 fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !bool {
