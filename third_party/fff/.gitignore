@@ -1,0 +1,24 @@
+doc/tags
+target/
+.archive.lua
+_*.lua
+.lazy.lua
+dual/
+result
+.direnv
+.devenv
+.repro/
+.wrangler/
+*.so
+big-repo/
+# all the perf like utility files
+*.data
+node_modules/
+
+dist/
+scripts/benchmark-results/
+
+# Native binaries (downloaded at install)
+*.dylib
+*.so
+*.dll

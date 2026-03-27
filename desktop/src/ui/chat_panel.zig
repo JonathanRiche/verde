@@ -690,8 +690,11 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
         },
     });
     state.composer_focused = zgui.isItemFocused();
+    const input_rect_min = zgui.getItemRectMin();
+    const input_rect_max = zgui.getItemRectMax();
     zgui.popStyleColor(.{ .count = 4 });
     zgui.popStyleVar(.{ .count = 2 });
+    state.updateFileSearch();
 
     if (buf[0] == 0) {
         const hint_pos = .{ cursor_before[0] + theme.scaledUi(4.0), cursor_before[1] + theme.scaledUi(6.0) };
@@ -759,9 +762,98 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
         }
 
         if ((clicked or submitted) and !pending) {
+            if (submitted and state.acceptPrimaryFileSearchResult()) {
+                return;
+            }
             state.sendDraft() catch |err| {
                 Impl.log.err("failed to send draft: {s}", .{@errorName(err)});
             };
+        }
+    }
+
+    if (state.hasActiveFileSearch()) {
+        renderComposerFileSearchResults(Impl, state, composer_screen_pos, width, input_rect_min, input_rect_max);
+    }
+}
+
+fn renderComposerFileSearchResults(
+    comptime Impl: type,
+    state: *Impl.AppState,
+    composer_screen_pos: [2]f32,
+    composer_width: f32,
+    input_rect_min: [2]f32,
+    input_rect_max: [2]f32,
+) void {
+    const results = state.fileSearchResults();
+    const row_height = theme.scaledUi(28.0);
+    const visible_rows = @max(@as(usize, 1), @min(results.len, 6));
+    const top_padding = theme.scaledUi(16.0);
+    const bottom_padding = theme.scaledUi(12.0);
+    const card_height = top_padding + bottom_padding + row_height * @as(f32, @floatFromInt(visible_rows));
+    const horizontal_margin = theme.scaledUi(12.0);
+    const card_width = theme.clampf(
+        input_rect_max[0] - input_rect_min[0],
+        theme.scaledUi(280.0),
+        composer_width - horizontal_margin * 2.0,
+    );
+    const popup_x = theme.clampf(
+        input_rect_min[0],
+        composer_screen_pos[0] + horizontal_margin,
+        composer_screen_pos[0] + composer_width - horizontal_margin - card_width,
+    );
+    const popup_y = @max(
+        composer_screen_pos[1] + horizontal_margin,
+        input_rect_min[1] - card_height - theme.scaledUi(8.0),
+    );
+
+    zgui.setNextWindowPos(.{
+        .x = popup_x,
+        .y = popup_y,
+    });
+    zgui.setNextWindowSize(.{
+        .w = card_width,
+        .h = card_height,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(10.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(10.0), theme.scaledUi(8.0) } });
+    zgui.pushStyleColor4f(.{ .idx = .window_bg, .c = colors.rgba(34, 36, 42, 244) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    _ = zgui.begin("ComposerFileSearchOverlay", .{
+        .flags = .{
+            .no_title_bar = true,
+            .no_resize = true,
+            .no_scrollbar = true,
+            .no_collapse = true,
+            .no_saved_settings = true,
+            .no_move = true,
+            .no_focus_on_appearing = true,
+            .no_nav_focus = true,
+        },
+    });
+    defer {
+        zgui.end();
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 2 });
+    }
+
+    if (results.len == 0) {
+        const message = if (state.fileSearchIsScanning())
+            "Indexing project files..."
+        else
+            "Type to search files...";
+        zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{message});
+        return;
+    }
+
+    for (results, 0..) |result, index| {
+        var label_buf = std.mem.zeroes([512:0]u8);
+        const label = std.fmt.bufPrintZ(&label_buf, "{s}    {s}", .{ result.relative_path, result.file_name }) catch "file";
+        if (zgui.selectable(label, .{
+            .selected = index == state.fileSearchSelectedIndex(),
+            .h = row_height,
+        })) {
+            _ = state.selectFileSearchResult(index);
+            return;
         }
     }
 }

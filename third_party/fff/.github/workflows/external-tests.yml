@@ -1,0 +1,112 @@
+name: e2e Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13"
+  # Force Node 24 for all JS-based actions to avoid the libuv
+  # process_title assertion crash on Windows (known Node 20 bug).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  lua-tests:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # e2e tests could be flaky on CI so we do not block release creation if they failed
+    continue-on-error: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
+        with:
+          cache: true
+          cache-on-failure: false
+          cache-key: "v2-lua-e2e"
+          rustflags: ""
+          target: ${{ matrix.target || '' }}
+
+      - name: Build Rust binary (Windows)
+        if: matrix.target
+        run: cargo build --release --target ${{ matrix.target }} -p fff-nvim --features zlob
+
+      - name: Copy binary to target/release (Windows)
+        if: matrix.target
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/fff_nvim.dll target/release/fff_nvim.dll
+
+      - name: Verify Windows DLL has no unexpected dependencies
+        if: matrix.target
+        shell: pwsh
+        run: |
+          # Find dumpbin via vswhere (always available on GitHub Actions Windows runners)
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath" -Recurse -Filter "dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { Write-Error "dumpbin.exe not found"; exit 1 }
+
+          $deps = & $dumpbin.FullName /DEPENDENTS target\release\fff_nvim.dll | Out-String
+          Write-Host $deps
+          # zlob must be statically linked - fail if zlob.dll appears as a dependency
+          if ($deps -match 'zlob\.dll') {
+            Write-Error "fff_nvim.dll has unexpected dynamic dependency on zlob.dll - zlob should be statically linked"
+            exit 1
+          }
+
+      - name: Build Rust binary
+        if: ${{ !matrix.target }}
+        run: cargo build --release -p fff-nvim --features zlob
+
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: v0.10.4
+
+      - name: Clone plenary.nvim
+        shell: bash
+        run: git clone --depth 1 https://github.com/nvim-lua/plenary.nvim ../plenary.nvim
+
+      - name: Run Lua tests
+        shell: bash
+        run: make test-lua
+
+      - name: Run bun tests
+        shell: bash
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: make test-bun
+
+      - name: Install Node.js
+        if: ${{ matrix.os != 'ubuntu-latest' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install node deps
+        if: ${{ matrix.os != 'ubuntu-latest' }}
+        shell: bash
+        run: npm install
+
+      - name: Run node tests
+        if: ${{ matrix.os != 'ubuntu-latest' }}
+        shell: bash
+        run: make test-node

@@ -119,8 +119,23 @@ Third-party Zig dependencies are declared in `build.zig.zon`:
 
 - `zgui`
 - `zsdl`
+- `zqlite`
 
 Zig fetches them automatically during build.
+
+## Third-Party Attribution
+
+The desktop app depends on the following upstream projects:
+
+- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko. Used for project-scoped file indexing and the chat composer `@` file search. Vendored in [`../third_party/fff`](../third_party/fff). License: MIT.
+- Dear ImGui by Omar Cornut. Used as the immediate-mode UI library underneath the native shell. Brought in through `zgui`. License: MIT.
+- `zgui` from `zig-gamedev`. Used for Zig bindings and SDL/OpenGL backend integration for Dear ImGui. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
+- `zsdl` from `zig-gamedev`. Used for Zig bindings to SDL3. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
+- SDL3 from libsdl-org. Used for window creation, events, monitor/display integration, and OpenGL context setup.
+- `zqlite` by Karl Seguin. Used for SQLite-backed state and persistence. Declared in [`build.zig.zon`](build.zig.zon). License: MIT-style.
+- `stb_image` by Sean Barrett and contributors. Used for image decoding. Vendored in [`src/vendor/stb_image.h`](src/vendor/stb_image.h). License: public domain or MIT.
+
+When distributing the desktop app, keep the applicable upstream licenses and notices for vendored or bundled components.
 
 ## Notes
 
