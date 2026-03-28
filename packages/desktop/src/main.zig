@@ -412,6 +412,21 @@ pub fn renderComposerPickers(state: *AppState) void {
     const model_preview = chat_threads.selectedModelLabel(ModelOption, thread, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]);
     var model_preview_buf = std.mem.zeroes([80:0]u8);
     const model_label = std.fmt.bufPrintZ(&model_preview_buf, "{s} v", .{model_preview}) catch "Model v";
+    const picker_start = zgui.getCursorPos();
+    if (providerLogoTexture(state, thread.provider)) |cached| {
+        const frame_height = zgui.getFrameHeight();
+        const logo_height = @max(ui_theme.scaledUi(16.0), frame_height - ui_theme.scaledUi(8.0));
+        const aspect_ratio = @as(f32, @floatFromInt(cached.width)) / @as(f32, @floatFromInt(cached.height));
+        const logo_width = logo_height * aspect_ratio;
+        const logo_y = picker_start[1] + (frame_height - logo_height) * 0.5;
+        zgui.setCursorPos(.{ picker_start[0], logo_y });
+        zgui.image(textureRefFromGlId(cached.texture_id), .{
+            .w = logo_width,
+            .h = logo_height,
+        });
+        zgui.sameLine(.{ .spacing = ui_theme.scaledUi(8.0) });
+        zgui.setCursorPos(.{ picker_start[0] + logo_width + ui_theme.scaledUi(8.0), picker_start[1] });
+    }
     zgui.setNextItemWidth(composerPickerTextWidth(model_preview) + 36.0);
     if (zgui.beginCombo("##model-picker", .{
         .preview_value = model_label,
@@ -538,6 +553,13 @@ pub fn isSendPending(state: *AppState) bool {
 
 fn composerPickerTextWidth(label: []const u8) f32 {
     return zgui.calcTextSize(label, .{})[0];
+}
+
+fn providerLogoTexture(state: *AppState, provider: Provider) ?native_state.CachedImageTexture {
+    return switch (provider) {
+        .opencode => state.opencode_logo_texture,
+        .codex => state.codex_logo_texture,
+    };
 }
 
 fn setThreadModelRef(state: *AppState, thread: *ChatThread, value: ?[:0]const u8) void {
