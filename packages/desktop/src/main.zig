@@ -27,6 +27,8 @@ const ReasoningOption = native_state.ReasoningOption;
 const Storage = native_state.Storage;
 const CODEX_MODEL_OPTIONS = native_state.CODEX_MODEL_OPTIONS;
 const CODEX_REASONING_OPTIONS = native_state.CODEX_REASONING_OPTIONS;
+const DEFAULT_CODEX_MODEL = native_state.DEFAULT_CODEX_MODEL;
+const DEFAULT_OPENCODE_MODEL = native_state.DEFAULT_OPENCODE_MODEL;
 const OPENCODE_MODEL_OPTIONS = native_state.OPENCODE_MODEL_OPTIONS;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
@@ -767,10 +769,14 @@ fn renderComposerModelFlyout(
     for (chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
         zgui.pushIntId(@intCast(index));
         var should_close_picker = false;
-        const is_selected = if (option.value) |value|
-            thread.provider == provider and thread.model_ref != null and std.mem.eql(u8, thread.model_ref.?, value)
+        const active_model_ref = if (thread.provider == provider and thread.model_ref != null)
+            thread.model_ref.?
         else
-            thread.provider == provider and thread.model_ref == null;
+            defaultModelRef(provider);
+        const is_selected = if (option.value) |value|
+            thread.provider == provider and std.mem.eql(u8, active_model_ref, value)
+        else
+            false;
         if (zgui.selectable("##model-row", .{ .selected = is_selected, .h = model_row_height })) {
             setThreadProvider(state, thread, provider);
             setThreadModelRef(state, thread, option.value);
@@ -918,7 +924,7 @@ fn setThreadProvider(state: *AppState, thread: *ChatThread, provider: Provider) 
     if (thread.model_ref) |model_ref| {
         state.allocator.free(model_ref);
     }
-    thread.model_ref = null;
+    thread.model_ref = state.allocator.dupeZ(u8, defaultModelRef(provider)) catch null;
     thread.reasoning_effort = null;
     thread.fast_mode = .off;
     state.markDirty();
@@ -935,6 +941,13 @@ fn setThreadModelRef(state: *AppState, thread: *ChatThread, value: ?[:0]const u8
     else
         null;
     state.markDirty();
+}
+
+fn defaultModelRef(provider: Provider) [:0]const u8 {
+    return switch (provider) {
+        .codex => DEFAULT_CODEX_MODEL,
+        .opencode => DEFAULT_OPENCODE_MODEL,
+    };
 }
 
 fn comboRowLabel(buffer: []u8, label: []const u8, selected: bool) [:0]const u8 {

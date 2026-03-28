@@ -43,7 +43,8 @@ pub fn selectedModelLabel(comptime Option: type, thread: anytype, opencode_optio
             }
         }
     }
-    return "Default";
+    const options = modelOptions(Option, thread.provider, opencode_options, codex_options);
+    return if (options.len > 0) options[0].label else "Model";
 }
 
 /// Returns the current reasoning label for a thread.
