@@ -28,6 +28,7 @@ const Storage = native_state.Storage;
 const CODEX_MODEL_OPTIONS = native_state.CODEX_MODEL_OPTIONS;
 const CODEX_REASONING_OPTIONS = native_state.CODEX_REASONING_OPTIONS;
 const OPENCODE_MODEL_OPTIONS = native_state.OPENCODE_MODEL_OPTIONS;
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 pub const log = native_state.log;
 pub const providerLabel = utils.providerLabel;
@@ -388,16 +389,32 @@ pub fn renderComposerPickers(state: *AppState) void {
     const thread = state.currentThreadMutable();
 
     const transparent = colors.rgba(0, 0, 0, 0);
+    const picker_frame_bg = colors.rgba(36, 38, 44, 255);
     const picker_text_color = colors.rgba(160, 164, 180, 255);
     const picker_hover_bg = colors.rgba(50, 52, 60, 255);
+    const picker_active_bg = colors.rgba(58, 60, 70, 255);
     const picker_popup_bg = colors.rgba(26, 27, 32, 255);
     const separator_color = colors.rgba(60, 62, 72, 255);
+    const chip_spacing = ui_theme.scaledUi(8.0);
+    const base_padding_x = ui_theme.scaledUi(12.0);
+    const base_padding_y = ui_theme.scaledUi(7.0);
+    const provider_logo_gap = ui_theme.scaledUi(8.0);
+    const popup_padding = ui_theme.scaledUi(12.0);
+    const provider_panel_width = ui_theme.scaledUi(196.0);
+    const model_panel_width = ui_theme.scaledUi(214.0);
+    const provider_row_height = ui_theme.scaledUi(38.0);
+    const model_row_height = ui_theme.scaledUi(34.0);
+    const provider_row_logo_width = @max(
+        providerLogoSize(state, .codex, provider_row_height - ui_theme.scaledUi(12.0))[0],
+        providerLogoSize(state, .opencode, provider_row_height - ui_theme.scaledUi(12.0))[0],
+    );
+    const provider_row_text_padding = ui_theme.scaledUi(14.0) + provider_row_logo_width + ui_theme.scaledUi(10.0);
 
-    zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 8.0 });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ 8.0, 6.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = transparent });
+    zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = ui_theme.scaledUi(11.0) });
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ base_padding_x, base_padding_y } });
+    zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = picker_frame_bg });
     zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = picker_hover_bg });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = picker_hover_bg });
+    zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = picker_active_bg });
     zgui.pushStyleColor4f(.{ .idx = .window_bg, .c = picker_popup_bg });
     zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = picker_popup_bg });
     zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(42, 44, 52, 255) });
@@ -410,80 +427,83 @@ pub fn renderComposerPickers(state: *AppState) void {
     }
 
     const model_preview = chat_threads.selectedModelLabel(ModelOption, thread, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]);
-    var model_preview_buf = std.mem.zeroes([80:0]u8);
-    const model_label = std.fmt.bufPrintZ(&model_preview_buf, "{s} v", .{model_preview}) catch "Model v";
-    const picker_start = zgui.getCursorPos();
-    if (providerLogoTexture(state, thread.provider)) |cached| {
-        const frame_height = zgui.getFrameHeight();
-        const logo_height = @max(ui_theme.scaledUi(16.0), frame_height - ui_theme.scaledUi(8.0));
-        const aspect_ratio = @as(f32, @floatFromInt(cached.width)) / @as(f32, @floatFromInt(cached.height));
-        const logo_width = logo_height * aspect_ratio;
-        const logo_y = picker_start[1] + (frame_height - logo_height) * 0.5;
-        zgui.setCursorPos(.{ picker_start[0], logo_y });
-        zgui.image(textureRefFromGlId(cached.texture_id), .{
-            .w = logo_width,
-            .h = logo_height,
-        });
-        zgui.sameLine(.{ .spacing = ui_theme.scaledUi(8.0) });
-        zgui.setCursorPos(.{ picker_start[0] + logo_width + ui_theme.scaledUi(8.0), picker_start[1] });
-    }
-    zgui.setNextItemWidth(composerPickerTextWidth(model_preview) + 36.0);
-    if (zgui.beginCombo("##model-picker", .{
-        .preview_value = model_label,
-        .flags = .{ .no_arrow_button = true },
-    })) {
+    const provider_logo_size = providerLogoSize(state, thread.provider, zgui.getFrameHeight() - ui_theme.scaledUi(10.0));
+    const popup_width = provider_panel_width + popup_padding * 2.0;
+    const popup_height = popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+    const combo_preview_pos = zgui.getCursorScreenPos();
+    const combo_preview_width = composerPickerTextWidth(model_preview) + provider_logo_size[0] + provider_logo_gap + ui_theme.scaledUi(52.0);
+    const combo_preview_height = zgui.getFrameHeight();
+    const combo_draw_list = zgui.getWindowDrawList();
+    zgui.setNextWindowSize(.{ .w = popup_width, .h = popup_height });
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{
+        base_padding_x + provider_logo_size[0] + provider_logo_gap,
+        base_padding_y,
+    } });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(16.0) });
+    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = ui_theme.scaledUi(12.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ popup_padding, popup_padding } });
+    zgui.setNextItemWidth(combo_preview_width);
+    const model_combo_open = zgui.beginCombo("##model-provider-picker", .{
+        .preview_value = "",
+        .flags = .{ .popup_align_left = true, .height_large = true },
+    });
+    drawModelPreviewInRect(combo_draw_list, state, thread.provider, model_preview, combo_preview_pos, combo_preview_width, combo_preview_height, base_padding_x);
+    zgui.popStyleVar(.{ .count = 4 });
+    if (model_combo_open) {
         defer zgui.endCombo();
 
-        zgui.pushStyleColor4f(.{ .idx = .text, .c = ui_theme.COLOR_TEXT_SUBTLE });
-        zgui.textUnformatted("Provider");
-        zgui.popStyleColor(.{ .count = 1 });
-        inline for (@typeInfo(Provider).@"enum".fields) |field| {
-            const candidate: Provider = @enumFromInt(field.value);
-            var row_buf = std.mem.zeroes([48:0]u8);
-            const row_label = comboRowLabel(&row_buf, chat_threads.providerLabel(candidate), candidate == thread.provider);
-            if (zgui.selectable(row_label, .{ .selected = candidate == thread.provider, .h = 28.0 })) {
-                if (thread.provider != candidate) {
-                    thread.provider = candidate;
-                    if (thread.provider_thread_id) |thread_id| {
-                        state.allocator.free(thread_id);
-                    }
-                    thread.provider_thread_id = null;
-                    if (thread.model_ref) |model_ref| {
-                        state.allocator.free(model_ref);
-                    }
-                    thread.model_ref = null;
-                    thread.reasoning_effort = null;
-                    thread.fast_mode = .off;
-                    state.markDirty();
-                }
-            }
+        var active_provider: ?Provider = state.composer_picker_provider;
+        if (active_provider != null and active_provider != .codex and active_provider != .opencode) {
+            active_provider = null;
         }
+        const panel_height = provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+        state.composer_picker_provider = active_provider;
 
-        zgui.separator();
-        zgui.pushStyleColor4f(.{ .idx = .text, .c = ui_theme.COLOR_TEXT_SUBTLE });
-        zgui.textUnformatted("Model");
-        zgui.popStyleColor(.{ .count = 1 });
-        for (chat_threads.modelOptions(ModelOption, thread.provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..])) |option| {
-            const is_selected = if (option.value) |value|
-                thread.model_ref != null and std.mem.eql(u8, thread.model_ref.?, value)
-            else
-                thread.model_ref == null;
-            var row_buf = std.mem.zeroes([96:0]u8);
-            const row_label = comboRowLabel(&row_buf, option.label, is_selected);
-            if (zgui.selectable(row_label, .{ .selected = is_selected, .h = 28.0 })) {
-                setThreadModelRef(state, thread, option.value);
+        zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ provider_row_text_padding, ui_theme.scaledUi(9.0) } });
+        zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+        defer zgui.popStyleVar(.{ .count = 2 });
+        defer zgui.popStyleColor(.{ .count = 1 });
+
+        const popup_origin = zgui.getCursorScreenPos();
+        _ = zgui.beginChild("##provider-panel", .{
+            .w = provider_panel_width,
+            .h = panel_height,
+            .child_flags = .{ .border = false },
+            .window_flags = .{ .no_saved_settings = true, .no_scrollbar = true, .no_scroll_with_mouse = true },
+        });
+        for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+            zgui.pushIntId(@intFromEnum(candidate));
+            const is_active = active_provider != null and candidate == active_provider.?;
+            if (zgui.selectable("##provider-row", .{ .selected = is_active, .h = provider_row_height })) {
+                active_provider = candidate;
+                state.composer_picker_provider = candidate;
             }
+            drawProviderRowForLastItem(state, candidate, is_active);
+            if (zgui.isItemHovered(.{})) {
+                active_provider = candidate;
+                state.composer_picker_provider = candidate;
+            }
+            zgui.popId();
         }
+        zgui.endChild();
+
+        if (active_provider) |provider| {
+            const provider_index = composerProviderIndex(provider);
+            renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_panel_width, provider_index, model_panel_width, model_row_height);
+        }
+    } else {
+        state.composer_picker_provider = null;
     }
 
-    zgui.sameLine(.{ .spacing = 6.0 });
+    zgui.sameLine(.{ .spacing = chip_spacing });
     zgui.textColored(separator_color, "|", .{});
 
-    zgui.sameLine(.{ .spacing = 6.0 });
+    zgui.sameLine(.{ .spacing = chip_spacing });
     const reasoning_preview = chat_threads.selectedReasoningLabel(ReasoningOption, thread, CODEX_REASONING_OPTIONS[0..]);
     var reasoning_buf = std.mem.zeroes([80:0]u8);
     const reasoning_label = std.fmt.bufPrintZ(&reasoning_buf, "{s} v", .{reasoning_preview}) catch "Reasoning v";
-    zgui.setNextItemWidth(composerPickerTextWidth(reasoning_preview) + 36.0);
+    zgui.setNextItemWidth(composerPickerTextWidth(reasoning_preview) + ui_theme.scaledUi(36.0));
     if (zgui.beginCombo("##reasoning-picker", .{
         .preview_value = reasoning_label,
         .flags = .{ .no_arrow_button = true },
@@ -508,10 +528,10 @@ pub fn renderComposerPickers(state: *AppState) void {
     }
 
     if (thread.provider == .codex) {
-        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.sameLine(.{ .spacing = chip_spacing });
         zgui.textColored(separator_color, "|", .{});
 
-        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.sameLine(.{ .spacing = chip_spacing });
         zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
@@ -522,11 +542,11 @@ pub fn renderComposerPickers(state: *AppState) void {
         }
         zgui.popStyleColor(.{ .count = 3 });
 
-        zgui.sameLine(.{ .spacing = 6.0 });
+        zgui.sameLine(.{ .spacing = chip_spacing });
         zgui.textColored(separator_color, "|", .{});
     }
 
-    zgui.sameLine(.{ .spacing = 6.0 });
+    zgui.sameLine(.{ .spacing = chip_spacing });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
@@ -560,6 +580,284 @@ fn providerLogoTexture(state: *AppState, provider: Provider) ?native_state.Cache
         .opencode => state.opencode_logo_texture,
         .codex => state.codex_logo_texture,
     };
+}
+
+fn providerLogoSize(state: *AppState, provider: Provider, target_height: f32) [2]f32 {
+    if (providerLogoTexture(state, provider)) |cached| {
+        const safe_height = @max(target_height * providerLogoScale(provider), ui_theme.scaledUi(14.0));
+        const aspect_ratio = @as(f32, @floatFromInt(cached.width)) / @as(f32, @floatFromInt(cached.height));
+        return .{ safe_height * aspect_ratio, safe_height };
+    }
+    return .{ 0.0, 0.0 };
+}
+
+fn drawProviderLogoForLastItem(state: *AppState, provider: Provider, left_padding: f32) void {
+    if (providerLogoTexture(state, provider)) |cached| {
+        const item_min = zgui.getItemRectMin();
+        const item_max = zgui.getItemRectMax();
+        const item_height = item_max[1] - item_min[1];
+        const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
+        const draw_list = zgui.getWindowDrawList();
+        const logo_min = .{
+            item_min[0] + left_padding,
+            item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
+        };
+        draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
+            .pmin = logo_min,
+            .pmax = .{ logo_min[0] + logo_size[0], logo_min[1] + logo_size[1] },
+        });
+    }
+}
+
+fn drawModelPreviewInRect(
+    draw_list: zgui.DrawList,
+    state: *AppState,
+    provider: Provider,
+    label: []const u8,
+    item_min: [2]f32,
+    item_width: f32,
+    item_height: f32,
+    left_padding: f32,
+) void {
+    const text_size = zgui.calcTextSize(label, .{});
+    const icon_slot_width = providerLogoSlotWidth(state, item_height);
+    const text_pos = .{
+        item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(6.0),
+        item_min[1] + (item_height - text_size[1]) * 0.5,
+    };
+    drawProviderLogoInRect(draw_list, state, provider, item_min, item_height, left_padding);
+    draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(ui_theme.COLOR_TEXT_MUTED), label);
+    const chevron_center_y = item_min[1] + item_height * 0.5;
+    const chevron_x = item_min[0] + item_width - ui_theme.scaledUi(16.0);
+    drawChevron(draw_list, chevron_x, chevron_center_y, ui_theme.COLOR_TEXT_SUBTLE);
+}
+
+fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: bool) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const item_height = item_max[1] - item_min[1];
+    const draw_list = zgui.getWindowDrawList();
+    const label = chat_threads.providerLabel(provider);
+    const text_size = zgui.calcTextSize(label, .{});
+    const left_padding = ui_theme.scaledUi(12.0);
+    const icon_slot_width = providerLogoSlotWidth(state, item_height);
+    const text_pos = .{
+        item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(8.0),
+        item_min[1] + (item_height - text_size[1]) * 0.5,
+    };
+    drawProviderLogoInRect(draw_list, state, provider, item_min, item_height, left_padding);
+    draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
+    drawChevron(draw_list, item_max[0] - ui_theme.scaledUi(14.0), item_min[1] + item_height * 0.5, if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_SUBTLE);
+}
+
+fn drawModelRowForLastItem(label: []const u8, is_selected: bool) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const item_height = item_max[1] - item_min[1];
+    const draw_list = zgui.getWindowDrawList();
+    const text_size = zgui.calcTextSize(label, .{});
+    const text_pos = .{
+        item_min[0] + ui_theme.scaledUi(22.0),
+        item_min[1] + (item_height - text_size[1]) * 0.5,
+    };
+    draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_selected) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
+    if (is_selected) drawCheckForLastItem(ui_theme.COLOR_WHITE);
+}
+
+fn composerProviderIndex(provider: Provider) usize {
+    for (COMPOSER_PROVIDER_OPTIONS, 0..) |candidate, index| {
+        if (candidate == provider) return index;
+    }
+    return 0;
+}
+
+fn renderComposerModelFlyout(
+    state: *AppState,
+    thread: *ChatThread,
+    provider: Provider,
+    provider_popup_origin: [2]f32,
+    popup_padding: f32,
+    provider_panel_width: f32,
+    provider_index: usize,
+    model_panel_width: f32,
+    model_row_height: f32,
+) void {
+    const model_panel_height = modelRowPanelHeight(provider, model_row_height);
+    const flyout_gap = ui_theme.scaledUi(-10.0);
+    zgui.setNextWindowPos(.{
+        // `provider_popup_origin` is already the provider popup content origin, so
+        // subtract flyout padding back out before placing the separate flyout window.
+        // A slight negative gap makes the rounded flyout feel visually attached.
+        .x = provider_popup_origin[0] + provider_panel_width + flyout_gap - popup_padding,
+        .y = provider_popup_origin[1] + providerRowHeightForFlyout(provider_index) - popup_padding - ui_theme.scaledUi(2.0),
+    });
+    zgui.setNextWindowSize(.{
+        .w = model_panel_width,
+        .h = model_panel_height + popup_padding * 2.0,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(14.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ popup_padding, popup_padding } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .window_bg, .c = colors.rgba(28, 30, 36, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(66, 68, 78, 255) });
+    defer {
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+
+    _ = zgui.begin("##composer-model-flyout", .{
+        .flags = .{
+            .no_title_bar = true,
+            .no_resize = true,
+            .no_scrollbar = true,
+            .no_saved_settings = true,
+            .no_move = true,
+            .no_focus_on_appearing = true,
+            .no_nav_focus = true,
+        },
+    });
+    defer zgui.end();
+
+    for (chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
+        zgui.pushIntId(@intCast(index));
+        const is_selected = if (option.value) |value|
+            thread.provider == provider and thread.model_ref != null and std.mem.eql(u8, thread.model_ref.?, value)
+        else
+            thread.provider == provider and thread.model_ref == null;
+        if (zgui.selectable("##model-row", .{ .selected = is_selected, .h = model_row_height })) {
+            setThreadProvider(state, thread, provider);
+            setThreadModelRef(state, thread, option.value);
+            state.composer_picker_provider = provider;
+        }
+        drawModelRowForLastItem(option.label, is_selected);
+        zgui.popId();
+    }
+}
+
+fn providerLogoSlotWidth(state: *AppState, item_height: f32) f32 {
+    return @max(
+        providerLogoSize(state, .codex, item_height - ui_theme.scaledUi(10.0))[0],
+        providerLogoSize(state, .opencode, item_height - ui_theme.scaledUi(10.0))[0],
+    );
+}
+
+fn providerRowHeightForFlyout(provider_index: usize) f32 {
+    return ui_theme.scaledUi(38.0) * @as(f32, @floatFromInt(provider_index));
+}
+
+fn providerLogoScale(provider: Provider) f32 {
+    return switch (provider) {
+        .codex => 0.86,
+        .opencode => 0.78,
+    };
+}
+
+fn providerLogoYOffset(provider: Provider) f32 {
+    return switch (provider) {
+        .codex => ui_theme.scaledUi(0.0),
+        .opencode => ui_theme.scaledUi(-0.5),
+    };
+}
+
+fn drawChevronForLastItem(color: [4]f32) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const draw_list = zgui.getWindowDrawList();
+    drawChevron(draw_list, item_max[0] - ui_theme.scaledUi(14.0), item_min[1] + (item_max[1] - item_min[1]) * 0.5, color);
+}
+
+fn drawProviderLogoInRect(
+    draw_list: zgui.DrawList,
+    state: *AppState,
+    provider: Provider,
+    item_min: [2]f32,
+    item_height: f32,
+    left_padding: f32,
+) void {
+    if (providerLogoTexture(state, provider)) |cached| {
+        const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
+        const slot_width = providerLogoSlotWidth(state, item_height);
+        const logo_min = .{
+            item_min[0] + left_padding + (slot_width - logo_size[0]) * 0.5,
+            item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
+        };
+        draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
+            .pmin = logo_min,
+            .pmax = .{ logo_min[0] + logo_size[0], logo_min[1] + logo_size[1] },
+        });
+    }
+}
+
+fn drawChevron(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const half = ui_theme.scaledUi(4.0);
+    const col = zgui.colorConvertFloat4ToU32(color);
+    draw_list.addLine(.{
+        .p1 = .{ x - half, center_y - half },
+        .p2 = .{ x, center_y },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ x - half, center_y + half },
+        .p2 = .{ x, center_y },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+}
+
+fn drawCheckForLastItem(color: [4]f32) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const draw_list = zgui.getWindowDrawList();
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const x = item_min[0] + ui_theme.scaledUi(12.0);
+    const center_y = item_min[1] + (item_max[1] - item_min[1]) * 0.5;
+    const small = ui_theme.scaledUi(3.0);
+    const large = ui_theme.scaledUi(6.0);
+    draw_list.addLine(.{
+        .p1 = .{ x - small, center_y },
+        .p2 = .{ x, center_y + small },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ x, center_y + small },
+        .p2 = .{ x + large, center_y - large * 0.6 },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+}
+
+fn drawPopupDivider(x: f32, y: f32, height: f32) void {
+    const draw_list = zgui.getWindowDrawList();
+    draw_list.addLine(.{
+        .p1 = .{ x, y + ui_theme.scaledUi(6.0) },
+        .p2 = .{ x, y + height - ui_theme.scaledUi(6.0) },
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(56, 58, 66, 255)),
+        .thickness = 1.0,
+    });
+}
+
+fn modelRowPanelHeight(provider: Provider, row_height: f32) f32 {
+    const model_count = chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]).len;
+    return row_height * @as(f32, @floatFromInt(model_count));
+}
+
+fn setThreadProvider(state: *AppState, thread: *ChatThread, provider: Provider) void {
+    if (thread.provider == provider) return;
+
+    thread.provider = provider;
+    if (thread.provider_thread_id) |thread_id| {
+        state.allocator.free(thread_id);
+    }
+    thread.provider_thread_id = null;
+    if (thread.model_ref) |model_ref| {
+        state.allocator.free(model_ref);
+    }
+    thread.model_ref = null;
+    thread.reasoning_effort = null;
+    thread.fast_mode = .off;
+    state.markDirty();
 }
 
 fn setThreadModelRef(state: *AppState, thread: *ChatThread, value: ?[:0]const u8) void {
