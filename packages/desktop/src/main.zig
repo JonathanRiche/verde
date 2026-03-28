@@ -400,15 +400,11 @@ pub fn renderComposerPickers(state: *AppState) void {
     const base_padding_y = ui_theme.scaledUi(7.0);
     const provider_logo_gap = ui_theme.scaledUi(8.0);
     const popup_padding = ui_theme.scaledUi(12.0);
-    const provider_panel_width = ui_theme.scaledUi(196.0);
-    const model_panel_width = ui_theme.scaledUi(214.0);
     const provider_row_height = ui_theme.scaledUi(38.0);
     const model_row_height = ui_theme.scaledUi(34.0);
-    const provider_row_logo_width = @max(
-        providerLogoSize(state, .codex, provider_row_height - ui_theme.scaledUi(12.0))[0],
-        providerLogoSize(state, .opencode, provider_row_height - ui_theme.scaledUi(12.0))[0],
-    );
-    const provider_row_text_padding = ui_theme.scaledUi(14.0) + provider_row_logo_width + ui_theme.scaledUi(10.0);
+    const provider_panel_width = composerProviderPanelWidth(state, provider_row_height);
+    const model_panel_width = ui_theme.scaledUi(214.0);
+    const provider_row_text_padding = 0.0;
 
     zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = ui_theme.scaledUi(11.0) });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ base_padding_x, base_padding_y } });
@@ -639,10 +635,10 @@ fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: b
     const draw_list = zgui.getWindowDrawList();
     const label = chat_threads.providerLabel(provider);
     const text_size = zgui.calcTextSize(label, .{});
-    const left_padding = ui_theme.scaledUi(12.0);
+    const left_padding = 0.0;
     const icon_slot_width = providerLogoSlotWidth(state, item_height);
     const text_pos = .{
-        item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(8.0),
+        item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(6.0),
         item_min[1] + (item_height - text_size[1]) * 0.5,
     };
     drawProviderLogoInRect(draw_list, state, provider, item_min, item_height, left_padding);
@@ -684,16 +680,23 @@ fn renderComposerModelFlyout(
 ) void {
     const model_panel_height = modelRowPanelHeight(provider, model_row_height);
     const flyout_gap = ui_theme.scaledUi(-10.0);
+    const flyout_x = provider_popup_origin[0] + provider_panel_width + flyout_gap - popup_padding;
+    const flyout_y = provider_popup_origin[1] + providerRowHeightForFlyout(provider_index) - popup_padding - ui_theme.scaledUi(2.0);
+    const desired_window_height = model_panel_height + popup_padding * 2.0;
+    const viewport = zgui.getMainViewport();
+    const work_pos = viewport.getWorkPos();
+    const work_size = viewport.getWorkSize();
+    const viewport_bottom = work_pos[1] + work_size[1] - ui_theme.scaledUi(12.0);
+    const available_window_height = @max(ui_theme.scaledUi(84.0), viewport_bottom - flyout_y);
+    const window_height = @min(desired_window_height, available_window_height);
+    const needs_scroll = desired_window_height > window_height + 0.5;
     zgui.setNextWindowPos(.{
-        // `provider_popup_origin` is already the provider popup content origin, so
-        // subtract flyout padding back out before placing the separate flyout window.
-        // A slight negative gap makes the rounded flyout feel visually attached.
-        .x = provider_popup_origin[0] + provider_panel_width + flyout_gap - popup_padding,
-        .y = provider_popup_origin[1] + providerRowHeightForFlyout(provider_index) - popup_padding - ui_theme.scaledUi(2.0),
+        .x = flyout_x,
+        .y = flyout_y,
     });
     zgui.setNextWindowSize(.{
         .w = model_panel_width,
-        .h = model_panel_height + popup_padding * 2.0,
+        .h = window_height,
     });
     zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(14.0) });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ popup_padding, popup_padding } });
@@ -709,17 +712,20 @@ fn renderComposerModelFlyout(
         .flags = .{
             .no_title_bar = true,
             .no_resize = true,
-            .no_scrollbar = true,
             .no_saved_settings = true,
             .no_move = true,
             .no_focus_on_appearing = true,
             .no_nav_focus = true,
+            .no_scrollbar = !needs_scroll,
+            .no_scroll_with_mouse = !needs_scroll,
+            .always_vertical_scrollbar = needs_scroll,
         },
     });
     defer zgui.end();
 
     for (chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
         zgui.pushIntId(@intCast(index));
+        var should_close_picker = false;
         const is_selected = if (option.value) |value|
             thread.provider == provider and thread.model_ref != null and std.mem.eql(u8, thread.model_ref.?, value)
         else
@@ -727,10 +733,15 @@ fn renderComposerModelFlyout(
         if (zgui.selectable("##model-row", .{ .selected = is_selected, .h = model_row_height })) {
             setThreadProvider(state, thread, provider);
             setThreadModelRef(state, thread, option.value);
-            state.composer_picker_provider = provider;
+            state.composer_picker_provider = null;
+            should_close_picker = true;
         }
         drawModelRowForLastItem(option.label, is_selected);
         zgui.popId();
+        if (should_close_picker) {
+            zgui.closeCurrentPopup();
+            return;
+        }
     }
 }
 
@@ -739,6 +750,15 @@ fn providerLogoSlotWidth(state: *AppState, item_height: f32) f32 {
         providerLogoSize(state, .codex, item_height - ui_theme.scaledUi(10.0))[0],
         providerLogoSize(state, .opencode, item_height - ui_theme.scaledUi(10.0))[0],
     );
+}
+
+fn composerProviderPanelWidth(state: *AppState, row_height: f32) f32 {
+    const icon_slot_width = providerLogoSlotWidth(state, row_height);
+    var max_label_width: f32 = 0.0;
+    for (COMPOSER_PROVIDER_OPTIONS) |provider| {
+        max_label_width = @max(max_label_width, zgui.calcTextSize(chat_threads.providerLabel(provider), .{})[0]);
+    }
+    return icon_slot_width + ui_theme.scaledUi(6.0) + max_label_width + ui_theme.scaledUi(28.0);
 }
 
 fn providerRowHeightForFlyout(provider_index: usize) f32 {
