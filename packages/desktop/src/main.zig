@@ -459,8 +459,9 @@ pub fn renderComposerPickers(state: *AppState) void {
 
         zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
         zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ provider_row_text_padding, ui_theme.scaledUi(9.0) } });
+        zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
         zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
-        defer zgui.popStyleVar(.{ .count = 2 });
+        defer zgui.popStyleVar(.{ .count = 3 });
         defer zgui.popStyleColor(.{ .count = 1 });
 
         const popup_cursor = zgui.getCursorPos();
@@ -586,10 +587,29 @@ fn providerLogoTexture(state: *AppState, provider: Provider) ?native_state.Cache
     };
 }
 
+fn providerLogoUvBounds(provider: Provider) struct { min: [2]f32, max: [2]f32 } {
+    return switch (provider) {
+        // The embedded Codex mark has large transparent margins baked into the PNG.
+        // Crop to the visible blossom bounds so layout uses the mark, not the canvas.
+        .codex => .{
+            .min = .{ 118.0 / 721.0, 120.0 / 721.0 },
+            .max = .{ 603.0 / 721.0, 601.0 / 721.0 },
+        },
+        .opencode => .{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ 1.0, 1.0 },
+        },
+    };
+}
+
 fn providerLogoSize(state: *AppState, provider: Provider, target_height: f32) [2]f32 {
     if (providerLogoTexture(state, provider)) |cached| {
         const safe_height = @max(target_height * providerLogoScale(provider), ui_theme.scaledUi(14.0));
-        const aspect_ratio = @as(f32, @floatFromInt(cached.width)) / @as(f32, @floatFromInt(cached.height));
+        _ = cached;
+        const uv_bounds = providerLogoUvBounds(provider);
+        const visible_width = uv_bounds.max[0] - uv_bounds.min[0];
+        const visible_height = uv_bounds.max[1] - uv_bounds.min[1];
+        const aspect_ratio = visible_width / visible_height;
         return .{ safe_height * aspect_ratio, safe_height };
     }
     return .{ 0.0, 0.0 };
@@ -647,6 +667,7 @@ fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: b
     const icon_slot_width = providerLogoSlotWidth(state, item_height);
     if (providerLogoTexture(state, provider)) |cached| {
         const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
+        const uv_bounds = providerLogoUvBounds(provider);
         const logo_min = .{
             item_min[0] + left_padding,
             item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
@@ -654,6 +675,8 @@ fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: b
         draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
             .pmin = logo_min,
             .pmax = .{ logo_min[0] + logo_size[0], logo_min[1] + logo_size[1] },
+            .uvmin = uv_bounds.min,
+            .uvmax = uv_bounds.max,
         });
     }
     const text_pos = .{
@@ -815,6 +838,7 @@ fn drawProviderLogoInRect(
     if (providerLogoTexture(state, provider)) |cached| {
         const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
         const slot_width = providerLogoSlotWidth(state, item_height);
+        const uv_bounds = providerLogoUvBounds(provider);
         const logo_min = .{
             item_min[0] + left_padding + (slot_width - logo_size[0]) * 0.5,
             item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
@@ -822,6 +846,8 @@ fn drawProviderLogoInRect(
         draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
             .pmin = logo_min,
             .pmax = .{ logo_min[0] + logo_size[0], logo_min[1] + logo_size[1] },
+            .uvmin = uv_bounds.min,
+            .uvmax = uv_bounds.max,
         });
     }
 }
