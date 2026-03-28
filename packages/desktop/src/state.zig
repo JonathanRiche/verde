@@ -22,6 +22,7 @@ pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
+pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
@@ -75,7 +76,6 @@ const AccessModeOption = struct {
 };
 
 pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default", .value = null },
     .{ .label = "GPT-5.4", .value = "opencode/gpt-5.4" },
     .{ .label = "Claude Opus 4.6", .value = "opencode/claude-opus-4-6" },
     .{ .label = "Claude Sonnet 4.5", .value = "opencode/claude-sonnet-4-5" },
@@ -83,7 +83,6 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 };
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default", .value = null },
     .{ .label = "GPT-5.4", .value = "gpt-5.4" },
     .{ .label = "GPT-5.4 Mini", .value = "gpt-5.4-mini" },
     .{ .label = "GPT-5.3 Codex", .value = "gpt-5.3-codex" },
