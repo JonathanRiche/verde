@@ -389,6 +389,7 @@ pub fn formatByteSize(buffer: *[32:0]u8, size: usize) [:0]const u8 {
 /// Renders the provider/model controls that sit under the shared composer UI.
 pub fn renderComposerPickers(state: *AppState) void {
     const thread = state.currentThreadMutable();
+    const provider_locked = thread.committed;
 
     const transparent = colors.rgba(0, 0, 0, 0);
     const picker_frame_bg = colors.rgba(36, 38, 44, 255);
@@ -426,8 +427,14 @@ pub fn renderComposerPickers(state: *AppState) void {
 
     const model_preview = chat_threads.selectedModelLabel(ModelOption, thread, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]);
     const provider_logo_size = providerLogoSize(state, thread.provider, zgui.getFrameHeight() - ui_theme.scaledUi(10.0));
-    const popup_width = provider_panel_width + popup_padding * 2.0;
-    const popup_height = popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+    const popup_width = if (provider_locked)
+        model_panel_width
+    else
+        provider_panel_width + popup_padding * 2.0;
+    const popup_height = if (provider_locked)
+        popup_padding * 2.0 + modelRowPanelHeight(thread.provider, model_row_height)
+    else
+        popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
     const combo_preview_pos = zgui.getCursorScreenPos();
     const combo_preview_width = composerPickerTextWidth(model_preview) + provider_logo_size[0] + provider_logo_gap + ui_theme.scaledUi(52.0);
     const combo_preview_height = zgui.getFrameHeight();
@@ -439,7 +446,10 @@ pub fn renderComposerPickers(state: *AppState) void {
     } });
     zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(16.0) });
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = ui_theme.scaledUi(12.0) });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ popup_padding, popup_padding } });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{
+        if (provider_locked) ui_theme.scaledUi(4.0) else popup_padding,
+        popup_padding,
+    } });
     zgui.setNextItemWidth(combo_preview_width);
     const model_combo_open = zgui.beginCombo("##model-provider-picker", .{
         .preview_value = "",
@@ -450,54 +460,81 @@ pub fn renderComposerPickers(state: *AppState) void {
     if (model_combo_open) {
         defer zgui.endCombo();
 
-        var active_provider: ?Provider = state.composer_picker_provider;
-        if (active_provider != null and active_provider != .codex and active_provider != .opencode) {
-            active_provider = null;
-        }
-        const panel_height = provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-        const provider_child_width = provider_panel_width + popup_padding;
+        if (provider_locked) {
+            state.composer_picker_provider = null;
+            zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+            defer zgui.popStyleVar(.{ .count = 1 });
 
-        state.composer_picker_provider = active_provider;
-
-        zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
-        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ provider_row_text_padding, ui_theme.scaledUi(9.0) } });
-        zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
-        zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
-        defer zgui.popStyleVar(.{ .count = 3 });
-        defer zgui.popStyleColor(.{ .count = 1 });
-
-        const popup_cursor = zgui.getCursorPos();
-        zgui.setCursorPos(.{ popup_cursor[0] - popup_padding, popup_cursor[1] });
-        const popup_origin = zgui.getCursorScreenPos();
-        _ = zgui.beginChild("##provider-panel", .{
-            .w = provider_child_width,
-            .h = panel_height,
-            .child_flags = .{ .border = false },
-            .window_flags = .{ .no_saved_settings = true, .no_scrollbar = true, .no_scroll_with_mouse = true },
-        });
-        for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
-            zgui.pushIntId(@intFromEnum(candidate));
-            const is_active = active_provider != null and candidate == active_provider.?;
-            if (zgui.selectable("##provider-row", .{
-                .selected = is_active,
-                .w = zgui.getContentRegionAvail()[0],
-                .h = provider_row_height,
-            })) {
-                active_provider = candidate;
-                state.composer_picker_provider = candidate;
+            const active_model_ref = if (thread.model_ref != null) thread.model_ref.? else defaultModelRef(thread.provider);
+            for (chat_threads.modelOptions(ModelOption, thread.provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
+                zgui.pushIntId(@intCast(index));
+                const is_selected = if (option.value) |value|
+                    std.mem.eql(u8, active_model_ref, value)
+                else
+                    false;
+                const clicked = zgui.invisibleButton("##locked-model-row", .{
+                    .w = zgui.getWindowWidth() - ui_theme.scaledUi(8.0),
+                    .h = model_row_height,
+                });
+                const is_hovered = zgui.isItemHovered(.{});
+                if (clicked) {
+                    setThreadModelRef(state, thread, option.value);
+                    zgui.closeCurrentPopup();
+                }
+                drawLockedModelRowForLastItem(option.label, is_selected, is_hovered);
+                zgui.popId();
             }
-            drawProviderRowForLastItem(state, candidate, is_active);
-            if (zgui.isItemHovered(.{})) {
-                active_provider = candidate;
-                state.composer_picker_provider = candidate;
+        } else {
+            var active_provider: ?Provider = state.composer_picker_provider;
+            if (active_provider != null and active_provider != .codex and active_provider != .opencode) {
+                active_provider = null;
             }
-            zgui.popId();
-        }
-        zgui.endChild();
+            const panel_height = provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+            const provider_child_width = provider_panel_width + popup_padding;
 
-        if (active_provider) |provider| {
-            const provider_index = composerProviderIndex(provider);
-            renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
+            state.composer_picker_provider = active_provider;
+
+            zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+            zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ provider_row_text_padding, ui_theme.scaledUi(9.0) } });
+            zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
+            zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+            defer zgui.popStyleVar(.{ .count = 3 });
+            defer zgui.popStyleColor(.{ .count = 1 });
+
+            const popup_cursor = zgui.getCursorPos();
+            zgui.setCursorPos(.{ popup_cursor[0] - popup_padding, popup_cursor[1] });
+            const popup_origin = zgui.getCursorScreenPos();
+            _ = zgui.beginChild("##provider-panel", .{
+                .w = provider_child_width,
+                .h = panel_height,
+                .child_flags = .{ .border = false },
+                .window_flags = .{ .no_saved_settings = true, .no_scrollbar = true, .no_scroll_with_mouse = true },
+            });
+            for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
+                zgui.pushIntId(@intFromEnum(candidate));
+                const is_active = active_provider != null and candidate == active_provider.?;
+                const clicked = zgui.invisibleButton("##provider-row", .{
+                    .w = zgui.getWindowWidth(),
+                    .h = provider_row_height,
+                });
+                const is_hovered = zgui.isItemHovered(.{});
+                if (clicked) {
+                    active_provider = candidate;
+                    state.composer_picker_provider = candidate;
+                }
+                drawProviderRowForLastItem(state, candidate, is_active, is_hovered);
+                if (is_hovered) {
+                    active_provider = candidate;
+                    state.composer_picker_provider = candidate;
+                }
+                zgui.popId();
+            }
+            zgui.endChild();
+
+            if (active_provider) |provider| {
+                const provider_index = composerProviderIndex(provider);
+                renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
+            }
         }
     } else {
         state.composer_picker_provider = null;
@@ -658,20 +695,37 @@ fn drawModelPreviewInRect(
     drawChevron(draw_list, chevron_x, chevron_center_y, ui_theme.COLOR_TEXT_SUBTLE);
 }
 
-fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: bool) void {
+fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: bool, is_hovered: bool) void {
     const item_min = zgui.getItemRectMin();
     const item_max = zgui.getItemRectMax();
     const item_height = item_max[1] - item_min[1];
     const draw_list = zgui.getWindowDrawList();
+    const window_pos = zgui.getWindowPos();
+    const row_min_x = window_pos[0];
+    const row_max_x = window_pos[0] + zgui.getWindowWidth();
     const label = chat_threads.providerLabel(provider);
     const text_size = zgui.calcTextSize(label, .{});
     const left_padding = 0.0;
     const icon_slot_width = providerLogoSlotWidth(state, item_height);
+    const row_bg = if (is_active)
+        colors.rgba(52, 54, 64, 255)
+    else if (is_hovered)
+        colors.rgba(42, 44, 52, 255)
+    else
+        null;
+    if (row_bg) |bg| {
+        draw_list.addRectFilled(.{
+            .pmin = .{ row_min_x, item_min[1] },
+            .pmax = .{ row_max_x, item_max[1] },
+            .col = zgui.colorConvertFloat4ToU32(bg),
+            .rounding = ui_theme.scaledUi(8.0),
+        });
+    }
     if (providerLogoTexture(state, provider)) |cached| {
         const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
         const uv_bounds = providerLogoUvBounds(provider);
         const logo_min = .{
-            item_min[0] + left_padding,
+            row_min_x + left_padding,
             item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
         };
         draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
@@ -682,11 +736,11 @@ fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: b
         });
     }
     const text_pos = .{
-        item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(6.0),
+        row_min_x + left_padding + icon_slot_width + ui_theme.scaledUi(6.0),
         item_min[1] + (item_height - text_size[1]) * 0.5,
     };
     draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
-    drawChevron(draw_list, item_max[0] - ui_theme.scaledUi(14.0), item_min[1] + item_height * 0.5, if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_SUBTLE);
+    drawChevron(draw_list, row_max_x - ui_theme.scaledUi(14.0), item_min[1] + item_height * 0.5, if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_SUBTLE);
 }
 
 fn drawModelRowForLastItem(label: []const u8, is_selected: bool) void {
@@ -701,6 +755,68 @@ fn drawModelRowForLastItem(label: []const u8, is_selected: bool) void {
     };
     draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_selected) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
     if (is_selected) drawCheckForLastItem(ui_theme.COLOR_WHITE);
+}
+
+fn drawFlyoutModelRowForLastItem(label: []const u8, is_selected: bool, is_hovered: bool) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const item_height = item_max[1] - item_min[1];
+    const draw_list = zgui.getWindowDrawList();
+    const window_pos = zgui.getWindowPos();
+    const row_min_x = window_pos[0] + ui_theme.scaledUi(2.0);
+    const row_max_x = window_pos[0] + zgui.getWindowWidth() - ui_theme.scaledUi(2.0);
+    const text_size = zgui.calcTextSize(label, .{});
+    const row_bg = if (is_selected)
+        colors.rgba(52, 54, 64, 255)
+    else if (is_hovered)
+        colors.rgba(42, 44, 52, 255)
+    else
+        null;
+    if (row_bg) |bg| {
+        draw_list.addRectFilled(.{
+            .pmin = .{ row_min_x, item_min[1] },
+            .pmax = .{ row_max_x, item_max[1] },
+            .col = zgui.colorConvertFloat4ToU32(bg),
+            .rounding = ui_theme.scaledUi(8.0),
+        });
+    }
+    const text_pos = .{
+        row_min_x + ui_theme.scaledUi(22.0),
+        item_min[1] + (item_height - text_size[1]) * 0.5,
+    };
+    draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_selected) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
+    if (is_selected) drawCheckForCustomRow(ui_theme.COLOR_WHITE, row_min_x + ui_theme.scaledUi(12.0));
+}
+
+fn drawLockedModelRowForLastItem(label: []const u8, is_selected: bool, is_hovered: bool) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const item_height = item_max[1] - item_min[1];
+    const draw_list = zgui.getWindowDrawList();
+    const window_pos = zgui.getWindowPos();
+    const row_min_x = window_pos[0] + ui_theme.scaledUi(4.0);
+    const row_max_x = window_pos[0] + zgui.getWindowWidth() - ui_theme.scaledUi(4.0);
+    const text_size = zgui.calcTextSize(label, .{});
+    const row_bg = if (is_selected)
+        colors.rgba(52, 54, 64, 255)
+    else if (is_hovered)
+        colors.rgba(42, 44, 52, 255)
+    else
+        null;
+    if (row_bg) |bg| {
+        draw_list.addRectFilled(.{
+            .pmin = .{ row_min_x, item_min[1] },
+            .pmax = .{ row_max_x, item_max[1] },
+            .col = zgui.colorConvertFloat4ToU32(bg),
+            .rounding = ui_theme.scaledUi(8.0),
+        });
+    }
+    const text_pos = .{
+        row_min_x + ui_theme.scaledUi(16.0),
+        item_min[1] + (item_height - text_size[1]) * 0.5,
+    };
+    draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_selected) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
+    if (is_selected) drawLockedModelCheckForLastItem(ui_theme.COLOR_WHITE, row_min_x);
 }
 
 fn composerProviderIndex(provider: Provider) usize {
@@ -777,13 +893,18 @@ fn renderComposerModelFlyout(
             thread.provider == provider and std.mem.eql(u8, active_model_ref, value)
         else
             false;
-        if (zgui.selectable("##model-row", .{ .selected = is_selected, .h = model_row_height })) {
+        const clicked = zgui.invisibleButton("##model-row", .{
+            .w = zgui.getWindowWidth() - popup_padding * 2.0,
+            .h = model_row_height,
+        });
+        const is_hovered = zgui.isItemHovered(.{});
+        if (clicked) {
             setThreadProvider(state, thread, provider);
             setThreadModelRef(state, thread, option.value);
             state.composer_picker_provider = null;
             should_close_picker = true;
         }
-        drawModelRowForLastItem(option.label, is_selected);
+        drawFlyoutModelRowForLastItem(option.label, is_selected, is_hovered);
         zgui.popId();
         if (should_close_picker) {
             zgui.closeCurrentPopup();
@@ -881,6 +1002,51 @@ fn drawCheckForLastItem(color: [4]f32) void {
     const draw_list = zgui.getWindowDrawList();
     const col = zgui.colorConvertFloat4ToU32(color);
     const x = item_min[0] + ui_theme.scaledUi(12.0);
+    const center_y = item_min[1] + (item_max[1] - item_min[1]) * 0.5;
+    const small = ui_theme.scaledUi(3.0);
+    const large = ui_theme.scaledUi(6.0);
+    draw_list.addLine(.{
+        .p1 = .{ x - small, center_y },
+        .p2 = .{ x, center_y + small },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ x, center_y + small },
+        .p2 = .{ x + large, center_y - large * 0.6 },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+}
+
+fn drawCheckForCustomRow(color: [4]f32, x: f32) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const draw_list = zgui.getWindowDrawList();
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const center_y = item_min[1] + (item_max[1] - item_min[1]) * 0.5;
+    const small = ui_theme.scaledUi(3.0);
+    const large = ui_theme.scaledUi(6.0);
+    draw_list.addLine(.{
+        .p1 = .{ x - small, center_y },
+        .p2 = .{ x, center_y + small },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ x, center_y + small },
+        .p2 = .{ x + large, center_y - large * 0.6 },
+        .col = col,
+        .thickness = ui_theme.scaledUi(1.8),
+    });
+}
+
+fn drawLockedModelCheckForLastItem(color: [4]f32, row_min_x: f32) void {
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const draw_list = zgui.getWindowDrawList();
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const x = row_min_x + ui_theme.scaledUi(7.0);
     const center_y = item_min[1] + (item_max[1] - item_min[1]) * 0.5;
     const small = ui_theme.scaledUi(3.0);
     const large = ui_theme.scaledUi(6.0);
