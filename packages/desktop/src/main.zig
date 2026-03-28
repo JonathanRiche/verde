@@ -399,7 +399,7 @@ pub fn renderComposerPickers(state: *AppState) void {
     const base_padding_x = ui_theme.scaledUi(12.0);
     const base_padding_y = ui_theme.scaledUi(7.0);
     const provider_logo_gap = ui_theme.scaledUi(8.0);
-    const popup_padding = ui_theme.scaledUi(12.0);
+    const popup_padding = ui_theme.scaledUi(10.0);
     const provider_row_height = ui_theme.scaledUi(38.0);
     const model_row_height = ui_theme.scaledUi(34.0);
     const provider_panel_width = composerProviderPanelWidth(state, provider_row_height);
@@ -453,6 +453,8 @@ pub fn renderComposerPickers(state: *AppState) void {
             active_provider = null;
         }
         const panel_height = provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+        const provider_child_width = provider_panel_width + popup_padding;
+
         state.composer_picker_provider = active_provider;
 
         zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
@@ -461,9 +463,11 @@ pub fn renderComposerPickers(state: *AppState) void {
         defer zgui.popStyleVar(.{ .count = 2 });
         defer zgui.popStyleColor(.{ .count = 1 });
 
+        const popup_cursor = zgui.getCursorPos();
+        zgui.setCursorPos(.{ popup_cursor[0] - popup_padding, popup_cursor[1] });
         const popup_origin = zgui.getCursorScreenPos();
         _ = zgui.beginChild("##provider-panel", .{
-            .w = provider_panel_width,
+            .w = provider_child_width,
             .h = panel_height,
             .child_flags = .{ .border = false },
             .window_flags = .{ .no_saved_settings = true, .no_scrollbar = true, .no_scroll_with_mouse = true },
@@ -471,7 +475,11 @@ pub fn renderComposerPickers(state: *AppState) void {
         for (COMPOSER_PROVIDER_OPTIONS) |candidate| {
             zgui.pushIntId(@intFromEnum(candidate));
             const is_active = active_provider != null and candidate == active_provider.?;
-            if (zgui.selectable("##provider-row", .{ .selected = is_active, .h = provider_row_height })) {
+            if (zgui.selectable("##provider-row", .{
+                .selected = is_active,
+                .w = zgui.getContentRegionAvail()[0],
+                .h = provider_row_height,
+            })) {
                 active_provider = candidate;
                 state.composer_picker_provider = candidate;
             }
@@ -486,7 +494,7 @@ pub fn renderComposerPickers(state: *AppState) void {
 
         if (active_provider) |provider| {
             const provider_index = composerProviderIndex(provider);
-            renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_panel_width, provider_index, model_panel_width, model_row_height);
+            renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
         }
     } else {
         state.composer_picker_provider = null;
@@ -637,11 +645,21 @@ fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: b
     const text_size = zgui.calcTextSize(label, .{});
     const left_padding = 0.0;
     const icon_slot_width = providerLogoSlotWidth(state, item_height);
+    if (providerLogoTexture(state, provider)) |cached| {
+        const logo_size = providerLogoSize(state, provider, item_height - ui_theme.scaledUi(10.0));
+        const logo_min = .{
+            item_min[0] + left_padding,
+            item_min[1] + (item_height - logo_size[1]) * 0.5 + providerLogoYOffset(provider),
+        };
+        draw_list.addImage(textureRefFromGlId(cached.texture_id), .{
+            .pmin = logo_min,
+            .pmax = .{ logo_min[0] + logo_size[0], logo_min[1] + logo_size[1] },
+        });
+    }
     const text_pos = .{
         item_min[0] + left_padding + icon_slot_width + ui_theme.scaledUi(6.0),
         item_min[1] + (item_height - text_size[1]) * 0.5,
     };
-    drawProviderLogoInRect(draw_list, state, provider, item_min, item_height, left_padding);
     draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_MUTED), label);
     drawChevron(draw_list, item_max[0] - ui_theme.scaledUi(14.0), item_min[1] + item_height * 0.5, if (is_active) ui_theme.COLOR_WHITE else ui_theme.COLOR_TEXT_SUBTLE);
 }
