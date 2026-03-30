@@ -6,9 +6,10 @@ const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const chat_panel = @import("chat_panel.zig");
+const runtime = @import("runtime.zig");
 
 /// Lays out the root window and routes to the main UI regions.
-pub fn renderRoot(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     zgui.setNextWindowPos(.{ .x = 0.0, .y = 0.0 });
     zgui.setNextWindowSize(.{ .w = width, .h = height });
 
@@ -33,18 +34,18 @@ pub fn renderRoot(comptime Impl: type, state: *Impl.AppState, width: f32, height
     const sidebar_width = theme.clampf(content[0] * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), content[0] * 0.38));
     const workspace_width = @max(content[0] - sidebar_width - gap, theme.scaledUi(320.0));
     zgui.setCursorPos(.{ 0.0, 0.0 });
-    sidebar.render(Impl, state, sidebar_width, 0.0);
+    sidebar.render(state, sidebar_width, 0.0);
     zgui.sameLine(.{ .spacing = gap });
-    chat_panel.renderWorkspace(Impl, state, workspace_width, content[1]);
-    renderImageModal(Impl, state, width, height);
-    renderProjectRenameModal(Impl, state, width, height);
+    chat_panel.renderWorkspace(state, workspace_width, content[1]);
+    renderImageModal(state, width, height);
+    renderProjectRenameModal(state, width, height);
 }
 
 /// Shows the attachment preview modal for the selected image.
-fn renderImageModal(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const modal_path = state.modal_image_path orelse return;
-    if (!zgui.isPopupOpen(Impl.IMAGE_MODAL_ID, .{})) {
-        zgui.openPopup(Impl.IMAGE_MODAL_ID, .{});
+    if (!zgui.isPopupOpen(runtime.IMAGE_MODAL_ID, .{})) {
+        zgui.openPopup(runtime.IMAGE_MODAL_ID, .{});
     }
 
     const modal_padding_x: f32 = 22.0;
@@ -66,7 +67,7 @@ fn renderImageModal(comptime Impl: type, state: *Impl.AppState, width: f32, heig
     zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = 16.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ modal_padding_x, modal_padding_y } });
     zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 10.0, 8.0 } });
-    if (!zgui.beginPopupModal(Impl.IMAGE_MODAL_ID, .{
+    if (!zgui.beginPopupModal(runtime.IMAGE_MODAL_ID, .{
         .flags = .{
             .no_title_bar = true,
             .no_saved_settings = true,
@@ -144,12 +145,12 @@ fn renderImageModal(comptime Impl: type, state: *Impl.AppState, width: f32, heig
     const image_max_h = @max(avail[1], 80.0);
 
     if (texture) |cached| {
-        const dims = Impl.scaledImageSize(cached.width, cached.height, image_max_w, image_max_h);
+        const dims = runtime.scaledImageSize(cached.width, cached.height, image_max_w, image_max_h);
         const x_offset = (image_max_w - dims[0]) * 0.5;
         const y_offset = (image_max_h - dims[1]) * 0.5;
         if (y_offset > 0.0) zgui.dummy(.{ .w = 0.0, .h = y_offset });
         if (x_offset > 0.0) zgui.setCursorPosX(zgui.getCursorPosX() + x_offset);
-        zgui.image(Impl.textureRefFromGlId(cached.texture_id), .{
+        zgui.image(runtime.textureRefFromGlId(cached.texture_id), .{
             .w = dims[0],
             .h = dims[1],
         });
@@ -159,15 +160,15 @@ fn renderImageModal(comptime Impl: type, state: *Impl.AppState, width: f32, heig
 }
 
 /// Shows the modal used to rename the active project.
-fn renderProjectRenameModal(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) void {
     const rename_index = state.rename_project_index orelse return;
     if (rename_index >= state.projects.items.len) {
         state.rename_project_index = null;
         return;
     }
 
-    if (!zgui.isPopupOpen(Impl.PROJECT_RENAME_MODAL_ID, .{})) {
-        zgui.openPopup(Impl.PROJECT_RENAME_MODAL_ID, .{});
+    if (!zgui.isPopupOpen(runtime.PROJECT_RENAME_MODAL_ID, .{})) {
+        zgui.openPopup(runtime.PROJECT_RENAME_MODAL_ID, .{});
     }
 
     zgui.setNextWindowPos(.{
@@ -186,7 +187,7 @@ fn renderProjectRenameModal(comptime Impl: type, state: *Impl.AppState, width: f
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(18.0) } });
     zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ theme.scaledUi(10.0), theme.scaledUi(10.0) } });
     var modal_open = true;
-    if (!zgui.beginPopupModal(Impl.PROJECT_RENAME_MODAL_ID, .{
+    if (!zgui.beginPopupModal(runtime.PROJECT_RENAME_MODAL_ID, .{
         .popen = &modal_open,
         .flags = .{ .no_saved_settings = true },
     })) {

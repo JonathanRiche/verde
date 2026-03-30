@@ -4,9 +4,10 @@ const std = @import("std");
 const zgui = @import("zgui");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
+const runtime = @import("runtime.zig");
 
 /// Renders the full project rail and thread list.
-pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     _ = height;
     const horiz_pad = theme.scaledUi(25.0);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
@@ -46,7 +47,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
     const project_header_button_width = theme.clampf(rail_width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
     const rail_inner_width = @max(rail_width, theme.scaledUi(140.0));
-    renderBrand(Impl, state, width);
+    renderBrand(state, width);
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(18.0) });
     zgui.textColored(theme.COLOR_TEXT_MUTED, "PROJECTS", .{});
     zgui.sameLine(.{ .spacing = 0.0 });
@@ -204,7 +205,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
                 if (zgui.menuItem("Rename project", .{})) {
                     state.beginProjectRename(index);
-                    zgui.openPopup(Impl.PROJECT_RENAME_MODAL_ID, .{});
+                    zgui.openPopup(runtime.PROJECT_RENAME_MODAL_ID, .{});
                     zgui.closeCurrentPopup();
                 }
                 if (zgui.menuItem("Remove project", .{})) {
@@ -217,7 +218,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
 
         zgui.sameLine(.{});
         zgui.setCursorPosX(width - horiz_pad - project_action_width);
-        if (renderThreadEditButton(Impl, state, project_action_width, row_height)) {
+        if (renderThreadEditButton(state, project_action_width, row_height)) {
             state.createThreadForProject(index);
             break;
         }
@@ -239,15 +240,15 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
             };
             defer sorted_indices.deinit(state.allocator);
 
-            const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.items.len <= Impl.SIDEBAR_VISIBLE_THREAD_LIMIT;
-            const visible_count = if (show_all_threads) sorted_indices.items.len else @min(sorted_indices.items.len, Impl.SIDEBAR_VISIBLE_THREAD_LIMIT);
+            const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.items.len <= runtime.SIDEBAR_VISIBLE_THREAD_LIMIT;
+            const visible_count = if (show_all_threads) sorted_indices.items.len else @min(sorted_indices.items.len, runtime.SIDEBAR_VISIBLE_THREAD_LIMIT);
 
             for (sorted_indices.items[0..visible_count]) |thread_index| {
                 const thread = &state.projects.items[index].threads.items[thread_index];
                 renderThreadRow(state, index, rail_width - sub_indent, thread, thread_index);
             }
 
-            if (sorted_indices.items.len > Impl.SIDEBAR_VISIBLE_THREAD_LIMIT) {
+            if (sorted_indices.items.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
                 if (zgui.button(if (state.projects.items[index].thread_list_expanded) "Show less" else "Show more", .{
                     .w = @max(rail_width - sub_indent, theme.scaledUi(110.0)),
@@ -273,7 +274,7 @@ pub fn render(comptime Impl: type, state: *Impl.AppState, width: f32, height: f3
     }
 }
 
-fn renderThreadEditButton(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) bool {
+fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) bool {
     const start = zgui.getCursorScreenPos();
     const clicked = zgui.invisibleButton("##thread-edit-button", .{ .w = width, .h = height });
     const hovered = zgui.isItemHovered(.{});
@@ -296,7 +297,7 @@ fn renderThreadEditButton(comptime Impl: type, state: *Impl.AppState, width: f32
             start[0] + (width - icon_size) * 0.5,
             start[1] + (height - icon_size) * 0.5,
         };
-        draw_list.addImage(Impl.textureRefFromGlId(cached.texture_id), .{
+        draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
             .pmin = image_min,
             .pmax = .{ image_min[0] + icon_size, image_min[1] + icon_size },
         });
@@ -306,7 +307,7 @@ fn renderThreadEditButton(comptime Impl: type, state: *Impl.AppState, width: f32
 }
 
 /// Draws the sidebar brand row with logo and title, centered horizontally.
-fn renderBrand(comptime Impl: type, state: anytype, sidebar_width: f32) void {
+fn renderBrand(state: *runtime.AppState, sidebar_width: f32) void {
     const start = zgui.getCursorPos();
     const spacing = theme.scaledUi(10.0);
     const fallback_logo_size = theme.scaledUi(28.0);
@@ -336,7 +337,7 @@ fn renderBrand(comptime Impl: type, state: anytype, sidebar_width: f32) void {
 
     if (state.logo_texture) |cached| {
         zgui.setCursorPos(.{ brand_x, start[1] });
-        zgui.image(Impl.textureRefFromGlId(cached.texture_id), .{
+        zgui.image(runtime.textureRefFromGlId(cached.texture_id), .{
             .w = logo_width,
             .h = logo_height,
         });

@@ -5,11 +5,13 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const colors = @import("colors.zig");
+const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
+const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
-fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
+fn inner_workspace(state: *app_state.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
     const available_width = zgui.getContentRegionAvail();
     // app_state.log.debug("available width: {d}", .{available_width[0]});
@@ -51,16 +53,16 @@ fn inner_workspace(comptime Impl: type, state: *Impl.AppState) void {
     const content = zgui.getContentRegionAvail();
     const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
     const transcript_height = @max(content[1] - composer_height - theme.scaledUi(8.0), theme.scaledUi(120.0));
-    renderTranscript(Impl, state, content[0], transcript_height, inner_pad_x);
+    renderTranscript(state, content[0], transcript_height, inner_pad_x);
     // Indent composer so it stays centered while transcript scrollbar is at far right.
     zgui.indent(.{ .indent_w = inner_pad_x });
     const composer_width = @max(content[0] - 2 * inner_pad_x, theme.scaledUi(120.0));
-    renderComposer(Impl, state, composer_width, @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+    renderComposer(state, composer_width, @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
     zgui.unindent(.{ .indent_w = inner_pad_x });
 }
 
 /// Renders the chat workspace shell beside the sidebar.
-pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void {
     _ = width;
     _ = height;
     zgui.setCursorPos(.{ zgui.getCursorPosX(), 0.0 });
@@ -83,7 +85,7 @@ pub fn renderWorkspace(comptime Impl: type, state: *Impl.AppState, width: f32, h
     zgui.separator();
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(5.0) });
     //END OUTER UI FOR CHAT WORKSPACE
-    inner_workspace(Impl, state);
+    inner_workspace(state);
 }
 
 /// Renders the current thread title block.
@@ -120,7 +122,7 @@ fn renderHeader(state: anytype) void {
 }
 
 /// Renders transcript history plus any in-flight stream state.
-fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32, pad_x: f32) void {
+fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: f32) void {
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     _ = zgui.beginChild("Transcript", .{
         .w = width,
@@ -130,7 +132,7 @@ fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, heig
     defer zgui.endChild();
 
     const should_follow_stream = transcriptShouldAutoFollow(state);
-    const has_pending_stream = Impl.isSendPending(state);
+    const has_pending_stream = runtime.isSendPending(state);
 
     // Inner content wrapper with horizontal padding; auto-resizes vertically so the
     // outer Transcript child handles scrolling while content stays centered.
@@ -153,15 +155,15 @@ fn renderTranscript(comptime Impl: type, state: *Impl.AppState, width: f32, heig
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
     } else {
         for (state.currentThread().messages.items, 0..) |message, index| {
-            renderTranscriptMessage(Impl, state, @intCast(index + 1), message.role, message.author, message.body, message.image);
+            renderTranscriptMessage(state, @intCast(index + 1), message.role, message.author, message.body, message.image);
             zgui.dummy(.{ .w = 0.0, .h = 10.0 });
         }
 
         if (has_pending_stream) {
             renderPendingApproval(state);
-            renderPendingDiffCard(Impl, state);
-            renderPendingTimelineEvents(Impl, state);
-            renderPendingTranscriptBubble(Impl, state);
+            renderPendingDiffCard(state);
+            renderPendingTimelineEvents(state);
+            renderPendingTranscriptBubble(state);
             zgui.dummy(.{ .w = 0.0, .h = 6.0 });
         }
     }
@@ -203,7 +205,7 @@ fn renderPendingApproval(state: anytype) void {
 }
 
 /// Renders streamed timeline events while a send is pending.
-fn renderPendingTimelineEvents(comptime Impl: type, state: *Impl.AppState) void {
+fn renderPendingTimelineEvents(state: *app_state.AppState) void {
     state.send_state.mutex.lock();
     defer state.send_state.mutex.unlock();
 
@@ -212,13 +214,13 @@ fn renderPendingTimelineEvents(comptime Impl: type, state: *Impl.AppState) void 
     if (state.send_state.thread_index != state.currentProject().selected_thread_index) return;
 
     for (state.send_state.pending_events.items, 0..) |event, index| {
-        renderTranscriptMessage(Impl, state, @intCast(50_000 + index), event.role, event.author, event.body, null);
+        renderTranscriptMessage(state, @intCast(50_000 + index), event.role, event.author, event.body, null);
         zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     }
 }
 
 /// Renders the live diff summary card for streamed file changes.
-fn renderPendingDiffCard(comptime Impl: type, state: *Impl.AppState) void {
+fn renderPendingDiffCard(state: *app_state.AppState) void {
     state.send_state.mutex.lock();
     defer state.send_state.mutex.unlock();
 
@@ -269,7 +271,7 @@ fn renderPendingDiffCardLocked(files: anytype) void {
 }
 
 /// Renders the streamed assistant bubble placeholder or partial text.
-fn renderPendingTranscriptBubble(comptime Impl: type, state: *Impl.AppState) void {
+fn renderPendingTranscriptBubble(state: *app_state.AppState) void {
     state.send_state.mutex.lock();
     defer state.send_state.mutex.unlock();
 
@@ -282,7 +284,7 @@ fn renderPendingTranscriptBubble(comptime Impl: type, state: *Impl.AppState) voi
         state,
         "pending-assistant",
         .assistant,
-        Impl.providerLabel(state.currentThread().provider),
+        runtime.providerLabel(state.currentThread().provider),
         if (stream_text.len > 0) stream_text else "Waiting for streamed output...",
         null,
         stream_text.len == 0,
@@ -290,9 +292,9 @@ fn renderPendingTranscriptBubble(comptime Impl: type, state: *Impl.AppState) voi
 }
 
 /// Dispatches a transcript item to the right visual treatment.
-fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, role: Impl.ChatRole, author: []const u8, body: []const u8, image: ?Impl.ChatImageAttachment) void {
+fn renderTranscriptMessage(state: *app_state.AppState, id: u32, role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) void {
     if (role == .system and std.mem.eql(u8, author, "Changed files")) {
-        renderChangedFilesCardId(Impl, id, body);
+        renderChangedFilesCardId(id, body);
         return;
     }
     if (role == .system and (std.mem.eql(u8, author, "Ran command") or std.mem.eql(u8, author, "Command failed"))) {
@@ -300,7 +302,7 @@ fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, 
         return;
     }
 
-    const bubble_height = transcriptBubbleHeight(Impl, role, author, body, image);
+    const bubble_height = transcriptBubbleHeight(role, author, body, image);
     const bubble_theme = transcriptBubbleTheme(role);
     const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
@@ -331,7 +333,7 @@ fn renderTranscriptMessage(comptime Impl: type, state: *Impl.AppState, id: u32, 
         zgui.dummy(.{ .w = 0.0, .h = 2.0 });
     }
     if (image) |attachment| {
-        renderImageAttachmentCard(Impl, state, attachment, false);
+        renderImageAttachmentCard(state, attachment, false);
         if (body.len > 0) {
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
@@ -374,7 +376,7 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
         zgui.dummy(.{ .w = 0.0, .h = 2.0 });
     }
     if (image) |attachment| {
-        renderImageAttachmentCard(@TypeOf(state.*), state, attachment, false);
+        renderImageAttachmentCard(state, attachment, false);
         if (body.len > 0) {
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
@@ -423,8 +425,8 @@ fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
 }
 
 /// Renders a persisted changed-files message as a rich card.
-fn renderChangedFilesCardId(comptime Impl: type, id: u32, body: []const u8) void {
-    var entries = parseChangedFileEntries(Impl, body);
+fn renderChangedFilesCardId(id: u32, body: []const u8) void {
+    var entries = parseChangedFileEntries(body);
     const totals = summarizeChangedFiles(entries);
     const has_patch_details = changedFilesEntriesHavePatch(entries.items);
     const card_height = if (has_patch_details) detailedChangedFilesCardHeight(entries.items) else changedFilesCardHeight(entries.items.len);
@@ -632,7 +634,7 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
 }
 
 /// Renders the composer card, input, pickers, and send button.
-fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height: f32) void {
+fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     const composer_bg = colors.GREEN_600;
     const composer_rounding = theme.scaledUi(18.0);
     state.composer_focused = false;
@@ -665,7 +667,7 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
     }
 
     if (state.currentThread().draft_image) |image| {
-        renderComposerAttachmentPreview(Impl, state, image);
+        renderComposerAttachmentPreview(state, image);
         zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
     }
 
@@ -704,7 +706,7 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
     }
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
-    Impl.renderComposerPickers(state);
+    composer_pickers.render(state);
 
     const send_btn_size = theme.scaledUi(32.0);
     zgui.sameLine(.{ .spacing = 0.0 });
@@ -714,7 +716,7 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
     }
 
     {
-        const pending = Impl.isSendPending(state);
+        const pending = runtime.isSendPending(state);
         const btn_pos = zgui.getCursorScreenPos();
         const clicked = zgui.invisibleButton("##send-btn", .{ .w = send_btn_size, .h = send_btn_size });
         const hovered = zgui.isItemHovered(.{});
@@ -767,19 +769,18 @@ fn renderComposer(comptime Impl: type, state: *Impl.AppState, width: f32, height
                 return;
             }
             state.sendDraft() catch |err| {
-                Impl.log.err("failed to send draft: {s}", .{@errorName(err)});
+                runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
             };
         }
     }
 
     if (state.hasActiveFileSearch()) {
-        renderComposerFileSearchResults(Impl, state, composer_screen_pos, width, input_rect_min, input_rect_max);
+        renderComposerFileSearchResults(state, composer_screen_pos, width, input_rect_min, input_rect_max);
     }
 }
 
 fn renderComposerFileSearchResults(
-    comptime Impl: type,
-    state: *Impl.AppState,
+    state: *app_state.AppState,
     composer_screen_pos: [2]f32,
     composer_width: f32,
     input_rect_min: [2]f32,
@@ -902,11 +903,11 @@ fn renderComposerFileSearchResults(
 }
 
 /// Draws the compact attachment preview above the composer.
-fn renderComposerAttachmentPreview(comptime Impl: type, state: *Impl.AppState, image: Impl.ChatImageAttachment) void {
+fn renderComposerAttachmentPreview(state: *app_state.AppState, image: app_state.ChatImageAttachment) void {
     zgui.beginGroup();
     defer zgui.endGroup();
 
-    renderImageAttachmentCard(Impl, state, image, true);
+    renderImageAttachmentCard(state, image, true);
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(52, 54, 61, 255) });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(74, 76, 84, 255) });
@@ -918,7 +919,7 @@ fn renderComposerAttachmentPreview(comptime Impl: type, state: *Impl.AppState, i
 }
 
 /// Draws an image attachment card in transcript or composer mode.
-fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: Impl.ChatImageAttachment, compact: bool) void {
+fn renderImageAttachmentCard(state: *app_state.AppState, image: app_state.ChatImageAttachment, compact: bool) void {
     const avail_width = @max(zgui.getContentRegionAvail()[0], theme.scaledUi(120.0));
     const card_width: f32 = if (compact)
         theme.clampf(avail_width, theme.scaledUi(196.0), theme.scaledUi(320.0))
@@ -933,7 +934,7 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
     const preview_height: f32 = if (compact) card_height - (card_padding * 2.0) else theme.clampf(card_height * 0.62, theme.scaledUi(116.0), theme.scaledUi(180.0));
     const start = zgui.getCursorScreenPos();
     var byte_size_buf = std.mem.zeroes([32:0]u8);
-    const byte_size_text = Impl.formatByteSize(&byte_size_buf, image.byte_size);
+    const byte_size_text = runtime.formatByteSize(&byte_size_buf, image.byte_size);
 
     zgui.dummy(.{ .w = card_width, .h = card_height });
     const draw_list = zgui.getWindowDrawList();
@@ -963,12 +964,12 @@ fn renderImageAttachmentCard(comptime Impl: type, state: *Impl.AppState, image: 
     zgui.setCursorScreenPos(.{ start[0] + card_padding, start[1] + card_padding });
     const texture = state.ensureImageTexture(image.path);
     if (texture) |cached| {
-        const dims = Impl.scaledImageSize(cached.width, cached.height, preview_width, preview_height);
+        const dims = runtime.scaledImageSize(cached.width, cached.height, preview_width, preview_height);
         const x_offset = (preview_width - dims[0]) * 0.5;
         const y_offset = (preview_height - dims[1]) * 0.5;
         const image_pos = [2]f32{ start[0] + card_padding + x_offset, start[1] + card_padding + y_offset };
         zgui.setCursorScreenPos(image_pos);
-        zgui.image(Impl.textureRefFromGlId(cached.texture_id), .{
+        zgui.image(runtime.textureRefFromGlId(cached.texture_id), .{
             .w = dims[0],
             .h = dims[1],
         });
@@ -1046,7 +1047,7 @@ fn transcriptShouldAutoFollow(state: anytype) bool {
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
-fn transcriptBubbleHeight(comptime Impl: type, role: Impl.ChatRole, author: []const u8, body: []const u8, image: ?Impl.ChatImageAttachment) f32 {
+fn transcriptBubbleHeight(role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) f32 {
     return transcriptBubbleHeightGeneric(role, author, body, image);
 }
 
@@ -1114,12 +1115,12 @@ fn pendingDiffPatchHeight(patch: []const u8) f32 {
 }
 
 /// Parses changed-file text from legacy or streamed bodies.
-fn parseChangedFileEntries(comptime Impl: type, body: []const u8) std.ArrayListUnmanaged(Impl.ChangedFileEntry) {
-    if (std.mem.startsWith(u8, body, Impl.PERSISTED_DIFF_MARKER)) {
-        return parsePersistedDiffEntries(Impl, body);
+fn parseChangedFileEntries(body: []const u8) std.ArrayListUnmanaged(runtime.ChangedFileEntry) {
+    if (std.mem.startsWith(u8, body, runtime.PERSISTED_DIFF_MARKER)) {
+        return parsePersistedDiffEntries(body);
     }
 
-    var entries: std.ArrayListUnmanaged(Impl.ChangedFileEntry) = .empty;
+    var entries: std.ArrayListUnmanaged(runtime.ChangedFileEntry) = .empty;
     var lines = std.mem.tokenizeScalar(u8, body, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
@@ -1145,9 +1146,9 @@ fn parseChangedFileEntries(comptime Impl: type, body: []const u8) std.ArrayListU
 }
 
 /// Parses the persisted diff wire format into file entries.
-fn parsePersistedDiffEntries(comptime Impl: type, body: []const u8) std.ArrayListUnmanaged(Impl.ChangedFileEntry) {
-    var entries: std.ArrayListUnmanaged(Impl.ChangedFileEntry) = .empty;
-    var cursor: usize = Impl.PERSISTED_DIFF_MARKER.len;
+fn parsePersistedDiffEntries(body: []const u8) std.ArrayListUnmanaged(runtime.ChangedFileEntry) {
+    var entries: std.ArrayListUnmanaged(runtime.ChangedFileEntry) = .empty;
+    var cursor: usize = runtime.PERSISTED_DIFF_MARKER.len;
 
     while (cursor < body.len) {
         const line_end_rel = std.mem.indexOfScalarPos(u8, body, cursor, '\n') orelse break;
