@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "fff": {
-      "type": "stdio",
-      "command": "/Users/neogoose/dev/fff.nvim/target/release/fff-mcp",
-      "args": []
-    }
-  }
-}
