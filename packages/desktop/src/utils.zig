@@ -28,6 +28,11 @@ pub const PickDirectoryError = std.process.Child.RunError || std.mem.Allocator.E
     ChildProcessFailed,
 };
 
+pub const OpenProjectError = std.mem.Allocator.Error || error{
+    UnsupportedOperatingSystem,
+    LauncherUnavailable,
+} || std.process.Child.SpawnError;
+
 pub fn loadEmbeddedTexture(bytes: []const u8) ?app_state.CachedImageTexture {
     const loaded = stb_image.loadFromMemory(bytes) catch |err| {
         app_state.log.err("failed to decode embedded logo texture: {s}", .{@errorName(err)});
@@ -81,6 +86,52 @@ pub fn projectLabelFromPath(path: []const u8) []const u8 {
     const basename = std.fs.path.basename(path);
     return if (basename.len == 0) path else basename;
 }
+
+pub fn canOpenProjectDirectory() bool {
+    return switch (@import("builtin").os.tag) {
+        .macos => commandExists("open"),
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => commandExists("xdg-open") or commandExists("gio"),
+        else => false,
+    };
+}
+
+pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
+    return switch (@import("builtin").os.tag) {
+        .macos => spawnDetached(allocator, &.{ "open", project_path }, null),
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            if (commandExists("xdg-open")) return spawnDetached(allocator, &.{ "xdg-open", project_path }, null);
+            if (commandExists("gio")) return spawnDetached(allocator, &.{ "gio", "open", project_path }, null);
+            return error.LauncherUnavailable;
+        },
+        else => error.UnsupportedOperatingSystem,
+    };
+}
+
+pub fn canOpenProjectEditor(target: app_state.ProjectEditorTarget) bool {
+    return switch (target) {
+        .configured => preferredEditorEnvName() != null,
+        .cursor => hasCursorLauncher(),
+        .vscode => hasVsCodeLauncher(),
+        .zed => hasZedLauncher(),
+    };
+}
+
+pub fn openProjectEditor(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    target: app_state.ProjectEditorTarget,
+) OpenProjectError!void {
+    return switch (target) {
+        .configured => {
+            const env_name = preferredEditorEnvName() orelse return error.LauncherUnavailable;
+            return openConfiguredEditor(allocator, env_name, project_path);
+        },
+        .cursor => openCursor(allocator, project_path),
+        .vscode => openVsCode(allocator, project_path),
+        .zed => openZed(allocator, project_path),
+    };
+}
+
 pub fn pickerWorker(state: *app_state.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 
@@ -340,6 +391,103 @@ fn escapeAppleScriptString(allocator: std.mem.Allocator, value: []const u8) ![]u
 
     return escaped.toOwnedSlice(allocator);
 }
+
+fn spawnDetached(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+) std.process.Child.SpawnError!void {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.cwd = cwd;
+    try child.spawn();
+}
+
+fn preferredEditorEnvName() ?[]const u8 {
+    const visual = std.posix.getenv("VISUAL");
+    if (visual) |value| {
+        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) return "VISUAL";
+    }
+
+    const editor = std.posix.getenv("EDITOR");
+    if (editor) |value| {
+        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) return "EDITOR";
+    }
+    return null;
+}
+
+fn openConfiguredEditor(
+    allocator: std.mem.Allocator,
+    env_name: []const u8,
+    project_path: []const u8,
+) OpenProjectError!void {
+    const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{env_name});
+    defer allocator.free(script);
+    return spawnDetached(allocator, &.{ "sh", "-lc", script, "verde-open-editor", project_path }, project_path);
+}
+
+fn hasCursorLauncher() bool {
+    if (commandExists("cursor")) return true;
+    return macApplicationExists("Cursor");
+}
+
+fn openCursor(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
+    if (commandExists("cursor")) return spawnDetached(allocator, &.{ "cursor", project_path }, project_path);
+    if (macApplicationExists("Cursor")) return openMacApplication(allocator, "Cursor", project_path);
+    return error.LauncherUnavailable;
+}
+
+fn hasVsCodeLauncher() bool {
+    if (commandExists("code") or commandExists("code-insiders")) return true;
+    return macApplicationExists("Visual Studio Code") or macApplicationExists("Visual Studio Code - Insiders");
+}
+
+fn openVsCode(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
+    if (commandExists("code")) return spawnDetached(allocator, &.{ "code", project_path }, project_path);
+    if (commandExists("code-insiders")) return spawnDetached(allocator, &.{ "code-insiders", project_path }, project_path);
+    if (macApplicationExists("Visual Studio Code")) return openMacApplication(allocator, "Visual Studio Code", project_path);
+    if (macApplicationExists("Visual Studio Code - Insiders")) return openMacApplication(allocator, "Visual Studio Code - Insiders", project_path);
+    return error.LauncherUnavailable;
+}
+
+fn hasZedLauncher() bool {
+    if (commandExists("zed") or commandExists("zeditor")) return true;
+    return macApplicationExists("Zed");
+}
+
+fn openZed(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
+    if (commandExists("zed")) return spawnDetached(allocator, &.{ "zed", project_path }, project_path);
+    if (commandExists("zeditor")) return spawnDetached(allocator, &.{ "zeditor", project_path }, project_path);
+    if (macApplicationExists("Zed")) return openMacApplication(allocator, "Zed", project_path);
+    return error.LauncherUnavailable;
+}
+
+fn openMacApplication(allocator: std.mem.Allocator, app_name: []const u8, project_path: []const u8) OpenProjectError!void {
+    if (!commandExists("open")) return error.LauncherUnavailable;
+    return spawnDetached(allocator, &.{ "open", "-a", app_name, project_path }, project_path);
+}
+
+fn macApplicationExists(app_name: []const u8) bool {
+    if (@import("builtin").os.tag != .macos) return false;
+
+    const system_path = std.fmt.allocPrint(std.heap.page_allocator, "/Applications/{s}.app", .{app_name}) catch return false;
+    defer std.heap.page_allocator.free(system_path);
+    if (directoryExistsAbsolute(system_path)) return true;
+
+    const home = std.posix.getenv("HOME") orelse return false;
+    const user_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/Applications/{s}.app", .{ home, app_name }) catch return false;
+    defer std.heap.page_allocator.free(user_path);
+    return directoryExistsAbsolute(user_path);
+}
+
+fn directoryExistsAbsolute(path: []const u8) bool {
+    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    defer dir.close();
+    return true;
+}
+
 fn commandExists(name: []const u8) bool {
     const path_env = std.posix.getenv("PATH") orelse return false;
     var parts = std.mem.splitScalar(u8, path_env, ':');

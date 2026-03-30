@@ -11,6 +11,8 @@ const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
+const HEADER_OPEN_MENU_ID: [:0]const u8 = "ChatHeaderOpenMenu";
+
 fn inner_workspace(state: *app_state.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
     const available_width = zgui.getContentRegionAvail();
@@ -90,7 +92,6 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 
 /// Renders the current thread title block.
 fn renderHeader(state: anytype) void {
-    const thread = state.currentThread();
     const header_height = theme.scaledUi(60.0);
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(28.0), theme.scaledUi(18.0) } });
@@ -112,13 +113,122 @@ fn renderHeader(state: anytype) void {
         },
     });
     defer zgui.endChild();
+
+    const has_project = state.projects.items.len > 0;
+    const title_text = if (has_project)
+        if (state.currentThread().committed) state.currentThread().title else "New chat"
+    else
+        "No project selected";
+
     if (theme.heading_font) |font| {
         zgui.pushFont(font, 18);
         defer zgui.popFont();
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{if (thread.committed) thread.title else "New chat"});
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{title_text});
     } else {
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{if (thread.committed) thread.title else "New chat"});
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{title_text});
     }
+
+    if (!has_project) return;
+
+    const button_height = theme.scaledUi(30.0);
+    const button_gap = theme.scaledUi(8.0);
+    const open_button_width = theme.scaledUi(82.0);
+    const menu_button_width = theme.scaledUi(30.0);
+    const browser_button_width = theme.scaledUi(88.0);
+    const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
+    const avail_width = zgui.getWindowContentRegionMax()[0] - zgui.getWindowContentRegionMin()[0];
+    const action_x = @max(theme.scaledUi(180.0), avail_width - actions_width);
+    const base_y = theme.scaledUi(6.0);
+    const can_open_folder = state.canOpenCurrentProjectDirectory();
+    const can_open_configured = state.canOpenCurrentProjectEditor(.configured);
+    const can_open_cursor = state.canOpenCurrentProjectEditor(.cursor);
+    const can_open_vscode = state.canOpenCurrentProjectEditor(.vscode);
+    const can_open_zed = state.canOpenCurrentProjectEditor(.zed);
+
+    zgui.setCursorPos(.{ action_x, base_y });
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(14.0), theme.scaledUi(8.0) } });
+    defer zgui.popStyleVar(.{ .count = 1 });
+
+    zgui.beginDisabled(.{ .disabled = !can_open_folder });
+    if (renderHeaderActionButton("Open", open_button_width, button_height, theme.COLOR_SECONDARY_GREEN, theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10), theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08))) {
+        state.openCurrentProjectDirectory();
+    }
+    if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted(if (can_open_folder) "Open this project's folder" else "No system folder opener was found");
+        zgui.endTooltip();
+    }
+    zgui.endDisabled();
+
+    zgui.sameLine(.{ .spacing = button_gap });
+    const menu_button_pos = zgui.getCursorScreenPos();
+    if (renderHeaderActionButton("v", menu_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
+        zgui.openPopup(HEADER_OPEN_MENU_ID, .{});
+    }
+
+    zgui.setNextWindowPos(.{
+        .x = menu_button_pos[0],
+        .y = menu_button_pos[1] + button_height + theme.scaledUi(6.0),
+        .cond = .appearing,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(12.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(8.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = colors.rgba(26, 28, 34, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(66, 68, 78, 255) });
+    defer {
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+    if (zgui.beginPopup(HEADER_OPEN_MENU_ID, .{})) {
+        defer zgui.endPopup();
+
+        if (zgui.menuItem("Open folder", .{ .enabled = can_open_folder })) {
+            state.openCurrentProjectDirectory();
+            zgui.closeCurrentPopup();
+        }
+        if (can_open_configured and zgui.menuItem("Open in configured editor", .{})) {
+            state.openCurrentProjectEditor(.configured);
+            zgui.closeCurrentPopup();
+        }
+        if (can_open_cursor and zgui.menuItem("Open in Cursor", .{})) {
+            state.openCurrentProjectEditor(.cursor);
+            zgui.closeCurrentPopup();
+        }
+        if (can_open_vscode and zgui.menuItem("Open in VS Code", .{})) {
+            state.openCurrentProjectEditor(.vscode);
+            zgui.closeCurrentPopup();
+        }
+        if (can_open_zed and zgui.menuItem("Open in Zed", .{})) {
+            state.openCurrentProjectEditor(.zed);
+            zgui.closeCurrentPopup();
+        }
+    }
+
+    zgui.sameLine(.{ .spacing = button_gap });
+    zgui.beginDisabled(.{});
+    defer zgui.endDisabled();
+    _ = renderHeaderActionButton("Browser", browser_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14));
+    if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted("Reserved for the upcoming browser action");
+        zgui.endTooltip();
+    }
+}
+
+fn renderHeaderActionButton(
+    label: [:0]const u8,
+    width: f32,
+    height: f32,
+    base_color: [4]f32,
+    hover_color: [4]f32,
+    active_color: [4]f32,
+) bool {
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = base_color });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = hover_color });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = active_color });
+    defer zgui.popStyleColor(.{ .count = 3 });
+    return zgui.button(label, .{ .w = width, .h = height });
 }
 
 /// Renders transcript history plus any in-flight stream state.
