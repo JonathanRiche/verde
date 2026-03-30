@@ -2,8 +2,6 @@
 members = [
   "crates/fff-c",
   "crates/fff-core",
-  "crates/fff-mcp",
-  "crates/fff-nvim",
   "crates/fff-query-parser",
   "crates/fff-grep",
 ]

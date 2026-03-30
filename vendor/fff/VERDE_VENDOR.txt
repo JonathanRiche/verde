@@ -1,5 +1,9 @@
 Vendored for Verde desktop integration.
 
 Upstream repository: https://github.com/dmtrKovalenko/fff.nvim
-Pinned tag: v0.4.2
+Pinned ref: v0.4.2
 Pinned commit: 85130958bdd15549278298b40e6a9728b0eb555f
+
+Managed by: scripts/vendor/update-fff.sh
+Local patches: patches/fff/*.patch
+Contents: minimal Rust workspace needed for Verde's fff-c integration
