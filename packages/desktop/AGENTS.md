@@ -105,6 +105,8 @@ const foo = Type{ .field = value };     // Avoid
 
 **Documentation:** Use `///` for public API, `//` for implementation notes. Always explain *why*, not just *what*.
 
+**UI methods:** In `packages/desktop/src/ui`, always add a short leading comment for each UI-rendering method explaining what region/component it renders. If a UI method uses non-obvious layout constants or geometry, add a brief comment explaining why.
+
 **Tests:** Inline in the same file, register in src/main.zig test block
 
 ## Safety Conventions
@@ -128,7 +130,7 @@ Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/do
 
 ## Native UI Stack
 
-`packages/native` is a native desktop app built on:
+`packages/desktop` is a native desktop app built on:
 - `SDL3` via `zsdl3` for window creation, events, display/usable-bounds queries, and OpenGL context setup
 - `OpenGL` for final rendering
 - `zgui` as the Zig binding layer for Dear ImGui
@@ -139,7 +141,7 @@ In practice:
 - `zgui.backend` bridges SDL3 + OpenGL into ImGui
 - `main.zig` is responsible for choosing the correct size space for layout and for feeding the backend the right dimensions every frame
 
-When editing UI in `packages/native`, assume this is an ImGui app first, not a web/CSS layout.
+When editing UI in `packages/desktop`, assume this is an ImGui app first, not a web/CSS layout.
 
 ## Coordinate Spaces
 
@@ -211,7 +213,7 @@ If you must add a constant, prefer naming it and documenting why it exists.
 
 ## Responsive Layout Checklist
 
-When changing any major UI in `packages/native`, verify all of these:
+When changing any major UI in `packages/desktop`, verify all of these:
 - Ultrawide desktop: layout should expand without leaving controls stranded in corners
 - Typical laptop width: no giant unused black region, no clipped root UI
 - Shorter laptop height: transcript and composer must both remain usable

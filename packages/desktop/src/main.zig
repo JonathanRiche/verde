@@ -112,18 +112,22 @@ pub fn main() !void {
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
 
+    // Initialize the core ImGui/zgui context and allocate its global state.
     zgui.init(allocator);
     defer zgui.deinit();
+    // Install the font atlas used by the desktop UI before the backend starts rendering.
     ui_theme.installFonts(
         CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
         CODICON_BYTES[0..CODICON_BYTES.len],
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
         ui_config.font_size,
     );
+    // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
     zgui.backend.init(window, gl_context);
     defer zgui.backend.deinit();
 
     var ui_scale = currentWindowDisplayScale(window);
+    // Apply the global ImGui style after the display scale is known.
     ui_theme.applyTheme(ui_scale);
 
     var state = try AppState.init(allocator, &storage);
@@ -147,7 +151,9 @@ pub fn main() !void {
             ui_theme.applyTheme(ui_scale);
         }
 
+        // Begin a fresh ImGui frame for the current framebuffer size.
         zgui.backend.newFrame(@intCast(fb_width), @intCast(fb_height));
+        // Render the root application layout for this frame.
         ui_layout.renderRoot(&state, @floatFromInt(fb_width), @floatFromInt(fb_height));
         state.flushIfDirty();
 
