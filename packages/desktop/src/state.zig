@@ -15,6 +15,12 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+pub const ProjectEditorTarget = enum {
+    configured,
+    cursor,
+    vscode,
+    zed,
+};
 
 pub const log = std.log.scoped(.native_shell);
 
@@ -1088,6 +1094,42 @@ pub const AppState = struct {
         return &self.projects.items[self.selected_project_index];
     }
 
+    pub fn canOpenCurrentProjectDirectory(self: *const AppState) bool {
+        return self.projects.items.len > 0 and utils.canOpenProjectDirectory();
+    }
+
+    pub fn canOpenCurrentProjectEditor(self: *const AppState, target: ProjectEditorTarget) bool {
+        return self.projects.items.len > 0 and utils.canOpenProjectEditor(target);
+    }
+
+    pub fn openCurrentProjectDirectory(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No project selected.");
+            return;
+        }
+
+        utils.openProjectDirectory(self.allocator, self.currentProject().path) catch |err| {
+            log.warn("failed to open project directory: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open project folder.");
+            return;
+        };
+        self.setSidebarNotice("Opened project folder.");
+    }
+
+    pub fn openCurrentProjectEditor(self: *AppState, target: ProjectEditorTarget) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No project selected.");
+            return;
+        }
+
+        utils.openProjectEditor(self.allocator, self.currentProject().path, target) catch |err| {
+            log.warn("failed to open project editor: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open project editor.");
+            return;
+        };
+        self.setSidebarNotice(projectEditorOpenedNotice(target));
+    }
+
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) void {
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
@@ -1939,6 +1981,15 @@ pub const AppState = struct {
         return self.allocator.dupe(u8, home);
     }
 };
+
+fn projectEditorOpenedNotice(target: ProjectEditorTarget) []const u8 {
+    return switch (target) {
+        .configured => "Opened project in the configured editor.",
+        .cursor => "Opened project in Cursor.",
+        .vscode => "Opened project in VS Code.",
+        .zed => "Opened project in Zed.",
+    };
+}
 
 fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
     if (draft.len == 0) return null;
