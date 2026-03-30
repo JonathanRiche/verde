@@ -75,6 +75,22 @@ That installs:
 
 After a user-local install, make sure `~/.local/bin` is on your `PATH`.
 
+On macOS, that prefix install is still a CLI-style install. It does not create a Finder app or anything that shows up in `/Applications` or the Dock.
+
+To install a real macOS app bundle, use:
+
+```bash
+./scripts/release/install-macos-local.sh
+```
+
+That builds `Verde.app` and copies it into `~/Applications` by default. To install for all users instead:
+
+```bash
+./scripts/release/install-macos-local.sh /Applications
+```
+
+Release `.zip` artifacts on macOS already contain `Verde.app`, so end users can also unzip and drag the app bundle into `Applications`.
+
 ## Release builds
 
 GitHub Actions builds release artifacts from tags that start with `v`.

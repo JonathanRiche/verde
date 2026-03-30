@@ -68,6 +68,16 @@ On Linux, the install step also writes:
 - `share/applications/verde.desktop`
 - `share/pixmaps/verde.png`
 
+On macOS, the prefix install places the executable, `libfff_c.dylib`, and `SDL3.framework` under the chosen prefix, but it does not create a `.app` bundle for Finder or the Dock.
+
+For a local app install on macOS, run this from the repo root:
+
+```bash
+./scripts/release/install-macos-local.sh
+```
+
+That installs `Verde.app` into `~/Applications` by default. Pass `/Applications` if you want the system-wide Applications folder instead.
+
 ## Typical development loop
 
 1. Edit files in `src/`.
