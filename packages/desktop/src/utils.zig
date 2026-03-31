@@ -109,7 +109,7 @@ pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const 
 
 pub fn canOpenProjectEditor(target: app_state.ProjectEditorTarget) bool {
     return switch (target) {
-        .configured => preferredEditorEnvName() != null,
+        .configured => canOpenConfiguredEditor(),
         .cursor => hasCursorLauncher(),
         .vscode => hasVsCodeLauncher(),
         .zed => hasZedLauncher(),
@@ -123,8 +123,8 @@ pub fn openProjectEditor(
 ) OpenProjectError!void {
     return switch (target) {
         .configured => {
-            const env_name = preferredEditorEnvName() orelse return error.LauncherUnavailable;
-            return openConfiguredEditor(allocator, env_name, project_path);
+            const editor = preferredEditorEnv() orelse return error.LauncherUnavailable;
+            return openConfiguredEditor(allocator, editor, project_path);
         },
         .cursor => openCursor(allocator, project_path),
         .vscode => openVsCode(allocator, project_path),
@@ -405,27 +405,197 @@ fn spawnDetached(
     try child.spawn();
 }
 
-fn preferredEditorEnvName() ?[]const u8 {
+const PreferredEditorEnv = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+fn preferredEditorEnv() ?PreferredEditorEnv {
     const visual = std.posix.getenv("VISUAL");
     if (visual) |value| {
-        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) return "VISUAL";
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len > 0) return .{ .name = "VISUAL", .value = trimmed };
     }
 
     const editor = std.posix.getenv("EDITOR");
     if (editor) |value| {
-        if (std.mem.trim(u8, value, &std.ascii.whitespace).len > 0) return "EDITOR";
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len > 0) return .{ .name = "EDITOR", .value = trimmed };
     }
     return null;
 }
 
+fn canOpenConfiguredEditor() bool {
+    const editor = preferredEditorEnv() orelse return false;
+    if (!isTerminalEditorCommand(editor.value)) return true;
+    return canLaunchConfiguredEditorTerminal();
+}
+
 fn openConfiguredEditor(
     allocator: std.mem.Allocator,
-    env_name: []const u8,
+    editor: PreferredEditorEnv,
     project_path: []const u8,
 ) OpenProjectError!void {
-    const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{env_name});
+    const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
     defer allocator.free(script);
+
+    if (isTerminalEditorCommand(editor.value)) {
+        return launchConfiguredEditorInTerminal(allocator, project_path, script);
+    }
     return spawnDetached(allocator, &.{ "sh", "-lc", script, "verde-open-editor", project_path }, project_path);
+}
+
+fn isTerminalEditorCommand(command: []const u8) bool {
+    const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
+    if (trimmed.len == 0) return false;
+
+    const executable = commandExecutableName(trimmed);
+    if (executable.len == 0) return false;
+
+    if (std.mem.eql(u8, executable, "emacs") or std.mem.eql(u8, executable, "emacsclient")) {
+        return std.mem.indexOf(u8, trimmed, " -nw") != null or
+            std.mem.indexOf(u8, trimmed, " --no-window-system") != null or
+            std.mem.indexOf(u8, trimmed, " -t") != null or
+            std.mem.indexOf(u8, trimmed, " --tty") != null or
+            std.mem.indexOf(u8, trimmed, " --terminal") != null;
+    }
+
+    return std.mem.eql(u8, executable, "nvim") or
+        std.mem.eql(u8, executable, "vim") or
+        std.mem.eql(u8, executable, "vi") or
+        std.mem.eql(u8, executable, "view") or
+        std.mem.eql(u8, executable, "nano") or
+        std.mem.eql(u8, executable, "hx") or
+        std.mem.eql(u8, executable, "helix") or
+        std.mem.eql(u8, executable, "kak") or
+        std.mem.eql(u8, executable, "kakoune") or
+        std.mem.eql(u8, executable, "micro");
+}
+
+fn commandExecutableName(command: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
+    if (trimmed.len == 0) return "";
+
+    var end: usize = 0;
+    while (end < trimmed.len and !std.ascii.isWhitespace(trimmed[end])) : (end += 1) {}
+    var token = trimmed[0..end];
+    token = std.mem.trim(u8, token, "\"'");
+    return std.fs.path.basename(token);
+}
+
+fn canLaunchConfiguredEditorTerminal() bool {
+    return switch (@import("builtin").os.tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => preferredLinuxTerminalLauncher() != null,
+        .macos => commandExists("osascript"),
+        else => false,
+    };
+}
+
+fn launchConfiguredEditorInTerminal(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    script: []const u8,
+) OpenProjectError!void {
+    return switch (@import("builtin").os.tag) {
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => launchConfiguredEditorInLinuxTerminal(allocator, project_path, script),
+        .macos => launchConfiguredEditorInMacTerminal(allocator, project_path, script),
+        else => error.UnsupportedOperatingSystem,
+    };
+}
+
+const LinuxTerminalLauncher = enum {
+    xdg_terminal_exec,
+    alacritty,
+    kitty,
+    wezterm,
+    foot,
+    gnome_terminal,
+    konsole,
+    xterm,
+};
+
+fn preferredLinuxTerminalLauncher() ?LinuxTerminalLauncher {
+    if (std.posix.getenv("TERMINAL")) |terminal| {
+        if (linuxTerminalLauncherForCommand(commandExecutableName(terminal))) |launcher| return launcher;
+    }
+
+    if (commandExists("xdg-terminal-exec")) return .xdg_terminal_exec;
+    if (commandExists("alacritty")) return .alacritty;
+    if (commandExists("kitty")) return .kitty;
+    if (commandExists("wezterm")) return .wezterm;
+    if (commandExists("foot")) return .foot;
+    if (commandExists("gnome-terminal")) return .gnome_terminal;
+    if (commandExists("konsole")) return .konsole;
+    if (commandExists("xterm")) return .xterm;
+    return null;
+}
+
+fn linuxTerminalLauncherForCommand(command: []const u8) ?LinuxTerminalLauncher {
+    if (std.mem.eql(u8, command, "xdg-terminal-exec")) return .xdg_terminal_exec;
+    if (std.mem.eql(u8, command, "alacritty")) return .alacritty;
+    if (std.mem.eql(u8, command, "kitty")) return .kitty;
+    if (std.mem.eql(u8, command, "wezterm")) return .wezterm;
+    if (std.mem.eql(u8, command, "foot")) return .foot;
+    if (std.mem.eql(u8, command, "gnome-terminal")) return .gnome_terminal;
+    if (std.mem.eql(u8, command, "konsole")) return .konsole;
+    if (std.mem.eql(u8, command, "xterm")) return .xterm;
+    return null;
+}
+
+fn launchConfiguredEditorInLinuxTerminal(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    script: []const u8,
+) OpenProjectError!void {
+    const launcher = preferredLinuxTerminalLauncher() orelse return error.LauncherUnavailable;
+
+    return switch (launcher) {
+        .xdg_terminal_exec => {
+            const dir_arg = try std.fmt.allocPrint(allocator, "--dir={s}", .{project_path});
+            defer allocator.free(dir_arg);
+            return spawnDetached(allocator, &.{ "xdg-terminal-exec", dir_arg, "--", "sh", "-lc", script, "verde-open-editor", project_path }, null);
+        },
+        .alacritty => spawnDetached(allocator, &.{ "alacritty", "--working-directory", project_path, "-e", "sh", "-lc", script, "verde-open-editor", project_path }, null),
+        .kitty => spawnDetached(allocator, &.{ "kitty", "--directory", project_path, "sh", "-lc", script, "verde-open-editor", project_path }, null),
+        .wezterm => spawnDetached(allocator, &.{ "wezterm", "start", "--cwd", project_path, "sh", "-lc", script, "verde-open-editor", project_path }, null),
+        .foot => {
+            const dir_arg = try std.fmt.allocPrint(allocator, "--working-directory={s}", .{project_path});
+            defer allocator.free(dir_arg);
+            return spawnDetached(allocator, &.{ "foot", dir_arg, "sh", "-lc", script, "verde-open-editor", project_path }, null);
+        },
+        .gnome_terminal => {
+            const dir_arg = try std.fmt.allocPrint(allocator, "--working-directory={s}", .{project_path});
+            defer allocator.free(dir_arg);
+            return spawnDetached(allocator, &.{ "gnome-terminal", dir_arg, "--", "sh", "-lc", script, "verde-open-editor", project_path }, null);
+        },
+        .konsole => spawnDetached(allocator, &.{ "konsole", "--workdir", project_path, "-e", "sh", "-lc", script, "verde-open-editor", project_path }, null),
+        .xterm => spawnDetached(allocator, &.{ "xterm", "-e", "sh", "-lc", script, "verde-open-editor", project_path }, project_path),
+    };
+}
+
+fn launchConfiguredEditorInMacTerminal(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    script: []const u8,
+) OpenProjectError!void {
+    if (!commandExists("osascript")) return error.LauncherUnavailable;
+
+    const escaped_path = try escapeAppleScriptString(allocator, project_path);
+    defer allocator.free(escaped_path);
+    const escaped_script = try escapeAppleScriptString(allocator, script);
+    defer allocator.free(escaped_script);
+    const apple_script = try std.fmt.allocPrint(
+        allocator,
+        \\tell application "Terminal"
+        \\activate
+        \\do script "cd \"{s}\"; {s} verde-open-editor \"{s}\""
+        \\end tell
+    ,
+        .{ escaped_path, escaped_script, escaped_path },
+    );
+    defer allocator.free(apple_script);
+
+    return spawnDetached(allocator, &.{ "osascript", "-e", apple_script }, null);
 }
 
 fn hasCursorLauncher() bool {

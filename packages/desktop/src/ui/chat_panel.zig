@@ -114,6 +114,9 @@ fn renderHeader(state: anytype) void {
     });
     defer zgui.endChild();
 
+    const header_start = zgui.getCursorPos();
+    const header_start_x = zgui.getCursorPosX();
+    const header_content_width = zgui.getContentRegionAvail()[0];
     const has_project = state.projects.items.len > 0;
     const title_text = if (has_project)
         if (state.currentThread().committed) state.currentThread().title else "New chat"
@@ -136,9 +139,8 @@ fn renderHeader(state: anytype) void {
     const menu_button_width = theme.scaledUi(30.0);
     const browser_button_width = theme.scaledUi(88.0);
     const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
-    const avail_width = zgui.getWindowContentRegionMax()[0] - zgui.getWindowContentRegionMin()[0];
-    const action_x = @max(theme.scaledUi(180.0), avail_width - actions_width);
-    const base_y = theme.scaledUi(6.0);
+    const action_x = header_start_x + @max(theme.scaledUi(180.0), header_content_width - actions_width);
+    const base_y = header_start[1];
     const can_open_folder = state.canOpenCurrentProjectDirectory();
     const can_open_configured = state.canOpenCurrentProjectEditor(.configured);
     const can_open_cursor = state.canOpenCurrentProjectEditor(.cursor);
@@ -162,7 +164,7 @@ fn renderHeader(state: anytype) void {
 
     zgui.sameLine(.{ .spacing = button_gap });
     const menu_button_pos = zgui.getCursorScreenPos();
-    if (renderHeaderActionButton("v", menu_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
+    if (renderHeaderChevronButton(menu_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
         zgui.openPopup(HEADER_OPEN_MENU_ID, .{});
     }
 
@@ -229,6 +231,58 @@ fn renderHeaderActionButton(
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = active_color });
     defer zgui.popStyleColor(.{ .count = 3 });
     return zgui.button(label, .{ .w = width, .h = height });
+}
+
+fn renderHeaderChevronButton(
+    width: f32,
+    height: f32,
+    base_color: [4]f32,
+    hover_color: [4]f32,
+    active_color: [4]f32,
+) bool {
+    const start = zgui.getCursorScreenPos();
+    const clicked = zgui.invisibleButton("##header-chevron-button", .{ .w = width, .h = height });
+    const hovered = zgui.isItemHovered(.{});
+    const active = zgui.isItemActive();
+    const draw_list = zgui.getWindowDrawList();
+    const bg_color = if (active)
+        active_color
+    else if (hovered)
+        hover_color
+    else
+        base_color;
+
+    draw_list.addRectFilled(.{
+        .pmin = start,
+        .pmax = .{ start[0] + width, start[1] + height },
+        .col = zgui.colorConvertFloat4ToU32(bg_color),
+        .rounding = theme.scaledUi(10.0),
+    });
+
+    drawChevron(
+        draw_list,
+        start[0] + width * 0.5 + theme.scaledUi(2.0),
+        start[1] + height * 0.5,
+        if (hovered or active) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
+    );
+    return clicked;
+}
+
+fn drawChevron(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const half = theme.scaledUi(4.0);
+    const col = zgui.colorConvertFloat4ToU32(color);
+    draw_list.addLine(.{
+        .p1 = .{ x - half, center_y - half },
+        .p2 = .{ x, center_y },
+        .col = col,
+        .thickness = theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ x - half, center_y + half },
+        .p2 = .{ x, center_y },
+        .col = col,
+        .thickness = theme.scaledUi(1.8),
+    });
 }
 
 /// Renders transcript history plus any in-flight stream state.
