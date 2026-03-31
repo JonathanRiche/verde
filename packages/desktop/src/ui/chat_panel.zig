@@ -184,12 +184,17 @@ fn renderHeader(state: anytype) void {
     }
     if (zgui.beginPopup(HEADER_OPEN_MENU_ID, .{})) {
         defer zgui.endPopup();
+        var configured_editor_label_buf = std.mem.zeroes([96:0]u8);
+        const configured_editor_label = if (state.configuredEditorDisplayName()) |name|
+            std.fmt.bufPrintZ(&configured_editor_label_buf, "Open in {s}", .{name}) catch "Open in configured editor"
+        else
+            "Open in configured editor";
 
         if (zgui.menuItem("Open folder", .{ .enabled = can_open_folder })) {
             state.openCurrentProjectDirectory();
             zgui.closeCurrentPopup();
         }
-        if (can_open_configured and zgui.menuItem("Open in configured editor", .{})) {
+        if (can_open_configured and zgui.menuItem(configured_editor_label, .{})) {
             state.openCurrentProjectEditor(.configured);
             zgui.closeCurrentPopup();
         }

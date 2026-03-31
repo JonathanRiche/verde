@@ -116,6 +116,13 @@ pub fn canOpenProjectEditor(target: app_state.ProjectEditorTarget) bool {
     };
 }
 
+pub fn configuredEditorDisplayName() ?[]const u8 {
+    const editor = preferredEditorEnv() orelse return null;
+    const executable = commandExecutableName(editor.value);
+    if (executable.len == 0) return null;
+    return executable;
+}
+
 pub fn openProjectEditor(
     allocator: std.mem.Allocator,
     project_path: []const u8,
