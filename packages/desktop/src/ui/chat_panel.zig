@@ -148,11 +148,11 @@ fn renderHeader(state: anytype) void {
     const can_open_zed = state.canOpenCurrentProjectEditor(.zed);
 
     zgui.setCursorPos(.{ action_x, base_y });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(14.0), theme.scaledUi(8.0) } });
-    defer zgui.popStyleVar(.{ .count = 1 });
-
     zgui.beginDisabled(.{ .disabled = !can_open_folder });
-    if (renderHeaderActionButton("Open", open_button_width, button_height, theme.COLOR_SECONDARY_GREEN, theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10), theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08))) {
+    const split_base_color = theme.COLOR_SECONDARY_GREEN;
+    const split_hover_color = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10);
+    const split_active_color = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08);
+    if (renderHeaderSplitTextButton("Open", open_button_width, button_height, split_base_color, split_hover_color, split_active_color)) {
         state.openCurrentProjectDirectory();
     }
     if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
@@ -162,9 +162,9 @@ fn renderHeader(state: anytype) void {
     }
     zgui.endDisabled();
 
-    zgui.sameLine(.{ .spacing = button_gap });
+    zgui.sameLine(.{ .spacing = 0.0 });
     const menu_button_pos = zgui.getCursorScreenPos();
-    if (renderHeaderChevronButton(menu_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
+    if (renderHeaderChevronButton(menu_button_width, button_height, theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.04), theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12), theme.darken(theme.COLOR_SECONDARY_GREEN, 0.04))) {
         zgui.openPopup(HEADER_OPEN_MENU_ID, .{});
     }
 
@@ -233,6 +233,48 @@ fn renderHeaderActionButton(
     return zgui.button(label, .{ .w = width, .h = height });
 }
 
+fn renderHeaderSplitTextButton(
+    label: []const u8,
+    width: f32,
+    height: f32,
+    base_color: [4]f32,
+    hover_color: [4]f32,
+    active_color: [4]f32,
+) bool {
+    const start = zgui.getCursorScreenPos();
+    const clicked = zgui.invisibleButton("##header-open-button", .{ .w = width, .h = height });
+    const hovered = zgui.isItemHovered(.{});
+    const active = zgui.isItemActive();
+    const draw_list = zgui.getWindowDrawList();
+    const bg_color = if (active)
+        active_color
+    else if (hovered)
+        hover_color
+    else
+        base_color;
+    const rounding = theme.scaledUi(10.0);
+
+    draw_list.addRectFilled(.{
+        .pmin = start,
+        .pmax = .{ start[0] + width, start[1] + height },
+        .col = zgui.colorConvertFloat4ToU32(bg_color),
+        .rounding = rounding,
+        .flags = .{ .round_corners_top_left = true, .round_corners_bottom_left = true },
+    });
+
+    const text_size = zgui.calcTextSize(label, .{});
+    const text_pos = .{
+        start[0] + theme.scaledUi(14.0),
+        start[1] + (height - text_size[1]) * 0.5,
+    };
+    draw_list.addTextUnformatted(
+        text_pos,
+        zgui.colorConvertFloat4ToU32(if (hovered or active) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
+        label,
+    );
+    return clicked;
+}
+
 fn renderHeaderChevronButton(
     width: f32,
     height: f32,
@@ -251,12 +293,20 @@ fn renderHeaderChevronButton(
         hover_color
     else
         base_color;
+    const rounding = theme.scaledUi(10.0);
 
     draw_list.addRectFilled(.{
         .pmin = start,
         .pmax = .{ start[0] + width, start[1] + height },
         .col = zgui.colorConvertFloat4ToU32(bg_color),
-        .rounding = theme.scaledUi(10.0),
+        .rounding = rounding,
+        .flags = .{ .round_corners_top_right = true, .round_corners_bottom_right = true },
+    });
+    draw_list.addLine(.{
+        .p1 = .{ start[0], start[1] + theme.scaledUi(5.0) },
+        .p2 = .{ start[0], start[1] + height - theme.scaledUi(5.0) },
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(22, 24, 28, 110)),
+        .thickness = 1.0,
     });
 
     drawChevron(
