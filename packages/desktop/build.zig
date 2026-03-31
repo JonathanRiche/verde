@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         .shared = false,
     });
     const zsdl = b.dependency("zsdl", .{});
+    const ghostty = b.lazyDependency("ghostty", .{});
     const zqlite = b.dependency("zqlite", .{
         .target = target,
         .optimize = optimize,
@@ -35,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
@@ -66,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .linux => {
             exe.linkSystemLibrary("SDL3");
             exe.linkSystemLibrary("GL");
+            exe.linkSystemLibrary("util");
         },
         .windows => {
             exe.linkSystemLibrary("SDL3");
@@ -146,6 +149,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
@@ -162,6 +166,9 @@ pub fn build(b: *std.Build) void {
         .flags = &.{},
     });
     exe_tests.linkLibC();
+    if (target.result.os.tag == .linux) {
+        exe_tests.linkSystemLibrary("util");
+    }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });

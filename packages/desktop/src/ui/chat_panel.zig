@@ -8,6 +8,7 @@ const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
+const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
@@ -27,7 +28,7 @@ fn inner_workspace(state: *app_state.AppState) void {
     const inner_pad_y = theme.scaledUi(18.0);
 
     // No horizontal padding here so the transcript scrollbar reaches the far right edge.
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, inner_pad_y } });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0, 0 } });
 
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
 
@@ -43,8 +44,10 @@ fn inner_workspace(state: *app_state.AppState) void {
     });
 
     defer zgui.endChild();
+    zgui.dummy(.{ .w = 0.0, .h = inner_pad_y });
 
     if (state.projects.items.len == 0) {
+        state.terminal_focused = false;
         zgui.indent(.{ .indent_w = inner_pad_x });
         zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
@@ -52,21 +55,35 @@ fn inner_workspace(state: *app_state.AppState) void {
         return;
     }
 
+    state.terminal_focused = false;
     const content = zgui.getContentRegionAvail();
-    const composer_height = theme.clampf(content[1] * 0.27, theme.scaledUi(168.0), @min(content[1] * 0.42, theme.scaledUi(320.0)));
-    const transcript_height = @max(content[1] - composer_height - theme.scaledUi(8.0), theme.scaledUi(120.0));
+    const terminal_visible = state.isTerminalVisible();
+    const composer_gap = theme.scaledUi(8.0);
+    const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
+    const max_terminal_height = @max(content[1] - theme.scaledUi(220.0) - terminal_gap, 0.0);
+    const terminal_height = if (terminal_visible)
+        @min(state.terminalPanelHeight(content[1]), max_terminal_height)
+    else
+        0.0;
+    const workspace_height = @max(content[1] - terminal_height - terminal_gap, theme.scaledUi(120.0));
+    const composer_height = theme.clampf(workspace_height * 0.27, theme.scaledUi(168.0), @min(workspace_height * 0.42, theme.scaledUi(320.0)));
+    const transcript_height = @max(workspace_height - composer_height - composer_gap, theme.scaledUi(120.0));
     renderTranscript(state, content[0], transcript_height, inner_pad_x);
+    zgui.dummy(.{ .w = 0.0, .h = composer_gap });
     // Indent composer so it stays centered while transcript scrollbar is at far right.
     zgui.indent(.{ .indent_w = inner_pad_x });
     const composer_width = @max(content[0] - 2 * inner_pad_x, theme.scaledUi(120.0));
-    renderComposer(state, composer_width, @max(content[1] - transcript_height - theme.scaledUi(8.0), theme.scaledUi(120.0)));
+    renderComposer(state, composer_width, @max(workspace_height - transcript_height - composer_gap, theme.scaledUi(120.0)));
     zgui.unindent(.{ .indent_w = inner_pad_x });
+
+    if (terminal_visible and terminal_height > 0.0) {
+        zgui.dummy(.{ .w = 0.0, .h = terminal_gap });
+        terminal_panel.renderDock(state, content[0], @max(zgui.getContentRegionAvail()[1], 0.0));
+    }
 }
 
 /// Renders the chat workspace shell beside the sidebar.
 pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void {
-    _ = width;
-    _ = height;
     zgui.setCursorPos(.{ zgui.getCursorPosX(), 0.0 });
     //OUTER UI FOR CHAT WORKSPACE
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
@@ -77,8 +94,8 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
     defer zgui.popStyleColor(.{ .count = 1 });
     defer zgui.popStyleVar(.{ .count = 2 });
     _ = zgui.beginChild("ChatWorkspace", .{
-        .w = zgui.getContentRegionAvail()[0],
-        .h = zgui.getContentRegionAvail()[1],
+        .w = width,
+        .h = height,
         .child_flags = .{ .border = false },
     });
     defer zgui.endChild();
