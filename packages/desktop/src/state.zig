@@ -1247,6 +1247,19 @@ pub const AppState = struct {
         self.setSidebarNotice(projectEditorOpenedNotice(target));
     }
 
+    pub fn openTranscriptFileReference(self: *AppState, file_path: []const u8) void {
+        const result = utils.openFilePreferEditor(self.allocator, file_path) catch |err| {
+            log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open file reference.");
+            return;
+        };
+
+        switch (result) {
+            .editor => self.setSidebarNotice("Opened file in editor."),
+            .file_manager => self.setSidebarNotice("Opened containing folder."),
+        }
+    }
+
     fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
         utils.runCustomProjectCommand(self.allocator, self.currentProject().path, custom.action) catch |err| {
             log.warn("failed to run custom open action: {s}", .{@errorName(err)});
