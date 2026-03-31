@@ -16,8 +16,8 @@ const MIN_COLS: u16 = 24;
 const MIN_ROWS: u16 = 4;
 const MAX_COLS: u16 = 320;
 const MAX_ROWS: u16 = 120;
-const CELL_PIXEL_WIDTH: u32 = 9;
-const CELL_PIXEL_HEIGHT: u32 = 18;
+pub const CELL_PIXEL_WIDTH: u32 = 9;
+pub const CELL_PIXEL_HEIGHT: u32 = 18;
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
 const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler());
 const DeviceAttributes = @typeInfo(
@@ -760,12 +760,20 @@ fn scancodeCodepoint(scancode: sdl.Scancode) ?u21 {
 
 fn columnsForWidth(width: f32) u16 {
     const sanitized = sanitizeViewportDimension(width) orelse return INITIAL_COLS;
-    return clampCellCount(@intFromFloat(sanitized / 8.6), MIN_COLS, MAX_COLS);
+    return clampCellCount(
+        @intFromFloat(sanitized / @as(f32, @floatFromInt(CELL_PIXEL_WIDTH))),
+        MIN_COLS,
+        MAX_COLS,
+    );
 }
 
 fn rowsForHeight(height: f32) u16 {
     const sanitized = sanitizeViewportDimension(height) orelse return INITIAL_ROWS;
-    return clampCellCount(@intFromFloat(sanitized / 18.0), MIN_ROWS, MAX_ROWS);
+    return clampCellCount(
+        @intFromFloat(sanitized / @as(f32, @floatFromInt(CELL_PIXEL_HEIGHT))),
+        MIN_ROWS,
+        MAX_ROWS,
+    );
 }
 
 fn clampCellCount(value: i32, min_value: u16, max_value: u16) u16 {

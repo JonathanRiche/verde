@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     const zgui = b.dependency("zgui", .{
         .backend = .sdl3_opengl3,
         .shared = false,
+        .use_wchar32 = true,
     });
     const zsdl = b.dependency("zsdl", .{});
     const ghostty = b.lazyDependency("ghostty", .{});
