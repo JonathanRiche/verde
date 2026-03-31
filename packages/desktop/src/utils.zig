@@ -139,6 +139,14 @@ pub fn openProjectEditor(
     };
 }
 
+pub fn runCustomProjectCommand(
+    allocator: std.mem.Allocator,
+    project_path: []const u8,
+    command: []const u8,
+) OpenProjectError!void {
+    return spawnDetached(allocator, &.{ "sh", "-lc", command, "verde-open-action", project_path }, project_path);
+}
+
 pub fn pickerWorker(state: *app_state.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 

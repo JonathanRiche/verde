@@ -123,20 +123,47 @@ User config is loaded from:
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
 
-Current supported config includes UI font size and keybind overrides. Example:
+Current supported config includes UI font size, keybind overrides, and the default action behind the main `Open` button plus `CommandOrControl+O`. Example:
 
 ```json
 {
   "ui": {
     "font_size": 20
   },
+  "open": {
+    "default": "editor"
+  },
   "keybinds": {
-    "refresh": ["CommandOrControl+R", "F5"]
+    "refresh": ["CommandOrControl+R", "F5"],
+    "open": "CommandOrControl+O"
   }
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Refresh reloads app state from disk and reloads keybinds.
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `CommandOrControl+O`. Refresh reloads app state from disk, config, and keybinds.
+
+`open.default` accepts lower-case string values:
+
+- `folder`
+- `editor`
+- `cursor`
+- `vscode`
+- `zed`
+
+You can also provide a custom shell action instead of a named built-in action:
+
+```json
+{
+  "open": {
+    "default": {
+      "label": "Workbench",
+      "action": "cursor ."
+    }
+  }
+}
+```
+
+Custom actions run through `sh -lc` with the selected project as the working directory. The command also receives the project path as `$1`.
 
 ## Dependencies
 

@@ -107,7 +107,7 @@ pub fn main() !void {
     try sdl.gl.makeCurrent(window, gl_context);
     try sdl.gl.setSwapInterval(1);
 
-    const ui_config = app_config.loadAppConfig(allocator) catch |err| blk: {
+    const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
@@ -120,7 +120,7 @@ pub fn main() !void {
         CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
         CODICON_BYTES[0..CODICON_BYTES.len],
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
-        ui_config.font_size,
+        loaded_app_config.font_size,
     );
     // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
     zgui.backend.init(window, gl_context);
@@ -130,7 +130,7 @@ pub fn main() !void {
     // Apply the global ImGui style after the display scale is known.
     ui_theme.applyTheme(ui_scale);
 
-    var state = try AppState.init(allocator, &storage);
+    var state = try AppState.init(allocator, &storage, loaded_app_config);
     defer state.deinit();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
@@ -319,6 +319,7 @@ fn handleKeyboardAction(
 ) void {
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
+        .open_default => state.runDefaultOpenAction(),
     }
 }
 
@@ -334,7 +335,15 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
         state.setSidebarNotice("App refreshed, but keybinds failed to reload.");
         return;
     };
+    const next_app_config = app_config.loadAppConfig(state.allocator) catch |err| {
+        log.err("failed to refresh native app config: {s}", .{@errorName(err)});
+        keyboard.deinit();
+        keyboard.* = next_keyboard;
+        state.setSidebarNotice("App refreshed, but config failed to reload.");
+        return;
+    };
     keyboard.deinit();
     keyboard.* = next_keyboard;
-    state.setSidebarNotice("App and keybinds refreshed.");
+    state.replaceAppConfig(next_app_config);
+    state.setSidebarNotice("App, config, and keybinds refreshed.");
 }
