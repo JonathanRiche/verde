@@ -15,10 +15,32 @@ const codicon_glyph_ranges = [_:0]zgui.Wchar{
 };
 
 const nerd_font_glyph_ranges = [_:0]zgui.Wchar{
+    0xe0a0,
+    0xe0d7,
     0xe5fa,
     0xe7ff,
     0xf000,
     0xf8ff,
+    0xf0000,
+    0xf20ff,
+    0,
+};
+
+const terminal_font_glyph_ranges = [_:0]zgui.Wchar{
+    0x0020,
+    0x00ff,
+    0x0100,
+    0x024f,
+    0x2500,
+    0x259f,
+    0xe0a0,
+    0xe0d7,
+    0xe5fa,
+    0xe7ff,
+    0xf000,
+    0xf8ff,
+    0xf0000,
+    0xf20ff,
     0,
 };
 
@@ -85,7 +107,16 @@ fn mergeIconFont(font_bytes: []const u8, font_size: f32, ranges: []const zgui.Wc
 fn installTerminalFont(nerd_font_bytes: []const u8, font_size: f32) ?zgui.Font {
     for (terminalFontCandidates()) |path| {
         std.fs.accessAbsolute(path, .{}) catch continue;
-        return zgui.io.addFontFromFile(path, font_size);
+        var config = zgui.FontConfig.init();
+        config.pixel_snap_h = true;
+        const font = zgui.io.addFontFromFileWithConfig(
+            path,
+            font_size,
+            config,
+            terminal_font_glyph_ranges[0..].ptr,
+        );
+        mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
+        return font;
     }
 
     // Fallback: keep using the UI atlas but at least merge the symbol font.

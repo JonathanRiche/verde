@@ -110,11 +110,14 @@ fn renderViewport(render_state: *const ghostty_vt.RenderState) void {
     const cell_width = width / cols_f;
     const cell_height = height / rows_f;
     const text_font = theme.terminal_font orelse zgui.getFont();
+    const base_cell_width = @as(f32, @floatFromInt(terminal.CELL_PIXEL_WIDTH));
+    const base_cell_height = @as(f32, @floatFromInt(terminal.CELL_PIXEL_HEIGHT));
+    const geometry_scale = @min(cell_width / base_cell_width, cell_height / base_cell_height);
     const text_size = if (theme.terminal_font != null)
-        @max(@min(theme.terminal_font_size, cell_height * 0.82), 10.0)
+        @max(theme.terminal_font_size * geometry_scale, 10.0)
     else
         @max(@min(cell_height * 0.74, cell_width * 1.45), 10.0);
-    const text_offset_y = @max((cell_height - text_size) * 0.18, 0.0);
+    const text_offset_y = @max((cell_height - text_size) * 0.12, 0.0);
     const text_offset_x = 0.0;
 
     const clip_min = origin;
@@ -186,18 +189,38 @@ fn renderViewport(render_state: *const ghostty_vt.RenderState) void {
             if (draw_cursor_overlay and render_state.cursor.visual_style != .block) {
                 drawCursor(render_state, draw_list, cell_rect_min, cell_rect_max);
             }
+        }
+
+        for (raw_cells, 0..) |raw_cell, x| {
+            const cell_x = origin[0] + @as(f32, @floatFromInt(x)) * cell_width;
+            const cell_span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
+            const cell_rect_min = .{ cell_x, row_y };
+            const cell_rect_max = .{ cell_x + cell_width * cell_span, row_y + cell_height };
+            const cell_style = resolvedStyle(raw_cell, row_styles[x]);
+            var fg = cell_style.fg(.{
+                .default = render_state.colors.foreground,
+                .palette = &render_state.colors.palette,
+            });
+
+            if (render_state.cursor.viewport) |cursor_vp| {
+                if (cursor_vp.x == x and cursor_vp.y == y and render_state.cursor.visible and render_state.cursor.visual_style == .block) {
+                    fg = render_state.colors.background;
+                }
+            }
 
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
 
             var text_buf: [128]u8 = undefined;
             const text = cellText(raw_cell, row_graphemes[x], &text_buf) orelse continue;
-            const clip_rect: [4]f32 = .{
-                cell_rect_min[0],
-                cell_rect_min[1],
-                cell_rect_max[0],
-                cell_rect_max[1],
-            };
-            const clip_rect_ptr: [*]const [4]f32 = @ptrCast(&clip_rect);
+            const glyph_clip_rect: ?[4]f32 = if (glyphNeedsRelaxedClip(raw_cell.codepoint()))
+                null
+            else
+                .{
+                    cell_rect_min[0],
+                    cell_rect_min[1],
+                    cell_rect_max[0],
+                    cell_rect_max[1],
+                };
             draw_list.addTextExtendedUnformatted(
                 .{ cell_rect_min[0] + text_offset_x, cell_rect_min[1] + text_offset_y },
                 rgbToU32(fg, 1.0),
@@ -205,7 +228,10 @@ fn renderViewport(render_state: *const ghostty_vt.RenderState) void {
                 .{
                     .font = text_font,
                     .font_size = text_size,
-                    .cpu_fine_clip_rect = clip_rect_ptr,
+                    .cpu_fine_clip_rect = if (glyph_clip_rect) |rect|
+                        @as([*]const [4]f32, @ptrCast(&rect))
+                    else
+                        null,
                 },
             );
         }
@@ -291,6 +317,17 @@ fn cellText(
         }
     }
     return buffer[0..index];
+}
+
+fn glyphNeedsRelaxedClip(cp: u21) bool {
+    return switch (cp) {
+        0xe0a0...0xe0d7,
+        0xe5fa...0xe7ff,
+        0xf000...0xf8ff,
+        0xf0000...0xf20ff,
+        => true,
+        else => false,
+    };
 }
 
 fn rgbToU32(rgb: ghostty_vt.color.RGB, alpha: f32) u32 {
