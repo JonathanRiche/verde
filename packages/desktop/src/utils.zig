@@ -33,6 +33,11 @@ pub const OpenProjectError = std.mem.Allocator.Error || error{
     LauncherUnavailable,
 } || std.process.Child.SpawnError;
 
+pub const OpenFileResult = enum {
+    editor,
+    file_manager,
+};
+
 pub fn loadEmbeddedTexture(bytes: []const u8) ?app_state.CachedImageTexture {
     const loaded = stb_image.loadFromMemory(bytes) catch |err| {
         app_state.log.err("failed to decode embedded logo texture: {s}", .{@errorName(err)});
@@ -141,6 +146,29 @@ pub fn openProjectEditor(
         .vscode => openVsCode(allocator, project_path),
         .zed => openZed(allocator, project_path),
     };
+}
+
+pub fn openFilePreferEditor(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+) OpenProjectError!OpenFileResult {
+    const parent_dir = std.fs.path.dirname(file_path) orelse file_path;
+
+    if (preferredEditorEnv()) |editor| {
+        if (canOpenConfiguredEditor()) {
+            try openConfiguredEditorPath(allocator, editor, parent_dir, file_path);
+            return .editor;
+        }
+    }
+
+    openKnownEditorPath(allocator, parent_dir, file_path) catch |err| switch (err) {
+        error.LauncherUnavailable => {},
+        else => return err,
+    };
+    if (hasCursorLauncher() or hasVsCodeLauncher() or hasZedLauncher()) return .editor;
+
+    try revealFileInFileManager(allocator, file_path);
+    return .file_manager;
 }
 
 pub fn runCustomProjectCommand(
@@ -464,6 +492,36 @@ fn openConfiguredEditor(
     return spawnDetached(allocator, &.{ "sh", "-lc", script, "verde-open-editor", project_path }, project_path);
 }
 
+fn openConfiguredEditorPath(
+    allocator: std.mem.Allocator,
+    editor: PreferredEditorEnv,
+    working_dir: []const u8,
+    path: []const u8,
+) OpenProjectError!void {
+    const executable = commandExecutableName(editor.value);
+    if (std.ascii.eqlIgnoreCase(executable, "cursor")) {
+        return openCursorPath(allocator, working_dir, path);
+    }
+    if (std.ascii.eqlIgnoreCase(executable, "code") or std.ascii.eqlIgnoreCase(executable, "code-insiders")) {
+        return openVsCodePath(allocator, working_dir, path);
+    }
+    if (std.ascii.eqlIgnoreCase(executable, "zed") or std.ascii.eqlIgnoreCase(executable, "zeditor")) {
+        return openZedPath(allocator, working_dir, path);
+    }
+
+    const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
+    defer allocator.free(script);
+
+    if (isTerminalEditorCommand(editor.value)) {
+        const escaped_path = try shellSingleQuoteEscape(allocator, path);
+        defer allocator.free(escaped_path);
+        const terminal_script = try std.fmt.allocPrint(allocator, "exec ${s} '{s}'", .{ editor.name, escaped_path });
+        defer allocator.free(terminal_script);
+        return launchConfiguredEditorInTerminal(allocator, working_dir, terminal_script);
+    }
+    return spawnDetached(allocator, &.{ "sh", "-lc", script, "verde-open-file", path }, working_dir);
+}
+
 fn isTerminalEditorCommand(command: []const u8) bool {
     const trimmed = std.mem.trim(u8, command, &std.ascii.whitespace);
     if (trimmed.len == 0) return false;
@@ -628,6 +686,12 @@ fn openCursor(allocator: std.mem.Allocator, project_path: []const u8) OpenProjec
     return error.LauncherUnavailable;
 }
 
+fn openCursorPath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
+    if (commandExists("cursor")) return spawnDetached(allocator, &.{ "cursor", file_path }, working_dir);
+    if (macApplicationExists("Cursor")) return openMacApplication(allocator, "Cursor", file_path);
+    return error.LauncherUnavailable;
+}
+
 fn hasVsCodeLauncher() bool {
     if (commandExists("code") or commandExists("code-insiders")) return true;
     return macApplicationExists("Visual Studio Code") or macApplicationExists("Visual Studio Code - Insiders");
@@ -638,6 +702,14 @@ fn openVsCode(allocator: std.mem.Allocator, project_path: []const u8) OpenProjec
     if (commandExists("code-insiders")) return spawnDetached(allocator, &.{ "code-insiders", project_path }, project_path);
     if (macApplicationExists("Visual Studio Code")) return openMacApplication(allocator, "Visual Studio Code", project_path);
     if (macApplicationExists("Visual Studio Code - Insiders")) return openMacApplication(allocator, "Visual Studio Code - Insiders", project_path);
+    return error.LauncherUnavailable;
+}
+
+fn openVsCodePath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
+    if (commandExists("code")) return spawnDetached(allocator, &.{ "code", file_path }, working_dir);
+    if (commandExists("code-insiders")) return spawnDetached(allocator, &.{ "code-insiders", file_path }, working_dir);
+    if (macApplicationExists("Visual Studio Code")) return openMacApplication(allocator, "Visual Studio Code", file_path);
+    if (macApplicationExists("Visual Studio Code - Insiders")) return openMacApplication(allocator, "Visual Studio Code - Insiders", file_path);
     return error.LauncherUnavailable;
 }
 
@@ -653,9 +725,42 @@ fn openZed(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectEr
     return error.LauncherUnavailable;
 }
 
+fn openZedPath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
+    if (commandExists("zed")) return spawnDetached(allocator, &.{ "zed", file_path }, working_dir);
+    if (commandExists("zeditor")) return spawnDetached(allocator, &.{ "zeditor", file_path }, working_dir);
+    if (macApplicationExists("Zed")) return openMacApplication(allocator, "Zed", file_path);
+    return error.LauncherUnavailable;
+}
+
 fn openMacApplication(allocator: std.mem.Allocator, app_name: []const u8, project_path: []const u8) OpenProjectError!void {
     if (!commandExists("open")) return error.LauncherUnavailable;
     return spawnDetached(allocator, &.{ "open", "-a", app_name, project_path }, project_path);
+}
+
+fn openKnownEditorPath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
+    openCursorPath(allocator, working_dir, file_path) catch |err| switch (err) {
+        error.LauncherUnavailable => {},
+        else => return err,
+    };
+    openVsCodePath(allocator, working_dir, file_path) catch |err| switch (err) {
+        error.LauncherUnavailable => {},
+        else => return err,
+    };
+    return openZedPath(allocator, working_dir, file_path);
+}
+
+fn revealFileInFileManager(allocator: std.mem.Allocator, file_path: []const u8) OpenProjectError!void {
+    return switch (@import("builtin").os.tag) {
+        .macos => {
+            if (!commandExists("open")) return error.LauncherUnavailable;
+            return spawnDetached(allocator, &.{ "open", "-R", file_path }, null);
+        },
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            const parent_dir = std.fs.path.dirname(file_path) orelse file_path;
+            return openProjectDirectory(allocator, parent_dir);
+        },
+        else => error.UnsupportedOperatingSystem,
+    };
 }
 
 fn macApplicationExists(app_name: []const u8) bool {
@@ -694,6 +799,22 @@ fn commandExists(name: []const u8) bool {
     }
     return false;
 }
+
+fn shellSingleQuoteEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var escaped: std.ArrayList(u8) = .empty;
+    errdefer escaped.deinit(allocator);
+
+    for (value) |char| {
+        if (char == '\'') {
+            try escaped.appendSlice(allocator, "'\\''");
+        } else {
+            try escaped.append(allocator, char);
+        }
+    }
+
+    return escaped.toOwnedSlice(allocator);
+}
+
 pub fn approvalPolicyForMode(_: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.ApprovalPolicy {
     return switch (mode) {
         .full_access => .never,

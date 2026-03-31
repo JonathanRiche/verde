@@ -677,9 +677,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, id: u32, role: app_state.
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    zgui.pushTextWrapPos(0.0);
-    zgui.textWrapped("{s}", .{body});
-    zgui.popTextWrapPos();
+    renderTranscriptBody(state, role, body, false);
 }
 
 /// Draws a generic transcript bubble with optional muted body text.
@@ -720,13 +718,207 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
+    renderTranscriptBody(state, role, body, muted_body);
+}
+
+fn renderTranscriptBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) void {
+    if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
+        renderCodexFileReferenceBody(state, body);
+        return;
+    }
+
     zgui.pushTextWrapPos(0.0);
+    defer zgui.popTextWrapPos();
     if (muted_body) {
         zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{body});
     } else {
         zgui.textWrapped("{s}", .{body});
     }
-    zgui.popTextWrapPos();
+}
+
+fn shouldRenderCodexFileReferenceBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) bool {
+    return !muted_body and role == .assistant and state.currentThread().provider == .codex and std.mem.indexOf(u8, body, "](/") != null;
+}
+
+const CodexFileReference = struct {
+    start: usize,
+    end: usize,
+    label: []const u8,
+    path: []const u8,
+};
+
+const CodexInlineLayout = struct {
+    base_screen: [2]f32,
+    cursor_x: f32,
+    cursor_y: f32,
+    max_x: f32,
+    line_height: f32,
+    available_width: f32,
+    file_ref_count: usize = 0,
+};
+
+fn renderCodexFileReferenceBody(state: *app_state.AppState, body: []const u8) void {
+    const base_screen = zgui.getCursorScreenPos();
+    const available_width = zgui.getContentRegionAvail()[0];
+    const line_height = @max(zgui.getTextLineHeightWithSpacing(), theme.scaledUi(28.0));
+    var layout: CodexInlineLayout = .{
+        .base_screen = base_screen,
+        .cursor_x = base_screen[0],
+        .cursor_y = base_screen[1],
+        .max_x = base_screen[0] + available_width,
+        .line_height = line_height,
+        .available_width = available_width,
+    };
+
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var first_line = true;
+    while (lines.next()) |line| {
+        if (!first_line) advanceCodexInlineLine(&layout) else first_line = false;
+        if (line.len == 0) continue;
+        renderCodexFileReferenceLine(state, line, &layout);
+    }
+
+    const used_height = @max(layout.cursor_y - layout.base_screen[1] + layout.line_height, zgui.getTextLineHeight());
+    zgui.setCursorScreenPos(base_screen);
+    zgui.dummy(.{ .w = available_width, .h = used_height });
+}
+
+fn renderCodexFileReferenceLine(state: *app_state.AppState, line: []const u8, layout: *CodexInlineLayout) void {
+    var cursor: usize = 0;
+    while (cursor < line.len) {
+        if (findNextCodexFileReference(line, cursor)) |file_ref| {
+            renderCodexTextRun(line[cursor..file_ref.start], layout);
+            renderCodexFileReferenceToken(state, file_ref, layout);
+            cursor = file_ref.end;
+            continue;
+        }
+
+        renderCodexTextRun(line[cursor..], layout);
+        break;
+    }
+}
+
+fn renderCodexTextRun(text: []const u8, layout: *CodexInlineLayout) void {
+    var cursor: usize = 0;
+    while (cursor < text.len) {
+        const is_space = std.ascii.isWhitespace(text[cursor]);
+        var end = cursor + 1;
+        while (end < text.len and std.ascii.isWhitespace(text[end]) == is_space) : (end += 1) {}
+        renderCodexTextToken(text[cursor..end], is_space, layout);
+        cursor = end;
+    }
+}
+
+fn renderCodexTextToken(token: []const u8, is_space: bool, layout: *CodexInlineLayout) void {
+    const start_x = layout.base_screen[0];
+    if (is_space) {
+        if (layout.cursor_x <= start_x) return;
+        const width = zgui.calcTextSize(token, .{})[0];
+        if (layout.cursor_x + width > layout.max_x) {
+            advanceCodexInlineLine(layout);
+            return;
+        }
+        layout.cursor_x += width;
+        return;
+    }
+
+    const width = zgui.calcTextSize(token, .{})[0];
+    if (layout.cursor_x > start_x and layout.cursor_x + width > layout.max_x) {
+        advanceCodexInlineLine(layout);
+    }
+
+    zgui.getWindowDrawList().addTextUnformatted(
+        .{ layout.cursor_x, layout.cursor_y + (layout.line_height - zgui.getTextLineHeight()) * 0.5 },
+        zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_MUTED),
+        token,
+    );
+    layout.cursor_x += width;
+}
+
+fn renderCodexFileReferenceToken(state: *app_state.AppState, file_ref: CodexFileReference, layout: *CodexInlineLayout) void {
+    const text_size = zgui.calcTextSize(file_ref.label, .{});
+    const padding_x = theme.scaledUi(8.0);
+    const chip_width = text_size[0] + padding_x * 2.0;
+    const chip_height = theme.scaledUi(24.0);
+    const start_x = layout.base_screen[0];
+
+    if (layout.cursor_x > start_x and layout.cursor_x + chip_width > layout.max_x) {
+        advanceCodexInlineLine(layout);
+    }
+
+    const chip_pos = .{
+        layout.cursor_x,
+        layout.cursor_y + (layout.line_height - chip_height) * 0.5,
+    };
+    var id_buf: [48:0]u8 = undefined;
+    const button_id = std.fmt.bufPrintZ(&id_buf, "##codex-file-ref-{d}", .{layout.file_ref_count}) catch return;
+    layout.file_ref_count += 1;
+
+    zgui.setCursorScreenPos(chip_pos);
+    const clicked = zgui.invisibleButton(button_id, .{ .w = chip_width, .h = chip_height });
+    const hovered = zgui.isItemHovered(.{});
+    const draw_list = zgui.getWindowDrawList();
+    const bg = if (hovered)
+        theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08)
+    else
+        theme.COLOR_SECONDARY_GREEN;
+    draw_list.addRectFilled(.{
+        .pmin = chip_pos,
+        .pmax = .{ chip_pos[0] + chip_width, chip_pos[1] + chip_height },
+        .col = zgui.colorConvertFloat4ToU32(bg),
+        .rounding = theme.scaledUi(7.0),
+    });
+    draw_list.addTextUnformatted(
+        .{
+            chip_pos[0] + padding_x,
+            chip_pos[1] + (chip_height - text_size[1]) * 0.5,
+        },
+        zgui.colorConvertFloat4ToU32(theme.COLOR_DIFF_ADD),
+        file_ref.label,
+    );
+
+    if (hovered) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted(file_ref.path);
+        zgui.endTooltip();
+    }
+    if (clicked) {
+        state.openTranscriptFileReference(file_ref.path);
+    }
+
+    layout.cursor_x += chip_width;
+}
+
+fn advanceCodexInlineLine(layout: *CodexInlineLayout) void {
+    layout.cursor_x = layout.base_screen[0];
+    layout.cursor_y += layout.line_height;
+}
+
+fn findNextCodexFileReference(text: []const u8, start_index: usize) ?CodexFileReference {
+    var index = start_index;
+    while (index < text.len) : (index += 1) {
+        if (text[index] != '[') continue;
+        const close_bracket_rel = std.mem.indexOfScalarPos(u8, text, index + 1, ']') orelse continue;
+        if (close_bracket_rel + 1 >= text.len or text[close_bracket_rel + 1] != '(') continue;
+        const close_paren = std.mem.indexOfScalarPos(u8, text, close_bracket_rel + 2, ')') orelse continue;
+        const target = text[close_bracket_rel + 2 .. close_paren];
+        if (target.len == 0 or target[0] != '/') continue;
+        const path = codexFileReferencePath(target);
+        if (path.len == 0) continue;
+
+        return .{
+            .start = index,
+            .end = close_paren + 1,
+            .label = text[index + 1 .. close_bracket_rel],
+            .path = path,
+        };
+    }
+    return null;
+}
+
+fn codexFileReferencePath(target: []const u8) []const u8 {
+    const hash_index = std.mem.indexOfScalar(u8, target, '#') orelse return target;
+    return target[0..hash_index];
 }
 
 /// Draws a compact system row for command execution events.
