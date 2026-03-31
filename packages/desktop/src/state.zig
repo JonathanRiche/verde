@@ -1102,6 +1102,11 @@ pub const AppState = struct {
         return self.projects.items.len > 0 and utils.canOpenProjectEditor(target);
     }
 
+    pub fn configuredEditorDisplayName(self: *const AppState) ?[]const u8 {
+        _ = self;
+        return utils.configuredEditorDisplayName();
+    }
+
     pub fn openCurrentProjectDirectory(self: *AppState) void {
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No project selected.");
