@@ -1160,6 +1160,21 @@ pub const AppState = struct {
         };
     }
 
+    pub fn defaultOpenShowsFolderIcon(self: *const AppState) bool {
+        return self.app_config.default_open_action == .folder;
+    }
+
+    pub fn defaultOpenIconTexture(self: *const AppState) ?CachedImageTexture {
+        return switch (self.app_config.default_open_action) {
+            .folder => null,
+            .editor => self.editorLogoTextureForTarget(.configured),
+            .cursor => self.editorLogoTextureForTarget(.cursor),
+            .vscode => self.editorLogoTextureForTarget(.vscode),
+            .zed => self.editorLogoTextureForTarget(.zed),
+            .custom => |custom| self.editorLogoTextureForCommand(utils.executableNameForCommand(custom.action)),
+        };
+    }
+
     pub fn runDefaultOpenAction(self: *AppState) void {
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No project selected.");
