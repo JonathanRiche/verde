@@ -50,6 +50,8 @@ extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeoutMS: c_int) bool;
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
 extern fn SDL_GetWindowDisplayScale(window: *sdl.Window) f32;
 extern fn SDL_SetWindowPosition(window: *sdl.Window, x: c_int, y: c_int) bool;
+extern fn SDL_StartTextInput(window: *sdl.Window) bool;
+extern fn SDL_StopTextInput(window: *sdl.Window) bool;
 extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
 extern fn glClear(mask: u32) void;
 
@@ -100,6 +102,8 @@ pub fn main() !void {
     );
     defer window.destroy();
     _ = SDL_SetWindowPosition(window, initial_window_frame.x, initial_window_frame.y);
+    _ = SDL_StartTextInput(window);
+    defer _ = SDL_StopTextInput(window);
     installWindowIcon(window);
 
     const gl_context = try sdl.gl.createContext(window);
@@ -140,6 +144,7 @@ pub fn main() !void {
         running = processEvents(&state, &keyboard);
         state.pollPicker();
         state.pollSend();
+        state.pollTerminals();
 
         var fb_width: c_int = 0;
         var fb_height: c_int = 0;
@@ -263,7 +268,10 @@ fn processEvents(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) boo
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasPendingStream() or state.isPickerPending()) ACTIVE_WAIT_TIMEOUT_MS else IDLE_WAIT_TIMEOUT_MS;
+    return if (state.hasPendingStream() or state.isPickerPending() or state.hasActiveTerminalSessions())
+        ACTIVE_WAIT_TIMEOUT_MS
+    else
+        IDLE_WAIT_TIMEOUT_MS;
 }
 
 fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event: *sdl.Event) bool {
@@ -271,6 +279,14 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
     switch (event.type) {
         .quit => return false,
         .key_down => {
+            const action = keyboard.actionForEvent(&event.key);
+            if (action == .toggle_terminal) {
+                handleKeyboardAction(state, keyboard, .toggle_terminal);
+                return true;
+            }
+            if (state.handleTerminalKeyDown(&event.key)) {
+                return true;
+            }
             if (shouldPasteClipboardImage(state, &event.key)) {
                 state.attachClipboardImageToCurrentDraft();
                 return true;
@@ -278,8 +294,14 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
             if (handleFileSearchNavigation(state, &event.key)) {
                 return true;
             }
-            const action = keyboard.actionForEvent(&event.key) orelse return true;
-            handleKeyboardAction(state, keyboard, action);
+            if (action) |resolved_action| {
+                handleKeyboardAction(state, keyboard, resolved_action);
+            }
+        },
+        .text_input => {
+            if (state.handleTerminalTextInput(event.text.text)) {
+                return true;
+            }
         },
         else => {},
     }
@@ -320,6 +342,7 @@ fn handleKeyboardAction(
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
         .open_default => state.runDefaultOpenAction(),
+        .toggle_terminal => state.toggleCurrentProjectTerminal(),
     }
 }
 

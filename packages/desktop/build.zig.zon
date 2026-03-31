@@ -14,6 +14,10 @@
             .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#05a88d6758753e1c63fdd45b211dde2057094b0c",
             .hash = "zqlite-0.0.1-RWLaYz6bmAAT7E_jxopXf-j5Ea8VQldnxsd6TU8sa0Bb",
         },
+        .ghostty = .{
+            .url = "git+https://github.com/ghostty-org/ghostty#0f6836c69fdc480ea84f983dfe4c0bb18edb4f61",
+            .hash = "ghostty-1.3.2-dev-5UdBC4XjAwXzjq5t_RMxJsCv8KY9ESo2Zi2ifJKVh2TA",
+        },
     },
     .fingerprint = 0xd77462097ec03b8f,
     .paths = .{

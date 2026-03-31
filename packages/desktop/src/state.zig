@@ -8,6 +8,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const stb_image = @import("stb_image.zig");
+const terminal = @import("terminal/terminal.zig");
 const utils = @import("utils.zig");
 
 pub const ReasoningEffort = db_types.ReasoningEffort;
@@ -350,10 +351,13 @@ pub const Project = struct {
     unread_count: u8 = 0,
     collapsed: bool = false,
     thread_list_expanded: bool = false,
+    terminal_dock: terminal.Dock,
     threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
 
     fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8, path: []const u8, unread_count: u8) !Project {
+        var terminal_dock = try terminal.Dock.init(allocator);
+        errdefer terminal_dock.deinit(allocator);
         var project: Project = .{
             .id = try allocator.dupeZ(u8, id),
             .label = try allocator.dupeZ(u8, label),
@@ -361,6 +365,7 @@ pub const Project = struct {
             .unread_count = unread_count,
             .collapsed = false,
             .thread_list_expanded = false,
+            .terminal_dock = terminal_dock,
             .threads = .empty,
             .selected_thread_index = 0,
         };
@@ -425,6 +430,7 @@ pub const Project = struct {
         allocator.free(self.id);
         allocator.free(self.label);
         allocator.free(self.path);
+        self.terminal_dock.deinit(allocator);
         for (self.threads.items) |*thread| {
             thread.deinit(allocator);
         }
@@ -555,6 +561,7 @@ pub const AppState = struct {
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
     composer_focused: bool,
+    terminal_focused: bool,
     composer_picker_provider: ?Provider,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
@@ -587,6 +594,7 @@ pub const AppState = struct {
             .rename_storage = std.mem.zeroes([256:0]u8),
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .composer_focused = false,
+            .terminal_focused = false,
             .composer_picker_provider = null,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
@@ -1498,6 +1506,72 @@ pub const AppState = struct {
 
     pub fn currentThread(self: *const AppState) *const ChatThread {
         return self.currentProject().currentThread();
+    }
+
+    pub fn currentProjectTerminal(self: *const AppState) *const terminal.Dock {
+        return &self.currentProject().terminal_dock;
+    }
+
+    pub fn currentProjectTerminalMutable(self: *AppState) *terminal.Dock {
+        return &self.currentProjectMutable().terminal_dock;
+    }
+
+    pub fn isTerminalVisible(self: *const AppState) bool {
+        return self.projects.items.len > 0 and self.currentProjectTerminal().visible;
+    }
+
+    pub fn terminalPanelHeight(self: *const AppState, available_height: f32) f32 {
+        if (self.projects.items.len == 0) return 0.0;
+        return self.currentProjectTerminal().effectiveHeight(available_height);
+    }
+
+    pub fn toggleCurrentProjectTerminal(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No project selected.");
+            return;
+        }
+
+        var dock = self.currentProjectTerminalMutable();
+        if (!dock.visible) {
+            const project_path = self.currentProject().path;
+            dock.ensureSession(self.allocator, project_path) catch |err| {
+                log.err("failed to start terminal dock: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to start terminal.");
+                return;
+            };
+        }
+
+        const is_visible = dock.toggle();
+        self.terminal_focused = is_visible;
+        self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
+    }
+
+    pub fn pollTerminals(self: *AppState) void {
+        for (self.projects.items, 0..) |*project, project_index| {
+            project.terminal_dock.poll(self.allocator) catch |err| {
+                log.err("failed to poll terminal session: {s}", .{@errorName(err)});
+                if (project_index == self.selected_project_index and project.terminal_dock.visible) {
+                    self.setSidebarNotice("Terminal session failed.");
+                }
+            };
+        }
+    }
+
+    pub fn hasActiveTerminalSessions(self: *const AppState) bool {
+        for (self.projects.items) |*project| {
+            if (project.terminal_dock.hasRunningSession()) return true;
+        }
+        return false;
+    }
+
+    pub fn handleTerminalKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
+        return self.currentProjectTerminalMutable().handleKeyDown(event);
+    }
+
+    pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
+        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
+        return self.currentProjectTerminalMutable().handleTextInput(std.mem.sliceTo(text, 0));
     }
 
     pub fn currentThreadMutable(self: *AppState) *ChatThread {

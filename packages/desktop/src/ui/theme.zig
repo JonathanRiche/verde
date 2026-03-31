@@ -1,6 +1,7 @@
 //! Shared native UI theme tokens and helpers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
 const app_state = @import("../state.zig");
@@ -46,9 +47,11 @@ pub const TRANSCRIPT_BUBBLE_PADDING_Y: f32 = 14.0;
 pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
 
 pub var heading_font: ?zgui.Font = null;
+pub var terminal_font: ?zgui.Font = null;
 // pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
 
 pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 2.22;
+pub var terminal_font_size: f32 = DEFAULT_FONT_SIZE * 0.92;
 
 /// Clamps a float into a safe UI range.
 pub fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
@@ -79,6 +82,41 @@ fn mergeIconFont(font_bytes: []const u8, font_size: f32, ranges: []const zgui.Wc
     _ = zgui.io.addFontFromMemoryWithConfig(font_bytes, font_size, config, ranges.ptr);
 }
 
+fn installTerminalFont(nerd_font_bytes: []const u8, font_size: f32) ?zgui.Font {
+    for (terminalFontCandidates()) |path| {
+        std.fs.accessAbsolute(path, .{}) catch continue;
+        return zgui.io.addFontFromFile(path, font_size);
+    }
+
+    // Fallback: keep using the UI atlas but at least merge the symbol font.
+    const fallback = zgui.io.addFontDefault(null);
+    mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
+    return fallback;
+}
+
+fn terminalFontCandidates() []const [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .linux => &.{
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/TTF/CaskaydiaMonoNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/TTF/FiraCodeNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        },
+        .macos => &.{
+            "/Library/Fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/SFNSMono.ttf",
+        },
+        .windows => &.{
+            "C:\\Windows\\Fonts\\JetBrainsMonoNerdFontMono-Regular.ttf",
+            "C:\\Windows\\Fonts\\CascadiaMono.ttf",
+            "C:\\Windows\\Fonts\\consola.ttf",
+        },
+        else => &.{},
+    };
+}
+
 /// Installs the default, icon, and heading fonts for the native UI.
 pub fn installFonts(font_bytes: []const u8, codicon_font_bytes: []const u8, nerd_font_bytes: []const u8, font_size: f32) void {
     const font = zgui.io.addFontFromMemory(font_bytes, font_size);
@@ -89,6 +127,8 @@ pub fn installFonts(font_bytes: []const u8, codicon_font_bytes: []const u8, nerd
     heading_font = zgui.io.addFontFromMemory(font_bytes, heading_font_size);
     mergeIconFont(codicon_font_bytes, heading_font_size, codicon_glyph_ranges[0..]);
     mergeIconFont(nerd_font_bytes, heading_font_size, nerd_font_glyph_ranges[0..]);
+    terminal_font_size = font_size * 0.86;
+    terminal_font = installTerminalFont(nerd_font_bytes, terminal_font_size);
 }
 
 /// Applies the shared ImGui theme colors and spacing.

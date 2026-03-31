@@ -10,6 +10,7 @@ const log = std.log.scoped(.native_keybinds);
 pub const NativeKeyboardAction = enum {
     refresh,
     open_default,
+    toggle_terminal,
 };
 
 pub const Keybind = struct {
@@ -49,12 +50,14 @@ pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
     open_default: []Keybind,
+    toggle_terminal: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
             .allocator = allocator,
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
+            .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -72,6 +75,7 @@ pub const NativeKeyboardConfig = struct {
     pub fn deinit(self: *NativeKeyboardConfig) void {
         self.allocator.free(self.refresh);
         self.allocator.free(self.open_default);
+        self.allocator.free(self.toggle_terminal);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -80,6 +84,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.open_default, event)) {
             return .open_default;
+        }
+        if (matchesAny(self.toggle_terminal, event)) {
+            return .toggle_terminal;
         }
 
         return null;
@@ -107,6 +114,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(open_value, "open")) |bindings| {
                 self.allocator.free(self.open_default);
                 self.open_default = bindings;
+            }
+        }
+        if (keybinds_value.object.get("terminal")) |terminal_value| {
+            if (self.parseOverrideValue(terminal_value, "terminal")) |bindings| {
+                self.allocator.free(self.toggle_terminal);
+                self.toggle_terminal = bindings;
             }
         }
     }
@@ -189,6 +202,12 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+O"),
+    });
+}
+
+fn cloneDefaultTerminalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+J"),
     });
 }
 
