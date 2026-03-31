@@ -9,6 +9,7 @@ const log = std.log.scoped(.native_keybinds);
 
 pub const NativeKeyboardAction = enum {
     refresh,
+    open_default,
 };
 
 pub const Keybind = struct {
@@ -47,11 +48,13 @@ pub const Keybind = struct {
 pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
+    open_default: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
             .allocator = allocator,
             .refresh = try cloneDefaultKeybinds(allocator),
+            .open_default = try cloneDefaultOpenKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -68,11 +71,15 @@ pub const NativeKeyboardConfig = struct {
 
     pub fn deinit(self: *NativeKeyboardConfig) void {
         self.allocator.free(self.refresh);
+        self.allocator.free(self.open_default);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
         if (matchesAny(self.refresh, event)) {
             return .refresh;
+        }
+        if (matchesAny(self.open_default, event)) {
+            return .open_default;
         }
 
         return null;
@@ -94,6 +101,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(refresh_value, "refresh")) |bindings| {
                 self.allocator.free(self.refresh);
                 self.refresh = bindings;
+            }
+        }
+        if (keybinds_value.object.get("open")) |open_value| {
+            if (self.parseOverrideValue(open_value, "open")) |bindings| {
+                self.allocator.free(self.open_default);
+                self.open_default = bindings;
             }
         }
     }
@@ -170,6 +183,12 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
         try parseDefaultAccelerator("CommandOrControl+R"),
         try parseDefaultAccelerator("CommandOrControl+Shift+R"),
         try parseDefaultAccelerator("F5"),
+    });
+}
+
+fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+O"),
     });
 }
 
@@ -399,4 +418,31 @@ test "array parsing deduplicates repeated bindings" {
 
     try std.testing.expectEqual(@as(usize, 1), config.refresh.len);
     try std.testing.expectEqual(sdl.Keycode.f5, config.refresh[0].key);
+}
+
+test "open keybind override accepts a single accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            try keybinds.put("open", .{ .string = "Ctrl+Shift+O" });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
+    try std.testing.expect(config.open_default[0].ctrl);
+    try std.testing.expect(config.open_default[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
 }

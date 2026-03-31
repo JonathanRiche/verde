@@ -1,6 +1,7 @@
 const std = @import("std");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
+const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
@@ -566,6 +567,7 @@ pub const AppState = struct {
     vscode_logo_texture: ?CachedImageTexture,
     zed_logo_texture: ?CachedImageTexture,
     modal_image_path: ?[:0]const u8,
+    app_config: app_config.AppConfig,
     rename_project_index: ?usize,
     show_project_creator: bool,
     picker_state: PickerState,
@@ -574,7 +576,7 @@ pub const AppState = struct {
     scroll_transcript_to_bottom: bool,
     dirty: bool,
 
-    pub fn init(allocator: std.mem.Allocator, storage: *const Storage) !AppState {
+    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
         var state: AppState = .{
             .allocator = allocator,
             .storage = storage,
@@ -597,6 +599,7 @@ pub const AppState = struct {
             .vscode_logo_texture = null,
             .zed_logo_texture = null,
             .modal_image_path = null,
+            .app_config = initial_config,
             .rename_project_index = null,
             .show_project_creator = false,
             .picker_state = .{},
@@ -1127,6 +1130,57 @@ pub const AppState = struct {
         return utils.configuredEditorDisplayName();
     }
 
+    pub fn defaultOpenButtonLabel(self: *const AppState) []const u8 {
+        return switch (self.app_config.default_open_action) {
+            .custom => |custom| custom.label,
+            else => "Open",
+        };
+    }
+
+    pub fn canRunDefaultOpenAction(self: *const AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        return switch (self.app_config.default_open_action) {
+            .folder => self.canOpenCurrentProjectDirectory(),
+            .editor => self.canOpenCurrentProjectEditor(.configured),
+            .cursor => self.canOpenCurrentProjectEditor(.cursor),
+            .vscode => self.canOpenCurrentProjectEditor(.vscode),
+            .zed => self.canOpenCurrentProjectEditor(.zed),
+            .custom => |custom| custom.action.len > 0,
+        };
+    }
+
+    pub fn defaultOpenTooltip(self: *const AppState) []const u8 {
+        return switch (self.app_config.default_open_action) {
+            .folder => if (self.canOpenCurrentProjectDirectory()) "Open this project's folder" else "No system folder opener was found",
+            .editor => if (self.canOpenCurrentProjectEditor(.configured)) "Open this project in the configured editor" else "Configured editor is unavailable",
+            .cursor => if (self.canOpenCurrentProjectEditor(.cursor)) "Open this project in Cursor" else "Cursor is unavailable",
+            .vscode => if (self.canOpenCurrentProjectEditor(.vscode)) "Open this project in VS Code" else "VS Code is unavailable",
+            .zed => if (self.canOpenCurrentProjectEditor(.zed)) "Open this project in Zed" else "Zed is unavailable",
+            .custom => |custom| if (custom.action.len > 0) custom.label else "Custom open action is unavailable",
+        };
+    }
+
+    pub fn runDefaultOpenAction(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No project selected.");
+            return;
+        }
+
+        switch (self.app_config.default_open_action) {
+            .folder => self.openCurrentProjectDirectory(),
+            .editor => self.openCurrentProjectEditor(.configured),
+            .cursor => self.openCurrentProjectEditor(.cursor),
+            .vscode => self.openCurrentProjectEditor(.vscode),
+            .zed => self.openCurrentProjectEditor(.zed),
+            .custom => |custom| self.runCustomOpenAction(custom),
+        }
+    }
+
+    pub fn replaceAppConfig(self: *AppState, next_config: app_config.AppConfig) void {
+        self.app_config.deinit(self.allocator);
+        self.app_config = next_config;
+    }
+
     pub fn configuredEditorLogoTexture(self: *const AppState) ?CachedImageTexture {
         const name = utils.configuredEditorDisplayName() orelse return null;
         return self.editorLogoTextureForCommand(name);
@@ -1176,6 +1230,18 @@ pub const AppState = struct {
             return;
         };
         self.setSidebarNotice(projectEditorOpenedNotice(target));
+    }
+
+    fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
+        utils.runCustomProjectCommand(self.allocator, self.currentProject().path, custom.action) catch |err| {
+            log.warn("failed to run custom open action: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to run custom open action.");
+            return;
+        };
+
+        var notice_buf: [256]u8 = undefined;
+        const notice = std.fmt.bufPrint(&notice_buf, "Ran {s}.", .{custom.label}) catch "Ran custom open action.";
+        self.setSidebarNotice(notice);
     }
 
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) void {
@@ -1668,6 +1734,7 @@ pub const AppState = struct {
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
         self.releaseAllImageTextures();
+        self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
     }
 

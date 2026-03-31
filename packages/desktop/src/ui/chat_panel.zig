@@ -135,7 +135,8 @@ fn renderHeader(state: anytype) void {
 
     const button_height = theme.scaledUi(30.0);
     const button_gap = theme.scaledUi(8.0);
-    const open_button_width = theme.scaledUi(82.0);
+    const open_label = state.defaultOpenButtonLabel();
+    const open_button_width = theme.clampf(zgui.calcTextSize(open_label, .{})[0] + theme.scaledUi(28.0), theme.scaledUi(82.0), theme.scaledUi(184.0));
     const menu_button_width = theme.scaledUi(30.0);
     const browser_button_width = theme.scaledUi(88.0);
     const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
@@ -152,16 +153,17 @@ fn renderHeader(state: anytype) void {
     const zed_logo = state.editorLogoTextureForTarget(.zed);
 
     zgui.setCursorPos(.{ action_x, base_y });
-    zgui.beginDisabled(.{ .disabled = !can_open_folder });
+    const can_run_default_open = state.canRunDefaultOpenAction();
+    zgui.beginDisabled(.{ .disabled = !can_run_default_open });
     const split_base_color = theme.COLOR_SECONDARY_GREEN;
     const split_hover_color = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10);
     const split_active_color = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08);
-    if (renderHeaderSplitTextButton("Open", open_button_width, button_height, split_base_color, split_hover_color, split_active_color)) {
-        state.openCurrentProjectDirectory();
+    if (renderHeaderSplitTextButton(open_label, open_button_width, button_height, split_base_color, split_hover_color, split_active_color)) {
+        state.runDefaultOpenAction();
     }
     if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
         _ = zgui.beginTooltip();
-        zgui.textUnformatted(if (can_open_folder) "Open this project's folder" else "No system folder opener was found");
+        zgui.textUnformatted(state.defaultOpenTooltip());
         zgui.endTooltip();
     }
     zgui.endDisabled();
