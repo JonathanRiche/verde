@@ -34,6 +34,11 @@ pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
 pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
+pub const CURSOR_LOGO_BYTES = @embedFile("assets/editor_logos/cursor.png");
+pub const EMACS_LOGO_BYTES = @embedFile("assets/editor_logos/emacs.png");
+pub const NEOVIM_LOGO_BYTES = @embedFile("assets/editor_logos/neovim.png");
+pub const VSCODE_LOGO_BYTES = @embedFile("assets/editor_logos/vscode.png");
+pub const ZED_LOGO_BYTES = @embedFile("assets/editor_logos/zed.png");
 
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
@@ -555,6 +560,11 @@ pub const AppState = struct {
     opencode_logo_texture: ?CachedImageTexture,
     codex_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
+    cursor_logo_texture: ?CachedImageTexture,
+    emacs_logo_texture: ?CachedImageTexture,
+    neovim_logo_texture: ?CachedImageTexture,
+    vscode_logo_texture: ?CachedImageTexture,
+    zed_logo_texture: ?CachedImageTexture,
     modal_image_path: ?[:0]const u8,
     rename_project_index: ?usize,
     show_project_creator: bool,
@@ -581,6 +591,11 @@ pub const AppState = struct {
             .opencode_logo_texture = null,
             .codex_logo_texture = null,
             .thread_edit_texture = null,
+            .cursor_logo_texture = null,
+            .emacs_logo_texture = null,
+            .neovim_logo_texture = null,
+            .vscode_logo_texture = null,
+            .zed_logo_texture = null,
             .modal_image_path = null,
             .rename_project_index = null,
             .show_project_creator = false,
@@ -602,6 +617,11 @@ pub const AppState = struct {
         state.opencode_logo_texture = utils.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
         state.codex_logo_texture = utils.loadEmbeddedTexture(CODEX_LOGO_BYTES);
         state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
+        state.cursor_logo_texture = utils.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
+        state.emacs_logo_texture = utils.loadEmbeddedTexture(EMACS_LOGO_BYTES);
+        state.neovim_logo_texture = utils.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
+        state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
+        state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
         return state;
     }
 
@@ -1107,6 +1127,29 @@ pub const AppState = struct {
         return utils.configuredEditorDisplayName();
     }
 
+    pub fn configuredEditorLogoTexture(self: *const AppState) ?CachedImageTexture {
+        const name = utils.configuredEditorDisplayName() orelse return null;
+        return self.editorLogoTextureForCommand(name);
+    }
+
+    pub fn editorLogoTextureForTarget(self: *const AppState, target: ProjectEditorTarget) ?CachedImageTexture {
+        return switch (target) {
+            .configured => self.configuredEditorLogoTexture(),
+            .cursor => self.cursor_logo_texture,
+            .vscode => self.vscode_logo_texture,
+            .zed => self.zed_logo_texture,
+        };
+    }
+
+    fn editorLogoTextureForCommand(self: *const AppState, command: []const u8) ?CachedImageTexture {
+        if (std.ascii.eqlIgnoreCase(command, "cursor")) return self.cursor_logo_texture;
+        if (std.ascii.eqlIgnoreCase(command, "code") or std.ascii.eqlIgnoreCase(command, "code-insiders")) return self.vscode_logo_texture;
+        if (std.ascii.eqlIgnoreCase(command, "zed") or std.ascii.eqlIgnoreCase(command, "zeditor")) return self.zed_logo_texture;
+        if (std.ascii.eqlIgnoreCase(command, "nvim")) return self.neovim_logo_texture;
+        if (std.ascii.eqlIgnoreCase(command, "emacs") or std.ascii.eqlIgnoreCase(command, "emacsclient")) return self.emacs_logo_texture;
+        return null;
+    }
+
     pub fn openCurrentProjectDirectory(self: *AppState) void {
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No project selected.");
@@ -1265,6 +1308,26 @@ pub const AppState = struct {
         if (self.thread_edit_texture) |cached| {
             cached.deinit();
             self.thread_edit_texture = null;
+        }
+        if (self.cursor_logo_texture) |cached| {
+            cached.deinit();
+            self.cursor_logo_texture = null;
+        }
+        if (self.emacs_logo_texture) |cached| {
+            cached.deinit();
+            self.emacs_logo_texture = null;
+        }
+        if (self.neovim_logo_texture) |cached| {
+            cached.deinit();
+            self.neovim_logo_texture = null;
+        }
+        if (self.vscode_logo_texture) |cached| {
+            cached.deinit();
+            self.vscode_logo_texture = null;
+        }
+        if (self.zed_logo_texture) |cached| {
+            cached.deinit();
+            self.zed_logo_texture = null;
         }
         self.image_texture_cache.deinit();
     }

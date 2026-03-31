@@ -146,6 +146,10 @@ fn renderHeader(state: anytype) void {
     const can_open_cursor = state.canOpenCurrentProjectEditor(.cursor);
     const can_open_vscode = state.canOpenCurrentProjectEditor(.vscode);
     const can_open_zed = state.canOpenCurrentProjectEditor(.zed);
+    const configured_editor_logo = state.editorLogoTextureForTarget(.configured);
+    const cursor_logo = state.editorLogoTextureForTarget(.cursor);
+    const vscode_logo = state.editorLogoTextureForTarget(.vscode);
+    const zed_logo = state.editorLogoTextureForTarget(.zed);
 
     zgui.setCursorPos(.{ action_x, base_y });
     zgui.beginDisabled(.{ .disabled = !can_open_folder });
@@ -182,6 +186,7 @@ fn renderHeader(state: anytype) void {
         zgui.popStyleColor(.{ .count = 2 });
         zgui.popStyleVar(.{ .count = 3 });
     }
+    zgui.setNextWindowSize(.{ .w = theme.scaledUi(250.0), .h = 0.0, .cond = .appearing });
     if (zgui.beginPopup(HEADER_OPEN_MENU_ID, .{})) {
         defer zgui.endPopup();
         var configured_editor_label_buf = std.mem.zeroes([96:0]u8);
@@ -190,23 +195,23 @@ fn renderHeader(state: anytype) void {
         else
             "Open in configured editor";
 
-        if (zgui.menuItem("Open folder", .{ .enabled = can_open_folder })) {
+        if (renderHeaderOpenMenuRow(0, "Open folder", null, true, can_open_folder)) {
             state.openCurrentProjectDirectory();
             zgui.closeCurrentPopup();
         }
-        if (can_open_configured and zgui.menuItem(configured_editor_label, .{})) {
+        if (can_open_configured and renderHeaderOpenMenuRow(1, configured_editor_label, configured_editor_logo, false, true)) {
             state.openCurrentProjectEditor(.configured);
             zgui.closeCurrentPopup();
         }
-        if (can_open_cursor and zgui.menuItem("Open in Cursor", .{})) {
+        if (can_open_cursor and renderHeaderOpenMenuRow(2, "Open in Cursor", cursor_logo, false, true)) {
             state.openCurrentProjectEditor(.cursor);
             zgui.closeCurrentPopup();
         }
-        if (can_open_vscode and zgui.menuItem("Open in VS Code", .{})) {
+        if (can_open_vscode and renderHeaderOpenMenuRow(3, "Open in VS Code", vscode_logo, false, true)) {
             state.openCurrentProjectEditor(.vscode);
             zgui.closeCurrentPopup();
         }
-        if (can_open_zed and zgui.menuItem("Open in Zed", .{})) {
+        if (can_open_zed and renderHeaderOpenMenuRow(4, "Open in Zed", zed_logo, false, true)) {
             state.openCurrentProjectEditor(.zed);
             zgui.closeCurrentPopup();
         }
@@ -321,6 +326,91 @@ fn renderHeaderChevronButton(
         if (hovered or active) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
     );
     return clicked;
+}
+
+fn renderHeaderOpenMenuRow(
+    id: i32,
+    label: []const u8,
+    texture: ?app_state.CachedImageTexture,
+    draw_folder: bool,
+    enabled: bool,
+) bool {
+    zgui.pushIntId(id);
+    defer zgui.popId();
+
+    const row_height = theme.scaledUi(34.0);
+    const row_width = zgui.getWindowWidth() - theme.scaledUi(4.0);
+    const clicked = zgui.invisibleButton("##header-open-menu-row", .{ .w = row_width, .h = row_height });
+    const hovered = zgui.isItemHovered(.{});
+    const item_min = zgui.getItemRectMin();
+    const item_max = zgui.getItemRectMax();
+    const draw_list = zgui.getWindowDrawList();
+    const row_bg = if (!enabled)
+        null
+    else if (hovered)
+        colors.rgba(42, 44, 52, 255)
+    else
+        null;
+
+    if (row_bg) |bg| {
+        draw_list.addRectFilled(.{
+            .pmin = .{ item_min[0], item_min[1] },
+            .pmax = .{ item_max[0], item_max[1] },
+            .col = zgui.colorConvertFloat4ToU32(bg),
+            .rounding = theme.scaledUi(8.0),
+        });
+    }
+
+    const icon_slot = theme.scaledUi(18.0);
+    const icon_x = item_min[0] + theme.scaledUi(12.0);
+    const icon_center_y = item_min[1] + row_height * 0.5;
+    const text_x = icon_x + icon_slot + theme.scaledUi(10.0);
+    const text_size = zgui.calcTextSize(label, .{});
+    const text_color = if (!enabled)
+        theme.COLOR_TEXT_SUBTLE
+    else if (hovered)
+        theme.COLOR_WHITE
+    else
+        theme.COLOR_TEXT_MUTED;
+
+    if (draw_folder) {
+        drawFolderIcon(draw_list, icon_x, icon_center_y, text_color);
+    } else if (texture) |cached| {
+        const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_slot, icon_slot);
+        const icon_min = .{
+            icon_x + (icon_slot - scaled[0]) * 0.5,
+            item_min[1] + (row_height - scaled[1]) * 0.5,
+        };
+        draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
+            .pmin = icon_min,
+            .pmax = .{ icon_min[0] + scaled[0], icon_min[1] + scaled[1] },
+        });
+    }
+
+    draw_list.addTextUnformatted(
+        .{ text_x, item_min[1] + (row_height - text_size[1]) * 0.5 },
+        zgui.colorConvertFloat4ToU32(text_color),
+        label,
+    );
+    return enabled and clicked;
+}
+
+fn drawFolderIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const fw = theme.scaledUi(13.0);
+    const fh = theme.scaledUi(9.0);
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, center_y - fh * 0.5 - theme.scaledUi(2.0) },
+        .pmax = .{ x + fw * 0.4, center_y - fh * 0.5 + theme.scaledUi(1.0) },
+        .col = col,
+        .rounding = theme.scaledUi(1.0),
+    });
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, center_y - fh * 0.5 },
+        .pmax = .{ x + fw, center_y + fh * 0.5 },
+        .col = col,
+        .rounding = theme.scaledUi(1.5),
+    });
 }
 
 fn drawChevron(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
