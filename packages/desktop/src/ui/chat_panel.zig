@@ -136,7 +136,14 @@ fn renderHeader(state: anytype) void {
     const button_height = theme.scaledUi(30.0);
     const button_gap = theme.scaledUi(8.0);
     const open_label = state.defaultOpenButtonLabel();
-    const open_button_width = theme.clampf(zgui.calcTextSize(open_label, .{})[0] + theme.scaledUi(28.0), theme.scaledUi(82.0), theme.scaledUi(184.0));
+    const open_icon_texture = state.defaultOpenIconTexture();
+    const open_draw_folder_icon = state.defaultOpenShowsFolderIcon();
+    const open_has_icon = open_draw_folder_icon or open_icon_texture != null;
+    const open_button_width = theme.clampf(
+        zgui.calcTextSize(open_label, .{})[0] + theme.scaledUi(if (open_has_icon) 54.0 else 28.0),
+        theme.scaledUi(82.0),
+        theme.scaledUi(184.0),
+    );
     const menu_button_width = theme.scaledUi(30.0);
     const browser_button_width = theme.scaledUi(88.0);
     const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
@@ -155,10 +162,10 @@ fn renderHeader(state: anytype) void {
     zgui.setCursorPos(.{ action_x, base_y });
     const can_run_default_open = state.canRunDefaultOpenAction();
     zgui.beginDisabled(.{ .disabled = !can_run_default_open });
-    const split_base_color = theme.COLOR_SECONDARY_GREEN;
-    const split_hover_color = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10);
-    const split_active_color = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08);
-    if (renderHeaderSplitTextButton(open_label, open_button_width, button_height, split_base_color, split_hover_color, split_active_color)) {
+    const split_base_color = theme.COLOR_PANEL_ALT;
+    const split_hover_color = theme.lighten(theme.COLOR_PANEL_ALT, 0.08);
+    const split_active_color = theme.lighten(theme.COLOR_PANEL_ALT, 0.14);
+    if (renderHeaderSplitTextButton(open_label, open_button_width, button_height, split_base_color, split_hover_color, split_active_color, open_icon_texture, open_draw_folder_icon)) {
         state.runDefaultOpenAction();
     }
     if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
@@ -252,6 +259,8 @@ fn renderHeaderSplitTextButton(
     base_color: [4]f32,
     hover_color: [4]f32,
     active_color: [4]f32,
+    texture: ?app_state.CachedImageTexture,
+    draw_folder: bool,
 ) bool {
     const start = zgui.getCursorScreenPos();
     const clicked = zgui.invisibleButton("##header-open-button", .{ .w = width, .h = height });
@@ -274,14 +283,33 @@ fn renderHeaderSplitTextButton(
         .flags = .{ .round_corners_top_left = true, .round_corners_bottom_left = true },
     });
 
+    const text_color = if (hovered or active) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_slot = theme.scaledUi(16.0);
+    const icon_x = start[0] + theme.scaledUi(14.0);
+    const icon_center_y = start[1] + height * 0.5;
+    const text_x = if (draw_folder or texture != null)
+        icon_x + icon_slot + theme.scaledUi(10.0)
+    else
+        start[0] + theme.scaledUi(14.0);
     const text_size = zgui.calcTextSize(label, .{});
-    const text_pos = .{
-        start[0] + theme.scaledUi(14.0),
-        start[1] + (height - text_size[1]) * 0.5,
-    };
+    if (draw_folder) {
+        drawFolderIcon(draw_list, icon_x, icon_center_y, text_color);
+    } else if (texture) |cached| {
+        const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_slot, icon_slot);
+        const icon_min = .{
+            icon_x + (icon_slot - scaled[0]) * 0.5,
+            start[1] + (height - scaled[1]) * 0.5,
+        };
+        draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
+            .pmin = icon_min,
+            .pmax = .{ icon_min[0] + scaled[0], icon_min[1] + scaled[1] },
+        });
+    }
+
+    const text_pos = .{ text_x, start[1] + (height - text_size[1]) * 0.5 };
     draw_list.addTextUnformatted(
         text_pos,
-        zgui.colorConvertFloat4ToU32(if (hovered or active) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED),
+        zgui.colorConvertFloat4ToU32(text_color),
         label,
     );
     return clicked;

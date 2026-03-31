@@ -123,6 +123,10 @@ pub fn configuredEditorDisplayName() ?[]const u8 {
     return executable;
 }
 
+pub fn executableNameForCommand(command: []const u8) []const u8 {
+    return commandExecutableName(command);
+}
+
 pub fn openProjectEditor(
     allocator: std.mem.Allocator,
     project_path: []const u8,
