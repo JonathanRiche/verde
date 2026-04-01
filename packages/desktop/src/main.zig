@@ -144,6 +144,7 @@ pub fn main() !void {
         running = processEvents(&state, &keyboard);
         state.pollPicker();
         state.pollSend();
+        state.pollBrowser();
         state.pollTerminals();
 
         var fb_width: c_int = 0;

@@ -243,12 +243,12 @@ fn renderHeader(state: anytype) void {
     }
 
     zgui.sameLine(.{ .spacing = button_gap });
-    zgui.beginDisabled(.{});
-    defer zgui.endDisabled();
-    _ = renderHeaderActionButton("Browser", browser_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14));
-    if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
+    if (renderHeaderActionButton("Browser", browser_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
+        state.toggleBrowser();
+    }
+    if (zgui.isItemHovered(.{ .delay_normal = true })) {
         _ = zgui.beginTooltip();
-        zgui.textUnformatted("Reserved for the upcoming browser action");
+        zgui.textUnformatted("Open the browser controls and native webview runtime");
         zgui.endTooltip();
     }
 }
