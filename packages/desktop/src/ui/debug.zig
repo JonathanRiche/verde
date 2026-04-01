@@ -5,6 +5,7 @@ const build_options = @import("build_options");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 
+/// Renders the floating debug overlay window for inspecting UI state.
 pub fn render(state: *runtime.AppState, width: f32, _: f32) void {
     if (!build_options.ui_debug) return;
 
@@ -12,7 +13,7 @@ pub fn render(state: *runtime.AppState, width: f32, _: f32) void {
     zgui.setNextWindowPos(.{
         .x = width - window_width - theme.scaledUi(16.0),
         .y = theme.scaledUi(16.0),
-        .cond = .always,
+        .cond = .appearing,
     });
     zgui.setNextWindowSize(.{
         .w = window_width,
