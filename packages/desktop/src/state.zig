@@ -1642,6 +1642,42 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser navigation requested.");
     }
 
+    /// Evaluates the current browser JavaScript input inside the browser runtime.
+    pub fn evalBrowserScript(self: *AppState) void {
+        const trimmed = std.mem.trim(u8, self.browser_state.scriptInput(), &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.setSidebarNotice("Enter JavaScript first.");
+            return;
+        }
+
+        self.browser_state.controller.eval(trimmed) catch |err| {
+            log.err("failed to evaluate browser script: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to evaluate browser script.") catch {};
+            self.setSidebarNotice("Browser script evaluation failed.");
+            return;
+        };
+        self.setSidebarNotice("Browser script evaluation requested.");
+    }
+
+    /// Posts the current JSON bridge input into the browser runtime.
+    pub fn postBrowserJsonFromInput(self: *AppState) void {
+        const trimmed = std.mem.trim(u8, self.browser_state.jsonInput(), &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.setSidebarNotice("Enter JSON first.");
+            return;
+        }
+
+        self.browser_state.controller.postJson(trimmed) catch |err| {
+            log.err("failed to post browser JSON: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to post browser JSON.") catch {};
+            self.setSidebarNotice("Browser JSON bridge failed.");
+            return;
+        };
+        self.setSidebarNotice("Browser JSON bridge requested.");
+    }
+
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
         while (self.browser_state.controller.pollEvent()) |event| {
@@ -1661,9 +1697,13 @@ pub const AppState = struct {
                     self.browser_state.setLastError(null) catch {};
                 },
                 .js_message => |message| {
-                    self.setSidebarNotice(message);
+                    self.browser_state.setLastJsMessage(message) catch {};
+                    self.setSidebarNotice("Browser bridge message received.");
                 },
-                .eval_result => |_| {},
+                .eval_result => |result| {
+                    self.browser_state.setLastEvalResult(result) catch {};
+                    self.setSidebarNotice("Browser script evaluation completed.");
+                },
                 .failed => |message| {
                     self.browser_state.status = .failed;
                     self.browser_state.setLastError(message) catch {};
