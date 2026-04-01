@@ -48,6 +48,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     renderBrowserSummary(state);
     renderBrowserAddressBar(state);
+    renderBrowserScriptTools(state);
     renderBrowserDetails(state);
 }
 
@@ -94,6 +95,47 @@ fn renderBrowserAddressBar(state: *runtime.AppState) void {
     zgui.popStyleColor(.{ .count = 3 });
 }
 
+/// Renders the JavaScript eval and JSON bridge inputs that exercise the browser API surface.
+fn renderBrowserScriptTools(state: *runtime.AppState) void {
+    const browser_state = state.browserState();
+    zgui.separator();
+    zgui.textColored(theme.COLOR_WHITE, "JavaScript", .{});
+    _ = zgui.inputTextMultiline("##browser-script", .{
+        .buf = browser_state.scriptBuffer(),
+        .w = 0.0,
+        .h = theme.scaledUi(92.0),
+    });
+
+    const action_width = theme.scaledUi(108.0);
+    const action_gap = theme.scaledUi(8.0);
+    const json_width = @max(zgui.getContentRegionAvail()[0] - action_width - action_gap, theme.scaledUi(160.0));
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Eval JS", .{ .w = action_width, .h = theme.scaledUi(34.0) })) {
+        state.evalBrowserScript();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
+    zgui.textColored(theme.COLOR_WHITE, "JSON Bridge", .{});
+    zgui.pushItemWidth(json_width);
+    _ = zgui.inputTextWithHint("##browser-json", .{
+        .hint = "{\"type\":\"ping\"}",
+        .buf = browser_state.jsonBuffer(),
+    });
+    zgui.popItemWidth();
+
+    zgui.sameLine(.{ .spacing = action_gap });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Send JSON", .{ .w = action_width, .h = theme.scaledUi(34.0) })) {
+        state.postBrowserJsonFromInput();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+}
+
 /// Renders the current URL and last error surfaced by browser state.
 fn renderBrowserDetails(state: *runtime.AppState) void {
     const browser_state = state.browserStateConst();
@@ -108,6 +150,18 @@ fn renderBrowserDetails(state: *runtime.AppState) void {
     if (browser_state.last_error) |message| {
         zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
         zgui.textColored(colors.rgba(255, 182, 72, 255), "Last error", .{});
+        zgui.textWrapped("{s}", .{message});
+    }
+
+    if (browser_state.last_eval_result) |result| {
+        zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
+        zgui.textColored(theme.COLOR_WHITE, "Last eval result", .{});
+        zgui.textWrapped("{s}", .{result});
+    }
+
+    if (browser_state.last_js_message) |message| {
+        zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
+        zgui.textColored(theme.COLOR_WHITE, "Last bridge message", .{});
         zgui.textWrapped("{s}", .{message});
     }
 }
