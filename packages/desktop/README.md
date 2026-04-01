@@ -24,6 +24,7 @@ From the repo root:
 ```bash
 zig build
 zig build run
+zig build run -Dui-debug=true
 zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
@@ -37,6 +38,7 @@ From this directory directly:
 ```bash
 zig build
 zig build run
+zig build run -Dui-debug=true
 zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
@@ -46,6 +48,7 @@ What these do:
 
 - `zig build`: build the app
 - `zig build run`: build and launch the app
+- `zig build run -Dui-debug=true`: build and launch the app with the `UI Debug` window enabled
 - `zig build test`: run the Zig tests plus the format check from `build.zig`
 
 The built executable is:
@@ -77,6 +80,23 @@ For a local app install on macOS, run this from the repo root:
 ```
 
 That installs `Verde.app` into `~/Applications` by default. Pass `/Applications` if you want the system-wide Applications folder instead.
+
+## Embedded terminal
+
+The desktop shell now includes a bottom-docked embedded terminal powered by Ghostty's `libghostty-vt`.
+
+- Toggle it with `CommandOrControl+J`
+- The terminal is scoped to the selected project and starts in that project's directory
+- The dock only consumes vertical space in the chat workspace and leaves the sidebar untouched
+- While the terminal is focused, `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale
+
+For terminal/composer focus debugging, run:
+
+```bash
+zig build run -Dui-debug=true
+```
+
+That opens a separate `UI Debug` window showing focus state, ImGui capture flags, terminal hitbox state, and recent terminal key/text routing.
 
 ## Typical development loop
 
@@ -190,6 +210,7 @@ The desktop app depends on the following upstream projects:
 - SDL3 from libsdl-org. Used for window creation, events, monitor/display integration, and OpenGL context setup.
 - `zqlite` by Karl Seguin. Used for SQLite-backed state and persistence. Declared in [`build.zig.zon`](build.zig.zon). License: MIT-style.
 - `stb_image` by Sean Barrett and contributors. Used for image decoding. Vendored in [`../../vendor/stb_image.h`](../../vendor/stb_image.h). License: public domain or MIT.
+- Ghostty / `libghostty-vt` by Mitchell Hashimoto and contributors. Used for terminal emulation and VT parsing in the embedded terminal dock. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
 
 When distributing the desktop app, keep the applicable upstream licenses and notices for vendored or bundled components.
 

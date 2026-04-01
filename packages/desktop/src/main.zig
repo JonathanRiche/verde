@@ -284,7 +284,9 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
                 handleKeyboardAction(state, keyboard, .toggle_terminal);
                 return true;
             }
-            if (state.handleTerminalKeyDown(&event.key)) {
+            const terminal_key_handled = state.handleTerminalKeyDown(&event.key);
+            state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+            if (terminal_key_handled) {
                 return true;
             }
             if (shouldPasteClipboardImage(state, &event.key)) {
@@ -299,7 +301,10 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
             }
         },
         .text_input => {
-            if (state.handleTerminalTextInput(event.text.text)) {
+            const text_input = std.mem.sliceTo(event.text.text, 0);
+            const terminal_text_handled = state.handleTerminalTextInput(event.text.text);
+            state.noteTerminalTextRouting(text_input, terminal_text_handled);
+            if (terminal_text_handled) {
                 return true;
             }
         },

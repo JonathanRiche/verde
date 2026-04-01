@@ -562,6 +562,15 @@ pub const AppState = struct {
     sidebar_notice_storage: [256:0]u8,
     composer_focused: bool,
     terminal_focused: bool,
+    debug_terminal_window_focused: bool,
+    debug_terminal_hitbox_focused: bool,
+    debug_terminal_hitbox_active: bool,
+    debug_terminal_hitbox_clicked: bool,
+    debug_terminal_focus_requested: bool,
+    debug_last_terminal_key_handled: bool,
+    debug_last_terminal_text_handled: bool,
+    debug_last_terminal_scancode: ?sdl.Scancode,
+    debug_last_terminal_text: [32:0]u8,
     composer_picker_provider: ?Provider,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
@@ -595,6 +604,15 @@ pub const AppState = struct {
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .composer_focused = false,
             .terminal_focused = false,
+            .debug_terminal_window_focused = false,
+            .debug_terminal_hitbox_focused = false,
+            .debug_terminal_hitbox_active = false,
+            .debug_terminal_hitbox_clicked = false,
+            .debug_terminal_focus_requested = false,
+            .debug_last_terminal_key_handled = false,
+            .debug_last_terminal_text_handled = false,
+            .debug_last_terminal_scancode = null,
+            .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
             .composer_picker_provider = null,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
@@ -1572,6 +1590,41 @@ pub const AppState = struct {
     pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
         if (!self.terminal_focused or !self.isTerminalVisible()) return false;
         return self.currentProjectTerminalMutable().handleTextInput(std.mem.sliceTo(text, 0));
+    }
+
+    pub fn resetUiDebugFrame(self: *AppState) void {
+        self.debug_terminal_window_focused = false;
+        self.debug_terminal_hitbox_focused = false;
+        self.debug_terminal_hitbox_active = false;
+        self.debug_terminal_hitbox_clicked = false;
+        self.debug_terminal_focus_requested = false;
+    }
+
+    pub fn noteTerminalViewportDebug(
+        self: *AppState,
+        window_focused: bool,
+        hitbox_focused: bool,
+        hitbox_active: bool,
+        hitbox_clicked: bool,
+        focus_requested: bool,
+    ) void {
+        self.debug_terminal_window_focused = window_focused;
+        self.debug_terminal_hitbox_focused = hitbox_focused;
+        self.debug_terminal_hitbox_active = hitbox_active;
+        self.debug_terminal_hitbox_clicked = hitbox_clicked;
+        self.debug_terminal_focus_requested = focus_requested;
+    }
+
+    pub fn noteTerminalKeyRouting(self: *AppState, event: *const sdl.KeyboardEvent, handled: bool) void {
+        self.debug_last_terminal_scancode = event.scancode;
+        self.debug_last_terminal_key_handled = handled;
+    }
+
+    pub fn noteTerminalTextRouting(self: *AppState, text: []const u8, handled: bool) void {
+        self.debug_last_terminal_text_handled = handled;
+        @memset(&self.debug_last_terminal_text, 0);
+        const len = @min(text.len, self.debug_last_terminal_text.len - 1);
+        @memcpy(self.debug_last_terminal_text[0..len], text[0..len]);
     }
 
     pub fn currentThreadMutable(self: *AppState) *ChatThread {
