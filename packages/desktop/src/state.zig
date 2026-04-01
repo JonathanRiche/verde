@@ -10,6 +10,7 @@ const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
+const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
 
 pub const ReasoningEffort = db_types.ReasoningEffort;
@@ -590,6 +591,11 @@ pub const AppState = struct {
     picker_state: PickerState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
+    browser_launch_open_delay_frames: u8,
+    browser_pane_min: [2]f32,
+    browser_pane_max: [2]f32,
+    browser_pane_hovered: bool,
+    browser_pane_focused: bool,
     send_state: SendState,
     scroll_transcript_to_bottom: bool,
     dirty: bool,
@@ -636,6 +642,11 @@ pub const AppState = struct {
             .picker_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
+            .browser_launch_open_delay_frames = 0,
+            .browser_pane_min = .{ 0.0, 0.0 },
+            .browser_pane_max = .{ 0.0, 0.0 },
+            .browser_pane_hovered = false,
+            .browser_pane_focused = false,
             .send_state = .{},
             .scroll_transcript_to_bottom = true,
             .dirty = false,
@@ -1591,6 +1602,16 @@ pub const AppState = struct {
         return &self.browser_state;
     }
 
+    /// Opens the browser during startup when an explicit debug environment flag requests it.
+    pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
+        const value = std.posix.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return;
+        if (!std.mem.eql(u8, value, "1")) return;
+        // Wait a couple of app-loop turns so this exercises the same path as a
+        // user click after the window is live instead of front-loading browser
+        // creation before the first frame.
+        self.browser_launch_open_delay_frames = 2;
+    }
+
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
         if (self.browser_state.controls_visible) {
@@ -1613,6 +1634,7 @@ pub const AppState = struct {
     /// Hides the desktop browser control surface and its browser runtime.
     pub fn hideBrowser(self: *AppState) void {
         self.browser_state.setControlsVisible(false);
+        self.browser_pane_focused = false;
         self.browser_state.controller.hide() catch |err| {
             log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
@@ -1623,6 +1645,101 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser hidden.");
     }
 
+    /// Reports whether the browser dock is visible in the chat workspace.
+    pub fn isBrowserVisible(self: *const AppState) bool {
+        return self.browser_state.controls_visible;
+    }
+
+    /// Computes the height reserved for the browser dock inside the chat workspace.
+    pub fn browserPanelHeight(self: *const AppState, available_height: f32) f32 {
+        if (!self.isBrowserVisible()) return 0.0;
+        return theme.clampf(available_height * 0.24, theme.scaledUi(182.0), @min(theme.scaledUi(320.0), available_height * 0.42));
+    }
+
+    /// Records the latest browser pane bounds so SDL events can target the correct in-app viewport.
+    pub fn noteBrowserPaneRegion(self: *AppState, min: [2]f32, max: [2]f32, hovered: bool) void {
+        self.browser_pane_min = min;
+        self.browser_pane_max = max;
+        self.browser_pane_hovered = hovered;
+    }
+
+    /// Clears browser-pane keyboard focus when another UI surface takes ownership.
+    pub fn unfocusBrowserPane(self: *AppState) void {
+        self.browser_pane_focused = false;
+    }
+
+    /// Reports whether the browser pane currently owns keyboard input.
+    pub fn isBrowserPaneFocused(self: *const AppState) bool {
+        return self.isBrowserVisible() and self.browser_pane_focused;
+    }
+
+    /// Reports whether the last rendered browser pane contains the given framebuffer-space point.
+    pub fn browserPaneContains(self: *const AppState, x: f32, y: f32) bool {
+        if (!self.isBrowserVisible()) return false;
+        if (self.browser_pane_max[0] <= self.browser_pane_min[0] or self.browser_pane_max[1] <= self.browser_pane_min[1]) {
+            return false;
+        }
+        return x >= self.browser_pane_min[0] and
+            y >= self.browser_pane_min[1] and
+            x <= self.browser_pane_max[0] and
+            y <= self.browser_pane_max[1];
+    }
+
+    /// Forwards browser-pane pointer input after converting it into pane-local coordinates.
+    pub fn handleBrowserMouse(self: *AppState, event: browser_runtime.MouseEvent) bool {
+        if (!self.isBrowserVisible()) return false;
+
+        const contains_pointer = self.browserPaneContains(event.x, event.y);
+        const is_pointer_event = event.button != null or event.wheel_x != 0.0 or event.wheel_y != 0.0;
+        if (event.button != null and event.pressed and !contains_pointer) {
+            self.browser_pane_focused = false;
+            return false;
+        }
+        if (!contains_pointer and !self.browser_pane_focused) return false;
+        if (is_pointer_event and !contains_pointer) return false;
+
+        var pane_event = event;
+        pane_event.x = event.x - self.browser_pane_min[0];
+        pane_event.y = event.y - self.browser_pane_min[1];
+
+        const handled = self.browser_state.controller.handleMouse(pane_event) catch |err| {
+            log.warn("failed to forward browser mouse input: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled and contains_pointer and event.button != null and event.pressed) {
+            self.browser_pane_focused = true;
+            self.terminal_focused = false;
+            self.composer_focused = false;
+        }
+        return handled;
+    }
+
+    /// Forwards browser-pane keyboard and text input when the pane owns focus.
+    pub fn handleBrowserKey(self: *AppState, event: browser_runtime.KeyEvent) bool {
+        if (!self.isBrowserPaneFocused()) return false;
+        return self.browser_state.controller.handleKey(event) catch |err| {
+            log.warn("failed to forward browser keyboard input: {s}", .{@errorName(err)});
+            return false;
+        };
+    }
+
+    /// Re-shows the native browser window without changing dock visibility.
+    pub fn reopenBrowserWindow(self: *AppState) void {
+        if (!self.browser_state.controller.supportsPopout()) {
+            self.setSidebarNotice("Browser pop out is not implemented yet.");
+            return;
+        }
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.err("failed to re-show browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to reopen browser window.") catch {};
+            self.setSidebarNotice("Failed to reopen browser window.");
+            return;
+        };
+        self.setSidebarNotice("Browser window reopened.");
+    }
+
     /// Navigates the browser runtime using the current browser address input buffer.
     pub fn navigateBrowserFromAddress(self: *AppState) void {
         const trimmed = std.mem.trim(u8, self.browser_state.addressInput(), &std.ascii.whitespace);
@@ -1630,15 +1747,21 @@ pub const AppState = struct {
             self.setSidebarNotice("Enter a browser URL first.");
             return;
         }
+        const normalized = self.normalizeBrowserUrl(trimmed) catch {
+            self.setSidebarNotice("Failed to normalize browser URL.");
+            return;
+        };
+        defer self.allocator.free(normalized);
 
         self.browser_state.status = .opening;
-        self.browser_state.controller.navigate(trimmed) catch |err| {
+        self.browser_state.controller.navigate(normalized) catch |err| {
             log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
             self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
             self.setSidebarNotice("Browser navigation failed.");
             return;
         };
+        self.browser_state.setAddress(normalized);
         self.setSidebarNotice("Browser navigation requested.");
     }
 
@@ -1680,6 +1803,12 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (self.browser_launch_open_delay_frames > 0) {
+            self.browser_launch_open_delay_frames -= 1;
+            if (self.browser_launch_open_delay_frames == 0) {
+                self.toggleBrowser();
+            }
+        }
         while (self.browser_state.controller.pollEvent()) |event| {
             defer event.deinit(self.allocator);
             switch (event) {
@@ -1689,6 +1818,8 @@ pub const AppState = struct {
                 },
                 .closed => {
                     self.browser_state.status = .hidden;
+                    self.browser_pane_focused = false;
+                    self.setSidebarNotice("Browser window closed.");
                 },
                 .navigated => |url| {
                     self.browser_state.status = .ready;
@@ -1696,6 +1827,7 @@ pub const AppState = struct {
                     self.browser_state.setAddress(url);
                     self.browser_state.setLastError(null) catch {};
                 },
+                .title_changed => |_| {},
                 .js_message => |message| {
                     self.browser_state.setLastJsMessage(message) catch {};
                     self.setSidebarNotice("Browser bridge message received.");
@@ -1711,6 +1843,17 @@ pub const AppState = struct {
                 },
             }
         }
+    }
+
+    // Adds an https scheme for bare hostnames so the browser control surface accepts normal typed URLs.
+    fn normalizeBrowserUrl(self: *AppState, value: []const u8) ![]u8 {
+        if (std.mem.indexOf(u8, value, "://") != null) {
+            return try self.allocator.dupe(u8, value);
+        }
+        if (std.mem.startsWith(u8, value, "about:")) {
+            return try self.allocator.dupe(u8, value);
+        }
+        return try std.fmt.allocPrint(self.allocator, "https://{s}", .{value});
     }
 
     pub fn hasActiveTerminalSessions(self: *const AppState) bool {
@@ -1736,6 +1879,7 @@ pub const AppState = struct {
         self.debug_terminal_hitbox_active = false;
         self.debug_terminal_hitbox_clicked = false;
         self.debug_terminal_focus_requested = false;
+        self.browser_pane_hovered = false;
     }
 
     pub fn noteTerminalViewportDebug(

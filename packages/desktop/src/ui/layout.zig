@@ -5,7 +5,6 @@ const zgui = @import("zgui");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
-const browser_window = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
@@ -40,7 +39,6 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     sidebar.render(state, sidebar_width, 0.0);
     zgui.sameLine(.{ .spacing = gap });
     chat_panel.renderWorkspace(state, workspace_width, content[1]);
-    browser_window.render(state, width, height);
     renderImageModal(state, width, height);
     renderProjectRenameModal(state, width, height);
     debug_window.render(state, width, height);

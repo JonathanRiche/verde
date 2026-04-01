@@ -4,7 +4,15 @@ const std = @import("std");
 
 pub const Controller = @import("controller.zig").Controller;
 pub const Event = @import("types.zig").Event;
+pub const KeyEvent = @import("input.zig").KeyEvent;
+pub const MouseButton = @import("input.zig").MouseButton;
+pub const MouseEvent = @import("input.zig").MouseEvent;
+pub const RuntimeKind = @import("types.zig").RuntimeKind;
+pub const RuntimeMode = @import("types.zig").RuntimeMode;
+pub const Session = @import("session.zig").Session;
+pub const SessionId = @import("types.zig").SessionId;
 pub const Status = @import("types.zig").Status;
+pub const PaneTexture = @import("texture.zig").PaneTexture;
 
 pub const ADDRESS_CAPACITY: usize = 2048;
 pub const SCRIPT_CAPACITY: usize = 4096;

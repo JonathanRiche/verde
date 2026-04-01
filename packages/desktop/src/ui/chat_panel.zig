@@ -5,6 +5,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const colors = @import("colors.zig");
+const browser_panel = @import("browser.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
@@ -13,7 +14,15 @@ const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
 const HEADER_OPEN_MENU_ID: [:0]const u8 = "ChatHeaderOpenMenu";
+const WorkspaceDockLayout = struct {
+    workspace_height: f32,
+    browser_gap: f32,
+    browser_height: f32,
+    terminal_gap: f32,
+    terminal_height: f32,
+};
 
+// Renders the transcript, composer, and any bottom-docked workspace panels.
 fn inner_workspace(state: *app_state.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
     const available_width = zgui.getContentRegionAvail();
@@ -56,15 +65,9 @@ fn inner_workspace(state: *app_state.AppState) void {
     }
 
     const content = zgui.getContentRegionAvail();
-    const terminal_visible = state.isTerminalVisible();
+    const dock_layout = computeWorkspaceDockLayout(state, content[1]);
     const composer_gap = theme.scaledUi(8.0);
-    const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
-    const max_terminal_height = @max(content[1] - theme.scaledUi(220.0) - terminal_gap, 0.0);
-    const terminal_height = if (terminal_visible)
-        @min(state.terminalPanelHeight(content[1]), max_terminal_height)
-    else
-        0.0;
-    const workspace_height = @max(content[1] - terminal_height - terminal_gap, theme.scaledUi(120.0));
+    const workspace_height = dock_layout.workspace_height;
     const composer_height = theme.clampf(workspace_height * 0.27, theme.scaledUi(168.0), @min(workspace_height * 0.42, theme.scaledUi(320.0)));
     const transcript_height = @max(workspace_height - composer_height - composer_gap, theme.scaledUi(120.0));
     renderTranscript(state, content[0], transcript_height, inner_pad_x);
@@ -75,10 +78,45 @@ fn inner_workspace(state: *app_state.AppState) void {
     renderComposer(state, composer_width, @max(workspace_height - transcript_height - composer_gap, theme.scaledUi(120.0)));
     zgui.unindent(.{ .indent_w = inner_pad_x });
 
-    if (terminal_visible and terminal_height > 0.0) {
-        zgui.dummy(.{ .w = 0.0, .h = terminal_gap });
-        terminal_panel.renderDock(state, content[0], @max(zgui.getContentRegionAvail()[1], 0.0));
+    if (dock_layout.browser_height > 0.0) {
+        zgui.dummy(.{ .w = 0.0, .h = dock_layout.browser_gap });
+        browser_panel.renderDock(state, content[0], dock_layout.browser_height);
     }
+
+    if (dock_layout.terminal_height > 0.0) {
+        zgui.dummy(.{ .w = 0.0, .h = dock_layout.terminal_gap });
+        terminal_panel.renderDock(state, content[0], dock_layout.terminal_height);
+    }
+}
+
+// Balances transcript/composer space against the browser and terminal docks.
+fn computeWorkspaceDockLayout(state: *app_state.AppState, available_height: f32) WorkspaceDockLayout {
+    const browser_visible = state.isBrowserVisible();
+    const terminal_visible = state.isTerminalVisible();
+    const browser_gap = if (browser_visible) theme.scaledUi(12.0) else 0.0;
+    const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
+    const minimum_workspace = theme.scaledUi(220.0);
+    const preferred_browser_height = if (browser_visible) state.browserPanelHeight(available_height) else 0.0;
+    const preferred_terminal_height = if (terminal_visible) state.terminalPanelHeight(available_height) else 0.0;
+    const preferred_total_height = preferred_browser_height + preferred_terminal_height;
+    const total_gap = browser_gap + terminal_gap;
+    const available_dock_height = @max(available_height - minimum_workspace - total_gap, 0.0);
+
+    var browser_height = preferred_browser_height;
+    var terminal_height = preferred_terminal_height;
+    if (preferred_total_height > 0.0 and preferred_total_height > available_dock_height) {
+        const scale = available_dock_height / preferred_total_height;
+        browser_height *= scale;
+        terminal_height *= scale;
+    }
+
+    return .{
+        .workspace_height = @max(available_height - total_gap - browser_height - terminal_height, theme.scaledUi(120.0)),
+        .browser_gap = if (browser_height > 0.0) browser_gap else 0.0,
+        .browser_height = browser_height,
+        .terminal_gap = if (terminal_height > 0.0) terminal_gap else 0.0,
+        .terminal_height = terminal_height,
+    };
 }
 
 /// Renders the chat workspace shell beside the sidebar.
