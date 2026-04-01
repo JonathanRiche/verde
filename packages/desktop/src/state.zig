@@ -3,6 +3,7 @@ const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
+const browser_runtime = @import("browser/mod.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
@@ -588,11 +589,15 @@ pub const AppState = struct {
     show_project_creator: bool,
     picker_state: PickerState,
     file_search_state: FileSearchState,
+    browser_state: browser_runtime.State,
     send_state: SendState,
     scroll_transcript_to_bottom: bool,
     dirty: bool,
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
+        var browser_state = try browser_runtime.State.init(allocator);
+        errdefer browser_state.deinit();
+
         var state: AppState = .{
             .allocator = allocator,
             .storage = storage,
@@ -630,6 +635,7 @@ pub const AppState = struct {
             .show_project_creator = false,
             .picker_state = .{},
             .file_search_state = .{},
+            .browser_state = browser_state,
             .send_state = .{},
             .scroll_transcript_to_bottom = true,
             .dirty = false,
@@ -1575,6 +1581,98 @@ pub const AppState = struct {
         }
     }
 
+    /// Returns mutable browser UI/runtime state for desktop control surfaces.
+    pub fn browserState(self: *AppState) *browser_runtime.State {
+        return &self.browser_state;
+    }
+
+    /// Returns read-only browser UI/runtime state for desktop rendering.
+    pub fn browserStateConst(self: *const AppState) *const browser_runtime.State {
+        return &self.browser_state;
+    }
+
+    /// Toggles the desktop browser control surface and the underlying browser runtime.
+    pub fn toggleBrowser(self: *AppState) void {
+        if (self.browser_state.controls_visible) {
+            self.hideBrowser();
+            return;
+        }
+
+        self.browser_state.setControlsVisible(true);
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.err("failed to show browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to show browser runtime.") catch {};
+            self.setSidebarNotice("Failed to show browser.");
+            return;
+        };
+        self.setSidebarNotice("Browser opened.");
+    }
+
+    /// Hides the desktop browser control surface and its browser runtime.
+    pub fn hideBrowser(self: *AppState) void {
+        self.browser_state.setControlsVisible(false);
+        self.browser_state.controller.hide() catch |err| {
+            log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to hide browser runtime.") catch {};
+            self.setSidebarNotice("Failed to hide browser.");
+            return;
+        };
+        self.setSidebarNotice("Browser hidden.");
+    }
+
+    /// Navigates the browser runtime using the current browser address input buffer.
+    pub fn navigateBrowserFromAddress(self: *AppState) void {
+        const trimmed = std.mem.trim(u8, self.browser_state.addressInput(), &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.setSidebarNotice("Enter a browser URL first.");
+            return;
+        }
+
+        self.browser_state.status = .opening;
+        self.browser_state.controller.navigate(trimmed) catch |err| {
+            log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
+            self.setSidebarNotice("Browser navigation failed.");
+            return;
+        };
+        self.setSidebarNotice("Browser navigation requested.");
+    }
+
+    /// Applies queued browser runtime events back onto app-visible browser state.
+    pub fn pollBrowser(self: *AppState) void {
+        while (self.browser_state.controller.pollEvent()) |event| {
+            defer event.deinit(self.allocator);
+            switch (event) {
+                .opened => {
+                    self.browser_state.status = .ready;
+                    self.browser_state.setLastError(null) catch {};
+                },
+                .closed => {
+                    self.browser_state.status = .hidden;
+                },
+                .navigated => |url| {
+                    self.browser_state.status = .ready;
+                    self.browser_state.setCurrentUrl(url) catch {};
+                    self.browser_state.setAddress(url);
+                    self.browser_state.setLastError(null) catch {};
+                },
+                .js_message => |message| {
+                    self.setSidebarNotice(message);
+                },
+                .eval_result => |_| {},
+                .failed => |message| {
+                    self.browser_state.status = .failed;
+                    self.browser_state.setLastError(message) catch {};
+                    self.setSidebarNotice("Browser runtime reported a failure.");
+                },
+            }
+        }
+    }
+
     pub fn hasActiveTerminalSessions(self: *const AppState) bool {
         for (self.projects.items) |*project| {
             if (project.terminal_dock.hasRunningSession()) return true;
@@ -1888,6 +1986,7 @@ pub const AppState = struct {
         freePendingApproval(std.heap.page_allocator, &self.send_state.pending_approval);
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
+        self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
