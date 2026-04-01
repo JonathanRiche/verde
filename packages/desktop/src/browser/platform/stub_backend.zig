@@ -1,6 +1,7 @@
 //! Temporary platform backend used while native webview shims are being built out.
 
 const std = @import("std");
+const browser_input = @import("../input.zig");
 const browser_queue = @import("../queue.zig");
 const browser_types = @import("../types.zig");
 
@@ -71,6 +72,20 @@ pub const Controller = struct {
         try self.queue.push(self.allocator, .{
             .js_message = try self.allocator.dupe(u8, json),
         });
+    }
+
+    /// Reports that pointer input is not implemented by the stub backend.
+    pub fn handleMouse(self: *Controller, event: browser_input.MouseEvent) !bool {
+        _ = self;
+        _ = event;
+        return false;
+    }
+
+    /// Reports that keyboard input is not implemented by the stub backend.
+    pub fn handleKey(self: *Controller, event: browser_input.KeyEvent) !bool {
+        _ = self;
+        _ = event;
+        return false;
     }
 
     /// Returns the next queued backend event, if one is available.

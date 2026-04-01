@@ -6,6 +6,7 @@ const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 
 const app_config = @import("config.zig");
+const browser_runtime = @import("browser/mod.zig");
 const chat_threads = @import("chat/threads.zig");
 const keybinds = @import("keybinds.zig");
 const stb_image = @import("stb_image.zig");
@@ -136,6 +137,7 @@ pub fn main() !void {
 
     var state = try AppState.init(allocator, &storage, loaded_app_config);
     defer state.deinit();
+    state.openBrowserOnLaunchIfRequested();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
 
@@ -285,6 +287,9 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
                 handleKeyboardAction(state, keyboard, .toggle_terminal);
                 return true;
             }
+            if (handleBrowserKeyboardEvent(state, &event.key)) {
+                return true;
+            }
             const terminal_key_handled = state.handleTerminalKeyDown(&event.key);
             state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
             if (terminal_key_handled) {
@@ -301,17 +306,120 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
                 handleKeyboardAction(state, keyboard, resolved_action);
             }
         },
+        .key_up => {
+            if (handleBrowserKeyboardEvent(state, &event.key)) {
+                return true;
+            }
+        },
         .text_input => {
             const text_input = std.mem.sliceTo(event.text.text, 0);
+            const browser_text_handled = state.handleBrowserKey(.{
+                .key_code = 0,
+                .text = text_input,
+                .pressed = true,
+            });
+            if (browser_text_handled) {
+                return true;
+            }
             const terminal_text_handled = state.handleTerminalTextInput(event.text.text);
             state.noteTerminalTextRouting(text_input, terminal_text_handled);
             if (terminal_text_handled) {
                 return true;
             }
         },
+        .mouse_motion => {
+            _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
+        },
+        .mouse_button_down, .mouse_button_up => {
+            const handled = state.handleBrowserMouse(browserMouseButtonEvent(&event.button));
+            if (!handled and event.button.down) {
+                state.unfocusBrowserPane();
+            }
+            if (handled) {
+                return true;
+            }
+        },
+        .mouse_wheel => {
+            if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
+                return true;
+            }
+        },
         else => {},
     }
     return true;
+}
+
+fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    const key_code = browserKeyCodeForEvent(event) orelse return false;
+    return state.handleBrowserKey(.{
+        .key_code = key_code,
+        .pressed = event.down,
+        .ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl),
+        .shift = isKeymodPressed(event.mod, sdl.Keymod.shift),
+        .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
+        .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
+    });
+}
+
+fn browserMouseMotionEvent(event: *const sdl.MouseMotionEvent) browser_runtime.MouseEvent {
+    return .{
+        .x = event.x,
+        .y = event.y,
+    };
+}
+
+fn browserMouseButtonEvent(event: *const sdl.MouseButtonEvent) browser_runtime.MouseEvent {
+    return .{
+        .x = event.x,
+        .y = event.y,
+        .button = switch (event.button) {
+            1 => .left,
+            2 => .middle,
+            3 => .right,
+            else => null,
+        },
+        .pressed = event.down,
+    };
+}
+
+fn browserMouseWheelEvent(event: *const sdl.MouseWheelEvent) browser_runtime.MouseEvent {
+    return .{
+        .x = event.mouse_x,
+        .y = event.mouse_y,
+        .wheel_x = event.x,
+        .wheel_y = event.y,
+    };
+}
+
+fn browserKeyCodeForEvent(event: *const sdl.KeyboardEvent) ?u32 {
+    return switch (event.key) {
+        .@"return", .kp_enter => 0xff0d,
+        .backspace, .kp_backspace => 0xff08,
+        .tab, .kp_tab => 0xff09,
+        .escape => 0xff1b,
+        .delete => 0xffff,
+        .home => 0xff50,
+        .left => 0xff51,
+        .up => 0xff52,
+        .right => 0xff53,
+        .down => 0xff54,
+        .pageup => 0xff55,
+        .pagedown => 0xff56,
+        .end => 0xff57,
+        else => {
+            const modifiers = keymodBits(event.mod);
+            if ((modifiers & (sdl.Keymod.ctrl | sdl.Keymod.alt | sdl.Keymod.gui)) == 0) return null;
+            return @intFromEnum(event.key);
+        },
+    };
+}
+
+fn isKeymodPressed(modifier_state: sdl.Keymod, flag: u16) bool {
+    return (keymodBits(modifier_state) & flag) != 0;
+}
+
+fn keymodBits(modifier_state: sdl.Keymod) u16 {
+    return @as(*const u16, @ptrCast(&modifier_state)).*;
 }
 
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {

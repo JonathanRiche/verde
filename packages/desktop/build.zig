@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
+    const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
+    const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
+    const cef_sdk_configured = cef_sdk_path != null and target.result.os.tag == .linux;
     const fff_root = b.path("../../vendor/fff");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
@@ -26,6 +29,8 @@ pub fn build(b: *std.Build) void {
     const imgui = zgui.artifact("imgui");
     const build_options = b.addOptions();
     build_options.addOption(bool, "ui_debug", ui_debug);
+    build_options.addOption(bool, "cef_sdk_configured", cef_sdk_configured);
+    build_options.addOption(bool, "cef_stub_preview", cef_stub_preview);
 
     // zgui's sdl3_opengl3 backend currently adds the nested SDL3 include dir,
     // but imgui_impl_sdl3.cpp includes <SDL3/SDL.h> and needs the parent root.
@@ -88,7 +93,6 @@ pub fn build(b: *std.Build) void {
         },
         else => {},
     }
-
     switch (target.result.os.tag) {
         .linux => exe.root_module.addRPathSpecial("$ORIGIN"),
         .macos => exe.root_module.addRPathSpecial("@executable_path"),
@@ -96,6 +100,42 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    if (target.result.os.tag == .linux) {
+        const browser_helper = b.addExecutable(.{
+            .name = "verde-browser-linux",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/browser/platform/linux_helper_main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        browser_helper.linkLibC();
+        browser_helper.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_webkitgtk.c"),
+            .flags = &.{},
+        });
+        browser_helper.root_module.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
+        b.installArtifact(browser_helper);
+    }
+    if (cef_sdk_configured) {
+        const cef_helper = b.addExecutable(.{
+            .name = "verde-browser-cef",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/browser/cef/subprocess_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = build_options.createModule() },
+                },
+            }),
+        });
+        cef_helper.linkLibC();
+        configureLinuxCefBinary(b, cef_helper, cef_sdk_path.?);
+        cef_helper.root_module.addRPathSpecial("$ORIGIN");
+        b.installArtifact(cef_helper);
+        installLinuxCefRuntime(b, cef_sdk_path.?);
+    }
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
     install_fff.step.dependOn(&build_fff.step);
     b.getInstallStep().dependOn(&install_fff.step);
@@ -179,4 +219,62 @@ pub fn build(b: *std.Build) void {
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
+}
+
+fn configureLinuxCefBinary(
+    b: *std.Build,
+    compile: *std.Build.Step.Compile,
+    sdk_path: []const u8,
+) void {
+    const sdk_root: std.Build.LazyPath = .{ .cwd_relative = sdk_path };
+    const release_dir = b.pathJoin(&.{ sdk_path, "Release" });
+
+    compile.root_module.link_libcpp = true;
+    compile.root_module.addIncludePath(sdk_root);
+    compile.addLibraryPath(.{ .cwd_relative = release_dir });
+    compile.linkSystemLibrary("cef");
+    compile.addCSourceFile(.{
+        .file = b.path("src/browser/cef/c/native_linux.cc"),
+        .flags = &.{"-std=c++17"},
+    });
+}
+
+fn installLinuxCefRuntime(b: *std.Build, sdk_path: []const u8) void {
+    const release_files = [_][]const u8{
+        "libcef.so",
+        "libEGL.so",
+        "libGLESv2.so",
+        "libvk_swiftshader.so",
+        "libvulkan.so.1",
+        "v8_context_snapshot.bin",
+        "vk_swiftshader_icd.json",
+        "chrome-sandbox",
+    };
+    for (release_files) |name| {
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Release", name }) },
+            .bin,
+            name,
+        ).step);
+    }
+
+    const resource_files = [_][]const u8{
+        "chrome_100_percent.pak",
+        "chrome_200_percent.pak",
+        "resources.pak",
+        "icudtl.dat",
+    };
+    for (resource_files) |name| {
+        b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+            .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Resources", name }) },
+            .bin,
+            name,
+        ).step);
+    }
+
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Resources", "locales" }) },
+        .install_dir = .bin,
+        .install_subdir = "locales",
+    }).step);
 }
