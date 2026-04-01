@@ -40,7 +40,8 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
         zgui.popStyleVar(.{ .count = 1 });
     }
 
-    if (dock.takeFocusRequest()) {
+    const focus_requested = dock.takeFocusRequest();
+    if (focus_requested) {
         zgui.setNextWindowFocus();
     }
 
@@ -66,8 +67,42 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
         app_state.log.warn("failed to resize terminal dock: {s}", .{@errorName(err)});
     };
 
-    state.terminal_focused = zgui.isWindowFocused(.{}) or
-        (zgui.isWindowHovered(.{}) and zgui.isMouseClicked(.left));
+    const viewport_cursor = zgui.getCursorPos();
+    const viewport_avail = zgui.getContentRegionAvail();
+    const hitbox_w = @max(viewport_avail[0], 1.0);
+    const hitbox_h = @max(viewport_avail[1], 1.0);
+    zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(0, 0, 0, 0) });
+    zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(0, 0, 0, 0) });
+    zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(0, 0, 0, 0) });
+    if (focus_requested) {
+        zgui.setKeyboardFocusHere(0);
+    }
+    const terminal_clicked = zgui.selectable("##TerminalDockViewportFocus", .{
+        .selected = false,
+        .flags = .{ .allow_overlap = true },
+        .w = hitbox_w,
+        .h = hitbox_h,
+    });
+    const terminal_hitbox_active = zgui.isItemActive();
+    const terminal_hitbox_focused = zgui.isItemFocused();
+    const terminal_window_focused = zgui.isWindowFocused(.{});
+    zgui.popStyleColor(.{ .count = 3 });
+    if (terminal_clicked) {
+        dock.focus_requested = true;
+        zgui.setWindowFocus("TerminalDockViewport");
+    }
+    state.noteTerminalViewportDebug(
+        terminal_window_focused,
+        terminal_hitbox_focused,
+        terminal_hitbox_active,
+        terminal_clicked,
+        focus_requested or dock.focus_requested,
+    );
+    if (terminal_window_focused or terminal_hitbox_active or terminal_hitbox_focused or terminal_clicked) {
+        state.terminal_focused = true;
+        state.composer_focused = false;
+    }
+    zgui.setCursorPos(viewport_cursor);
 
     if (dock.renderState()) |render_state| {
         renderViewport(render_state);

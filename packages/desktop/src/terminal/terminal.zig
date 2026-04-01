@@ -147,6 +147,7 @@ pub const Dock = struct {
     }
 
     pub fn handleTextInput(self: *Dock, input_text: []const u8) bool {
+        if (input_text.len == 0 or isAsciiTerminalText(input_text)) return false;
         if (self.session) |session| {
             return session.writeInput(input_text) catch |err| {
                 log.warn("terminal text input failed: {s}", .{@errorName(err)});
@@ -337,13 +338,18 @@ const UnixSession = struct {
 
     pub fn handleKeyDown(self: *UnixSession, event: *const sdl.KeyboardEvent) !bool {
         if (!self.running or !event.down) return false;
-        if (shouldDeferToTextInput(event)) return false;
+
+        var utf8_buf: [8]u8 = undefined;
+        const synthesized_utf8 = synthesizeTerminalUtf8(event, &utf8_buf);
+        if (synthesized_utf8.len == 0 and shouldDeferToTextInput(event)) return false;
 
         const key = mapScancodeToGhostty(event.scancode) orelse return false;
         const key_event: ghostty_vt.input.KeyEvent = .{
             .action = if (event.repeat) .repeat else .press,
             .key = key,
             .mods = modsFromKeyboardEvent(event),
+            .consumed_mods = consumedModsFromKeyboardEvent(event, synthesized_utf8),
+            .utf8 = synthesized_utf8,
             .unshifted_codepoint = scancodeCodepoint(event.scancode) orelse 0,
         };
 
@@ -600,6 +606,67 @@ fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
         => true,
         else => false,
     };
+}
+
+fn isAsciiTerminalText(input_text: []const u8) bool {
+    if (input_text.len == 0) return false;
+    for (input_text) |byte| {
+        if (byte < 0x20 or byte > 0x7E) return false;
+    }
+    return true;
+}
+
+fn consumedModsFromKeyboardEvent(event: *const sdl.KeyboardEvent, utf8: []const u8) ghostty_vt.input.KeyMods {
+    if (utf8.len == 0) return .{};
+    return .{
+        .shift = modifierPressed(event.mod, sdl.Keymod.shift),
+    };
+}
+
+fn synthesizeTerminalUtf8(event: *const sdl.KeyboardEvent, buf: *[8]u8) []const u8 {
+    if (modifierPressed(event.mod, sdl.Keymod.ctrl)) return "";
+    if (modifierPressed(event.mod, sdl.Keymod.alt)) return "";
+    if (modifierPressed(event.mod, sdl.Keymod.gui)) return "";
+
+    const shift = modifierPressed(event.mod, sdl.Keymod.shift);
+    const caps = modifierPressed(event.mod, sdl.Keymod.caps);
+    const scancode_value = @intFromEnum(event.scancode);
+    const a_value = @intFromEnum(sdl.Scancode.a);
+    const z_value = @intFromEnum(sdl.Scancode.z);
+    if (scancode_value >= a_value and scancode_value <= z_value) {
+        const base = @as(u8, @intCast(scancode_value - a_value)) + 'a';
+        const upper = shift != caps;
+        buf[0] = if (upper) std.ascii.toUpper(base) else base;
+        return buf[0..1];
+    }
+
+    const ch: u8 = switch (event.scancode) {
+        .@"0" => if (shift) ')' else '0',
+        .@"1" => if (shift) '!' else '1',
+        .@"2" => if (shift) '@' else '2',
+        .@"3" => if (shift) '#' else '3',
+        .@"4" => if (shift) '$' else '4',
+        .@"5" => if (shift) '%' else '5',
+        .@"6" => if (shift) '^' else '6',
+        .@"7" => if (shift) '&' else '7',
+        .@"8" => if (shift) '*' else '8',
+        .@"9" => if (shift) '(' else '9',
+        .space => ' ',
+        .minus => if (shift) '_' else '-',
+        .equals => if (shift) '+' else '=',
+        .leftbracket => if (shift) '{' else '[',
+        .rightbracket => if (shift) '}' else ']',
+        .backslash => if (shift) '|' else '\\',
+        .semicolon => if (shift) ':' else ';',
+        .apostrophe => if (shift) '"' else '\'',
+        .grave => if (shift) '~' else '`',
+        .comma => if (shift) '<' else ',',
+        .period => if (shift) '>' else '.',
+        .slash => if (shift) '?' else '/',
+        else => return "",
+    };
+    buf[0] = ch;
+    return buf[0..1];
 }
 
 fn modsFromKeyboardEvent(event: *const sdl.KeyboardEvent) ghostty_vt.input.KeyMods {

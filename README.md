@@ -32,6 +32,7 @@ From the repo root:
 ```bash
 zig build
 zig build run
+zig build run -Dui-debug=true
 zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
@@ -39,6 +40,7 @@ zig build -Doptimize=ReleaseFast
 
 - `zig build` builds the app
 - `zig build run` builds and launches it
+- `zig build run -Dui-debug=true` launches it with the native UI debug window enabled
 - `zig build test` runs the Zig tests and the format check
 
 The built binary is written to:
@@ -107,6 +109,23 @@ The Linux archive contains a local install helper:
 
 That installs the archive contents into `~/.local` by default.
 
+## Embedded terminal
+
+The desktop app includes a project-scoped embedded terminal dock powered by Ghostty's `libghostty-vt` terminal engine.
+
+- Hidden by default and toggled with `CommandOrControl+J`
+- Docked at the bottom of the chat workspace without taking sidebar width
+- Starts a shell in the selected project's working directory
+- Supports per-terminal zoom with `Ctrl+-` and `Ctrl+=` while the terminal is focused
+
+For input/focus debugging while working on the terminal UI, launch with:
+
+```bash
+zig build run -Dui-debug=true
+```
+
+That enables a separate `UI Debug` window with live terminal/composer focus and input-routing state.
+
 ## Provider runtime notes
 
 The desktop app talks to local provider CLIs rather than bundling its own backend:
@@ -149,6 +168,7 @@ Verde uses and distributes third-party software. The main components in the desk
 - SDL3 from libsdl-org for windowing, input, display integration, and OpenGL context management at runtime.
 - `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT-style.
 - `stb_image` by Sean Barrett and contributors for image decoding in the native app. Vendored in [`vendor/stb_image.h`](vendor/stb_image.h). License: public domain or MIT.
+- Ghostty / `libghostty-vt` by Mitchell Hashimoto and contributors for terminal emulation and VT parsing in the embedded terminal dock. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT.
 
 If you redistribute Verde, keep the relevant upstream notices and license texts with the distributed app and any vendored source.
 

@@ -7,9 +7,11 @@ const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
 const chat_panel = @import("chat_panel.zig");
 const runtime = @import("runtime.zig");
+const debug_window = @import("debug.zig");
 
 /// Lays out the root window and routes to the main UI regions.
 pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
+    state.resetUiDebugFrame();
     zgui.setNextWindowPos(.{ .x = 0.0, .y = 0.0 });
     zgui.setNextWindowSize(.{ .w = width, .h = height });
 
@@ -39,6 +41,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     chat_panel.renderWorkspace(state, workspace_width, content[1]);
     renderImageModal(state, width, height);
     renderProjectRenameModal(state, width, height);
+    debug_window.render(state, width, height);
 }
 
 /// Shows the attachment preview modal for the selected image.

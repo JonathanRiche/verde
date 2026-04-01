@@ -55,7 +55,6 @@ fn inner_workspace(state: *app_state.AppState) void {
         return;
     }
 
-    state.terminal_focused = false;
     const content = zgui.getContentRegionAvail();
     const terminal_visible = state.isTerminalVisible();
     const composer_gap = theme.scaledUi(8.0);
@@ -1241,6 +1240,9 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         },
     });
     state.composer_focused = zgui.isItemFocused();
+    if (state.composer_focused) {
+        state.terminal_focused = false;
+    }
     const input_rect_min = zgui.getItemRectMin();
     const input_rect_max = zgui.getItemRectMax();
     zgui.popStyleColor(.{ .count = 4 });

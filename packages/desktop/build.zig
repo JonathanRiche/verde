@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const fff_root = b.path("../../vendor/fff");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
@@ -23,6 +24,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const imgui = zgui.artifact("imgui");
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "ui_debug", ui_debug);
 
     // zgui's sdl3_opengl3 backend currently adds the nested SDL3 include dir,
     // but imgui_impl_sdl3.cpp includes <SDL3/SDL.h> and needs the parent root.
@@ -37,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
@@ -150,6 +154,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
