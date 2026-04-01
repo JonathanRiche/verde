@@ -18,6 +18,10 @@ const MAX_COLS: u16 = 320;
 const MAX_ROWS: u16 = 120;
 pub const CELL_PIXEL_WIDTH: u32 = 9;
 pub const CELL_PIXEL_HEIGHT: u32 = 18;
+const DEFAULT_FONT_SCALE: f32 = 1.0;
+const MIN_FONT_SCALE: f32 = 0.75;
+const MAX_FONT_SCALE: f32 = 2.0;
+const FONT_SCALE_STEP: f32 = 0.125;
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
 const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler());
 const DeviceAttributes = @typeInfo(
@@ -29,6 +33,7 @@ const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const Dock = struct {
     visible: bool = false,
     preferred_height: f32 = DEFAULT_DOCK_HEIGHT,
+    font_scale: f32 = DEFAULT_FONT_SCALE,
     cwd: ?[]u8 = null,
     session: ?*Session = null,
     focus_requested: bool = false,
@@ -107,8 +112,8 @@ pub const Dock = struct {
 
     pub fn resizeToFit(self: *Dock, allocator: std.mem.Allocator, width: f32, height: f32) !void {
         if (self.session) |session| {
-            const cols = columnsForWidth(width);
-            const rows = rowsForHeight(height);
+            const cols = columnsForWidth(width, self.font_scale);
+            const rows = rowsForHeight(height, self.font_scale);
             if (cols == 0 or rows == 0) {
                 log.warn("skipping terminal resize for invalid dock size width={d:.2} height={d:.2}", .{ width, height });
                 return;
@@ -117,6 +122,8 @@ pub const Dock = struct {
                 allocator,
                 cols,
                 rows,
+                scaledCellPixelWidth(self.font_scale),
+                scaledCellPixelHeight(self.font_scale),
             );
         }
     }
@@ -150,6 +157,11 @@ pub const Dock = struct {
     }
 
     pub fn handleKeyDown(self: *Dock, event: *const sdl.KeyboardEvent) bool {
+        if (terminalZoomDelta(event)) |delta| {
+            self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
+            return true;
+        }
+
         if (self.session) |session| {
             return session.handleKeyDown(event) catch |err| {
                 log.warn("terminal key input failed: {s}", .{@errorName(err)});
@@ -169,7 +181,7 @@ const UnsupportedSession = struct {
 
     pub fn poll(_: *UnsupportedSession, _: std.mem.Allocator) !void {}
 
-    pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16) !void {}
+    pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16, _: u32, _: u32) !void {}
 
     pub fn displayText(_: *const UnsupportedSession) []const u8 {
         return "";
@@ -200,6 +212,8 @@ const UnixSession = struct {
     render_state: ghostty_vt.RenderState = .empty,
     cols: u16,
     rows: u16,
+    cell_width: u32,
+    cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
 
@@ -240,6 +254,8 @@ const UnixSession = struct {
             .render_state = .empty,
             .cols = cols,
             .rows = rows,
+            .cell_width = CELL_PIXEL_WIDTH,
+            .cell_height = CELL_PIXEL_HEIGHT,
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
@@ -271,13 +287,21 @@ const UnixSession = struct {
         }
     }
 
-    pub fn resize(self: *UnixSession, allocator: std.mem.Allocator, cols: u16, rows: u16) !void {
+    pub fn resize(self: *UnixSession, allocator: std.mem.Allocator, cols: u16, rows: u16, cell_width: u32, cell_height: u32) !void {
         const next_cols = sanitizeCellCount(cols, MIN_COLS);
         const next_rows = sanitizeCellCount(rows, MIN_ROWS);
-        if (self.cols == next_cols and self.rows == next_rows) return;
+        const next_cell_width = @max(cell_width, 1);
+        const next_cell_height = @max(cell_height, 1);
+        const size_changed = self.cols != next_cols or self.rows != next_rows;
+        const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
+        if (!size_changed and !metrics_changed) return;
         self.cols = next_cols;
         self.rows = next_rows;
-        try self.terminal.resize(allocator, next_cols, next_rows);
+        self.cell_width = next_cell_width;
+        self.cell_height = next_cell_height;
+        if (size_changed) {
+            try self.terminal.resize(allocator, next_cols, next_rows);
+        }
         self.applyWinsize();
         try self.refreshRenderState(allocator);
     }
@@ -430,8 +454,8 @@ const UnixSession = struct {
         return .{
             .rows = session.rows,
             .columns = session.cols,
-            .cell_width = CELL_PIXEL_WIDTH,
-            .cell_height = CELL_PIXEL_HEIGHT,
+            .cell_width = session.cell_width,
+            .cell_height = session.cell_height,
         };
     }
 
@@ -456,8 +480,8 @@ const UnixSession = struct {
         var winsize = std.posix.winsize{
             .row = self.rows,
             .col = self.cols,
-            .xpixel = 0,
-            .ypixel = 0,
+            .xpixel = @intCast(@min(@as(u32, std.math.maxInt(u16)), self.cell_width * self.cols)),
+            .ypixel = @intCast(@min(@as(u32, std.math.maxInt(u16)), self.cell_height * self.rows)),
         };
         _ = std.c.ioctl(
             self.master_fd,
@@ -758,19 +782,44 @@ fn scancodeCodepoint(scancode: sdl.Scancode) ?u21 {
     };
 }
 
-fn columnsForWidth(width: f32) u16 {
+fn terminalZoomDelta(event: *const sdl.KeyboardEvent) ?f32 {
+    if (!event.down or event.repeat) return null;
+    if (!modifierPressed(event.mod, sdl.Keymod.ctrl)) return null;
+    if (modifierPressed(event.mod, sdl.Keymod.alt) or modifierPressed(event.mod, sdl.Keymod.gui)) return null;
+
+    return switch (event.scancode) {
+        .minus, .kp_minus => -FONT_SCALE_STEP,
+        .equals, .kp_plus, .kp_equals => FONT_SCALE_STEP,
+        else => null,
+    };
+}
+
+fn scaledCellPixelWidth(font_scale: f32) u32 {
+    return scaledCellPixels(CELL_PIXEL_WIDTH, font_scale);
+}
+
+fn scaledCellPixelHeight(font_scale: f32) u32 {
+    return scaledCellPixels(CELL_PIXEL_HEIGHT, font_scale);
+}
+
+fn scaledCellPixels(base: u32, font_scale: f32) u32 {
+    const clamped = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
+    return @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(base)) * clamped))));
+}
+
+fn columnsForWidth(width: f32, font_scale: f32) u16 {
     const sanitized = sanitizeViewportDimension(width) orelse return INITIAL_COLS;
     return clampCellCount(
-        @intFromFloat(sanitized / @as(f32, @floatFromInt(CELL_PIXEL_WIDTH))),
+        @intFromFloat(sanitized / @as(f32, @floatFromInt(scaledCellPixelWidth(font_scale)))),
         MIN_COLS,
         MAX_COLS,
     );
 }
 
-fn rowsForHeight(height: f32) u16 {
+fn rowsForHeight(height: f32, font_scale: f32) u16 {
     const sanitized = sanitizeViewportDimension(height) orelse return INITIAL_ROWS;
     return clampCellCount(
-        @intFromFloat(sanitized / @as(f32, @floatFromInt(CELL_PIXEL_HEIGHT))),
+        @intFromFloat(sanitized / @as(f32, @floatFromInt(scaledCellPixelHeight(font_scale)))),
         MIN_ROWS,
         MAX_ROWS,
     );
