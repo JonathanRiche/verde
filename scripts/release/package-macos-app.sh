@@ -9,6 +9,10 @@ fi
 VERSION="$1"
 OUTPUT_DIR="$2"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CALLER_ROOT="$(pwd)"
+if [[ "$OUTPUT_DIR" != /* ]]; then
+  OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
+fi
 ARCH="$(uname -m)"
 
 case "$ARCH" in
@@ -25,6 +29,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 PREFIX_DIR="$WORK_DIR/prefix"
 APP_DIR="$WORK_DIR/Verde.app"
+DMG_DIR="$WORK_DIR/dmg"
 ICONSET_DIR="$WORK_DIR/verde.iconset"
 ICON_FILE="$APP_DIR/Contents/Resources/verde.icns"
 
@@ -86,3 +91,13 @@ sips -z 1024 1024 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out 
 iconutil -c icns "$ICONSET_DIR" -o "$ICON_FILE"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.zip"
+
+mkdir -p "$DMG_DIR"
+ditto "$APP_DIR" "$DMG_DIR/Verde.app"
+ln -s /Applications "$DMG_DIR/Applications"
+hdiutil create \
+  -volname "Verde" \
+  -srcfolder "$DMG_DIR" \
+  -ov \
+  -format UDZO \
+  "$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.dmg" >/dev/null
