@@ -99,6 +99,36 @@ That builds `Verde.app` and copies it into `~/Applications` by default. To insta
 
 Release `.zip` artifacts on macOS already contain `Verde.app`, so end users can also unzip and drag the app bundle into `Applications`.
 
+## Install from releases
+
+If you do not want to build from source, download the latest release from:
+
+```text
+https://github.com/JonathanRiche/verde/releases
+```
+
+- Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run:
+
+```bash
+./install-local.sh
+```
+
+- macOS: download the `.zip` for your architecture, unzip it, and move `Verde.app` into `Applications`
+
+## Install on Arch Linux
+
+An AUR package is available for Arch users:
+
+```bash
+yay -S verde-bin
+```
+
+Package page:
+
+```text
+https://aur.archlinux.org/packages/verde-bin
+```
+
 ## Release builds
 
 GitHub Actions builds release artifacts from tags that start with `v`.
