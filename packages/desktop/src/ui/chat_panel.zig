@@ -14,10 +14,10 @@ const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
 
 const HEADER_OPEN_MENU_ID: [:0]const u8 = "ChatHeaderOpenMenu";
-const WorkspaceDockLayout = struct {
-    workspace_height: f32,
+const WorkspaceLayout = struct {
+    body_height: f32,
     browser_gap: f32,
-    browser_height: f32,
+    browser_width: f32,
     terminal_gap: f32,
     terminal_height: f32,
 };
@@ -65,55 +65,83 @@ fn inner_workspace(state: *app_state.AppState) void {
     }
 
     const content = zgui.getContentRegionAvail();
-    const dock_layout = computeWorkspaceDockLayout(state, content[1]);
-    const composer_gap = theme.scaledUi(8.0);
-    const workspace_height = dock_layout.workspace_height;
-    const composer_height = theme.clampf(workspace_height * 0.27, theme.scaledUi(168.0), @min(workspace_height * 0.42, theme.scaledUi(320.0)));
-    const transcript_height = @max(workspace_height - composer_height - composer_gap, theme.scaledUi(120.0));
-    renderTranscript(state, content[0], transcript_height, inner_pad_x);
-    zgui.dummy(.{ .w = 0.0, .h = composer_gap });
-    // Indent composer so it stays centered while transcript scrollbar is at far right.
-    zgui.indent(.{ .indent_w = inner_pad_x });
-    const composer_width = @max(content[0] - 2 * inner_pad_x, theme.scaledUi(120.0));
-    renderComposer(state, composer_width, @max(workspace_height - transcript_height - composer_gap, theme.scaledUi(120.0)));
-    zgui.unindent(.{ .indent_w = inner_pad_x });
+    const layout = computeWorkspaceLayout(state, content[0], content[1]);
+    if (layout.browser_width > 0.0) {
+        zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
+        defer zgui.popStyleVar(.{ .count = 1 });
+        _ = zgui.beginChild("ChatBrowserSplit", .{
+            .w = 0.0,
+            .h = layout.body_height,
+            .child_flags = .{
+                .border = false,
+                .always_use_window_padding = true,
+            },
+        });
+        defer zgui.endChild();
 
-    if (dock_layout.browser_height > 0.0) {
-        zgui.dummy(.{ .w = 0.0, .h = dock_layout.browser_gap });
-        browser_panel.renderDock(state, content[0], dock_layout.browser_height);
+        renderChatColumn(state, @max(zgui.getContentRegionAvail()[0] - layout.browser_gap - layout.browser_width, theme.scaledUi(240.0)), layout.body_height, inner_pad_x);
+        zgui.sameLine(.{ .spacing = layout.browser_gap });
+        browser_panel.renderDock(state, layout.browser_width, layout.body_height);
+    } else {
+        renderChatColumn(state, content[0], layout.body_height, inner_pad_x);
     }
 
-    if (dock_layout.terminal_height > 0.0) {
-        zgui.dummy(.{ .w = 0.0, .h = dock_layout.terminal_gap });
-        terminal_panel.renderDock(state, content[0], dock_layout.terminal_height);
+    if (layout.terminal_height > 0.0) {
+        zgui.dummy(.{ .w = 0.0, .h = layout.terminal_gap });
+        terminal_panel.renderDock(state, content[0], layout.terminal_height);
     }
 }
 
-// Balances transcript/composer space against the browser and terminal docks.
-fn computeWorkspaceDockLayout(state: *app_state.AppState, available_height: f32) WorkspaceDockLayout {
+// Renders the transcript and composer column that stays alongside the browser pane.
+fn renderChatColumn(state: *app_state.AppState, width: f32, height: f32, inner_pad_x: f32) void {
+    _ = zgui.beginChild("ChatBrowserSplitColumn", .{
+        .w = width,
+        .h = height,
+        .child_flags = .{
+            .border = false,
+            .always_use_window_padding = true,
+        },
+    });
+    defer zgui.endChild();
+
+    const composer_gap = theme.scaledUi(8.0);
+    const composer_height = theme.clampf(height * 0.27, theme.scaledUi(168.0), @min(height * 0.42, theme.scaledUi(320.0)));
+    const transcript_height = @max(height - composer_height - composer_gap, theme.scaledUi(120.0));
+    renderTranscript(state, width, transcript_height, inner_pad_x);
+    zgui.dummy(.{ .w = 0.0, .h = composer_gap });
+    // Indent composer so it stays centered while transcript scrollbar is at far right.
+    zgui.indent(.{ .indent_w = inner_pad_x });
+    const composer_width = @max(width - 2 * inner_pad_x, theme.scaledUi(120.0));
+    renderComposer(state, composer_width, @max(height - transcript_height - composer_gap, theme.scaledUi(120.0)));
+    zgui.unindent(.{ .indent_w = inner_pad_x });
+}
+
+// Balances the horizontal browser split against the bottom terminal dock.
+fn computeWorkspaceLayout(state: *app_state.AppState, available_width: f32, available_height: f32) WorkspaceLayout {
     const browser_visible = state.isBrowserVisible();
-    const terminal_visible = state.isTerminalVisible();
     const browser_gap = if (browser_visible) theme.scaledUi(12.0) else 0.0;
+    const terminal_visible = state.isTerminalVisible();
     const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
     const minimum_workspace = theme.scaledUi(220.0);
-    const preferred_browser_height = if (browser_visible) state.browserPanelHeight(available_height) else 0.0;
     const preferred_terminal_height = if (terminal_visible) state.terminalPanelHeight(available_height) else 0.0;
-    const preferred_total_height = preferred_browser_height + preferred_terminal_height;
-    const total_gap = browser_gap + terminal_gap;
-    const available_dock_height = @max(available_height - minimum_workspace - total_gap, 0.0);
-
-    var browser_height = preferred_browser_height;
     var terminal_height = preferred_terminal_height;
-    if (preferred_total_height > 0.0 and preferred_total_height > available_dock_height) {
-        const scale = available_dock_height / preferred_total_height;
-        browser_height *= scale;
-        terminal_height *= scale;
+    const available_terminal_height = @max(available_height - minimum_workspace - terminal_gap, 0.0);
+    if (terminal_height > available_terminal_height) {
+        terminal_height = available_terminal_height;
     }
+    const body_height = @max(available_height - terminal_gap - terminal_height, theme.scaledUi(120.0));
+    const browser_width = if (browser_visible)
+        @min(
+            state.browserPanelWidth(available_width - browser_gap),
+            @max(available_width - browser_gap - theme.scaledUi(260.0), theme.scaledUi(240.0)),
+        )
+    else
+        0.0;
 
     return .{
-        .workspace_height = @max(available_height - total_gap - browser_height - terminal_height, theme.scaledUi(120.0)),
-        .browser_gap = if (browser_height > 0.0) browser_gap else 0.0,
-        .browser_height = browser_height,
+        .body_height = body_height,
+        .browser_gap = if (browser_width > 0.0) browser_gap else 0.0,
+        .browser_width = browser_width,
         .terminal_gap = if (terminal_height > 0.0) terminal_gap else 0.0,
         .terminal_height = terminal_height,
     };

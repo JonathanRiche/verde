@@ -1656,6 +1656,12 @@ pub const AppState = struct {
         return theme.clampf(available_height * 0.24, theme.scaledUi(182.0), @min(theme.scaledUi(320.0), available_height * 0.42));
     }
 
+    /// Computes the width reserved for the browser pane when the chat workspace is split horizontally.
+    pub fn browserPanelWidth(self: *const AppState, available_width: f32) f32 {
+        if (!self.isBrowserVisible()) return 0.0;
+        return theme.clampf(available_width * 0.5, theme.scaledUi(320.0), available_width * 0.62);
+    }
+
     /// Records the latest browser pane bounds so SDL events can target the correct in-app viewport.
     pub fn noteBrowserPaneRegion(self: *AppState, min: [2]f32, max: [2]f32, hovered: bool) void {
         self.browser_pane_min = min;
