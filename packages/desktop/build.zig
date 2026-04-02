@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
 
     // zgui's sdl3_opengl3 backend currently adds the nested SDL3 include dir,
     // but imgui_impl_sdl3.cpp includes <SDL3/SDL.h> and needs the parent root.
-    if (target.result.os.tag == .macos) {
+    if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
         imgui.root_module.addIncludePath(zsdl.path("libs/sdl3/include"));
     }
 
