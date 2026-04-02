@@ -89,17 +89,29 @@ With that flag:
 Typical Linux run:
 
 ```bash
-zig build run -Dcef-sdk-path=/tmp/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+zig build run -Dcef-sdk-path=$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
 ```
 
 Typical Linux install to `~/.local`:
 
 ```bash
 zig build --release=safe -p ~/.local \
-  -Dcef-sdk-path=/tmp/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+  -Dcef-sdk-path=$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+```
+
+Or, from the repo root, use the helper installer:
+
+```bash
+bash ./scripts/release/install-linux-local-cef.sh
 ```
 
 You do not need `VERDE_OPEN_BROWSER_ON_START=1` for normal use. That env var is only useful for smoke-testing the browser pane during startup.
+
+Do not keep the CEF SDK under `/tmp`. Many Linux systems clear `/tmp` on reboot, which will break future builds or installs that still point at that path. Use a persistent directory such as:
+
+```bash
+$HOME/.cache/verde/cef-sdk
+```
 
 On Linux, the install step also writes:
 
