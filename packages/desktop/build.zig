@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
                 .{cef_sdk_path.?},
             ),
         });
+        build_cef_helper.setCwd(b.path("."));
         b.getInstallStep().dependOn(&build_cef_helper.step);
         const install_cef_helper = b.addInstallBinFile(
             .{ .cwd_relative = "zig-out/bin/verde-browser-cef" },

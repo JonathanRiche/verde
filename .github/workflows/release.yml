@@ -40,7 +40,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsdl3-dev libgl1-mesa-dev
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            pkg-config \
+            curl \
+            libsdl3-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev
 
       - name: Compute release version
         id: version
