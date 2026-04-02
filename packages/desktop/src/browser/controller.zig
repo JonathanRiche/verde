@@ -64,6 +64,15 @@ pub const Controller = struct {
         self.visible = false;
     }
 
+    /// Tears the browser runtime down completely so the next open pays the lazy-init cost again.
+    pub fn shutdown(self: *Controller) void {
+        if (self.backend) |*backend| {
+            backend.deinit();
+            self.backend = null;
+        }
+        self.visible = false;
+    }
+
     /// Toggles platform browser visibility.
     pub fn toggle(self: *Controller) !void {
         if (self.visible) {

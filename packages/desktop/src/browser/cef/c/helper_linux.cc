@@ -640,7 +640,7 @@ int main(int argc, char** argv) {
   if (isChromiumSubprocess(argc, argv)) {
     return verde_cef_execute_subprocess(argc, const_cast<const char* const*>(argv));
   }
-  if (command_fd < 0 || event_fd < 0 || frame0_fd < 0 || frame1_fd < 0) {
+  if (command_fd < 0 || event_fd < 0 || frame0_fd < 0 || frame1_fd < 0 || frame2_fd < 0) {
     return 1;
   }
   setCloseOnExec(command_fd);

@@ -1621,8 +1621,22 @@ pub const AppState = struct {
             return;
         }
 
+        const restore_last_url = !self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null;
         self.browser_state.setControlsVisible(true);
         self.browser_state.status = .opening;
+        if (restore_last_url) {
+            const url = self.browser_state.current_url.?;
+            self.browser_state.controller.navigate(url) catch |err| {
+                log.err("failed to restore browser runtime: {s}", .{@errorName(err)});
+                self.browser_state.status = .failed;
+                self.browser_state.setLastError("Failed to restore browser runtime.") catch {};
+                self.setSidebarNotice("Failed to reopen browser.");
+                return;
+            };
+            self.setSidebarNotice("Browser reopened.");
+            return;
+        }
+
         self.browser_state.controller.show() catch |err| {
             log.err("failed to show browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
@@ -1631,6 +1645,17 @@ pub const AppState = struct {
             return;
         };
         self.setSidebarNotice("Browser opened.");
+    }
+
+    /// Closes the browser dock and fully tears the runtime down so CEF exits until the next open.
+    pub fn closeBrowser(self: *AppState) void {
+        self.browser_state.setControlsVisible(false);
+        self.browser_pane_focused = false;
+        self.browser_pane_hovered = false;
+        self.browser_state.controller.shutdown();
+        self.browser_state.status = .hidden;
+        self.browser_state.setLastError(null) catch {};
+        self.setSidebarNotice("Browser closed.");
     }
 
     /// Hides the desktop browser control surface and its browser runtime.

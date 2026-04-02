@@ -31,6 +31,7 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     defer zgui.endChild();
 
     renderToolbar(state);
+    if (!state.isBrowserVisible()) return;
     renderPaneCanvas(state);
 }
 
@@ -85,7 +86,7 @@ fn renderToolbar(state: *app_state.AppState) void {
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
     if (zgui.button("x", .{ .w = close_width, .h = theme.scaledUi(36.0) })) {
-        state.hideBrowser();
+        state.closeBrowser();
     }
     zgui.popStyleColor(.{ .count = 3 });
 }

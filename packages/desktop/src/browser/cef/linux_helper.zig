@@ -7,9 +7,9 @@ const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("ipc.zig");
 
-const COMMAND_FD: std.posix.fd_t = 3;
-const EVENT_FD: std.posix.fd_t = 4;
-const FRAME_FD_BASE: std.posix.fd_t = 5;
+const COMMAND_FD: std.posix.fd_t = 100;
+const EVENT_FD: std.posix.fd_t = 101;
+const FRAME_FD_BASE: std.posix.fd_t = 102;
 const FRAME_SLOT_COUNT: usize = 3;
 const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 
@@ -106,6 +106,7 @@ const SharedFrame = struct {
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     child_pid: ?std.posix.pid_t = null,
+    child_process_group: ?std.posix.pid_t = null,
     command_file: ?std.fs.File = null,
     queue: *SharedQueue,
     frame: *SharedFrame,
@@ -303,11 +304,12 @@ pub const Controller = struct {
 
         var env_map = try std.process.getEnvMap(self.allocator);
         defer env_map.deinit();
-        try env_map.put("VERDE_CEF_CMD_FD", "3");
-        try env_map.put("VERDE_CEF_EVENT_FD", "4");
-        try env_map.put("VERDE_CEF_FRAME0_FD", "5");
-        try env_map.put("VERDE_CEF_FRAME1_FD", "6");
-        try env_map.put("VERDE_CEF_FRAME2_FD", "7");
+        // Keep helper IPC away from Chromium's low-numbered descriptor handoff slots.
+        try env_map.put("VERDE_CEF_CMD_FD", "100");
+        try env_map.put("VERDE_CEF_EVENT_FD", "101");
+        try env_map.put("VERDE_CEF_FRAME0_FD", "102");
+        try env_map.put("VERDE_CEF_FRAME1_FD", "103");
+        try env_map.put("VERDE_CEF_FRAME2_FD", "104");
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -332,7 +334,9 @@ pub const Controller = struct {
         const event_file: std.fs.File = .{ .handle = event_pipe[0] };
 
         self.child_pid = child_pid;
+        self.child_process_group = child_pid;
         self.command_file = command_file;
+        std.posix.setpgid(child_pid, child_pid) catch {};
 
         const context = try self.allocator.create(ReaderContext);
         context.* = .{
@@ -367,12 +371,16 @@ pub const Controller = struct {
         self.command_file = null;
     }
 
-    // Forces the helper process down after the reader thread has drained its event pipe.
+    // Forces the helper process tree down after the reader thread has drained its event pipe.
     fn terminateChild(self: *Controller) void {
         const child_pid = self.child_pid orelse return;
-        std.posix.kill(child_pid, std.posix.SIG.TERM) catch {};
+        const child_process_group = self.child_process_group orelse child_pid;
+        // Chromium may leave utility, zygote, or GPU workers behind unless we signal the full helper process group.
+        std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
         _ = std.posix.waitpid(child_pid, 0);
+        std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
         self.child_pid = null;
+        self.child_process_group = null;
     }
 };
 
@@ -432,6 +440,7 @@ fn execHelperChild(
     event_pipe: [2]std.posix.fd_t,
     frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t,
 ) noreturn {
+    std.posix.setpgid(0, 0) catch {};
     std.posix.dup2(command_pipe[0], COMMAND_FD) catch std.posix.exit(126);
     std.posix.dup2(event_pipe[1], EVENT_FD) catch std.posix.exit(126);
     inline for (frame_fds, 0..) |frame_fd, index| {
