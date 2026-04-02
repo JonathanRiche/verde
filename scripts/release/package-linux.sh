@@ -10,6 +10,10 @@ VERSION="$1"
 OUTPUT_DIR="$2"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DESKTOP_ROOT="$REPO_ROOT/packages/desktop"
+CALLER_ROOT="$(pwd)"
+if [[ "$OUTPUT_DIR" != /* ]]; then
+  OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
+fi
 ARCH="$(uname -m)"
 CACHE_ROOT="${VERDE_CEF_CACHE_DIR:-$HOME/.cache/verde/cef-sdk}"
 CEF_BASENAME="cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal"
