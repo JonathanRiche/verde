@@ -19,6 +19,7 @@ copy_if_present() {
 
 install -m 755 "$SCRIPT_DIR/bin/verde" "$PREFIX/bin/verde"
 install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
+copy_if_present "$SCRIPT_DIR/bin/libSDL3.so" "$PREFIX/bin/libSDL3.so"
 copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef" "$PREFIX/bin/verde-browser-cef"
 copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef-process" "$PREFIX/bin/verde-browser-cef-process"
 copy_if_present "$SCRIPT_DIR/bin/libcef.so" "$PREFIX/bin/libcef.so"

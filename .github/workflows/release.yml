@@ -20,7 +20,7 @@ jobs:
             package_script: scripts/release/package-linux.sh
             zig_download: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
             zig_dir: zig-x86_64-linux-0.15.2
-          - os: macos-13
+          - os: macos-15-intel
             artifact_name: release-macos-x86_64
             package_script: scripts/release/package-macos-app.sh
             zig_download: https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz
@@ -54,10 +54,7 @@ jobs:
             ninja-build \
             pkg-config \
             curl \
-            libsdl3-dev \
-            libgl1-mesa-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev
+            libgl1-mesa-dev
 
       - name: Compute release version
         id: version

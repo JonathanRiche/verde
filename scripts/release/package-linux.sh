@@ -56,6 +56,7 @@ mkdir -p \
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
+install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
 install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
 install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"
 install -m 755 "$PREFIX_DIR/bin/libcef.so" "$PACKAGE_ROOT/bin/libcef.so"

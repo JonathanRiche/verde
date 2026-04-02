@@ -76,6 +76,9 @@ pub fn build(b: *std.Build) void {
     });
     switch (target.result.os.tag) {
         .linux => {
+            if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+                exe.addLibraryPath(sdl3_prebuilt.path("lib"));
+            }
             exe.linkSystemLibrary("SDL3");
             exe.linkSystemLibrary("GL");
             exe.linkSystemLibrary("util");
@@ -100,7 +103,7 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
-    if (target.result.os.tag == .linux) {
+    if (target.result.os.tag == .linux and !cef_sdk_configured) {
         const browser_helper = b.addExecutable(.{
             .name = "verde-browser-linux",
             .root_module = b.createModule(.{
@@ -146,6 +149,15 @@ pub fn build(b: *std.Build) void {
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
     install_fff.step.dependOn(&build_fff.step);
     b.getInstallStep().dependOn(&install_fff.step);
+    if (target.result.os.tag == .linux) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+            b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                sdl3_prebuilt.path("lib/libSDL3.so"),
+                .bin,
+                "libSDL3.so",
+            ).step);
+        }
+    }
     if (target.result.os.tag == .linux) {
         const desktop_entry = b.addWriteFiles();
         const desktop_entry_path = desktop_entry.add("verde.desktop", b.fmt(
@@ -220,6 +232,10 @@ pub fn build(b: *std.Build) void {
     });
     exe_tests.linkLibC();
     if (target.result.os.tag == .linux) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+            exe_tests.addLibraryPath(sdl3_prebuilt.path("lib"));
+        }
+        exe_tests.linkSystemLibrary("SDL3");
         exe_tests.linkSystemLibrary("util");
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
