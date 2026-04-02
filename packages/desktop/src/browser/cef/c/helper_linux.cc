@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -46,12 +47,11 @@ extern "C" int verde_cef_send_key_event(unsigned int key_code,
                                          int pressed,
                                          unsigned int modifiers);
 extern "C" int verde_cef_send_text_input(const char* text, unsigned int modifiers);
-extern "C" void verde_cef_get_frame(const unsigned char** pixels,
-                                     size_t* len,
+extern "C" int verde_cef_copy_frame(void* dest,
+                                     size_t cap,
+                                     size_t* out_len,
                                      int* width,
-                                     int* height,
-                                     int* dirty);
-extern "C" void verde_cef_clear_frame_dirty();
+                                     int* height);
 extern "C" int verde_cef_pop_event(int* kind, char* buffer, size_t cap, size_t* out_len);
 
 namespace {
@@ -61,7 +61,7 @@ constexpr unsigned kModShift = 1u << 0;
 constexpr unsigned kModCtrl = 1u << 1;
 constexpr unsigned kModAlt = 1u << 2;
 constexpr unsigned kModSuper = 1u << 3;
-constexpr size_t kFrameSlotCount = 2;
+constexpr size_t kFrameSlotCount = 3;
 constexpr size_t kFrameBytesMax = 4096u * 2160u * 4u;
 FILE* g_event_output = nullptr;
 
@@ -429,6 +429,13 @@ int parseHelperFd(const char* value) {
   return static_cast<int>(parsed);
 }
 
+void setCloseOnExec(int fd) {
+  if (fd < 0) return;
+  const int flags = fcntl(fd, F_GETFD);
+  if (flags < 0) return;
+  (void)fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 bool ensureBrowserCreated(RuntimeState& state, const std::string& url) {
   if (verde_cef_has_browser() != 0) {
     verde_cef_resize_browser(static_cast<int>(std::max(state.pane_width, 1u)),
@@ -470,13 +477,18 @@ void flushNativeEvents() {
 }
 
 void publishLatestFrame(RuntimeState& state) {
-  const unsigned char* pixels = nullptr;
   size_t len = 0;
   int width = 0;
   int height = 0;
-  int dirty = 0;
-  verde_cef_get_frame(&pixels, &len, &width, &height, &dirty);
-  if (dirty == 0 || pixels == nullptr || width <= 0 || height <= 0) return;
+  const uint8_t slot = state.next_frame_slot;
+  const int copied = verde_cef_copy_frame(state.frame_slots[slot], kFrameBytesMax, &len, &width, &height);
+  if (copied == 0) return;
+  if (copied < 0) {
+    const std::string message = "CEF frame copy into shared memory failed.";
+    emitEvent("failed", &message);
+    return;
+  }
+  if (width <= 0 || height <= 0) return;
 
   const size_t expected_len = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
   if (len < expected_len) {
@@ -490,17 +502,13 @@ void publishLatestFrame(RuntimeState& state) {
     return;
   }
 
-  const uint8_t slot = state.next_frame_slot;
-  std::memcpy(state.frame_slots[slot], pixels, expected_len);
   state.next_frame_slot = static_cast<uint8_t>((slot + 1) % kFrameSlotCount);
-
-  verde_cef_clear_frame_dirty();
   emitEvent("frame_ready", nullptr, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
             expected_len, slot);
 }
 
-bool mapFrameSlots(RuntimeState& state, int frame0_fd, int frame1_fd) {
-  const int frame_fds[kFrameSlotCount] = {frame0_fd, frame1_fd};
+bool mapFrameSlots(RuntimeState& state, int frame0_fd, int frame1_fd, int frame2_fd) {
+  const int frame_fds[kFrameSlotCount] = {frame0_fd, frame1_fd, frame2_fd};
   for (size_t index = 0; index < kFrameSlotCount; index += 1) {
     if (frame_fds[index] < 0) return false;
     void* mapping = mmap(nullptr, kFrameBytesMax, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fds[index], 0);
@@ -620,6 +628,7 @@ int main(int argc, char** argv) {
   const int event_fd = parseHelperFd(std::getenv("VERDE_CEF_EVENT_FD"));
   const int frame0_fd = parseHelperFd(std::getenv("VERDE_CEF_FRAME0_FD"));
   const int frame1_fd = parseHelperFd(std::getenv("VERDE_CEF_FRAME1_FD"));
+  const int frame2_fd = parseHelperFd(std::getenv("VERDE_CEF_FRAME2_FD"));
 
   if (chdir(exe_dir.c_str()) != 0) {
     return 1;
@@ -634,6 +643,11 @@ int main(int argc, char** argv) {
   if (command_fd < 0 || event_fd < 0 || frame0_fd < 0 || frame1_fd < 0) {
     return 1;
   }
+  setCloseOnExec(command_fd);
+  setCloseOnExec(event_fd);
+  setCloseOnExec(frame0_fd);
+  setCloseOnExec(frame1_fd);
+  setCloseOnExec(frame2_fd);
 
   g_event_output = fdopen(event_fd, "w");
   if (g_event_output == nullptr) {
@@ -653,7 +667,7 @@ int main(int argc, char** argv) {
   }
 
   RuntimeState state;
-  if (!mapFrameSlots(state, frame0_fd, frame1_fd)) {
+  if (!mapFrameSlots(state, frame0_fd, frame1_fd, frame2_fd)) {
     verde_cef_shutdown();
     fclose(g_event_output);
     g_event_output = nullptr;
@@ -685,7 +699,7 @@ int main(int argc, char** argv) {
     publishLatestFrame(state);
 
     if (!running || queue.isDrained()) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(4));
   }
 
   queue.markClosed();

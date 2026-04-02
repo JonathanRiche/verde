@@ -10,7 +10,7 @@ const ipc = @import("ipc.zig");
 const COMMAND_FD: std.posix.fd_t = 3;
 const EVENT_FD: std.posix.fd_t = 4;
 const FRAME_FD_BASE: std.posix.fd_t = 5;
-const FRAME_SLOT_COUNT: usize = 2;
+const FRAME_SLOT_COUNT: usize = 3;
 const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 
 const ReaderContext = struct {
@@ -48,6 +48,7 @@ const SharedFrame = struct {
     mutex: std.Thread.Mutex = .{},
     slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
     slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
+    staging: std.ArrayList(u8) = .empty,
     latest_slot: u8 = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -55,12 +56,13 @@ const SharedFrame = struct {
     dirty: bool = false,
 
     /// Releases the stored frame metadata.
-    fn deinit(self: *SharedFrame) void {
+    fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
         for (0..FRAME_SLOT_COUNT) |index| {
             if (!self.slot_ready[index]) continue;
             std.posix.munmap(self.slots[index]);
             self.slot_ready[index] = false;
         }
+        self.staging.deinit(allocator);
         self.width = 0;
         self.height = 0;
         self.byte_len = 0;
@@ -68,12 +70,14 @@ const SharedFrame = struct {
     }
 
     /// Replaces the latest dirty frame metadata published by the helper.
-    fn update(self: *SharedFrame, event: ipc.Event) !void {
+    fn update(self: *SharedFrame, allocator: std.mem.Allocator, event: ipc.Event) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (event.frame_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
         if (event.byte_len > self.slots[event.frame_slot].len) return error.FrameTooLarge;
+        try self.staging.resize(allocator, event.byte_len);
+        @memcpy(self.staging.items[0..event.byte_len], self.slots[event.frame_slot][0..event.byte_len]);
         self.latest_slot = event.frame_slot;
         self.width = event.width;
         self.height = event.height;
@@ -93,7 +97,7 @@ const SharedFrame = struct {
         if (self.width == 0 or self.height == 0 or self.byte_len == 0) return;
         if (self.latest_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
 
-        try texture.uploadBgra(self.width, self.height, self.slots[self.latest_slot][0..self.byte_len]);
+        try texture.uploadBgra(self.width, self.height, self.staging.items[0..self.byte_len]);
         self.dirty = false;
     }
 };
@@ -123,7 +127,7 @@ pub const Controller = struct {
             .frame = frame,
         };
         errdefer {
-            controller.frame.deinit();
+            controller.frame.deinit(allocator);
             controller.queue.deinit(allocator);
         }
         try controller.spawnHelper(helper_name);
@@ -142,7 +146,7 @@ pub const Controller = struct {
         }
         self.terminateChild();
         self.queue.deinit(self.allocator);
-        self.frame.deinit();
+        self.frame.deinit(self.allocator);
         self.allocator.destroy(self.queue);
         self.allocator.destroy(self.frame);
     }
@@ -291,10 +295,10 @@ pub const Controller = struct {
             std.posix.close(event_pipe[0]);
             std.posix.close(event_pipe[1]);
         }
-        const frame_fds = try createFrameSlots(self.frame);
+        const frame_fds = try createFrameSlots(self.frame, self.allocator);
         errdefer {
             for (frame_fds) |frame_fd| std.posix.close(frame_fd);
-            self.frame.deinit();
+            self.frame.deinit(self.allocator);
         }
 
         var env_map = try std.process.getEnvMap(self.allocator);
@@ -303,6 +307,7 @@ pub const Controller = struct {
         try env_map.put("VERDE_CEF_EVENT_FD", "4");
         try env_map.put("VERDE_CEF_FRAME0_FD", "5");
         try env_map.put("VERDE_CEF_FRAME1_FD", "6");
+        try env_map.put("VERDE_CEF_FRAME2_FD", "7");
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -408,7 +413,7 @@ fn helperReaderMain(context: *ReaderContext) !void {
         defer parsed.deinit();
 
         if (parsed.value.kind == .frame_ready) {
-            try context.frame.update(parsed.value);
+            try context.frame.update(context.allocator, parsed.value);
             continue;
         }
 
@@ -470,14 +475,15 @@ fn restoreDefaultSignal(signal_number: u8) void {
 }
 
 // Creates shared memory frame slots so the helper can publish pixels without rewriting files.
-fn createFrameSlots(frame: *SharedFrame) ![FRAME_SLOT_COUNT]std.posix.fd_t {
+fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_SLOT_COUNT]std.posix.fd_t {
     var frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
-    errdefer frame.deinit();
+    errdefer frame.deinit(allocator);
 
     inline for (0..FRAME_SLOT_COUNT) |index| {
         const name: [*:0]const u8 = switch (index) {
             0 => "verde-cef-frame-0",
             1 => "verde-cef-frame-1",
+            2 => "verde-cef-frame-2",
             else => unreachable,
         };
         const raw_fd = std.os.linux.memfd_create(name, 0);

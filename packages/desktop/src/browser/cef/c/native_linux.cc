@@ -4,6 +4,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <mutex>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -17,6 +18,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_line.h"
+#include "include/cef_context_menu_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/internal/cef_linux.h"
 #include "include/wrapper/cef_helpers.h"
@@ -117,6 +119,7 @@ struct VerdeRuntime {
   int frame_width = 0;
   int frame_height = 0;
   bool frame_dirty = false;
+  std::mutex frame_mutex;
   std::vector<unsigned char> frame;
   std::deque<VerdeEvent> events;
   CefRefPtr<VerdeApp> app;
@@ -150,13 +153,7 @@ class VerdeApp final : public CefApp {
       const CefString& process_type,
       CefRefPtr<CefCommandLine> command_line) override {
     (void)process_type;
-    appendSwitchIfMissing(command_line, "disable-gpu");
-    appendSwitchIfMissing(command_line, "disable-gpu-compositing");
-    appendSwitchIfMissing(command_line, "disable-surfaces");
-    appendSwitchIfMissing(command_line, "disable-dev-shm-usage");
     appendSwitchIfMissing(command_line, "no-sandbox");
-    appendSwitchIfMissing(command_line, "no-zygote");
-    appendSwitchIfMissing(command_line, "single-process");
   }
 
  private:
@@ -165,17 +162,32 @@ class VerdeApp final : public CefApp {
 
 class VerdeClient final : public CefClient,
                           public CefRenderHandler,
+                          public CefContextMenuHandler,
                           public CefDisplayHandler,
                           public CefLoadHandler,
                           public CefLifeSpanHandler {
  public:
   CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
 
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override {
+    return this;
+  }
+
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
 
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+
+  void OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
+                           CefRefPtr<CefFrame> frame,
+                           CefRefPtr<CefContextMenuParams> params,
+                           CefRefPtr<CefMenuModel> model) override {
+    (void)browser;
+    (void)frame;
+    (void)params;
+    model->Clear();
+  }
 
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
                                 CefRefPtr<CefFrame> frame,
@@ -232,6 +244,7 @@ class VerdeClient final : public CefClient,
 
     const size_t pixel_len =
         static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    std::lock_guard<std::mutex> lock(g_runtime.frame_mutex);
     g_runtime.frame.resize(pixel_len);
     std::memcpy(g_runtime.frame.data(), buffer, pixel_len);
     g_runtime.frame_width = width;
@@ -448,11 +461,14 @@ extern "C" void verde_cef_shutdown() {
   g_runtime.app = nullptr;
   CefShutdown();
 
-  g_runtime.frame.clear();
+  {
+    std::lock_guard<std::mutex> lock(g_runtime.frame_mutex);
+    g_runtime.frame.clear();
+    g_runtime.frame_width = 0;
+    g_runtime.frame_height = 0;
+    g_runtime.frame_dirty = false;
+  }
   g_runtime.events.clear();
-  g_runtime.frame_width = 0;
-  g_runtime.frame_height = 0;
-  g_runtime.frame_dirty = false;
   g_runtime.initialized = false;
 }
 
@@ -491,7 +507,7 @@ extern "C" int verde_cef_create_browser(int width,
   window_info.bounds = CefRect(0, 0, g_runtime.width, g_runtime.height);
 
   CefBrowserSettings browser_settings;
-  browser_settings.windowless_frame_rate = 30;
+  browser_settings.windowless_frame_rate = 60;
   browser_settings.background_color = CefColorSetARGB(255, 255, 255, 255);
 
   auto browser = CefBrowserHost::CreateBrowserSync(
@@ -509,6 +525,7 @@ extern "C" int verde_cef_create_browser(int width,
   if (!g_runtime.browser) {
     g_runtime.browser = browser;
   }
+  browser->GetHost()->SetWindowlessFrameRate(60);
   browser->GetHost()->WasResized();
   browser->GetHost()->Invalidate(PET_VIEW);
 
@@ -665,6 +682,7 @@ extern "C" void verde_cef_get_frame(const unsigned char** pixels,
                                      int* width,
                                      int* height,
                                      int* dirty) {
+  std::lock_guard<std::mutex> lock(g_runtime.frame_mutex);
   if (pixels != nullptr) {
     *pixels = g_runtime.frame.empty() ? nullptr : g_runtime.frame.data();
   }
@@ -683,7 +701,33 @@ extern "C" void verde_cef_get_frame(const unsigned char** pixels,
 }
 
 extern "C" void verde_cef_clear_frame_dirty() {
+  std::lock_guard<std::mutex> lock(g_runtime.frame_mutex);
   g_runtime.frame_dirty = false;
+}
+
+extern "C" int verde_cef_copy_frame(void* dest,
+                                     size_t cap,
+                                     size_t* out_len,
+                                     int* width,
+                                     int* height) {
+  std::lock_guard<std::mutex> lock(g_runtime.frame_mutex);
+
+  if (!g_runtime.frame_dirty || g_runtime.frame.empty()) {
+    if (out_len != nullptr) *out_len = 0;
+    if (width != nullptr) *width = 0;
+    if (height != nullptr) *height = 0;
+    return 0;
+  }
+  if (dest == nullptr || cap < g_runtime.frame.size()) {
+    return -1;
+  }
+
+  std::memcpy(dest, g_runtime.frame.data(), g_runtime.frame.size());
+  if (out_len != nullptr) *out_len = g_runtime.frame.size();
+  if (width != nullptr) *width = g_runtime.frame_width;
+  if (height != nullptr) *height = g_runtime.frame_height;
+  g_runtime.frame_dirty = false;
+  return 1;
 }
 
 extern "C" int verde_cef_pop_event(int* kind,
