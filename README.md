@@ -178,6 +178,10 @@ Verde uses and distributes third-party software. The main components in the desk
 
 If you redistribute Verde, keep the relevant upstream notices and license texts with the distributed app and any vendored source.
 
+## License
+
+Verde is licensed under the MIT License. See [LICENSE](LICENSE).
+
 ## More detail
 
 See [`packages/desktop/README.md`](packages/desktop/README.md) for the desktop app's build details, runtime notes, and current config behavior.
