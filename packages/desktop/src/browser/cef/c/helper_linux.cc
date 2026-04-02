@@ -56,7 +56,7 @@ extern "C" int verde_cef_pop_event(int* kind, char* buffer, size_t cap, size_t* 
 
 namespace {
 
-constexpr size_t kMaxNativeEventBytes = 4096;
+constexpr size_t kMaxNativeEventBytes = 64 * 1024;
 constexpr unsigned kModShift = 1u << 0;
 constexpr unsigned kModCtrl = 1u << 1;
 constexpr unsigned kModAlt = 1u << 2;
@@ -468,6 +468,12 @@ void flushNativeEvents() {
         emitEvent("title_changed", &payload);
         break;
       case 5:
+        emitEvent("document_loaded");
+        break;
+      case 6:
+        emitEvent("js_message", &payload);
+        break;
+      case 7:
         emitEvent("failed", &payload);
         break;
       default:

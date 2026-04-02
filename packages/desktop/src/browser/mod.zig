@@ -23,6 +23,8 @@ pub const State = struct {
     allocator: std.mem.Allocator,
     controller: Controller,
     controls_visible: bool = false,
+    inspector_enabled: bool = false,
+    suppressed_eval_results: u8 = 0,
     status: Status = .hidden,
     address_storage: [ADDRESS_CAPACITY:0]u8 = std.mem.zeroes([ADDRESS_CAPACITY:0]u8),
     script_storage: [SCRIPT_CAPACITY:0]u8 = std.mem.zeroes([SCRIPT_CAPACITY:0]u8),
@@ -85,6 +87,33 @@ pub const State = struct {
     /// Shows or hides the desktop control surface that drives the browser backend.
     pub fn setControlsVisible(self: *State, visible: bool) void {
         self.controls_visible = visible;
+    }
+
+    /// Returns whether the bundled DOM inspector should remain armed for the current browser session.
+    pub fn inspectorEnabled(self: *const State) bool {
+        return self.inspector_enabled;
+    }
+
+    /// Records whether the DOM inspector is currently armed in app state.
+    pub fn setInspectorEnabled(self: *State, enabled: bool) void {
+        self.inspector_enabled = enabled;
+    }
+
+    /// Suppresses one forthcoming eval result for internal browser-script dispatches.
+    pub fn expectSuppressedEvalResult(self: *State) void {
+        self.suppressed_eval_results = std.math.add(u8, self.suppressed_eval_results, 1) catch std.math.maxInt(u8);
+    }
+
+    /// Consumes one pending internal eval suppression when available.
+    pub fn consumeSuppressedEvalResult(self: *State) bool {
+        if (self.suppressed_eval_results == 0) return false;
+        self.suppressed_eval_results -= 1;
+        return true;
+    }
+
+    /// Clears any pending internal eval suppressions when the browser lifetime resets.
+    pub fn clearSuppressedEvalResults(self: *State) void {
+        self.suppressed_eval_results = 0;
     }
 
     /// Replaces the editable URL field with a new value.

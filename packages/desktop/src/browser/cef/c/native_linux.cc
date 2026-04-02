@@ -20,6 +20,7 @@
 #include "include/cef_command_line.h"
 #include "include/cef_context_menu_handler.h"
 #include "include/cef_load_handler.h"
+#include "include/cef_v8.h"
 #include "include/internal/cef_linux.h"
 #include "include/wrapper/cef_helpers.h"
 
@@ -101,7 +102,9 @@ enum VerdeEventKind {
   VERDE_EVENT_CLOSED = 2,
   VERDE_EVENT_NAVIGATED = 3,
   VERDE_EVENT_TITLE_CHANGED = 4,
-  VERDE_EVENT_FAILED = 5,
+  VERDE_EVENT_DOCUMENT_LOADED = 5,
+  VERDE_EVENT_JS_MESSAGE = 6,
+  VERDE_EVENT_FAILED = 7,
 };
 
 struct VerdeEvent {
@@ -111,6 +114,53 @@ struct VerdeEvent {
 
 class VerdeApp;
 class VerdeClient;
+
+class VerdeIpcV8Handler final : public CefV8Handler {
+ public:
+  explicit VerdeIpcV8Handler(CefRefPtr<CefBrowser> browser)
+      : browser_(browser) {}
+
+  bool Execute(const CefString& name,
+               CefRefPtr<CefV8Value> object,
+               const CefV8ValueList& arguments,
+               CefRefPtr<CefV8Value>& retval,
+               CefString& exception) override {
+    (void)object;
+    if (name != "postMessage") {
+      return false;
+    }
+    if (!browser_) {
+      exception = "Browser bridge unavailable.";
+      return true;
+    }
+
+    std::string payload = "null";
+    if (!arguments.empty()) {
+      if (!arguments[0]->IsString()) {
+        exception = "postMessage expects a JSON string payload.";
+        return true;
+      }
+      payload = arguments[0]->GetStringValue().ToString();
+    }
+
+    CefRefPtr<CefProcessMessage> message =
+        CefProcessMessage::Create("verde.js_message");
+    message->GetArgumentList()->SetString(0, payload);
+    auto frame = browser_->GetMainFrame();
+    if (!frame) {
+      exception = "Main frame bridge unavailable.";
+      return true;
+    }
+    frame->SendProcessMessage(PID_BROWSER, message);
+    retval = CefV8Value::CreateBool(true);
+    return true;
+  }
+
+ private:
+  CefRefPtr<CefBrowser> browser_;
+
+  IMPLEMENT_REFCOUNTING(VerdeIpcV8Handler);
+};
 
 struct VerdeRuntime {
   bool initialized = false;
@@ -157,15 +207,13 @@ void removeSwitchIfPresent(CefRefPtr<CefCommandLine> command_line,
   }
 }
 
-class VerdeApp final : public CefApp {
+class VerdeApp final : public CefApp, public CefRenderProcessHandler {
  public:
   void OnBeforeCommandLineProcessing(
       const CefString& process_type,
       CefRefPtr<CefCommandLine> command_line) override {
     appendSwitchIfMissing(command_line, "no-sandbox");
     appendSwitchIfMissing(command_line, "no-zygote");
-    appendSwitchIfMissing(command_line, "disable-gpu");
-    appendSwitchIfMissing(command_line, "disable-gpu-compositing");
     if (!process_type.empty()) {
       // Chromium 146 expects non-zygote children to remap the pseudonymization
       // salt descriptor before startup. CEF's subprocess path in this embedder
@@ -173,6 +221,28 @@ class VerdeApp final : public CefApp {
       // warning until the runtime branch picks up the upstream fix.
       removeSwitchIfPresent(command_line, "pseudonymization-salt-handle");
     }
+  }
+
+  CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override {
+    return this;
+  }
+
+  void OnContextCreated(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        CefRefPtr<CefV8Context> context) override {
+    CEF_REQUIRE_RENDERER_THREAD();
+    if (!frame || !frame->IsMain()) {
+      return;
+    }
+
+    auto global = context->GetGlobal();
+    auto bridge = CefV8Value::CreateObject(nullptr, nullptr);
+    auto handler = CefRefPtr<VerdeIpcV8Handler>(new VerdeIpcV8Handler(browser));
+    bridge->SetValue(
+        "postMessage",
+        CefV8Value::CreateFunction("postMessage", handler),
+        V8_PROPERTY_ATTRIBUTE_NONE);
+    global->SetValue("__VERDE_CEF_IPC__", bridge, V8_PROPERTY_ATTRIBUTE_NONE);
   }
 
  private:
@@ -214,9 +284,17 @@ class VerdeClient final : public CefClient,
                                 CefRefPtr<CefProcessMessage> message) override {
     (void)browser;
     (void)frame;
-    (void)source_process;
-    (void)message;
-    return false;
+    if (source_process != PID_RENDERER || !message) {
+      return false;
+    }
+    if (message->GetName() != "verde.js_message") {
+      return false;
+    }
+
+    const std::string payload =
+        message->GetArgumentList()->GetString(0).ToString();
+    pushEvent(VERDE_EVENT_JS_MESSAGE, payload);
+    return true;
   }
 
   bool GetRootScreenRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
@@ -295,6 +373,16 @@ class VerdeClient final : public CefClient,
     (void)frame;
     (void)error_code;
     pushFailure(error_text.ToString() + " (" + failed_url.ToString() + ")");
+  }
+
+  void OnLoadEnd(CefRefPtr<CefBrowser> browser,
+                 CefRefPtr<CefFrame> frame,
+                 int http_status_code) override {
+    (void)browser;
+    (void)http_status_code;
+    if (frame && frame->IsMain()) {
+      pushEvent(VERDE_EVENT_DOCUMENT_LOADED, {});
+    }
   }
 
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
@@ -567,8 +655,14 @@ extern "C" int verde_cef_create_browser(int width,
 }
 
 extern "C" void verde_cef_resize_browser(int width, int height) {
-  g_runtime.width = std::max(width, 1);
-  g_runtime.height = std::max(height, 1);
+  const int next_width = std::max(width, 1);
+  const int next_height = std::max(height, 1);
+  if (g_runtime.width == next_width && g_runtime.height == next_height) {
+    return;
+  }
+
+  g_runtime.width = next_width;
+  g_runtime.height = next_height;
 
   if (!g_runtime.browser) {
     return;

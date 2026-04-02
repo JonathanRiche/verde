@@ -61,9 +61,10 @@ fn renderToolbar(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const avail = zgui.getContentRegionAvail()[0];
     const navigate_width = theme.scaledUi(40.0);
+    const inspect_width = theme.scaledUi(68.0);
     const close_width = theme.scaledUi(36.0);
     const gap = theme.scaledUi(8.0);
-    const field_width = @max(avail - navigate_width - close_width - gap * 2.0, theme.scaledUi(180.0));
+    const field_width = @max(avail - navigate_width - inspect_width - close_width - gap * 3.0, theme.scaledUi(180.0));
 
     zgui.pushItemWidth(field_width);
     _ = zgui.inputTextWithHint("##browser-address", .{
@@ -80,6 +81,26 @@ fn renderToolbar(state: *app_state.AppState) void {
         state.navigateBrowserFromAddress();
     }
     zgui.popStyleColor(.{ .count = 3 });
+
+    zgui.sameLine(.{ .spacing = gap });
+    zgui.beginDisabled(.{ .disabled = !state.canUseBrowserInspector() });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = if (state.isBrowserInspectorEnabled()) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (state.isBrowserInspectorEnabled()) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (state.isBrowserInspectorEnabled()) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Inspect", .{ .w = inspect_width, .h = theme.scaledUi(36.0) })) {
+        state.toggleBrowserInspector();
+    }
+    if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
+        _ = zgui.beginTooltip();
+        if (state.canUseBrowserInspector()) {
+            zgui.textUnformatted("Toggle the bundled DOM inspector inside the CEF pane");
+        } else {
+            zgui.textUnformatted("The page inspector currently requires a real CEF runtime");
+        }
+        zgui.endTooltip();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+    zgui.endDisabled();
 
     zgui.sameLine(.{ .spacing = gap });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });

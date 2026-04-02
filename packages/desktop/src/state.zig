@@ -3,6 +3,7 @@ const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
+const browser_inspector = @import("browser/inspector.zig");
 const browser_runtime = @import("browser/mod.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
@@ -1650,6 +1651,8 @@ pub const AppState = struct {
     /// Closes the browser dock and fully tears the runtime down so CEF exits until the next open.
     pub fn closeBrowser(self: *AppState) void {
         self.browser_state.setControlsVisible(false);
+        self.browser_state.setInspectorEnabled(false);
+        self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
         self.browser_pane_hovered = false;
         self.browser_state.controller.shutdown();
@@ -1661,6 +1664,8 @@ pub const AppState = struct {
     /// Hides the desktop browser control surface and its browser runtime.
     pub fn hideBrowser(self: *AppState) void {
         self.browser_state.setControlsVisible(false);
+        self.browser_state.setInspectorEnabled(false);
+        self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
         self.browser_state.controller.hide() catch |err| {
             log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
@@ -1675,6 +1680,16 @@ pub const AppState = struct {
     /// Reports whether the browser dock is visible in the chat workspace.
     pub fn isBrowserVisible(self: *const AppState) bool {
         return self.browser_state.controls_visible;
+    }
+
+    /// Reports whether the current browser runtime can host the bundled CEF inspector.
+    pub fn canUseBrowserInspector(self: *const AppState) bool {
+        return self.browser_state.controller.runtimeKind() == .cef and self.browser_state.controller.sdkConfigured();
+    }
+
+    /// Reports whether the bundled browser inspector is currently armed.
+    pub fn isBrowserInspectorEnabled(self: *const AppState) bool {
+        return self.browser_state.inspectorEnabled();
     }
 
     /// Computes the height reserved for the browser dock inside the chat workspace.
@@ -1839,6 +1854,15 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser JSON bridge requested.");
     }
 
+    /// Toggles the bundled page inspector overlay inside the CEF browser runtime.
+    pub fn toggleBrowserInspector(self: *AppState) void {
+        if (self.browser_state.inspectorEnabled()) {
+            self.disableBrowserInspector(true);
+            return;
+        }
+        self.enableBrowserInspector(true);
+    }
+
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
         if (self.browser_launch_open_delay_frames > 0) {
@@ -1866,12 +1890,33 @@ pub const AppState = struct {
                     self.browser_state.setLastError(null) catch {};
                 },
                 .title_changed => |_| {},
+                .document_loaded => {
+                    self.reapplyBrowserInspectorAfterLoad();
+                },
                 .js_message => |message| {
+                    if (isInspectorBridgeMessage(message)) {
+                        if (isInspectorHoverMessage(message) or
+                            isInspectorLifecycleMessage(message) or
+                            isInspectorPromptChangedMessage(message))
+                        {
+                            continue;
+                        }
+                        self.browser_state.setLastJsMessage(message) catch {};
+                        if (isInspectorSelectionMessage(message)) {
+                            self.setSidebarNotice("Browser inspector captured an element.");
+                        } else if (isInspectorPromptSubmittedMessage(message)) {
+                            self.setSidebarNotice("Browser inspector prompt submitted.");
+                        }
+                        continue;
+                    }
                     self.browser_state.setLastJsMessage(message) catch {};
                     self.setSidebarNotice("Browser bridge message received.");
                 },
                 .eval_result => |result| {
                     self.browser_state.setLastEvalResult(result) catch {};
+                    if (self.browser_state.consumeSuppressedEvalResult()) {
+                        continue;
+                    }
                     self.setSidebarNotice("Browser script evaluation completed.");
                 },
                 .failed => |message| {
@@ -1892,6 +1937,97 @@ pub const AppState = struct {
             return try self.allocator.dupe(u8, value);
         }
         return try std.fmt.allocPrint(self.allocator, "https://{s}", .{value});
+    }
+
+    // Enables the bundled inspector and dispatches one internal eval into the current browser document.
+    fn enableBrowserInspector(self: *AppState, show_notice: bool) void {
+        if (!self.isBrowserVisible()) {
+            self.setSidebarNotice("Open the browser before enabling the inspector.");
+            return;
+        }
+        if (!self.canUseBrowserInspector()) {
+            self.setSidebarNotice("The browser inspector currently requires a real CEF runtime.");
+            return;
+        }
+
+        const script = browser_inspector.enableScriptAlloc(self.allocator) catch |err| {
+            log.err("failed to build browser inspector script: {s}", .{@errorName(err)});
+            if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
+            return;
+        };
+        defer self.allocator.free(script);
+
+        self.browser_state.setInspectorEnabled(true);
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            self.browser_state.setInspectorEnabled(false);
+            log.err("failed to enable browser inspector: {s}", .{@errorName(err)});
+            if (show_notice) self.setSidebarNotice("Failed to enable the browser inspector.");
+            return;
+        };
+        if (show_notice) self.setSidebarNotice("Browser inspector enabled.");
+    }
+
+    // Disables the bundled inspector overlay while leaving the page alive.
+    fn disableBrowserInspector(self: *AppState, show_notice: bool) void {
+        self.browser_state.setInspectorEnabled(false);
+        if (!self.isBrowserVisible() or !self.canUseBrowserInspector()) {
+            if (show_notice) self.setSidebarNotice("Browser inspector disabled.");
+            return;
+        }
+
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(browser_inspector.disable_script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            log.err("failed to disable browser inspector: {s}", .{@errorName(err)});
+            if (show_notice) self.setSidebarNotice("Failed to disable the browser inspector.");
+            return;
+        };
+        if (show_notice) self.setSidebarNotice("Browser inspector disabled.");
+    }
+
+    // Reapplies the inspector after the next main-frame load when the user has it armed.
+    fn reapplyBrowserInspectorAfterLoad(self: *AppState) void {
+        if (!self.browser_state.inspectorEnabled()) return;
+        if (!self.canUseBrowserInspector()) return;
+
+        const script = browser_inspector.enableScriptAlloc(self.allocator) catch |err| {
+            log.warn("failed to rebuild browser inspector after load: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(script);
+
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            log.warn("failed to reapply browser inspector after load: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn isInspectorBridgeMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"source\":\"verde-inspector\"") != null;
+    }
+
+    fn isInspectorHoverMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"element:hover\"") != null;
+    }
+
+    fn isInspectorLifecycleMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"inspector:enabled\"") != null or
+            std.mem.indexOf(u8, message, "\"type\":\"inspector:disabled\"") != null;
+    }
+
+    fn isInspectorSelectionMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"element:selected\"") != null;
+    }
+
+    fn isInspectorPromptSubmittedMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"prompt:submitted\"") != null;
+    }
+
+    fn isInspectorPromptChangedMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
     }
 
     pub fn hasActiveTerminalSessions(self: *const AppState) bool {

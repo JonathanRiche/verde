@@ -416,7 +416,7 @@ fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
     defer context.event_file.close();
 
-    var read_buffer: [16 * 1024]u8 = undefined;
+    var read_buffer: [64 * 1024]u8 = undefined;
     var reader = context.event_file.reader(&read_buffer);
 
     while (true) {
@@ -566,6 +566,7 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .closed => .closed,
         .navigated => .{ .navigated = try allocator.dupe(u8, event.payload orelse "about:blank") },
         .title_changed => .{ .title_changed = try allocator.dupe(u8, event.payload orelse "") },
+        .document_loaded => .document_loaded,
         .js_message => .{ .js_message = try allocator.dupe(u8, event.payload orelse "{}") },
         .eval_result => .{ .eval_result = try allocator.dupe(u8, event.payload orelse "null") },
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux CEF helper failed.") },

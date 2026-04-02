@@ -42,6 +42,7 @@ pub const EventKind = enum {
     closed,
     navigated,
     title_changed,
+    document_loaded,
     js_message,
     eval_result,
     frame_ready,

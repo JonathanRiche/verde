@@ -121,11 +121,14 @@ pub const Backend = struct {
     pub fn resizePane(self: *Backend, width: u32, height: u32) !void {
         try self.ensureRuntime();
         const pane = try self.ensurePaneSession(width, height);
-        pane.resize(width, height);
+        const next_width = @max(width, 1);
+        const next_height = @max(height, 1);
+        if (pane.width == next_width and pane.height == next_height) return;
+        pane.resize(next_width, next_height);
 
         if (self.usingNativeRuntime()) {
             const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
-            try helper.resize(@max(width, 1), @max(height, 1));
+            try helper.resize(next_width, next_height);
             return;
         }
 
