@@ -25,7 +25,9 @@ Download the latest release from [GitHub Releases](https://github.com/JonathanRi
 ./install-local.sh
 ```
 
-- macOS: download the `.zip` for your architecture, unzip it, and move `Verde.app` into `Applications`
+- macOS: download the `.dmg` or `.zip` for your architecture
+  - `.dmg`: open it and drag `Verde.app` into `Applications`
+  - `.zip`: unzip it and move `Verde.app` into `Applications`
 
 ### Install on Arch Linux
 
@@ -134,8 +136,8 @@ packages/desktop/zig-out/bin/verde
 GitHub Actions builds release artifacts from tags that start with `v`.
 
 - Linux: `verde-<version>-linux-x86_64.tar.gz`
-- macOS Intel: `verde-<version>-macos-x86_64.zip`
-- macOS Apple Silicon: `verde-<version>-macos-arm64.zip`
+- macOS Intel: `verde-<version>-macos-x86_64.zip` and `verde-<version>-macos-x86_64.dmg`
+- macOS Apple Silicon: `verde-<version>-macos-arm64.zip` and `verde-<version>-macos-arm64.dmg`
 
 The Linux archive contains a local install helper:
 
