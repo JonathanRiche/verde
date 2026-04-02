@@ -25,15 +25,6 @@ const WorkspaceLayout = struct {
 // Renders the transcript, composer, and any bottom-docked workspace panels.
 fn inner_workspace(state: *app_state.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
-    const available_width = zgui.getContentRegionAvail();
-    // app_state.log.debug("available width: {d}", .{available_width[0]});
-    const inner_pad_x =
-        if (available_width[0] < theme.scaledUi(1900.0))
-            theme.scaledUi(160.0)
-        else
-            theme.clampf(available_width[0] * 0.32, theme.scaledUi(24.0), theme.scaledUi(480.0));
-
-    // const inner_pad_x = theme.clampf(available_width[0] * 0.14, theme.scaledUi(24.0), theme.scaledUi(200.0));
     const inner_pad_y = theme.scaledUi(18.0);
 
     // No horizontal padding here so the transcript scrollbar reaches the far right edge.
@@ -57,16 +48,23 @@ fn inner_workspace(state: *app_state.AppState) void {
 
     if (state.projects.items.len == 0) {
         state.terminal_focused = false;
-        zgui.indent(.{ .indent_w = inner_pad_x });
+        const empty_pad_x = chatColumnInnerPadding(zgui.getContentRegionAvail()[0], false);
+        zgui.indent(.{ .indent_w = empty_pad_x });
         zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
-        zgui.unindent(.{ .indent_w = inner_pad_x });
+        zgui.unindent(.{ .indent_w = empty_pad_x });
         return;
     }
 
     const content = zgui.getContentRegionAvail();
     const layout = computeWorkspaceLayout(state, content[0], content[1]);
-    if (layout.browser_width > 0.0) {
+    const split_active = layout.browser_width > 0.0;
+    const chat_column_width = if (split_active)
+        @max(content[0] - layout.browser_gap - layout.browser_width, theme.scaledUi(240.0))
+    else
+        content[0];
+    const inner_pad_x = chatColumnInnerPadding(chat_column_width, split_active);
+    if (split_active) {
         zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
         defer zgui.popStyleVar(.{ .count = 1 });
         _ = zgui.beginChild("ChatBrowserSplit", .{
@@ -79,17 +77,25 @@ fn inner_workspace(state: *app_state.AppState) void {
         });
         defer zgui.endChild();
 
-        renderChatColumn(state, @max(zgui.getContentRegionAvail()[0] - layout.browser_gap - layout.browser_width, theme.scaledUi(240.0)), layout.body_height, inner_pad_x);
+        renderChatColumn(state, chat_column_width, layout.body_height, inner_pad_x);
         zgui.sameLine(.{ .spacing = layout.browser_gap });
         browser_panel.renderDock(state, layout.browser_width, layout.body_height);
     } else {
-        renderChatColumn(state, content[0], layout.body_height, inner_pad_x);
+        renderChatColumn(state, chat_column_width, layout.body_height, inner_pad_x);
     }
 
     if (layout.terminal_height > 0.0) {
         zgui.dummy(.{ .w = 0.0, .h = layout.terminal_gap });
         terminal_panel.renderDock(state, content[0], layout.terminal_height);
     }
+}
+
+// Derives responsive horizontal padding for the chat column so transcript and composer stay usable in split-pane layouts.
+fn chatColumnInnerPadding(column_width: f32, split_active: bool) f32 {
+    if (split_active) {
+        return theme.clampf(column_width * 0.075, theme.scaledUi(18.0), theme.scaledUi(56.0));
+    }
+    return theme.clampf(column_width * 0.14, theme.scaledUi(24.0), theme.scaledUi(160.0));
 }
 
 // Renders the transcript and composer column that stays alongside the browser pane.
