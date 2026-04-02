@@ -4,7 +4,48 @@
 
 This repo currently contains the desktop app in [`packages/desktop/`](packages/desktop). If you clone the repo and want to run the app locally in development, that is the directory you want.
 
-## Quick start
+## Getting started
+
+Verde talks to local provider CLIs rather than bundling its own backend.
+
+To actually use the app, you need at least one of these on your machine:
+
+- `codex` installed and already logged in
+- `opencode` installed and available on your `PATH`
+
+If you just want to install the app instead of building it yourself, use one of these paths first.
+
+### Install from releases
+
+Download the latest release from:
+
+```text
+https://github.com/JonathanRiche/verde/releases
+```
+
+- Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run:
+
+```bash
+./install-local.sh
+```
+
+- macOS: download the `.zip` for your architecture, unzip it, and move `Verde.app` into `Applications`
+
+### Install on Arch Linux
+
+An AUR package is available for Arch users:
+
+```bash
+yay -S verde-bin
+```
+
+Package page:
+
+```text
+https://aur.archlinux.org/packages/verde-bin
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/JonathanRiche/verde
@@ -21,35 +62,8 @@ That launches the app in development mode.
 - SDL3 available for your platform
   - Linux and Windows: install SDL3 development files
   - macOS: the build uses the bundled SDL3 framework from the Zig dependency
-- At least one supported provider CLI on your `PATH` if you want to send prompts from the app:
-  - `codex`
-  - `opencode`
 
-## Development commands
-
-From the repo root:
-
-```bash
-zig build
-zig build run
-zig build run -Dui-debug=true
-zig build test
-zig build -Doptimize=ReleaseSafe
-zig build -Doptimize=ReleaseFast
-```
-
-- `zig build` builds the app
-- `zig build run` builds and launches it
-- `zig build run -Dui-debug=true` launches it with the native UI debug window enabled
-- `zig build test` runs the Zig tests and the format check
-
-The built binary is written to:
-
-```bash
-packages/desktop/zig-out/bin/verde
-```
-
-## Install on Linux or macOS
+## Install on Linux or macOS from source
 
 The root build now forwards Zig install prefixes into `packages/desktop`, so you can build and install from the repo root with one command.
 
@@ -99,34 +113,28 @@ That builds `Verde.app` and copies it into `~/Applications` by default. To insta
 
 Release `.zip` artifacts on macOS already contain `Verde.app`, so end users can also unzip and drag the app bundle into `Applications`.
 
-## Install from releases
+## Development
 
-If you do not want to build from source, download the latest release from:
-
-```text
-https://github.com/JonathanRiche/verde/releases
-```
-
-- Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run:
+From the repo root:
 
 ```bash
-./install-local.sh
+zig build
+zig build run
+zig build run -Dui-debug=true
+zig build test
+zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseFast
 ```
 
-- macOS: download the `.zip` for your architecture, unzip it, and move `Verde.app` into `Applications`
+- `zig build` builds the app
+- `zig build run` builds and launches it
+- `zig build run -Dui-debug=true` launches it with the native UI debug window enabled
+- `zig build test` runs the Zig tests and the format check
 
-## Install on Arch Linux
-
-An AUR package is available for Arch users:
+The built binary is written to:
 
 ```bash
-yay -S verde-bin
-```
-
-Package page:
-
-```text
-https://aur.archlinux.org/packages/verde-bin
+packages/desktop/zig-out/bin/verde
 ```
 
 ## Release builds
