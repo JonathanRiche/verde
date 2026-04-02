@@ -9,6 +9,9 @@ const ipc = @import("ipc.zig");
 
 const COMMAND_FD: std.posix.fd_t = 3;
 const EVENT_FD: std.posix.fd_t = 4;
+const FRAME_FD_BASE: std.posix.fd_t = 5;
+const FRAME_SLOT_COUNT: usize = 2;
+const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
@@ -43,16 +46,21 @@ const SharedQueue = struct {
 
 const SharedFrame = struct {
     mutex: std.Thread.Mutex = .{},
-    path: ?[]u8 = null,
+    slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
+    slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
+    latest_slot: u8 = 0,
     width: u32 = 0,
     height: u32 = 0,
     byte_len: usize = 0,
     dirty: bool = false,
 
     /// Releases the stored frame metadata.
-    fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
-        if (self.path) |path| allocator.free(path);
-        self.path = null;
+    fn deinit(self: *SharedFrame) void {
+        for (0..FRAME_SLOT_COUNT) |index| {
+            if (!self.slot_ready[index]) continue;
+            std.posix.munmap(self.slots[index]);
+            self.slot_ready[index] = false;
+        }
         self.width = 0;
         self.height = 0;
         self.byte_len = 0;
@@ -60,15 +68,13 @@ const SharedFrame = struct {
     }
 
     /// Replaces the latest dirty frame metadata published by the helper.
-    fn update(self: *SharedFrame, allocator: std.mem.Allocator, event: ipc.Event) !void {
+    fn update(self: *SharedFrame, event: ipc.Event) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.path) |path| allocator.free(path);
-        self.path = if (event.frame_path) |path|
-            try allocator.dupe(u8, path)
-        else
-            null;
+        if (event.frame_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
+        if (event.byte_len > self.slots[event.frame_slot].len) return error.FrameTooLarge;
+        self.latest_slot = event.frame_slot;
         self.width = event.width;
         self.height = event.height;
         self.byte_len = event.byte_len;
@@ -78,25 +84,16 @@ const SharedFrame = struct {
     /// Uploads the newest dirty helper frame into the pane texture on the UI thread.
     fn uploadIntoTexture(
         self: *SharedFrame,
-        allocator: std.mem.Allocator,
-        buffer: *std.ArrayList(u8),
         texture: *browser_texture.PaneTexture,
     ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (!self.dirty) return;
-        const path = self.path orelse return;
         if (self.width == 0 or self.height == 0 or self.byte_len == 0) return;
+        if (self.latest_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
 
-        try buffer.resize(allocator, self.byte_len);
-        const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-        defer file.close();
-
-        const read_len = try file.preadAll(buffer.items[0..self.byte_len], 0);
-        if (read_len < self.byte_len) return error.UnexpectedFrameEof;
-
-        try texture.uploadBgra(self.width, self.height, buffer.items[0..self.byte_len]);
+        try texture.uploadBgra(self.width, self.height, self.slots[self.latest_slot][0..self.byte_len]);
         self.dirty = false;
     }
 };
@@ -108,7 +105,6 @@ pub const Controller = struct {
     command_file: ?std.fs.File = null,
     queue: *SharedQueue,
     frame: *SharedFrame,
-    frame_buffer: std.ArrayList(u8) = .empty,
     reader_thread: ?std.Thread = null,
 
     /// Creates the helper-backed Linux CEF controller.
@@ -126,7 +122,10 @@ pub const Controller = struct {
             .queue = queue,
             .frame = frame,
         };
-        errdefer controller.frame_buffer.deinit(allocator);
+        errdefer {
+            controller.frame.deinit();
+            controller.queue.deinit(allocator);
+        }
         try controller.spawnHelper(helper_name);
         return controller;
     }
@@ -142,9 +141,8 @@ pub const Controller = struct {
             self.reader_thread = null;
         }
         self.terminateChild();
-        self.frame_buffer.deinit(self.allocator);
         self.queue.deinit(self.allocator);
-        self.frame.deinit(self.allocator);
+        self.frame.deinit();
         self.allocator.destroy(self.queue);
         self.allocator.destroy(self.frame);
     }
@@ -275,7 +273,7 @@ pub const Controller = struct {
 
     /// Uploads the latest dirty helper frame into the browser pane texture.
     pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !void {
-        try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+        try self.frame.uploadIntoTexture(texture);
     }
 
     // Launches the installed Linux CEF helper beside the desktop executable.
@@ -293,11 +291,18 @@ pub const Controller = struct {
             std.posix.close(event_pipe[0]);
             std.posix.close(event_pipe[1]);
         }
+        const frame_fds = try createFrameSlots(self.frame);
+        errdefer {
+            for (frame_fds) |frame_fd| std.posix.close(frame_fd);
+            self.frame.deinit();
+        }
 
         var env_map = try std.process.getEnvMap(self.allocator);
         defer env_map.deinit();
         try env_map.put("VERDE_CEF_CMD_FD", "3");
         try env_map.put("VERDE_CEF_EVENT_FD", "4");
+        try env_map.put("VERDE_CEF_FRAME0_FD", "5");
+        try env_map.put("VERDE_CEF_FRAME1_FD", "6");
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -311,11 +316,12 @@ pub const Controller = struct {
 
         const child_pid = try std.posix.fork();
         if (child_pid == 0) {
-            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp.ptr, command_pipe, event_pipe);
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp.ptr, command_pipe, event_pipe, frame_fds);
         }
 
         std.posix.close(command_pipe[0]);
         std.posix.close(event_pipe[1]);
+        for (frame_fds) |frame_fd| std.posix.close(frame_fd);
 
         const command_file: std.fs.File = .{ .handle = command_pipe[1] };
         const event_file: std.fs.File = .{ .handle = event_pipe[0] };
@@ -402,7 +408,7 @@ fn helperReaderMain(context: *ReaderContext) !void {
         defer parsed.deinit();
 
         if (parsed.value.kind == .frame_ready) {
-            try context.frame.update(context.allocator, parsed.value);
+            try context.frame.update(parsed.value);
             continue;
         }
 
@@ -419,14 +425,19 @@ fn execHelperChild(
     envp: [*:null]const ?[*:0]const u8,
     command_pipe: [2]std.posix.fd_t,
     event_pipe: [2]std.posix.fd_t,
+    frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t,
 ) noreturn {
     std.posix.dup2(command_pipe[0], COMMAND_FD) catch std.posix.exit(126);
     std.posix.dup2(event_pipe[1], EVENT_FD) catch std.posix.exit(126);
+    inline for (frame_fds, 0..) |frame_fd, index| {
+        std.posix.dup2(frame_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) catch std.posix.exit(126);
+    }
 
     std.posix.close(command_pipe[0]);
     std.posix.close(command_pipe[1]);
     std.posix.close(event_pipe[0]);
     std.posix.close(event_pipe[1]);
+    for (frame_fds) |frame_fd| std.posix.close(frame_fd);
     closeInheritedFileDescriptors();
 
     var empty_signal_mask = std.posix.sigemptyset();
@@ -441,7 +452,7 @@ fn execHelperChild(
 fn closeInheritedFileDescriptors() void {
     const limits = std.posix.getrlimit(.NOFILE) catch return;
     const max_fd: usize = @intCast(@min(limits.cur, 4096));
-    var fd: usize = 5;
+    var fd: usize = FRAME_FD_BASE + FRAME_SLOT_COUNT;
     while (fd < max_fd) : (fd += 1) {
         _ = std.c.close(@intCast(fd));
     }
@@ -456,6 +467,39 @@ fn restoreDefaultSignal(signal_number: u8) void {
         .restorer = null,
     };
     std.posix.sigaction(signal_number, &action, null);
+}
+
+// Creates shared memory frame slots so the helper can publish pixels without rewriting files.
+fn createFrameSlots(frame: *SharedFrame) ![FRAME_SLOT_COUNT]std.posix.fd_t {
+    var frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
+    errdefer frame.deinit();
+
+    inline for (0..FRAME_SLOT_COUNT) |index| {
+        const name: [*:0]const u8 = switch (index) {
+            0 => "verde-cef-frame-0",
+            1 => "verde-cef-frame-1",
+            else => unreachable,
+        };
+        const raw_fd = std.os.linux.memfd_create(name, 0);
+        switch (std.posix.errno(raw_fd)) {
+            .SUCCESS => frame_fds[index] = @intCast(raw_fd),
+            else => return error.FrameMemfdCreateFailed,
+        }
+        errdefer std.posix.close(frame_fds[index]);
+
+        try std.posix.ftruncate(frame_fds[index], FRAME_BYTES_MAX);
+        frame.slots[index] = try std.posix.mmap(
+            null,
+            FRAME_BYTES_MAX,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            frame_fds[index],
+            0,
+        );
+        frame.slot_ready[index] = true;
+        @memset(frame.slots[index], 0);
+    }
+    return frame_fds;
 }
 
 /// Converts one helper JSON event into the desktop browser event union.

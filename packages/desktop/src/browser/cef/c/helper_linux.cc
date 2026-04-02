@@ -1,15 +1,16 @@
 #include <atomic>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -60,6 +61,8 @@ constexpr unsigned kModShift = 1u << 0;
 constexpr unsigned kModCtrl = 1u << 1;
 constexpr unsigned kModAlt = 1u << 2;
 constexpr unsigned kModSuper = 1u << 3;
+constexpr size_t kFrameSlotCount = 2;
+constexpr size_t kFrameBytesMax = 4096u * 2160u * 4u;
 FILE* g_event_output = nullptr;
 
 struct Command {
@@ -110,29 +113,11 @@ struct CommandQueue {
   }
 };
 
-struct FrameStore {
-  std::string path;
-
-  explicit FrameStore() {
-    path = "/tmp/verde-cef-frame-" + std::to_string(getpid()) + ".rgba";
-  }
-
-  ~FrameStore() {
-    std::remove(path.c_str());
-  }
-
-  bool write(const unsigned char* pixels, size_t len) {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) return false;
-    file.write(reinterpret_cast<const char*>(pixels), static_cast<std::streamsize>(len));
-    return file.good();
-  }
-};
-
 struct RuntimeState {
-  FrameStore frame_store;
+  std::array<unsigned char*, kFrameSlotCount> frame_slots = {nullptr, nullptr};
   uint32_t pane_width = 1280;
   uint32_t pane_height = 720;
+  uint8_t next_frame_slot = 0;
 };
 
 bool startsWith(std::string_view value, std::string_view prefix) {
@@ -370,7 +355,7 @@ void emitEvent(const char* kind,
                uint32_t width = 0,
                uint32_t height = 0,
                size_t byte_len = 0,
-               const std::string* frame_path = nullptr) {
+               uint8_t frame_slot = 0) {
   FILE* out = g_event_output != nullptr ? g_event_output : stdout;
   std::fputs("{\"kind\":\"", out);
   std::fputs(kind, out);
@@ -380,15 +365,11 @@ void emitEvent(const char* kind,
   std::fprintf(out, "%u", height);
   std::fputs(",\"byte_len\":", out);
   std::fprintf(out, "%zu", byte_len);
+  std::fputs(",\"frame_slot\":", out);
+  std::fprintf(out, "%u", static_cast<unsigned>(frame_slot));
   std::fputs(",\"payload\":", out);
   if (payload != nullptr) {
     writeEscapedJsonString(out, *payload);
-  } else {
-    std::fputs("null", out);
-  }
-  std::fputs(",\"frame_path\":", out);
-  if (frame_path != nullptr) {
-    writeEscapedJsonString(out, *frame_path);
   } else {
     std::fputs("null", out);
   }
@@ -503,15 +484,38 @@ void publishLatestFrame(RuntimeState& state) {
     emitEvent("failed", &message);
     return;
   }
-  if (!state.frame_store.write(pixels, expected_len)) {
-    const std::string message = "Failed to write CEF frame file.";
+  if (expected_len > kFrameBytesMax) {
+    const std::string message = "CEF frame exceeded shared memory capacity.";
     emitEvent("failed", &message);
     return;
   }
 
+  const uint8_t slot = state.next_frame_slot;
+  std::memcpy(state.frame_slots[slot], pixels, expected_len);
+  state.next_frame_slot = static_cast<uint8_t>((slot + 1) % kFrameSlotCount);
+
   verde_cef_clear_frame_dirty();
   emitEvent("frame_ready", nullptr, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
-            expected_len, &state.frame_store.path);
+            expected_len, slot);
+}
+
+bool mapFrameSlots(RuntimeState& state, int frame0_fd, int frame1_fd) {
+  const int frame_fds[kFrameSlotCount] = {frame0_fd, frame1_fd};
+  for (size_t index = 0; index < kFrameSlotCount; index += 1) {
+    if (frame_fds[index] < 0) return false;
+    void* mapping = mmap(nullptr, kFrameBytesMax, PROT_READ | PROT_WRITE, MAP_SHARED, frame_fds[index], 0);
+    if (mapping == MAP_FAILED) return false;
+    state.frame_slots[index] = static_cast<unsigned char*>(mapping);
+  }
+  return true;
+}
+
+void unmapFrameSlots(RuntimeState& state) {
+  for (size_t index = 0; index < kFrameSlotCount; index += 1) {
+    if (state.frame_slots[index] == nullptr) continue;
+    munmap(state.frame_slots[index], kFrameBytesMax);
+    state.frame_slots[index] = nullptr;
+  }
 }
 
 bool applyCommand(RuntimeState& state, const Command& command) {
@@ -614,6 +618,8 @@ int main(int argc, char** argv) {
   const std::string process_helper_path = joinPath(exe_dir, "verde-browser-cef-process");
   const int command_fd = parseHelperFd(std::getenv("VERDE_CEF_CMD_FD"));
   const int event_fd = parseHelperFd(std::getenv("VERDE_CEF_EVENT_FD"));
+  const int frame0_fd = parseHelperFd(std::getenv("VERDE_CEF_FRAME0_FD"));
+  const int frame1_fd = parseHelperFd(std::getenv("VERDE_CEF_FRAME1_FD"));
 
   if (chdir(exe_dir.c_str()) != 0) {
     return 1;
@@ -625,7 +631,7 @@ int main(int argc, char** argv) {
   if (isChromiumSubprocess(argc, argv)) {
     return verde_cef_execute_subprocess(argc, const_cast<const char* const*>(argv));
   }
-  if (command_fd < 0 || event_fd < 0) {
+  if (command_fd < 0 || event_fd < 0 || frame0_fd < 0 || frame1_fd < 0) {
     return 1;
   }
 
@@ -646,15 +652,23 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  FILE* command_input = fdopen(command_fd, "r");
-  if (command_input == nullptr) {
+  RuntimeState state;
+  if (!mapFrameSlots(state, frame0_fd, frame1_fd)) {
     verde_cef_shutdown();
     fclose(g_event_output);
     g_event_output = nullptr;
     return 1;
   }
 
-  RuntimeState state;
+  FILE* command_input = fdopen(command_fd, "r");
+  if (command_input == nullptr) {
+    unmapFrameSlots(state);
+    verde_cef_shutdown();
+    fclose(g_event_output);
+    g_event_output = nullptr;
+    return 1;
+  }
+
   CommandQueue queue;
   std::thread reader(commandReaderMain, &queue, command_input);
 
@@ -676,6 +690,7 @@ int main(int argc, char** argv) {
 
   queue.markClosed();
   if (reader.joinable()) reader.join();
+  unmapFrameSlots(state);
   verde_cef_shutdown();
   fclose(g_event_output);
   g_event_output = nullptr;
