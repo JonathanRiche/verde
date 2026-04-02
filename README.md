@@ -1,6 +1,6 @@
 # verde
 
-`verde` is a desktop chat app built in Zig with SDL3, OpenGL, and zgui.
+`verde` is a desktop GUI for coding agents, currently built around Codex and OpenCode, with more integrations coming soon.
 
 This repo currently contains the desktop app in [`packages/desktop/`](packages/desktop). If you clone the repo and want to run the app locally in development, that is the directory you want.
 
@@ -17,11 +17,7 @@ If you just want to install the app instead of building it yourself, use one of 
 
 ### Install from releases
 
-Download the latest release from:
-
-```text
-https://github.com/JonathanRiche/verde/releases
-```
+Download the latest release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).
 
 - Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run:
 
@@ -39,11 +35,7 @@ An AUR package is available for Arch users:
 yay -S verde-bin
 ```
 
-Package page:
-
-```text
-https://aur.archlinux.org/packages/verde-bin
-```
+Package page: [verde-bin on the AUR](https://aur.archlinux.org/packages/verde-bin)
 
 ### Build from source
 
