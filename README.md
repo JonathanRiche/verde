@@ -8,10 +8,10 @@ This repo currently contains the desktop app in [`packages/desktop/`](packages/d
 
 Verde talks to local provider CLIs rather than bundling its own backend.
 
-To actually use the app, you need at least one of these on your machine:
-
-- `codex` installed and already logged in
-- `opencode` installed and available on your `PATH`
+> [!WARNING]
+> To actually use Verde, you need at least one supported provider installed and authenticated on your machine:
+> - Codex: install [Codex CLI](https://github.com/openai/codex) and run `codex login`
+> - OpenCode: install [OpenCode](https://github.com/anomalyco/opencode) and make sure `opencode` is available on your `PATH`
 
 If you just want to install the app instead of building it yourself, use one of these paths first.
 
