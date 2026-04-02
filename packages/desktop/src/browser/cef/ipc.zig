@@ -8,6 +8,11 @@ pub const CommandKind = enum {
     navigate,
     eval,
     post_json,
+    mouse_move,
+    mouse_button,
+    mouse_wheel,
+    key_input,
+    text_input,
     quit,
 };
 
@@ -17,6 +22,17 @@ pub const Command = struct {
     session_id: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    wheel_x: f32 = 0.0,
+    wheel_y: f32 = 0.0,
+    button: u8 = 0,
+    pressed: bool = false,
+    key_code: u32 = 0,
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false,
+    super: bool = false,
     payload: ?[]const u8 = null,
 };
 

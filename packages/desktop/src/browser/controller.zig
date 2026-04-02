@@ -222,7 +222,7 @@ pub const Controller = struct {
 // Chooses the CEF backend when a real SDK is configured or when preview mode is requested explicitly.
 fn shouldUseCefBackend() bool {
     if (builtin.os.tag == .linux) {
-        return build_options.cef_stub_preview;
+        return build_options.cef_sdk_configured or build_options.cef_stub_preview;
     }
     return build_options.cef_sdk_configured or build_options.cef_stub_preview;
 }

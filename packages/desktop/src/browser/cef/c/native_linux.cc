@@ -1,28 +1,25 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string>
 #include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
-#include <stdarg.h>
 #include <vector>
 
-#include "include/capi/cef_app_capi.h"
-#include "include/capi/cef_browser_capi.h"
-#include "include/capi/cef_client_capi.h"
-#include "include/capi/cef_display_handler_capi.h"
-#include "include/capi/cef_frame_capi.h"
-#include "include/capi/cef_life_span_handler_capi.h"
-#include "include/capi/cef_load_handler_capi.h"
-#include "include/capi/cef_render_handler_capi.h"
-#include "include/internal/cef_string.h"
+#include "include/cef_app.h"
+#include "include/cef_browser.h"
+#include "include/cef_client.h"
+#include "include/cef_command_line.h"
+#include "include/cef_load_handler.h"
+#include "include/internal/cef_linux.h"
+#include "include/wrapper/cef_helpers.h"
 
 namespace {
 
@@ -49,21 +46,291 @@ int openViaSyscall(int dirfd, const char* pathname, int flags, mode_t mode) {
   return static_cast<int>(syscall(SYS_openat, dirfd, pathname, flags, mode));
 }
 
+int closeViaSyscall(int fd) {
+  return static_cast<int>(syscall(SYS_close, fd));
+}
+
+uint32_t eventFlagsFromModifiers(unsigned int modifiers) {
+  uint32_t flags = EVENTFLAG_NONE;
+  if ((modifiers & (1u << 0)) != 0) flags |= EVENTFLAG_SHIFT_DOWN;
+  if ((modifiers & (1u << 1)) != 0) flags |= EVENTFLAG_CONTROL_DOWN;
+  if ((modifiers & (1u << 2)) != 0) flags |= EVENTFLAG_ALT_DOWN;
+  if ((modifiers & (1u << 3)) != 0) flags |= EVENTFLAG_COMMAND_DOWN;
+  return flags;
+}
+
+CefBrowserHost::MouseButtonType mouseButtonType(unsigned int button) {
+  switch (button) {
+    case 1:
+      return MBT_LEFT;
+    case 2:
+      return MBT_MIDDLE;
+    case 3:
+      return MBT_RIGHT;
+    default:
+      return MBT_LEFT;
+  }
+}
+
+uint32_t mouseButtonFlag(unsigned int button) {
+  switch (button) {
+    case 1:
+      return EVENTFLAG_LEFT_MOUSE_BUTTON;
+    case 2:
+      return EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+    case 3:
+      return EVENTFLAG_RIGHT_MOUSE_BUTTON;
+    default:
+      return EVENTFLAG_NONE;
+  }
+}
+
+CefMouseEvent makeMouseEvent(double x, double y, unsigned int modifiers) {
+  CefMouseEvent event{};
+  event.x = static_cast<int>(x);
+  event.y = static_cast<int>(y);
+  event.modifiers = eventFlagsFromModifiers(modifiers);
+  return event;
+}
+
+enum VerdeEventKind {
+  VERDE_EVENT_NONE = 0,
+  VERDE_EVENT_OPENED = 1,
+  VERDE_EVENT_CLOSED = 2,
+  VERDE_EVENT_NAVIGATED = 3,
+  VERDE_EVENT_TITLE_CHANGED = 4,
+  VERDE_EVENT_FAILED = 5,
+};
+
+struct VerdeEvent {
+  int kind = VERDE_EVENT_NONE;
+  std::string payload;
+};
+
+class VerdeApp;
+class VerdeClient;
+
+struct VerdeRuntime {
+  bool initialized = false;
+  int width = 1;
+  int height = 1;
+  int frame_width = 0;
+  int frame_height = 0;
+  bool frame_dirty = false;
+  std::vector<unsigned char> frame;
+  std::deque<VerdeEvent> events;
+  CefRefPtr<VerdeApp> app;
+  CefRefPtr<VerdeClient> client;
+  CefRefPtr<CefBrowser> browser;
+};
+
+VerdeRuntime g_runtime;
+
+void pushEvent(int kind, const std::string& payload) {
+  g_runtime.events.push_back(VerdeEvent{kind, payload});
+}
+
+void pushFailure(const std::string& message) {
+  pushEvent(VERDE_EVENT_FAILED, message);
+}
+
+void appendSwitchIfMissing(CefRefPtr<CefCommandLine> command_line,
+                           const char* name) {
+  if (!command_line || name == nullptr) {
+    return;
+  }
+  if (!command_line->HasSwitch(name)) {
+    command_line->AppendSwitch(name);
+  }
+}
+
+class VerdeApp final : public CefApp {
+ public:
+  void OnBeforeCommandLineProcessing(
+      const CefString& process_type,
+      CefRefPtr<CefCommandLine> command_line) override {
+    (void)process_type;
+    appendSwitchIfMissing(command_line, "disable-gpu");
+    appendSwitchIfMissing(command_line, "disable-gpu-compositing");
+    appendSwitchIfMissing(command_line, "disable-surfaces");
+    appendSwitchIfMissing(command_line, "disable-dev-shm-usage");
+    appendSwitchIfMissing(command_line, "no-sandbox");
+    appendSwitchIfMissing(command_line, "no-zygote");
+    appendSwitchIfMissing(command_line, "single-process");
+  }
+
+ private:
+  IMPLEMENT_REFCOUNTING(VerdeApp);
+};
+
+class VerdeClient final : public CefClient,
+                          public CefRenderHandler,
+                          public CefDisplayHandler,
+                          public CefLoadHandler,
+                          public CefLifeSpanHandler {
+ public:
+  CefRefPtr<CefRenderHandler> GetRenderHandler() override { return this; }
+
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
+
+  CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser,
+                                CefRefPtr<CefFrame> frame,
+                                CefProcessId source_process,
+                                CefRefPtr<CefProcessMessage> message) override {
+    (void)browser;
+    (void)frame;
+    (void)source_process;
+    (void)message;
+    return false;
+  }
+
+  bool GetRootScreenRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
+    (void)browser;
+    rect = CefRect(0, 0, std::max(g_runtime.width, 1), std::max(g_runtime.height, 1));
+    return true;
+  }
+
+  void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect) override {
+    (void)browser;
+    rect = CefRect(0, 0, std::max(g_runtime.width, 1), std::max(g_runtime.height, 1));
+  }
+
+  bool GetScreenPoint(CefRefPtr<CefBrowser> browser,
+                      int view_x,
+                      int view_y,
+                      int& screen_x,
+                      int& screen_y) override {
+    (void)browser;
+    screen_x = view_x;
+    screen_y = view_y;
+    return true;
+  }
+
+  bool GetScreenInfo(CefRefPtr<CefBrowser> browser,
+                     CefScreenInfo& screen_info) override {
+    (void)browser;
+    const CefRect rect(0, 0, std::max(g_runtime.width, 1), std::max(g_runtime.height, 1));
+    screen_info.Set(1.0f, 32, 8, false, rect, rect);
+    return true;
+  }
+
+  void OnPaint(CefRefPtr<CefBrowser> browser,
+               PaintElementType type,
+               const RectList& dirty_rects,
+               const void* buffer,
+               int width,
+               int height) override {
+    (void)browser;
+    (void)dirty_rects;
+    if (type != PET_VIEW || buffer == nullptr || width <= 0 || height <= 0) {
+      return;
+    }
+
+    const size_t pixel_len =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    g_runtime.frame.resize(pixel_len);
+    std::memcpy(g_runtime.frame.data(), buffer, pixel_len);
+    g_runtime.frame_width = width;
+    g_runtime.frame_height = height;
+    g_runtime.frame_dirty = true;
+  }
+
+  void OnAddressChange(CefRefPtr<CefBrowser> browser,
+                       CefRefPtr<CefFrame> frame,
+                       const CefString& url) override {
+    (void)browser;
+    if (frame && frame->IsMain()) {
+      pushEvent(VERDE_EVENT_NAVIGATED, url.ToString());
+    }
+  }
+
+  void OnTitleChange(CefRefPtr<CefBrowser> browser,
+                     const CefString& title) override {
+    (void)browser;
+    pushEvent(VERDE_EVENT_TITLE_CHANGED, title.ToString());
+  }
+
+  void OnLoadError(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   ErrorCode error_code,
+                   const CefString& error_text,
+                   const CefString& failed_url) override {
+    (void)browser;
+    (void)frame;
+    (void)error_code;
+    pushFailure(error_text.ToString() + " (" + failed_url.ToString() + ")");
+  }
+
+  bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
+                     CefRefPtr<CefFrame> frame,
+                     int popup_id,
+                     const CefString& target_url,
+                     const CefString& target_frame_name,
+                     WindowOpenDisposition target_disposition,
+                     bool user_gesture,
+                     const CefPopupFeatures& popup_features,
+                     CefWindowInfo& window_info,
+                     CefRefPtr<CefClient>& client,
+                     CefBrowserSettings& settings,
+                     CefRefPtr<CefDictionaryValue>& extra_info,
+                     bool* no_javascript_access) override {
+    (void)browser;
+    (void)frame;
+    (void)popup_id;
+    (void)target_url;
+    (void)target_frame_name;
+    (void)target_disposition;
+    (void)user_gesture;
+    (void)popup_features;
+    (void)window_info;
+    (void)client;
+    (void)settings;
+    (void)extra_info;
+    (void)no_javascript_access;
+    return true;
+  }
+
+  void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+    if (!g_runtime.browser) {
+      g_runtime.browser = browser;
+    }
+    pushEvent(VERDE_EVENT_OPENED, {});
+  }
+
+  bool DoClose(CefRefPtr<CefBrowser> browser) override {
+    (void)browser;
+    return false;
+  }
+
+  void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    if (g_runtime.browser && g_runtime.browser->IsSame(browser)) {
+      g_runtime.browser = nullptr;
+    }
+    pushEvent(VERDE_EVENT_CLOSED, {});
+  }
+
+ private:
+  IMPLEMENT_REFCOUNTING(VerdeClient);
+};
+
+void sendFocusToBrowser() {
+  if (!g_runtime.browser) {
+    return;
+  }
+  auto host = g_runtime.browser->GetHost();
+  if (!host) {
+    return;
+  }
+  host->SetFocus(true);
+}
+
 }  // namespace
 
 extern "C" int open(const char* pathname, int flags, ...) {
-  mode_t mode = 0;
-  if ((flags & O_CREAT) != 0) {
-    va_list args;
-    va_start(args, flags);
-    mode = static_cast<mode_t>(va_arg(args, int));
-    va_end(args);
-  }
-  const char* target = isOomAdjustPath(pathname) ? "/dev/null" : pathname;
-  return openViaSyscall(AT_FDCWD, target, flags, mode);
-}
-
-extern "C" int open64(const char* pathname, int flags, ...) {
   mode_t mode = 0;
   if ((flags & O_CREAT) != 0) {
     va_list args;
@@ -87,16 +354,8 @@ extern "C" int openat(int dirfd, const char* pathname, int flags, ...) {
   return openViaSyscall(dirfd, target, flags, mode);
 }
 
-extern "C" int openat64(int dirfd, const char* pathname, int flags, ...) {
-  mode_t mode = 0;
-  if ((flags & O_CREAT) != 0) {
-    va_list args;
-    va_start(args, flags);
-    mode = static_cast<mode_t>(va_arg(args, int));
-    va_end(args);
-  }
-  const char* target = isOomAdjustPath(pathname) ? "/dev/null" : pathname;
-  return openViaSyscall(dirfd, target, flags, mode);
+extern "C" int close(int fd) {
+  return closeViaSyscall(fd);
 }
 
 extern "C" bool _ZN4base14AdjustOOMScoreEii(int process, int score) {
@@ -105,439 +364,13 @@ extern "C" bool _ZN4base14AdjustOOMScoreEii(int process, int score) {
   return true;
 }
 
-namespace {
-
-enum VerdeEventKind {
-  VERDE_EVENT_NONE = 0,
-  VERDE_EVENT_OPENED = 1,
-  VERDE_EVENT_CLOSED = 2,
-  VERDE_EVENT_NAVIGATED = 3,
-  VERDE_EVENT_TITLE_CHANGED = 4,
-  VERDE_EVENT_FAILED = 5,
-};
-
-struct VerdeEvent {
-  int kind = VERDE_EVENT_NONE;
-  std::string payload;
-};
-
-struct VerdeRuntime;
-struct VerdeClient;
-struct VerdeRenderHandler;
-struct VerdeDisplayHandler;
-struct VerdeLoadHandler;
-struct VerdeLifeSpanHandler;
-struct VerdeApp;
-
-struct VerdeRenderHandler {
-  cef_render_handler_t base{};
-  std::atomic<int> ref_count{1};
-  VerdeRuntime* runtime = nullptr;
-};
-
-struct VerdeDisplayHandler {
-  cef_display_handler_t base{};
-  std::atomic<int> ref_count{1};
-  VerdeRuntime* runtime = nullptr;
-};
-
-struct VerdeLoadHandler {
-  cef_load_handler_t base{};
-  std::atomic<int> ref_count{1};
-  VerdeRuntime* runtime = nullptr;
-};
-
-struct VerdeLifeSpanHandler {
-  cef_life_span_handler_t base{};
-  std::atomic<int> ref_count{1};
-  VerdeRuntime* runtime = nullptr;
-};
-
-struct VerdeClient {
-  cef_client_t base{};
-  std::atomic<int> ref_count{1};
-  VerdeRuntime* runtime = nullptr;
-  VerdeRenderHandler* render_handler = nullptr;
-  VerdeDisplayHandler* display_handler = nullptr;
-  VerdeLoadHandler* load_handler = nullptr;
-  VerdeLifeSpanHandler* life_span_handler = nullptr;
-
-  ~VerdeClient() {
-    if (render_handler != nullptr) {
-      render_handler->base.base.release(&render_handler->base.base);
-      render_handler = nullptr;
-    }
-    if (display_handler != nullptr) {
-      display_handler->base.base.release(&display_handler->base.base);
-      display_handler = nullptr;
-    }
-    if (load_handler != nullptr) {
-      load_handler->base.base.release(&load_handler->base.base);
-      load_handler = nullptr;
-    }
-    if (life_span_handler != nullptr) {
-      life_span_handler->base.base.release(&life_span_handler->base.base);
-      life_span_handler = nullptr;
-    }
-  }
-};
-
-struct VerdeApp {
-  cef_app_t base{};
-  std::atomic<int> ref_count{1};
-};
-
-struct VerdeRuntime {
-  bool initialized = false;
-  bool browser_create_pending = false;
-  int width = 1;
-  int height = 1;
-  int frame_width = 0;
-  int frame_height = 0;
-  bool frame_dirty = false;
-  std::vector<unsigned char> frame;
-  std::deque<VerdeEvent> events;
-  cef_browser_t* browser = nullptr;
-  VerdeClient* client = nullptr;
-};
-
-VerdeRuntime g_runtime;
-
-template <typename T>
-void CEF_CALLBACK addRef(cef_base_ref_counted_t* base) {
-  auto* self = reinterpret_cast<T*>(base);
-  self->ref_count.fetch_add(1, std::memory_order_relaxed);
-}
-
-template <typename T>
-int CEF_CALLBACK releaseRef(cef_base_ref_counted_t* base) {
-  auto* self = reinterpret_cast<T*>(base);
-  const int next = self->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-  if (next == 0) {
-    delete self;
-    return 1;
-  }
-  return 0;
-}
-
-template <typename T>
-int CEF_CALLBACK hasOneRef(cef_base_ref_counted_t* base) {
-  auto* self = reinterpret_cast<T*>(base);
-  return self->ref_count.load(std::memory_order_acquire) == 1 ? 1 : 0;
-}
-
-template <typename T>
-int CEF_CALLBACK hasAtLeastOneRef(cef_base_ref_counted_t* base) {
-  auto* self = reinterpret_cast<T*>(base);
-  return self->ref_count.load(std::memory_order_acquire) >= 1 ? 1 : 0;
-}
-
-template <typename T, typename CefType>
-void initializeRefCounted(CefType* value) {
-  value->base.size = sizeof(CefType);
-  value->base.add_ref = addRef<T>;
-  value->base.release = releaseRef<T>;
-  value->base.has_one_ref = hasOneRef<T>;
-  value->base.has_at_least_one_ref = hasAtLeastOneRef<T>;
-}
-
-std::string toUtf8(const cef_string_t* value) {
-  if (value == nullptr || value->str == nullptr || value->length == 0) {
-    return {};
-  }
-
-  cef_string_utf8_t utf8{};
-  cef_string_to_utf8(value->str, value->length, &utf8);
-  std::string out;
-  if (utf8.str != nullptr && utf8.length > 0) {
-    out.assign(utf8.str, utf8.length);
-  }
-  cef_string_utf8_clear(&utf8);
-  return out;
-}
-
-cef_string_t toCefString(const char* utf8) {
-  cef_string_t value{};
-  if (utf8 != nullptr) {
-    cef_string_from_utf8(utf8, std::strlen(utf8), &value);
-  }
-  return value;
-}
-
-void pushEvent(int kind, const std::string& payload) {
-  g_runtime.events.push_back(VerdeEvent{kind, payload});
-}
-
-void pushFailure(const std::string& message) {
-  pushEvent(VERDE_EVENT_FAILED, message);
-}
-
-VerdeClient* createClient();
-
-// Appends a Chromium switch only when it is not already present on the process command line.
-void appendSwitchIfMissing(cef_command_line_t* command_line, const char* name) {
-  if (command_line == nullptr || name == nullptr) {
-    return;
-  }
-
-  const cef_string_t switch_name = toCefString(name);
-  const int has_switch = command_line->has_switch(command_line, &switch_name);
-  if (has_switch == 0) {
-    command_line->append_switch(command_line, &switch_name);
-  }
-  cef_string_clear(const_cast<cef_string_t*>(&switch_name));
-}
-
-// Creates the shared app delegate used to customize Chromium startup behavior.
-VerdeApp* createApp() {
-  auto* app = new VerdeApp();
-  initializeRefCounted<VerdeApp>(&app->base);
-
-  app->base.on_before_command_line_processing =
-      [](cef_app_t*, const cef_string_t* process_type, cef_command_line_t* command_line) {
-        const bool is_browser_process =
-            process_type == nullptr || process_type->str == nullptr || process_type->length == 0;
-        if (!is_browser_process) {
-          return;
-        }
-
-        // Linux zygote startup tries to adjust child OOM scores. In restricted
-        // desktop environments that can SIGTRAP during CEF initialization, so
-        // keep Chromium on the direct child-process path instead.
-        appendSwitchIfMissing(command_line, "no-zygote");
-      };
-  app->base.get_resource_bundle_handler =
-      [](cef_app_t*) -> cef_resource_bundle_handler_t* { return nullptr; };
-  app->base.get_browser_process_handler =
-      [](cef_app_t*) -> cef_browser_process_handler_t* { return nullptr; };
-  app->base.get_render_process_handler =
-      [](cef_app_t*) -> cef_render_process_handler_t* { return nullptr; };
-  app->base.on_register_custom_schemes =
-      [](cef_app_t*, cef_scheme_registrar_t*) {};
-
-  return app;
-}
-
-VerdeRenderHandler* createRenderHandler(VerdeRuntime* runtime) {
-  auto* handler = new VerdeRenderHandler();
-  initializeRefCounted<VerdeRenderHandler>(&handler->base);
-  handler->runtime = runtime;
-
-  handler->base.get_root_screen_rect =
-      [](cef_render_handler_t*, cef_browser_t*, cef_rect_t*) -> int {
-    return 0;
-  };
-  handler->base.get_view_rect =
-      [](cef_render_handler_t* self, cef_browser_t*, cef_rect_t* rect) {
-        auto* handler = reinterpret_cast<VerdeRenderHandler*>(self);
-        rect->x = 0;
-        rect->y = 0;
-        rect->width = std::max(handler->runtime->width, 1);
-        rect->height = std::max(handler->runtime->height, 1);
-      };
-  handler->base.get_screen_point =
-      [](cef_render_handler_t*, cef_browser_t*, int, int, int*, int*) -> int {
-    return 0;
-  };
-  handler->base.get_screen_info =
-      [](cef_render_handler_t*, cef_browser_t*, cef_screen_info_t*) -> int {
-    return 0;
-  };
-  handler->base.on_popup_show =
-      [](cef_render_handler_t*, cef_browser_t*, int) {};
-  handler->base.on_popup_size =
-      [](cef_render_handler_t*, cef_browser_t*, const cef_rect_t*) {};
-  handler->base.on_paint =
-      [](cef_render_handler_t* self,
-         cef_browser_t*,
-         cef_paint_element_type_t type,
-         size_t,
-         const cef_rect_t*,
-         const void* buffer,
-         int width,
-         int height) {
-        auto* handler = reinterpret_cast<VerdeRenderHandler*>(self);
-        if (type != PET_VIEW || buffer == nullptr || width <= 0 || height <= 0) {
-          return;
-        }
-
-        const size_t pixel_len =
-            static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
-        handler->runtime->frame.resize(pixel_len);
-        std::memcpy(handler->runtime->frame.data(), buffer, pixel_len);
-        handler->runtime->frame_width = width;
-        handler->runtime->frame_height = height;
-        handler->runtime->frame_dirty = true;
-      };
-  handler->base.on_accelerated_paint =
-      [](cef_render_handler_t*,
-         cef_browser_t*,
-         cef_paint_element_type_t,
-         size_t,
-         const cef_rect_t*,
-         const cef_accelerated_paint_info_t*) {};
-  handler->base.start_dragging =
-      [](cef_render_handler_t*, cef_browser_t*, cef_drag_data_t*, cef_drag_operations_mask_t, int, int) -> int {
-    return 0;
-  };
-  handler->base.update_drag_cursor =
-      [](cef_render_handler_t*, cef_browser_t*, cef_drag_operations_mask_t) {};
-  handler->base.on_scroll_offset_changed =
-      [](cef_render_handler_t*, cef_browser_t*, double, double) {};
-  handler->base.on_ime_composition_range_changed =
-      [](cef_render_handler_t*, cef_browser_t*, const cef_range_t*, size_t, const cef_rect_t*) {};
-  handler->base.on_text_selection_changed =
-      [](cef_render_handler_t*, cef_browser_t*, const cef_string_t*, const cef_range_t*) {};
-  handler->base.on_virtual_keyboard_requested =
-      [](cef_render_handler_t*, cef_browser_t*, cef_text_input_mode_t) {};
-  return handler;
-}
-
-VerdeDisplayHandler* createDisplayHandler(VerdeRuntime* runtime) {
-  auto* handler = new VerdeDisplayHandler();
-  initializeRefCounted<VerdeDisplayHandler>(&handler->base);
-  handler->runtime = runtime;
-
-  handler->base.on_address_change =
-      [](cef_display_handler_t*, cef_browser_t*, cef_frame_t* frame, const cef_string_t* url) {
-        if (frame == nullptr || frame->is_main(frame) == 0) {
-          return;
-        }
-        pushEvent(VERDE_EVENT_NAVIGATED, toUtf8(url));
-      };
-  handler->base.on_title_change =
-      [](cef_display_handler_t*, cef_browser_t*, const cef_string_t* title) {
-        pushEvent(VERDE_EVENT_TITLE_CHANGED, toUtf8(title));
-      };
-  handler->base.on_console_message =
-      [](cef_display_handler_t*, cef_browser_t*, cef_log_severity_t, const cef_string_t*, const cef_string_t*, int) -> int {
-        return 0;
-      };
-  return handler;
-}
-
-VerdeLoadHandler* createLoadHandler(VerdeRuntime* runtime) {
-  auto* handler = new VerdeLoadHandler();
-  initializeRefCounted<VerdeLoadHandler>(&handler->base);
-  handler->runtime = runtime;
-
-  handler->base.on_loading_state_change =
-      [](cef_load_handler_t*, cef_browser_t*, int, int, int) {};
-  handler->base.on_load_start =
-      [](cef_load_handler_t*, cef_browser_t*, cef_frame_t*, cef_transition_type_t) {};
-  handler->base.on_load_end =
-      [](cef_load_handler_t*, cef_browser_t*, cef_frame_t*, int) {};
-  handler->base.on_load_error =
-      [](cef_load_handler_t*, cef_browser_t*, cef_frame_t*, cef_errorcode_t, const cef_string_t* error_text, const cef_string_t* failed_url) {
-        const std::string message = toUtf8(error_text) + " (" + toUtf8(failed_url) + ")";
-        pushFailure(message);
-      };
-  return handler;
-}
-
-VerdeLifeSpanHandler* createLifeSpanHandler(VerdeRuntime* runtime) {
-  auto* handler = new VerdeLifeSpanHandler();
-  initializeRefCounted<VerdeLifeSpanHandler>(&handler->base);
-  handler->runtime = runtime;
-
-  handler->base.on_before_popup =
-      [](cef_life_span_handler_t*,
-         cef_browser_t*,
-         cef_frame_t*,
-         int,
-         const cef_string_t*,
-         const cef_string_t*,
-         cef_window_open_disposition_t,
-         int,
-         const cef_popup_features_t*,
-         cef_window_info_t*,
-         cef_client_t**,
-         cef_browser_settings_t*,
-         cef_dictionary_value_t**,
-         int*) -> int {
-        return 1;
-      };
-  handler->base.on_before_popup_aborted =
-      [](cef_life_span_handler_t*, cef_browser_t*, int) {};
-  handler->base.on_before_dev_tools_popup =
-      [](cef_life_span_handler_t*, cef_browser_t*, cef_window_info_t*, cef_client_t**, cef_browser_settings_t*, cef_dictionary_value_t**, int*) {};
-  handler->base.on_after_created =
-      [](cef_life_span_handler_t* self, cef_browser_t* browser) {
-        auto* handler = reinterpret_cast<VerdeLifeSpanHandler*>(self);
-        handler->runtime->browser_create_pending = false;
-        if (handler->runtime->browser == nullptr) {
-          browser->base.add_ref(&browser->base);
-          handler->runtime->browser = browser;
-        }
-        pushEvent(VERDE_EVENT_OPENED, {});
-      };
-  handler->base.do_close =
-      [](cef_life_span_handler_t*, cef_browser_t*) -> int {
-        return 0;
-      };
-  handler->base.on_before_close =
-      [](cef_life_span_handler_t* self, cef_browser_t* browser) {
-        auto* handler = reinterpret_cast<VerdeLifeSpanHandler*>(self);
-        handler->runtime->browser_create_pending = false;
-        if (handler->runtime->browser == browser) {
-          browser->base.release(&browser->base);
-          handler->runtime->browser = nullptr;
-        }
-        pushEvent(VERDE_EVENT_CLOSED, {});
-      };
-  return handler;
-}
-
-VerdeClient* createClient() {
-  auto* client = new VerdeClient();
-  initializeRefCounted<VerdeClient>(&client->base);
-  client->runtime = &g_runtime;
-  client->render_handler = createRenderHandler(&g_runtime);
-  client->display_handler = createDisplayHandler(&g_runtime);
-  client->load_handler = createLoadHandler(&g_runtime);
-  client->life_span_handler = createLifeSpanHandler(&g_runtime);
-
-  client->base.get_render_handler =
-      [](cef_client_t* self) -> cef_render_handler_t* {
-        auto* client = reinterpret_cast<VerdeClient*>(self);
-        client->render_handler->base.base.add_ref(&client->render_handler->base.base);
-        return &client->render_handler->base;
-      };
-  client->base.get_display_handler =
-      [](cef_client_t* self) -> cef_display_handler_t* {
-        auto* client = reinterpret_cast<VerdeClient*>(self);
-        client->display_handler->base.base.add_ref(&client->display_handler->base.base);
-        return &client->display_handler->base;
-      };
-  client->base.get_load_handler =
-      [](cef_client_t* self) -> cef_load_handler_t* {
-        auto* client = reinterpret_cast<VerdeClient*>(self);
-        client->load_handler->base.base.add_ref(&client->load_handler->base.base);
-        return &client->load_handler->base;
-      };
-  client->base.get_life_span_handler =
-      [](cef_client_t* self) -> cef_life_span_handler_t* {
-        auto* client = reinterpret_cast<VerdeClient*>(self);
-        client->life_span_handler->base.base.add_ref(&client->life_span_handler->base.base);
-        return &client->life_span_handler->base;
-      };
-  client->base.on_process_message_received =
-      [](cef_client_t*, cef_browser_t*, cef_frame_t*, cef_process_id_t, cef_process_message_t*) -> int {
-        return 0;
-      };
-  return client;
-}
-
-}  // namespace
-
 extern "C" int verde_cef_execute_subprocess(int argc,
                                              const char* const* argv) {
   std::fprintf(stderr, "verde-cef: execute_subprocess start argc=%d\n", argc);
   std::fflush(stderr);
-  cef_main_args_t main_args{};
-  main_args.argc = argc;
-  main_args.argv = const_cast<char**>(argv);
-  const int result = cef_execute_process(&main_args, nullptr, nullptr);
+  CefMainArgs main_args(argc, const_cast<char**>(argv));
+  CefRefPtr<VerdeApp> app(new VerdeApp());
+  const int result = CefExecuteProcess(main_args, app, nullptr);
   std::fprintf(stderr, "verde-cef: execute_subprocess result=%d\n", result);
   std::fflush(stderr);
   return result;
@@ -559,49 +392,37 @@ extern "C" int verde_cef_initialize(int argc,
                locales_dir != nullptr ? locales_dir : "(null)");
   std::fflush(stderr);
 
-  cef_main_args_t main_args{};
-  main_args.argc = argc;
-  main_args.argv = const_cast<char**>(argv);
-
-  cef_settings_t settings{};
-  settings.size = sizeof(cef_settings_t);
-  const char* sandbox_binary = "/usr/lib/chromium/chrome-sandbox";
-  if (getenv("CHROME_DEVEL_SANDBOX") == nullptr && access(sandbox_binary, X_OK) == 0) {
-    setenv("CHROME_DEVEL_SANDBOX", sandbox_binary, 0);
-  }
-  settings.no_sandbox = 0;
-  settings.multi_threaded_message_loop = 0;
-  settings.external_message_pump = 0;
-  settings.windowless_rendering_enabled = 1;
-  settings.log_severity = LOGSEVERITY_DISABLE;
+  CefMainArgs main_args(argc, const_cast<char**>(argv));
+  CefSettings settings;
+  settings.no_sandbox = true;
+  settings.multi_threaded_message_loop = false;
+  settings.external_message_pump = false;
+  settings.windowless_rendering_enabled = true;
+  settings.log_severity = LOGSEVERITY_INFO;
   settings.background_color = CefColorSetARGB(255, 255, 255, 255);
+  const std::string cache_root =
+      std::string(resources_dir != nullptr ? resources_dir : "/tmp") + "/verde-cef-cache";
+  const std::string cache_path = cache_root + "/profile";
+  CefString(&settings.browser_subprocess_path) = subprocess_path != nullptr ? subprocess_path : "";
+  CefString(&settings.resources_dir_path) = resources_dir != nullptr ? resources_dir : "";
+  CefString(&settings.locales_dir_path) = locales_dir != nullptr ? locales_dir : "";
+  CefString(&settings.root_cache_path) = cache_root;
+  CefString(&settings.cache_path) = cache_path;
+  CefString(&settings.log_file) = "/tmp/verde-browser-cef.log";
 
-  settings.browser_subprocess_path = toCefString(subprocess_path);
-  settings.resources_dir_path = toCefString(resources_dir);
-  settings.locales_dir_path = toCefString(locales_dir);
+  CefRefPtr<VerdeApp> app(new VerdeApp());
+  const bool ok = CefInitialize(main_args, settings, app, nullptr);
 
-  struct sigaction old_trap{};
-  struct sigaction ignore_trap{};
-  ignore_trap.sa_handler = SIG_IGN;
-  sigemptyset(&ignore_trap.sa_mask);
-  ignore_trap.sa_flags = 0;
-  sigaction(SIGTRAP, &ignore_trap, &old_trap);
-  const int ok = cef_initialize(&main_args, &settings, nullptr, nullptr);
-  sigaction(SIGTRAP, &old_trap, nullptr);
-
-  cef_string_clear(&settings.browser_subprocess_path);
-  cef_string_clear(&settings.resources_dir_path);
-  cef_string_clear(&settings.locales_dir_path);
-
-  std::fprintf(stderr, "verde-cef: initialize result=%d\n", ok);
+  std::fprintf(stderr, "verde-cef: initialize result=%d\n", ok ? 1 : 0);
   std::fflush(stderr);
 
-  if (ok == 0) {
+  if (!ok) {
     return 0;
   }
 
   g_runtime.initialized = true;
-  g_runtime.client = createClient();
+  g_runtime.app = app;
+  g_runtime.client = new VerdeClient();
   return 1;
 }
 
@@ -614,28 +435,19 @@ extern "C" void verde_cef_shutdown() {
     return;
   }
 
-  if (g_runtime.browser != nullptr) {
-    auto* host = g_runtime.browser->get_host(g_runtime.browser);
-    if (host != nullptr) {
-      host->close_browser(host, 1);
-      host->base.release(&host->base);
-    }
-
-    for (int iteration = 0; iteration < 100 && g_runtime.browser != nullptr; ++iteration) {
-      cef_do_message_loop_work();
+  if (g_runtime.browser) {
+    g_runtime.browser->GetHost()->CloseBrowser(true);
+    for (int iteration = 0; iteration < 100 && g_runtime.browser; ++iteration) {
+      CefDoMessageLoopWork();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
-  cef_shutdown();
-
-  if (g_runtime.client != nullptr) {
-    g_runtime.client->base.base.release(&g_runtime.client->base.base);
-    g_runtime.client = nullptr;
-  }
-
   g_runtime.browser = nullptr;
-  g_runtime.browser_create_pending = false;
+  g_runtime.client = nullptr;
+  g_runtime.app = nullptr;
+  CefShutdown();
+
   g_runtime.frame.clear();
   g_runtime.events.clear();
   g_runtime.frame_width = 0;
@@ -648,17 +460,17 @@ extern "C" void verde_cef_do_message_loop_work() {
   if (!g_runtime.initialized) {
     return;
   }
-  cef_do_message_loop_work();
+  CefDoMessageLoopWork();
 }
 
 extern "C" int verde_cef_has_browser() {
-  return g_runtime.browser != nullptr ? 1 : 0;
+  return g_runtime.browser ? 1 : 0;
 }
 
 extern "C" int verde_cef_create_browser(int width,
                                          int height,
                                          const char* url) {
-  if (!g_runtime.initialized || g_runtime.client == nullptr) {
+  if (!g_runtime.initialized || !g_runtime.client) {
     pushFailure("CEF runtime is not initialized.");
     return 0;
   }
@@ -667,49 +479,42 @@ extern "C" int verde_cef_create_browser(int width,
                url != nullptr ? url : "(null)");
   std::fflush(stderr);
 
-  if (g_runtime.browser != nullptr) {
-    return 1;
-  }
-  if (g_runtime.browser_create_pending) {
+  if (g_runtime.browser) {
     return 1;
   }
 
   g_runtime.width = std::max(width, 1);
   g_runtime.height = std::max(height, 1);
 
-  cef_window_info_t window_info{};
-  window_info.size = sizeof(cef_window_info_t);
-  window_info.windowless_rendering_enabled = 1;
-  window_info.bounds.x = 0;
-  window_info.bounds.y = 0;
-  window_info.bounds.width = g_runtime.width;
-  window_info.bounds.height = g_runtime.height;
-  window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+  CefWindowInfo window_info;
+  window_info.SetAsWindowless(0);
+  window_info.bounds = CefRect(0, 0, g_runtime.width, g_runtime.height);
 
-  cef_browser_settings_t browser_settings{};
-  browser_settings.size = sizeof(cef_browser_settings_t);
+  CefBrowserSettings browser_settings;
   browser_settings.windowless_frame_rate = 30;
   browser_settings.background_color = CefColorSetARGB(255, 255, 255, 255);
 
-  cef_string_t initial_url = toCefString(url != nullptr ? url : "about:blank");
-  const int ok = cef_browser_host_create_browser(
-      &window_info,
-      &g_runtime.client->base,
-      &initial_url,
-      &browser_settings,
+  auto browser = CefBrowserHost::CreateBrowserSync(
+      window_info,
+      g_runtime.client,
+      url != nullptr ? url : "about:blank",
+      browser_settings,
       nullptr,
       nullptr);
-  cef_string_clear(&initial_url);
-
-  std::fprintf(stderr, "verde-cef: create_browser queued=%d\n", ok);
-  std::fflush(stderr);
-
-  if (ok == 0) {
+  if (!browser) {
     pushFailure("CEF failed to create the off-screen browser.");
     return 0;
   }
 
-  g_runtime.browser_create_pending = true;
+  if (!g_runtime.browser) {
+    g_runtime.browser = browser;
+  }
+  browser->GetHost()->WasResized();
+  browser->GetHost()->Invalidate(PET_VIEW);
+
+  std::fprintf(stderr, "verde-cef: create_browser ready id=%d\n",
+               browser->GetIdentifier());
+  std::fflush(stderr);
   return 1;
 }
 
@@ -717,52 +522,141 @@ extern "C" void verde_cef_resize_browser(int width, int height) {
   g_runtime.width = std::max(width, 1);
   g_runtime.height = std::max(height, 1);
 
-  if (g_runtime.browser == nullptr) {
+  if (!g_runtime.browser) {
     return;
   }
 
-  auto* host = g_runtime.browser->get_host(g_runtime.browser);
-  if (host == nullptr) {
-    return;
-  }
-
-  host->was_resized(host);
-  host->base.release(&host->base);
+  auto host = g_runtime.browser->GetHost();
+  host->NotifyScreenInfoChanged();
+  host->WasResized();
+  host->Invalidate(PET_VIEW);
 }
 
 extern "C" int verde_cef_navigate(const char* url) {
-  if (g_runtime.browser == nullptr || url == nullptr) {
+  if (!g_runtime.browser || url == nullptr) {
     return 0;
   }
-
-  auto* frame = g_runtime.browser->get_main_frame(g_runtime.browser);
-  if (frame == nullptr) {
+  auto frame = g_runtime.browser->GetMainFrame();
+  if (!frame) {
     return 0;
   }
-
-  cef_string_t target = toCefString(url);
-  frame->load_url(frame, &target);
-  cef_string_clear(&target);
-  frame->base.release(&frame->base);
+  frame->LoadURL(url);
   return 1;
 }
 
 extern "C" int verde_cef_eval(const char* js) {
-  if (g_runtime.browser == nullptr || js == nullptr) {
+  if (!g_runtime.browser || js == nullptr) {
+    return 0;
+  }
+  auto frame = g_runtime.browser->GetMainFrame();
+  if (!frame) {
+    return 0;
+  }
+  frame->ExecuteJavaScript(js, "app://verde-eval.js", 1);
+  return 1;
+}
+
+extern "C" int verde_cef_post_json(const char* json) {
+  if (!g_runtime.browser || json == nullptr) {
     return 0;
   }
 
-  auto* frame = g_runtime.browser->get_main_frame(g_runtime.browser);
-  if (frame == nullptr) {
+  std::string script =
+      "(function(){const payload=" + std::string(json) +
+      ";window.dispatchEvent(new MessageEvent('verde-host-message',{data:payload}));})();";
+  return verde_cef_eval(script.c_str());
+}
+
+extern "C" int verde_cef_send_mouse_move(double x,
+                                          double y,
+                                          unsigned int modifiers) {
+  if (!g_runtime.browser) {
     return 0;
   }
 
-  cef_string_t code = toCefString(js);
-  cef_string_t script_url = toCefString("app://verde-eval.js");
-  frame->execute_java_script(frame, &code, &script_url, 1);
-  cef_string_clear(&code);
-  cef_string_clear(&script_url);
-  frame->base.release(&frame->base);
+  sendFocusToBrowser();
+  const CefMouseEvent event = makeMouseEvent(x, y, modifiers);
+  g_runtime.browser->GetHost()->SendMouseMoveEvent(event, false);
+  return 1;
+}
+
+extern "C" int verde_cef_send_mouse_click(double x,
+                                           double y,
+                                           unsigned int button,
+                                           int mouse_up,
+                                           unsigned int modifiers) {
+  if (!g_runtime.browser || button == 0) {
+    return 0;
+  }
+
+  sendFocusToBrowser();
+  CefMouseEvent event = makeMouseEvent(x, y, modifiers);
+  event.modifiers |= mouseButtonFlag(button);
+  g_runtime.browser->GetHost()->SendMouseClickEvent(
+      event, mouseButtonType(button), mouse_up != 0, 1);
+  return 1;
+}
+
+extern "C" int verde_cef_send_mouse_wheel(double x,
+                                           double y,
+                                           double delta_x,
+                                           double delta_y,
+                                           unsigned int modifiers) {
+  if (!g_runtime.browser) {
+    return 0;
+  }
+
+  sendFocusToBrowser();
+  const CefMouseEvent event = makeMouseEvent(x, y, modifiers);
+  const int wheel_x = static_cast<int>(delta_x * 120.0);
+  const int wheel_y = static_cast<int>(-delta_y * 120.0);
+  g_runtime.browser->GetHost()->SendMouseWheelEvent(event, wheel_x, wheel_y);
+  return 1;
+}
+
+extern "C" int verde_cef_send_key_event(unsigned int key_code,
+                                         int pressed,
+                                         unsigned int modifiers) {
+  if (!g_runtime.browser || key_code == 0) {
+    return 0;
+  }
+
+  sendFocusToBrowser();
+
+  CefKeyEvent event;
+  event.type = pressed ? KEYEVENT_RAWKEYDOWN : KEYEVENT_KEYUP;
+  event.modifiers = eventFlagsFromModifiers(modifiers);
+  event.windows_key_code = static_cast<int>(key_code);
+  event.native_key_code = static_cast<int>(key_code);
+  event.character = static_cast<char16_t>(key_code);
+  event.unmodified_character = static_cast<char16_t>(key_code);
+  event.focus_on_editable_field = true;
+  g_runtime.browser->GetHost()->SendKeyEvent(event);
+  return 1;
+}
+
+extern "C" int verde_cef_send_text_input(const char* text,
+                                          unsigned int modifiers) {
+  if (!g_runtime.browser || text == nullptr || text[0] == '\0') {
+    return 0;
+  }
+
+  sendFocusToBrowser();
+
+  for (const unsigned char* cursor =
+           reinterpret_cast<const unsigned char*>(text);
+       *cursor != '\0'; cursor += 1) {
+    CefKeyEvent event;
+    event.type = KEYEVENT_CHAR;
+    event.modifiers = eventFlagsFromModifiers(modifiers);
+    event.windows_key_code = static_cast<int>(*cursor);
+    event.native_key_code = static_cast<int>(*cursor);
+    event.character = static_cast<char16_t>(*cursor);
+    event.unmodified_character = static_cast<char16_t>(*cursor);
+    event.focus_on_editable_field = true;
+    g_runtime.browser->GetHost()->SendKeyEvent(event);
+  }
+
   return 1;
 }
 

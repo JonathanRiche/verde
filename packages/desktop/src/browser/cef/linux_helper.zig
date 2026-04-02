@@ -1,16 +1,20 @@
 //! Linux CEF browser helper client used by the desktop app.
 
 const std = @import("std");
+const browser_input = @import("../input.zig");
 const browser_queue = @import("../queue.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("ipc.zig");
 
+const COMMAND_FD: std.posix.fd_t = 3;
+const EVENT_FD: std.posix.fd_t = 4;
+
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
     queue: *SharedQueue,
     frame: *SharedFrame,
-    stdout_file: std.fs.File,
+    event_file: std.fs.File,
 };
 
 const SharedQueue = struct {
@@ -19,8 +23,6 @@ const SharedQueue = struct {
 
     /// Releases any queued browser events received from the helper.
     fn deinit(self: *SharedQueue, allocator: std.mem.Allocator) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.events.deinit(allocator);
     }
 
@@ -49,10 +51,12 @@ const SharedFrame = struct {
 
     /// Releases the stored frame metadata.
     fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.path) |path| allocator.free(path);
-        self.* = .{};
+        self.path = null;
+        self.width = 0;
+        self.height = 0;
+        self.byte_len = 0;
+        self.dirty = false;
     }
 
     /// Replaces the latest dirty frame metadata published by the helper.
@@ -100,7 +104,8 @@ const SharedFrame = struct {
 /// Owns the Linux CEF helper process and translates its output back into desktop browser state.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
-    child: ?std.process.Child = null,
+    child_pid: ?std.posix.pid_t = null,
+    command_file: ?std.fs.File = null,
     queue: *SharedQueue,
     frame: *SharedFrame,
     frame_buffer: std.ArrayList(u8) = .empty,
@@ -128,19 +133,15 @@ pub const Controller = struct {
 
     /// Terminates the helper and releases queued events plus frame metadata.
     pub fn deinit(self: *Controller) void {
-        if (self.child) |_| {
+        if (self.child_pid != null) {
             self.sendCommand(.{ .kind = .quit }) catch {};
-            self.closeChildStdin();
+            self.closeCommandFile();
         }
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
         }
-        if (self.child) |*child| {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
-            self.child = null;
-        }
+        self.terminateChild();
         self.frame_buffer.deinit(self.allocator);
         self.queue.deinit(self.allocator);
         self.frame.deinit(self.allocator);
@@ -198,6 +199,75 @@ pub const Controller = struct {
         });
     }
 
+    /// Sends pointer motion, button, and wheel input into the helper-backed browser.
+    pub fn handleMouse(self: *Controller, event: browser_input.MouseEvent) !bool {
+        if (event.button) |button| {
+            try self.sendCommand(.{
+                .kind = .mouse_button,
+                .x = event.x,
+                .y = event.y,
+                .button = encodeMouseButton(button),
+                .pressed = event.pressed,
+                .ctrl = event.ctrl,
+                .shift = event.shift,
+                .alt = event.alt,
+                .super = event.super,
+            });
+            return true;
+        }
+        if (event.wheel_x != 0.0 or event.wheel_y != 0.0) {
+            try self.sendCommand(.{
+                .kind = .mouse_wheel,
+                .x = event.x,
+                .y = event.y,
+                .wheel_x = event.wheel_x,
+                .wheel_y = event.wheel_y,
+                .ctrl = event.ctrl,
+                .shift = event.shift,
+                .alt = event.alt,
+                .super = event.super,
+            });
+            return true;
+        }
+        try self.sendCommand(.{
+            .kind = .mouse_move,
+            .x = event.x,
+            .y = event.y,
+            .ctrl = event.ctrl,
+            .shift = event.shift,
+            .alt = event.alt,
+            .super = event.super,
+        });
+        return true;
+    }
+
+    /// Sends key and text input into the helper-backed browser.
+    pub fn handleKey(self: *Controller, event: browser_input.KeyEvent) !bool {
+        if (event.text) |text| {
+            if (text.len == 0) return false;
+            try self.sendCommand(.{
+                .kind = .text_input,
+                .payload = text,
+                .ctrl = event.ctrl,
+                .shift = event.shift,
+                .alt = event.alt,
+                .super = event.super,
+            });
+            return true;
+        }
+        if (event.key_code == 0) return false;
+        try self.sendCommand(.{
+            .kind = .key_input,
+            .key_code = event.key_code,
+            .pressed = event.pressed,
+            .ctrl = event.ctrl,
+            .shift = event.shift,
+            .alt = event.alt,
+            .super = event.super,
+        });
+        return true;
+    }
+
     /// Returns the next helper event, if one has been read already.
     pub fn popEvent(self: *Controller) ?browser_types.Event {
         return self.queue.pop();
@@ -213,21 +283,52 @@ pub const Controller = struct {
         const helper_path = try browserHelperPath(self.allocator, helper_name);
         defer self.allocator.free(helper_path);
 
-        var child = std.process.Child.init(&.{helper_path}, self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
+        const command_pipe = try std.posix.pipe();
+        errdefer {
+            std.posix.close(command_pipe[0]);
+            std.posix.close(command_pipe[1]);
+        }
+        const event_pipe = try std.posix.pipe();
+        errdefer {
+            std.posix.close(event_pipe[0]);
+            std.posix.close(event_pipe[1]);
+        }
 
-        const stdout_file = child.stdout.?;
-        self.child = child;
+        var env_map = try std.process.getEnvMap(self.allocator);
+        defer env_map.deinit();
+        try env_map.put("VERDE_CEF_CMD_FD", "3");
+        try env_map.put("VERDE_CEF_EVENT_FD", "4");
+
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const helper_path_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_path}, 0);
+        const helper_dir = std.fs.path.dirname(helper_path) orelse return error.BrowserUnavailable;
+        const helper_dir_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_dir}, 0);
+        const argv = try arena.allocSentinel(?[*:0]u8, 1, null);
+        argv[0] = helper_path_z.ptr;
+        const envp = try std.process.createEnvironFromMap(arena, &env_map, .{});
+
+        const child_pid = try std.posix.fork();
+        if (child_pid == 0) {
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp.ptr, command_pipe, event_pipe);
+        }
+
+        std.posix.close(command_pipe[0]);
+        std.posix.close(event_pipe[1]);
+
+        const command_file: std.fs.File = .{ .handle = command_pipe[1] };
+        const event_file: std.fs.File = .{ .handle = event_pipe[0] };
+
+        self.child_pid = child_pid;
+        self.command_file = command_file;
 
         const context = try self.allocator.create(ReaderContext);
         context.* = .{
             .allocator = self.allocator,
             .queue = self.queue,
             .frame = self.frame,
-            .stdout_file = stdout_file,
+            .event_file = event_file,
         };
         errdefer self.allocator.destroy(context);
 
@@ -236,24 +337,31 @@ pub const Controller = struct {
 
     // Serializes and sends one JSON-line command to the helper process.
     fn sendCommand(self: *Controller, command: ipc.Command) !void {
-        const child = self.child orelse return error.BrowserUnavailable;
-        const stdin_file = child.stdin orelse return error.BrowserUnavailable;
+        _ = self.child_pid orelse return error.BrowserUnavailable;
+        const command_file = self.command_file orelse return error.BrowserUnavailable;
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, command, .{});
         defer self.allocator.free(encoded);
 
         var write_buffer: [8 * 1024]u8 = undefined;
-        var writer = stdin_file.writer(&write_buffer);
+        var writer = command_file.writer(&write_buffer);
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
         try writer.interface.flush();
     }
 
-    // Closes the helper stdin pipe so the reader can observe EOF during teardown.
-    fn closeChildStdin(self: *Controller) void {
-        const child = if (self.child) |*child| child else return;
-        const stdin_file = child.stdin orelse return;
-        stdin_file.close();
-        child.stdin = null;
+    // Closes the command FIFO writer so the helper can observe EOF during teardown.
+    fn closeCommandFile(self: *Controller) void {
+        const command_file = self.command_file orelse return;
+        command_file.close();
+        self.command_file = null;
+    }
+
+    // Forces the helper process down after the reader thread has drained its event pipe.
+    fn terminateChild(self: *Controller) void {
+        const child_pid = self.child_pid orelse return;
+        std.posix.kill(child_pid, std.posix.SIG.TERM) catch {};
+        _ = std.posix.waitpid(child_pid, 0);
+        self.child_pid = null;
     }
 };
 
@@ -264,12 +372,22 @@ fn browserHelperPath(allocator: std.mem.Allocator, helper_name: []const u8) ![]u
     return try std.fs.path.join(allocator, &.{ exe_dir, helper_name });
 }
 
+// Maps the shared browser mouse button enum to the helper protocol integer.
+fn encodeMouseButton(button: browser_input.MouseButton) u8 {
+    return switch (button) {
+        .left => 1,
+        .middle => 2,
+        .right => 3,
+    };
+}
+
 /// Reads helper JSON-line events from stdout and stores them in shared state.
 fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
+    defer context.event_file.close();
 
     var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = context.stdout_file.reader(&read_buffer);
+    var reader = context.event_file.reader(&read_buffer);
 
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
@@ -291,6 +409,53 @@ fn helperReaderMain(context: *ReaderContext) !void {
         const event = try convertHelperEvent(context.allocator, parsed.value);
         try context.queue.push(context.allocator, event);
     }
+}
+
+// Replaces std.process.Child with a direct fork/exec path because Linux CEF hangs under the std child launcher.
+fn execHelperChild(
+    helper_dir_z: [*:0]const u8,
+    helper_path_z: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    command_pipe: [2]std.posix.fd_t,
+    event_pipe: [2]std.posix.fd_t,
+) noreturn {
+    std.posix.dup2(command_pipe[0], COMMAND_FD) catch std.posix.exit(126);
+    std.posix.dup2(event_pipe[1], EVENT_FD) catch std.posix.exit(126);
+
+    std.posix.close(command_pipe[0]);
+    std.posix.close(command_pipe[1]);
+    std.posix.close(event_pipe[0]);
+    std.posix.close(event_pipe[1]);
+    closeInheritedFileDescriptors();
+
+    var empty_signal_mask = std.posix.sigemptyset();
+    std.posix.sigprocmask(std.c.SIG.SETMASK, &empty_signal_mask, null);
+    restoreDefaultSignal(std.posix.SIG.PIPE);
+    std.posix.chdirZ(helper_dir_z) catch std.posix.exit(126);
+
+    std.posix.execveZ(helper_path_z, argv, envp) catch std.posix.exit(127);
+}
+
+// Closes unrelated desktop-app descriptors so the Linux CEF host starts in a shell-like fd state.
+fn closeInheritedFileDescriptors() void {
+    const limits = std.posix.getrlimit(.NOFILE) catch return;
+    const max_fd: usize = @intCast(@min(limits.cur, 4096));
+    var fd: usize = 5;
+    while (fd < max_fd) : (fd += 1) {
+        _ = std.c.close(@intCast(fd));
+    }
+}
+
+// Restores the default action for signals that the desktop app may have globally ignored.
+fn restoreDefaultSignal(signal_number: u8) void {
+    const action: std.posix.Sigaction = .{
+        .flags = 0,
+        .handler = .{ .handler = null },
+        .mask = std.posix.sigemptyset(),
+        .restorer = null,
+    };
+    std.posix.sigaction(signal_number, &action, null);
 }
 
 /// Converts one helper JSON event into the desktop browser event union.

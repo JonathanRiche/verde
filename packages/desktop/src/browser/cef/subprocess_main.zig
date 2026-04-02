@@ -29,6 +29,14 @@ const OwnedArgv = struct {
         return owned;
     }
 
+    /// Appends one Chromium switch when it is not already present on the command line.
+    fn appendSwitchIfMissing(self: *OwnedArgv, switch_name: []const u8) !void {
+        for (self.values.items) |arg| {
+            if (std.mem.eql(u8, std.mem.span(arg), switch_name)) return;
+        }
+        try self.values.append(self.allocator, try self.allocator.dupeZ(u8, switch_name));
+    }
+
     /// Releases the duplicated command line after CEF startup is done with it.
     fn deinit(self: *OwnedArgv) void {
         for (self.values.items) |value| {
@@ -183,12 +191,22 @@ pub fn main() !void {
     var argv = try OwnedArgv.init(allocator);
     defer argv.deinit();
 
-    const subprocess_result = browser_native.executeSubprocess(
-        @intCast(argv.values.items.len),
-        argv.values.items.ptr,
-    );
-    if (subprocess_result >= 0) {
-        std.process.exit(@intCast(subprocess_result));
+    if (!isChromiumSubprocess(argv.values.items)) {
+        try argv.appendSwitchIfMissing("--no-sandbox");
+        try argv.appendSwitchIfMissing("--no-zygote");
+        try argv.appendSwitchIfMissing("--single-process");
+        try argv.appendSwitchIfMissing("--disable-gpu");
+        try argv.appendSwitchIfMissing("--disable-gpu-compositing");
+    }
+
+    if (isChromiumSubprocess(argv.values.items)) {
+        const subprocess_result = browser_native.executeSubprocess(
+            @intCast(argv.values.items.len),
+            argv.values.items.ptr,
+        );
+        if (subprocess_result >= 0) {
+            std.process.exit(@intCast(subprocess_result));
+        }
     }
 
     var runtime_paths = try RuntimePaths.init(allocator);
@@ -239,6 +257,14 @@ pub fn main() !void {
         if (command_queue.isDrained()) std.process.exit(0);
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
+}
+
+// Chromium subprocesses are launched with a `--type=` command-line flag.
+fn isChromiumSubprocess(args: []const [*:0]const u8) bool {
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, std.mem.span(arg), "--type=")) return true;
+    }
+    return false;
 }
 
 /// Reads JSON-line helper commands from stdin and queues them for the browser loop.
