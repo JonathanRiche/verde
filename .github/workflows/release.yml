@@ -36,10 +36,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/fff/target
+          key: ${{ runner.os }}-${{ runner.arch }}-release-zig-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-release-zig-cache-
+
       - name: Install Zig
         shell: bash
         run: |
-          curl -fL "${{ matrix.zig_download }}" -o zig.tar.xz
+          curl -fL --retry 5 --retry-delay 2 "${{ matrix.zig_download }}" -o zig.tar.xz
           tar -xf zig.tar.xz
           echo "$PWD/${{ matrix.zig_dir }}" >> "$GITHUB_PATH"
 
@@ -70,7 +81,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          bash "${{ matrix.package_script }}" "${{ steps.version.outputs.value }}" dist
+          for attempt in 1 2 3; do
+            if bash "${{ matrix.package_script }}" "${{ steps.version.outputs.value }}" dist; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            echo "Retrying release build after transient failure (attempt $attempt)"
+            sleep 15
+          done
 
       - uses: actions/upload-artifact@v4
         with:

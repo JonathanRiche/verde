@@ -24,7 +24,7 @@ const MAX_FONT_SCALE: f32 = 2.0;
 const FONT_SCALE_STEP: f32 = 0.125;
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
-    .macos => @intCast(0x80087467),
+    .macos => @bitCast(@as(u32, 0x80087467)),
     else => @intCast(std.c.T.IOCSWINSZ),
 };
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
