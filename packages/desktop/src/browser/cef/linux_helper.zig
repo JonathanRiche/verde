@@ -375,10 +375,21 @@ pub const Controller = struct {
     fn terminateChild(self: *Controller) void {
         const child_pid = self.child_pid orelse return;
         const child_process_group = self.child_process_group orelse child_pid;
+        if (waitForChildExit(child_pid, 300)) {
+            self.child_pid = null;
+            self.child_process_group = null;
+            return;
+        }
         // Chromium may leave utility, zygote, or GPU workers behind unless we signal the full helper process group.
         std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
         _ = std.posix.waitpid(child_pid, 0);
-        std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
+        var grace_checks: u8 = 0;
+        while (grace_checks < 8 and processGroupAlive(child_process_group)) : (grace_checks += 1) {
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+        }
+        if (processGroupAlive(child_process_group)) {
+            std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
+        }
         self.child_pid = null;
         self.child_process_group = null;
     }
@@ -466,10 +477,34 @@ fn execHelperChild(
 fn closeInheritedFileDescriptors() void {
     const limits = std.posix.getrlimit(.NOFILE) catch return;
     const max_fd: usize = @intCast(@min(limits.cur, 4096));
-    var fd: usize = FRAME_FD_BASE + FRAME_SLOT_COUNT;
+    var fd: usize = 3;
     while (fd < max_fd) : (fd += 1) {
+        if (fd == COMMAND_FD or fd == EVENT_FD) continue;
+        if (fd >= FRAME_FD_BASE and fd < FRAME_FD_BASE + FRAME_SLOT_COUNT) continue;
         _ = std.c.close(@intCast(fd));
     }
+}
+
+// Checks whether any Chromium subprocesses are still alive in the helper process group.
+fn processGroupAlive(process_group: std.posix.pid_t) bool {
+    std.posix.kill(-process_group, 0) catch |err| {
+        return switch (err) {
+            error.ProcessNotFound => false,
+            else => true,
+        };
+    };
+    return true;
+}
+
+// Waits briefly for the helper process to exit on its own after receiving the quit command.
+fn waitForChildExit(child_pid: std.posix.pid_t, timeout_ms: u16) bool {
+    var waited_ms: u16 = 0;
+    while (waited_ms <= timeout_ms) : (waited_ms += 25) {
+        const result = std.posix.waitpid(child_pid, std.c.W.NOHANG);
+        if (result.pid == child_pid) return true;
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return false;
 }
 
 // Restores the default action for signals that the desktop app may have globally ignored.
