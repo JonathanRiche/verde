@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verde Inspector Playground</title>
+    <link rel="stylesheet" href="./index.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <article class="panel copy">
+          <p class="eyebrow">Playground</p>
+          <h1>Verde Inspector Overlay</h1>
+          <p class="lede">
+            Hover any element to see a DevTools-style highlight. Click to freeze
+            the selection and open the fixed prompt overlay that will later be
+            driven from the embedded browser in Verde.
+          </p>
+          <div class="actions">
+            <button class="primary">Launch prototype</button>
+            <button class="secondary">Compare variants</button>
+          </div>
+        </article>
+
+        <aside class="panel inspector-toolbar">
+          <div class="controls">
+            <button data-enable>Enable inspector</button>
+            <button data-disable>Disable inspector</button>
+          </div>
+          <div class="status" data-status>booting</div>
+          <p>
+            Keyboard: press <strong>Escape</strong> once to clear the current
+            selection, and again to disable the inspector completely.
+          </p>
+        </aside>
+      </section>
+
+      <section class="gallery">
+        <article class="panel card">
+          <div class="media" aria-hidden="true"></div>
+          <h2>Studio workspace</h2>
+          <p>Mixed text, images, spacing, and buttons give the inspector a realistic DOM surface.</p>
+        </article>
+        <article class="panel card">
+          <div class="media" aria-hidden="true"></div>
+          <h2>Layout stress test</h2>
+          <p>Use this card grid to verify nested box-model geometry and sibling selectors.</p>
+        </article>
+        <article class="panel card">
+          <div class="media" aria-hidden="true"></div>
+          <h2>Selection metadata</h2>
+          <p>Click any heading, paragraph, image, or button and inspect the emitted payload in the event feed.</p>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel specs">
+          <h2>What this prototype proves</h2>
+          <ul>
+            <li>The bundle can be built as a single browser-ready JS asset.</li>
+            <li>The overlay ignores its own DOM so hover targeting remains stable.</li>
+            <li>The inspector emits structured payloads for later Zig and CEF bridging.</li>
+            <li>The fixed prompt UI can coexist with page content at a top-level z-index.</li>
+          </ul>
+        </article>
+
+        <section class="panel feed">
+          <h2>Inspector events</h2>
+          <div data-log></div>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="./index.ts"></script>
+  </body>
+</html>

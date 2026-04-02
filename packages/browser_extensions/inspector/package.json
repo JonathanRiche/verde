@@ -1,0 +1,16 @@
+{
+  "name": "inspector",
+  "module": "src/entry-embed.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "bun build ./src/entry-embed.ts --outfile ./dist/inspector.js --target browser --format iife",
+    "build:playground": "bun build ./playground/index.html --outdir ./dist/playground --target browser",
+    "dev": "bun --hot ./dev-server.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}
