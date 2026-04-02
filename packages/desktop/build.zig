@@ -128,6 +128,18 @@ pub fn build(b: *std.Build) void {
             ),
         });
         b.getInstallStep().dependOn(&build_cef_helper.step);
+        const install_cef_helper = b.addInstallBinFile(
+            .{ .cwd_relative = "zig-out/bin/verde-browser-cef" },
+            "verde-browser-cef",
+        );
+        install_cef_helper.step.dependOn(&build_cef_helper.step);
+        b.getInstallStep().dependOn(&install_cef_helper.step);
+        const install_cef_process_helper = b.addInstallBinFile(
+            .{ .cwd_relative = "zig-out/bin/verde-browser-cef-process" },
+            "verde-browser-cef-process",
+        );
+        install_cef_process_helper.step.dependOn(&build_cef_helper.step);
+        b.getInstallStep().dependOn(&install_cef_process_helper.step);
         installLinuxCefRuntime(b, cef_sdk_path.?);
     }
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
