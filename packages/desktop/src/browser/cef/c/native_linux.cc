@@ -147,16 +147,32 @@ void appendSwitchIfMissing(CefRefPtr<CefCommandLine> command_line,
   }
 }
 
+void removeSwitchIfPresent(CefRefPtr<CefCommandLine> command_line,
+                           const char* name) {
+  if (!command_line || name == nullptr) {
+    return;
+  }
+  if (command_line->HasSwitch(name)) {
+    command_line->RemoveSwitch(name);
+  }
+}
+
 class VerdeApp final : public CefApp {
  public:
   void OnBeforeCommandLineProcessing(
       const CefString& process_type,
       CefRefPtr<CefCommandLine> command_line) override {
-    (void)process_type;
     appendSwitchIfMissing(command_line, "no-sandbox");
     appendSwitchIfMissing(command_line, "no-zygote");
     appendSwitchIfMissing(command_line, "disable-gpu");
     appendSwitchIfMissing(command_line, "disable-gpu-compositing");
+    if (!process_type.empty()) {
+      // Chromium 146 expects non-zygote children to remap the pseudonymization
+      // salt descriptor before startup. CEF's subprocess path in this embedder
+      // does not, so drop the switch to avoid the known descriptor-lookup
+      // warning until the runtime branch picks up the upstream fix.
+      removeSwitchIfPresent(command_line, "pseudonymization-salt-handle");
+    }
   }
 
  private:
