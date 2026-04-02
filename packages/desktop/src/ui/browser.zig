@@ -35,9 +35,33 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     renderPaneCanvas(state);
 }
 
+/// Draws an icon glyph centered within the last-placed item rect.
+fn drawCenteredIcon(icon: [:0]const u8, color: [4]f32) void {
+    const min = zgui.getItemRectMin();
+    const max = zgui.getItemRectMax();
+    const font = zgui.getFont();
+    const icon_size = zgui.getFontSize() * 0.5;
+    const size = zgui.calcTextSize(icon, .{});
+    const scaled_w = size[0] * 0.5;
+    const scaled_h = size[1] * 0.5;
+    zgui.getWindowDrawList().addTextExtendedUnformatted(
+        .{
+            min[0] + (max[0] - min[0] - scaled_w) * 0.5,
+            min[1] + (max[1] - min[1] - scaled_h) * 0.5,
+        },
+        zgui.colorConvertFloat4ToU32(color),
+        icon,
+        .{ .font = font, .font_size = icon_size },
+    );
+}
+
 /// Renders the compact browser toolbar with URL entry and primary actions.
 fn renderToolbar(state: *app_state.AppState) void {
+    const navigate_icon = "\u{f061}";
+    const inspect_icon = "\u{f245}";
+    const close_icon = "\u{f00d}";
     const toolbar_height = theme.scaledUi(52.0);
+    const button_size = theme.scaledUi(36.0);
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(10.0), theme.scaledUi(8.0) } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(18, 20, 25, 255) });
     defer {
@@ -60,26 +84,27 @@ fn renderToolbar(state: *app_state.AppState) void {
 
     const browser_state = state.browserState();
     const avail = zgui.getContentRegionAvail()[0];
-    const navigate_width = theme.scaledUi(40.0);
-    const inspect_width = theme.scaledUi(68.0);
-    const close_width = theme.scaledUi(36.0);
     const gap = theme.scaledUi(8.0);
-    const field_width = @max(avail - navigate_width - inspect_width - close_width - gap * 3.0, theme.scaledUi(180.0));
+    const field_width = @max(avail - button_size * 3.0 - gap * 3.0, theme.scaledUi(180.0));
 
+    const frame_pad_y = (button_size - zgui.getFontSize()) * 0.5;
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), frame_pad_y } });
     zgui.pushItemWidth(field_width);
     _ = zgui.inputTextWithHint("##browser-address", .{
         .hint = "https://example.com",
         .buf = browser_state.addressBuffer(),
     });
     zgui.popItemWidth();
+    zgui.popStyleVar(.{ .count = 1 });
 
     zgui.sameLine(.{ .spacing = gap });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) });
-    if (zgui.button("->", .{ .w = navigate_width, .h = theme.scaledUi(36.0) })) {
+    if (zgui.button("##browser-navigate", .{ .w = button_size, .h = button_size })) {
         state.navigateBrowserFromAddress();
     }
+    drawCenteredIcon(navigate_icon, theme.COLOR_WHITE);
     zgui.popStyleColor(.{ .count = 3 });
 
     zgui.sameLine(.{ .spacing = gap });
@@ -87,9 +112,10 @@ fn renderToolbar(state: *app_state.AppState) void {
     zgui.pushStyleColor4f(.{ .idx = .button, .c = if (state.isBrowserInspectorEnabled()) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (state.isBrowserInspectorEnabled()) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (state.isBrowserInspectorEnabled()) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
-    if (zgui.button("Inspect", .{ .w = inspect_width, .h = theme.scaledUi(36.0) })) {
+    if (zgui.button("##browser-inspect", .{ .w = button_size, .h = button_size })) {
         state.toggleBrowserInspector();
     }
+    drawCenteredIcon(inspect_icon, if (state.canUseBrowserInspector()) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE);
     if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
         _ = zgui.beginTooltip();
         if (state.canUseBrowserInspector()) {
@@ -106,9 +132,10 @@ fn renderToolbar(state: *app_state.AppState) void {
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
-    if (zgui.button("x", .{ .w = close_width, .h = theme.scaledUi(36.0) })) {
+    if (zgui.button("##browser-close", .{ .w = button_size, .h = button_size })) {
         state.closeBrowser();
     }
+    drawCenteredIcon(close_icon, theme.COLOR_WHITE);
     zgui.popStyleColor(.{ .count = 3 });
 }
 
