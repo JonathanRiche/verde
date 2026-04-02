@@ -29,6 +29,8 @@ zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
 zig build --release=safe -p ~/.local
+zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
+zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
 ```
 
 These root commands delegate into `packages/desktop/`.
@@ -42,6 +44,8 @@ zig build run -Dui-debug=true
 zig build test
 zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
+zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
+zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
 ```
 
 What these do:
@@ -65,6 +69,37 @@ zig build --release=safe -p /usr/local
 ```
 
 The `/usr/local` example requires write access to that prefix.
+
+## Linux browser pane
+
+The in-app browser pane on Linux currently uses CEF. If you want the installed app to include the CEF browser path, you must pass `-Dcef-sdk-path=...` at build/install time.
+
+Without that flag:
+
+- the app still builds and installs
+- the Linux-specific CEF helper binaries are not built
+- the app falls back to the non-CEF browser backend
+
+With that flag:
+
+- the Linux CEF helper binaries are built and installed into `zig-out/bin`
+- the required CEF runtime files are copied into the install prefix
+- the in-app browser pane uses the CEF path
+
+Typical Linux run:
+
+```bash
+zig build run -Dcef-sdk-path=/tmp/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+```
+
+Typical Linux install to `~/.local`:
+
+```bash
+zig build --release=safe -p ~/.local \
+  -Dcef-sdk-path=/tmp/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+```
+
+You do not need `VERDE_OPEN_BROWSER_ON_START=1` for normal use. That env var is only useful for smoke-testing the browser pane during startup.
 
 On Linux, the install step also writes:
 
