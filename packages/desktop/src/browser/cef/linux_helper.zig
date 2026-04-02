@@ -465,12 +465,19 @@ fn closeInheritedFileDescriptors() void {
 
 // Restores the default action for signals that the desktop app may have globally ignored.
 fn restoreDefaultSignal(signal_number: u8) void {
-    const action: std.posix.Sigaction = .{
-        .flags = 0,
-        .handler = .{ .handler = null },
-        .mask = std.posix.sigemptyset(),
-        .restorer = null,
-    };
+    const action: std.posix.Sigaction = if (@hasField(std.posix.Sigaction, "restorer"))
+        .{
+            .flags = 0,
+            .handler = .{ .handler = null },
+            .mask = std.posix.sigemptyset(),
+            .restorer = null,
+        }
+    else
+        .{
+            .flags = 0,
+            .handler = .{ .handler = null },
+            .mask = std.posix.sigemptyset(),
+        };
     std.posix.sigaction(signal_number, &action, null);
 }
 
