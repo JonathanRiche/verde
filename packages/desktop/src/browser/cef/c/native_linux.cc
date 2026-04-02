@@ -154,6 +154,9 @@ class VerdeApp final : public CefApp {
       CefRefPtr<CefCommandLine> command_line) override {
     (void)process_type;
     appendSwitchIfMissing(command_line, "no-sandbox");
+    appendSwitchIfMissing(command_line, "no-zygote");
+    appendSwitchIfMissing(command_line, "disable-gpu");
+    appendSwitchIfMissing(command_line, "disable-gpu-compositing");
   }
 
  private:
@@ -341,6 +344,18 @@ void sendFocusToBrowser() {
   host->SetFocus(true);
 }
 
+void pumpMessageLoopFor(std::chrono::milliseconds slice,
+                        int iterations,
+                        bool stop_when_browser_closes) {
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    CefDoMessageLoopWork();
+    if (stop_when_browser_closes && !g_runtime.browser) {
+      return;
+    }
+    std::this_thread::sleep_for(slice);
+  }
+}
+
 }  // namespace
 
 extern "C" int open(const char* pathname, int flags, ...) {
@@ -450,11 +465,11 @@ extern "C" void verde_cef_shutdown() {
 
   if (g_runtime.browser) {
     g_runtime.browser->GetHost()->CloseBrowser(true);
-    for (int iteration = 0; iteration < 100 && g_runtime.browser; ++iteration) {
-      CefDoMessageLoopWork();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    pumpMessageLoopFor(std::chrono::milliseconds(10), 100, true);
   }
+
+  // Give late close notifications and background cleanup work one last chance to run before teardown.
+  pumpMessageLoopFor(std::chrono::milliseconds(5), 20, false);
 
   g_runtime.browser = nullptr;
   g_runtime.client = nullptr;
