@@ -59,6 +59,12 @@ User-local install:
 zig build --release=safe -p ~/.local
 ```
 
+Linux source install with the embedded CEF browser pane:
+
+```bash
+bash ./scripts/release/install-linux-local-cef.sh
+```
+
 System-wide install:
 
 ```bash

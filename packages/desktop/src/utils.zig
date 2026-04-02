@@ -255,12 +255,71 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
 }
 
 pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
-    const argv = detectLinuxPicker(start_path) orelse return error.FolderPickerUnavailable;
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 16 * 1024,
-    });
+    const result = blk: {
+        if (commandExists("zenity")) {
+            break :blk try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "zenity",
+                    "--file-selection",
+                    "--directory",
+                    "--filename",
+                    start_path,
+                    "--title",
+                    "Select project folder",
+                },
+                .max_output_bytes = 16 * 1024,
+            });
+        }
+
+        if (commandExists("kdialog")) {
+            break :blk try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "kdialog",
+                    "--getexistingdirectory",
+                    start_path,
+                    "--title",
+                    "Select project folder",
+                },
+                .max_output_bytes = 16 * 1024,
+            });
+        }
+
+        if (commandExists("yad")) {
+            break :blk try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "yad",
+                    "--file-selection",
+                    "--directory",
+                    "--filename",
+                    start_path,
+                    "--title",
+                    "Select project folder",
+                },
+                .max_output_bytes = 16 * 1024,
+            });
+        }
+
+        if (commandExists("qarma")) {
+            break :blk try std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "qarma",
+                    "--file-selection",
+                    "--directory",
+                    "--filename",
+                    start_path,
+                    "--title",
+                    "Select project folder",
+                },
+                .max_output_bytes = 16 * 1024,
+            });
+        }
+
+        return error.FolderPickerUnavailable;
+    };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
@@ -370,56 +429,6 @@ pub fn runSendWorker(
         .provider_thread_id = result.thread_id,
         .reply_text = result.reply_text,
     };
-}
-
-fn detectLinuxPicker(start_path: []const u8) ?[]const []const u8 {
-    if (commandExists("zenity")) {
-        return &.{
-            "zenity",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        };
-    }
-
-    if (commandExists("kdialog")) {
-        return &.{
-            "kdialog",
-            "--getexistingdirectory",
-            start_path,
-            "--title",
-            "Select project folder",
-        };
-    }
-
-    if (commandExists("yad")) {
-        return &.{
-            "yad",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        };
-    }
-
-    if (commandExists("qarma")) {
-        return &.{
-            "qarma",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        };
-    }
-
-    return null;
 }
 
 fn escapeAppleScriptString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
