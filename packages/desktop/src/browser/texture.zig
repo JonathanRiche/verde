@@ -20,6 +20,7 @@ extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
 extern fn glPixelStorei(pname: c_uint, param: c_int) void;
 extern fn glTexParameteri(target: c_uint, pname: c_uint, param: c_int) void;
 extern fn glTexImage2D(target: c_uint, level: c_int, internalformat: c_int, width: c_int, height: c_int, border: c_int, format: c_uint, type_: c_uint, pixels: ?*const anyopaque) void;
+extern fn glTexSubImage2D(target: c_uint, level: c_int, xoffset: c_int, yoffset: c_int, width: c_int, height: c_int, format: c_uint, type_: c_uint, pixels: ?*const anyopaque) void;
 
 /// Tracks the OpenGL texture that backs one browser pane.
 pub const PaneTexture = struct {
@@ -71,7 +72,7 @@ pub const PaneTexture = struct {
         try self.uploadPixels(width, height, GL_BGRA, pixels);
     }
 
-    // Centralizes the shared OpenGL upload path so RGBA and BGRA frames stay in sync.
+    // Reuses the existing texture storage when the browser viewport size stays stable.
     fn uploadPixels(self: *PaneTexture, width: u32, height: u32, format: c_uint, pixels: []const u8) !void {
         if (self.texture_id == 0) {
             var textures = [_]c_uint{0};
@@ -86,17 +87,31 @@ pub const PaneTexture = struct {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA,
-            @intCast(width),
-            @intCast(height),
-            0,
-            format,
-            GL_UNSIGNED_BYTE,
-            pixels.ptr,
-        );
+        if (self.width != width or self.height != height) {
+            glTexImage2D(
+                GL_TEXTURE_2D,
+                0,
+                GL_RGBA,
+                @intCast(width),
+                @intCast(height),
+                0,
+                format,
+                GL_UNSIGNED_BYTE,
+                pixels.ptr,
+            );
+        } else {
+            glTexSubImage2D(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                @intCast(width),
+                @intCast(height),
+                format,
+                GL_UNSIGNED_BYTE,
+                pixels.ptr,
+            );
+        }
         glBindTexture(GL_TEXTURE_2D, 0);
         self.update(self.texture_id, width, height, true);
     }
