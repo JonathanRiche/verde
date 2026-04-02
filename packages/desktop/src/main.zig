@@ -143,7 +143,7 @@ pub fn main() !void {
 
     var running = true;
     while (running) {
-        running = processEvents(&state, &keyboard);
+        running = processEvents(window, &state, &keyboard);
         state.pollPicker();
         state.pollSend();
         state.pollBrowser();
@@ -251,19 +251,57 @@ fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
 }
 
-fn processEvents(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) bool {
+// Keeps SDL mouse coordinates in the same framebuffer space used by the ImGui root layout.
+fn normalizeMouseEventCoordinates(window: *sdl.Window, event: *sdl.Event) void {
+    var logical_width: c_int = 0;
+    var logical_height: c_int = 0;
+    window.getSize(&logical_width, &logical_height) catch return;
+
+    var pixel_width: c_int = 0;
+    var pixel_height: c_int = 0;
+    getWindowSizeInPixels(window, &pixel_width, &pixel_height);
+
+    if (logical_width <= 0 or logical_height <= 0 or pixel_width <= 0 or pixel_height <= 0) return;
+
+    const scale_x = @as(f32, @floatFromInt(pixel_width)) / @as(f32, @floatFromInt(logical_width));
+    const scale_y = @as(f32, @floatFromInt(pixel_height)) / @as(f32, @floatFromInt(logical_height));
+    if (@abs(scale_x - 1.0) < 0.01 and @abs(scale_y - 1.0) < 0.01) return;
+
+    switch (event.type) {
+        .mouse_motion => {
+            event.motion.x *= scale_x;
+            event.motion.y *= scale_y;
+            event.motion.xrel *= scale_x;
+            event.motion.yrel *= scale_y;
+        },
+        .mouse_button_down, .mouse_button_up => {
+            event.button.x *= scale_x;
+            event.button.y *= scale_y;
+        },
+        .mouse_wheel => {
+            event.wheel.mouse_x *= scale_x;
+            event.wheel.mouse_y *= scale_y;
+        },
+        else => {},
+    }
+}
+
+fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) bool {
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
         if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state))) {
             return true;
         }
+        normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(state, keyboard, &event)) return false;
     } else {
+        normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(state, keyboard, &event)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
+        normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(state, keyboard, &event)) return false;
     }
 
