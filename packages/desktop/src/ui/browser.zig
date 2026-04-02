@@ -108,7 +108,12 @@ fn renderAddressBar(state: *app_state.AppState) void {
 fn renderPaneCanvas(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const avail = zgui.getContentRegionAvail();
-    const canvas_height = theme.clampf(avail[1] * 0.42, theme.scaledUi(120.0), theme.scaledUi(220.0));
+    const reserved_detail_height = theme.scaledUi(180.0);
+    const canvas_height = theme.clampf(
+        avail[1] * 0.68,
+        theme.scaledUi(180.0),
+        @max(avail[1] - reserved_detail_height, theme.scaledUi(180.0)),
+    );
     const width_px: u32 = @intFromFloat(@max(avail[0], 1.0));
     const height_px: u32 = @intFromFloat(@max(canvas_height, 1.0));
     browser_state.controller.resizePane(width_px, height_px) catch {};
