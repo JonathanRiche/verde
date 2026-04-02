@@ -119,21 +119,15 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(browser_helper);
     }
     if (cef_sdk_configured) {
-        const cef_helper = b.addExecutable(.{
-            .name = "verde-browser-cef",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/browser/cef/subprocess_main.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "build_options", .module = build_options.createModule() },
-                },
-            }),
+        const build_cef_helper = b.addSystemCommand(&.{
+            "bash",
+            "-lc",
+            b.fmt(
+                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process -j$(nproc)",
+                .{cef_sdk_path.?},
+            ),
         });
-        cef_helper.linkLibC();
-        configureLinuxCefBinary(b, cef_helper, cef_sdk_path.?);
-        cef_helper.root_module.addRPathSpecial("$ORIGIN");
-        b.installArtifact(cef_helper);
+        b.getInstallStep().dependOn(&build_cef_helper.step);
         installLinuxCefRuntime(b, cef_sdk_path.?);
     }
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);

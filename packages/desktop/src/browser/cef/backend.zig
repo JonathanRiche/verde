@@ -191,18 +191,20 @@ pub const Backend = struct {
         });
     }
 
-    /// Reports that direct pane pointer input is not wired on the CEF backend yet.
+    /// Forwards direct pane pointer input into the active native helper runtime.
     pub fn handleMouse(self: *Backend, event: browser_input.MouseEvent) !bool {
-        _ = self;
-        _ = event;
-        return false;
+        try self.ensureRuntime();
+        if (!self.usingNativeRuntime()) return false;
+        const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
+        return try helper.handleMouse(event);
     }
 
-    /// Reports that direct pane keyboard input is not wired on the CEF backend yet.
+    /// Forwards direct pane keyboard input into the active native helper runtime.
     pub fn handleKey(self: *Backend, event: browser_input.KeyEvent) !bool {
-        _ = self;
-        _ = event;
-        return false;
+        try self.ensureRuntime();
+        if (!self.usingNativeRuntime()) return false;
+        const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
+        return try helper.handleKey(event);
     }
 
     /// Returns the next pending browser event, pumping the native helper first when needed.

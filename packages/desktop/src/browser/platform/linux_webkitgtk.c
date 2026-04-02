@@ -56,6 +56,7 @@ static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
 }
 
 static void verde_browser_linux_request_snapshot(struct verde_browser_linux *browser);
+static void verde_browser_linux_run_internal_script(struct verde_browser_linux *browser, const char *script);
 
 static void verde_browser_linux_on_uri_changed(GObject *object, GParamSpec *pspec, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
@@ -233,6 +234,35 @@ static void verde_browser_linux_on_eval_finished(GObject *object, GAsyncResult *
     g_free(payload);
     g_object_unref(value);
     verde_browser_linux_request_snapshot(browser);
+}
+
+static void verde_browser_linux_on_internal_script_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    if (error != NULL) {
+        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, error->message);
+        g_error_free(error);
+        return;
+    }
+    if (value != NULL) {
+        g_object_unref(value);
+    }
+    verde_browser_linux_request_snapshot(browser);
+}
+
+static void verde_browser_linux_run_internal_script(struct verde_browser_linux *browser, const char *script) {
+    if (browser == NULL || script == NULL) return;
+    webkit_web_view_evaluate_javascript(
+        browser->web_view,
+        script,
+        -1,
+        NULL,
+        "app://verde-browser-input.js",
+        NULL,
+        verde_browser_linux_on_internal_script_finished,
+        browser
+    );
 }
 
 struct verde_browser_linux *verde_browser_linux_create(void) {
@@ -429,134 +459,73 @@ int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **p
 
 int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
     if (browser == NULL) return 0;
-    GdkWindow *target = verde_browser_linux_target_window(browser);
-    if (target == NULL) return 0;
-
-    browser->modifier_state = verde_browser_linux_gdk_modifiers(modifiers);
-    GdkEvent *event = gdk_event_new(GDK_MOTION_NOTIFY);
-    event->motion.window = g_object_ref(target);
-    event->motion.send_event = TRUE;
-    event->motion.time = GDK_CURRENT_TIME;
-    event->motion.x = x;
-    event->motion.y = y;
-    event->motion.x_root = x;
-    event->motion.y_root = y;
-    event->motion.state = browser->modifier_state;
-    verde_browser_linux_attach_device(browser, event, FALSE);
-    return verde_browser_linux_dispatch_event(GTK_WIDGET(browser->web_view), event) ? 1 : 1;
+    char *script = g_strdup_printf(
+        "(function(){const x=%f;const y=%f;const target=document.elementFromPoint(x,y);if(!target)return false;target.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y}));return true;})()",
+        x,
+        y
+    );
+    verde_browser_linux_run_internal_script(browser, script);
+    g_free(script);
+    return 1;
 }
 
 int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double x, double y, unsigned int button, int down, unsigned int modifiers) {
     if (browser == NULL || button == 0) return 0;
-    GdkWindow *target = verde_browser_linux_target_window(browser);
-    if (target == NULL) return 0;
-
-    browser->modifier_state = verde_browser_linux_gdk_modifiers(modifiers);
-    if (down != 0) {
-        if (button == 1) browser->modifier_state |= GDK_BUTTON1_MASK;
-        if (button == 2) browser->modifier_state |= GDK_BUTTON2_MASK;
-        if (button == 3) browser->modifier_state |= GDK_BUTTON3_MASK;
-        gtk_widget_grab_focus(GTK_WIDGET(browser->web_view));
-    }
-
-    GdkEvent *event = gdk_event_new(down != 0 ? GDK_BUTTON_PRESS : GDK_BUTTON_RELEASE);
-    event->button.window = g_object_ref(target);
-    event->button.send_event = TRUE;
-    event->button.time = GDK_CURRENT_TIME;
-    event->button.x = x;
-    event->button.y = y;
-    event->button.x_root = x;
-    event->button.y_root = y;
-    event->button.state = browser->modifier_state;
-    event->button.button = button;
-    verde_browser_linux_attach_device(browser, event, FALSE);
-    const int result = verde_browser_linux_dispatch_event(GTK_WIDGET(browser->web_view), event) ? 1 : 1;
-
-    if (down == 0) {
-        if (button == 1) browser->modifier_state &= ~GDK_BUTTON1_MASK;
-        if (button == 2) browser->modifier_state &= ~GDK_BUTTON2_MASK;
-        if (button == 3) browser->modifier_state &= ~GDK_BUTTON3_MASK;
-    }
-    verde_browser_linux_request_snapshot(browser);
-    return result;
+    const char *event_name = down != 0 ? "mousedown" : "mouseup";
+    const gboolean emit_click = down == 0 && button == 1;
+    char *script = g_strdup_printf(
+        "(function(){const x=%f;const y=%f;const button=%u;const target=document.elementFromPoint(x,y);if(!target)return false;const interactive=(target.closest&&target.closest('a[href],button,input,textarea,select,label,summary,[contenteditable=\"true\"],[tabindex]'))||target;if(interactive&&interactive.focus)interactive.focus({preventScroll:true});interactive.dispatchEvent(new MouseEvent('%s',{bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:button-1,buttons:button===1?1:(button===2?4:2)}));%s return true;})()",
+        x,
+        y,
+        button,
+        event_name,
+        emit_click ? "interactive.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,button:0,buttons:0}));if(typeof interactive.click==='function')interactive.click();" : ""
+    );
+    verde_browser_linux_run_internal_script(browser, script);
+    g_free(script);
+    (void)modifiers;
+    return 1;
 }
 
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, unsigned int modifiers) {
     if (browser == NULL) return 0;
-    GdkWindow *target = verde_browser_linux_target_window(browser);
-    if (target == NULL) return 0;
-
-    browser->modifier_state = verde_browser_linux_gdk_modifiers(modifiers);
-    GdkEvent *event = gdk_event_new(GDK_SCROLL);
-    event->scroll.window = g_object_ref(target);
-    event->scroll.send_event = TRUE;
-    event->scroll.time = GDK_CURRENT_TIME;
-    event->scroll.x = x;
-    event->scroll.y = y;
-    event->scroll.x_root = x;
-    event->scroll.y_root = y;
-    event->scroll.state = browser->modifier_state;
-    event->scroll.direction = GDK_SCROLL_SMOOTH;
-    event->scroll.delta_x = delta_x;
-    event->scroll.delta_y = delta_y;
-    verde_browser_linux_attach_device(browser, event, FALSE);
-    verde_browser_linux_request_snapshot(browser);
-    return verde_browser_linux_dispatch_event(GTK_WIDGET(browser->web_view), event) ? 1 : 1;
+    char *script = g_strdup_printf(
+        "(function(){const x=%f;const y=%f;const dx=%f;const dy=%f;const target=document.elementFromPoint(x,y)||document.scrollingElement||document.documentElement||document.body;const deltaX=-dx*96;const deltaY=-dy*96;const wheel=new WheelEvent('wheel',{bubbles:true,cancelable:true,composed:true,view:window,clientX:x,clientY:y,deltaX,deltaY});target.dispatchEvent(wheel);if(wheel.defaultPrevented)return true;function isScrollable(node){if(!node||node===document.body||node===document.documentElement)return false;const style=getComputedStyle(node);const overflowY=style.overflowY||'';const overflowX=style.overflowX||'';const canScrollY=(overflowY==='auto'||overflowY==='scroll'||overflowY==='overlay')&&node.scrollHeight>node.clientHeight+1;const canScrollX=(overflowX==='auto'||overflowX==='scroll'||overflowX==='overlay')&&node.scrollWidth>node.clientWidth+1;return canScrollY||canScrollX;}let scroller=target;while(scroller&&scroller!==document.body&&scroller!==document.documentElement&&!isScrollable(scroller)){scroller=scroller.parentElement;}if(!scroller||scroller===document.body||scroller===document.documentElement){scroller=document.scrollingElement||document.documentElement||document.body;}if(scroller&&typeof scroller.scrollBy==='function'){scroller.scrollBy({left:deltaX,top:deltaY,behavior:'auto'});}else if(typeof window.scrollBy==='function'){window.scrollBy(deltaX,deltaY);}return true;})()",
+        x,
+        y,
+        delta_x,
+        delta_y
+    );
+    verde_browser_linux_run_internal_script(browser, script);
+    g_free(script);
+    (void)modifiers;
+    return 1;
 }
 
 int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned int key_code, int down, unsigned int modifiers) {
     if (browser == NULL || key_code == 0) return 0;
-    GdkWindow *target = verde_browser_linux_target_window(browser);
-    if (target == NULL) return 0;
-
-    browser->modifier_state = verde_browser_linux_gdk_modifiers(modifiers);
-    gtk_widget_grab_focus(GTK_WIDGET(browser->web_view));
-
-    GdkEvent *event = gdk_event_new(down != 0 ? GDK_KEY_PRESS : GDK_KEY_RELEASE);
-    event->key.window = g_object_ref(target);
-    event->key.send_event = TRUE;
-    event->key.time = GDK_CURRENT_TIME;
-    event->key.state = browser->modifier_state;
-    event->key.keyval = verde_browser_linux_keyval_from_code(key_code);
-    event->key.length = 0;
-    event->key.string = NULL;
-    event->key.hardware_keycode = 0;
-    event->key.group = 0;
-    event->key.is_modifier = FALSE;
-    verde_browser_linux_attach_device(browser, event, TRUE);
-    verde_browser_linux_request_snapshot(browser);
-    return verde_browser_linux_dispatch_event(GTK_WIDGET(browser->web_view), event) ? 1 : 1;
+    const char *event_name = down != 0 ? "keydown" : "keyup";
+    char *script = g_strdup_printf(
+        "(function(){const code=%u;const eventName='%s';const el=document.activeElement||document.body;let key='';if(code===0xff0d)key='Enter';else if(code===0xff08)key='Backspace';else if(code===0xff09)key='Tab';else if(code===0xff1b)key='Escape';else if(code===0xffff)key='Delete';else key=String.fromCharCode(code);const evt=new KeyboardEvent(eventName,{key,bubbles:true,cancelable:true});el.dispatchEvent(evt);if(eventName!=='keydown'||evt.defaultPrevented)return true;if((el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)&&key==='Backspace'){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start>0){el.value=el.value.slice(0,start-1)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start-1,start-1);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return true;}if(key==='Enter'){if(el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;el.value=el.value.slice(0,start)+'\\n'+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start+1,start+1);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:'\\n',inputType:'insertLineBreak'}));return true;}if(el instanceof HTMLInputElement&&el.form&&typeof el.form.requestSubmit==='function'){el.form.requestSubmit();return true;}}return true;})()",
+        key_code,
+        event_name
+    );
+    verde_browser_linux_run_internal_script(browser, script);
+    g_free(script);
+    (void)modifiers;
+    return 1;
 }
 
 int verde_browser_linux_text_input(struct verde_browser_linux *browser, const char *text, unsigned int modifiers) {
     if (browser == NULL || text == NULL || text[0] == '\0') return 0;
-    GdkWindow *target = verde_browser_linux_target_window(browser);
-    if (target == NULL) return 0;
-
-    browser->modifier_state = verde_browser_linux_gdk_modifiers(modifiers);
-    gtk_widget_grab_focus(GTK_WIDGET(browser->web_view));
-
-    const char *cursor = text;
-    while (*cursor != '\0') {
-        gunichar codepoint = g_utf8_get_char(cursor);
-        const gchar *next = g_utf8_next_char(cursor);
-        const gint byte_len = (gint)(next - cursor);
-        GdkEvent *event = gdk_event_new(GDK_KEY_PRESS);
-        event->key.window = g_object_ref(target);
-        event->key.send_event = TRUE;
-        event->key.time = GDK_CURRENT_TIME;
-        event->key.state = browser->modifier_state;
-        event->key.keyval = gdk_unicode_to_keyval(codepoint);
-        event->key.length = byte_len;
-        event->key.string = g_strndup(cursor, byte_len);
-        event->key.hardware_keycode = 0;
-        event->key.group = 0;
-        event->key.is_modifier = FALSE;
-        verde_browser_linux_attach_device(browser, event, TRUE);
-        verde_browser_linux_dispatch_event(GTK_WIDGET(browser->web_view), event);
-        cursor = next;
-    }
-    verde_browser_linux_request_snapshot(browser);
+    char *escaped = g_strescape(text, NULL);
+    char *script = g_strdup_printf(
+        "(function(){const text='%s';const el=document.activeElement;if(!el)return false;if(el.isContentEditable){document.execCommand('insertText',false,text);return true;}if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;const before=el.value.slice(0,start);const after=el.value.slice(end);el.value=before+text+after;const next=start+text.length;if(el.setSelectionRange)el.setSelectionRange(next,next);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'}));return true;}el.dispatchEvent(new KeyboardEvent('keypress',{key:text,bubbles:true}));return true;})()",
+        escaped
+    );
+    verde_browser_linux_run_internal_script(browser, script);
+    g_free(script);
+    g_free(escaped);
     return 1;
 }
 
