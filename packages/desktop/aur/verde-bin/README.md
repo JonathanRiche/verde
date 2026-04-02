@@ -19,6 +19,5 @@ makepkg --printsrcinfo > .SRCINFO
 
 - The package installs the bundled runtime under `/usr/lib/verde`.
 - `/usr/bin/verde` is a thin wrapper that launches `/usr/lib/verde/verde`.
-- Upstream currently does not ship a top-level `LICENSE` file, so the package
-  uses `license=('custom:upstream-unlicensed')`. Update that once upstream adds
-  a canonical license file.
+- Upstream ships a top-level MIT license, which the package installs to
+  `/usr/share/licenses/verde-bin/LICENSE`.
