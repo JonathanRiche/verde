@@ -594,6 +594,7 @@ pub const AppState = struct {
     browser_launch_open_delay_frames: u8,
     browser_pane_min: [2]f32,
     browser_pane_max: [2]f32,
+    browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
     send_state: SendState,
@@ -645,6 +646,7 @@ pub const AppState = struct {
             .browser_launch_open_delay_frames = 0,
             .browser_pane_min = .{ 0.0, 0.0 },
             .browser_pane_max = .{ 0.0, 0.0 },
+            .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
             .send_state = .{},
@@ -1662,10 +1664,11 @@ pub const AppState = struct {
         return theme.clampf(available_width * 0.5, theme.scaledUi(320.0), available_width * 0.62);
     }
 
-    /// Records the latest browser pane bounds so SDL events can target the correct in-app viewport.
-    pub fn noteBrowserPaneRegion(self: *AppState, min: [2]f32, max: [2]f32, hovered: bool) void {
+    /// Records the latest browser pane bounds plus the helper input size so SDL events can be remapped correctly.
+    pub fn noteBrowserPaneRegion(self: *AppState, min: [2]f32, max: [2]f32, input_size: [2]f32, hovered: bool) void {
         self.browser_pane_min = min;
         self.browser_pane_max = max;
+        self.browser_pane_input_size = input_size;
         self.browser_pane_hovered = hovered;
     }
 
@@ -1705,8 +1708,12 @@ pub const AppState = struct {
         if (is_pointer_event and !contains_pointer) return false;
 
         var pane_event = event;
-        pane_event.x = event.x - self.browser_pane_min[0];
-        pane_event.y = event.y - self.browser_pane_min[1];
+        const displayed_width = self.browser_pane_max[0] - self.browser_pane_min[0];
+        const displayed_height = self.browser_pane_max[1] - self.browser_pane_min[1];
+        const input_width = @max(self.browser_pane_input_size[0], 1.0);
+        const input_height = @max(self.browser_pane_input_size[1], 1.0);
+        pane_event.x = (event.x - self.browser_pane_min[0]) * (input_width / @max(displayed_width, 1.0));
+        pane_event.y = (event.y - self.browser_pane_min[1]) * (input_height / @max(displayed_height, 1.0));
 
         const handled = self.browser_state.controller.handleMouse(pane_event) catch |err| {
             log.warn("failed to forward browser mouse input: {s}", .{@errorName(err)});

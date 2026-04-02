@@ -97,6 +97,7 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
     const canvas_height = @max(avail[1], theme.scaledUi(180.0));
     const width_px: u32 = @intFromFloat(@max(avail[0], 1.0));
     const height_px: u32 = @intFromFloat(@max(canvas_height, 1.0));
+    const input_size = .{ @as(f32, @floatFromInt(width_px)), @as(f32, @floatFromInt(height_px)) };
     browser_state.controller.resizePane(width_px, height_px) catch {};
 
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
@@ -114,18 +115,34 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
     });
     defer zgui.endChild();
 
-    // Track the pane bounds in framebuffer-space so SDL input can be remapped into browser-local coordinates.
     const pane_pos = zgui.getWindowPos();
     const pane_size = zgui.getWindowSize();
-    state.noteBrowserPaneRegion(
-        pane_pos,
-        .{ pane_pos[0] + pane_size[0], pane_pos[1] + pane_size[1] },
-        zgui.isWindowHovered(.{}),
-    );
+    const pane_hovered = zgui.isWindowHovered(.{});
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {
-            const image_size = zgui.getContentRegionAvail();
+            // Preserve the browser snapshot aspect ratio so compositor-sized frames are not stretched into the pane.
+            const image_size = runtime.scaledImageSize(
+                @intCast(pane_texture.width),
+                @intCast(pane_texture.height),
+                zgui.getContentRegionAvail()[0],
+                zgui.getContentRegionAvail()[1],
+            );
+            const x_offset = (pane_size[0] - image_size[0]) * 0.5;
+            const y_offset = (pane_size[1] - image_size[1]) * 0.5;
+            if (y_offset > 0.0) {
+                zgui.dummy(.{ .w = 0.0, .h = y_offset });
+            }
+            if (x_offset > 0.0) {
+                zgui.setCursorPosX(zgui.getCursorPosX() + x_offset);
+            }
+            const image_pos = zgui.getCursorScreenPos();
+            state.noteBrowserPaneRegion(
+                image_pos,
+                .{ image_pos[0] + image_size[0], image_pos[1] + image_size[1] },
+                input_size,
+                pane_hovered,
+            );
             zgui.image(runtime.textureRefFromGlId(pane_texture.texture_id), .{
                 .w = image_size[0],
                 .h = image_size[1],
@@ -133,6 +150,14 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
             return;
         }
     }
+
+    // Fall back to the full pane bounds while the browser frame has not arrived yet.
+    state.noteBrowserPaneRegion(
+        pane_pos,
+        .{ pane_pos[0] + pane_size[0], pane_pos[1] + pane_size[1] },
+        input_size,
+        pane_hovered,
+    );
 
     renderPanePlaceholder(
         browser_state.controller.runtimeKind(),
