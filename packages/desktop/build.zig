@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_sdk_configured = cef_sdk_path != null and target.result.os.tag == .linux;
     const fff_root = b.path("../../vendor/fff");
+    const inspector_root = b.path("../browser_extensions/inspector");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
         .macos => "libfff_c.dylib",
@@ -38,6 +39,25 @@ pub fn build(b: *std.Build) void {
         imgui.root_module.addIncludePath(zsdl.path("libs/sdl3/include"));
     }
 
+    const build_inspector_bundle = b.addSystemCommand(&.{
+        "bun",
+        "run",
+        "build",
+    });
+    build_inspector_bundle.setCwd(inspector_root);
+    const inspector_bundle_files = b.addWriteFiles();
+    inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
+    _ = inspector_bundle_files.addCopyFile(
+        b.path("../browser_extensions/inspector/dist/inspector.js"),
+        "inspector.js",
+    );
+    const inspector_bundle_module = b.createModule(.{
+        .root_source_file = inspector_bundle_files.add("inspector_bundle.zig",
+            \\pub const bundle = @embedFile("inspector.js");
+            \\
+        ),
+    });
+
     const exe = b.addExecutable(.{
         .name = "verde",
         .root_module = b.createModule(.{
@@ -46,6 +66,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
@@ -53,6 +74,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.step.dependOn(&build_inspector_bundle.step);
     const build_fff = b.addSystemCommand(&.{
         "cargo",
         "build",
@@ -214,6 +236,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
@@ -221,6 +244,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe_tests.step.dependOn(&build_inspector_bundle.step);
     exe_tests.step.dependOn(&build_fff.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));

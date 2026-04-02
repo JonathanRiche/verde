@@ -31,6 +31,7 @@ pub const Event = union(enum) {
     closed,
     navigated: []u8,
     title_changed: []u8,
+    document_loaded,
     js_message: []u8,
     eval_result: []u8,
     failed: []u8,
