@@ -52,6 +52,7 @@ extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int)
 extern fn SDL_GetWindowDisplayScale(window: *sdl.Window) f32;
 extern fn SDL_SetWindowPosition(window: *sdl.Window, x: c_int, y: c_int) bool;
 extern fn SDL_StartTextInput(window: *sdl.Window) bool;
+extern fn SDL_TextInputActive(window: *sdl.Window) bool;
 extern fn SDL_StopTextInput(window: *sdl.Window) bool;
 extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
 extern fn glClear(mask: u32) void;
@@ -143,6 +144,7 @@ pub fn main() !void {
 
     var running = true;
     while (running) {
+        syncWindowTextInput(window, &state);
         running = processEvents(window, &state, &keyboard);
         state.pollPicker();
         state.pollSend();
@@ -294,15 +296,15 @@ fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Nati
             return true;
         }
         normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(state, keyboard, &event)) return false;
+        if (!handleEvent(window, state, keyboard, &event)) return false;
     } else {
         normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(state, keyboard, &event)) return false;
+        if (!handleEvent(window, state, keyboard, &event)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
         normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(state, keyboard, &event)) return false;
+        if (!handleEvent(window, state, keyboard, &event)) return false;
     }
 
     return true;
@@ -315,11 +317,17 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
         IDLE_WAIT_TIMEOUT_MS;
 }
 
-fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event: *sdl.Event) bool {
+fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event: *sdl.Event) bool {
     _ = zgui.backend.processEvent(event);
     switch (event.type) {
         .quit => return false,
         .key_down => {
+            if (browserInputDebugEnabled()) {
+                log.info(
+                    "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
+                    .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
+                );
+            }
             const action = keyboard.actionForEvent(&event.key);
             if (action == .toggle_terminal) {
                 handleKeyboardAction(state, keyboard, .toggle_terminal);
@@ -345,12 +353,24 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
             }
         },
         .key_up => {
+            if (browserInputDebugEnabled()) {
+                log.info(
+                    "browser-input sdl key_up key=0x{x} scancode={} focused={} visible={}",
+                    .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
+                );
+            }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
         },
         .text_input => {
             const text_input = std.mem.sliceTo(event.text.text, 0);
+            if (browserInputDebugEnabled()) {
+                log.info(
+                    "browser-input sdl text_input text=\"{s}\" focused={} visible={}",
+                    .{ text_input, state.isBrowserPaneFocused(), state.isBrowserVisible() },
+                );
+            }
             const browser_text_handled = state.handleBrowserKey(.{
                 .key_code = 0,
                 .text = text_input,
@@ -369,10 +389,24 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (browserInputDebugEnabled()) {
+                log.info(
+                    "browser-input sdl mouse_button down={} button={} x={d:.1} y={d:.1} contains={} focused={}",
+                    .{
+                        event.button.down,
+                        event.button.button,
+                        event.button.x,
+                        event.button.y,
+                        state.browserPaneContains(event.button.x, event.button.y),
+                        state.isBrowserPaneFocused(),
+                    },
+                );
+            }
             const handled = state.handleBrowserMouse(browserMouseButtonEvent(&event.button));
             if (!handled and event.button.down) {
                 state.unfocusBrowserPane();
             }
+            syncWindowTextInput(window, state);
             if (handled) {
                 return true;
             }
@@ -385,6 +419,19 @@ fn handleEvent(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event
         else => {},
     }
     return true;
+}
+
+fn browserInputDebugEnabled() bool {
+    return std.posix.getenv("VERDE_CEF_INPUT_DEBUG") != null;
+}
+
+fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
+    if (!state.isBrowserPaneFocused()) return;
+    if (SDL_TextInputActive(window)) return;
+    _ = SDL_StartTextInput(window);
+    if (browserInputDebugEnabled()) {
+        log.info("browser-input forced SDL_StartTextInput for browser pane focus", .{});
+    }
 }
 
 fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent) bool {
@@ -445,9 +492,13 @@ fn browserKeyCodeForEvent(event: *const sdl.KeyboardEvent) ?u32 {
         .pagedown => 0xff56,
         .end => 0xff57,
         else => {
+            // Chromium expects raw key down/up around printable text input, while SDL's
+            // text_input event still carries the actual composed UTF-8 characters.
+            const key_code = @intFromEnum(event.key);
+            if (key_code > 0 and key_code <= 0x7f) return key_code;
             const modifiers = keymodBits(event.mod);
             if ((modifiers & (sdl.Keymod.ctrl | sdl.Keymod.alt | sdl.Keymod.gui)) == 0) return null;
-            return @intFromEnum(event.key);
+            return key_code;
         },
     };
 }

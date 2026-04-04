@@ -26,6 +26,28 @@
 
 namespace {
 
+bool inputDebugEnabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("VERDE_CEF_INPUT_DEBUG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+void inputDebugLog(const char* format, ...) {
+  if (!inputDebugEnabled()) {
+    return;
+  }
+
+  std::fprintf(stderr, "verde-cef-native[input]: ");
+  va_list args;
+  va_start(args, format);
+  std::vfprintf(stderr, format, args);
+  va_end(args);
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
+
 bool isOomAdjustPath(const char* pathname) {
   if (pathname == nullptr) {
     return false;
@@ -94,6 +116,95 @@ CefMouseEvent makeMouseEvent(double x, double y, unsigned int modifiers) {
   event.y = static_cast<int>(y);
   event.modifiers = eventFlagsFromModifiers(modifiers);
   return event;
+}
+
+bool decodeNextUtf8Codepoint(const unsigned char* cursor,
+                             uint32_t& codepoint,
+                             size_t& advance) {
+  if (cursor == nullptr || cursor[0] == '\0') {
+    return false;
+  }
+
+  const unsigned char first = cursor[0];
+  if ((first & 0x80u) == 0) {
+    codepoint = first;
+    advance = 1;
+    return true;
+  }
+
+  if ((first & 0xe0u) == 0xc0u && cursor[1] != '\0' &&
+      (cursor[1] & 0xc0u) == 0x80u) {
+    codepoint =
+        (static_cast<uint32_t>(first & 0x1fu) << 6) |
+        static_cast<uint32_t>(cursor[1] & 0x3fu);
+    advance = 2;
+    return true;
+  }
+
+  if ((first & 0xf0u) == 0xe0u && cursor[1] != '\0' && cursor[2] != '\0' &&
+      (cursor[1] & 0xc0u) == 0x80u && (cursor[2] & 0xc0u) == 0x80u) {
+    codepoint =
+        (static_cast<uint32_t>(first & 0x0fu) << 12) |
+        (static_cast<uint32_t>(cursor[1] & 0x3fu) << 6) |
+        static_cast<uint32_t>(cursor[2] & 0x3fu);
+    advance = 3;
+    return true;
+  }
+
+  if ((first & 0xf8u) == 0xf0u && cursor[1] != '\0' && cursor[2] != '\0' &&
+      cursor[3] != '\0' && (cursor[1] & 0xc0u) == 0x80u &&
+      (cursor[2] & 0xc0u) == 0x80u && (cursor[3] & 0xc0u) == 0x80u) {
+    codepoint =
+        (static_cast<uint32_t>(first & 0x07u) << 18) |
+        (static_cast<uint32_t>(cursor[1] & 0x3fu) << 12) |
+        (static_cast<uint32_t>(cursor[2] & 0x3fu) << 6) |
+        static_cast<uint32_t>(cursor[3] & 0x3fu);
+    advance = 4;
+    return true;
+  }
+
+  codepoint = 0xfffd;
+  advance = 1;
+  return true;
+}
+
+std::string escapeJsString(const char* text) {
+  std::string escaped;
+  if (text == nullptr) {
+    return escaped;
+  }
+
+  for (const unsigned char* cursor =
+           reinterpret_cast<const unsigned char*>(text);
+       *cursor != '\0'; cursor += 1) {
+    switch (*cursor) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\'':
+        escaped += "\\'";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      case '\b':
+        escaped += "\\b";
+        break;
+      case '\f':
+        escaped += "\\f";
+        break;
+      default:
+        escaped.push_back(static_cast<char>(*cursor));
+        break;
+    }
+  }
+  return escaped;
 }
 
 enum VerdeEventKind {
@@ -448,6 +559,89 @@ void sendFocusToBrowser() {
   host->SetFocus(true);
 }
 
+bool executeMainFrameScript(const char* label, const std::string& script) {
+  if (!g_runtime.browser) {
+    inputDebugLog("script %s skipped: browser missing", label);
+    return false;
+  }
+  auto frame = g_runtime.browser->GetMainFrame();
+  if (!frame) {
+    inputDebugLog("script %s skipped: main frame missing", label);
+    return false;
+  }
+  inputDebugLog("script %s dispatch", label);
+  frame->ExecuteJavaScript(script, "app://verde-input.js", 1);
+  return true;
+}
+
+void focusDomTargetAtPoint(double x, double y, unsigned int button, int mouse_up) {
+  if (mouse_up != 0 || button == 0) {
+    return;
+  }
+
+  char script[1600];
+  std::snprintf(
+      script,
+      sizeof(script),
+      "(function(){const x=%f;const y=%f;window.__verdeInputPoint={x,y};const target=document.elementFromPoint(x,y);if(!target)return;const interactive=(target.closest&&target.closest('a[href],button,input,textarea,select,label,summary,[contenteditable=\"true\"],[tabindex]'))||target;window.__verdeInputTarget=interactive;if(interactive&&interactive.focus)interactive.focus({preventScroll:true});})();",
+      x,
+      y);
+  (void)executeMainFrameScript("focus-click-target", script);
+}
+
+bool handleEditableKeyFallback(unsigned int key_code, int pressed) {
+  if (!pressed) {
+    return false;
+  }
+
+  const char* key = nullptr;
+  if (key_code == 0xff08) {
+    key = "Backspace";
+  } else if (key_code == 0xff0d) {
+    key = "Enter";
+  } else if (key_code == 0xff09) {
+    key = "Tab";
+  } else if (key_code == 0xffff) {
+    key = "Delete";
+  } else {
+    return false;
+  }
+
+  char script[4096];
+  std::snprintf(
+      script,
+      sizeof(script),
+      "(function(){const key='%s';const point=window.__verdeInputPoint;let el=window.__verdeInputTarget;if(el&&!el.isConnected)el=null;if(!el){el=document.activeElement;}const resolve=(node)=>{if(!node)return null;if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;return (node.closest&&node.closest('input,textarea,[contenteditable=\"true\"]'))||null;};el=resolve(el);if(!el&&point){el=resolve(document.elementFromPoint(point.x,point.y));}if(!el)return false;window.__verdeInputTarget=el;if(el.focus)el.focus({preventScroll:true});const evt=new KeyboardEvent('keydown',{key:key,bubbles:true,cancelable:true});el.dispatchEvent(evt);if(evt.defaultPrevented)return true;if(key==='Backspace'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start>0){el.value=el.value.slice(0,start-1)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start-1,start-1);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return true;}if(key==='Delete'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start<el.value.length){el.value=el.value.slice(0,start)+el.value.slice(start+1);if(el.setSelectionRange)el.setSelectionRange(start,start);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentForward'}));return true;}if(key==='Enter'){if(el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;el.value=el.value.slice(0,start)+'\\n'+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start+1,start+1);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:'\\n',inputType:'insertLineBreak'}));return true;}if(el instanceof HTMLInputElement&&el.form&&typeof el.form.requestSubmit==='function'){el.form.requestSubmit();return true;}}return false;})();",
+      key);
+  return executeMainFrameScript("editable-key-fallback", script);
+}
+
+bool insertTextIntoActiveElement(const char* text) {
+  const std::string escaped = escapeJsString(text);
+  std::string script =
+      "(function(){const text='" + escaped +
+      "';const point=window.__verdeInputPoint;let el=window.__verdeInputTarget;"
+      "if(el&&!el.isConnected)el=null;"
+      "const resolve=(node)=>{if(!node)return null;if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;return (node.closest&&node.closest('input,textarea,[contenteditable=\"true\"]'))||null;};"
+      "el=resolve(el)||resolve(document.activeElement);"
+      "if(!el&&point){el=resolve(document.elementFromPoint(point.x,point.y));}"
+      "if(!el)return false;window.__verdeInputTarget=el;"
+      "if(el.focus)el.focus({preventScroll:true});"
+      "if(el.isContentEditable){document.execCommand('insertText',false,text);return true;}"
+      "if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){"
+      "const start=el.selectionStart??el.value.length;"
+      "const end=el.selectionEnd??el.value.length;"
+      "const before=el.value.slice(0,start);"
+      "const after=el.value.slice(end);"
+      "el.value=before+text+after;"
+      "const next=start+text.length;"
+      "if(el.setSelectionRange)el.setSelectionRange(next,next);"
+      "el.dispatchEvent(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'}));"
+      "return true;}"
+      "return false;})();";
+  return executeMainFrameScript("editable-text-fallback", script);
+}
+
 void pumpMessageLoopFor(std::chrono::milliseconds slice,
                         int iterations,
                         bool stop_when_browser_closes) {
@@ -732,6 +926,13 @@ extern "C" int verde_cef_send_mouse_click(double x,
   }
 
   sendFocusToBrowser();
+  inputDebugLog("mouse_click x=%.1f y=%.1f button=%u mouse_up=%d modifiers=0x%x",
+                x,
+                y,
+                button,
+                mouse_up,
+                modifiers);
+  focusDomTargetAtPoint(x, y, button, mouse_up);
   CefMouseEvent event = makeMouseEvent(x, y, modifiers);
   event.modifiers |= mouseButtonFlag(button);
   g_runtime.browser->GetHost()->SendMouseClickEvent(
@@ -764,6 +965,10 @@ extern "C" int verde_cef_send_key_event(unsigned int key_code,
   }
 
   sendFocusToBrowser();
+  inputDebugLog("key_event key=0x%x pressed=%d modifiers=0x%x",
+                key_code,
+                pressed,
+                modifiers);
 
   CefKeyEvent event;
   event.type = pressed ? KEYEVENT_RAWKEYDOWN : KEYEVENT_KEYUP;
@@ -774,6 +979,11 @@ extern "C" int verde_cef_send_key_event(unsigned int key_code,
   event.unmodified_character = static_cast<char16_t>(key_code);
   event.focus_on_editable_field = true;
   g_runtime.browser->GetHost()->SendKeyEvent(event);
+  const bool fallback_dispatched = handleEditableKeyFallback(key_code, pressed);
+  inputDebugLog("key_event fallback=%d", fallback_dispatched ? 1 : 0);
+  if (fallback_dispatched) {
+    return 1;
+  }
   return 1;
 }
 
@@ -784,17 +994,30 @@ extern "C" int verde_cef_send_text_input(const char* text,
   }
 
   sendFocusToBrowser();
+  inputDebugLog("text_input text=\"%s\" modifiers=0x%x", text, modifiers);
+  (void)modifiers;
+  const bool fallback_dispatched = insertTextIntoActiveElement(text);
+  inputDebugLog("text_input fallback=%d", fallback_dispatched ? 1 : 0);
 
   for (const unsigned char* cursor =
            reinterpret_cast<const unsigned char*>(text);
-       *cursor != '\0'; cursor += 1) {
+       *cursor != '\0';) {
+    uint32_t codepoint = 0;
+    size_t advance = 1;
+    if (!decodeNextUtf8Codepoint(cursor, codepoint, advance)) {
+      break;
+    }
+    cursor += advance;
+
     CefKeyEvent event;
     event.type = KEYEVENT_CHAR;
     event.modifiers = eventFlagsFromModifiers(modifiers);
-    event.windows_key_code = static_cast<int>(*cursor);
-    event.native_key_code = static_cast<int>(*cursor);
-    event.character = static_cast<char16_t>(*cursor);
-    event.unmodified_character = static_cast<char16_t>(*cursor);
+    event.windows_key_code = static_cast<int>(codepoint);
+    event.native_key_code = static_cast<int>(codepoint);
+    const char16_t character =
+        static_cast<char16_t>(codepoint <= 0xffffu ? codepoint : 0xfffdu);
+    event.character = character;
+    event.unmodified_character = character;
     event.focus_on_editable_field = true;
     g_runtime.browser->GetHost()->SendKeyEvent(event);
   }
