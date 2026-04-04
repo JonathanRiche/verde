@@ -1,5 +1,6 @@
 #include <atomic>
 #include <array>
+#include <cstdarg>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +65,28 @@ constexpr unsigned kModSuper = 1u << 3;
 constexpr size_t kFrameSlotCount = 3;
 constexpr size_t kFrameBytesMax = 4096u * 2160u * 4u;
 FILE* g_event_output = nullptr;
+
+bool inputDebugEnabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("VERDE_CEF_INPUT_DEBUG");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+void inputDebugLog(const char* format, ...) {
+  if (!inputDebugEnabled()) {
+    return;
+  }
+
+  std::fprintf(stderr, "verde-cef-helper[input]: ");
+  va_list args;
+  va_start(args, format);
+  std::vfprintf(stderr, format, args);
+  va_end(args);
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
 
 struct Command {
   std::string kind;
@@ -589,6 +612,11 @@ bool applyCommand(RuntimeState& state, const Command& command) {
     return true;
   }
   if (command.kind == "mouse_button") {
+    inputDebugLog("dispatch mouse_button x=%.1f y=%.1f button=%u pressed=%d",
+                  command.x,
+                  command.y,
+                  command.button,
+                  command.pressed ? 1 : 0);
     (void)verde_cef_send_mouse_click(command.x,
                                      command.y,
                                      command.button,
@@ -597,6 +625,11 @@ bool applyCommand(RuntimeState& state, const Command& command) {
     return true;
   }
   if (command.kind == "mouse_wheel") {
+    inputDebugLog("dispatch mouse_wheel x=%.1f y=%.1f dx=%.2f dy=%.2f",
+                  command.x,
+                  command.y,
+                  command.wheel_x,
+                  command.wheel_y);
     (void)verde_cef_send_mouse_wheel(command.x,
                                      command.y,
                                      command.wheel_x,
@@ -605,11 +638,18 @@ bool applyCommand(RuntimeState& state, const Command& command) {
     return true;
   }
   if (command.kind == "key_input") {
+    inputDebugLog("dispatch key_input key=0x%x pressed=%d modifiers=0x%x",
+                  command.key_code,
+                  command.pressed ? 1 : 0,
+                  encodeModifierMask(command));
     (void)verde_cef_send_key_event(command.key_code, command.pressed ? 1 : 0, encodeModifierMask(command));
     return true;
   }
   if (command.kind == "text_input") {
     if (command.has_payload) {
+      inputDebugLog("dispatch text_input text=\"%s\" modifiers=0x%x",
+                    command.payload.c_str(),
+                    encodeModifierMask(command));
       (void)verde_cef_send_text_input(command.payload.c_str(), encodeModifierMask(command));
     }
     return true;
