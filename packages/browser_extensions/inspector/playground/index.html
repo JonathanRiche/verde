@@ -23,15 +23,25 @@
           </div>
         </article>
 
-        <aside class="panel inspector-toolbar">
+        <aside class="panel inspector-toolbar" data-verde-inspector-ignore="true">
           <div class="controls">
             <button data-enable>Enable inspector</button>
             <button data-disable>Disable inspector</button>
+          </div>
+          <div class="controls">
+            <button data-mode-point>Point mode</button>
+            <button data-mode-box>Draw box</button>
+            <button data-mode-freeform>Draw freeform</button>
           </div>
           <div class="status" data-status>booting</div>
           <p>
             Keyboard: press <strong>Escape</strong> once to clear the current
             selection, and again to disable the inspector completely.
+          </p>
+          <p>
+            Draw box selects visible top-level elements inside the rectangle.
+            Draw freeform lets you scribble or loop around content with a
+            pencil-style path.
           </p>
         </aside>
       </section>
