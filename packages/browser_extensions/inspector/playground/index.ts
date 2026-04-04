@@ -5,6 +5,9 @@ const log = document.querySelector<HTMLElement>("[data-log]");
 const status = document.querySelector<HTMLElement>("[data-status]");
 const enableButton = document.querySelector<HTMLButtonElement>("[data-enable]");
 const disableButton = document.querySelector<HTMLButtonElement>("[data-disable]");
+const pointModeButton = document.querySelector<HTMLButtonElement>("[data-mode-point]");
+const boxModeButton = document.querySelector<HTMLButtonElement>("[data-mode-box]");
+const freeformModeButton = document.querySelector<HTMLButtonElement>("[data-mode-freeform]");
 
 const inspector = createInspector({
   enabled: true,
@@ -16,6 +19,9 @@ const inspector = createInspector({
 
 enableButton?.addEventListener("click", () => inspector.enable());
 disableButton?.addEventListener("click", () => inspector.disable());
+pointModeButton?.addEventListener("click", () => inspector.setMode("point"));
+boxModeButton?.addEventListener("click", () => inspector.setMode("draw-box"));
+freeformModeButton?.addEventListener("click", () => inspector.setMode("draw-freeform"));
 
 renderStatus({
   source: "verde-inspector",
@@ -28,9 +34,16 @@ function renderStatus(event: InspectorAnyEvent): void {
   if (!status) return;
 
   switch (event.type) {
+    case "inspector:mode-changed":
+      status.textContent = `mode: ${event.payload.mode}`;
+      return;
     case "element:hover":
     case "element:selected":
       status.textContent = `${event.type}: ${event.payload.selector}`;
+      return;
+    case "region:selected":
+      status.textContent =
+        `${event.type}: ${event.payload.elements.length} elements`;
       return;
     default:
       status.textContent = event.type;

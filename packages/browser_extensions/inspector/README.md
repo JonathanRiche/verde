@@ -32,5 +32,7 @@ The playground exercises:
 
 - hover highlight with margin, border, padding, and content regions
 - click-to-freeze selection
+- draw-box mode for visible top-level region selection
+- draw-freeform mode for pencil-style region selection
 - fixed prompt textarea overlay
 - structured event emission intended for later Zig/CEF integration

@@ -20,6 +20,7 @@ function mount(options: InspectorOptions = {}): InspectorHandle {
   activeInspector?.destroy();
   activeInspector = createInspector({
     enabled: options.enabled ?? true,
+    mode: options.mode,
     root: options.root,
     onEvent: options.onEvent,
     bridge: options.bridge ?? window.__VERDE_INSPECTOR_BRIDGE__,
