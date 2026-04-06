@@ -39,14 +39,18 @@ pub fn build(b: *std.Build) void {
         imgui.root_module.addIncludePath(zsdl.path("libs/sdl3/include"));
     }
 
-    const build_inspector_bundle = b.addSystemCommand(&.{
-        "bun",
-        "run",
-        "build",
-    });
-    build_inspector_bundle.setCwd(inspector_root);
     const inspector_bundle_files = b.addWriteFiles();
-    inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
+    if (b.findProgram(&.{"bun"}, &.{})) |bun_path| {
+        const build_inspector_bundle = b.addSystemCommand(&.{
+            bun_path,
+            "run",
+            "build",
+        });
+        build_inspector_bundle.setCwd(inspector_root);
+        inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
+    } else |_| {
+        std.log.warn("bun was not found; using the checked-in inspector bundle", .{});
+    }
     _ = inspector_bundle_files.addCopyFile(
         b.path("../browser_extensions/inspector/dist/inspector.js"),
         "inspector.js",
@@ -74,7 +78,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.step.dependOn(&build_inspector_bundle.step);
     const build_fff = b.addSystemCommand(&.{
         "cargo",
         "build",
@@ -244,7 +247,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe_tests.step.dependOn(&build_inspector_bundle.step);
     exe_tests.step.dependOn(&build_fff.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
