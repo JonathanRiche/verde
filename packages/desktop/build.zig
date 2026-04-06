@@ -22,7 +22,11 @@ pub fn build(b: *std.Build) void {
         .use_wchar32 = true,
     });
     const zsdl = b.dependency("zsdl", .{});
-    const ghostty = b.lazyDependency("ghostty", .{});
+    const ghostty = b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"emit-lib-vt" = true,
+    });
     const zqlite = b.dependency("zqlite", .{
         .target = target,
         .optimize = optimize,
