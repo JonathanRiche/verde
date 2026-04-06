@@ -32,6 +32,7 @@ pkgbase = verde-bin
 	depends = nss
 	depends = pango
 	depends = systemd-libs
+	depends = zenity
 	depends = zlib
 	optdepends = codex: local Codex CLI integration
 	optdepends = opencode: local OpenCode CLI integration

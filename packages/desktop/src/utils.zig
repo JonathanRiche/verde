@@ -255,70 +255,95 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
 }
 
 pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
-    const result = blk: {
-        if (commandExists("zenity")) {
-            break :blk try std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{
-                    "zenity",
-                    "--file-selection",
-                    "--directory",
-                    "--filename",
-                    start_path,
-                    "--title",
-                    "Select project folder",
-                },
-                .max_output_bytes = 16 * 1024,
-            });
-        }
+    if (commandExists("zenity")) {
+        return runDirectoryPickerCommand(allocator, &.{
+            "zenity",
+            "--file-selection",
+            "--directory",
+            "--filename",
+            start_path,
+            "--title",
+            "Select project folder",
+        }, null);
+    }
 
-        if (commandExists("kdialog")) {
-            break :blk try std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{
-                    "kdialog",
-                    "--getexistingdirectory",
-                    start_path,
-                    "--title",
-                    "Select project folder",
-                },
-                .max_output_bytes = 16 * 1024,
-            });
-        }
+    if (commandExists("kdialog")) {
+        return runDirectoryPickerCommand(allocator, &.{
+            "kdialog",
+            "--getexistingdirectory",
+            start_path,
+            "--title",
+            "Select project folder",
+        }, null);
+    }
 
-        if (commandExists("yad")) {
-            break :blk try std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{
-                    "yad",
-                    "--file-selection",
-                    "--directory",
-                    "--filename",
-                    start_path,
-                    "--title",
-                    "Select project folder",
-                },
-                .max_output_bytes = 16 * 1024,
-            });
-        }
+    if (commandExists("yad")) {
+        return runDirectoryPickerCommand(allocator, &.{
+            "yad",
+            "--file-selection",
+            "--directory",
+            "--filename",
+            start_path,
+            "--title",
+            "Select project folder",
+        }, null);
+    }
 
-        if (commandExists("qarma")) {
-            break :blk try std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{
-                    "qarma",
-                    "--file-selection",
-                    "--directory",
-                    "--filename",
-                    start_path,
-                    "--title",
-                    "Select project folder",
-                },
-                .max_output_bytes = 16 * 1024,
-            });
-        }
+    if (commandExists("qarma")) {
+        return runDirectoryPickerCommand(allocator, &.{
+            "qarma",
+            "--file-selection",
+            "--directory",
+            "--filename",
+            start_path,
+            "--title",
+            "Select project folder",
+        }, null);
+    }
 
-        return error.FolderPickerUnavailable;
+    if (commandExists("python3")) {
+        return runDirectoryPickerCommand(allocator, &.{
+            "python3",
+            "-c",
+            \\import sys
+            \\try:
+            \\    import tkinter as tk
+            \\    from tkinter import filedialog
+            \\except Exception:
+            \\    raise SystemExit(2)
+            \\root = tk.Tk()
+            \\root.withdraw()
+            \\root.attributes("-topmost", True)
+            \\path = filedialog.askdirectory(
+            \\    initialdir=sys.argv[1],
+            \\    title="Select project folder",
+            \\    mustexist=True,
+            \\)
+            \\root.update()
+            \\root.destroy()
+            \\if not path:
+            \\    raise SystemExit(1)
+            \\print(path)
+        ,
+            start_path,
+        }, 2);
+    }
+
+    return error.FolderPickerUnavailable;
+}
+
+fn runDirectoryPickerCommand(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    unavailable_exit_code: ?u8,
+) PickDirectoryError![]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 16 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.FolderPickerUnavailable,
+        else => return err,
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -326,6 +351,9 @@ pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) 
     switch (result.term) {
         .Exited => |code| {
             if (code == 1) return error.UserCancelled;
+            if (unavailable_exit_code) |expected| {
+                if (code == expected) return error.FolderPickerUnavailable;
+            }
             if (code != 0) return error.ChildProcessFailed;
         },
         else => return error.ChildProcessFailed,

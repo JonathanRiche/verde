@@ -47,6 +47,18 @@ SRCINFO="${AUR_REPO_DIR}/.SRCINFO"
 sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" "${PKGBUILD}"
 sed -i -E "/^sha256sums=\(/,/^\)/c\\sha256sums=(\\n  '${LINUX_SHA}'\\n  '${LICENSE_SHA}'\\n)" "${PKGBUILD}"
 
+if ! grep -Fq "'zenity'" "${PKGBUILD}"; then
+  awk '
+    /^\)/ && in_depends {
+      print "  '\''zenity'\''"
+      in_depends = 0
+    }
+    /^depends=\(/ { in_depends = 1 }
+    { print }
+  ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
+  mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+fi
+
 awk \
   -v version="${VERSION}" \
   -v linux_sha="${LINUX_SHA}" \
@@ -84,6 +96,17 @@ awk \
   }
   ' "${SRCINFO}" > "${SRCINFO}.tmp"
 mv "${SRCINFO}.tmp" "${SRCINFO}"
+
+if ! grep -Fq $'\tdepends = zenity' "${SRCINFO}"; then
+  awk '
+    /^\tpkgname = / && !inserted {
+      print "\tdepends = zenity"
+      inserted = 1
+    }
+    { print }
+  ' "${SRCINFO}" > "${SRCINFO}.tmp"
+  mv "${SRCINFO}.tmp" "${SRCINFO}"
+fi
 
 echo "Updated verde-bin metadata to ${TAG}"
 echo "linux sha256: ${LINUX_SHA}"

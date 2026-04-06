@@ -33,6 +33,7 @@ depends=(
   'nss'
   'pango'
   'systemd-libs'
+  'zenity'
   'zlib'
 )
 optdepends=(
