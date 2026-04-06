@@ -1,0 +1,24 @@
+{
+  "name": "verde-app-linux-x64",
+  "version": "0.0.0-dev",
+  "description": "Linux x64 runtime package for Verde",
+  "license": "MIT",
+  "homepage": "https://github.com/JonathanRiche/verde",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonathanRiche/verde.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin",
+    "share",
+    "README.md",
+    "index.js",
+    "install-local.sh"
+  ]
+}

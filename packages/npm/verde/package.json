@@ -1,0 +1,35 @@
+{
+  "name": "verde-app",
+  "version": "0.0.0-dev",
+  "description": "Developer-friendly launcher for the Verde desktop app",
+  "license": "MIT",
+  "homepage": "https://github.com/JonathanRiche/verde",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonathanRiche/verde.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JonathanRiche/verde/issues"
+  },
+  "bin": {
+    "verde": "bin/verde.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "verde-app-darwin-arm64": "0.0.0-dev",
+    "verde-app-darwin-x64": "0.0.0-dev",
+    "verde-app-linux-x64": "0.0.0-dev"
+  },
+  "keywords": [
+    "verde",
+    "desktop",
+    "codex",
+    "opencode"
+  ]
+}
