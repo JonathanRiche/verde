@@ -16,6 +16,13 @@ if [[ "$OUTPUT_DIR" != /* ]]; then
 fi
 ARCH="$(uname -m)"
 CACHE_ROOT="${VERDE_CEF_CACHE_DIR:-$HOME/.cache/verde/cef-sdk}"
+DEFAULT_CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}"
+if [[ -z "${VERDE_CEF_CACHE_DIR:-}" ]]; then
+  if ! mkdir -p "${DEFAULT_CACHE_BASE}/verde" 2>/dev/null; then
+    DEFAULT_CACHE_BASE="/tmp"
+  fi
+  CACHE_ROOT="${DEFAULT_CACHE_BASE}/verde/cef-sdk"
+fi
 CEF_BASENAME="cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal"
 CEF_ARCHIVE="$CEF_BASENAME.tar.bz2"
 CEF_URL="${VERDE_CEF_URL:-https://cef-builds.spotifycdn.com/cef_binary_146.0.9%2Bg3ca6a87%2Bchromium-146.0.7680.165_linux64_minimal.tar.bz2}"
@@ -36,6 +43,16 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 PREFIX_DIR="$WORK_DIR/prefix"
 PACKAGE_ROOT="$WORK_DIR/verde-${VERSION}-linux-${ARCH}"
 
+strip_debug_symbols() {
+  local path="$1"
+
+  if [[ ! -f "$path" ]]; then
+    return
+  fi
+
+  strip --strip-debug "$path"
+}
+
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$CACHE_ROOT"
 
@@ -47,7 +64,7 @@ if [[ ! -d "$CEF_SDK_PATH" ]]; then
   fi
 
   echo "Extracting CEF into $CACHE_ROOT"
-  tar -xjf "$ARCHIVE_PATH" -C "$CACHE_ROOT"
+  python3 -c "import tarfile; tarfile.open('$ARCHIVE_PATH').extractall('$CACHE_ROOT')"
 fi
 
 cd "$DESKTOP_ROOT"
@@ -79,6 +96,18 @@ cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
+
+strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef"
+strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef-process"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libfff_c.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libcef.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libEGL.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libGLESv2.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libvk_swiftshader.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libvulkan.so.1"
+strip_debug_symbols "$PACKAGE_ROOT/bin/chrome-sandbox"
 
 cat > "$PACKAGE_ROOT/share/applications/verde.desktop" <<'EOF'
 [Desktop Entry]

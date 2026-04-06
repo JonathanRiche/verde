@@ -3,3 +3,5 @@ zig-out/
 imgui.ini
 vendor/imgui.ini
 .codex
+node_modules/
+.agent-ci/
