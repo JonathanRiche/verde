@@ -1,5 +1,6 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
+const process_env = @import("process_env.zig");
 const stb_image = @import("stb_image.zig");
 const chat_threads = @import("chat/threads.zig");
 const std = @import("std");
@@ -324,7 +325,7 @@ pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) 
             \\if not path:
             \\    raise SystemExit(1)
             \\print(path)
-        ,
+            ,
             start_path,
         }, 2);
     }
@@ -386,7 +387,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         state.error_message = null;
         state.status = .completed;
     } else |err| {
-        const message = std.fmt.allocPrint(page_alloc, "Provider request failed: {s}", .{@errorName(err)}) catch null;
+        const message = formatSendWorkerError(page_alloc, request.provider, err) catch null;
         state.error_message = message;
         state.result = null;
         state.status = .failed;
@@ -820,21 +821,26 @@ fn directoryExistsAbsolute(path: []const u8) bool {
 }
 
 fn commandExists(name: []const u8) bool {
-    const path_env = std.posix.getenv("PATH") orelse return false;
-    var parts = std.mem.splitScalar(u8, path_env, ':');
-    while (parts.next()) |part| {
-        if (part.len == 0) continue;
-        const joined = std.fs.path.join(std.heap.page_allocator, &.{ part, name }) catch return false;
-        defer std.heap.page_allocator.free(joined);
+    return process_env.commandExists(name);
+}
 
-        const file = if (std.fs.path.isAbsolute(joined))
-            std.fs.openFileAbsolute(joined, .{}) catch continue
-        else
-            std.fs.cwd().openFile(joined, .{}) catch continue;
-        file.close();
-        return true;
-    }
-    return false;
+fn formatSendWorkerError(
+    allocator: std.mem.Allocator,
+    provider: app_state.Provider,
+    err: anyerror,
+) ![]u8 {
+    return switch (err) {
+        error.FileNotFound => std.fmt.allocPrint(
+            allocator,
+            "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
+            .{providerLabel(provider)},
+        ),
+        error.OpencodeServerUnavailable => allocator.dupe(
+            u8,
+            "OpenCode did not start. Ensure the opencode CLI is installed, authenticated, and reachable from this session.",
+        ),
+        else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
+    };
 }
 
 fn shellSingleQuoteEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {

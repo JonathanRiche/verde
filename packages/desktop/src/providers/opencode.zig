@@ -1,6 +1,7 @@
 //! OpenCode provider harness backed by the local HTTP server.
 
 const std = @import("std");
+const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 
 const log = std.log.scoped(.native_opencode);
@@ -178,8 +179,14 @@ pub const Client = struct {
         const port_text = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
         defer self.allocator.free(port_text);
 
+        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        defer env_map.deinit();
+
+        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
+        defer self.allocator.free(executable);
+
         var argv = [_][]const u8{
-            self.config.executable,
+            executable,
             "serve",
             "--hostname",
             host,
@@ -192,7 +199,9 @@ pub const Client = struct {
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         child.cwd = self.config.working_directory;
+        child.env_map = &env_map;
         try child.spawn();
+        child.env_map = null;
         child.argv = &.{};
 
         self.child = child;
@@ -825,6 +834,12 @@ fn runEventStream(context: *EventStreamContext) void {
 }
 
 fn streamSessionEvents(context: *EventStreamContext) !void {
+    var env_map = try process_env.buildAugmentedEnvMap(context.allocator);
+    defer env_map.deinit();
+
+    const curl_executable = try process_env.resolveExecutableInEnvMapAlloc(context.allocator, &env_map, "curl");
+    defer context.allocator.free(curl_executable);
+
     var opened = false;
     errdefer if (!opened) signalEventStreamOpenState(context, .failed);
 
@@ -834,7 +849,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     defer argv.deinit(context.allocator);
 
     try argv.appendSlice(context.allocator, &.{
-        "curl",
+        curl_executable,
         "--no-buffer",
         "--silent",
         "--show-error",
@@ -863,7 +878,9 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
+    child.env_map = &env_map;
     try child.spawn();
+    child.env_map = null;
     child.argv = &.{};
 
     context.mutex.lock();

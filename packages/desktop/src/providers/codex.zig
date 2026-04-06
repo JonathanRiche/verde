@@ -1,6 +1,7 @@
 //! Codex provider harness backed by `codex app-server`.
 
 const std = @import("std");
+const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 
 const log = std.log.scoped(.native_codex);
@@ -188,8 +189,14 @@ pub const Client = struct {
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (self.child != null) return;
 
+        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        defer env_map.deinit();
+
+        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
+        defer self.allocator.free(executable);
+
         var argv = [_][]const u8{
-            self.config.executable,
+            executable,
             "app-server",
             "--listen",
             url,
@@ -200,7 +207,9 @@ pub const Client = struct {
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
         child.cwd = self.config.cwd;
+        child.env_map = &env_map;
         try child.spawn();
+        child.env_map = null;
         child.argv = &.{};
 
         self.child = child;
