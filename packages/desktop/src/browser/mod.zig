@@ -18,12 +18,35 @@ pub const ADDRESS_CAPACITY: usize = 2048;
 pub const SCRIPT_CAPACITY: usize = 4096;
 pub const JSON_CAPACITY: usize = 2048;
 
+pub const InspectorMode = enum {
+    point,
+    draw_box,
+    draw_freeform,
+
+    pub fn label(self: InspectorMode) []const u8 {
+        return switch (self) {
+            .point => "Point",
+            .draw_box => "Draw Box",
+            .draw_freeform => "Draw Freeform",
+        };
+    }
+
+    pub fn jsValue(self: InspectorMode) []const u8 {
+        return switch (self) {
+            .point => "point",
+            .draw_box => "draw-box",
+            .draw_freeform => "draw-freeform",
+        };
+    }
+};
+
 /// Stores browser-facing UI state separately from the rest of the chat shell.
 pub const State = struct {
     allocator: std.mem.Allocator,
     controller: Controller,
     controls_visible: bool = false,
     inspector_enabled: bool = false,
+    inspector_mode: InspectorMode = .point,
     suppressed_eval_results: u8 = 0,
     status: Status = .hidden,
     address_storage: [ADDRESS_CAPACITY:0]u8 = std.mem.zeroes([ADDRESS_CAPACITY:0]u8),
@@ -97,6 +120,16 @@ pub const State = struct {
     /// Records whether the DOM inspector is currently armed in app state.
     pub fn setInspectorEnabled(self: *State, enabled: bool) void {
         self.inspector_enabled = enabled;
+    }
+
+    /// Returns the currently selected bundled inspector interaction mode.
+    pub fn inspectorMode(self: *const State) InspectorMode {
+        return self.inspector_mode;
+    }
+
+    /// Records the interaction mode the bundled inspector should use when armed.
+    pub fn setInspectorMode(self: *State, mode: InspectorMode) void {
+        self.inspector_mode = mode;
     }
 
     /// Suppresses one forthcoming eval result for internal browser-script dispatches.
