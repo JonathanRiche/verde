@@ -8,7 +8,8 @@ fi
 
 VERSION="$1"
 OUTPUT_DIR="$2"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CALLER_ROOT="$(pwd)"
 if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
@@ -33,10 +34,19 @@ DMG_DIR="$WORK_DIR/dmg"
 ICONSET_DIR="$WORK_DIR/verde.iconset"
 ICON_FILE="$APP_DIR/Contents/Resources/verde.icns"
 
+source "$SCRIPT_DIR/cef-common.sh"
+
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO_ROOT"
-zig build --release=safe -p "$PREFIX_DIR"
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
+if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
+  verde_cef_ensure_sdk macos "$ARCH"
+  BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
+elif [[ -n "${VERDE_CEF_SDK_PATH:-}" ]]; then
+  BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH")
+fi
+"${BUILD_ARGS[@]}"
 
 mkdir -p \
   "$APP_DIR/Contents/MacOS" \
@@ -46,6 +56,16 @@ mkdir -p \
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
 ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
+if [[ -x "$PREFIX_DIR/bin/verde-browser-cef" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$APP_DIR/Contents/MacOS/verde-browser-cef"
+fi
+if [[ -x "$PREFIX_DIR/bin/verde-browser-cef-process" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$APP_DIR/Contents/MacOS/verde-browser-cef-process"
+fi
+if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
+  ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
+    "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
+fi
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

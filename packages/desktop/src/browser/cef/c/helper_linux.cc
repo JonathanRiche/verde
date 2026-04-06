@@ -17,6 +17,10 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "cef_loader.h"
 
 extern "C" int verde_cef_execute_subprocess(int argc, const char* const* argv);
@@ -155,11 +159,20 @@ bool isChromiumSubprocess(int argc, char** argv) {
 }
 
 std::string selfExePath() {
+#if defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  if (size == 0) return {};
+  std::vector<char> buffer(size + 1, '\0');
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+  return std::string(buffer.data());
+#else
   std::vector<char> buffer(4096);
   const ssize_t len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
   if (len <= 0) return {};
   buffer[static_cast<size_t>(len)] = '\0';
   return std::string(buffer.data(), static_cast<size_t>(len));
+#endif
 }
 
 std::string dirnameOf(const std::string& path) {
@@ -668,7 +681,14 @@ bool applyCommand(RuntimeState& state, const Command& command) {
 int main(int argc, char** argv) {
   const std::string exe_path = selfExePath();
   const std::string exe_dir = dirnameOf(exe_path);
+#if defined(__APPLE__)
+  const std::string resources_dir =
+      exe_dir + "/Chromium Embedded Framework.framework/Resources";
+  const std::string locales_dir = resources_dir + "/locales";
+#else
+  const std::string resources_dir = exe_dir;
   const std::string locales_dir = exe_dir + "/locales";
+#endif
   const std::string process_helper_path = joinPath(exe_dir, "verde-browser-cef-process");
   const int command_fd = parseHelperFd(std::getenv("VERDE_CEF_CMD_FD"));
   const int event_fd = parseHelperFd(std::getenv("VERDE_CEF_EVENT_FD"));
@@ -705,7 +725,7 @@ int main(int argc, char** argv) {
           argc,
           const_cast<const char* const*>(argv),
           process_helper_path.c_str(),
-          exe_dir.c_str(),
+          resources_dir.c_str(),
           locales_dir.c_str())) {
     fclose(g_event_output);
     g_event_output = nullptr;

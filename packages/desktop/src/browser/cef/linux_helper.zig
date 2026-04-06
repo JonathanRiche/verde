@@ -1,4 +1,4 @@
-//! Linux CEF browser helper client used by the desktop app.
+//! POSIX CEF browser helper client used by the desktop app.
 
 const std = @import("std");
 const browser_input = @import("../input.zig");
@@ -102,7 +102,7 @@ const SharedFrame = struct {
     }
 };
 
-/// Owns the Linux CEF helper process and translates its output back into desktop browser state.
+/// Owns the helper process and translates its output back into desktop browser state.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
     child_pid: ?std.posix.pid_t = null,
@@ -112,7 +112,7 @@ pub const Controller = struct {
     frame: *SharedFrame,
     reader_thread: ?std.Thread = null,
 
-    /// Creates the helper-backed Linux CEF controller.
+    /// Creates the helper-backed CEF controller.
     pub fn init(allocator: std.mem.Allocator, helper_name: []const u8) !Controller {
         const queue = try allocator.create(SharedQueue);
         queue.* = .{};
@@ -281,7 +281,7 @@ pub const Controller = struct {
         try self.frame.uploadIntoTexture(texture);
     }
 
-    // Launches the installed Linux CEF helper beside the desktop executable.
+    // Launches the installed CEF helper beside the desktop executable.
     fn spawnHelper(self: *Controller, helper_name: []const u8) !void {
         const helper_path = try browserHelperPath(self.allocator, helper_name);
         defer self.allocator.free(helper_path);
@@ -395,7 +395,7 @@ pub const Controller = struct {
     }
 };
 
-/// Resolves the installed Linux CEF helper path beside the app executable.
+/// Resolves the installed CEF helper path beside the app executable.
 fn browserHelperPath(allocator: std.mem.Allocator, helper_name: []const u8) ![]u8 {
     const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
     defer allocator.free(exe_dir);
@@ -441,7 +441,7 @@ fn helperReaderMain(context: *ReaderContext) !void {
     }
 }
 
-// Replaces std.process.Child with a direct fork/exec path because Linux CEF hangs under the std child launcher.
+// Replaces std.process.Child with a direct fork/exec path because the helper runtime hangs under the std child launcher.
 fn execHelperChild(
     helper_dir_z: [*:0]const u8,
     helper_path_z: [*:0]const u8,
@@ -473,7 +473,7 @@ fn execHelperChild(
     std.posix.execveZ(helper_path_z, argv, envp) catch std.posix.exit(127);
 }
 
-// Closes unrelated desktop-app descriptors so the Linux CEF host starts in a shell-like fd state.
+// Closes unrelated desktop-app descriptors so the helper host starts in a shell-like fd state.
 fn closeInheritedFileDescriptors() void {
     const limits = std.posix.getrlimit(.NOFILE) catch return;
     const max_fd: usize = @intCast(@min(limits.cur, 4096));
@@ -525,23 +525,31 @@ fn restoreDefaultSignal(signal_number: u8) void {
     std.posix.sigaction(signal_number, &action, null);
 }
 
-// Creates shared memory frame slots so the helper can publish pixels without rewriting files.
+// Creates shared frame slots so the helper can publish pixels without rewriting files.
 fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_SLOT_COUNT]std.posix.fd_t {
     var frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
     errdefer frame.deinit(allocator);
 
     inline for (0..FRAME_SLOT_COUNT) |index| {
-        const name: [*:0]const u8 = switch (index) {
-            0 => "verde-cef-frame-0",
-            1 => "verde-cef-frame-1",
-            2 => "verde-cef-frame-2",
-            else => unreachable,
-        };
-        const raw_fd = std.os.linux.memfd_create(name, 0);
-        switch (std.posix.errno(raw_fd)) {
-            .SUCCESS => frame_fds[index] = @intCast(raw_fd),
-            else => return error.FrameMemfdCreateFailed,
-        }
+        const frame_path = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/verde-cef-frame-{d}-{d}-{d}.rgba",
+            .{
+                @as(i32, @intCast(std.c.getpid())),
+                std.time.milliTimestamp(),
+                index,
+            },
+        );
+        defer allocator.free(frame_path);
+
+        var frame_file = try std.fs.createFileAbsolute(frame_path, .{
+            .read = true,
+            .truncate = true,
+            .exclusive = true,
+        });
+        std.fs.deleteFileAbsolute(frame_path) catch {};
+        frame_fds[index] = frame_file.handle;
+        frame_file.handle = -1;
         errdefer std.posix.close(frame_fds[index]);
 
         try std.posix.ftruncate(frame_fds[index], FRAME_BYTES_MAX);
@@ -569,7 +577,7 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .document_loaded => .document_loaded,
         .js_message => .{ .js_message = try allocator.dupe(u8, event.payload orelse "{}") },
         .eval_result => .{ .eval_result = try allocator.dupe(u8, event.payload orelse "null") },
-        .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux CEF helper failed.") },
+        .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "CEF helper failed.") },
         .frame_ready => unreachable,
     };
 }

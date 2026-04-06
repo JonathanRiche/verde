@@ -73,6 +73,12 @@ Linux source install with the embedded CEF browser pane:
 bash ./scripts/release/install-linux-local-cef.sh
 ```
 
+macOS source install with the embedded CEF browser pane:
+
+```bash
+./scripts/release/install-macos-local.sh
+```
+
 System-wide install:
 
 ```bash
@@ -88,6 +94,7 @@ That installs:
 - `verde.desktop` into `share/applications/` on Linux
 - `verde.png` into `share/pixmaps/` on Linux
 - `SDL3.framework` into `bin/SDL3.framework` on macOS
+- when `-Dcef-sdk-path=...` is provided, the CEF helper binaries and platform runtime are installed alongside the app binaries
 
 After a user-local install, make sure `~/.local/bin` is on your `PATH`.
 
@@ -97,6 +104,21 @@ To install a real macOS app bundle, use:
 
 ```bash
 ./scripts/release/install-macos-local.sh
+```
+
+On macOS, that installer now downloads and bundles the matching CEF runtime automatically by default.
+
+If you already have a local CEF SDK cache and want to force a specific one, set `VERDE_CEF_SDK_PATH`:
+
+```bash
+VERDE_CEF_SDK_PATH=$HOME/.cache/verde/cef-sdk/cef_binary_..._macosarm64_minimal \
+  ./scripts/release/install-macos-local.sh
+```
+
+If you want a no-CEF app bundle for faster local iteration, set:
+
+```bash
+VERDE_CEF_DISABLE_DOWNLOAD=1 ./scripts/release/install-macos-local.sh
 ```
 
 That builds `Verde.app` and copies it into `~/Applications` by default. To install for all users instead:

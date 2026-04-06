@@ -2,6 +2,10 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "cef_loader.h"
 
 extern "C" int verde_cef_execute_subprocess(int argc, const char* const* argv);
@@ -22,11 +26,20 @@ bool isChromiumSubprocess(int argc, char** argv) {
 }
 
 std::string selfExePath() {
+#if defined(__APPLE__)
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  if (size == 0) return {};
+  std::vector<char> buffer(size + 1, '\0');
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+  return std::string(buffer.data());
+#else
   std::vector<char> buffer(4096);
   const ssize_t len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
   if (len <= 0) return {};
   buffer[static_cast<size_t>(len)] = '\0';
   return std::string(buffer.data(), static_cast<size_t>(len));
+#endif
 }
 
 std::string dirnameOf(const std::string& path) {

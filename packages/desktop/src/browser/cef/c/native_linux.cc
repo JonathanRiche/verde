@@ -9,7 +9,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -21,7 +23,11 @@
 #include "include/cef_context_menu_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_v8.h"
+#if defined(__APPLE__)
+#include "include/internal/cef_mac.h"
+#else
 #include "include/internal/cef_linux.h"
+#endif
 #include "include/wrapper/cef_helpers.h"
 
 namespace {
@@ -67,12 +73,22 @@ bool isOomAdjustPath(const char* pathname) {
              0;
 }
 
+#if defined(__linux__)
 int openViaSyscall(int dirfd, const char* pathname, int flags, mode_t mode) {
   return static_cast<int>(syscall(SYS_openat, dirfd, pathname, flags, mode));
 }
 
 int closeViaSyscall(int fd) {
   return static_cast<int>(syscall(SYS_close, fd));
+}
+#endif
+
+std::string defaultCacheRoot() {
+  const char* tmpdir = std::getenv("TMPDIR");
+  if (tmpdir != nullptr && tmpdir[0] != '\0') {
+    return std::string(tmpdir) + "/verde-cef-cache";
+  }
+  return "/tmp/verde-cef-cache";
 }
 
 uint32_t eventFlagsFromModifiers(unsigned int modifiers) {
@@ -656,6 +672,7 @@ void pumpMessageLoopFor(std::chrono::milliseconds slice,
 
 }  // namespace
 
+#if defined(__linux__)
 extern "C" int open(const char* pathname, int flags, ...) {
   mode_t mode = 0;
   if ((flags & O_CREAT) != 0) {
@@ -689,6 +706,7 @@ extern "C" bool _ZN4base14AdjustOOMScoreEii(int process, int score) {
   (void)score;
   return true;
 }
+#endif
 
 extern "C" int verde_cef_execute_subprocess(int argc,
                                              const char* const* argv) {
@@ -726,8 +744,7 @@ extern "C" int verde_cef_initialize(int argc,
   settings.windowless_rendering_enabled = true;
   settings.log_severity = LOGSEVERITY_INFO;
   settings.background_color = CefColorSetARGB(255, 255, 255, 255);
-  const std::string cache_root =
-      std::string(resources_dir != nullptr ? resources_dir : "/tmp") + "/verde-cef-cache";
+  const std::string cache_root = defaultCacheRoot();
   const std::string cache_path = cache_root + "/profile";
   CefString(&settings.browser_subprocess_path) = subprocess_path != nullptr ? subprocess_path : "";
   CefString(&settings.resources_dir_path) = resources_dir != nullptr ? resources_dir : "";
