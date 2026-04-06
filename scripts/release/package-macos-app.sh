@@ -35,6 +35,8 @@ ICONSET_DIR="$WORK_DIR/verde.iconset"
 ICON_FILE="$APP_DIR/Contents/Resources/verde.icns"
 
 source "$SCRIPT_DIR/cef-common.sh"
+need_cmd zig
+need_cmake
 
 mkdir -p "$OUTPUT_DIR"
 

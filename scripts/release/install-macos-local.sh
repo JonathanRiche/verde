@@ -26,6 +26,8 @@ DEST_APP_DIR="$APPLICATIONS_DIR/Verde.app"
 
 source "$SCRIPT_DIR/cef-common.sh"
 ARCH="$(uname -m)"
+need_cmd zig
+need_cmake
 
 cd "$REPO_ROOT"
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")

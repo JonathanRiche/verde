@@ -9,6 +9,21 @@ need_cmd() {
   fi
 }
 
+need_cmake() {
+  if command -v cmake >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "missing required command: cmake" >&2
+    echo "install it first, for example: brew install cmake" >&2
+    exit 1
+  fi
+
+  echo "missing required command: cmake" >&2
+  exit 1
+}
+
 verde_cef_normalize_arch() {
   case "$1" in
     x86_64|amd64) printf '%s\n' "x86_64" ;;

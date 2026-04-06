@@ -20,6 +20,7 @@ PREFIX="${1:-${VERDE_INSTALL_PREFIX:-$HOME/.local}}"
 source "$SCRIPT_DIR/cef-common.sh"
 
 need_cmd zig
+need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
 
 cd "$DESKTOP_ROOT"

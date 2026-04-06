@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
             "bash",
             "-lc",
             b.fmt(
-                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel",
+                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel",
                 .{cef_sdk_path.?},
             ),
         });
