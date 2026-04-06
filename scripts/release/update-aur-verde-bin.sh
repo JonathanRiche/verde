@@ -47,13 +47,23 @@ SRCINFO="${AUR_REPO_DIR}/.SRCINFO"
 sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" "${PKGBUILD}"
 sed -i -E "/^sha256sums=\(/,/^\)/c\\sha256sums=(\\n  '${LINUX_SHA}'\\n  '${LICENSE_SHA}'\\n)" "${PKGBUILD}"
 
-if ! grep -Fq "'zenity'" "${PKGBUILD}"; then
+awk '
+  /^depends=\(/ { in_depends = 1 }
+  in_depends && /'\''zenity'\''/ { next }
+  /^\)/ && in_depends {
+    in_depends = 0
+  }
+  { print }
+' "${PKGBUILD}" > "${PKGBUILD}.tmp"
+mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+
+if ! grep -Fq "'zenity: native folder picker integration'" "${PKGBUILD}"; then
   awk '
-    /^\)/ && in_depends {
-      print "  '\''zenity'\''"
-      in_depends = 0
+    /^\)/ && in_optdepends {
+      print "  '\''zenity: native folder picker integration'\''"
+      in_optdepends = 0
     }
-    /^depends=\(/ { in_depends = 1 }
+    /^optdepends=\(/ { in_optdepends = 1 }
     { print }
   ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
   mv "${PKGBUILD}.tmp" "${PKGBUILD}"
@@ -97,10 +107,16 @@ awk \
   ' "${SRCINFO}" > "${SRCINFO}.tmp"
 mv "${SRCINFO}.tmp" "${SRCINFO}"
 
-if ! grep -Fq $'\tdepends = zenity' "${SRCINFO}"; then
+awk '
+  $0 == "\tdepends = zenity" { next }
+  { print }
+' "${SRCINFO}" > "${SRCINFO}.tmp"
+mv "${SRCINFO}.tmp" "${SRCINFO}"
+
+if ! grep -Fq $'\toptdepends = zenity: native folder picker integration' "${SRCINFO}"; then
   awk '
     /^\tpkgname = / && !inserted {
-      print "\tdepends = zenity"
+      print "\toptdepends = zenity: native folder picker integration"
       inserted = 1
     }
     { print }
