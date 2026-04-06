@@ -123,3 +123,49 @@ jobs:
         with:
           files: release-assets/*
           generate_release_notes: true
+
+  sync-aur:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: publish
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AUR SSH key
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+            echo "AUR_SSH_PRIVATE_KEY secret is required" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Clone AUR repository
+        shell: bash
+        run: |
+          git clone ssh://aur@aur.archlinux.org/verde-bin.git /tmp/verde-bin-aur
+
+      - name: Update AUR package metadata
+        shell: bash
+        run: |
+          bash ./scripts/release/update-aur-verde-bin.sh "${GITHUB_REF_NAME}" /tmp/verde-bin-aur
+
+      - name: Commit and push AUR update
+        shell: bash
+        run: |
+          cd /tmp/verde-bin-aur
+          if git diff --quiet; then
+            echo "No AUR changes required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update verde-bin to ${GITHUB_REF_NAME}"
+          git push origin master
