@@ -1,0 +1,10 @@
+{
+  "name": "verde-dev-tools",
+  "private": true,
+  "scripts": {
+    "postinstall": "node ./scripts/dev/patch-agent-ci.mjs"
+  },
+  "devDependencies": {
+    "@redwoodjs/agent-ci": "^0.6.0"
+  }
+}

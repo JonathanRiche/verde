@@ -14,24 +14,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            artifact_name: release-linux-x86_64
-            package_script: scripts/release/package-linux.sh
-            zig_download: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-            zig_dir: zig-x86_64-linux-0.15.2
-          - os: macos-15-intel
-            artifact_name: release-macos-x86_64
-            package_script: scripts/release/package-macos-app.sh
-            zig_download: https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz
-            zig_dir: zig-x86_64-macos-0.15.2
-          - os: macos-14
-            artifact_name: release-macos-arm64
-            package_script: scripts/release/package-macos-app.sh
-            zig_download: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
-            zig_dir: zig-aarch64-macos-0.15.2
+        target:
+          - linux-x86_64
+          - macos-x86_64
+          - macos-arm64
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.target == 'linux-x86_64' && 'ubuntu-24.04' || matrix.target == 'macos-x86_64' && 'macos-15-intel' || 'macos-14' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -50,9 +38,28 @@ jobs:
       - name: Install Zig
         shell: bash
         run: |
-          curl -fL --retry 5 --retry-delay 2 "${{ matrix.zig_download }}" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          echo "$PWD/${{ matrix.zig_dir }}" >> "$GITHUB_PATH"
+          case "${{ matrix.target }}" in
+            linux-x86_64)
+              ZIG_DOWNLOAD="https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz"
+              ZIG_DIR="zig-x86_64-linux-0.15.2"
+              ;;
+            macos-x86_64)
+              ZIG_DOWNLOAD="https://ziglang.org/download/0.15.2/zig-x86_64-macos-0.15.2.tar.xz"
+              ZIG_DIR="zig-x86_64-macos-0.15.2"
+              ;;
+            macos-arm64)
+              ZIG_DOWNLOAD="https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz"
+              ZIG_DIR="zig-aarch64-macos-0.15.2"
+              ;;
+            *)
+              echo "unsupported release target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+
+          curl -fL --retry 5 --retry-delay 2 "${ZIG_DOWNLOAD}" -o zig.tar.xz
+          python3 -c "import tarfile; tarfile.open('zig.tar.xz').extractall('.')"
+          echo "$PWD/${ZIG_DIR}" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         shell: bash
@@ -67,6 +74,7 @@ jobs:
           for attempt in 1 2 3; do
             if rustup toolchain install stable --profile minimal --no-self-update; then
               rustup default stable
+              echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
               cargo --version
               rustc --version
               exit 0
@@ -78,38 +86,93 @@ jobs:
             sleep 15
           done
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+      - name: Install Bun
+        shell: bash
+        run: |
+          export BUN_INSTALL="${RUNNER_TEMP:-/tmp}/.bun"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+
+          if ! command -v bun >/dev/null 2>&1; then
+            curl -fsSL https://bun.sh/install | bash
+          fi
+
+          echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
+          bun --version
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          SUDO=""
+          if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          fi
+
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential \
+            clang \
+            g++ \
             cmake \
             ninja-build \
             patchelf \
             pkg-config \
             curl \
-            libgl1-mesa-dev
+            libasound2-dev \
+            libatk1.0-dev \
+            libatspi2.0-dev \
+            libcairo2-dev \
+            libcups2-dev \
+            libdbus-1-dev \
+            libdrm-dev \
+            libgl1-mesa-dev \
+            libgbm-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libnspr4-dev \
+            libnss3-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libclang-dev
 
       - name: Compute release version
         id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
-            echo "value=manual-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
+            fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
+            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build release artifact
         shell: bash
         run: |
+          export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP:-/tmp}/zig-cache"
+
+          case "${{ matrix.target }}" in
+            linux-x86_64)
+              PACKAGE_SCRIPT="scripts/release/package-linux.sh"
+              ;;
+            macos-x86_64|macos-arm64)
+              PACKAGE_SCRIPT="scripts/release/package-macos-app.sh"
+              ;;
+            *)
+              echo "unsupported release target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+
           mkdir -p dist
           for attempt in 1 2 3; do
-            if bash "${{ matrix.package_script }}" "${{ steps.version.outputs.value }}" dist; then
+            if bash "${PACKAGE_SCRIPT}" "${{ steps.version.outputs.value }}" dist; then
               exit 0
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -121,7 +184,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: release-${{ matrix.target }}
           path: dist/*
 
   publish:
