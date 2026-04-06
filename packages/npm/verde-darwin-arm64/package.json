@@ -1,0 +1,22 @@
+{
+  "name": "verde-app-darwin-arm64",
+  "version": "0.0.0-dev",
+  "description": "macOS arm64 runtime package for Verde",
+  "license": "MIT",
+  "homepage": "https://github.com/JonathanRiche/verde",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonathanRiche/verde.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "Verde.app",
+    "index.js",
+    "README.md"
+  ]
+}

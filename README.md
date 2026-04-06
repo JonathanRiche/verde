@@ -129,6 +129,24 @@ That builds `Verde.app` and copies it into `~/Applications` by default. To insta
 
 Release `.zip` artifacts on macOS already contain `Verde.app`, so end users can also unzip and drag the app bundle into `Applications`.
 
+## Install with npm
+
+For developers who prefer npm-style tools, Verde can also be distributed as a platform-specific npm package with a thin launcher.
+
+Typical usage:
+
+```bash
+npx verde-app
+npm install -g verde-app
+verde
+```
+
+The npm path is intended for developer machines on:
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
 ## Development
 
 From the repo root:

@@ -193,17 +193,40 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: release-assets
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Build npm packages
+        shell: bash
+        run: |
+          node ./scripts/release/package-npm.mjs "${GITHUB_REF_NAME}" release-assets release-assets
+
       - name: Generate checksums
         shell: bash
         run: |
           cd release-assets
           sha256sum * > SHA256SUMS.txt
+
+      - name: Publish npm packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish."
+            exit 0
+          fi
+          node ./scripts/release/publish-npm.mjs release-assets/npm-packages.json
 
       - uses: softprops/action-gh-release@v2
         with:
