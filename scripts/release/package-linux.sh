@@ -65,6 +65,7 @@ normalize_fff_dependency() {
 }
 
 mkdir -p "$OUTPUT_DIR"
+need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
 
 cd "$DESKTOP_ROOT"
