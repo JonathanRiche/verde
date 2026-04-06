@@ -128,7 +128,22 @@ pub fn build(b: *std.Build) void {
         else => {},
     }
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    if (target.result.os.tag == .linux) {
+        if (b.findProgram(&.{"patchelf"}, &.{})) |patchelf_path| {
+            const normalize_fff_needed = b.addSystemCommand(&.{
+                patchelf_path,
+                "--replace-needed",
+                b.pathResolve(&.{ "../../vendor/fff/target/release", fff_lib_name }),
+                fff_lib_name,
+            });
+            normalize_fff_needed.addArtifactArg(exe);
+            install_exe.step.dependOn(&normalize_fff_needed.step);
+        } else |_| {
+            std.log.warn("patchelf was not found; Linux builds may embed an absolute libfff_c.so dependency", .{});
+        }
+    }
+    b.getInstallStep().dependOn(&install_exe.step);
     if (target.result.os.tag == .linux and !cef_sdk_configured) {
         const browser_helper = b.addExecutable(.{
             .name = "verde-browser-linux",
