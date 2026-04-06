@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.each_lib_rpath = false;
     const build_fff = b.addSystemCommand(&.{
         "cargo",
         "build",
