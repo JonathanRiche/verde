@@ -31,6 +31,8 @@ zig build -Doptimize=ReleaseFast
 zig build --release=safe -p ~/.local
 zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
 zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
+zig build run -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
+zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
 ```
 
 These root commands delegate into `packages/desktop/`.
@@ -46,6 +48,8 @@ zig build -Doptimize=ReleaseSafe
 zig build -Doptimize=ReleaseFast
 zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
 zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
+zig build run -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
+zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
 ```
 
 What these do:
@@ -70,20 +74,20 @@ zig build --release=safe -p /usr/local
 
 The `/usr/local` example requires write access to that prefix.
 
-## Linux browser pane
+## CEF browser pane
 
-The in-app browser pane on Linux currently uses CEF. If you want the installed app to include the CEF browser path, you must pass `-Dcef-sdk-path=...` at build/install time.
+The in-app browser pane uses CEF when the build is pointed at a real CEF SDK. If you want the installed app to include the CEF browser path, pass `-Dcef-sdk-path=...` at build/install time.
 
 Without that flag:
 
 - the app still builds and installs
-- the Linux-specific CEF helper binaries are not built
+- the CEF helper binaries are not built
 - the app falls back to the non-CEF browser backend
 
 With that flag:
 
-- the Linux CEF helper binaries are built and installed into `zig-out/bin`
-- the required CEF runtime files are copied into the install prefix
+- the CEF helper binaries are built and installed into `zig-out/bin`
+- the required platform CEF runtime files are copied into the install prefix
 - the in-app browser pane uses the CEF path
 
 Typical Linux run:
@@ -113,17 +117,44 @@ Do not keep the CEF SDK under `/tmp`. Many Linux systems clear `/tmp` on reboot,
 $HOME/.cache/verde/cef-sdk
 ```
 
+Typical macOS app install:
+
+```bash
+./scripts/release/install-macos-local.sh
+```
+
+Typical macOS pinned-SDK app install:
+
+```bash
+./scripts/release/install-macos-local.sh
+```
+
 On Linux, the install step also writes:
 
 - `share/applications/verde.desktop`
 - `share/pixmaps/verde.png`
 
-On macOS, the prefix install places the executable, `libfff_c.dylib`, and `SDL3.framework` under the chosen prefix, but it does not create a `.app` bundle for Finder or the Dock.
+On macOS, the prefix install places the executable, `libfff_c.dylib`, `SDL3.framework`, and, when configured, the CEF helper binaries plus `Chromium Embedded Framework.framework` under the chosen prefix. It does not create a `.app` bundle for Finder or the Dock.
 
 For a local app install on macOS, run this from the repo root:
 
 ```bash
 ./scripts/release/install-macos-local.sh
+```
+
+That installer now downloads and bundles the matching CEF runtime automatically by default.
+
+To pin the build to a specific cached SDK instead, set `VERDE_CEF_SDK_PATH` when running the script:
+
+```bash
+VERDE_CEF_SDK_PATH=$HOME/.cache/verde/cef-sdk/cef_binary_..._macosarm64_minimal \
+  ./scripts/release/install-macos-local.sh
+```
+
+To skip the CEF download and build a no-CEF app bundle, set:
+
+```bash
+VERDE_CEF_DISABLE_DOWNLOAD=1 ./scripts/release/install-macos-local.sh
 ```
 
 That installs `Verde.app` into `~/Applications` by default. Pass `/Applications` if you want the system-wide Applications folder instead.

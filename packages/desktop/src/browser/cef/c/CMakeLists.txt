@@ -30,18 +30,33 @@ add_executable(verde-browser-cef-process
 
 SET_EXECUTABLE_TARGET_PROPERTIES(verde-browser-cef)
 SET_EXECUTABLE_TARGET_PROPERTIES(verde-browser-cef-process)
+
+if(APPLE)
+  set_target_properties(verde-browser-cef PROPERTIES
+    BUILD_RPATH "@loader_path"
+    INSTALL_RPATH "@loader_path"
+  )
+  set_target_properties(verde-browser-cef-process PROPERTIES
+    BUILD_RPATH "@loader_path"
+    INSTALL_RPATH "@loader_path"
+  )
+endif()
+
 target_link_libraries(verde-browser-cef PRIVATE
   libcef_lib
   libcef_dll_wrapper
-  dl
   ${CEF_STANDARD_LIBS}
 )
 target_link_libraries(verde-browser-cef-process PRIVATE
   libcef_lib
   libcef_dll_wrapper
-  dl
   ${CEF_STANDARD_LIBS}
 )
+
+if(UNIX AND NOT APPLE)
+  target_link_libraries(verde-browser-cef PRIVATE dl)
+  target_link_libraries(verde-browser-cef-process PRIVATE dl)
+endif()
 
 if(VERDE_OUTPUT_DIR)
   set_target_properties(verde-browser-cef PROPERTIES

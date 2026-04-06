@@ -1,5 +1,9 @@
 #include "cef_loader.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +15,7 @@ bool CefLoader::initialized_ = false;
 
 namespace {
 
+#if !defined(__APPLE__)
 void prependLibraryPath(const std::string& runtime_dir) {
   const char* current = std::getenv("LD_LIBRARY_PATH");
   if (current == nullptr || current[0] == '\0') {
@@ -27,6 +32,7 @@ void prependLibraryPath(const std::string& runtime_dir) {
   const std::string updated = runtime_dir + ":" + current_value;
   setenv("LD_LIBRARY_PATH", updated.c_str(), 1);
 }
+#endif
 
 bool loadLibrary(const std::string& path, bool required) {
   void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
@@ -48,6 +54,11 @@ bool CefLoader::Initialize(const std::string& runtime_dir) {
     return true;
   }
 
+#if defined(__APPLE__)
+  (void)runtime_dir;
+  initialized_ = true;
+  return true;
+#else
   prependLibraryPath(runtime_dir);
 
   const std::vector<std::pair<const char*, bool>> libraries = {
@@ -66,4 +77,5 @@ bool CefLoader::Initialize(const std::string& runtime_dir) {
 
   initialized_ = true;
   return true;
+#endif
 }

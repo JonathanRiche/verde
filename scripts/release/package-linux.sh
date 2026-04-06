@@ -10,23 +10,13 @@ VERSION="$1"
 OUTPUT_DIR="$2"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DESKTOP_ROOT="$REPO_ROOT/packages/desktop"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CALLER_ROOT="$(pwd)"
 if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
 fi
 ARCH="$(uname -m)"
-CACHE_ROOT="${VERDE_CEF_CACHE_DIR:-$HOME/.cache/verde/cef-sdk}"
-DEFAULT_CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}"
-if [[ -z "${VERDE_CEF_CACHE_DIR:-}" ]]; then
-  if ! mkdir -p "${DEFAULT_CACHE_BASE}/verde" 2>/dev/null; then
-    DEFAULT_CACHE_BASE="/tmp"
-  fi
-  CACHE_ROOT="${DEFAULT_CACHE_BASE}/verde/cef-sdk"
-fi
-CEF_BASENAME="cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal"
-CEF_ARCHIVE="$CEF_BASENAME.tar.bz2"
-CEF_URL="${VERDE_CEF_URL:-https://cef-builds.spotifycdn.com/cef_binary_146.0.9%2Bg3ca6a87%2Bchromium-146.0.7680.165_linux64_minimal.tar.bz2}"
-CEF_SDK_PATH="${VERDE_CEF_SDK_PATH:-$CACHE_ROOT/$CEF_BASENAME}"
+source "$SCRIPT_DIR/cef-common.sh"
 
 case "$ARCH" in
   x86_64) ARCH="x86_64" ;;
@@ -75,21 +65,10 @@ normalize_fff_dependency() {
 }
 
 mkdir -p "$OUTPUT_DIR"
-mkdir -p "$CACHE_ROOT"
-
-if [[ ! -d "$CEF_SDK_PATH" ]]; then
-  ARCHIVE_PATH="$CACHE_ROOT/$CEF_ARCHIVE"
-  if [[ ! -f "$ARCHIVE_PATH" ]]; then
-    echo "Downloading CEF into $CACHE_ROOT"
-    curl -fL --retry 3 --output "$ARCHIVE_PATH" "$CEF_URL"
-  fi
-
-  echo "Extracting CEF into $CACHE_ROOT"
-  python3 -c "import tarfile; tarfile.open('$ARCHIVE_PATH').extractall('$CACHE_ROOT')"
-fi
+verde_cef_ensure_sdk linux "$ARCH"
 
 cd "$DESKTOP_ROOT"
-zig build --release=safe -p "$PREFIX_DIR" -Dcef-sdk-path="$CEF_SDK_PATH"
+zig build --release=safe -p "$PREFIX_DIR" -Dcef-sdk-path="$VERDE_CEF_SDK_PATH_RESOLVED"
 
 mkdir -p \
   "$PACKAGE_ROOT/bin" \

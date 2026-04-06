@@ -3,10 +3,10 @@
 
 #include <string>
 
-// Preloads libcef and related runtime libraries on Linux before any CEF API use.
+// Preloads the CEF runtime before any API use when the platform needs it.
 class CefLoader {
  public:
-  // Loads the CEF runtime from the helper executable directory.
+  // Prepares the CEF runtime from the helper executable directory.
   static bool Initialize(const std::string& runtime_dir);
 
  private:

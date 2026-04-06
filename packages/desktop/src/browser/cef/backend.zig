@@ -1,4 +1,4 @@
-//! Lazy CEF-oriented browser backend that uses a Linux helper for the real pane runtime.
+//! Lazy CEF-oriented browser backend that uses a helper process for the real pane runtime.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,7 +14,7 @@ const browser_types = @import("../types.zig");
 const DEFAULT_PANE_WIDTH: u32 = 1280;
 const DEFAULT_PANE_HEIGHT: u32 = 720;
 const DEFAULT_SESSION_ID: browser_types.SessionId = 1;
-/// Backs the desktop browser dock with either the real Linux CEF helper or the preview texture path.
+/// Backs the desktop browser dock with either the real helper-backed CEF runtime or the preview texture path.
 pub const Backend = struct {
     allocator: std.mem.Allocator,
     queue: browser_queue.EventQueue = .{},
@@ -222,9 +222,9 @@ pub const Backend = struct {
         return self.queue.pop();
     }
 
-    // Reports whether this build should use the real Linux helper runtime instead of the synthetic preview.
+    // Reports whether this build should use the real helper runtime instead of the synthetic preview.
     fn usingNativeRuntime(self: *const Backend) bool {
-        return builtin.os.tag == .linux and self.sdkConfigured() and !self.stubPreview();
+        return (builtin.os.tag == .linux or builtin.os.tag == .macos) and self.sdkConfigured() and !self.stubPreview();
     }
 
     // Warms the runtime once so the browser cost is paid on first open instead of app launch.

@@ -6,7 +6,8 @@ pub fn build(b: *std.Build) void {
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
-    const cef_sdk_configured = cef_sdk_path != null and target.result.os.tag == .linux;
+    const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
+    const cef_sdk_configured = cef_sdk_path != null and cef_supported;
     const fff_root = b.path("../../vendor/fff");
     const inspector_root = b.path("../browser_extensions/inspector");
     const fff_lib_name = switch (target.result.os.tag) {
@@ -171,7 +172,7 @@ pub fn build(b: *std.Build) void {
             "bash",
             "-lc",
             b.fmt(
-                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process -j$(nproc)",
+                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -G Ninja -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel",
                 .{cef_sdk_path.?},
             ),
         });
@@ -189,7 +190,11 @@ pub fn build(b: *std.Build) void {
         );
         install_cef_process_helper.step.dependOn(&build_cef_helper.step);
         b.getInstallStep().dependOn(&install_cef_process_helper.step);
-        installLinuxCefRuntime(b, cef_sdk_path.?);
+        switch (target.result.os.tag) {
+            .linux => installLinuxCefRuntime(b, cef_sdk_path.?),
+            .macos => installMacOSCefRuntime(b, cef_sdk_path.?),
+            else => {},
+        }
     }
     const install_fff = b.addInstallBinFile(fff_lib_path, fff_lib_name);
     install_fff.step.dependOn(&build_fff.step);
@@ -345,5 +350,13 @@ fn installLinuxCefRuntime(b: *std.Build, sdk_path: []const u8) void {
         .source_dir = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Resources", "locales" }) },
         .install_dir = .bin,
         .install_subdir = "locales",
+    }).step);
+}
+
+fn installMacOSCefRuntime(b: *std.Build, sdk_path: []const u8) void {
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "Release", "Chromium Embedded Framework.framework" }) },
+        .install_dir = .bin,
+        .install_subdir = "Chromium Embedded Framework.framework",
     }).step);
 }
