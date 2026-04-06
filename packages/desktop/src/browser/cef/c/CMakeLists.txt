@@ -14,7 +14,9 @@ list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
 
 add_subdirectory(${CEF_LIBCEF_DLL_WRAPPER_PATH} libcef_dll_wrapper)
-ADD_LOGICAL_TARGET(libcef_lib "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
+if(NOT APPLE)
+  ADD_LOGICAL_TARGET(libcef_lib "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
+endif()
 
 add_executable(verde-browser-cef
   cef_loader.cpp
@@ -43,17 +45,17 @@ if(APPLE)
 endif()
 
 target_link_libraries(verde-browser-cef PRIVATE
-  libcef_lib
   libcef_dll_wrapper
   ${CEF_STANDARD_LIBS}
 )
 target_link_libraries(verde-browser-cef-process PRIVATE
-  libcef_lib
   libcef_dll_wrapper
   ${CEF_STANDARD_LIBS}
 )
 
 if(UNIX AND NOT APPLE)
+  target_link_libraries(verde-browser-cef PRIVATE libcef_lib)
+  target_link_libraries(verde-browser-cef-process PRIVATE libcef_lib)
   target_link_libraries(verde-browser-cef PRIVATE dl)
   target_link_libraries(verde-browser-cef-process PRIVATE dl)
 endif()
