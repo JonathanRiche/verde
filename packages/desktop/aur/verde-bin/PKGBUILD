@@ -33,12 +33,12 @@ depends=(
   'nss'
   'pango'
   'systemd-libs'
-  'zenity'
   'zlib'
 )
 optdepends=(
   'codex: local Codex CLI integration'
   'opencode: local OpenCode CLI integration'
+  'zenity: native folder picker integration'
 )
 provides=('verde')
 conflicts=('verde' 'verde-git')
