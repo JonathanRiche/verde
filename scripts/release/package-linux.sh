@@ -53,6 +53,27 @@ strip_debug_symbols() {
   strip --strip-debug "$path"
 }
 
+normalize_fff_dependency() {
+  local path="$1"
+  local original_needed="$2"
+  local replacement_needed="$3"
+
+  if [[ ! -f "$path" ]]; then
+    return
+  fi
+
+  if ! command -v patchelf >/dev/null 2>&1; then
+    echo "warning: patchelf was not found; packaged verde may retain an absolute libfff_c.so dependency" >&2
+    return
+  fi
+
+  if ! readelf -d "$path" | grep -Fq "$original_needed"; then
+    return
+  fi
+
+  patchelf --replace-needed "$original_needed" "$replacement_needed" "$path"
+}
+
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$CACHE_ROOT"
 
@@ -96,6 +117,11 @@ cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
+
+normalize_fff_dependency \
+  "$PACKAGE_ROOT/bin/verde" \
+  "$REPO_ROOT/vendor/fff/target/release/libfff_c.so" \
+  "libfff_c.so"
 
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
