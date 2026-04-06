@@ -2584,7 +2584,7 @@ pub const AppState = struct {
                 }
             },
             .cancelled => self.setSidebarNotice("Folder selection cancelled."),
-            .unavailable => self.setSidebarNotice("No folder picker found. Paste a directory path manually."),
+            .unavailable => self.setSidebarNotice("No supported folder picker found. Install zenity or paste a directory path manually."),
             .failed => self.setSidebarNotice("Folder picker failed."),
             else => {},
         }
