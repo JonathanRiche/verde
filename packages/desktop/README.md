@@ -221,7 +221,7 @@ User config is loaded from:
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
 
-Current supported config includes UI font size, keybind overrides, and the default action behind the main `Open` button plus `CommandOrControl+O`. Example:
+Current supported config includes UI font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`. Example:
 
 ```json
 {
@@ -233,13 +233,13 @@ Current supported config includes UI font size, keybind overrides, and the defau
   },
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
-    "open": "CommandOrControl+O",
+    "open": "Alt+O",
     "terminal": "CommandOrControl+J"
   }
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `CommandOrControl+O`. Built-in terminal toggle binding is `CommandOrControl+J`. Refresh reloads app state from disk, config, and keybinds.
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in terminal toggle binding is `CommandOrControl+J`. Refresh reloads app state from disk, config, and keybinds.
 
 `open.default` accepts lower-case string values:
 

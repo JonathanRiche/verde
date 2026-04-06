@@ -201,7 +201,7 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+O"),
+        try parseDefaultAccelerator("Alt+O"),
     });
 }
 
@@ -463,5 +463,17 @@ test "open keybind override accepts a single accelerator" {
     try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
     try std.testing.expect(config.open_default[0].ctrl);
     try std.testing.expect(config.open_default[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
+}
+
+test "default open keybind uses alt plus o" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
+    try std.testing.expect(config.open_default[0].alt);
+    try std.testing.expect(!config.open_default[0].ctrl);
+    try std.testing.expect(!config.open_default[0].meta);
+    try std.testing.expect(!config.open_default[0].primary);
     try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
 }
