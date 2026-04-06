@@ -91,6 +91,35 @@ const AccessModeOption = struct {
     value: AccessMode,
 };
 
+const InspectorPromptSubmittedEvent = struct {
+    payload: struct {
+        prompt: []const u8,
+        selection: InspectorSelectionPayload,
+    },
+};
+
+const InspectorSelectionPayload = struct {
+    mode: []const u8,
+    element: ?InspectorElementPayload = null,
+    elements: ?[]InspectorElementPayload = null,
+    rect: ?InspectorRectPayload = null,
+};
+
+const InspectorElementPayload = struct {
+    selector: ?[]const u8 = null,
+    tagName: ?[]const u8 = null,
+    textSnippet: ?[]const u8 = null,
+    ariaLabel: ?[]const u8 = null,
+    href: ?[]const u8 = null,
+};
+
+const InspectorRectPayload = struct {
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+};
+
 pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.4", .value = "opencode/gpt-5.4" },
     .{ .label = "Claude Opus 4.6", .value = "opencode/claude-opus-4-6" },
@@ -1692,6 +1721,11 @@ pub const AppState = struct {
         return self.browser_state.inspectorEnabled();
     }
 
+    /// Reports which interaction mode the bundled browser inspector will use.
+    pub fn browserInspectorMode(self: *const AppState) browser_runtime.InspectorMode {
+        return self.browser_state.inspectorMode();
+    }
+
     /// Computes the height reserved for the browser dock inside the chat workspace.
     pub fn browserPanelHeight(self: *const AppState, available_height: f32) f32 {
         if (!self.isBrowserVisible()) return 0.0;
@@ -1863,6 +1897,19 @@ pub const AppState = struct {
         self.enableBrowserInspector(true);
     }
 
+    /// Updates the browser inspector mode and reapplies the live inspector when needed.
+    pub fn setBrowserInspectorMode(self: *AppState, mode: browser_runtime.InspectorMode) void {
+        if (self.browser_state.inspectorMode() == mode) return;
+
+        self.browser_state.setInspectorMode(mode);
+        if (!self.browser_state.inspectorEnabled()) {
+            self.setSidebarNotice(inspectorModeStoredNotice(mode));
+            return;
+        }
+
+        self.applyBrowserInspector(true, inspectorModeSwitchedNotice(mode));
+    }
+
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
         if (self.browser_launch_open_delay_frames > 0) {
@@ -1903,9 +1950,9 @@ pub const AppState = struct {
                         }
                         self.browser_state.setLastJsMessage(message) catch {};
                         if (isInspectorSelectionMessage(message)) {
-                            self.setSidebarNotice("Browser inspector captured an element.");
+                            self.setSidebarNotice("Browser inspector captured a selection.");
                         } else if (isInspectorPromptSubmittedMessage(message)) {
-                            self.setSidebarNotice("Browser inspector prompt submitted.");
+                            self.handleInspectorPromptSubmitted(message);
                         }
                         continue;
                     }
@@ -1939,8 +1986,163 @@ pub const AppState = struct {
         return try std.fmt.allocPrint(self.allocator, "https://{s}", .{value});
     }
 
+    fn inspectorModeStoredNotice(mode: browser_runtime.InspectorMode) []const u8 {
+        return switch (mode) {
+            .point => "Browser inspector mode set to Point.",
+            .draw_box => "Browser inspector mode set to Draw Box.",
+            .draw_freeform => "Browser inspector mode set to Draw Freeform.",
+        };
+    }
+
+    fn inspectorModeSwitchedNotice(mode: browser_runtime.InspectorMode) []const u8 {
+        return switch (mode) {
+            .point => "Browser inspector switched to Point mode.",
+            .draw_box => "Browser inspector switched to Draw Box mode.",
+            .draw_freeform => "Browser inspector switched to Draw Freeform mode.",
+        };
+    }
+
+    fn handleInspectorPromptSubmitted(self: *AppState, message: []const u8) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No active chat is available for the browser inspector prompt.");
+            return;
+        }
+
+        var parsed = std.json.parseFromSlice(InspectorPromptSubmittedEvent, self.allocator, message, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("failed to parse inspector prompt submission: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be parsed.");
+            return;
+        };
+        defer parsed.deinit();
+
+        const prompt = std.mem.trim(u8, parsed.value.payload.prompt, &std.ascii.whitespace);
+        if (prompt.len == 0) {
+            self.setSidebarNotice("Browser inspector prompt was empty.");
+            return;
+        }
+
+        const draft_block = buildInspectorDraftBlock(self.allocator, parsed.value.payload.selection, prompt) catch |err| {
+            log.warn("failed to build inspector draft block: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be prepared.");
+            return;
+        };
+        defer self.allocator.free(draft_block);
+
+        const current_draft = self.currentDraft();
+        const next_draft = if (current_draft.len == 0)
+            self.allocator.dupe(u8, draft_block)
+        else
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ current_draft, draft_block });
+        const resolved_next_draft = next_draft catch |err| {
+            log.warn("failed to append inspector prompt to draft: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be added to the draft.");
+            return;
+        };
+        defer self.allocator.free(resolved_next_draft);
+
+        self.setDraft(resolved_next_draft);
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+        self.setSidebarNotice("Browser inspector prompt added to the current chat draft.");
+    }
+
+    fn buildInspectorDraftBlock(
+        allocator: std.mem.Allocator,
+        selection: InspectorSelectionPayload,
+        prompt: []const u8,
+    ) ![]u8 {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(allocator);
+
+        try buffer.writer(allocator).print(
+            "Browser inspector selection\nMode: {s}\n",
+            .{selection.mode},
+        );
+
+        if (selection.rect) |rect| {
+            try buffer.writer(allocator).print(
+                "Region: {d:.0} x {d:.0} at ({d:.0}, {d:.0})\n",
+                .{ rect.width, rect.height, rect.x, rect.y },
+            );
+        }
+
+        if (selection.element) |element| {
+            try appendInspectorElementSummary(&buffer, allocator, element, null);
+        } else if (selection.elements) |elements| {
+            const count = @min(elements.len, 6);
+            try buffer.writer(allocator).print(
+                "Selected elements ({d} shown):\n",
+                .{count},
+            );
+            for (elements[0..count], 0..) |element, index| {
+                try appendInspectorElementSummary(&buffer, allocator, element, index + 1);
+            }
+            if (elements.len > count) {
+                try buffer.writer(allocator).print(
+                    "... and {d} more element{s}\n",
+                    .{ elements.len - count, if (elements.len - count == 1) "" else "s" },
+                );
+            }
+        }
+
+        try buffer.writer(allocator).print(
+            "Requested change:\n{s}",
+            .{prompt},
+        );
+
+        return buffer.toOwnedSlice(allocator);
+    }
+
+    fn appendInspectorElementSummary(
+        buffer: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        element: InspectorElementPayload,
+        index: ?usize,
+    ) !void {
+        const prefix = if (index) |value|
+            try std.fmt.allocPrint(allocator, "{d}. ", .{value})
+        else
+            try allocator.dupe(u8, "Element: ");
+        defer allocator.free(prefix);
+
+        try buffer.appendSlice(allocator, prefix);
+        try buffer.appendSlice(allocator, element.selector orelse "(unknown selector)");
+        if (element.tagName) |tag_name| {
+            try buffer.writer(allocator).print(" [{s}]", .{tag_name});
+        }
+        try buffer.append(allocator, '\n');
+
+        if (element.textSnippet) |text_snippet| {
+            const trimmed = std.mem.trim(u8, text_snippet, &std.ascii.whitespace);
+            if (trimmed.len > 0) {
+                try buffer.writer(allocator).print("   text: {s}\n", .{trimmed});
+            }
+        }
+        if (element.ariaLabel) |aria_label| {
+            const trimmed = std.mem.trim(u8, aria_label, &std.ascii.whitespace);
+            if (trimmed.len > 0) {
+                try buffer.writer(allocator).print("   aria-label: {s}\n", .{trimmed});
+            }
+        }
+        if (element.href) |href| {
+            const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+            if (trimmed.len > 0) {
+                try buffer.writer(allocator).print("   href: {s}\n", .{trimmed});
+            }
+        }
+    }
+
     // Enables the bundled inspector and dispatches one internal eval into the current browser document.
     fn enableBrowserInspector(self: *AppState, show_notice: bool) void {
+        self.applyBrowserInspector(show_notice, "Browser inspector enabled.");
+    }
+
+    // Enables or reapplies the bundled inspector using the currently selected mode.
+    fn applyBrowserInspector(self: *AppState, show_notice: bool, success_notice: []const u8) void {
         if (!self.isBrowserVisible()) {
             self.setSidebarNotice("Open the browser before enabling the inspector.");
             return;
@@ -1950,7 +2152,7 @@ pub const AppState = struct {
             return;
         }
 
-        const script = browser_inspector.enableScriptAlloc(self.allocator) catch |err| {
+        const script = browser_inspector.enableScriptAlloc(self.allocator, self.browser_state.inspectorMode()) catch |err| {
             log.err("failed to build browser inspector script: {s}", .{@errorName(err)});
             if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
             return;
@@ -1966,7 +2168,7 @@ pub const AppState = struct {
             if (show_notice) self.setSidebarNotice("Failed to enable the browser inspector.");
             return;
         };
-        if (show_notice) self.setSidebarNotice("Browser inspector enabled.");
+        if (show_notice) self.setSidebarNotice(success_notice);
     }
 
     // Disables the bundled inspector overlay while leaving the page alive.
@@ -1991,18 +2193,7 @@ pub const AppState = struct {
     fn reapplyBrowserInspectorAfterLoad(self: *AppState) void {
         if (!self.browser_state.inspectorEnabled()) return;
         if (!self.canUseBrowserInspector()) return;
-
-        const script = browser_inspector.enableScriptAlloc(self.allocator) catch |err| {
-            log.warn("failed to rebuild browser inspector after load: {s}", .{@errorName(err)});
-            return;
-        };
-        defer self.allocator.free(script);
-
-        self.browser_state.expectSuppressedEvalResult();
-        self.browser_state.controller.eval(script) catch |err| {
-            _ = self.browser_state.consumeSuppressedEvalResult();
-            log.warn("failed to reapply browser inspector after load: {s}", .{@errorName(err)});
-        };
+        self.applyBrowserInspector(false, "");
     }
 
     fn isInspectorBridgeMessage(message: []const u8) bool {
@@ -2015,11 +2206,13 @@ pub const AppState = struct {
 
     fn isInspectorLifecycleMessage(message: []const u8) bool {
         return std.mem.indexOf(u8, message, "\"type\":\"inspector:enabled\"") != null or
-            std.mem.indexOf(u8, message, "\"type\":\"inspector:disabled\"") != null;
+            std.mem.indexOf(u8, message, "\"type\":\"inspector:disabled\"") != null or
+            std.mem.indexOf(u8, message, "\"type\":\"inspector:mode-changed\"") != null;
     }
 
     fn isInspectorSelectionMessage(message: []const u8) bool {
-        return std.mem.indexOf(u8, message, "\"type\":\"element:selected\"") != null;
+        return std.mem.indexOf(u8, message, "\"type\":\"element:selected\"") != null or
+            std.mem.indexOf(u8, message, "\"type\":\"region:selected\"") != null;
     }
 
     fn isInspectorPromptSubmittedMessage(message: []const u8) bool {

@@ -1,5 +1,6 @@
 //! Browser dock rendering for the native shell.
 
+const std = @import("std");
 const zgui = @import("zgui");
 
 const app_state = @import("../state.zig");
@@ -7,6 +8,8 @@ const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
+
+const BROWSER_INSPECTOR_MODE_MENU_ID: [:0]const u8 = "BrowserInspectorModeMenu";
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
@@ -62,6 +65,7 @@ fn renderToolbar(state: *app_state.AppState) void {
     const close_icon = "\u{f00d}";
     const toolbar_height = theme.scaledUi(52.0);
     const button_size = theme.scaledUi(36.0);
+    const inspect_menu_button_width = theme.scaledUi(22.0);
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(10.0), theme.scaledUi(8.0) } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(18, 20, 25, 255) });
     defer {
@@ -85,7 +89,7 @@ fn renderToolbar(state: *app_state.AppState) void {
     const browser_state = state.browserState();
     const avail = zgui.getContentRegionAvail()[0];
     const gap = theme.scaledUi(8.0);
-    const field_width = @max(avail - button_size * 3.0 - gap * 3.0, theme.scaledUi(180.0));
+    const field_width = @max(avail - button_size * 3.0 - inspect_menu_button_width - gap * 3.0, theme.scaledUi(180.0));
 
     const frame_pad_y = (button_size - zgui.getFontSize()) * 0.5;
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), frame_pad_y } });
@@ -108,18 +112,47 @@ fn renderToolbar(state: *app_state.AppState) void {
     zgui.popStyleColor(.{ .count = 3 });
 
     zgui.sameLine(.{ .spacing = gap });
-    zgui.beginDisabled(.{ .disabled = !state.canUseBrowserInspector() });
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = if (state.isBrowserInspectorEnabled()) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (state.isBrowserInspectorEnabled()) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (state.isBrowserInspectorEnabled()) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    const can_use_inspector = state.canUseBrowserInspector();
+    const inspector_active = state.isBrowserInspectorEnabled();
+    const inspector_mode = state.browserInspectorMode();
+    const inspector_button_color = if (inspector_active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT;
+    const inspector_hover_color = if (inspector_active) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08);
+    const inspector_active_color = if (inspector_active) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14);
+    var inspector_menu_button_pos = [_]f32{ 0.0, 0.0 };
+
+    zgui.beginDisabled(.{ .disabled = !can_use_inspector });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = inspector_button_color });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = inspector_hover_color });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = inspector_active_color });
     if (zgui.button("##browser-inspect", .{ .w = button_size, .h = button_size })) {
         state.toggleBrowserInspector();
     }
-    drawCenteredIcon(inspect_icon, if (state.canUseBrowserInspector()) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE);
+    drawCenteredIcon(inspect_icon, if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE);
     if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
         _ = zgui.beginTooltip();
-        if (state.canUseBrowserInspector()) {
-            zgui.textUnformatted("Toggle the bundled DOM inspector inside the CEF pane");
+        if (can_use_inspector) {
+            zgui.text("Toggle the bundled DOM inspector inside the CEF pane\nCurrent mode: {s}", .{inspector_mode.label()});
+        } else {
+            zgui.textUnformatted("The page inspector currently requires a real CEF runtime");
+        }
+        zgui.endTooltip();
+    }
+
+    zgui.sameLine(.{ .spacing = 0.0 });
+    inspector_menu_button_pos = zgui.getCursorScreenPos();
+    if (zgui.button("##browser-inspect-mode", .{ .w = inspect_menu_button_width, .h = button_size })) {
+        zgui.openPopup(BROWSER_INSPECTOR_MODE_MENU_ID, .{});
+    }
+    drawDownChevron(
+        if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
+        inspector_menu_button_pos,
+        inspect_menu_button_width,
+        button_size,
+    );
+    if (zgui.isItemHovered(.{ .delay_normal = true, .allow_when_disabled = true })) {
+        _ = zgui.beginTooltip();
+        if (can_use_inspector) {
+            zgui.text("Choose the browser inspector mode\nCurrent mode: {s}", .{inspector_mode.label()});
         } else {
             zgui.textUnformatted("The page inspector currently requires a real CEF runtime");
         }
@@ -127,6 +160,38 @@ fn renderToolbar(state: *app_state.AppState) void {
     }
     zgui.popStyleColor(.{ .count = 3 });
     zgui.endDisabled();
+
+    zgui.setNextWindowPos(.{
+        .x = inspector_menu_button_pos[0] + inspect_menu_button_width - theme.scaledUi(180.0),
+        .y = inspector_menu_button_pos[1] + button_size + theme.scaledUi(6.0),
+        .cond = .appearing,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(12.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(8.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = colors.rgba(26, 28, 34, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(66, 68, 78, 255) });
+    defer {
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+    zgui.setNextWindowSize(.{ .w = theme.scaledUi(180.0), .h = 0.0, .cond = .appearing });
+    if (zgui.beginPopup(BROWSER_INSPECTOR_MODE_MENU_ID, .{})) {
+        defer zgui.endPopup();
+
+        if (renderInspectorModeMenuRow("Point", inspector_mode == .point)) {
+            state.setBrowserInspectorMode(.point);
+            zgui.closeCurrentPopup();
+        }
+        if (renderInspectorModeMenuRow("Draw Box", inspector_mode == .draw_box)) {
+            state.setBrowserInspectorMode(.draw_box);
+            zgui.closeCurrentPopup();
+        }
+        if (renderInspectorModeMenuRow("Draw Freeform", inspector_mode == .draw_freeform)) {
+            state.setBrowserInspectorMode(.draw_freeform);
+            zgui.closeCurrentPopup();
+        }
+    }
 
     zgui.sameLine(.{ .spacing = gap });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
@@ -137,6 +202,39 @@ fn renderToolbar(state: *app_state.AppState) void {
     }
     drawCenteredIcon(close_icon, theme.COLOR_WHITE);
     zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn drawDownChevron(color: [4]f32, start: [2]f32, width: f32, height: f32) void {
+    const center_x = start[0] + width * 0.5;
+    const center_y = start[1] + height * 0.5;
+    const half = theme.scaledUi(3.5);
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const draw_list = zgui.getWindowDrawList();
+    draw_list.addLine(.{
+        .p1 = .{ center_x - half, center_y - half * 0.5 },
+        .p2 = .{ center_x, center_y + half * 0.5 },
+        .col = col,
+        .thickness = theme.scaledUi(1.8),
+    });
+    draw_list.addLine(.{
+        .p1 = .{ center_x + half, center_y - half * 0.5 },
+        .p2 = .{ center_x, center_y + half * 0.5 },
+        .col = col,
+        .thickness = theme.scaledUi(1.8),
+    });
+}
+
+fn renderInspectorModeMenuRow(label: []const u8, selected: bool) bool {
+    var row_buf = std.mem.zeroes([64:0]u8);
+    const row_label = std.fmt.bufPrintZ(
+        &row_buf,
+        "{s}{s}",
+        .{ if (selected) "• " else "  ", label },
+    ) catch unreachable;
+    return zgui.selectable(row_label, .{
+        .selected = selected,
+        .h = theme.scaledUi(32.0),
+    });
 }
 
 /// Renders the in-app browser pane canvas or the current scaffold placeholder.

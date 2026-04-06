@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const inspector_bundle = @import("browser_inspector_bundle");
+const browser_runtime = @import("mod.zig");
 
 pub const bundle = inspector_bundle.bundle;
 
@@ -17,10 +18,11 @@ pub const disable_script =
 ;
 
 /// Wraps the bundled inspector runtime with the bridge expected by the CEF renderer process.
-pub fn enableScriptAlloc(allocator: std.mem.Allocator) ![]u8 {
+pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.InspectorMode) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         \\(function() {{
+        \\  const mode = "{s}";
         \\  window.__VERDE_INSPECTOR_BRIDGE__ = {{
         \\    postMessage: function(event) {{
         \\      if (window.__VERDE_CEF_IPC__ && typeof window.__VERDE_CEF_IPC__.postMessage === "function") {{
@@ -32,17 +34,20 @@ pub fn enableScriptAlloc(allocator: std.mem.Allocator) ![]u8 {
         \\{s}
         \\  }}
         \\  const handle = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null;
+        \\  if (handle && typeof handle.setMode === "function") {{
+        \\    handle.setMode(mode);
+        \\  }}
         \\  if (handle && typeof handle.enable === "function") {{
         \\    handle.enable();
         \\    return "enabled";
         \\  }}
         \\  if (window.VerdeInspector && typeof window.VerdeInspector.mount === "function") {{
-        \\    window.VerdeInspector.mount();
+        \\    window.VerdeInspector.mount({{ mode: mode }});
         \\    return "mounted";
         \\  }}
         \\  return "unavailable";
         \\}})();
     ,
-        .{bundle},
+        .{ mode.jsValue(), bundle },
     );
 }
