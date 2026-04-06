@@ -995,9 +995,11 @@ extern "C" int verde_cef_send_text_input(const char* text,
 
   sendFocusToBrowser();
   inputDebugLog("text_input text=\"%s\" modifiers=0x%x", text, modifiers);
-  (void)modifiers;
   const bool fallback_dispatched = insertTextIntoActiveElement(text);
   inputDebugLog("text_input fallback=%d", fallback_dispatched ? 1 : 0);
+  if (fallback_dispatched) {
+    return 1;
+  }
 
   for (const unsigned char* cursor =
            reinterpret_cast<const unsigned char*>(text);
