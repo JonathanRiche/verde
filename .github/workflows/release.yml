@@ -54,7 +54,29 @@ jobs:
           tar -xf zig.tar.xz
           echo "$PWD/${{ matrix.zig_dir }}" >> "$GITHUB_PATH"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -fL --retry 5 --retry-delay 2 https://sh.rustup.rs -o rustup-init.sh
+            sh rustup-init.sh -y --profile minimal --default-toolchain stable
+          fi
+
+          for attempt in 1 2 3; do
+            if rustup toolchain install stable --profile minimal --no-self-update; then
+              rustup default stable
+              cargo --version
+              rustc --version
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            echo "Retrying Rust toolchain install after transient failure (attempt $attempt)"
+            sleep 15
+          done
 
       - uses: oven-sh/setup-bun@v2
         with:
