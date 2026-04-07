@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   cpSync,
+  readdirSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -65,7 +66,7 @@ const platformPackages = [
     templateDir: path.join(repoRoot, "packages", "npm", "verde-linux-x64"),
     archiveName: `verde-${rawVersion}-linux-x86_64.tar.gz`,
     copyFromExtracted(extractDir, destDir) {
-      const extractedRoot = path.join(extractDir, `verde-${rawVersion}-linux-x86_64`);
+      const extractedRoot = resolveSingleDirectory(extractDir);
       for (const entry of ["bin", "share", "install-local.sh", "README.md"]) {
         const source = path.join(extractedRoot, entry);
         if (!existsSync(source)) continue;
@@ -112,11 +113,33 @@ function extractArchive(archivePath, destDir) {
   throw new Error(`unsupported archive type: ${archivePath}`);
 }
 
+function resolveSingleDirectory(rootDir) {
+  const entries = readdirSync(rootDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+
+  if (entries.length !== 1) {
+    throw new Error(`expected exactly one extracted directory in ${rootDir}, found ${entries.length}`);
+  }
+
+  return path.join(rootDir, entries[0]);
+}
+
 function rewritePackageJson(packageDir, updater) {
   const packageJsonPath = path.join(packageDir, "package.json");
   const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
   updater(packageJson);
   writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + "\n");
+}
+
+function fixupMacAppBundle(appDir) {
+  execFileSync(
+    "bash",
+    [path.join(repoRoot, "scripts", "release", "fixup-macos-app.sh"), appDir],
+    {
+      stdio: "inherit",
+    },
+  );
 }
 
 function shellQuote(value) {
@@ -153,6 +176,9 @@ for (const pkg of platformPackages) {
   rmSync(extractDir, { recursive: true, force: true });
   extractArchive(archivePath, extractDir);
   pkg.copyFromExtracted(extractDir, packageDir);
+  if (pkg.name.includes("-darwin-")) {
+    fixupMacAppBundle(path.join(packageDir, "Verde.app"));
+  }
   rewritePackageJson(packageDir, (packageJson) => {
     packageJson.version = npmVersion;
   });
