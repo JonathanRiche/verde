@@ -311,7 +311,7 @@ fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Nati
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasPendingStream() or state.isPickerPending() or state.hasActiveTerminalSessions())
+    return if (state.hasPendingStream() or state.isPickerPending() or state.hasVisibleTerminalSessions())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
