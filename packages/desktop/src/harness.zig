@@ -11,6 +11,7 @@ pub const AuthState = types.AuthState;
 pub const MessageRole = types.MessageRole;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatThreadSummary = types.ChatThreadSummary;
+pub const ReadThreadResult = types.ReadThreadResult;
 pub const ReasoningEffort = types.ReasoningEffort;
 pub const ApprovalPolicy = types.ApprovalPolicy;
 pub const SandboxMode = types.SandboxMode;
@@ -48,6 +49,13 @@ pub const ProviderClient = union(Provider) {
         return switch (self.*) {
             .opencode => |*client| client.listThreads(allocator),
             .codex => |*client| client.listThreads(allocator),
+        };
+    }
+
+    pub fn readThread(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8) !ReadThreadResult {
+        return switch (self.*) {
+            .opencode => |*client| client.readThread(allocator, thread_id),
+            .codex => |*client| client.readThread(allocator, thread_id),
         };
     }
 

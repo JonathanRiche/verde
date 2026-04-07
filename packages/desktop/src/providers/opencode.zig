@@ -94,6 +94,17 @@ pub const Client = struct {
         return threads.toOwnedSlice(allocator);
     }
 
+    pub fn readThread(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+    ) !provider_types.ReadThreadResult {
+        _ = self;
+        _ = allocator;
+        _ = thread_id;
+        return error.UnsupportedOperation;
+    }
+
     pub fn sendPrompt(
         self: *Client,
         allocator: std.mem.Allocator,

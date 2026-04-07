@@ -1,6 +1,7 @@
 //! SQLite client for persisting app state.
 
 const std = @import("std");
+const testing = std.testing;
 const zqlite = @import("zqlite");
 
 const schema = @import("schema.zig");
@@ -98,6 +99,8 @@ pub const Client = struct {
         errdefer self.conn.rollback();
 
         try self.conn.execNoArgs(
+            \\delete from messages;
+            \\delete from threads;
             \\delete from app_state;
             \\delete from projects;
         );
@@ -315,4 +318,92 @@ fn decodeOptionalEnum(comptime Enum: type, raw: ?i64) ?Enum {
 
 fn decodeEnumOr(comptime Enum: type, raw: i64, fallback: Enum) Enum {
     return std.meta.intToEnum(Enum, @as(u8, @intCast(raw))) catch fallback;
+}
+
+test "save clears orphaned threads left behind by manual db edits" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    const initial_state = PersistedState{
+        .selected_project_index = 0,
+        .projects = &.{.{
+            .id = "project-1",
+            .label = "Project",
+            .path = "/tmp/project",
+            .selected_thread_index = 0,
+            .threads = &.{.{
+                .title = "Original thread",
+                .committed = true,
+                .provider = .codex,
+                .draft = "",
+                .messages = &.{.{
+                    .role = .user,
+                    .author = "You",
+                    .body = "hello",
+                }},
+            }},
+        }},
+    };
+    try client.save(initial_state);
+
+    try client.conn.execNoArgs(
+        \\pragma foreign_keys = off;
+        \\delete from app_state;
+        \\delete from projects;
+        \\insert into threads (
+        \\    project_id,
+        \\    sort_index,
+        \\    title,
+        \\    committed,
+        \\    provider,
+        \\    harness,
+        \\    draft
+        \\) values (
+        \\    1,
+        \\    0,
+        \\    'orphaned thread',
+        \\    1,
+        \\    1,
+        \\    0,
+        \\    ''
+        \\);
+        \\pragma foreign_keys = on;
+    );
+
+    const recovered_state = PersistedState{
+        .selected_project_index = 0,
+        .projects = &.{.{
+            .id = "project-1",
+            .label = "Project",
+            .path = "/tmp/project",
+            .selected_thread_index = 0,
+            .threads = &.{.{
+                .title = "Recovered thread",
+                .committed = true,
+                .provider = .codex,
+                .draft = "",
+                .messages = &.{.{
+                    .role = .user,
+                    .author = "You",
+                    .body = "fixed",
+                }},
+            }},
+        }},
+    };
+    try client.save(recovered_state);
+
+    const loaded = try client.load(testing.allocator);
+    defer if (loaded) |*state| state.deinit();
+
+    try testing.expect(loaded != null);
+    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects.len);
+    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[0].threads.?.len);
+    try testing.expectEqualStrings("Recovered thread", loaded.?.value.projects[0].threads.?[0].title);
+    try testing.expectEqualStrings("fixed", loaded.?.value.projects[0].threads.?[0].messages[0].body);
 }
