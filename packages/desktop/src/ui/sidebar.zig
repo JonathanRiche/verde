@@ -396,6 +396,20 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         state.requestTranscriptScrollToBottom();
         state.markDirty();
     }
+
+    if (zgui.beginPopupContextItem()) {
+        defer zgui.endPopup();
+
+        state.selected_project_index = project_index;
+        state.projects.items[project_index].selected_thread_index = thread_index;
+        state.syncRenameBuffer();
+
+        const can_sync = thread.provider == .codex and thread.provider_thread_id != null;
+        if (zgui.menuItem("Sync thread", .{ .enabled = can_sync })) {
+            state.syncThreadFromProvider(project_index, thread_index);
+            zgui.closeCurrentPopup();
+        }
+    }
     zgui.popStyleVar(.{ .count = 1 });
 
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });

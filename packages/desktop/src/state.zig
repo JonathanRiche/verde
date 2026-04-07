@@ -985,43 +985,11 @@ pub const AppState = struct {
         };
         defer imported_thread.deinit(self.allocator);
 
-        var imported = ChatThread.init(self.allocator, imported_thread.title) catch {
+        var imported = self.buildImportedThread(imported_thread, null) catch {
             self.setCodexImportNotice("Failed to create the imported thread.");
             return;
         };
         errdefer imported.deinit(self.allocator);
-        imported.committed = true;
-        imported.provider = .codex;
-        imported.harness = .local_cli;
-        imported.last_activity_at = imported_thread.updated_at orelse 0;
-        imported.provider_thread_id = self.allocator.dupeZ(u8, imported_thread.thread_id) catch {
-            self.setCodexImportNotice("Failed to store the Codex thread ID.");
-            return;
-        };
-        for (imported_thread.messages) |message| {
-            imported.messages.append(self.allocator, .{
-                .role = switch (message.role) {
-                    .user => .user,
-                    .assistant => .assistant,
-                    .system => .system,
-                },
-                .author = self.dupeZ(message.author) catch {
-                    self.setCodexImportNotice("Failed to create the imported thread.");
-                    return;
-                },
-                .body = self.dupeZ(message.body) catch {
-                    self.setCodexImportNotice("Failed to create the imported thread.");
-                    return;
-                },
-                .image = null,
-            }) catch {
-                self.setCodexImportNotice("Failed to create the imported thread.");
-                return;
-            };
-        }
-        if (imported.last_activity_at == 0) {
-            imported.touch();
-        }
 
         self.projects.items[project_index].threads.append(self.allocator, imported) catch {
             self.setCodexImportNotice("Failed to add the imported thread.");
@@ -1033,6 +1001,69 @@ pub const AppState = struct {
         self.markDirty();
         self.setSidebarNotice("Codex thread imported.");
         self.cancelCodexThreadImport();
+    }
+
+    pub fn syncThreadFromProvider(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) {
+            self.setSidebarNotice("Project not found.");
+            return;
+        }
+
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) {
+            self.setSidebarNotice("Thread not found.");
+            return;
+        }
+
+        self.send_state.mutex.lock();
+        const send_pending = self.send_state.status == .pending;
+        self.send_state.mutex.unlock();
+        if (send_pending) {
+            self.setSidebarNotice("Finish the current provider request before syncing.");
+            return;
+        }
+
+        const provider_config = switch (project.threads.items[thread_index].provider) {
+            .codex => ai_harness.ProviderConfig{
+                .codex = .{
+                    .cwd = project.path,
+                    .launch_on_connect = true,
+                },
+            },
+            .opencode => {
+                self.setSidebarNotice("Thread sync is available for Codex threads only right now.");
+                return;
+            },
+        };
+
+        const provider_thread_id = project.threads.items[thread_index].provider_thread_id orelse {
+            self.setSidebarNotice("This thread is not linked to a remote provider session.");
+            return;
+        };
+
+        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
+            self.setSidebarNotice(syncCodexFailureMessage(err));
+            return;
+        };
+        defer client.deinit();
+
+        const imported_thread = client.readThread(self.allocator, provider_thread_id) catch |err| {
+            self.setSidebarNotice(syncCodexFailureMessage(err));
+            return;
+        };
+        defer imported_thread.deinit(self.allocator);
+
+        self.replaceThreadWithImportedSnapshot(project_index, thread_index, imported_thread) catch {
+            self.setSidebarNotice("Failed to sync the local thread.");
+            return;
+        };
+
+        self.selected_project_index = project_index;
+        self.projects.items[project_index].selected_thread_index = thread_index;
+        self.syncRenameBuffer();
+        self.requestTranscriptScrollToBottom();
+        self.markDirty();
+        self.setSidebarNotice("Thread synced from Codex.");
     }
 
     pub fn finishProjectRename(self: *AppState) void {
@@ -1629,6 +1660,95 @@ pub const AppState = struct {
         while (thread.messages.items.len > 0) {
             self.releaseMessage(thread.messages.pop().?);
         }
+    }
+
+    fn replaceThreadWithImportedSnapshot(
+        self: *AppState,
+        project_index: usize,
+        thread_index: usize,
+        imported_thread: ai_harness.ReadThreadResult,
+    ) !void {
+        if (project_index >= self.projects.items.len) return error.ProjectNotFound;
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return error.ThreadNotFound;
+
+        const existing = &project.threads.items[thread_index];
+        var refreshed = try self.buildImportedThread(imported_thread, existing);
+        errdefer refreshed.deinit(self.allocator);
+
+        var previous = existing.*;
+        existing.* = refreshed;
+        previous.deinit(self.allocator);
+    }
+
+    fn buildImportedThread(
+        self: *AppState,
+        imported_thread: ai_harness.ReadThreadResult,
+        existing_template: ?*const ChatThread,
+    ) !ChatThread {
+        var hydrated = try ChatThread.init(self.allocator, imported_thread.title);
+        errdefer hydrated.deinit(self.allocator);
+
+        hydrated.committed = true;
+        hydrated.last_activity_at = imported_thread.updated_at orelse 0;
+
+        if (hydrated.provider_thread_id) |thread_id| {
+            self.allocator.free(thread_id);
+            hydrated.provider_thread_id = null;
+        }
+        hydrated.provider_thread_id = try self.allocator.dupeZ(u8, imported_thread.thread_id);
+
+        if (existing_template) |existing| {
+            hydrated.provider = existing.provider;
+            hydrated.harness = existing.harness;
+            hydrated.reasoning_effort = existing.reasoning_effort;
+            hydrated.fast_mode = existing.fast_mode;
+            hydrated.access_mode = existing.access_mode;
+
+            if (hydrated.model_ref) |model_ref| {
+                self.allocator.free(model_ref);
+            }
+            hydrated.model_ref = if (existing.model_ref) |model_ref|
+                try self.allocator.dupeZ(u8, model_ref)
+            else
+                null;
+
+            hydrated.setDraft(existing.currentDraft());
+            if (existing.draft_image) |image| {
+                try hydrated.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
+            }
+        } else {
+            hydrated.provider = .codex;
+            hydrated.harness = .local_cli;
+        }
+
+        for (imported_thread.messages) |message| {
+            try hydrated.messages.append(self.allocator, try self.importedChatMessage(message));
+        }
+
+        if (hydrated.last_activity_at == 0) {
+            hydrated.touch();
+        }
+
+        return hydrated;
+    }
+
+    fn importedChatMessage(self: *AppState, message: ai_harness.ChatMessage) !ChatMessage {
+        const author = try self.dupeZ(message.author);
+        errdefer self.allocator.free(author);
+        const body = try self.dupeZ(message.body);
+        errdefer self.allocator.free(body);
+
+        return .{
+            .role = switch (message.role) {
+                .user => .user,
+                .assistant => .assistant,
+                .system => .system,
+            },
+            .author = author,
+            .body = body,
+            .image = null,
+        };
     }
 
     fn releaseMessage(self: *AppState, message: ChatMessage) void {
@@ -2448,9 +2568,9 @@ pub const AppState = struct {
         return std.mem.indexOf(u8, message, "\"type\":\"prompt:changed\"") != null;
     }
 
-    pub fn hasActiveTerminalSessions(self: *const AppState) bool {
+    pub fn hasVisibleTerminalSessions(self: *const AppState) bool {
         for (self.projects.items) |*project| {
-            if (project.terminal_dock.hasRunningSession()) return true;
+            if (project.terminal_dock.visible and project.terminal_dock.hasRunningSession()) return true;
         }
         return false;
     }
@@ -3177,6 +3297,18 @@ fn importCodexFailureMessage(err: anyerror) []const u8 {
         error.FileNotFound => "The codex executable was not found on PATH.",
         error.UnsupportedOperation => "This provider does not support thread imports.",
         else => "Failed to load Codex threads.",
+    };
+}
+
+fn syncCodexFailureMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CodexRpcFailed => "Failed to sync the Codex thread.",
+        error.ConnectionClosed => "Codex app-server connection closed.",
+        error.NotConnected => "Could not connect to Codex app-server.",
+        error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
+        error.FileNotFound => "The codex executable was not found on PATH.",
+        error.UnsupportedOperation => "This provider does not support thread sync.",
+        else => "Failed to sync the Codex thread.",
     };
 }
 
