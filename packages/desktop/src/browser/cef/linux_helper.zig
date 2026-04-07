@@ -141,11 +141,13 @@ pub const Controller = struct {
             self.sendCommand(.{ .kind = .quit }) catch {};
             self.closeCommandFile();
         }
+        // Stop the helper process before joining the reader so the UI thread does not block
+        // forever if CEF teardown stalls and keeps the event pipe open.
+        self.terminateChild();
         if (self.reader_thread) |thread| {
             thread.join();
             self.reader_thread = null;
         }
-        self.terminateChild();
         self.queue.deinit(self.allocator);
         self.frame.deinit(self.allocator);
         self.allocator.destroy(self.queue);
@@ -382,13 +384,13 @@ pub const Controller = struct {
         }
         // Chromium may leave utility, zygote, or GPU workers behind unless we signal the full helper process group.
         std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
-        _ = std.posix.waitpid(child_pid, 0);
+        if (!waitForChildExit(child_pid, 250)) {
+            std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
+            _ = waitForChildExit(child_pid, 250);
+        }
         var grace_checks: u8 = 0;
         while (grace_checks < 8 and processGroupAlive(child_process_group)) : (grace_checks += 1) {
             std.Thread.sleep(25 * std.time.ns_per_ms);
-        }
-        if (processGroupAlive(child_process_group)) {
-            std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
         }
         self.child_pid = null;
         self.child_process_group = null;
