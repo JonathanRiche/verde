@@ -18,6 +18,7 @@ pub const ChangedFileEntry = struct {
 pub const log = native_state.log;
 pub const IMAGE_MODAL_ID: [:0]const u8 = native_state.IMAGE_MODAL_ID;
 pub const PROJECT_RENAME_MODAL_ID: [:0]const u8 = "ProjectRenameModal";
+pub const CODEX_IMPORT_MODAL_ID: [:0]const u8 = native_state.CODEX_IMPORT_MODAL_ID;
 pub const SIDEBAR_VISIBLE_THREAD_LIMIT: usize = 6;
 pub const PERSISTED_DIFF_MARKER = utils.PERSISTED_DIFF_MARKER;
 

@@ -38,6 +38,23 @@ pub const ChatThreadSummary = struct {
     title: []const u8,
 };
 
+pub const ReadThreadResult = struct {
+    thread_id: []const u8,
+    title: []const u8,
+    updated_at: ?i64 = null,
+    messages: []const ChatMessage,
+
+    pub fn deinit(self: ReadThreadResult, allocator: anytype) void {
+        allocator.free(self.thread_id);
+        allocator.free(self.title);
+        for (self.messages) |message| {
+            allocator.free(message.author);
+            allocator.free(message.body);
+        }
+        allocator.free(self.messages);
+    }
+};
+
 pub const ReasoningEffort = enum(u8) {
     low,
     medium,

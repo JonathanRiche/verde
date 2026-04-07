@@ -73,36 +73,109 @@ pub const Client = struct {
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
         try self.ensureConnected();
 
+        var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
+        defer threads.deinit(allocator);
+
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |owned_cursor| self.allocator.free(owned_cursor);
+
+        while (true) {
+            const params = .{
+                .limit = 100,
+                .sortKey = "updated_at",
+                .archived = false,
+                .cwd = self.config.cwd,
+                .cursor = cursor,
+            };
+            const payload = try self.callRpcForResultAlloc("thread/list", params);
+            defer self.allocator.free(payload);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
+            defer parsed.deinit();
+
+            const threads_value = getObjectField(parsed.value, "data") orelse break;
+            if (threads_value != .array) break;
+
+            for (threads_value.array.items) |item| {
+                if (item != .object) continue;
+                const id_value = item.object.get("id") orelse continue;
+                const id = stringValue(id_value) orelse continue;
+                const title = getOptionalObjectString(item, "name") orelse
+                    getOptionalObjectString(item, "title") orelse
+                    getOptionalObjectString(item, "preview") orelse
+                    id;
+
+                try threads.append(allocator, .{
+                    .id = try allocator.dupe(u8, id),
+                    .title = try allocator.dupe(u8, title),
+                });
+            }
+
+            if (cursor) |owned_cursor| {
+                self.allocator.free(owned_cursor);
+                cursor = null;
+            }
+
+            const next_cursor = getOptionalObjectString(parsed.value, "nextCursor") orelse break;
+            cursor = try self.allocator.dupe(u8, next_cursor);
+        }
+
+        return threads.toOwnedSlice(allocator);
+    }
+
+    pub fn readThread(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+    ) !provider_types.ReadThreadResult {
+        try self.ensureConnected();
+
         const params = .{
-            .limit = 50,
+            .threadId = thread_id,
+            .includeTurns = true,
         };
-        const payload = try self.callRpcForResultAlloc("thread/list", params);
+        const payload = try self.callRpcForResultAlloc("thread/read", params);
         defer self.allocator.free(payload);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
         defer parsed.deinit();
 
-        const threads_value = getObjectField(parsed.value, "threads") orelse return allocator.alloc(provider_types.ChatThreadSummary, 0);
-        if (threads_value != .array) {
-            return allocator.alloc(provider_types.ChatThreadSummary, 0);
+        const thread = getObjectField(parsed.value, "thread") orelse return error.MissingThreadId;
+        const id = getOptionalObjectString(thread, "id") orelse return error.MissingThreadId;
+        const title = getOptionalObjectString(thread, "name") orelse
+            getOptionalObjectString(thread, "title") orelse
+            getOptionalObjectString(thread, "preview") orelse
+            id;
+
+        var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
+        defer {
+            for (messages.items) |message| {
+                allocator.free(message.author);
+                allocator.free(message.body);
+            }
+            messages.deinit(allocator);
         }
 
-        var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
-        defer threads.deinit(allocator);
-
-        for (threads_value.array.items) |item| {
-            if (item != .object) continue;
-            const id_value = item.object.get("id") orelse continue;
-            const id = stringValue(id_value) orelse continue;
-            const title = getOptionalObjectString(item, "title") orelse id;
-
-            try threads.append(allocator, .{
-                .id = try allocator.dupe(u8, id),
-                .title = try allocator.dupe(u8, title),
-            });
+        const turns_value = getObjectField(thread, "turns");
+        if (turns_value != null and turns_value.? == .array) {
+            for (turns_value.?.array.items) |turn| {
+                const items_value = getObjectField(turn, "items") orelse continue;
+                if (items_value != .array) continue;
+                for (items_value.array.items) |item| {
+                    try appendImportedMessagesForItem(allocator, item, &messages);
+                }
+            }
         }
 
-        return threads.toOwnedSlice(allocator);
+        const owned_messages = try messages.toOwnedSlice(allocator);
+        messages = .empty;
+
+        return .{
+            .thread_id = try allocator.dupe(u8, id),
+            .title = try allocator.dupe(u8, title),
+            .updated_at = getOptionalObjectInteger(thread, "updatedAt"),
+            .messages = owned_messages,
+        };
     }
 
     pub fn sendPrompt(
@@ -414,6 +487,8 @@ pub const Client = struct {
     ) ![]u8 {
         const request_id = try self.sendTurnStartRequest(thread_id, request);
         var turn_started = false;
+        var started_turn_id: ?[]u8 = null;
+        defer if (started_turn_id) |turn_id| allocator.free(turn_id);
         var reply: std.ArrayList(u8) = .empty;
         defer reply.deinit(allocator);
 
@@ -430,10 +505,21 @@ pub const Client = struct {
             }
             if (try self.maybeHandleMatchingResponse(root, request_id)) {
                 turn_started = true;
+                if (started_turn_id == null) {
+                    if (extractTurnIdFromStartResponse(root)) |turn_id| {
+                        started_turn_id = try allocator.dupe(u8, turn_id);
+                    }
+                }
                 continue;
             }
 
             if (!turn_started) continue;
+
+            if (started_turn_id == null) {
+                if (extractTurnIdFromStartedNotification(root, thread_id)) |turn_id| {
+                    started_turn_id = try allocator.dupe(u8, turn_id);
+                }
+            }
 
             try emitNotificationEvent(self, root, request);
 
@@ -446,8 +532,12 @@ pub const Client = struct {
                 continue;
             }
 
-            if (isTurnCompleted(root)) {
-                break;
+            if (detectTurnTerminalState(root, thread_id, started_turn_id)) |terminal_state| {
+                switch (terminal_state) {
+                    .completed => break,
+                    .failed => return error.CodexTurnFailed,
+                    .interrupted => return error.CodexTurnInterrupted,
+                }
             }
         }
 
@@ -891,6 +981,131 @@ fn getOptionalObjectInteger(value: std.json.Value, field: []const u8) ?i64 {
     };
 }
 
+fn appendImportedMessagesForItem(
+    allocator: std.mem.Allocator,
+    item: std.json.Value,
+    messages: *std.ArrayList(provider_types.ChatMessage),
+) !void {
+    const item_type = getOptionalObjectString(item, "type") orelse return;
+
+    if (std.mem.eql(u8, item_type, "userMessage")) {
+        const content = getObjectField(item, "content") orelse return;
+        const body = try flattenUserMessageContentAlloc(allocator, content);
+        defer allocator.free(body);
+        if (std.mem.trim(u8, body, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .user, "You", body);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "agentMessage")) {
+        const text = getOptionalObjectString(item, "text") orelse return;
+        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .assistant, "Codex", text);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "commandExecution")) {
+        const command = getOptionalObjectString(item, "command") orelse return;
+        const status = getOptionalObjectString(item, "status") orelse "completed";
+        const author: []const u8 = if (std.mem.eql(u8, status, "failed")) "Command failed" else "Ran command";
+        try appendImportedMessage(allocator, messages, .system, author, command);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "fileChange")) {
+        const changes = getObjectField(item, "changes") orelse return;
+        const body = try buildImportedFileChangeSummaryAlloc(allocator, changes);
+        defer allocator.free(body);
+        if (std.mem.trim(u8, body, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .system, "Changed files", body);
+        return;
+    }
+
+    if (std.mem.eql(u8, item_type, "webSearch")) {
+        const query = getOptionalObjectString(item, "query") orelse return;
+        if (std.mem.trim(u8, query, &std.ascii.whitespace).len == 0) return;
+        try appendImportedMessage(allocator, messages, .system, "Web search", query);
+    }
+}
+
+fn appendImportedMessage(
+    allocator: std.mem.Allocator,
+    messages: *std.ArrayList(provider_types.ChatMessage),
+    role: provider_types.MessageRole,
+    author: []const u8,
+    body: []const u8,
+) !void {
+    try messages.append(allocator, .{
+        .role = role,
+        .author = try allocator.dupe(u8, author),
+        .body = try allocator.dupe(u8, body),
+    });
+}
+
+fn flattenUserMessageContentAlloc(allocator: std.mem.Allocator, content: std.json.Value) ![]u8 {
+    if (content != .array) return allocator.dupe(u8, "");
+
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+
+    for (content.array.items) |entry| {
+        if (entry != .object) continue;
+        const content_type = getOptionalObjectString(entry, "type") orelse continue;
+        var segment: ?[]const u8 = null;
+
+        if (std.mem.eql(u8, content_type, "text")) {
+            segment = getOptionalObjectString(entry, "text");
+        } else if (std.mem.eql(u8, content_type, "mention")) {
+            segment = getOptionalObjectString(entry, "path") orelse getOptionalObjectString(entry, "name");
+        } else if (std.mem.eql(u8, content_type, "skill")) {
+            segment = getOptionalObjectString(entry, "name");
+        }
+
+        if (segment) |text| {
+            if (text.len == 0) continue;
+            if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
+            try builder.appendSlice(allocator, text);
+            continue;
+        }
+
+        if (std.mem.eql(u8, content_type, "localImage")) {
+            const path = getOptionalObjectString(entry, "path") orelse continue;
+            if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
+            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{path});
+            continue;
+        }
+
+        if (std.mem.eql(u8, content_type, "image")) {
+            const url = getOptionalObjectString(entry, "url") orelse continue;
+            if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
+            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{url});
+        }
+    }
+
+    return builder.toOwnedSlice(allocator);
+}
+
+fn buildImportedFileChangeSummaryAlloc(allocator: std.mem.Allocator, changes: std.json.Value) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
+    if (changes != .array) return allocator.dupe(u8, "");
+
+    for (changes.array.items) |change| {
+        const path = getOptionalObjectString(change, "path") orelse continue;
+        const additions = countDiffLines(change, '+');
+        const deletions = countDiffLines(change, '-');
+        if (body.items.len > 0) try body.append(allocator, '\n');
+        try std.fmt.format(body.writer(allocator), "{s}  +{d} / -{d}", .{
+            path,
+            additions,
+            deletions,
+        });
+    }
+
+    return body.toOwnedSlice(allocator);
+}
+
 fn appendNotificationDelta(
     root: std.json.Value,
     allocator: std.mem.Allocator,
@@ -1261,9 +1476,61 @@ fn extractPermissionsApprovalSummary(root: std.json.Value) ?[]const u8 {
         findFirstStringByField(params, "message");
 }
 
-fn isTurnCompleted(root: std.json.Value) bool {
-    const method = getOptionalObjectString(root, "method") orelse return false;
-    return std.mem.eql(u8, method, "turn/completed");
+const TurnTerminalState = enum {
+    completed,
+    failed,
+    interrupted,
+};
+
+fn extractTurnIdFromStartResponse(root: std.json.Value) ?[]const u8 {
+    const result = getObjectField(root, "result") orelse return null;
+    const turn = getObjectField(result, "turn") orelse return null;
+    return getOptionalObjectString(turn, "id");
+}
+
+fn extractTurnIdFromStartedNotification(root: std.json.Value, thread_id: []const u8) ?[]const u8 {
+    const method = getOptionalObjectString(root, "method") orelse return null;
+    if (!std.mem.eql(u8, method, "turn/started")) return null;
+
+    const params = getObjectField(root, "params") orelse return null;
+    const notification_thread_id = getOptionalObjectString(params, "threadId") orelse return null;
+    if (!std.mem.eql(u8, notification_thread_id, thread_id)) return null;
+
+    const turn = getObjectField(params, "turn") orelse return null;
+    return getOptionalObjectString(turn, "id");
+}
+
+fn detectTurnTerminalState(root: std.json.Value, thread_id: []const u8, turn_id: ?[]const u8) ?TurnTerminalState {
+    const method = getOptionalObjectString(root, "method") orelse return null;
+    const params = getObjectField(root, "params") orelse return null;
+
+    if (std.mem.eql(u8, method, "turn/completed")) {
+        const notification_thread_id = getOptionalObjectString(params, "threadId") orelse return null;
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return null;
+
+        const turn = getObjectField(params, "turn") orelse return null;
+        if (turn_id) |expected_turn_id| {
+            const completed_turn_id = getOptionalObjectString(turn, "id") orelse return null;
+            if (!std.mem.eql(u8, completed_turn_id, expected_turn_id)) return null;
+        }
+
+        const status = getOptionalObjectString(turn, "status") orelse return .completed;
+        if (std.mem.eql(u8, status, "completed")) return .completed;
+        if (std.mem.eql(u8, status, "failed")) return .failed;
+        if (std.mem.eql(u8, status, "interrupted")) return .interrupted;
+        return null;
+    }
+
+    if (std.mem.eql(u8, method, "thread/status/changed")) {
+        const notification_thread_id = getOptionalObjectString(params, "threadId") orelse return null;
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return null;
+
+        const status = getObjectField(params, "status") orelse return null;
+        const type_name = getOptionalObjectString(status, "type") orelse return null;
+        if (std.mem.eql(u8, type_name, "idle")) return .completed;
+    }
+
+    return null;
 }
 
 fn findFirstStringByPath(value: std.json.Value, fields: []const []const u8) ?[]const u8 {
@@ -1377,4 +1644,113 @@ test "compute accept key matches websocket example" {
     defer allocator.free(accept);
 
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
+}
+
+test "appendImportedMessagesForItem maps transcript items into chat messages" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[
+        \\  {
+        \\    "type": "userMessage",
+        \\    "id": "u1",
+        \\    "content": [
+        \\      { "type": "text", "text": "Look at this" },
+        \\      { "type": "localImage", "path": "/tmp/screenshot.png" }
+        \\    ]
+        \\  },
+        \\  {
+        \\    "type": "agentMessage",
+        \\    "id": "a1",
+        \\    "text": "I checked it."
+        \\  },
+        \\  {
+        \\    "type": "commandExecution",
+        \\    "id": "c1",
+        \\    "command": "git status",
+        \\    "status": "completed"
+        \\  },
+        \\  {
+        \\    "type": "fileChange",
+        \\    "id": "f1",
+        \\    "changes": [
+        \\      {
+        \\        "path": "src/main.zig",
+        \\        "diff": "@@ -1 +1 @@\n-old\n+new\n"
+        \\      }
+        \\    ]
+        \\  }
+        \\]
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
+    defer {
+        for (messages.items) |message| {
+            allocator.free(message.author);
+            allocator.free(message.body);
+        }
+        messages.deinit(allocator);
+    }
+
+    for (parsed.value.array.items) |item| {
+        try appendImportedMessagesForItem(allocator, item, &messages);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), messages.items.len);
+    try std.testing.expectEqual(provider_types.MessageRole.user, messages.items[0].role);
+    try std.testing.expectEqualStrings("You", messages.items[0].author);
+    try std.testing.expectEqualStrings("Look at this\n\n[Image: /tmp/screenshot.png]", messages.items[0].body);
+    try std.testing.expectEqual(provider_types.MessageRole.assistant, messages.items[1].role);
+    try std.testing.expectEqualStrings("Codex", messages.items[1].author);
+    try std.testing.expectEqualStrings("I checked it.", messages.items[1].body);
+    try std.testing.expectEqualStrings("Ran command", messages.items[2].author);
+    try std.testing.expectEqualStrings("git status", messages.items[2].body);
+    try std.testing.expectEqualStrings("Changed files", messages.items[3].author);
+    try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[3].body);
+}
+
+test "detectTurnTerminalState recognizes thread idle fallback for the active thread" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "method": "thread/status/changed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "status": { "type": "idle" }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const terminal = detectTurnTerminalState(parsed.value, "thread-123", "turn-456");
+    try std.testing.expectEqual(TurnTerminalState.completed, terminal.?);
+}
+
+test "detectTurnTerminalState matches turn completion status for the started turn" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "method": "turn/completed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "turn": {
+        \\      "id": "turn-456",
+        \\      "status": "failed",
+        \\      "items": [],
+        \\      "error": { "message": "boom", "codexErrorInfo": null, "additionalDetails": null }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const terminal = detectTurnTerminalState(parsed.value, "thread-123", "turn-456");
+    try std.testing.expectEqual(TurnTerminalState.failed, terminal.?);
+    try std.testing.expectEqual(@as(?TurnTerminalState, null), detectTurnTerminalState(parsed.value, "thread-123", "other-turn"));
 }

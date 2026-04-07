@@ -208,6 +208,11 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                     zgui.openPopup(runtime.PROJECT_RENAME_MODAL_ID, .{});
                     zgui.closeCurrentPopup();
                 }
+                if (zgui.menuItem("Import Codex thread", .{})) {
+                    state.beginCodexThreadImport(index);
+                    zgui.openPopup(runtime.CODEX_IMPORT_MODAL_ID, .{});
+                    zgui.closeCurrentPopup();
+                }
                 if (zgui.menuItem("Remove project", .{})) {
                     state.removeProjectAtIndex(index);
                     zgui.closeCurrentPopup();

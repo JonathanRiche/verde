@@ -41,6 +41,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     chat_panel.renderWorkspace(state, workspace_width, content[1]);
     renderImageModal(state, width, height);
     renderProjectRenameModal(state, width, height);
+    renderCodexImportModal(state, width, height);
     debug_window.render(state, width, height);
 }
 
@@ -237,6 +238,133 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
         zgui.closeCurrentPopup();
         zgui.popStyleColor(.{ .count = 3 });
         return;
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn renderCodexImportModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const project_index = state.codex_import_project_index orelse return;
+    if (project_index >= state.projects.items.len) {
+        state.cancelCodexThreadImport();
+        return;
+    }
+
+    if (!zgui.isPopupOpen(runtime.CODEX_IMPORT_MODAL_ID, .{})) {
+        zgui.openPopup(runtime.CODEX_IMPORT_MODAL_ID, .{});
+    }
+
+    zgui.setNextWindowPos(.{
+        .x = width * 0.5,
+        .y = height * 0.5,
+        .cond = .appearing,
+        .pivot_x = 0.5,
+        .pivot_y = 0.5,
+    });
+    zgui.setNextWindowSize(.{
+        .w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0)),
+        .h = theme.clampf(height * 0.66, theme.scaledUi(420.0), theme.scaledUi(620.0)),
+        .cond = .appearing,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(16.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(18.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ theme.scaledUi(10.0), theme.scaledUi(10.0) } });
+    var modal_open = true;
+    if (!zgui.beginPopupModal(runtime.CODEX_IMPORT_MODAL_ID, .{
+        .popen = &modal_open,
+        .flags = .{ .no_saved_settings = true },
+    })) {
+        if (!modal_open) state.cancelCodexThreadImport();
+        zgui.popStyleVar(.{ .count = 3 });
+        return;
+    }
+    defer {
+        zgui.endPopup();
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+
+    if (zgui.isWindowAppearing()) {
+        zgui.setKeyboardFocusHere(0);
+    }
+
+    const project = &state.projects.items[project_index];
+    zgui.textColored(theme.COLOR_WHITE, "Import Codex thread", .{});
+    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Project: {s}", .{project.label});
+    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{project.path});
+    zgui.textWrapped("Import loads the existing Codex transcript into this project and binds future turns to the same thread.", .{});
+
+    _ = zgui.inputTextWithHint("##codex-thread-id", .{
+        .hint = "Paste a Codex thread ID",
+        .buf = state.codexImportThreadIdBuffer(),
+    });
+
+    const actions_width = zgui.getContentRegionAvail()[0];
+    const refresh_width = @max(theme.scaledUi(104.0), actions_width * 0.28);
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Refresh list", .{ .w = refresh_width, .h = theme.scaledUi(32.0) })) {
+        state.refreshCodexThreadImportList();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+
+    zgui.separator();
+    _ = zgui.beginChild("CodexImportThreadList", .{
+        .w = 0.0,
+        .h = -theme.scaledUi(92.0),
+        .child_flags = .{ .border = true },
+        .window_flags = .{},
+    });
+
+    if (state.codex_import_threads.items.len == 0) {
+        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No cached Codex threads to show.", .{});
+    } else {
+        for (state.codex_import_threads.items, 0..) |thread, index| {
+            zgui.pushIntId(@intCast(index + 4000));
+            defer zgui.popId();
+
+            const selected = state.codex_import_selected_index != null and state.codex_import_selected_index.? == index;
+            if (zgui.selectable(thread.title, .{
+                .selected = selected,
+                .w = 0.0,
+                .h = theme.scaledUi(26.0),
+            })) {
+                state.selectCodexImportThread(index);
+            }
+            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{thread.id});
+            if (index + 1 < state.codex_import_threads.items.len) {
+                zgui.separator();
+            }
+        }
+    }
+    zgui.endChild();
+
+    if (state.codexImportNotice().len > 0) {
+        zgui.textColored(theme.COLOR_YELLOW, "{s}", .{state.codexImportNotice()});
+    }
+
+    const button_width = @max((zgui.getContentRegionAvail()[0] - theme.scaledUi(10.0)) * 0.5, theme.scaledUi(120.0));
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Cancel", .{ .w = button_width, .h = theme.scaledUi(34.0) })) {
+        state.cancelCodexThreadImport();
+        zgui.closeCurrentPopup();
+        zgui.popStyleColor(.{ .count = 3 });
+        return;
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+
+    zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    if (zgui.button("Import", .{ .w = button_width, .h = theme.scaledUi(34.0) })) {
+        state.importSelectedCodexThread();
+        if (state.codex_import_project_index == null) {
+            zgui.closeCurrentPopup();
+            zgui.popStyleColor(.{ .count = 3 });
+            return;
+        }
     }
     zgui.popStyleColor(.{ .count = 3 });
 }
