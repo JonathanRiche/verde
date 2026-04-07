@@ -28,6 +28,7 @@ source "$SCRIPT_DIR/cef-common.sh"
 ARCH="$(uname -m)"
 need_cmd zig
 need_cmake
+need_cmd bash
 
 cd "$REPO_ROOT"
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
@@ -57,6 +58,8 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
   ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
+
+"$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
