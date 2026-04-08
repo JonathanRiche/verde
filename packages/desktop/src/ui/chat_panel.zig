@@ -646,14 +646,13 @@ fn renderPendingApproval(state: anytype) void {
 
 /// Renders streamed timeline events while a send is pending.
 fn renderPendingTimelineEvents(state: *app_state.AppState) void {
-    state.send_state.mutex.lock();
-    defer state.send_state.mutex.unlock();
+    const send_state = state.currentThread().send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
 
-    if (state.send_state.status != .pending) return;
-    if (state.send_state.project_index != state.selected_project_index) return;
-    if (state.send_state.thread_index != state.currentProject().selected_thread_index) return;
+    if (send_state.status != .pending) return;
 
-    for (state.send_state.pending_events.items, 0..) |event, index| {
+    for (send_state.pending_events.items, 0..) |event, index| {
         renderTranscriptMessage(state, @intCast(50_000 + index), event.role, event.author, event.body, null);
         zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     }
@@ -661,15 +660,14 @@ fn renderPendingTimelineEvents(state: *app_state.AppState) void {
 
 /// Renders the live diff summary card for streamed file changes.
 fn renderPendingDiffCard(state: *app_state.AppState) void {
-    state.send_state.mutex.lock();
-    defer state.send_state.mutex.unlock();
+    const send_state = state.currentThread().send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
 
-    if (state.send_state.status != .pending) return;
-    if (state.send_state.project_index != state.selected_project_index) return;
-    if (state.send_state.thread_index != state.currentProject().selected_thread_index) return;
-    if (state.send_state.pending_diff_files.items.len == 0) return;
+    if (send_state.status != .pending) return;
+    if (send_state.pending_diff_files.items.len == 0) return;
 
-    renderPendingDiffCardLocked(&state.send_state.pending_diff_files);
+    renderPendingDiffCardLocked(&send_state.pending_diff_files);
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
 }
 
@@ -712,14 +710,13 @@ fn renderPendingDiffCardLocked(files: anytype) void {
 
 /// Renders the streamed assistant bubble placeholder or partial text.
 fn renderPendingTranscriptBubble(state: *app_state.AppState) void {
-    state.send_state.mutex.lock();
-    defer state.send_state.mutex.unlock();
+    const send_state = state.currentThread().send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
 
-    if (state.send_state.status != .pending) return;
-    if (state.send_state.project_index != state.selected_project_index) return;
-    if (state.send_state.thread_index != state.currentProject().selected_thread_index) return;
+    if (send_state.status != .pending) return;
 
-    const stream_text = state.send_state.partial_text.items;
+    const stream_text = send_state.partial_text.items;
     renderTranscriptBubble(
         state,
         "pending-assistant",

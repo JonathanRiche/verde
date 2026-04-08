@@ -196,10 +196,15 @@ pub const ChatThread = struct {
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
     messages: std.ArrayList(ChatMessage),
+    send_state: *SendState,
     draft_image: ?ChatImageAttachment = null,
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
     fn init(allocator: std.mem.Allocator, title: []const u8) !ChatThread {
+        const send_state = try allocator.create(SendState);
+        errdefer allocator.destroy(send_state);
+        send_state.* = .{};
+
         return .{
             .title = try allocator.dupeZ(u8, title),
             .committed = false,
@@ -211,6 +216,7 @@ pub const ChatThread = struct {
             .provider = .codex,
             .harness = .local_cli,
             .messages = .empty,
+            .send_state = send_state,
             .draft_image = null,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
@@ -259,7 +265,43 @@ pub const ChatThread = struct {
         self.last_activity_at = std.time.timestamp();
     }
 
+    fn isSendPending(self: *const ChatThread) bool {
+        self.send_state.mutex.lock();
+        defer self.send_state.mutex.unlock();
+        return self.send_state.status == .pending;
+    }
+
+    fn finishSendThread(self: *ChatThread) void {
+        self.send_state.mutex.lock();
+        const maybe_worker = self.send_state.worker;
+        self.send_state.worker = null;
+        self.send_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+    }
+
+    fn deinitSendState(self: *ChatThread, allocator: std.mem.Allocator) void {
+        self.finishSendThread();
+        if (self.send_state.result) |result| {
+            std.heap.page_allocator.free(result.provider_thread_id);
+            std.heap.page_allocator.free(result.reply_text);
+            self.send_state.result = null;
+        }
+        if (self.send_state.error_message) |message| {
+            std.heap.page_allocator.free(message);
+            self.send_state.error_message = null;
+        }
+        self.send_state.partial_text.deinit(std.heap.page_allocator);
+        freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
+        freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
+        freePendingApproval(std.heap.page_allocator, &self.send_state.pending_approval);
+        allocator.destroy(self.send_state);
+    }
+
     fn deinit(self: *ChatThread, allocator: std.mem.Allocator) void {
+        self.deinitSendState(allocator);
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
@@ -441,7 +483,9 @@ pub const Project = struct {
     }
 
     fn addThread(self: *Project, allocator: std.mem.Allocator) !void {
-        try self.threads.append(allocator, try ChatThread.init(allocator, "New thread"));
+        var thread = try ChatThread.init(allocator, "New thread");
+        errdefer thread.deinit(allocator);
+        try self.threads.append(allocator, thread);
         self.selected_thread_index = self.threads.items.len - 1;
     }
 
@@ -560,8 +604,6 @@ pub const SendState = struct {
     result: ?SendResultPayload = null,
     error_message: ?[]u8 = null,
     provider: ?Provider = null,
-    project_index: ?usize = null,
-    thread_index: ?usize = null,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
@@ -587,8 +629,6 @@ pub const PendingTimelineEvent = struct {
     body: []u8,
 };
 pub const SendResultPayload = struct {
-    project_index: usize,
-    thread_index: usize,
     provider_thread_id: []const u8,
     reply_text: []const u8,
 };
@@ -643,7 +683,6 @@ pub const AppState = struct {
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
-    send_state: SendState,
     transcript_project_index: ?usize,
     transcript_thread_index: ?usize,
     scroll_transcript_to_bottom_frames: u8,
@@ -702,7 +741,6 @@ pub const AppState = struct {
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
-            .send_state = .{},
             .transcript_project_index = null,
             .transcript_thread_index = null,
             .scroll_transcript_to_bottom_frames = 8,
@@ -1019,11 +1057,8 @@ pub const AppState = struct {
             return;
         }
 
-        self.send_state.mutex.lock();
-        const send_pending = self.send_state.status == .pending;
-        self.send_state.mutex.unlock();
-        if (send_pending) {
-            self.setSidebarNotice("Finish the current provider request before syncing.");
+        if (project.threads.items[thread_index].isSendPending()) {
+            self.setSidebarNotice("Finish this thread's provider request before syncing.");
             return;
         }
 
@@ -1094,6 +1129,12 @@ pub const AppState = struct {
 
     fn removeSelectedProject(self: *AppState) void {
         if (self.projects.items.len == 0) return;
+        for (self.projects.items[self.selected_project_index].threads.items) |*thread| {
+            if (thread.isSendPending()) {
+                self.setSidebarNotice("Finish this project's running provider requests before removing it.");
+                return;
+            }
+        }
         self.cancelCodexThreadImport();
         var removed = self.projects.orderedRemove(self.selected_project_index);
         removed.deinit(self.allocator);
@@ -1127,11 +1168,8 @@ pub const AppState = struct {
         const draft_image = self.currentThread().draft_image;
         if (draft.len == 0 and draft_image == null) return;
 
-        self.send_state.mutex.lock();
-        const send_pending = self.send_state.status == .pending;
-        self.send_state.mutex.unlock();
-        if (send_pending) {
-            self.setSidebarNotice("A provider request is already running.");
+        if (self.currentThread().isSendPending()) {
+            self.setSidebarNotice("This chat already has a provider request running.");
             return;
         }
 
@@ -1200,9 +1238,7 @@ pub const AppState = struct {
         const request = try page_alloc.create(SendWorkerRequest);
         errdefer page_alloc.destroy(request);
         request.* = .{
-            .send_state_ptr = &self.send_state,
-            .project_index = self.selected_project_index,
-            .thread_index = self.currentProject().selected_thread_index,
+            .send_state_ptr = thread.send_state,
             .provider = thread.provider,
             .harness = thread.harness,
             .project_path = try page_alloc.dupe(u8, project.path),
@@ -1224,20 +1260,19 @@ pub const AppState = struct {
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         }
 
-        self.send_state.mutex.lock();
-        defer self.send_state.mutex.unlock();
-        self.send_state.status = .pending;
-        self.send_state.result = null;
-        self.send_state.error_message = null;
-        self.send_state.provider = thread.provider;
-        self.send_state.project_index = request.project_index;
-        self.send_state.thread_index = request.thread_index;
-        self.send_state.partial_text.clearRetainingCapacity();
-        freePendingTimelineEventsLocked(page_alloc, &self.send_state.pending_events);
-        freePendingDiffFilesLocked(page_alloc, &self.send_state.pending_diff_files);
-        freePendingApprovalLocked(page_alloc, &self.send_state.pending_approval);
-        self.send_state.approval_decision = null;
-        self.send_state.worker = try std.Thread.spawn(.{}, sendWorker, .{ &self.send_state, request });
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        send_state.status = .pending;
+        send_state.result = null;
+        send_state.error_message = null;
+        send_state.provider = thread.provider;
+        send_state.partial_text.clearRetainingCapacity();
+        freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
+        freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
+        freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+        send_state.approval_decision = null;
+        send_state.worker = try std.Thread.spawn(.{}, sendWorker, .{ send_state, request });
     }
 
     fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
@@ -2838,6 +2873,11 @@ pub const AppState = struct {
     }
 
     pub fn reloadFromStorage(self: *AppState) !void {
+        self.pollSend();
+        if (self.hasAnyPendingSends()) {
+            self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
+            return;
+        }
         self.flushIfDirty();
         self.clearProjects();
 
@@ -2885,13 +2925,9 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         self.finishPickerThread();
-        self.finishSendThread();
+        self.finishAllSendThreads();
         self.pollSend();
         self.flushIfDirty();
-        self.send_state.partial_text.deinit(std.heap.page_allocator);
-        freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
-        freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
-        freePendingApproval(std.heap.page_allocator, &self.send_state.pending_approval);
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
         self.browser_state.deinit();
@@ -2949,56 +2985,57 @@ pub const AppState = struct {
     }
 
     pub fn pollSend(self: *AppState) void {
+        for (self.projects.items, 0..) |*project, project_index| {
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                self.pollThreadSend(project_index, thread_index, thread);
+            }
+        }
+    }
+
+    fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
         var next_status: SendStatus = .idle;
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
-        var failed_project_index: ?usize = null;
-        var failed_thread_index: ?usize = null;
+        const send_state = thread.send_state;
 
-        self.send_state.mutex.lock();
-        switch (self.send_state.status) {
+        send_state.mutex.lock();
+        switch (send_state.status) {
             .completed => {
-                completed_result = self.send_state.result;
-                self.send_state.result = null;
-                flushPendingAssistantTextLocked(&self.send_state, std.heap.page_allocator);
-                completed_events = self.send_state.pending_events;
-                self.send_state.pending_events = .empty;
-                completed_diff_files = self.send_state.pending_diff_files;
-                self.send_state.pending_diff_files = .empty;
-                freePendingApprovalLocked(std.heap.page_allocator, &self.send_state.pending_approval);
-                self.send_state.approval_decision = null;
-                self.send_state.provider = null;
-                self.send_state.project_index = null;
-                self.send_state.thread_index = null;
-                self.send_state.status = .idle;
+                completed_result = send_state.result;
+                send_state.result = null;
+                flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+                completed_events = send_state.pending_events;
+                send_state.pending_events = .empty;
+                completed_diff_files = send_state.pending_diff_files;
+                send_state.pending_diff_files = .empty;
+                freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
+                send_state.approval_decision = null;
+                send_state.provider = null;
+                send_state.status = .idle;
                 next_status = .completed;
             },
             .failed => {
-                failed_message = self.send_state.error_message;
-                self.send_state.error_message = null;
-                self.send_state.partial_text.clearRetainingCapacity();
-                completed_events = self.send_state.pending_events;
-                self.send_state.pending_events = .empty;
-                completed_diff_files = self.send_state.pending_diff_files;
-                self.send_state.pending_diff_files = .empty;
-                failed_project_index = self.send_state.project_index;
-                failed_thread_index = self.send_state.thread_index;
-                freePendingApprovalLocked(std.heap.page_allocator, &self.send_state.pending_approval);
-                self.send_state.approval_decision = null;
-                self.send_state.provider = null;
-                self.send_state.project_index = null;
-                self.send_state.thread_index = null;
-                self.send_state.status = .idle;
+                failed_message = send_state.error_message;
+                send_state.error_message = null;
+                send_state.partial_text.clearRetainingCapacity();
+                completed_events = send_state.pending_events;
+                send_state.pending_events = .empty;
+                completed_diff_files = send_state.pending_diff_files;
+                send_state.pending_diff_files = .empty;
+                freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
+                send_state.approval_decision = null;
+                send_state.provider = null;
+                send_state.status = .idle;
                 next_status = .failed;
             },
             else => {},
         }
-        self.send_state.mutex.unlock();
+        send_state.mutex.unlock();
 
         if (next_status != .idle) {
-            self.finishSendThread();
+            thread.finishSendThread();
         }
 
         switch (next_status) {
@@ -3010,13 +3047,16 @@ pub const AppState = struct {
                     defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
                     appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
                     const should_append_reply_text = !pendingTimelineEventsContainAssistant(completed_events.items);
-                    self.applyPendingTimelineEvents(result, &completed_events) catch |err| {
+                    self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                         log.err("failed to apply timeline events: {s}", .{@errorName(err)});
                     };
-                    self.applySendSuccess(result, should_append_reply_text) catch |err| {
+                    self.applySendSuccess(thread, result, should_append_reply_text) catch |err| {
                         log.err("failed to apply send result: {s}", .{@errorName(err)});
                         self.setSidebarNotice("Failed to apply provider reply.");
                     };
+                    if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+                        self.requestTranscriptScrollToBottom();
+                    }
                 }
             },
             .failed => {
@@ -3025,13 +3065,9 @@ pub const AppState = struct {
                 appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
                 if (failed_message) |message| {
                     defer std.heap.page_allocator.free(message);
-                    if (failed_project_index) |project_index| {
-                        if (failed_thread_index) |thread_index| {
-                            self.applySendFailure(project_index, thread_index, &completed_events, message) catch |err| {
-                                log.err("failed to apply send failure: {s}", .{@errorName(err)});
-                            };
-                        }
-                    }
+                    self.applySendFailure(thread, &completed_events, message) catch |err| {
+                        log.err("failed to apply send failure: {s}", .{@errorName(err)});
+                    };
                     self.setSidebarNotice(message);
                 } else {
                     self.setSidebarNotice("Provider request failed.");
@@ -3052,25 +3088,26 @@ pub const AppState = struct {
         }
     }
 
-    fn finishSendThread(self: *AppState) void {
-        self.send_state.mutex.lock();
-        const maybe_worker = self.send_state.worker;
-        self.send_state.worker = null;
-        self.send_state.mutex.unlock();
-
-        if (maybe_worker) |worker| {
-            worker.join();
+    fn finishAllSendThreads(self: *AppState) void {
+        for (self.projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                thread.finishSendThread();
+            }
         }
     }
 
     pub fn hasPendingStream(self: *AppState) bool {
-        self.send_state.mutex.lock();
-        defer self.send_state.mutex.unlock();
+        if (self.projects.items.len == 0) return false;
+        return self.currentThread().isSendPending();
+    }
 
-        if (self.send_state.status != .pending) return false;
-        if (self.send_state.project_index != self.selected_project_index) return false;
-        if (self.send_state.thread_index != self.currentProject().selected_thread_index) return false;
-        return true;
+    pub fn hasAnyPendingSends(self: *AppState) bool {
+        for (self.projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                if (thread.isSendPending()) return true;
+            }
+        }
+        return false;
     }
 
     pub fn isPickerPending(self: *AppState) bool {
@@ -3080,13 +3117,13 @@ pub const AppState = struct {
     }
 
     pub fn pendingApprovalSnapshot(self: *AppState) !?PendingApproval {
-        self.send_state.mutex.lock();
-        defer self.send_state.mutex.unlock();
+        if (self.projects.items.len == 0) return null;
+        const send_state = self.currentThread().send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
 
-        if (self.send_state.status != .pending) return null;
-        if (self.send_state.project_index != self.selected_project_index) return null;
-        if (self.send_state.thread_index != self.currentProject().selected_thread_index) return null;
-        const approval = self.send_state.pending_approval orelse return null;
+        if (send_state.status != .pending) return null;
+        const approval = send_state.pending_approval orelse return null;
         return .{
             .call_id = try self.allocator.dupe(u8, approval.call_id),
             .title = try self.allocator.dupe(u8, approval.title),
@@ -3095,19 +3132,16 @@ pub const AppState = struct {
     }
 
     pub fn resolvePendingApproval(self: *AppState, decision: ai_harness.ApprovalDecision) void {
-        self.send_state.mutex.lock();
-        defer self.send_state.mutex.unlock();
-        if (self.send_state.pending_approval == null) return;
-        self.send_state.approval_decision = decision;
-        self.send_state.condition.broadcast();
+        if (self.projects.items.len == 0) return;
+        const send_state = self.currentThread().send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        if (send_state.pending_approval == null) return;
+        send_state.approval_decision = decision;
+        send_state.condition.broadcast();
     }
 
-    fn applySendSuccess(self: *AppState, result: SendResultPayload, append_reply_text: bool) !void {
-        if (result.project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[result.project_index];
-        if (result.thread_index >= project.threads.items.len) return;
-        const thread = &project.threads.items[result.thread_index];
-
+    fn applySendSuccess(self: *AppState, thread: *ChatThread, result: SendResultPayload, append_reply_text: bool) !void {
         if (thread.provider_thread_id) |thread_id| {
             self.allocator.free(thread_id);
         }
@@ -3143,13 +3177,8 @@ pub const AppState = struct {
         self.setSidebarNotice("Provider session updated.");
     }
 
-    fn applyPendingTimelineEvents(self: *AppState, result: SendResultPayload, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) !void {
+    fn applyPendingTimelineEvents(self: *AppState, thread: *ChatThread, events: *std.ArrayListUnmanaged(PendingTimelineEvent)) !void {
         if (events.items.len == 0) return;
-        if (result.project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[result.project_index];
-        if (result.thread_index >= project.threads.items.len) return;
-        const thread = &project.threads.items[result.thread_index];
-
         self.trimThreadMessages(thread, events.items.len);
         for (events.items) |event| {
             try thread.messages.append(self.allocator, .{
@@ -3165,16 +3194,10 @@ pub const AppState = struct {
 
     fn applySendFailure(
         self: *AppState,
-        project_index: usize,
-        thread_index: usize,
+        thread: *ChatThread,
         events: *std.ArrayListUnmanaged(PendingTimelineEvent),
         failure_message: []const u8,
     ) !void {
-        if (project_index >= self.projects.items.len) return;
-        const project = &self.projects.items[project_index];
-        if (thread_index >= project.threads.items.len) return;
-        const thread = &project.threads.items[thread_index];
-
         self.trimThreadMessages(thread, events.items.len + 1);
         for (events.items) |event| {
             try thread.messages.append(self.allocator, .{
