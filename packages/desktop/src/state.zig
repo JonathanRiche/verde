@@ -644,7 +644,7 @@ pub const AppState = struct {
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
     send_state: SendState,
-    scroll_transcript_to_bottom: bool,
+    scroll_transcript_to_bottom_frames: u8,
     dirty: bool,
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
@@ -701,7 +701,7 @@ pub const AppState = struct {
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
             .send_state = .{},
-            .scroll_transcript_to_bottom = true,
+            .scroll_transcript_to_bottom_frames = 2,
             .dirty = false,
         };
 
@@ -2765,7 +2765,7 @@ pub const AppState = struct {
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
-        self.scroll_transcript_to_bottom = true;
+        self.scroll_transcript_to_bottom_frames = 2;
     }
 
     fn importPath(self: *const AppState) []const u8 {
