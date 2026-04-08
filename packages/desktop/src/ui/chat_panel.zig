@@ -233,7 +233,7 @@ fn renderHeader(state: anytype) void {
         theme.scaledUi(184.0),
     );
     const menu_button_width = theme.scaledUi(30.0);
-    const browser_button_width = theme.scaledUi(88.0);
+    const browser_button_width = theme.scaledUi(106.0);
     const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
     const action_x = header_start_x + @max(theme.scaledUi(180.0), header_content_width - actions_width);
     const base_y = header_start[1];
