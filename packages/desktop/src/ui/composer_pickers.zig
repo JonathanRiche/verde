@@ -16,12 +16,11 @@ const ReasoningOption = native_state.ReasoningOption;
 const CODEX_MODEL_OPTIONS = native_state.CODEX_MODEL_OPTIONS;
 const CODEX_REASONING_OPTIONS = native_state.CODEX_REASONING_OPTIONS;
 const DEFAULT_CODEX_MODEL = native_state.DEFAULT_CODEX_MODEL;
-const DEFAULT_OPENCODE_MODEL = native_state.DEFAULT_OPENCODE_MODEL;
-const OPENCODE_MODEL_OPTIONS = native_state.OPENCODE_MODEL_OPTIONS;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 pub fn render(state: *AppState) void {
     const thread = state.currentThreadMutable();
+    const opencode_model_options = state.opencodeModelOptions();
     const provider_locked = thread.committed;
 
     const transparent = colors.rgba(0, 0, 0, 0);
@@ -60,14 +59,14 @@ pub fn render(state: *AppState) void {
         zgui.popStyleVar(.{ .count = 2 });
     }
 
-    const model_preview = chat_threads.selectedModelLabel(ModelOption, thread, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]);
+    const model_preview = chat_threads.selectedModelLabel(ModelOption, thread, opencode_model_options, CODEX_MODEL_OPTIONS[0..]);
     const provider_logo_size = providerLogoSize(state, thread.provider, zgui.getFrameHeight() - ui_theme.scaledUi(10.0));
     const popup_width = if (provider_locked)
         model_panel_width
     else
         provider_panel_width + popup_padding * 2.0;
     const popup_height = if (provider_locked)
-        popup_padding * 2.0 + modelRowPanelHeight(thread.provider, model_row_height)
+        popup_padding * 2.0 + modelRowPanelHeight(thread.provider, opencode_model_options, model_row_height)
     else
         popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
     const combo_preview_pos = zgui.getCursorScreenPos();
@@ -100,8 +99,8 @@ pub fn render(state: *AppState) void {
             zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
             defer zgui.popStyleVar(.{ .count = 1 });
 
-            const active_model_ref = if (thread.model_ref != null) thread.model_ref.? else defaultModelRef(thread.provider);
-            for (chat_threads.modelOptions(ModelOption, thread.provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
+            const active_model_ref = if (thread.model_ref != null) thread.model_ref.? else defaultModelRef(state, thread.provider);
+            for (chat_threads.modelOptions(ModelOption, thread.provider, opencode_model_options, CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
                 zgui.pushIntId(@intCast(index));
                 const is_selected = if (option.value) |value|
                     std.mem.eql(u8, active_model_ref, value)
@@ -169,7 +168,7 @@ pub fn render(state: *AppState) void {
 
             if (active_provider) |provider| {
                 const provider_index = composerProviderIndex(provider);
-                renderComposerModelFlyout(state, thread, provider, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
+                renderComposerModelFlyout(state, thread, provider, opencode_model_options, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
             }
         }
     } else {
@@ -468,6 +467,7 @@ fn renderComposerModelFlyout(
     state: *AppState,
     thread: *ChatThread,
     provider: Provider,
+    opencode_model_options: []const ModelOption,
     provider_popup_origin: [2]f32,
     popup_padding: f32,
     provider_panel_width: f32,
@@ -475,7 +475,7 @@ fn renderComposerModelFlyout(
     model_panel_width: f32,
     model_row_height: f32,
 ) void {
-    const model_panel_height = modelRowPanelHeight(provider, model_row_height);
+    const model_panel_height = modelRowPanelHeight(provider, opencode_model_options, model_row_height);
     const flyout_gap = ui_theme.scaledUi(-10.0);
     const flyout_x = provider_popup_origin[0] + provider_panel_width + flyout_gap - popup_padding;
     const flyout_y = provider_popup_origin[1] + providerRowHeightForFlyout(provider_index) - popup_padding - ui_theme.scaledUi(2.0);
@@ -520,13 +520,13 @@ fn renderComposerModelFlyout(
     });
     defer zgui.end();
 
-    for (chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
+    for (chat_threads.modelOptions(ModelOption, provider, opencode_model_options, CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
         zgui.pushIntId(@intCast(index));
         var should_close_picker = false;
         const active_model_ref = if (thread.provider == provider and thread.model_ref != null)
             thread.model_ref.?
         else
-            defaultModelRef(provider);
+            defaultModelRef(state, provider);
         const is_selected = if (option.value) |value|
             thread.provider == provider and std.mem.eql(u8, active_model_ref, value)
         else
@@ -739,8 +739,11 @@ fn drawLockedModelCheckForLastItem(color: [4]f32, row_min_x: f32) void {
     });
 }
 
-fn modelRowPanelHeight(provider: Provider, row_height: f32) f32 {
-    const model_count = chat_threads.modelOptions(ModelOption, provider, OPENCODE_MODEL_OPTIONS[0..], CODEX_MODEL_OPTIONS[0..]).len;
+fn modelRowPanelHeight(provider: Provider, opencode_model_options: []const ModelOption, row_height: f32) f32 {
+    const model_count = switch (provider) {
+        .opencode => opencode_model_options.len,
+        .codex => CODEX_MODEL_OPTIONS.len,
+    };
     return row_height * @as(f32, @floatFromInt(model_count));
 }
 
@@ -755,7 +758,7 @@ fn setThreadProvider(state: *AppState, thread: *ChatThread, provider: Provider) 
     if (thread.model_ref) |model_ref| {
         state.allocator.free(model_ref);
     }
-    thread.model_ref = state.allocator.dupeZ(u8, defaultModelRef(provider)) catch null;
+    thread.model_ref = state.allocator.dupeZ(u8, defaultModelRef(state, provider)) catch null;
     thread.reasoning_effort = null;
     thread.fast_mode = .off;
     state.markDirty();
@@ -774,10 +777,10 @@ fn setThreadModelRef(state: *AppState, thread: *ChatThread, value: ?[:0]const u8
     state.markDirty();
 }
 
-fn defaultModelRef(provider: Provider) [:0]const u8 {
+fn defaultModelRef(state: *AppState, provider: Provider) [:0]const u8 {
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
-        .opencode => DEFAULT_OPENCODE_MODEL,
+        .opencode => state.defaultModelRefForProvider(.opencode),
     };
 }
 

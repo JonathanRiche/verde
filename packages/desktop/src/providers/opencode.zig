@@ -94,6 +94,18 @@ pub const Client = struct {
         return threads.toOwnedSlice(allocator);
     }
 
+    pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
+        const response = try self.requestJson(.GET, "/config/providers", null);
+        defer self.allocator.free(response.body);
+
+        if (response.status != .ok) return error.OpencodeRequestFailed;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
+        defer parsed.deinit();
+
+        return parseConfiguredModelsAlloc(allocator, parsed.value);
+    }
+
     pub fn readThread(
         self: *Client,
         allocator: std.mem.Allocator,
@@ -762,6 +774,89 @@ fn getOptionalObjectString(value: std.json.Value, field: []const u8) ?[]const u8
     };
 }
 
+fn parseConfiguredModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value) ![]provider_types.ModelInfo {
+    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
+    errdefer {
+        for (models.items) |model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+
+    switch (root) {
+        .object => {
+            var iterator = root.object.iterator();
+            while (iterator.next()) |entry| {
+                try appendProviderModels(allocator, entry.value_ptr.*, entry.key_ptr.*, &models);
+            }
+        },
+        .array => {
+            for (root.array.items) |provider_value| {
+                try appendProviderModels(allocator, provider_value, null, &models);
+            }
+        },
+        else => {},
+    }
+
+    return models.toOwnedSlice(allocator);
+}
+
+fn appendProviderModels(
+    allocator: std.mem.Allocator,
+    provider_value: std.json.Value,
+    fallback_provider_id: ?[]const u8,
+    models: *std.ArrayList(provider_types.ModelInfo),
+) !void {
+    if (provider_value != .object) return;
+
+    const provider_id = getOptionalObjectString(provider_value, "id") orelse fallback_provider_id orelse return;
+    const provider_name = getOptionalObjectString(provider_value, "name") orelse
+        getOptionalObjectString(provider_value, "displayName") orelse
+        provider_id;
+    const provider_models = getObjectField(provider_value, "models") orelse return;
+
+    switch (provider_models) {
+        .object => {
+            var iterator = provider_models.object.iterator();
+            while (iterator.next()) |entry| {
+                try appendModelInfo(allocator, entry.value_ptr.*, provider_id, provider_name, entry.key_ptr.*, models);
+            }
+        },
+        .array => {
+            for (provider_models.array.items) |model_value| {
+                try appendModelInfo(allocator, model_value, provider_id, provider_name, null, models);
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendModelInfo(
+    allocator: std.mem.Allocator,
+    model_value: std.json.Value,
+    provider_id: []const u8,
+    provider_name: []const u8,
+    fallback_model_id: ?[]const u8,
+    models: *std.ArrayList(provider_types.ModelInfo),
+) !void {
+    const model_id, const model_name = switch (model_value) {
+        .string => |text| .{ text, text },
+        .object => .{
+            getOptionalObjectString(model_value, "id") orelse fallback_model_id orelse return,
+            getOptionalObjectString(model_value, "name") orelse
+                getOptionalObjectString(model_value, "displayName") orelse
+                getOptionalObjectString(model_value, "id") orelse
+                fallback_model_id orelse return,
+        },
+        else => return,
+    };
+
+    try models.append(allocator, .{
+        .provider_id = try allocator.dupe(u8, provider_id),
+        .provider_name = try allocator.dupe(u8, provider_name),
+        .model_id = try allocator.dupe(u8, model_id),
+        .model_name = try allocator.dupe(u8, model_name),
+    });
+}
+
 fn extractAssistantTextAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     const parts = getObjectField(value, "parts") orelse return allocator.dupe(u8, "");
     if (parts != .array) return allocator.dupe(u8, "");
@@ -1276,4 +1371,39 @@ test "extractAssistantTextAlloc joins text parts" {
     const text = try extractAssistantTextAlloc(allocator, parsed.value);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello world", text);
+}
+
+test "parseConfiguredModelsAlloc reads configured providers and models" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "openai": {
+        \\    "id": "openai",
+        \\    "name": "OpenAI",
+        \\    "models": {
+        \\      "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" }
+        \\    }
+        \\  },
+        \\  "zen": {
+        \\    "id": "zen",
+        \\    "name": "Zen",
+        \\    "models": {
+        \\      "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" },
+        \\      "sonnet": { "id": "sonnet", "name": "Claude Sonnet" }
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    const models = try parseConfiguredModelsAlloc(allocator, parsed.value);
+    defer provider_types.freeModelInfos(allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("openai", models[0].provider_id);
+    try std.testing.expectEqualStrings("OpenAI", models[0].provider_name);
+    try std.testing.expectEqualStrings("gpt-5.4", models[0].model_id);
+    try std.testing.expectEqualStrings("GPT-5.4", models[0].model_name);
+    try std.testing.expectEqualStrings("zen", models[1].provider_id);
+    try std.testing.expectEqualStrings("Zen", models[1].provider_name);
 }

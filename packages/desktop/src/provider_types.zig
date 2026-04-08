@@ -38,6 +38,25 @@ pub const ChatThreadSummary = struct {
     title: []const u8,
 };
 
+pub const ModelInfo = struct {
+    provider_id: []const u8,
+    provider_name: []const u8,
+    model_id: []const u8,
+    model_name: []const u8,
+
+    pub fn deinit(self: ModelInfo, allocator: anytype) void {
+        allocator.free(self.provider_id);
+        allocator.free(self.provider_name);
+        allocator.free(self.model_id);
+        allocator.free(self.model_name);
+    }
+};
+
+pub fn freeModelInfos(allocator: anytype, models: []const ModelInfo) void {
+    for (models) |model| model.deinit(allocator);
+    allocator.free(models);
+}
+
 pub const ReadThreadResult = struct {
     thread_id: []const u8,
     title: []const u8,
