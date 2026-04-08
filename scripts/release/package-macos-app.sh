@@ -70,7 +70,7 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
 
-"$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
+bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
