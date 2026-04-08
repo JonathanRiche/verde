@@ -315,7 +315,7 @@ fn renderHeader(state: anytype) void {
     }
 
     zgui.sameLine(.{ .spacing = button_gap });
-    if (renderHeaderActionButton("Browser", browser_button_width, button_height, theme.COLOR_PANEL_ALT, theme.lighten(theme.COLOR_PANEL_ALT, 0.08), theme.lighten(theme.COLOR_PANEL_ALT, 0.14))) {
+    if (renderHeaderBrowserButton(browser_button_width, button_height)) {
         state.toggleBrowser();
     }
     if (zgui.isItemHovered(.{ .delay_normal = true })) {
@@ -338,6 +338,73 @@ fn renderHeaderActionButton(
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = active_color });
     defer zgui.popStyleColor(.{ .count = 3 });
     return zgui.button(label, .{ .w = width, .h = height });
+}
+
+/// Browser button with a globe icon to the left of the label.
+fn renderHeaderBrowserButton(width: f32, height: f32) bool {
+    const start = zgui.getCursorScreenPos();
+    const clicked = zgui.invisibleButton("##header-browser-button", .{ .w = width, .h = height });
+    const hovered = zgui.isItemHovered(.{});
+    const draw_list = zgui.getWindowDrawList();
+
+    const bg = if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT;
+    draw_list.addRectFilled(.{
+        .pmin = start,
+        .pmax = .{ start[0] + width, start[1] + height },
+        .col = zgui.colorConvertFloat4ToU32(bg),
+        .rounding = theme.scaledUi(6.0),
+    });
+
+    const label = "Browser";
+    const text_size = zgui.calcTextSize(label, .{});
+    const icon_size = theme.scaledUi(12.0);
+    const icon_gap = theme.scaledUi(5.0);
+    const total_content = icon_size + icon_gap + text_size[0];
+    const content_x = start[0] + (width - total_content) * 0.5;
+    const cy = start[1] + height * 0.5;
+
+    drawGlobeIcon(draw_list, content_x, cy, icon_size, theme.COLOR_TEXT_MUTED);
+
+    const text_x = content_x + icon_size + icon_gap;
+    const text_y = start[1] + (height - text_size[1]) * 0.5;
+    draw_list.addTextUnformatted(.{ text_x, text_y }, zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE), label);
+
+    return clicked;
+}
+
+/// Draws a globe/world icon: a circle with horizontal and vertical arc lines.
+fn drawGlobeIcon(draw_list: zgui.DrawList, x: f32, cy: f32, size: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const r = size * 0.5;
+    const cx = x + r;
+    const t = theme.scaledUi(1.3);
+
+    // Outer circle
+    draw_list.addCircle(.{ .p = .{ cx, cy }, .r = r, .col = col, .thickness = t });
+
+    // Vertical meridian (ellipse approximated as a narrower arc)
+    // Left half of vertical ellipse
+    const ew = r * 0.4; // ellipse half-width
+    draw_list.addBezierCubic(.{
+        .p1 = .{ cx, cy - r },
+        .p2 = .{ cx - ew * 1.8, cy - r * 0.5 },
+        .p3 = .{ cx - ew * 1.8, cy + r * 0.5 },
+        .p4 = .{ cx, cy + r },
+        .col = col,
+        .thickness = t,
+    });
+    // Right half of vertical ellipse
+    draw_list.addBezierCubic(.{
+        .p1 = .{ cx, cy - r },
+        .p2 = .{ cx + ew * 1.8, cy - r * 0.5 },
+        .p3 = .{ cx + ew * 1.8, cy + r * 0.5 },
+        .p4 = .{ cx, cy + r },
+        .col = col,
+        .thickness = t,
+    });
+
+    // Horizontal line across the middle
+    draw_list.addLine(.{ .p1 = .{ cx - r, cy }, .p2 = .{ cx + r, cy }, .col = col, .thickness = t });
 }
 
 fn renderHeaderSplitTextButton(
