@@ -5,6 +5,8 @@ const zgui = @import("zgui");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
+const native_state = @import("../state.zig");
+const Provider = native_state.Provider;
 
 /// Renders the full project rail and thread list.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
@@ -298,15 +300,14 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }
 }
 
-/// New-thread button: vector-drawn compose icon (pen + page corner).
+/// New-thread button using the loaded edit texture, transparent bg with hover highlight.
 fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) bool {
-    _ = state;
     const start = zgui.getCursorScreenPos();
     const clicked = zgui.invisibleButton("##thread-edit-button", .{ .w = width, .h = height });
     const hovered = zgui.isItemHovered(.{});
     const draw_list = zgui.getWindowDrawList();
 
-    // Transparent by default, subtle bg on hover
+    // Only show bg on hover
     if (hovered) {
         draw_list.addRectFilled(.{
             .pmin = start,
@@ -316,10 +317,17 @@ fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) boo
         });
     }
 
-    const icon_color = if (hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE;
-    const cx = start[0] + width * 0.5;
-    const cy = start[1] + height * 0.5;
-    drawComposeIcon(draw_list, cx, cy, icon_color);
+    if (state.thread_edit_texture) |cached| {
+        const icon_size = theme.clampf(@min(width, height) - theme.scaledUi(8.0), theme.scaledUi(14.0), theme.scaledUi(18.0));
+        const image_min = .{
+            start[0] + (width - icon_size) * 0.5,
+            start[1] + (height - icon_size) * 0.5,
+        };
+        draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
+            .pmin = image_min,
+            .pmax = .{ image_min[0] + icon_size, image_min[1] + icon_size },
+        });
+    }
 
     return clicked;
 }
@@ -395,13 +403,12 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         zgui.pushStyleColor4f(.{ .idx = .header_active, .c = theme.lighten(colors.DARK_BLUE, 0.12) });
     }
 
-    // Chat bubble icon drawn before the selectable row
+    // Provider logo drawn before the selectable row
     const chat_icon_space = theme.scaledUi(18.0);
     const row_height = theme.scaledUi(26.0);
     const icon_screen_pos = zgui.getCursorScreenPos();
     const icon_cy = icon_screen_pos[1] + row_height * 0.5;
-    const icon_col = if (thread_selected) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE;
-    drawChatBubbleIcon(zgui.getWindowDrawList(), icon_screen_pos[0], icon_cy, icon_col);
+    drawThreadProviderLogo(zgui.getWindowDrawList(), state, thread.provider, icon_screen_pos[0], icon_cy);
 
     // Indent the selectable past the icon
     zgui.indent(.{ .indent_w = chat_icon_space });
@@ -538,35 +545,81 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "recent";
 }
 
-/// Draws a compose/new-chat icon: a square with a folded corner and a diagonal pen line.
+/// Draws the provider logo for a thread row, falling back to a chat bubble if no texture is loaded.
+fn drawThreadProviderLogo(draw_list: zgui.DrawList, state: anytype, provider: Provider, x: f32, center_y: f32) void {
+    // Keep the logo proportional to the font size so it doesn't dominate the row
+    const logo_height = @min(zgui.getFontSize() * 0.85, theme.scaledUi(11.0));
+    const cached = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    };
+    if (cached) |tex| {
+        const uv = providerLogoUvBounds(provider);
+        const visible_w = uv.max[0] - uv.min[0];
+        const visible_h = uv.max[1] - uv.min[1];
+        const aspect = visible_w / visible_h;
+        const logo_width = logo_height * aspect;
+        const img_min: [2]f32 = .{ x, center_y - logo_height * 0.5 };
+        draw_list.addImage(runtime.textureRefFromGlId(tex.texture_id), .{
+            .pmin = img_min,
+            .pmax = .{ img_min[0] + logo_width, img_min[1] + logo_height },
+            .uvmin = uv.min,
+            .uvmax = uv.max,
+        });
+    } else {
+        drawChatBubbleIcon(draw_list, x, center_y, theme.COLOR_TEXT_SUBTLE);
+    }
+}
+
+/// Returns the UV crop bounds for a provider's logo texture.
+fn providerLogoUvBounds(provider: Provider) struct { min: [2]f32, max: [2]f32 } {
+    return switch (provider) {
+        .codex => .{
+            .min = .{ 118.0 / 721.0, 120.0 / 721.0 },
+            .max = .{ 603.0 / 721.0, 601.0 / 721.0 },
+        },
+        .opencode => .{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ 1.0, 1.0 },
+        },
+    };
+}
+
+/// Draws an edit icon: rounded square with a diagonal pen exiting the top-right corner.
 fn drawComposeIcon(draw_list: zgui.DrawList, cx: f32, cy: f32, color: [4]f32) void {
     const col = zgui.colorConvertFloat4ToU32(color);
-    const t = theme.scaledUi(1.5); // stroke thickness
-    const s = theme.scaledUi(6.0); // half-size of the page square
+    const t = theme.scaledUi(1.5);
+    const s = theme.scaledUi(5.5); // half-size of the square
+    const r = theme.scaledUi(1.5); // corner rounding
 
-    // Page outline (square with top-right corner removed for the fold)
+    // Rounded square (open at top-right corner where the pen exits)
     const left = cx - s;
     const right = cx + s;
     const top = cy - s;
     const bottom = cy + s;
-    const fold = theme.scaledUi(3.5); // size of the corner fold
+    const gap = theme.scaledUi(3.5); // how far from corner the square opens
 
-    // Draw page edges: left, bottom, right (partial), fold diagonal, top (partial)
-    draw_list.addLine(.{ .p1 = .{ left, top }, .p2 = .{ left, bottom }, .col = col, .thickness = t });
-    draw_list.addLine(.{ .p1 = .{ left, bottom }, .p2 = .{ right, bottom }, .col = col, .thickness = t });
-    draw_list.addLine(.{ .p1 = .{ right, top + fold }, .p2 = .{ right, bottom }, .col = col, .thickness = t });
-    draw_list.addLine(.{ .p1 = .{ left, top }, .p2 = .{ right - fold, top }, .col = col, .thickness = t });
-    // Fold: diagonal from top-right inward
-    draw_list.addLine(.{ .p1 = .{ right - fold, top }, .p2 = .{ right, top + fold }, .col = col, .thickness = t });
+    // Bottom edge
+    draw_list.addLine(.{ .p1 = .{ left + r, bottom }, .p2 = .{ right - r, bottom }, .col = col, .thickness = t });
+    // Left edge
+    draw_list.addLine(.{ .p1 = .{ left, top + r }, .p2 = .{ left, bottom - r }, .col = col, .thickness = t });
+    // Right edge (stops short of top for the pen gap)
+    draw_list.addLine(.{ .p1 = .{ right, top + gap }, .p2 = .{ right, bottom - r }, .col = col, .thickness = t });
+    // Top edge (stops short of right for the pen gap)
+    draw_list.addLine(.{ .p1 = .{ left + r, top }, .p2 = .{ right - gap, top }, .col = col, .thickness = t });
 
-    // Diagonal pen stroke across the page
-    const pen_offset = theme.scaledUi(2.0);
-    draw_list.addLine(.{
-        .p1 = .{ cx + s - pen_offset, cy - s + pen_offset },
-        .p2 = .{ cx - s + pen_offset + theme.scaledUi(1.0), cy + s - pen_offset - theme.scaledUi(1.0) },
-        .col = col,
-        .thickness = t,
-    });
+    // Diagonal pen line from inside the square out through the top-right
+    const pen_len = theme.scaledUi(5.5);
+    const pen_start_x = right - gap + theme.scaledUi(0.5);
+    const pen_start_y = top + gap - theme.scaledUi(0.5);
+    const pen_end_x = pen_start_x + pen_len * 0.707;
+    const pen_end_y = pen_start_y - pen_len * 0.707;
+    draw_list.addLine(.{ .p1 = .{ pen_start_x, pen_start_y }, .p2 = .{ pen_end_x, pen_end_y }, .col = col, .thickness = t });
+
+    // Small arrowhead/nib at pen tip end
+    const arrow = theme.scaledUi(2.5);
+    draw_list.addLine(.{ .p1 = .{ pen_end_x, pen_end_y }, .p2 = .{ pen_end_x - arrow, pen_end_y }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ pen_end_x, pen_end_y }, .p2 = .{ pen_end_x, pen_end_y + arrow }, .col = col, .thickness = t });
 }
 
 /// Draws a small speech bubble icon for thread rows.
