@@ -395,8 +395,6 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
 }
 pub const SendWorkerRequest = struct {
     send_state_ptr: *app_state.SendState,
-    project_index: usize,
-    thread_index: usize,
     provider: app_state.Provider,
     harness: app_state.Harness,
     project_path: []u8,
@@ -453,8 +451,6 @@ pub fn runSendWorker(
     });
 
     return .{
-        .project_index = request.project_index,
-        .thread_index = request.thread_index,
         .provider_thread_id = result.thread_id,
         .reply_text = result.reply_text,
     };

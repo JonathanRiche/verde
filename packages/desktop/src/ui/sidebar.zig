@@ -298,34 +298,28 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }
 }
 
+/// New-thread button: vector-drawn compose icon (pen + page corner).
 fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) bool {
+    _ = state;
     const start = zgui.getCursorScreenPos();
     const clicked = zgui.invisibleButton("##thread-edit-button", .{ .w = width, .h = height });
     const hovered = zgui.isItemHovered(.{});
     const draw_list = zgui.getWindowDrawList();
-    const bg_color = if (hovered)
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.08)
-    else
-        theme.COLOR_PANEL_ALT;
 
-    draw_list.addRectFilled(.{
-        .pmin = start,
-        .pmax = .{ start[0] + width, start[1] + height },
-        .col = zgui.colorConvertFloat4ToU32(bg_color),
-        .rounding = theme.scaledUi(6.0),
-    });
-
-    if (state.thread_edit_texture) |cached| {
-        const icon_size = theme.clampf(@min(width, height) - theme.scaledUi(8.0), theme.scaledUi(14.0), theme.scaledUi(18.0));
-        const image_min = .{
-            start[0] + (width - icon_size) * 0.5,
-            start[1] + (height - icon_size) * 0.5,
-        };
-        draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
-            .pmin = image_min,
-            .pmax = .{ image_min[0] + icon_size, image_min[1] + icon_size },
+    // Transparent by default, subtle bg on hover
+    if (hovered) {
+        draw_list.addRectFilled(.{
+            .pmin = start,
+            .pmax = .{ start[0] + width, start[1] + height },
+            .col = zgui.colorConvertFloat4ToU32(theme.lighten(theme.COLOR_PANEL_ALT, 0.10)),
+            .rounding = theme.scaledUi(6.0),
         });
     }
+
+    const icon_color = if (hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE;
+    const cx = start[0] + width * 0.5;
+    const cy = start[1] + height * 0.5;
+    drawComposeIcon(draw_list, cx, cy, icon_color);
 
     return clicked;
 }
@@ -542,6 +536,37 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     }
     const days = @divFloor(elapsed, 86_400);
     return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "recent";
+}
+
+/// Draws a compose/new-chat icon: a square with a folded corner and a diagonal pen line.
+fn drawComposeIcon(draw_list: zgui.DrawList, cx: f32, cy: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = theme.scaledUi(1.5); // stroke thickness
+    const s = theme.scaledUi(6.0); // half-size of the page square
+
+    // Page outline (square with top-right corner removed for the fold)
+    const left = cx - s;
+    const right = cx + s;
+    const top = cy - s;
+    const bottom = cy + s;
+    const fold = theme.scaledUi(3.5); // size of the corner fold
+
+    // Draw page edges: left, bottom, right (partial), fold diagonal, top (partial)
+    draw_list.addLine(.{ .p1 = .{ left, top }, .p2 = .{ left, bottom }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ left, bottom }, .p2 = .{ right, bottom }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ right, top + fold }, .p2 = .{ right, bottom }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ left, top }, .p2 = .{ right - fold, top }, .col = col, .thickness = t });
+    // Fold: diagonal from top-right inward
+    draw_list.addLine(.{ .p1 = .{ right - fold, top }, .p2 = .{ right, top + fold }, .col = col, .thickness = t });
+
+    // Diagonal pen stroke across the page
+    const pen_offset = theme.scaledUi(2.0);
+    draw_list.addLine(.{
+        .p1 = .{ cx + s - pen_offset, cy - s + pen_offset },
+        .p2 = .{ cx - s + pen_offset + theme.scaledUi(1.0), cy + s - pen_offset - theme.scaledUi(1.0) },
+        .col = col,
+        .thickness = t,
+    });
 }
 
 /// Draws a small speech bubble icon for thread rows.

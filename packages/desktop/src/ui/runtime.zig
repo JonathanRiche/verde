@@ -54,7 +54,5 @@ pub fn formatByteSize(buffer: *[32:0]u8, size: usize) [:0]const u8 {
 }
 
 pub fn isSendPending(state: *AppState) bool {
-    state.send_state.mutex.lock();
-    defer state.send_state.mutex.unlock();
-    return state.send_state.status == .pending;
+    return state.hasPendingStream();
 }
