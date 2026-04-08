@@ -329,8 +329,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 );
             }
             const action = keyboard.actionForEvent(&event.key);
-            if (action == .toggle_terminal) {
-                handleKeyboardAction(state, keyboard, .toggle_terminal);
+            if (action == .toggle_terminal or action == .toggle_browser) {
+                handleKeyboardAction(state, keyboard, action.?);
                 return true;
             }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
@@ -545,6 +545,7 @@ fn handleKeyboardAction(
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
         .open_default => state.runDefaultOpenAction(),
+        .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
     }
 }
