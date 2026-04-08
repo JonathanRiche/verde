@@ -230,8 +230,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                     zgui.closeCurrentPopup();
                 }
                 if (zgui.menuItem("Import Codex thread", .{})) {
-                    state.beginCodexThreadImport(index);
-                    zgui.openPopup(runtime.CODEX_IMPORT_MODAL_ID, .{});
+                    state.beginThreadImport(index, .codex);
+                    zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
+                    zgui.closeCurrentPopup();
+                }
+                if (zgui.menuItem("Import OpenCode thread", .{})) {
+                    state.beginThreadImport(index, .opencode);
+                    zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
                     zgui.closeCurrentPopup();
                 }
                 if (zgui.menuItem("Remove project", .{})) {
@@ -434,7 +439,7 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         state.projects.items[project_index].selected_thread_index = thread_index;
         state.syncRenameBuffer();
 
-        const can_sync = thread.provider == .codex and thread.provider_thread_id != null;
+        const can_sync = thread.provider_thread_id != null;
         if (zgui.menuItem("Sync thread", .{ .enabled = can_sync })) {
             state.syncThreadFromProvider(project_index, thread_index);
             zgui.closeCurrentPopup();
