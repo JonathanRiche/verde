@@ -151,7 +151,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             const cy = row_pos[1] + row_height * 0.5;
             var x = row_pos[0] + theme.scaledUi(2.0);
             const chevron_col = zgui.colorConvertFloat4ToU32(if (hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);
-            const cs: f32 = theme.scaledUi(3.5);
+            const cs: f32 = theme.scaledUi(4.5);
             if (is_collapsed) {
                 dl.addTriangleFilled(.{
                     .p1 = .{ x - cs * 0.3, cy - cs },
@@ -169,21 +169,40 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             }
             x += theme.scaledUi(8.0);
 
-            const folder_col = zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_SUBTLE);
+            // Folder icon: filled green for selected, outline for others
             const fw = theme.scaledUi(13.0);
             const fh = theme.scaledUi(9.0);
-            dl.addRectFilled(.{
-                .pmin = .{ x, cy - fh * 0.5 - theme.scaledUi(2.0) },
-                .pmax = .{ x + fw * 0.4, cy - fh * 0.5 + theme.scaledUi(1.0) },
-                .col = folder_col,
-                .rounding = theme.scaledUi(1.0),
-            });
-            dl.addRectFilled(.{
-                .pmin = .{ x, cy - fh * 0.5 },
-                .pmax = .{ x + fw, cy + fh * 0.5 },
-                .col = folder_col,
-                .rounding = theme.scaledUi(1.5),
-            });
+            if (is_selected) {
+                const folder_fill = zgui.colorConvertFloat4ToU32(theme.COLOR_SECONDARY_GREEN);
+                dl.addRectFilled(.{
+                    .pmin = .{ x, cy - fh * 0.5 - theme.scaledUi(2.0) },
+                    .pmax = .{ x + fw * 0.4, cy - fh * 0.5 + theme.scaledUi(1.0) },
+                    .col = folder_fill,
+                    .rounding = theme.scaledUi(1.0),
+                });
+                dl.addRectFilled(.{
+                    .pmin = .{ x, cy - fh * 0.5 },
+                    .pmax = .{ x + fw, cy + fh * 0.5 },
+                    .col = folder_fill,
+                    .rounding = theme.scaledUi(1.5),
+                });
+            } else {
+                const folder_outline = zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_SUBTLE);
+                const ft = theme.scaledUi(1.4);
+                dl.addRectFilled(.{
+                    .pmin = .{ x, cy - fh * 0.5 - theme.scaledUi(2.0) },
+                    .pmax = .{ x + fw * 0.4, cy - fh * 0.5 + theme.scaledUi(1.0) },
+                    .col = folder_outline,
+                    .rounding = theme.scaledUi(1.0),
+                });
+                dl.addRect(.{
+                    .pmin = .{ x, cy - fh * 0.5 },
+                    .pmax = .{ x + fw, cy + fh * 0.5 },
+                    .col = folder_outline,
+                    .rounding = theme.scaledUi(1.5),
+                    .thickness = ft,
+                });
+            }
             x += fw + theme.scaledUi(4.0);
 
             const text_col = zgui.colorConvertFloat4ToU32(if (is_selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
@@ -237,7 +256,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         const sub_indent = theme.scaledUi(20.0);
         if (!is_collapsed) zgui.indent(.{ .indent_w = sub_indent });
         if (!is_collapsed) {
-            zgui.textDisabled("{d} saved chats", .{state.projects.items[index].committedThreadCount()});
+            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{d} saved chats", .{state.projects.items[index].committedThreadCount()});
         }
         if (!is_collapsed) {
             var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &state.projects.items[index]) catch blk: {
@@ -371,7 +390,7 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
     var time_buf: [24]u8 = undefined;
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
     const timestamp_width = zgui.calcTextSize(relative_time, .{})[0] + theme.scaledUi(6.0);
-    const title_width_chars: usize = @intFromFloat(@max((row_width - timestamp_width - theme.scaledUi(12.0)) / @max(zgui.getFontSize() * 0.42, 6.0), 10.0));
+    const title_width_chars: usize = @intFromFloat(@max((row_width - timestamp_width - theme.scaledUi(30.0)) / @max(zgui.getFontSize() * 0.42, 6.0), 10.0));
 
     zgui.pushIntId(@intCast(thread_index + 1000));
     defer zgui.popId();
@@ -382,13 +401,23 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         zgui.pushStyleColor4f(.{ .idx = .header_active, .c = theme.lighten(colors.DARK_BLUE, 0.12) });
     }
 
+    // Chat bubble icon drawn before the selectable row
+    const chat_icon_space = theme.scaledUi(18.0);
+    const row_height = theme.scaledUi(26.0);
+    const icon_screen_pos = zgui.getCursorScreenPos();
+    const icon_cy = icon_screen_pos[1] + row_height * 0.5;
+    const icon_col = if (thread_selected) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE;
+    drawChatBubbleIcon(zgui.getWindowDrawList(), icon_screen_pos[0], icon_cy, icon_col);
+
+    // Indent the selectable past the icon
+    zgui.indent(.{ .indent_w = chat_icon_space });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(6.0) } });
     var title_buf = std.mem.zeroes([64:0]u8);
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_width_chars);
     if (zgui.selectable(row_label, .{
         .selected = thread_selected,
-        .w = row_width - timestamp_width,
-        .h = theme.scaledUi(26.0),
+        .w = row_width - timestamp_width - chat_icon_space,
+        .h = row_height,
     })) {
         state.selected_project_index = project_index;
         state.projects.items[project_index].selected_thread_index = thread_index;
@@ -411,9 +440,9 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         }
     }
     zgui.popStyleVar(.{ .count = 1 });
-
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
     zgui.textColored(colors.TIME_LABEL, "{s}", .{relative_time});
+    zgui.unindent(.{ .indent_w = chat_icon_space });
 
     if (thread_selected) {
         zgui.popStyleColor(.{ .count = 3 });
@@ -513,6 +542,33 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     }
     const days = @divFloor(elapsed, 86_400);
     return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "recent";
+}
+
+/// Draws a small speech bubble icon for thread rows.
+fn drawChatBubbleIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const bw = theme.scaledUi(11.0); // bubble width
+    const bh = theme.scaledUi(8.0); // bubble height
+    const r = theme.scaledUi(2.0); // corner rounding
+    const bubble_top = center_y - bh * 0.5 - theme.scaledUi(1.0);
+
+    // Rounded rectangle body
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, bubble_top },
+        .pmax = .{ x + bw, bubble_top + bh },
+        .col = col,
+        .rounding = r,
+    });
+
+    // Small tail triangle at bottom-left
+    const tail_x = x + theme.scaledUi(2.5);
+    const tail_top = bubble_top + bh - theme.scaledUi(0.5);
+    draw_list.addTriangleFilled(.{
+        .p1 = .{ tail_x, tail_top },
+        .p2 = .{ tail_x + theme.scaledUi(3.0), tail_top },
+        .p3 = .{ tail_x, tail_top + theme.scaledUi(3.0) },
+        .col = col,
+    });
 }
 
 /// Collects committed threads and sorts them by recent activity.
