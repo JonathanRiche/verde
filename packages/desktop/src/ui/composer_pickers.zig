@@ -179,12 +179,10 @@ pub fn render(state: *AppState) void {
 
     zgui.sameLine(.{ .spacing = chip_spacing });
     const reasoning_preview = chat_threads.selectedReasoningLabel(ReasoningOption, thread, CODEX_REASONING_OPTIONS[0..]);
-    var reasoning_buf = std.mem.zeroes([80:0]u8);
-    const reasoning_label = std.fmt.bufPrintZ(&reasoning_buf, "{s} v", .{reasoning_preview}) catch "Reasoning v";
-    zgui.setNextItemWidth(composerPickerTextWidth(reasoning_preview) + ui_theme.scaledUi(36.0));
+    zgui.setNextItemWidth(composerPickerTextWidth(reasoning_preview) + ui_theme.scaledUi(52.0));
     if (zgui.beginCombo("##reasoning-picker", .{
-        .preview_value = reasoning_label,
-        .flags = .{ .no_arrow_button = true },
+        .preview_value = reasoning_preview,
+        .flags = .{ .popup_align_left = true },
     })) {
         defer zgui.endCombo();
         for (CODEX_REASONING_OPTIONS) |option| {
@@ -224,12 +222,19 @@ pub fn render(state: *AppState) void {
         zgui.textColored(separator_color, "|", .{});
     }
 
+    // Access mode toggle with lock/unlock icon
     zgui.sameLine(.{ .spacing = chip_spacing });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
     const access_label: [:0]const u8 = chat_threads.accessModeLabel(thread.access_mode);
-    if (zgui.button(access_label, .{ .w = 0.0, .h = 0.0 })) {
+    const icon_gap = ui_theme.scaledUi(6.0);
+    const icon_width = ui_theme.scaledUi(12.0);
+    const access_text_width = composerPickerTextWidth(access_label);
+    const access_btn_width = icon_width + icon_gap + access_text_width + base_padding_x * 2.0;
+    const access_btn_pos = zgui.getCursorScreenPos();
+    const access_btn_height = zgui.getFrameHeight();
+    if (zgui.button("##access-mode", .{ .w = access_btn_width, .h = 0.0 })) {
         const new_mode: AccessMode = if (thread.access_mode == .full_access) .supervised else .full_access;
         if (thread.access_mode != new_mode) {
             thread.access_mode = new_mode;
@@ -240,6 +245,14 @@ pub fn render(state: *AppState) void {
             state.markDirty();
         }
     }
+    const access_dl = zgui.getWindowDrawList();
+    const lock_x = access_btn_pos[0] + base_padding_x;
+    const lock_cy = access_btn_pos[1] + access_btn_height * 0.5;
+    const is_locked = thread.access_mode == .supervised;
+    drawLockIcon(access_dl, lock_x, lock_cy, picker_text_color, is_locked);
+    const text_x = lock_x + icon_width + icon_gap;
+    const text_y = access_btn_pos[1] + (access_btn_height - zgui.calcTextSize(access_label, .{})[1]) * 0.5;
+    access_dl.addTextUnformatted(.{ text_x, text_y }, zgui.colorConvertFloat4ToU32(picker_text_color), access_label);
     zgui.popStyleColor(.{ .count = 3 });
 }
 
@@ -579,6 +592,43 @@ fn drawChevron(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) v
         .col = col,
         .thickness = ui_theme.scaledUi(1.8),
     });
+}
+
+/// Draws a padlock icon: a rounded-rect body with a U-shaped shackle above it.
+/// When `locked` the shackle is centered; when unlocked it shifts right (open latch look).
+fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = ui_theme.scaledUi(1.6); // stroke thickness
+
+    // Body: rounded rectangle below center
+    const bw = ui_theme.scaledUi(10.0); // body width
+    const bh = ui_theme.scaledUi(7.0); // body height
+    const body_top = center_y - ui_theme.scaledUi(0.5);
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, body_top },
+        .pmax = .{ x + bw, body_top + bh },
+        .col = col,
+        .rounding = ui_theme.scaledUi(1.5),
+    });
+
+    // Shackle: three line segments forming an open-top U shape
+    const sw = ui_theme.scaledUi(6.0); // shackle inner width
+    const sh = ui_theme.scaledUi(5.0); // shackle height above body top
+    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + ui_theme.scaledUi(2.5);
+    const sl = x + shackle_offset; // shackle left x
+    const sr = sl + sw; // shackle right x
+    const stop = body_top - sh; // shackle top y
+
+    // Left vertical
+    draw_list.addLine(.{ .p1 = .{ sl, body_top }, .p2 = .{ sl, stop + ui_theme.scaledUi(2.0) }, .col = col, .thickness = t });
+    // Top horizontal
+    draw_list.addLine(.{ .p1 = .{ sl, stop + ui_theme.scaledUi(2.0) }, .p2 = .{ sr, stop + ui_theme.scaledUi(2.0) }, .col = col, .thickness = t });
+    // Right vertical — only extends to body when locked
+    if (locked) {
+        draw_list.addLine(.{ .p1 = .{ sr, stop + ui_theme.scaledUi(2.0) }, .p2 = .{ sr, body_top }, .col = col, .thickness = t });
+    } else {
+        draw_list.addLine(.{ .p1 = .{ sr, stop + ui_theme.scaledUi(2.0) }, .p2 = .{ sr, stop + ui_theme.scaledUi(0.5) }, .col = col, .thickness = t });
+    }
 }
 
 fn drawCheckForCustomRow(color: [4]f32, x: f32) void {
