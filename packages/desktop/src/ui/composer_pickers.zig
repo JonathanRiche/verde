@@ -17,6 +17,7 @@ const CODEX_MODEL_OPTIONS = native_state.CODEX_MODEL_OPTIONS;
 const CODEX_REASONING_OPTIONS = native_state.CODEX_REASONING_OPTIONS;
 const DEFAULT_CODEX_MODEL = native_state.DEFAULT_CODEX_MODEL;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+const LOCKED_MODEL_WINDOW_ID = "##composer-locked-model-picker";
 
 pub fn render(state: *AppState) void {
     const thread = state.currentThreadMutable();
@@ -38,7 +39,7 @@ pub fn render(state: *AppState) void {
     const provider_row_height = ui_theme.scaledUi(38.0);
     const model_row_height = ui_theme.scaledUi(34.0);
     const provider_panel_width = composerProviderPanelWidth(state, provider_row_height);
-    const model_panel_width = ui_theme.scaledUi(214.0);
+    const model_panel_width = composerModelPanelWidth(opencode_model_options);
     const provider_row_text_padding = 0.0;
     const icon_gap = ui_theme.scaledUi(6.0); // gap between toolbar icons and their label text
     const icon_width = ui_theme.scaledUi(12.0); // icon slot width for toolbar toggle buttons
@@ -65,60 +66,67 @@ pub fn render(state: *AppState) void {
         model_panel_width
     else
         provider_panel_width + popup_padding * 2.0;
-    const popup_height = if (provider_locked)
-        popup_padding * 2.0 + modelRowPanelHeight(thread.provider, opencode_model_options, model_row_height)
-    else
-        popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-    const combo_preview_pos = zgui.getCursorScreenPos();
-    const combo_preview_width = composerPickerTextWidth(model_preview) + provider_logo_size[0] + provider_logo_gap + ui_theme.scaledUi(52.0);
-    const combo_preview_height = zgui.getFrameHeight();
-    const combo_draw_list = zgui.getWindowDrawList();
-    zgui.setNextWindowSize(.{ .w = popup_width, .h = popup_height });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{
-        base_padding_x + provider_logo_size[0] + provider_logo_gap,
-        base_padding_y,
-    } });
-    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(16.0) });
-    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = ui_theme.scaledUi(12.0) });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{
-        if (provider_locked) ui_theme.scaledUi(4.0) else popup_padding,
-        popup_padding,
-    } });
-    zgui.setNextItemWidth(combo_preview_width);
-    const model_combo_open = zgui.beginCombo("##model-provider-picker", .{
-        .preview_value = "",
-        .flags = .{ .popup_align_left = true, .height_large = true },
-    });
-    drawModelPreviewInRect(combo_draw_list, state, thread.provider, model_preview, combo_preview_pos, combo_preview_width, combo_preview_height, base_padding_x);
-    zgui.popStyleVar(.{ .count = 4 });
-    if (model_combo_open) {
-        defer zgui.endCombo();
+    const popup_height = if (provider_locked) blk: {
+        const viewport = zgui.getMainViewport();
+        const work_size = viewport.getWorkSize();
+        const max_height = @max(ui_theme.scaledUi(140.0), work_size[1] * 0.45);
+        break :blk @min(
+            popup_padding * 2.0 + modelRowPanelHeight(thread.provider, opencode_model_options, model_row_height),
+            max_height,
+        );
+    } else popup_padding * 2.0 + provider_row_height * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+    const model_picker_width = composerPickerTextWidth(model_preview) + provider_logo_size[0] + provider_logo_gap + ui_theme.scaledUi(52.0);
+    const model_picker_draw_list = zgui.getWindowDrawList();
+    if (provider_locked) {
+        zgui.pushStyleColor4f(.{ .idx = .button, .c = picker_frame_bg });
+        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
+        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_active_bg });
+        defer zgui.popStyleColor(.{ .count = 3 });
 
-        if (provider_locked) {
-            state.composer_picker_provider = null;
-            zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
-            defer zgui.popStyleVar(.{ .count = 1 });
+        if (zgui.button("##model-provider-picker-locked", .{
+            .w = model_picker_width,
+            .h = 0.0,
+        })) {
+            state.composer_locked_model_picker_open = !state.composer_locked_model_picker_open;
+        }
 
-            const active_model_ref = if (thread.model_ref != null) thread.model_ref.? else defaultModelRef(state, thread.provider);
-            for (chat_threads.modelOptions(ModelOption, thread.provider, opencode_model_options, CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
-                zgui.pushIntId(@intCast(index));
-                const is_selected = if (option.value) |value|
-                    std.mem.eql(u8, active_model_ref, value)
-                else
-                    false;
-                const clicked = zgui.invisibleButton("##locked-model-row", .{
-                    .w = zgui.getWindowWidth() - ui_theme.scaledUi(8.0),
-                    .h = model_row_height,
-                });
-                const is_hovered = zgui.isItemHovered(.{});
-                if (clicked) {
-                    setThreadModelRef(state, thread, option.value);
-                    zgui.closeCurrentPopup();
-                }
-                drawLockedModelRowForLastItem(option.label, is_selected, is_hovered);
-                zgui.popId();
-            }
-        } else {
+        const model_picker_min = zgui.getItemRectMin();
+        const model_picker_max = zgui.getItemRectMax();
+        const model_picker_height = model_picker_max[1] - model_picker_min[1];
+        drawModelPreviewInRect(model_picker_draw_list, state, thread.provider, model_preview, model_picker_min, model_picker_width, model_picker_height, base_padding_x);
+        renderLockedComposerModelWindow(
+            state,
+            thread,
+            opencode_model_options,
+            model_picker_min,
+            model_picker_width,
+            model_picker_height,
+            popup_width,
+            popup_height,
+            popup_padding,
+            model_row_height,
+        );
+    } else {
+        const combo_preview_pos = zgui.getCursorScreenPos();
+        const combo_preview_height = zgui.getFrameHeight();
+        zgui.setNextWindowSize(.{ .w = popup_width, .h = popup_height });
+        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{
+            base_padding_x + provider_logo_size[0] + provider_logo_gap,
+            base_padding_y,
+        } });
+        zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(16.0) });
+        zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = ui_theme.scaledUi(12.0) });
+        zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ popup_padding, popup_padding } });
+        zgui.setNextItemWidth(model_picker_width);
+        const model_combo_open = zgui.beginCombo("##model-provider-picker", .{
+            .preview_value = "",
+            .flags = .{ .popup_align_left = true, .height_large = true },
+        });
+        drawModelPreviewInRect(model_picker_draw_list, state, thread.provider, model_preview, combo_preview_pos, model_picker_width, combo_preview_height, base_padding_x);
+        zgui.popStyleVar(.{ .count = 4 });
+        if (model_combo_open) {
+            defer zgui.endCombo();
+
             var active_provider: ?Provider = state.composer_picker_provider;
             if (active_provider != null and active_provider != .codex and active_provider != .opencode) {
                 active_provider = null;
@@ -170,9 +178,10 @@ pub fn render(state: *AppState) void {
                 const provider_index = composerProviderIndex(provider);
                 renderComposerModelFlyout(state, thread, provider, opencode_model_options, popup_origin, popup_padding, provider_child_width, provider_index, model_panel_width, model_row_height);
             }
+        } else {
+            state.composer_picker_provider = null;
         }
-    } else {
-        state.composer_picker_provider = null;
+        state.composer_locked_model_picker_open = false;
     }
 
     zgui.sameLine(.{ .spacing = chip_spacing });
@@ -345,6 +354,110 @@ fn drawModelPreviewInRect(
     const chevron_center_y = item_min[1] + item_height * 0.5;
     const chevron_x = item_min[0] + item_width - ui_theme.scaledUi(16.0);
     drawChevron(draw_list, chevron_x, chevron_center_y, ui_theme.COLOR_TEXT_SUBTLE);
+}
+
+fn renderLockedComposerModelWindow(
+    state: *AppState,
+    thread: *ChatThread,
+    opencode_model_options: []const ModelOption,
+    picker_min: [2]f32,
+    picker_width: f32,
+    picker_height: f32,
+    popup_width: f32,
+    popup_height: f32,
+    popup_padding: f32,
+    model_row_height: f32,
+) void {
+    if (!state.composer_locked_model_picker_open) return;
+
+    const popup_pos = lockedComposerPopupPosition(picker_min, picker_width, picker_height, popup_width, popup_height);
+    const desired_window_height = popup_padding * 2.0 + modelRowPanelHeight(thread.provider, opencode_model_options, model_row_height);
+    const needs_scroll = desired_window_height > popup_height + 0.5;
+
+    zgui.setNextWindowPos(.{
+        .x = popup_pos[0],
+        .y = popup_pos[1],
+        .cond = .always,
+    });
+    zgui.setNextWindowSize(.{
+        .w = popup_width,
+        .h = popup_height,
+        .cond = .always,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = ui_theme.scaledUi(16.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ ui_theme.scaledUi(4.0), popup_padding } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .popup_bg, .c = colors.rgba(26, 27, 32, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.rgba(66, 68, 78, 255) });
+    defer {
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+
+    _ = zgui.begin(LOCKED_MODEL_WINDOW_ID, .{
+        .flags = .{
+            .no_title_bar = true,
+            .no_resize = true,
+            .no_saved_settings = true,
+            .no_move = true,
+            .no_focus_on_appearing = true,
+            .no_nav_focus = true,
+            .no_scrollbar = !needs_scroll,
+            .no_scroll_with_mouse = !needs_scroll,
+            .always_vertical_scrollbar = needs_scroll,
+        },
+    });
+    defer zgui.end();
+
+    const active_model_ref = if (thread.model_ref != null) thread.model_ref.? else defaultModelRef(state, thread.provider);
+    for (chat_threads.modelOptions(ModelOption, thread.provider, opencode_model_options, CODEX_MODEL_OPTIONS[0..]), 0..) |option, index| {
+        zgui.pushIntId(@intCast(index));
+        const is_selected = if (option.value) |value|
+            std.mem.eql(u8, active_model_ref, value)
+        else
+            false;
+        const clicked = zgui.invisibleButton("##locked-model-row", .{
+            .w = popup_width - ui_theme.scaledUi(8.0),
+            .h = model_row_height,
+        });
+        const is_hovered = zgui.isItemHovered(.{});
+        if (clicked) {
+            setThreadModelRef(state, thread, option.value);
+            state.composer_locked_model_picker_open = false;
+        }
+        drawLockedModelRowForLastItem(option.label, is_selected, is_hovered);
+        zgui.popId();
+    }
+}
+
+fn lockedComposerPopupPosition(
+    picker_min: [2]f32,
+    picker_width: f32,
+    picker_height: f32,
+    popup_width: f32,
+    popup_height: f32,
+) [2]f32 {
+    _ = picker_width;
+
+    const viewport = zgui.getMainViewport();
+    const work_pos = viewport.getWorkPos();
+    const work_size = viewport.getWorkSize();
+    const margin = ui_theme.scaledUi(12.0);
+    const gap = ui_theme.scaledUi(6.0);
+    const min_x = work_pos[0] + margin;
+    const min_y = work_pos[1] + margin;
+    const max_x = @max(min_x, work_pos[0] + work_size[0] - margin - popup_width);
+    const max_y = @max(min_y, work_pos[1] + work_size[1] - margin - popup_height);
+    const below_y = picker_min[1] + picker_height + gap;
+    const above_y = picker_min[1] - popup_height - gap;
+    const available_below = work_pos[1] + work_size[1] - margin - below_y;
+    const available_above = picker_min[1] - gap - min_y;
+    const place_below = available_below >= popup_height or available_below >= available_above;
+
+    return .{
+        ui_theme.clampf(picker_min[0], min_x, max_x),
+        ui_theme.clampf(if (place_below) below_y else above_y, min_y, max_y),
+    };
 }
 
 fn drawProviderRowForLastItem(state: *AppState, provider: Provider, is_active: bool, is_hovered: bool) void {
@@ -565,6 +678,19 @@ fn composerProviderPanelWidth(state: *AppState, row_height: f32) f32 {
         max_label_width = @max(max_label_width, zgui.calcTextSize(chat_threads.providerLabel(provider), .{})[0]);
     }
     return icon_slot_width + ui_theme.scaledUi(6.0) + max_label_width + ui_theme.scaledUi(18.0);
+}
+
+fn composerModelPanelWidth(opencode_model_options: []const ModelOption) f32 {
+    var max_label_width: f32 = 0.0;
+    for (CODEX_MODEL_OPTIONS) |option| {
+        max_label_width = @max(max_label_width, zgui.calcTextSize(option.label, .{})[0]);
+    }
+    for (opencode_model_options) |option| {
+        max_label_width = @max(max_label_width, zgui.calcTextSize(option.label, .{})[0]);
+    }
+
+    const desired_width = max_label_width + ui_theme.scaledUi(56.0);
+    return ui_theme.clampf(desired_width, ui_theme.scaledUi(214.0), ui_theme.scaledUi(420.0));
 }
 
 fn providerRowHeightForFlyout(provider_index: usize) f32 {

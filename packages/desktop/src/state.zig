@@ -657,6 +657,7 @@ pub const AppState = struct {
     debug_last_terminal_scancode: ?sdl.Scancode,
     debug_last_terminal_text: [32:0]u8,
     composer_picker_provider: ?Provider,
+    composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
     opencode_model_options_project_path: ?[]u8,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
@@ -717,6 +718,7 @@ pub const AppState = struct {
             .debug_last_terminal_scancode = null,
             .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
             .composer_picker_provider = null,
+            .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
             .opencode_model_options_project_path = null,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
@@ -845,25 +847,41 @@ pub const AppState = struct {
     }
 
     fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
-        var label_counts = std.StringHashMap(usize).init(self.allocator);
-        defer label_counts.deinit();
+        const SortedModel = struct {
+            provider_name: []const u8,
+            provider_id: []const u8,
+            model_name: []const u8,
+            model_id: []const u8,
+        };
 
-        for (models) |model| {
-            const label = if (model.model_name.len > 0) model.model_name else model.model_id;
-            const entry = try label_counts.getOrPut(label);
-            if (!entry.found_existing) entry.value_ptr.* = 0;
-            entry.value_ptr.* += 1;
+        var sorted_models = try self.allocator.alloc(SortedModel, models.len);
+        defer self.allocator.free(sorted_models);
+
+        for (models, 0..) |model, index| {
+            sorted_models[index] = .{
+                .provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id,
+                .provider_id = model.provider_id,
+                .model_name = if (model.model_name.len > 0) model.model_name else model.model_id,
+                .model_id = model.model_id,
+            };
         }
 
-        for (models) |model| {
-            const model_name = if (model.model_name.len > 0) model.model_name else model.model_id;
-            const provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id;
-            const duplicate_name = (label_counts.get(model_name) orelse 0) > 1;
-            const label = if (duplicate_name) blk: {
-                const label_text = try std.fmt.allocPrint(self.allocator, "{s}({s})", .{ model_name, provider_name });
-                defer self.allocator.free(label_text);
-                break :blk try self.allocator.dupeZ(u8, label_text);
-            } else try self.allocator.dupeZ(u8, model_name);
+        var i: usize = 1;
+        while (i < sorted_models.len) : (i += 1) {
+            const current = sorted_models[i];
+            var j = i;
+            while (j > 0 and opencodeModelSortLessThan(current, sorted_models[j - 1])) : (j -= 1) {
+                sorted_models[j] = sorted_models[j - 1];
+            }
+            sorted_models[j] = current;
+        }
+
+        for (sorted_models) |model| {
+            const model_name = model.model_name;
+            const provider_name = model.provider_name;
+            const label_text = try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ model_name, provider_name });
+            defer self.allocator.free(label_text);
+            const label = try self.allocator.dupeZ(u8, label_text);
             errdefer self.allocator.free(label);
 
             const value_text = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ model.provider_id, model.model_id });
@@ -876,6 +894,33 @@ pub const AppState = struct {
                 .value = value,
             });
         }
+    }
+
+    fn opencodeModelSortLessThan(a: anytype, b: anytype) bool {
+        const provider_cmp = asciiCaseInsensitiveCompare(a.provider_name, b.provider_name);
+        if (provider_cmp != .eq) return provider_cmp == .lt;
+
+        const model_cmp = asciiCaseInsensitiveCompare(a.model_name, b.model_name);
+        if (model_cmp != .eq) return model_cmp == .lt;
+
+        const provider_id_cmp = asciiCaseInsensitiveCompare(a.provider_id, b.provider_id);
+        if (provider_id_cmp != .eq) return provider_id_cmp == .lt;
+
+        return asciiCaseInsensitiveCompare(a.model_id, b.model_id) == .lt;
+    }
+
+    fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order {
+        var index: usize = 0;
+        const min_len = @min(a.len, b.len);
+        while (index < min_len) : (index += 1) {
+            const lhs = std.ascii.toLower(a[index]);
+            const rhs = std.ascii.toLower(b[index]);
+            if (lhs < rhs) return .lt;
+            if (lhs > rhs) return .gt;
+        }
+        if (a.len < b.len) return .lt;
+        if (a.len > b.len) return .gt;
+        return .eq;
     }
 
     fn normalizeCurrentOpencodeThreadModel(self: *AppState) void {
