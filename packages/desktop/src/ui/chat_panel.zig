@@ -550,6 +550,18 @@ fn drawChevron(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) v
 
 /// Renders transcript history plus any in-flight stream state.
 fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: f32) void {
+    const selected_project_index = state.selected_project_index;
+    const selected_thread_index = state.currentProject().selected_thread_index;
+    const transcript_changed = state.transcript_project_index == null or
+        state.transcript_thread_index == null or
+        state.transcript_project_index.? != selected_project_index or
+        state.transcript_thread_index.? != selected_thread_index;
+    if (transcript_changed) {
+        state.transcript_project_index = selected_project_index;
+        state.transcript_thread_index = selected_thread_index;
+        state.requestTranscriptScrollToBottom();
+    }
+
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     _ = zgui.beginChild("Transcript", .{
         .w = width,
