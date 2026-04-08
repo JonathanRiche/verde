@@ -10,6 +10,7 @@ const log = std.log.scoped(.native_keybinds);
 pub const NativeKeyboardAction = enum {
     refresh,
     open_default,
+    toggle_browser,
     toggle_terminal,
 };
 
@@ -50,6 +51,7 @@ pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
     open_default: []Keybind,
+    toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
@@ -57,6 +59,7 @@ pub const NativeKeyboardConfig = struct {
             .allocator = allocator,
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
+            .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
         };
 
@@ -75,6 +78,7 @@ pub const NativeKeyboardConfig = struct {
     pub fn deinit(self: *NativeKeyboardConfig) void {
         self.allocator.free(self.refresh);
         self.allocator.free(self.open_default);
+        self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
     }
 
@@ -84,6 +88,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.open_default, event)) {
             return .open_default;
+        }
+        if (matchesAny(self.toggle_browser, event)) {
+            return .toggle_browser;
         }
         if (matchesAny(self.toggle_terminal, event)) {
             return .toggle_terminal;
@@ -114,6 +121,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(open_value, "open")) |bindings| {
                 self.allocator.free(self.open_default);
                 self.open_default = bindings;
+            }
+        }
+        if (keybinds_value.object.get("browser")) |browser_value| {
+            if (self.parseOverrideValue(browser_value, "browser")) |bindings| {
+                self.allocator.free(self.toggle_browser);
+                self.toggle_browser = bindings;
             }
         }
         if (keybinds_value.object.get("terminal")) |terminal_value| {
@@ -208,6 +221,12 @@ fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultTerminalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+J"),
+    });
+}
+
+fn cloneDefaultBrowserKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+B"),
     });
 }
 
@@ -466,6 +485,33 @@ test "open keybind override accepts a single accelerator" {
     try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
 }
 
+test "browser keybind override accepts a single accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            try keybinds.put("browser", .{ .string = "Alt+Shift+B" });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_browser.len);
+    try std.testing.expect(config.toggle_browser[0].alt);
+    try std.testing.expect(config.toggle_browser[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
+}
+
 test "default open keybind uses alt plus o" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -476,4 +522,16 @@ test "default open keybind uses alt plus o" {
     try std.testing.expect(!config.open_default[0].meta);
     try std.testing.expect(!config.open_default[0].primary);
     try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
+}
+
+test "default browser keybind uses ctrl plus b" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_browser.len);
+    try std.testing.expect(!config.toggle_browser[0].alt);
+    try std.testing.expect(config.toggle_browser[0].ctrl);
+    try std.testing.expect(!config.toggle_browser[0].meta);
+    try std.testing.expect(!config.toggle_browser[0].primary);
+    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
 }

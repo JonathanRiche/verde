@@ -227,7 +227,8 @@ Example config:
     "font_size": 20
   },
   "keybinds": {
-    "refresh": ["CommandOrControl+R", "F5"]
+    "refresh": ["CommandOrControl+R", "F5"],
+    "browser": "Ctrl+B"
   }
 }
 ```

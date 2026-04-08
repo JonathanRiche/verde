@@ -234,12 +234,13 @@ Current supported config includes UI font size, keybind overrides, and the defau
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
     "open": "Alt+O",
+    "browser": "Ctrl+B",
     "terminal": "CommandOrControl+J"
   }
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in terminal toggle binding is `CommandOrControl+J`. Refresh reloads app state from disk, config, and keybinds.
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Refresh reloads app state from disk, config, and keybinds.
 
 `open.default` accepts lower-case string values:
 
