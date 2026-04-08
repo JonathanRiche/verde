@@ -54,6 +54,7 @@ void inputDebugLog(const char* format, ...) {
   std::fflush(stderr);
 }
 
+#if defined(__linux__)
 bool isOomAdjustPath(const char* pathname) {
   if (pathname == nullptr) {
     return false;
@@ -73,7 +74,6 @@ bool isOomAdjustPath(const char* pathname) {
              0;
 }
 
-#if defined(__linux__)
 int openViaSyscall(int dirfd, const char* pathname, int flags, mode_t mode) {
   return static_cast<int>(syscall(SYS_openat, dirfd, pathname, flags, mode));
 }

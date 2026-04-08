@@ -32,7 +32,6 @@ void prependLibraryPath(const std::string& runtime_dir) {
   const std::string updated = runtime_dir + ":" + current_value;
   setenv("LD_LIBRARY_PATH", updated.c_str(), 1);
 }
-#endif
 
 bool loadLibrary(const std::string& path, bool required) {
   void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
@@ -46,6 +45,7 @@ bool loadLibrary(const std::string& path, bool required) {
   }
   return !required;
 }
+#endif
 
 }  // namespace
 
