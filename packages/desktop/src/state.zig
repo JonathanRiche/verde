@@ -35,7 +35,7 @@ pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
-pub const CODEX_IMPORT_MODAL_ID: [:0]const u8 = "CodexThreadImportModal";
+pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
@@ -347,11 +347,11 @@ pub const FileSearchResult = struct {
     }
 };
 
-pub const CodexImportThread = struct {
+pub const ImportThreadSummary = struct {
     id: [:0]const u8,
     title: [:0]const u8,
 
-    fn deinit(self: CodexImportThread, allocator: std.mem.Allocator) void {
+    fn deinit(self: ImportThreadSummary, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.title);
     }
@@ -643,8 +643,8 @@ pub const AppState = struct {
     import_path_storage: [DRAFT_CAPACITY:0]u8,
     rename_storage: [256:0]u8,
     sidebar_notice_storage: [256:0]u8,
-    codex_import_thread_id_storage: [256:0]u8,
-    codex_import_notice_storage: [256:0]u8,
+    import_thread_id_storage: [256:0]u8,
+    import_notice_storage: [256:0]u8,
     composer_focused: bool,
     terminal_focused: bool,
     debug_terminal_window_focused: bool,
@@ -673,9 +673,10 @@ pub const AppState = struct {
     modal_image_path: ?[:0]const u8,
     app_config: app_config.AppConfig,
     rename_project_index: ?usize,
-    codex_import_project_index: ?usize,
-    codex_import_selected_index: ?usize,
-    codex_import_threads: std.ArrayList(CodexImportThread),
+    thread_import_provider: ?Provider,
+    thread_import_project_index: ?usize,
+    thread_import_selected_index: ?usize,
+    thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
     picker_state: PickerState,
     file_search_state: FileSearchState,
@@ -704,8 +705,8 @@ pub const AppState = struct {
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
             .rename_storage = std.mem.zeroes([256:0]u8),
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
-            .codex_import_thread_id_storage = std.mem.zeroes([256:0]u8),
-            .codex_import_notice_storage = std.mem.zeroes([256:0]u8),
+            .import_thread_id_storage = std.mem.zeroes([256:0]u8),
+            .import_notice_storage = std.mem.zeroes([256:0]u8),
             .composer_focused = false,
             .terminal_focused = false,
             .debug_terminal_window_focused = false,
@@ -734,9 +735,10 @@ pub const AppState = struct {
             .modal_image_path = null,
             .app_config = initial_config,
             .rename_project_index = null,
-            .codex_import_project_index = null,
-            .codex_import_selected_index = null,
-            .codex_import_threads = .empty,
+            .thread_import_provider = null,
+            .thread_import_project_index = null,
+            .thread_import_selected_index = null,
+            .thread_import_threads = .empty,
             .show_project_creator = false,
             .picker_state = .{},
             .file_search_state = .{},
@@ -1074,51 +1076,63 @@ pub const AppState = struct {
         self.setSidebarNotice("");
     }
 
-    pub fn beginCodexThreadImport(self: *AppState, index: usize) void {
+    pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.projects.items.len) return;
         self.selected_project_index = index;
         self.rename_project_index = null;
-        self.codex_import_project_index = index;
-        self.codex_import_selected_index = null;
-        self.codex_import_thread_id_storage[0] = 0;
-        self.setCodexImportNotice("");
-        self.clearCodexImportThreads();
-        self.refreshCodexThreadImportList();
+        self.thread_import_provider = provider;
+        self.thread_import_project_index = index;
+        self.thread_import_selected_index = null;
+        self.import_thread_id_storage[0] = 0;
+        self.setThreadImportNotice("");
+        self.clearThreadImportThreads();
+        self.refreshThreadImportList();
     }
 
-    pub fn cancelCodexThreadImport(self: *AppState) void {
-        self.codex_import_project_index = null;
-        self.codex_import_selected_index = null;
-        self.codex_import_thread_id_storage[0] = 0;
-        self.setCodexImportNotice("");
-        self.clearCodexImportThreads();
+    pub fn cancelThreadImport(self: *AppState) void {
+        self.thread_import_provider = null;
+        self.thread_import_project_index = null;
+        self.thread_import_selected_index = null;
+        self.import_thread_id_storage[0] = 0;
+        self.setThreadImportNotice("");
+        self.clearThreadImportThreads();
     }
 
-    pub fn refreshCodexThreadImportList(self: *AppState) void {
-        const project_index = self.codex_import_project_index orelse return;
+    pub fn refreshThreadImportList(self: *AppState) void {
+        const provider = self.thread_import_provider orelse return;
+        const project_index = self.thread_import_project_index orelse return;
         if (project_index >= self.projects.items.len) {
-            self.cancelCodexThreadImport();
+            self.cancelThreadImport();
             return;
         }
 
-        self.clearCodexImportThreads();
+        self.clearThreadImportThreads();
 
         const project = &self.projects.items[project_index];
-        const provider_config = ai_harness.ProviderConfig{
-            .codex = .{
-                .cwd = project.path,
-                .launch_on_connect = true,
+        const provider_config = switch (provider) {
+            .codex => ai_harness.ProviderConfig{
+                .codex = .{
+                    .cwd = project.path,
+                    .launch_on_connect = true,
+                },
+            },
+            .opencode => ai_harness.ProviderConfig{
+                .opencode = .{
+                    .allocator = self.allocator,
+                    .working_directory = project.path,
+                    .launch_if_missing = true,
+                },
             },
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setCodexImportNotice(importCodexFailureMessage(err));
+            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
             return;
         };
         defer client.deinit();
 
         const provider_threads = client.listThreads(self.allocator) catch |err| {
-            self.setCodexImportNotice(importCodexFailureMessage(err));
+            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
             return;
         };
         defer {
@@ -1131,118 +1145,138 @@ pub const AppState = struct {
 
         for (provider_threads) |thread| {
             const owned_id = self.allocator.dupeZ(u8, thread.id) catch {
-                self.setCodexImportNotice("Failed to store Codex thread list.");
+                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
                 return;
             };
             errdefer self.allocator.free(owned_id);
             const owned_title = self.allocator.dupeZ(u8, thread.title) catch {
-                self.setCodexImportNotice("Failed to store Codex thread list.");
+                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
                 return;
             };
             errdefer self.allocator.free(owned_title);
 
-            self.codex_import_threads.append(self.allocator, .{
+            self.thread_import_threads.append(self.allocator, .{
                 .id = owned_id,
                 .title = owned_title,
             }) catch {
-                self.setCodexImportNotice("Failed to store Codex thread list.");
+                self.setThreadImportNotice(failedToStoreThreadListNotice(provider));
                 return;
             };
         }
 
-        if (self.codex_import_threads.items.len == 0) {
-            self.setCodexImportNotice("No recent Codex threads found.");
+        if (self.thread_import_threads.items.len == 0) {
+            self.setThreadImportNotice(noRecentThreadsNotice(provider));
             return;
         }
 
-        self.setCodexImportNotice("Select a Codex thread or paste a thread ID.");
+        self.setThreadImportNotice(selectThreadNotice(provider));
     }
 
-    pub fn codexImportThreadIdBuffer(self: *AppState) [:0]u8 {
-        return self.codex_import_thread_id_storage[0 .. self.codex_import_thread_id_storage.len - 1 :0];
+    pub fn threadImportThreadIdBuffer(self: *AppState) [:0]u8 {
+        return self.import_thread_id_storage[0 .. self.import_thread_id_storage.len - 1 :0];
     }
 
-    pub fn codexImportThreadId(self: *const AppState) []const u8 {
-        return std.mem.sliceTo(self.codex_import_thread_id_storage[0..], 0);
+    pub fn threadImportThreadId(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.import_thread_id_storage[0..], 0);
     }
 
-    pub fn codexImportNotice(self: *const AppState) []const u8 {
-        return std.mem.sliceTo(self.codex_import_notice_storage[0..], 0);
+    pub fn threadImportNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.import_notice_storage[0..], 0);
     }
 
-    pub fn setCodexImportNotice(self: *AppState, value: []const u8) void {
-        @memset(&self.codex_import_notice_storage, 0);
-        const len = @min(value.len, self.codex_import_notice_storage.len - 1);
-        @memcpy(self.codex_import_notice_storage[0..len], value[0..len]);
+    pub fn setThreadImportNotice(self: *AppState, value: []const u8) void {
+        @memset(&self.import_notice_storage, 0);
+        const len = @min(value.len, self.import_notice_storage.len - 1);
+        @memcpy(self.import_notice_storage[0..len], value[0..len]);
     }
 
-    pub fn selectCodexImportThread(self: *AppState, index: usize) void {
-        if (index >= self.codex_import_threads.items.len) return;
-        self.codex_import_selected_index = index;
-        @memset(&self.codex_import_thread_id_storage, 0);
-        const thread_id = self.codex_import_threads.items[index].id;
-        const len = @min(thread_id.len, self.codex_import_thread_id_storage.len - 1);
-        @memcpy(self.codex_import_thread_id_storage[0..len], thread_id[0..len]);
+    pub fn selectThreadImport(self: *AppState, index: usize) void {
+        if (index >= self.thread_import_threads.items.len) return;
+        self.thread_import_selected_index = index;
+        @memset(&self.import_thread_id_storage, 0);
+        const thread_id = self.thread_import_threads.items[index].id;
+        const len = @min(thread_id.len, self.import_thread_id_storage.len - 1);
+        @memcpy(self.import_thread_id_storage[0..len], thread_id[0..len]);
     }
 
-    pub fn importSelectedCodexThread(self: *AppState) void {
-        const project_index = self.codex_import_project_index orelse return;
+    pub fn importSelectedThread(self: *AppState) void {
+        const provider = self.thread_import_provider orelse return;
+        const project_index = self.thread_import_project_index orelse return;
         if (project_index >= self.projects.items.len) {
-            self.cancelCodexThreadImport();
+            self.cancelThreadImport();
             return;
         }
 
-        const trimmed_id = std.mem.trim(u8, self.codexImportThreadId(), &std.ascii.whitespace);
+        const trimmed_id = std.mem.trim(u8, self.threadImportThreadId(), &std.ascii.whitespace);
         if (trimmed_id.len == 0) {
-            self.setCodexImportNotice("Enter a Codex thread ID or select one from the list.");
+            self.setThreadImportNotice(emptyThreadImportIdNotice(provider));
             return;
         }
 
-        if (self.findThreadIndexByProviderThreadId(project_index, .codex, trimmed_id)) |thread_index| {
+        if (self.findThreadIndexByProviderThreadId(project_index, provider, trimmed_id)) |thread_index| {
             self.selected_project_index = project_index;
             self.projects.items[project_index].selected_thread_index = thread_index;
             self.requestTranscriptScrollToBottom();
-            self.setSidebarNotice("Codex thread already exists in this project.");
-            self.cancelCodexThreadImport();
+            self.setSidebarNotice(duplicateThreadNotice(provider));
+            self.cancelThreadImport();
             return;
         }
 
         const project = &self.projects.items[project_index];
-        const provider_config = ai_harness.ProviderConfig{
-            .codex = .{
-                .cwd = project.path,
-                .launch_on_connect = true,
+        const provider_config = switch (provider) {
+            .codex => ai_harness.ProviderConfig{
+                .codex = .{
+                    .cwd = project.path,
+                    .launch_on_connect = true,
+                },
+            },
+            .opencode => ai_harness.ProviderConfig{
+                .opencode = .{
+                    .allocator = self.allocator,
+                    .working_directory = project.path,
+                    .launch_if_missing = true,
+                },
             },
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setCodexImportNotice(importCodexFailureMessage(err));
+            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
             return;
         };
         defer client.deinit();
 
         const imported_thread = client.readThread(self.allocator, trimmed_id) catch |err| {
-            self.setCodexImportNotice(importCodexFailureMessage(err));
+            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
             return;
         };
         defer imported_thread.deinit(self.allocator);
 
         var imported = self.buildImportedThread(imported_thread, null) catch {
-            self.setCodexImportNotice("Failed to create the imported thread.");
+            self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
             return;
         };
         errdefer imported.deinit(self.allocator);
 
+        imported.provider = provider;
+        if (imported.model_ref) |model_ref| {
+            self.allocator.free(model_ref);
+            imported.model_ref = null;
+        }
+        imported.model_ref = self.allocator.dupeZ(u8, self.defaultModelRefForProvider(provider)) catch {
+            self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
+            return;
+        };
+
         self.projects.items[project_index].threads.append(self.allocator, imported) catch {
-            self.setCodexImportNotice("Failed to add the imported thread.");
+            self.setThreadImportNotice(failedAddImportedThreadNotice(provider));
             return;
         };
         self.selected_project_index = project_index;
         self.projects.items[project_index].selected_thread_index = self.projects.items[project_index].threads.items.len - 1;
         self.requestTranscriptScrollToBottom();
         self.markDirty();
-        self.setSidebarNotice("Codex thread imported.");
-        self.cancelCodexThreadImport();
+        self.setSidebarNotice(threadImportedNotice(provider));
+        self.cancelThreadImport();
     }
 
     pub fn syncThreadFromProvider(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -1262,16 +1296,20 @@ pub const AppState = struct {
             return;
         }
 
-        const provider_config = switch (project.threads.items[thread_index].provider) {
+        const provider = project.threads.items[thread_index].provider;
+        const provider_config = switch (provider) {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
                     .launch_on_connect = true,
                 },
             },
-            .opencode => {
-                self.setSidebarNotice("Thread sync is available for Codex threads only right now.");
-                return;
+            .opencode => ai_harness.ProviderConfig{
+                .opencode = .{
+                    .allocator = self.allocator,
+                    .working_directory = project.path,
+                    .launch_if_missing = true,
+                },
             },
         };
 
@@ -1281,13 +1319,13 @@ pub const AppState = struct {
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            self.setSidebarNotice(syncCodexFailureMessage(err));
+            self.setSidebarNotice(syncThreadFailureMessage(provider, err));
             return;
         };
         defer client.deinit();
 
         const imported_thread = client.readThread(self.allocator, provider_thread_id) catch |err| {
-            self.setSidebarNotice(syncCodexFailureMessage(err));
+            self.setSidebarNotice(syncThreadFailureMessage(provider, err));
             return;
         };
         defer imported_thread.deinit(self.allocator);
@@ -1302,7 +1340,7 @@ pub const AppState = struct {
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
-        self.setSidebarNotice("Thread synced from Codex.");
+        self.setSidebarNotice(threadSyncedNotice(provider));
     }
 
     pub fn finishProjectRename(self: *AppState) void {
@@ -1335,7 +1373,7 @@ pub const AppState = struct {
                 return;
             }
         }
-        self.cancelCodexThreadImport();
+        self.cancelThreadImport();
         var removed = self.projects.orderedRemove(self.selected_project_index);
         removed.deinit(self.allocator);
 
@@ -3054,12 +3092,12 @@ pub const AppState = struct {
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
     }
 
-    fn clearCodexImportThreads(self: *AppState) void {
-        for (self.codex_import_threads.items) |thread| {
+    fn clearThreadImportThreads(self: *AppState) void {
+        for (self.thread_import_threads.items) |thread| {
             thread.deinit(self.allocator);
         }
-        self.codex_import_threads.clearRetainingCapacity();
-        self.codex_import_selected_index = null;
+        self.thread_import_threads.clearRetainingCapacity();
+        self.thread_import_selected_index = null;
     }
 
     pub fn flushIfDirty(self: *AppState) void {
@@ -3132,7 +3170,7 @@ pub const AppState = struct {
         self.clearProjects();
         self.browser_state.deinit();
         self.releaseAllImageTextures();
-        self.codex_import_threads.deinit(self.allocator);
+        self.thread_import_threads.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
@@ -3476,7 +3514,7 @@ pub const AppState = struct {
     }
 
     fn clearProjects(self: *AppState) void {
-        self.cancelCodexThreadImport();
+        self.cancelThreadImport();
         self.clearFileSearch();
         self.clearOpencodeModelOptions();
         if (self.file_search_state.finder) |*finder| {
@@ -3517,27 +3555,108 @@ pub const AppState = struct {
     }
 };
 
-fn importCodexFailureMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.CodexRpcFailed => "Failed to load Codex threads.",
-        error.ConnectionClosed => "Codex app-server connection closed.",
-        error.NotConnected => "Could not connect to Codex app-server.",
-        error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
-        error.FileNotFound => "The codex executable was not found on PATH.",
-        error.UnsupportedOperation => "This provider does not support thread imports.",
-        else => "Failed to load Codex threads.",
+fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
+    return switch (provider) {
+        .codex => switch (err) {
+            error.CodexRpcFailed => "Failed to load Codex threads.",
+            error.ConnectionClosed => "Codex app-server connection closed.",
+            error.NotConnected => "Could not connect to Codex app-server.",
+            error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
+            error.FileNotFound => "The codex executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to load Codex threads.",
+        },
+        .opencode => switch (err) {
+            error.OpencodeRequestFailed => "Failed to load OpenCode threads.",
+            error.OpencodeServerUnavailable => "OpenCode did not start.",
+            error.FileNotFound => "The opencode executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to load OpenCode threads.",
+        },
     };
 }
 
-fn syncCodexFailureMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.CodexRpcFailed => "Failed to sync the Codex thread.",
-        error.ConnectionClosed => "Codex app-server connection closed.",
-        error.NotConnected => "Could not connect to Codex app-server.",
-        error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
-        error.FileNotFound => "The codex executable was not found on PATH.",
-        error.UnsupportedOperation => "This provider does not support thread sync.",
-        else => "Failed to sync the Codex thread.",
+fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
+    return switch (provider) {
+        .codex => switch (err) {
+            error.CodexRpcFailed => "Failed to sync the Codex thread.",
+            error.ConnectionClosed => "Codex app-server connection closed.",
+            error.NotConnected => "Could not connect to Codex app-server.",
+            error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
+            error.FileNotFound => "The codex executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread sync.",
+            else => "Failed to sync the Codex thread.",
+        },
+        .opencode => switch (err) {
+            error.OpencodeRequestFailed => "Failed to sync the OpenCode thread.",
+            error.OpencodeServerUnavailable => "OpenCode did not start.",
+            error.FileNotFound => "The opencode executable was not found on PATH.",
+            error.UnsupportedOperation => "This provider does not support thread sync.",
+            else => "Failed to sync the OpenCode thread.",
+        },
+    };
+}
+
+fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Failed to store Codex thread list.",
+        .opencode => "Failed to store OpenCode thread list.",
+    };
+}
+
+fn noRecentThreadsNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "No recent Codex threads found.",
+        .opencode => "No recent OpenCode threads found.",
+    };
+}
+
+fn selectThreadNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Select a Codex thread or paste a thread ID.",
+        .opencode => "Select an OpenCode thread or paste a thread ID.",
+    };
+}
+
+fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Enter a Codex thread ID or select one from the list.",
+        .opencode => "Enter an OpenCode thread ID or select one from the list.",
+    };
+}
+
+fn duplicateThreadNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex thread already exists in this project.",
+        .opencode => "OpenCode thread already exists in this project.",
+    };
+}
+
+fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Failed to create the imported thread.",
+        .opencode => "Failed to create the imported thread.",
+    };
+}
+
+fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Failed to add the imported thread.",
+        .opencode => "Failed to add the imported thread.",
+    };
+}
+
+fn threadImportedNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Codex thread imported.",
+        .opencode => "OpenCode thread imported.",
+    };
+}
+
+fn threadSyncedNotice(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Thread synced from Codex.",
+        .opencode => "Thread synced from OpenCode.",
     };
 }
 
