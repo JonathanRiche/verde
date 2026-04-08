@@ -41,6 +41,8 @@ pub fn render(state: *AppState) void {
     const provider_panel_width = composerProviderPanelWidth(state, provider_row_height);
     const model_panel_width = ui_theme.scaledUi(214.0);
     const provider_row_text_padding = 0.0;
+    const icon_gap = ui_theme.scaledUi(6.0); // gap between toolbar icons and their label text
+    const icon_width = ui_theme.scaledUi(12.0); // icon slot width for toolbar toggle buttons
 
     zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = ui_theme.scaledUi(11.0) });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ base_padding_x, base_padding_y } });
@@ -177,12 +179,17 @@ pub fn render(state: *AppState) void {
     zgui.sameLine(.{ .spacing = chip_spacing });
     zgui.textColored(separator_color, "|", .{});
 
+    // Reasoning level picker, custom-drawn to match the model selector style
     zgui.sameLine(.{ .spacing = chip_spacing });
     const reasoning_preview = chat_threads.selectedReasoningLabel(ReasoningOption, thread, CODEX_REASONING_OPTIONS[0..]);
-    zgui.setNextItemWidth(composerPickerTextWidth(reasoning_preview) + ui_theme.scaledUi(52.0));
+    const reasoning_preview_width = composerPickerTextWidth(reasoning_preview) + ui_theme.scaledUi(36.0);
+    const reasoning_combo_pos = zgui.getCursorScreenPos();
+    const reasoning_combo_height = zgui.getFrameHeight();
+    const reasoning_draw_list = zgui.getWindowDrawList();
+    zgui.setNextItemWidth(reasoning_preview_width);
     if (zgui.beginCombo("##reasoning-picker", .{
-        .preview_value = reasoning_preview,
-        .flags = .{ .popup_align_left = true },
+        .preview_value = "",
+        .flags = .{ .popup_align_left = true, .no_arrow_button = true },
     })) {
         defer zgui.endCombo();
         for (CODEX_REASONING_OPTIONS) |option| {
@@ -202,20 +209,48 @@ pub fn render(state: *AppState) void {
             }
         }
     }
+    // Draw custom preview text + chevron over the reasoning combo, matching model picker style
+    {
+        const text_size = zgui.calcTextSize(reasoning_preview, .{});
+        const text_pos: [2]f32 = .{
+            reasoning_combo_pos[0] + base_padding_x,
+            reasoning_combo_pos[1] + (reasoning_combo_height - text_size[1]) * 0.5,
+        };
+        reasoning_draw_list.addTextUnformatted(text_pos, zgui.colorConvertFloat4ToU32(ui_theme.COLOR_TEXT_MUTED), reasoning_preview);
+        const chevron_x = reasoning_combo_pos[0] + reasoning_preview_width - ui_theme.scaledUi(16.0);
+        const chevron_cy = reasoning_combo_pos[1] + reasoning_combo_height * 0.5;
+        drawChevron(reasoning_draw_list, chevron_x, chevron_cy, ui_theme.COLOR_TEXT_SUBTLE);
+    }
 
     if (thread.provider == .codex) {
         zgui.sameLine(.{ .spacing = chip_spacing });
         zgui.textColored(separator_color, "|", .{});
 
+        // Fast/Default toggle with lightning bolt / horizontal bars icon
         zgui.sameLine(.{ .spacing = chip_spacing });
         zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
         const fast_label: [:0]const u8 = if (thread.fast_mode == .on) "Fast" else "Default";
-        if (zgui.button(fast_label, .{ .w = 0.0, .h = 0.0 })) {
+        const fast_text_width = composerPickerTextWidth(fast_label);
+        const fast_btn_width = icon_width + icon_gap + fast_text_width + base_padding_x * 2.0;
+        const fast_btn_pos = zgui.getCursorScreenPos();
+        const fast_btn_height = zgui.getFrameHeight();
+        if (zgui.button("##fast-mode", .{ .w = fast_btn_width, .h = 0.0 })) {
             thread.fast_mode = if (thread.fast_mode == .on) .off else .on;
             state.markDirty();
         }
+        const fast_dl = zgui.getWindowDrawList();
+        const fast_icon_x = fast_btn_pos[0] + base_padding_x;
+        const fast_icon_cy = fast_btn_pos[1] + fast_btn_height * 0.5;
+        if (thread.fast_mode == .on) {
+            drawLightningIcon(fast_dl, fast_icon_x, fast_icon_cy, picker_text_color);
+        } else {
+            drawBarsIcon(fast_dl, fast_icon_x, fast_icon_cy, picker_text_color);
+        }
+        const fast_text_x = fast_icon_x + icon_width + icon_gap;
+        const fast_text_y = fast_btn_pos[1] + (fast_btn_height - zgui.calcTextSize(fast_label, .{})[1]) * 0.5;
+        fast_dl.addTextUnformatted(.{ fast_text_x, fast_text_y }, zgui.colorConvertFloat4ToU32(picker_text_color), fast_label);
         zgui.popStyleColor(.{ .count = 3 });
 
         zgui.sameLine(.{ .spacing = chip_spacing });
@@ -228,8 +263,6 @@ pub fn render(state: *AppState) void {
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
     const access_label: [:0]const u8 = chat_threads.accessModeLabel(thread.access_mode);
-    const icon_gap = ui_theme.scaledUi(6.0);
-    const icon_width = ui_theme.scaledUi(12.0);
     const access_text_width = composerPickerTextWidth(access_label);
     const access_btn_width = icon_width + icon_gap + access_text_width + base_padding_x * 2.0;
     const access_btn_pos = zgui.getCursorScreenPos();
@@ -629,6 +662,36 @@ fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, 
     } else {
         draw_list.addLine(.{ .p1 = .{ sr, stop + ui_theme.scaledUi(2.0) }, .p2 = .{ sr, stop + ui_theme.scaledUi(0.5) }, .col = col, .thickness = t });
     }
+}
+
+/// Draws a small lightning bolt icon (zigzag shape) for the Fast mode toggle.
+fn drawLightningIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = ui_theme.scaledUi(1.8);
+    const hw = ui_theme.scaledUi(4.0); // half-width of the bolt
+    const hh = ui_theme.scaledUi(6.0); // half-height of the bolt
+    const cx = x + ui_theme.scaledUi(5.0); // center x within the icon slot
+
+    // Top segment: upper-right to center-left
+    draw_list.addLine(.{ .p1 = .{ cx + hw * 0.3, center_y - hh }, .p2 = .{ cx - hw * 0.5, center_y - hh * 0.1 }, .col = col, .thickness = t });
+    // Middle segment: center-left to center-right (the kink)
+    draw_list.addLine(.{ .p1 = .{ cx - hw * 0.5, center_y - hh * 0.1 }, .p2 = .{ cx + hw * 0.5, center_y + hh * 0.1 }, .col = col, .thickness = t });
+    // Bottom segment: center-right to lower-left
+    draw_list.addLine(.{ .p1 = .{ cx + hw * 0.5, center_y + hh * 0.1 }, .p2 = .{ cx - hw * 0.3, center_y + hh }, .col = col, .thickness = t });
+}
+
+/// Draws two horizontal bars icon for the Default mode toggle.
+fn drawBarsIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = ui_theme.scaledUi(1.8);
+    const w = ui_theme.scaledUi(9.0); // bar width
+    const gap = ui_theme.scaledUi(3.0); // vertical gap between bars
+    const bx = x + ui_theme.scaledUi(1.0); // left edge
+
+    // Top bar
+    draw_list.addLine(.{ .p1 = .{ bx, center_y - gap }, .p2 = .{ bx + w, center_y - gap }, .col = col, .thickness = t });
+    // Bottom bar
+    draw_list.addLine(.{ .p1 = .{ bx, center_y + gap }, .p2 = .{ bx + w, center_y + gap }, .col = col, .thickness = t });
 }
 
 fn drawCheckForCustomRow(color: [4]f32, x: f32) void {
