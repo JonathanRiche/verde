@@ -657,6 +657,8 @@ pub const AppState = struct {
     debug_last_terminal_scancode: ?sdl.Scancode,
     debug_last_terminal_text: [32:0]u8,
     composer_picker_provider: ?Provider,
+    opencode_model_options: std.ArrayList(ModelOption),
+    opencode_model_options_project_path: ?[]u8,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
     opencode_logo_texture: ?CachedImageTexture,
@@ -715,6 +717,8 @@ pub const AppState = struct {
             .debug_last_terminal_scancode = null,
             .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
             .composer_picker_provider = null,
+            .opencode_model_options = .empty,
+            .opencode_model_options_project_path = null,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
             .opencode_logo_texture = null,
@@ -764,6 +768,157 @@ pub const AppState = struct {
         state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
         state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
         return state;
+    }
+
+    pub fn opencodeModelOptions(self: *AppState) []const ModelOption {
+        self.ensureOpencodeModelOptionsForCurrentProject();
+        return if (self.opencode_model_options.items.len > 0)
+            self.opencode_model_options.items
+        else
+            OPENCODE_MODEL_OPTIONS[0..];
+    }
+
+    pub fn defaultModelRefForProvider(self: *AppState, provider: Provider) [:0]const u8 {
+        return switch (provider) {
+            .codex => DEFAULT_CODEX_MODEL,
+            .opencode => blk: {
+                for (self.opencodeModelOptions()) |option| {
+                    if (option.value) |value| break :blk value;
+                }
+                break :blk DEFAULT_OPENCODE_MODEL;
+            },
+        };
+    }
+
+    fn ensureOpencodeModelOptionsForCurrentProject(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.clearOpencodeModelOptions();
+            return;
+        }
+
+        const project_path = self.currentProject().path;
+        if (self.opencode_model_options_project_path) |cached_path| {
+            if (std.mem.eql(u8, cached_path, project_path)) return;
+        }
+
+        self.refreshOpencodeModelOptionsForCurrentProject();
+    }
+
+    fn refreshOpencodeModelOptionsForCurrentProject(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.clearOpencodeModelOptions();
+            return;
+        }
+
+        const project_path = self.currentProject().path;
+        self.clearOpencodeModelOptions();
+        self.opencode_model_options_project_path = self.allocator.dupe(u8, project_path) catch return;
+
+        const provider_config = ai_harness.ProviderConfig{
+            .opencode = .{
+                .allocator = self.allocator,
+                .working_directory = project_path,
+                .launch_if_missing = true,
+            },
+        };
+
+        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
+            log.warn("failed to connect to OpenCode for model discovery: {s}", .{@errorName(err)});
+            return;
+        };
+        defer client.deinit();
+
+        const models = client.listModels(self.allocator) catch |err| {
+            log.warn("failed to load OpenCode configured models: {s}", .{@errorName(err)});
+            return;
+        };
+        defer ai_harness.freeModelInfos(self.allocator, models);
+
+        if (models.len == 0) return;
+
+        self.populateOpencodeModelOptions(models) catch |err| {
+            log.warn("failed to cache OpenCode configured models: {s}", .{@errorName(err)});
+            self.clearDynamicOpencodeModelOptions();
+            return;
+        };
+        self.normalizeCurrentOpencodeThreadModel();
+    }
+
+    fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
+        var label_counts = std.StringHashMap(usize).init(self.allocator);
+        defer label_counts.deinit();
+
+        for (models) |model| {
+            const label = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const entry = try label_counts.getOrPut(label);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
+
+        for (models) |model| {
+            const model_name = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id;
+            const duplicate_name = (label_counts.get(model_name) orelse 0) > 1;
+            const label = if (duplicate_name) blk: {
+                const label_text = try std.fmt.allocPrint(self.allocator, "{s}({s})", .{ model_name, provider_name });
+                defer self.allocator.free(label_text);
+                break :blk try self.allocator.dupeZ(u8, label_text);
+            } else try self.allocator.dupeZ(u8, model_name);
+            errdefer self.allocator.free(label);
+
+            const value_text = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ model.provider_id, model.model_id });
+            defer self.allocator.free(value_text);
+            const value = try self.allocator.dupeZ(u8, value_text);
+            errdefer self.allocator.free(value);
+
+            try self.opencode_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+            });
+        }
+    }
+
+    fn normalizeCurrentOpencodeThreadModel(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        if (self.opencode_model_options.items.len == 0) return;
+
+        const thread = self.currentThreadMutable();
+        if (thread.provider != .opencode) return;
+
+        const fallback_model_ref = blk: {
+            for (self.opencode_model_options.items) |option| {
+                if (option.value) |value| break :blk value;
+            }
+            return;
+        };
+
+        if (thread.model_ref) |model_ref| {
+            for (self.opencode_model_options.items) |option| {
+                if (option.value) |value| {
+                    if (std.mem.eql(u8, model_ref, value)) return;
+                }
+            }
+            self.allocator.free(model_ref);
+        }
+
+        thread.model_ref = self.allocator.dupeZ(u8, fallback_model_ref) catch null;
+        self.markDirty();
+    }
+
+    fn clearDynamicOpencodeModelOptions(self: *AppState) void {
+        for (self.opencode_model_options.items) |option| {
+            self.allocator.free(option.label);
+            if (option.value) |value| self.allocator.free(value);
+        }
+        self.opencode_model_options.clearRetainingCapacity();
+    }
+
+    fn clearOpencodeModelOptions(self: *AppState) void {
+        self.clearDynamicOpencodeModelOptions();
+        if (self.opencode_model_options_project_path) |path| {
+            self.allocator.free(path);
+            self.opencode_model_options_project_path = null;
+        }
     }
 
     fn addProject(self: *AppState, label: []const u8, path: []const u8, unread_count: u8) !void {
@@ -2933,6 +3088,7 @@ pub const AppState = struct {
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.codex_import_threads.deinit(self.allocator);
+        self.opencode_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
     }
@@ -3277,6 +3433,7 @@ pub const AppState = struct {
     fn clearProjects(self: *AppState) void {
         self.cancelCodexThreadImport();
         self.clearFileSearch();
+        self.clearOpencodeModelOptions();
         if (self.file_search_state.finder) |*finder| {
             finder.deinit();
             self.file_search_state.finder = null;

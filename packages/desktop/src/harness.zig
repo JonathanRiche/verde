@@ -11,6 +11,7 @@ pub const AuthState = types.AuthState;
 pub const MessageRole = types.MessageRole;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatThreadSummary = types.ChatThreadSummary;
+pub const ModelInfo = types.ModelInfo;
 pub const ReadThreadResult = types.ReadThreadResult;
 pub const ReasoningEffort = types.ReasoningEffort;
 pub const ApprovalPolicy = types.ApprovalPolicy;
@@ -21,6 +22,7 @@ pub const StreamDiffFile = types.StreamDiffFile;
 pub const StreamEvent = types.StreamEvent;
 pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
+pub const freeModelInfos = types.freeModelInfos;
 
 pub const ProviderConfig = union(Provider) {
     opencode: opencode.Config,
@@ -49,6 +51,13 @@ pub const ProviderClient = union(Provider) {
         return switch (self.*) {
             .opencode => |*client| client.listThreads(allocator),
             .codex => |*client| client.listThreads(allocator),
+        };
+    }
+
+    pub fn listModels(self: *ProviderClient, allocator: std.mem.Allocator) ![]ModelInfo {
+        return switch (self.*) {
+            .opencode => |*client| client.listModels(allocator),
+            .codex => |*client| client.listModels(allocator),
         };
     }
 

@@ -123,6 +123,12 @@ pub const Client = struct {
         return threads.toOwnedSlice(allocator);
     }
 
+    pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
+        _ = self;
+        _ = allocator;
+        return error.UnsupportedOperation;
+    }
+
     pub fn readThread(
         self: *Client,
         allocator: std.mem.Allocator,
