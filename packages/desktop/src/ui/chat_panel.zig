@@ -598,12 +598,13 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     zgui.endChild();
     zgui.popStyleVar(.{ .count = 1 });
 
-    // Scroll control stays in the outer Transcript context.
-    if (state.scroll_transcript_to_bottom) {
-        zgui.setScrollHereY(.{ .center_y_ratio = 1.0 });
-        state.scroll_transcript_to_bottom = false;
+    // Hold bottom-scroll requests for a couple of frames so startup and thread
+    // switches still land correctly after nested child layout settles.
+    if (state.scroll_transcript_to_bottom_frames > 0) {
+        zgui.setScrollY(zgui.getScrollMaxY());
+        state.scroll_transcript_to_bottom_frames -= 1;
     } else if (should_follow_stream) {
-        zgui.setScrollHereY(.{ .center_y_ratio = 1.0 });
+        zgui.setScrollY(zgui.getScrollMaxY());
     }
 }
 
