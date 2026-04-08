@@ -644,6 +644,8 @@ pub const AppState = struct {
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
     send_state: SendState,
+    transcript_project_index: ?usize,
+    transcript_thread_index: ?usize,
     scroll_transcript_to_bottom_frames: u8,
     dirty: bool,
 
@@ -701,7 +703,9 @@ pub const AppState = struct {
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
             .send_state = .{},
-            .scroll_transcript_to_bottom_frames = 2,
+            .transcript_project_index = null,
+            .transcript_thread_index = null,
+            .scroll_transcript_to_bottom_frames = 8,
             .dirty = false,
         };
 
@@ -2765,7 +2769,7 @@ pub const AppState = struct {
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
-        self.scroll_transcript_to_bottom_frames = 2;
+        self.scroll_transcript_to_bottom_frames = 8;
     }
 
     fn importPath(self: *const AppState) []const u8 {
