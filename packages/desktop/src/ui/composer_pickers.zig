@@ -213,7 +213,7 @@ pub fn render(state: *AppState) void {
         zgui.pushStyleColor4f(.{ .idx = .button, .c = transparent });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = picker_hover_bg });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = picker_hover_bg });
-        const fast_label: [:0]const u8 = if (thread.fast_mode == .on) "Fast" else "Chat";
+        const fast_label: [:0]const u8 = if (thread.fast_mode == .on) "Fast" else "Default";
         if (zgui.button(fast_label, .{ .w = 0.0, .h = 0.0 })) {
             thread.fast_mode = if (thread.fast_mode == .on) .off else .on;
             state.markDirty();
