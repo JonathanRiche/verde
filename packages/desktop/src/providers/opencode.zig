@@ -781,22 +781,27 @@ fn parseConfiguredModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value
         models.deinit(allocator);
     }
 
-    switch (root) {
-        .object => {
-            var iterator = root.object.iterator();
-            while (iterator.next()) |entry| {
-                try appendProviderModels(allocator, entry.value_ptr.*, entry.key_ptr.*, &models);
+    switch (providerCollectionValue(root) orelse root) {
+        .array => |providers| {
+            for (providers.items) |provider_value| {
+                try appendProviderModels(allocator, provider_value, null, &models);
             }
         },
-        .array => {
-            for (root.array.items) |provider_value| {
-                try appendProviderModels(allocator, provider_value, null, &models);
+        .object => |providers| {
+            var iterator = providers.iterator();
+            while (iterator.next()) |entry| {
+                try appendProviderModels(allocator, entry.value_ptr.*, entry.key_ptr.*, &models);
             }
         },
         else => {},
     }
 
     return models.toOwnedSlice(allocator);
+}
+
+fn providerCollectionValue(root: std.json.Value) ?std.json.Value {
+    if (root != .object) return null;
+    return getObjectField(root, "providers");
 }
 
 fn appendProviderModels(
@@ -1377,21 +1382,23 @@ test "parseConfiguredModelsAlloc reads configured providers and models" {
     const allocator = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
         \\{
-        \\  "openai": {
-        \\    "id": "openai",
-        \\    "name": "OpenAI",
-        \\    "models": {
-        \\      "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" }
+        \\  "providers": [
+        \\    {
+        \\      "id": "openai",
+        \\      "name": "OpenAI",
+        \\      "models": {
+        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" }
+        \\      }
+        \\    },
+        \\    {
+        \\      "id": "zen",
+        \\      "name": "Zen",
+        \\      "models": {
+        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" },
+        \\        "sonnet": { "id": "sonnet", "name": "Claude Sonnet" }
+        \\      }
         \\    }
-        \\  },
-        \\  "zen": {
-        \\    "id": "zen",
-        \\    "name": "Zen",
-        \\    "models": {
-        \\      "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" },
-        \\      "sonnet": { "id": "sonnet", "name": "Claude Sonnet" }
-        \\    }
-        \\  }
+        \\  ]
         \\}
     , .{});
     defer parsed.deinit();
