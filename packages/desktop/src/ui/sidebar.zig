@@ -211,6 +211,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             dl.addText(.{ x, cy - zgui.getFontSize() * 0.5 }, text_col, "{s}", .{project.label});
 
             if (left_clicked) {
+                state.noteInteraction();
                 state.selected_project_index = index;
                 state.projects.items[index].collapsed = !state.projects.items[index].collapsed;
                 state.syncRenameBuffer();
@@ -221,6 +222,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             if (zgui.beginPopupContextItem()) {
                 defer zgui.endPopup();
 
+                state.noteInteraction();
                 state.selected_project_index = index;
                 state.syncRenameBuffer();
 
@@ -239,8 +241,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                     zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
                     zgui.closeCurrentPopup();
                 }
-                if (zgui.menuItem("Remove project", .{})) {
-                    state.removeProjectAtIndex(index);
+                if (zgui.menuItem("Archive project", .{})) {
+                    state.archiveProjectAtIndex(index);
                     zgui.closeCurrentPopup();
                     break;
                 }
@@ -425,16 +427,17 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         .w = row_width - timestamp_width - chat_icon_space,
         .h = row_height,
     })) {
+        state.noteInteraction();
         state.selected_project_index = project_index;
         state.projects.items[project_index].selected_thread_index = thread_index;
         state.syncRenameBuffer();
         state.requestTranscriptScrollToBottom();
-        state.markDirty();
     }
 
     if (zgui.beginPopupContextItem()) {
         defer zgui.endPopup();
 
+        state.noteInteraction();
         state.selected_project_index = project_index;
         state.projects.items[project_index].selected_thread_index = thread_index;
         state.syncRenameBuffer();
@@ -442,6 +445,10 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         const can_sync = thread.provider_thread_id != null;
         if (zgui.menuItem("Sync thread", .{ .enabled = can_sync })) {
             state.syncThreadFromProvider(project_index, thread_index);
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.menuItem("Archive thread", .{})) {
+            state.archiveThreadAtIndex(project_index, thread_index);
             zgui.closeCurrentPopup();
         }
     }

@@ -186,6 +186,7 @@ pub const ChatImageAttachment = struct {
 
 pub const ChatThread = struct {
     title: [:0]const u8,
+    archived: bool = false,
     committed: bool = false,
     last_activity_at: i64 = 0,
     provider_thread_id: ?[:0]const u8 = null,
@@ -329,6 +330,20 @@ pub const PickerState = struct {
     worker: ?std.Thread = null,
 };
 
+const OpencodeModelCacheStatus = enum {
+    idle,
+    pending,
+    completed,
+    failed,
+};
+
+const OpencodeModelCacheState = struct {
+    mutex: std.Thread.Mutex = .{},
+    status: OpencodeModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
 const FileSearchToken = struct {
     at_start: usize,
     query_start: usize,
@@ -433,11 +448,13 @@ pub const Project = struct {
     id: [:0]const u8,
     label: [:0]const u8,
     path: [:0]const u8,
+    archived: bool = false,
     unread_count: u8 = 0,
     collapsed: bool = false,
     thread_list_expanded: bool = false,
     terminal_dock: terminal.Dock,
     threads: std.ArrayList(ChatThread),
+    archived_threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
 
     fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8, path: []const u8, unread_count: u8) !Project {
@@ -447,11 +464,13 @@ pub const Project = struct {
             .id = try allocator.dupeZ(u8, id),
             .label = try allocator.dupeZ(u8, label),
             .path = try allocator.dupeZ(u8, path),
+            .archived = false,
             .unread_count = unread_count,
             .collapsed = false,
             .thread_list_expanded = false,
             .terminal_dock = terminal_dock,
             .threads = .empty,
+            .archived_threads = .empty,
             .selected_thread_index = 0,
         };
         try project.addThread(allocator);
@@ -490,13 +509,22 @@ pub const Project = struct {
     }
 
     fn normalize(self: *Project, allocator: std.mem.Allocator) !void {
-        if (self.threads.items.len == 0) {
+        if (!self.archived and self.threads.items.len == 0) {
             try self.addThread(allocator);
         }
-        if (self.selected_thread_index >= self.threads.items.len) {
+        if (self.threads.items.len == 0) {
+            self.selected_thread_index = 0;
+        } else if (self.selected_thread_index >= self.threads.items.len) {
             self.selected_thread_index = self.threads.items.len - 1;
         }
         for (self.threads.items) |*thread| {
+            chat_threads.sanitizeEnum(Provider, &thread.provider, .opencode);
+            chat_threads.sanitizeEnum(Harness, &thread.harness, .local_cli);
+            for (thread.messages.items) |*message| {
+                chat_threads.sanitizeEnum(ChatRole, &message.role, .user);
+            }
+        }
+        for (self.archived_threads.items) |*thread| {
             chat_threads.sanitizeEnum(Provider, &thread.provider, .opencode);
             chat_threads.sanitizeEnum(Harness, &thread.harness, .local_cli);
             for (thread.messages.items) |*message| {
@@ -522,6 +550,19 @@ pub const Project = struct {
             thread.deinit(allocator);
         }
         self.threads.deinit(allocator);
+        for (self.archived_threads.items) |*thread| {
+            thread.deinit(allocator);
+        }
+        self.archived_threads.deinit(allocator);
+    }
+
+    fn archiveAllThreads(self: *Project, allocator: std.mem.Allocator) !void {
+        while (self.threads.items.len > 0) {
+            var thread = self.threads.orderedRemove(self.threads.items.len - 1);
+            thread.archived = true;
+            try self.archived_threads.append(allocator, thread);
+        }
+        self.selected_thread_index = 0;
     }
 };
 
@@ -634,10 +675,12 @@ pub const SendResultPayload = struct {
 };
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
+    const SAVE_DEBOUNCE_MS: i64 = 750;
 
     allocator: std.mem.Allocator,
     storage: *const Storage,
     projects: std.ArrayList(Project),
+    archived_projects: std.ArrayList(Project),
     selected_project_index: usize,
     next_project_number: usize,
     import_path_storage: [DRAFT_CAPACITY:0]u8,
@@ -659,7 +702,6 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
-    opencode_model_options_project_path: ?[]u8,
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
     opencode_logo_texture: ?CachedImageTexture,
@@ -679,6 +721,7 @@ pub const AppState = struct {
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
     picker_state: PickerState,
+    opencode_model_cache_state: OpencodeModelCacheState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
     browser_launch_open_delay_frames: u8,
@@ -691,6 +734,8 @@ pub const AppState = struct {
     transcript_thread_index: ?usize,
     scroll_transcript_to_bottom_frames: u8,
     dirty: bool,
+    last_dirty_at_ms: i64,
+    last_interaction_at_ms: i64,
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
@@ -700,6 +745,7 @@ pub const AppState = struct {
             .allocator = allocator,
             .storage = storage,
             .projects = .empty,
+            .archived_projects = .empty,
             .selected_project_index = 0,
             .next_project_number = 4,
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
@@ -721,7 +767,6 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
-            .opencode_model_options_project_path = null,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
             .opencode_logo_texture = null,
@@ -741,6 +786,7 @@ pub const AppState = struct {
             .thread_import_threads = .empty,
             .show_project_creator = false,
             .picker_state = .{},
+            .opencode_model_cache_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
             .browser_launch_open_delay_frames = 0,
@@ -753,6 +799,8 @@ pub const AppState = struct {
             .transcript_thread_index = null,
             .scroll_transcript_to_bottom_frames = 8,
             .dirty = false,
+            .last_dirty_at_ms = 0,
+            .last_interaction_at_ms = 0,
         };
 
         if (try storage.load(allocator)) |persisted_value| {
@@ -774,19 +822,18 @@ pub const AppState = struct {
         return state;
     }
 
-    pub fn opencodeModelOptions(self: *AppState) []const ModelOption {
-        self.ensureOpencodeModelOptionsForCurrentProject();
+    pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
         return if (self.opencode_model_options.items.len > 0)
             self.opencode_model_options.items
         else
             OPENCODE_MODEL_OPTIONS[0..];
     }
 
-    pub fn defaultModelRefForProvider(self: *AppState, provider: Provider) [:0]const u8 {
+    pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
             .opencode => blk: {
-                for (self.opencodeModelOptions()) |option| {
+                for (self.opencodeModelOptionsSnapshot()) |option| {
                     if (option.value) |value| break :blk value;
                 }
                 break :blk DEFAULT_OPENCODE_MODEL;
@@ -794,58 +841,24 @@ pub const AppState = struct {
         };
     }
 
-    fn ensureOpencodeModelOptionsForCurrentProject(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearOpencodeModelOptions();
-            return;
-        }
-
-        const project_path = self.currentProject().path;
-        if (self.opencode_model_options_project_path) |cached_path| {
-            if (std.mem.eql(u8, cached_path, project_path)) return;
-        }
-
-        self.refreshOpencodeModelOptionsForCurrentProject();
+    pub fn startOpencodeModelOptionsRefresh(self: *AppState) void {
+        self.refreshOpencodeModelOptionsCacheAsync();
     }
 
-    fn refreshOpencodeModelOptionsForCurrentProject(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearOpencodeModelOptions();
-            return;
-        }
+    fn refreshOpencodeModelOptionsCacheAsync(self: *AppState) void {
+        self.pollOpencodeModelOptionsCache();
 
-        const project_path = self.currentProject().path;
-        self.clearOpencodeModelOptions();
-        self.opencode_model_options_project_path = self.allocator.dupe(u8, project_path) catch return;
+        self.opencode_model_cache_state.mutex.lock();
+        defer self.opencode_model_cache_state.mutex.unlock();
+        if (self.opencode_model_cache_state.status == .pending) return;
 
-        const provider_config = ai_harness.ProviderConfig{
-            .opencode = .{
-                .allocator = self.allocator,
-                .working_directory = project_path,
-                .launch_if_missing = true,
-            },
-        };
-
-        var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
-            log.warn("failed to connect to OpenCode for model discovery: {s}", .{@errorName(err)});
+        self.opencode_model_cache_state.status = .pending;
+        self.opencode_model_cache_state.worker = std.Thread.spawn(.{}, opencodeModelCacheWorker, .{
+            &self.opencode_model_cache_state,
+        }) catch {
+            self.opencode_model_cache_state.status = .idle;
             return;
         };
-        defer client.deinit();
-
-        const models = client.listModels(self.allocator) catch |err| {
-            log.warn("failed to load OpenCode configured models: {s}", .{@errorName(err)});
-            return;
-        };
-        defer ai_harness.freeModelInfos(self.allocator, models);
-
-        if (models.len == 0) return;
-
-        self.populateOpencodeModelOptions(models) catch |err| {
-            log.warn("failed to cache OpenCode configured models: {s}", .{@errorName(err)});
-            self.clearDynamicOpencodeModelOptions();
-            return;
-        };
-        self.normalizeCurrentOpencodeThreadModel();
     }
 
     fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
@@ -962,17 +975,31 @@ pub const AppState = struct {
 
     fn clearOpencodeModelOptions(self: *AppState) void {
         self.clearDynamicOpencodeModelOptions();
-        if (self.opencode_model_options_project_path) |path| {
-            self.allocator.free(path);
-            self.opencode_model_options_project_path = null;
-        }
     }
 
-    fn addProject(self: *AppState, label: []const u8, path: []const u8, unread_count: u8) !void {
+    const AddProjectResult = enum {
+        created,
+        restored,
+    };
+
+    fn addProject(self: *AppState, label: []const u8, path: []const u8, unread_count: u8) !AddProjectResult {
         const id = try self.deriveProjectId(path);
         defer self.allocator.free(id);
+        if (self.findArchivedProjectIndexByPath(path)) |archived_index| {
+            var restored = self.archived_projects.orderedRemove(archived_index);
+            restored.archived = false;
+            restored.unread_count = unread_count;
+            if (restored.threads.items.len == 0) {
+                try restored.addThread(self.allocator);
+            }
+            try restored.normalize(self.allocator);
+            try self.projects.append(self.allocator, restored);
+            self.markDirty();
+            return .restored;
+        }
         try self.projects.append(self.allocator, try Project.init(self.allocator, id, label, path, unread_count));
         self.markDirty();
+        return .created;
     }
 
     fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
@@ -1008,11 +1035,11 @@ pub const AppState = struct {
         }
 
         const label = utils.projectLabelFromPath(resolved);
-        try self.addProject(label, resolved, 0);
+        const add_result = try self.addProject(label, resolved, 0);
         self.selected_project_index = self.projects.items.len - 1;
         self.clearImportPath();
         self.syncRenameBuffer();
-        self.setSidebarNotice("Project imported.");
+        self.setSidebarNotice(if (add_result == .restored) "Project restored from archive." else "Project imported.");
         self.show_project_creator = false;
         self.markDirty();
     }
@@ -1262,7 +1289,7 @@ pub const AppState = struct {
             self.allocator.free(model_ref);
             imported.model_ref = null;
         }
-        imported.model_ref = self.allocator.dupeZ(u8, self.defaultModelRefForProvider(provider)) catch {
+        imported.model_ref = self.allocator.dupeZ(u8, self.cachedDefaultModelRefForProvider(provider)) catch {
             self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
             return;
         };
@@ -1358,24 +1385,36 @@ pub const AppState = struct {
         self.syncRenameBuffer();
     }
 
-    pub fn removeProjectAtIndex(self: *AppState, index: usize) void {
+    pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
         self.selected_project_index = index;
-        self.removeSelectedProject();
+        self.archiveSelectedProject();
         self.rename_project_index = null;
     }
 
-    fn removeSelectedProject(self: *AppState) void {
+    fn archiveSelectedProject(self: *AppState) void {
         if (self.projects.items.len == 0) return;
         for (self.projects.items[self.selected_project_index].threads.items) |*thread| {
             if (thread.isSendPending()) {
-                self.setSidebarNotice("Finish this project's running provider requests before removing it.");
+                self.setSidebarNotice("Finish this project's running provider requests before archiving it.");
                 return;
             }
         }
         self.cancelThreadImport();
         var removed = self.projects.orderedRemove(self.selected_project_index);
-        removed.deinit(self.allocator);
+        removed.archived = true;
+        removed.terminal_dock.visible = false;
+        removed.archiveAllThreads(self.allocator) catch {
+            removed.deinit(self.allocator);
+            self.setSidebarNotice("Failed to archive the project.");
+            return;
+        };
+        self.archived_projects.append(self.allocator, removed) catch |err| {
+            var failed = removed;
+            failed.deinit(self.allocator);
+            self.setSidebarNotice(@errorName(err));
+            return;
+        };
 
         if (self.projects.items.len == 0) {
             self.selected_project_index = 0;
@@ -1384,8 +1423,62 @@ pub const AppState = struct {
         }
 
         self.syncRenameBuffer();
-        self.setSidebarNotice("Project removed from recents.");
+        self.setSidebarNotice("Project archived.");
         self.markDirty();
+    }
+
+    pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) {
+            self.setSidebarNotice("Project not found.");
+            return;
+        }
+
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) {
+            self.setSidebarNotice("Thread not found.");
+            return;
+        }
+
+        if (project.threads.items[thread_index].isSendPending()) {
+            self.setSidebarNotice("Finish this thread's provider request before archiving.");
+            return;
+        }
+
+        var archived_thread = project.threads.orderedRemove(thread_index);
+        archived_thread.archived = true;
+        project.archived_threads.append(self.allocator, archived_thread) catch |err| {
+            var failed = archived_thread;
+            failed.archived = false;
+            if (thread_index <= project.threads.items.len) {
+                project.threads.insert(self.allocator, thread_index, failed) catch {
+                    failed.deinit(self.allocator);
+                };
+            } else {
+                project.threads.append(self.allocator, failed) catch {
+                    failed.deinit(self.allocator);
+                };
+            }
+            self.setSidebarNotice(@errorName(err));
+            return;
+        };
+
+        if (project.threads.items.len == 0) {
+            project.addThread(self.allocator) catch {
+                self.setSidebarNotice("Archived the thread, but failed to create a new draft.");
+                self.markDirty();
+                return;
+            };
+        } else if (thread_index < project.selected_thread_index) {
+            project.selected_thread_index -= 1;
+        } else if (project.selected_thread_index >= project.threads.items.len) {
+            project.selected_thread_index = project.threads.items.len - 1;
+        }
+
+        self.selected_project_index = project_index;
+        self.syncRenameBuffer();
+        self.requestTranscriptScrollToBottom();
+        self.markDirty();
+        self.setSidebarNotice("Thread archived.");
     }
 
     pub fn createThreadForProject(self: *AppState, index: usize) void {
@@ -1530,6 +1623,7 @@ pub const AppState = struct {
             defer self.allocator.free(project_id);
 
             var loaded = try Project.init(self.allocator, project_id, project.label, project.path, project.unread_count);
+            loaded.archived = project.archived;
             loaded.collapsed = project.collapsed orelse false;
             loaded.thread_list_expanded = project.thread_list_expanded orelse false;
             for (loaded.threads.items) |*thread| {
@@ -1540,6 +1634,7 @@ pub const AppState = struct {
             if (project.threads) |threads| {
                 for (threads) |persisted_thread| {
                     var thread = try ChatThread.init(self.allocator, persisted_thread.title);
+                    thread.archived = project.archived or persisted_thread.archived;
                     thread.committed = persisted_thread.committed;
                     thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
                     thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
@@ -1576,14 +1671,23 @@ pub const AppState = struct {
                     if (thread.last_activity_at == 0 and thread.messages.items.len > 0) {
                         thread.touch();
                     }
-                    try loaded.threads.append(self.allocator, thread);
+                    if (thread.archived) {
+                        try loaded.archived_threads.append(self.allocator, thread);
+                    } else {
+                        try loaded.threads.append(self.allocator, thread);
+                    }
                 }
-                if (loaded.threads.items.len == 0) {
+                if (!loaded.archived and loaded.threads.items.len == 0) {
                     try loaded.addThread(self.allocator);
                 }
-                loaded.selected_thread_index = @min(project.selected_thread_index, loaded.threads.items.len - 1);
+                if (loaded.threads.items.len == 0) {
+                    loaded.selected_thread_index = 0;
+                } else {
+                    loaded.selected_thread_index = @min(project.selected_thread_index, loaded.threads.items.len - 1);
+                }
             } else {
                 var thread = try ChatThread.init(self.allocator, "New thread");
+                thread.archived = project.archived;
                 thread.committed = project.messages.len > 0;
                 thread.last_activity_at = if (thread.committed) std.time.timestamp() else 0;
                 thread.provider = project.provider;
@@ -1600,11 +1704,15 @@ pub const AppState = struct {
                             null,
                     });
                 }
-                try loaded.threads.append(self.allocator, thread);
-                loaded.selected_thread_index = 0;
+                if (thread.archived) {
+                    try loaded.archived_threads.append(self.allocator, thread);
+                } else {
+                    try loaded.threads.append(self.allocator, thread);
+                    loaded.selected_thread_index = 0;
+                }
             }
 
-            if (index == 0 and project.messages.len == 0 and project.threads == null and persisted.messages != null) {
+            if (!loaded.archived and index == 0 and project.messages.len == 0 and project.threads == null and persisted.messages != null) {
                 var fallback_thread = loaded.currentThreadMutable();
                 fallback_thread.provider = persisted.provider orelse fallback_thread.provider;
                 fallback_thread.harness = persisted.harness orelse fallback_thread.harness;
@@ -1624,11 +1732,19 @@ pub const AppState = struct {
 
             try loaded.normalize(self.allocator);
 
-            try self.projects.append(self.allocator, loaded);
+            if (loaded.archived) {
+                try self.archived_projects.append(self.allocator, loaded);
+            } else {
+                try self.projects.append(self.allocator, loaded);
+            }
         }
 
-        self.selected_project_index = @min(persisted.selected_project_index, self.projects.items.len - 1);
-        self.next_project_number = self.projects.items.len + 1;
+        if (self.projects.items.len == 0) {
+            self.selected_project_index = 0;
+        } else {
+            self.selected_project_index = @min(persisted.selected_project_index, self.projects.items.len - 1);
+        }
+        self.next_project_number = self.projects.items.len + self.archived_projects.items.len + 1;
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.dirty = false;
@@ -1645,6 +1761,9 @@ pub const AppState = struct {
         for (self.projects.items) |project| {
             try projects.append(arena, try self.persistedProjectSnapshot(arena, &project));
         }
+        for (self.archived_projects.items) |project| {
+            try projects.append(arena, try self.persistedProjectSnapshot(arena, &project));
+        }
 
         loaded.value = .{
             .selected_project_index = self.selected_project_index,
@@ -1658,7 +1777,10 @@ pub const AppState = struct {
         defer threads.deinit(allocator);
 
         for (project.threads.items) |thread| {
-            if (!thread.committed) continue;
+            if (!project.archived and !thread.committed) continue;
+            try threads.append(allocator, try self.persistedThreadSnapshot(allocator, &thread));
+        }
+        for (project.archived_threads.items) |thread| {
             try threads.append(allocator, try self.persistedThreadSnapshot(allocator, &thread));
         }
 
@@ -1666,10 +1788,11 @@ pub const AppState = struct {
             .id = try allocator.dupe(u8, project.id),
             .label = try allocator.dupe(u8, project.label),
             .path = try allocator.dupe(u8, project.path),
+            .archived = project.archived,
             .unread_count = project.unread_count,
             .collapsed = project.collapsed,
             .thread_list_expanded = project.thread_list_expanded,
-            .selected_thread_index = chat_threads.selectedCommittedThreadIndex(project),
+            .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
             .threads = try threads.toOwnedSlice(allocator),
         };
     }
@@ -1684,6 +1807,7 @@ pub const AppState = struct {
 
         return .{
             .title = try allocator.dupe(u8, thread.title),
+            .archived = thread.archived,
             .committed = thread.committed,
             .last_activity_at = if (thread.last_activity_at == 0) null else thread.last_activity_at,
             .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
@@ -2242,6 +2366,11 @@ pub const AppState = struct {
                 if (project_index == self.selected_project_index and project.terminal_dock.visible) {
                     self.setSidebarNotice("Terminal session failed.");
                 }
+            };
+        }
+        for (self.archived_projects.items) |*project| {
+            project.terminal_dock.poll(self.allocator) catch |err| {
+                log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
             };
         }
     }
@@ -3038,7 +3167,13 @@ pub const AppState = struct {
     }
 
     pub fn markDirty(self: *AppState) void {
+        self.noteInteraction();
         self.dirty = true;
+        self.last_dirty_at_ms = std.time.milliTimestamp();
+    }
+
+    pub fn noteInteraction(self: *AppState) void {
+        self.last_interaction_at_ms = std.time.milliTimestamp();
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
@@ -3102,6 +3237,14 @@ pub const AppState = struct {
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
+        if (std.time.milliTimestamp() - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (std.time.milliTimestamp() - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+
+        self.flushDirtyNow();
+    }
+
+    fn flushDirtyNow(self: *AppState) void {
+        if (!self.dirty) return;
 
         self.storage.save(self) catch |err| {
             log.err("failed to save native state: {s}", .{@errorName(err)});
@@ -3116,7 +3259,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
         }
-        self.flushIfDirty();
+        self.flushDirtyNow();
         self.clearProjects();
 
         if (try self.storage.load(self.allocator)) |persisted_value| {
@@ -3126,6 +3269,7 @@ pub const AppState = struct {
         } else {
             try self.seedDefaultState();
         }
+        self.refreshOpencodeModelOptionsCacheAsync();
 
         self.setSidebarNotice("App refreshed from disk.");
         self.requestTranscriptScrollToBottom();
@@ -3163,9 +3307,10 @@ pub const AppState = struct {
 
     pub fn deinit(self: *AppState) void {
         self.finishPickerThread();
+        self.finishOpencodeModelCacheThread();
         self.finishAllSendThreads();
         self.pollSend();
-        self.flushIfDirty();
+        self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
         self.browser_state.deinit();
@@ -3174,6 +3319,7 @@ pub const AppState = struct {
         self.opencode_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
+        self.archived_projects.deinit(self.allocator);
     }
 
     pub fn pollPicker(self: *AppState) void {
@@ -3219,6 +3365,50 @@ pub const AppState = struct {
             .cancelled => self.setSidebarNotice("Folder selection cancelled."),
             .unavailable => self.setSidebarNotice("No supported folder picker found. Install zenity or paste a directory path manually."),
             .failed => self.setSidebarNotice("Folder picker failed."),
+            else => {},
+        }
+    }
+
+    pub fn pollOpencodeModelOptionsCache(self: *AppState) void {
+        var loaded_models: ?[]ai_harness.ModelInfo = null;
+        var next_status: OpencodeModelCacheStatus = .idle;
+
+        self.opencode_model_cache_state.mutex.lock();
+        switch (self.opencode_model_cache_state.status) {
+            .completed => {
+                loaded_models = self.opencode_model_cache_state.models;
+                self.opencode_model_cache_state.models = null;
+                self.opencode_model_cache_state.status = .idle;
+                next_status = .completed;
+            },
+            .failed => {
+                self.opencode_model_cache_state.status = .idle;
+                next_status = .failed;
+            },
+            else => {},
+        }
+        self.opencode_model_cache_state.mutex.unlock();
+
+        if (next_status != .idle) {
+            self.finishOpencodeModelCacheThread();
+        }
+
+        switch (next_status) {
+            .completed => {
+                const models = loaded_models orelse return;
+                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+                self.clearOpencodeModelOptions();
+                if (models.len == 0) return;
+                self.populateOpencodeModelOptions(models) catch |err| {
+                    log.warn("failed to cache OpenCode configured models: {s}", .{@errorName(err)});
+                    self.clearDynamicOpencodeModelOptions();
+                    return;
+                };
+                self.normalizeCurrentOpencodeThreadModel();
+            },
+            .failed => {
+                log.warn("failed to refresh OpenCode model cache", .{});
+            },
             else => {},
         }
     }
@@ -3327,9 +3517,37 @@ pub const AppState = struct {
         }
     }
 
+    fn finishOpencodeModelCacheThread(self: *AppState) void {
+        self.opencode_model_cache_state.mutex.lock();
+        const maybe_worker = self.opencode_model_cache_state.worker;
+        self.opencode_model_cache_state.worker = null;
+        const maybe_models = self.opencode_model_cache_state.models;
+        self.opencode_model_cache_state.models = null;
+        self.opencode_model_cache_state.status = .idle;
+        self.opencode_model_cache_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+        if (maybe_models) |models| {
+            ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        }
+    }
+
     fn finishAllSendThreads(self: *AppState) void {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
+                thread.finishSendThread();
+            }
+            for (project.archived_threads.items) |*thread| {
+                thread.finishSendThread();
+            }
+        }
+        for (self.archived_projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                thread.finishSendThread();
+            }
+            for (project.archived_threads.items) |*thread| {
                 thread.finishSendThread();
             }
         }
@@ -3343,6 +3561,17 @@ pub const AppState = struct {
     pub fn hasAnyPendingSends(self: *AppState) bool {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
+                if (thread.isSendPending()) return true;
+            }
+            for (project.archived_threads.items) |*thread| {
+                if (thread.isSendPending()) return true;
+            }
+        }
+        for (self.archived_projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                if (thread.isSendPending()) return true;
+            }
+            for (project.archived_threads.items) |*thread| {
                 if (thread.isSendPending()) return true;
             }
         }
@@ -3482,6 +3711,13 @@ pub const AppState = struct {
         return null;
     }
 
+    fn findArchivedProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
+        for (self.archived_projects.items, 0..) |project, index| {
+            if (std.mem.eql(u8, project.path, path)) return index;
+        }
+        return null;
+    }
+
     fn findThreadIndexByProviderThreadId(self: *const AppState, project_index: usize, provider: Provider, thread_id: []const u8) ?usize {
         if (project_index >= self.projects.items.len) return null;
         const project = &self.projects.items[project_index];
@@ -3531,6 +3767,10 @@ pub const AppState = struct {
             project.deinit(self.allocator);
         }
         self.projects.clearRetainingCapacity();
+        for (self.archived_projects.items) |*project| {
+            project.deinit(self.allocator);
+        }
+        self.archived_projects.clearRetainingCapacity();
         self.selected_project_index = 0;
         self.next_project_number = 1;
         self.show_project_creator = false;
@@ -3574,6 +3814,39 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             else => "Failed to load OpenCode threads.",
         },
     };
+}
+
+fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {
+    const provider_config = ai_harness.ProviderConfig{
+        .opencode = .{
+            .allocator = std.heap.page_allocator,
+            .working_directory = null,
+            .launch_if_missing = true,
+        },
+    };
+
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
+            log.warn("failed to connect to OpenCode for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load OpenCode configured models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
 }
 
 fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {

@@ -139,6 +139,7 @@ pub fn main() !void {
     var state = try AppState.init(allocator, &storage, loaded_app_config);
     defer state.deinit();
     state.openBrowserOnLaunchIfRequested();
+    state.startOpencodeModelOptionsRefresh();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
 
@@ -147,6 +148,7 @@ pub fn main() !void {
         syncWindowTextInput(window, &state);
         running = processEvents(window, &state, &keyboard);
         state.pollPicker();
+        state.pollOpencodeModelOptionsCache();
         state.pollSend();
         state.pollBrowser();
         state.pollTerminals();

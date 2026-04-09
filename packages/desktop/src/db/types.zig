@@ -46,6 +46,7 @@ pub const PersistedMessage = struct {
 
 pub const PersistedThread = struct {
     title: []const u8,
+    archived: bool = false,
     committed: bool = true,
     last_activity_at: ?i64 = null,
     provider_thread_id: ?[]const u8 = null,
@@ -64,6 +65,7 @@ pub const PersistedProject = struct {
     id: ?[]const u8 = null,
     label: []const u8,
     path: []const u8,
+    archived: bool = false,
     unread_count: u8 = 0,
     collapsed: ?bool = null,
     thread_list_expanded: ?bool = null,
