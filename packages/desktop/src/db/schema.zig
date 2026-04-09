@@ -1,5 +1,6 @@
 //! SQLite schema and connection initialization for app persistence.
 
+const std = @import("std");
 const zqlite = @import("zqlite");
 
 pub const INIT_SQL: [:0]const u8 =
@@ -15,6 +16,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    sort_index integer not null,
     \\    label text not null,
     \\    path text not null,
+    \\    archived integer not null default 0,
     \\    unread_count integer not null default 0,
     \\    collapsed integer not null default 0,
     \\    thread_list_expanded integer not null default 0,
@@ -26,6 +28,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    project_id integer not null references projects(id) on delete cascade,
     \\    sort_index integer not null,
     \\    title text not null,
+    \\    archived integer not null default 0,
     \\    committed integer not null default 1,
     \\    last_activity_at integer,
     \\    provider_thread_id text,
@@ -58,4 +61,20 @@ pub const INIT_SQL: [:0]const u8 =
 pub fn initialize(conn: zqlite.Conn) !void {
     try conn.busyTimeout(5000);
     try conn.execNoArgs(INIT_SQL);
+    try ensureColumn(conn, "projects", "archived", "alter table projects add column archived integer not null default 0");
+    try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
+}
+
+fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {
+    var pragma_buf: [128]u8 = undefined;
+    const pragma_sql = try std.fmt.bufPrint(&pragma_buf, "pragma table_info({s})", .{table_name});
+    var rows = try conn.rows(pragma_sql, .{});
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        if (std.mem.eql(u8, row.text(1), column_name)) return;
+    }
+    if (rows.err) |err| return err;
+
+    try conn.execNoArgs(alter_sql);
 }

@@ -21,7 +21,7 @@ const LOCKED_MODEL_WINDOW_ID = "##composer-locked-model-picker";
 
 pub fn render(state: *AppState) void {
     const thread = state.currentThreadMutable();
-    const opencode_model_options = state.opencodeModelOptions();
+    const opencode_model_options = state.opencodeModelOptionsSnapshot();
     const provider_locked = thread.committed;
 
     const transparent = colors.rgba(0, 0, 0, 0);
@@ -906,7 +906,7 @@ fn setThreadModelRef(state: *AppState, thread: *ChatThread, value: ?[:0]const u8
 fn defaultModelRef(state: *AppState, provider: Provider) [:0]const u8 {
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
-        .opencode => state.defaultModelRefForProvider(.opencode),
+        .opencode => state.cachedDefaultModelRefForProvider(.opencode),
     };
 }
 

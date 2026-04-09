@@ -69,7 +69,7 @@ pub const Client = struct {
         defer projects.deinit(arena);
 
         var project_rows = try self.conn.rows(
-            "select id, project_id, label, path, unread_count, collapsed, thread_list_expanded, selected_thread_index " ++
+            "select id, project_id, label, path, archived, unread_count, collapsed, thread_list_expanded, selected_thread_index " ++
                 "from projects order by sort_index",
             .{},
         );
@@ -81,10 +81,11 @@ pub const Client = struct {
                 .id = try arena.dupe(u8, project_row.text(1)),
                 .label = try arena.dupe(u8, project_row.text(2)),
                 .path = try arena.dupe(u8, project_row.text(3)),
-                .unread_count = @intCast(project_row.int(4)),
-                .collapsed = project_row.int(5) != 0,
-                .thread_list_expanded = project_row.int(6) != 0,
-                .selected_thread_index = @intCast(project_row.int(7)),
+                .archived = project_row.int(4) != 0,
+                .unread_count = @intCast(project_row.int(5)),
+                .collapsed = project_row.int(6) != 0,
+                .thread_list_expanded = project_row.int(7) != 0,
+                .selected_thread_index = @intCast(project_row.int(8)),
                 .threads = try self.loadThreads(arena, project_id),
             });
         }
@@ -112,13 +113,14 @@ pub const Client = struct {
 
         for (state.projects, 0..) |project, project_index| {
             try self.conn.exec(
-                "insert into projects (project_id, sort_index, label, path, unread_count, collapsed, thread_list_expanded, selected_thread_index) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "insert into projects (project_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, selected_thread_index) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 .{
                     project.id orelse project.path,
                     @as(i64, @intCast(project_index)),
                     project.label,
                     project.path,
+                    boolToInt(project.archived),
                     @as(i64, @intCast(project.unread_count)),
                     boolToInt(project.collapsed orelse false),
                     boolToInt(project.thread_list_expanded orelse false),
@@ -137,7 +139,7 @@ pub const Client = struct {
         defer threads.deinit(allocator);
 
         var thread_rows = try self.conn.rows(
-            "select id, title, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
+            "select id, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
                 "from threads where project_id = ?1 order by sort_index",
             .{project_id},
         );
@@ -147,21 +149,22 @@ pub const Client = struct {
             const thread_id = thread_row.int(0);
             try threads.append(allocator, .{
                 .title = try allocator.dupe(u8, thread_row.text(1)),
-                .committed = thread_row.int(2) != 0,
-                .last_activity_at = thread_row.nullableInt(3),
-                .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(4)),
-                .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(5)),
-                .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(6)),
-                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(7)),
-                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(8)),
-                .provider = decodeEnumOr(db_types.Provider, thread_row.int(9), .opencode),
-                .harness = decodeEnumOr(db_types.Harness, thread_row.int(10), .local_cli),
-                .draft = try allocator.dupe(u8, thread_row.text(11)),
+                .archived = thread_row.int(2) != 0,
+                .committed = thread_row.int(3) != 0,
+                .last_activity_at = thread_row.nullableInt(4),
+                .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(5)),
+                .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(6)),
+                .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(7)),
+                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(8)),
+                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(9)),
+                .provider = decodeEnumOr(db_types.Provider, thread_row.int(10), .opencode),
+                .harness = decodeEnumOr(db_types.Harness, thread_row.int(11), .local_cli),
+                .draft = try allocator.dupe(u8, thread_row.text(12)),
                 .draft_image = try loadOptionalImage(
                     allocator,
-                    thread_row.nullableText(12),
                     thread_row.nullableText(13),
-                    thread_row.nullableInt(14),
+                    thread_row.nullableText(14),
+                    thread_row.nullableInt(15),
                 ),
                 .messages = try self.loadMessages(allocator, thread_id),
             });
@@ -213,6 +216,7 @@ pub const Client = struct {
 
         var synthesized: PersistedThread = .{
             .title = "New thread",
+            .archived = project.archived,
             .committed = project.messages.len > 0,
             .last_activity_at = if (project.messages.len > 0) std.time.timestamp() else null,
             .provider = project.provider,
@@ -235,12 +239,13 @@ pub const Client = struct {
         for (threads, 0..) |thread, thread_index| {
             const draft_image = thread.draft_image;
             try self.conn.exec(
-                "insert into threads (project_id, sort_index, title, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "insert into threads (project_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 .{
                     project_id,
                     @as(i64, @intCast(thread_index)),
                     thread.title,
+                    boolToInt(thread.archived),
                     boolToInt(thread.committed),
                     thread.last_activity_at,
                     thread.provider_thread_id,
@@ -406,4 +411,85 @@ test "save clears orphaned threads left behind by manual db edits" {
     try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[0].threads.?.len);
     try testing.expectEqualStrings("Recovered thread", loaded.?.value.projects[0].threads.?[0].title);
     try testing.expectEqualStrings("fixed", loaded.?.value.projects[0].threads.?[0].messages[0].body);
+}
+
+test "save and load preserve archived projects and threads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    const archived_state = PersistedState{
+        .selected_project_index = 0,
+        .projects = &.{
+            .{
+                .id = "project-active",
+                .label = "Active Project",
+                .path = "/tmp/project-active",
+                .selected_thread_index = 0,
+                .threads = &.{
+                    .{
+                        .title = "Visible thread",
+                        .committed = true,
+                        .provider = .codex,
+                        .draft = "",
+                        .messages = &.{.{
+                            .role = .user,
+                            .author = "You",
+                            .body = "active",
+                        }},
+                    },
+                    .{
+                        .title = "Archived thread",
+                        .archived = true,
+                        .committed = true,
+                        .provider = .codex,
+                        .draft = "",
+                        .messages = &.{.{
+                            .role = .user,
+                            .author = "You",
+                            .body = "archived-thread",
+                        }},
+                    },
+                },
+            },
+            .{
+                .id = "project-archived",
+                .label = "Archived Project",
+                .path = "/tmp/project-archived",
+                .archived = true,
+                .selected_thread_index = 0,
+                .threads = &.{.{
+                    .title = "Archived project thread",
+                    .archived = true,
+                    .committed = true,
+                    .provider = .opencode,
+                    .draft = "",
+                    .messages = &.{.{
+                        .role = .user,
+                        .author = "You",
+                        .body = "archived-project",
+                    }},
+                }},
+            },
+        },
+    };
+    try client.save(archived_state);
+
+    const loaded = try client.load(testing.allocator);
+    defer if (loaded) |*state| state.deinit();
+
+    try testing.expect(loaded != null);
+    try testing.expectEqual(@as(usize, 2), loaded.?.value.projects.len);
+    try testing.expect(!loaded.?.value.projects[0].archived);
+    try testing.expectEqual(@as(usize, 2), loaded.?.value.projects[0].threads.?.len);
+    try testing.expect(!loaded.?.value.projects[0].threads.?[0].archived);
+    try testing.expect(loaded.?.value.projects[0].threads.?[1].archived);
+    try testing.expect(loaded.?.value.projects[1].archived);
+    try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[1].threads.?.len);
+    try testing.expect(loaded.?.value.projects[1].threads.?[0].archived);
 }
