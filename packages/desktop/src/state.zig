@@ -733,6 +733,8 @@ pub const AppState = struct {
     transcript_project_index: ?usize,
     transcript_thread_index: ?usize,
     scroll_transcript_to_bottom_frames: u8,
+    pending_transcript_line_scroll_steps: i16,
+    pending_transcript_page_scroll_steps: i16,
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
@@ -798,6 +800,8 @@ pub const AppState = struct {
             .transcript_project_index = null,
             .transcript_thread_index = null,
             .scroll_transcript_to_bottom_frames = 8,
+            .pending_transcript_line_scroll_steps = 0,
+            .pending_transcript_page_scroll_steps = 0,
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
@@ -3178,6 +3182,22 @@ pub const AppState = struct {
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
         self.scroll_transcript_to_bottom_frames = 8;
+    }
+
+    pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
+        if (delta == 0) return;
+        self.noteInteraction();
+        self.scroll_transcript_to_bottom_frames = 0;
+        const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
+        self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
+    }
+
+    pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
+        if (delta == 0) return;
+        self.noteInteraction();
+        self.scroll_transcript_to_bottom_frames = 0;
+        const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
+        self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
     }
 
     fn importPath(self: *const AppState) []const u8 {

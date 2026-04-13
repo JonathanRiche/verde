@@ -12,6 +12,10 @@ pub const NativeKeyboardAction = enum {
     open_default,
     toggle_browser,
     toggle_terminal,
+    chat_up,
+    chat_down,
+    chat_page_up,
+    chat_page_down,
 };
 
 pub const Keybind = struct {
@@ -53,6 +57,10 @@ pub const NativeKeyboardConfig = struct {
     open_default: []Keybind,
     toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
+    chat_up: []Keybind,
+    chat_down: []Keybind,
+    chat_page_up: []Keybind,
+    chat_page_down: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -61,6 +69,10 @@ pub const NativeKeyboardConfig = struct {
             .open_default = try cloneDefaultOpenKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
+            .chat_up = try cloneDefaultChatUpKeybinds(allocator),
+            .chat_down = try cloneDefaultChatDownKeybinds(allocator),
+            .chat_page_up = try cloneDefaultChatPageUpKeybinds(allocator),
+            .chat_page_down = try cloneDefaultChatPageDownKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -80,6 +92,10 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.open_default);
         self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
+        self.allocator.free(self.chat_up);
+        self.allocator.free(self.chat_down);
+        self.allocator.free(self.chat_page_up);
+        self.allocator.free(self.chat_page_down);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -94,6 +110,18 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.toggle_terminal, event)) {
             return .toggle_terminal;
+        }
+        if (matchesAny(self.chat_up, event)) {
+            return .chat_up;
+        }
+        if (matchesAny(self.chat_down, event)) {
+            return .chat_down;
+        }
+        if (matchesAny(self.chat_page_up, event)) {
+            return .chat_page_up;
+        }
+        if (matchesAny(self.chat_page_down, event)) {
+            return .chat_page_down;
         }
 
         return null;
@@ -133,6 +161,30 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(terminal_value, "terminal")) |bindings| {
                 self.allocator.free(self.toggle_terminal);
                 self.toggle_terminal = bindings;
+            }
+        }
+        if (keybinds_value.object.get("chat_up")) |chat_up_value| {
+            if (self.parseOverrideValue(chat_up_value, "chat_up")) |bindings| {
+                self.allocator.free(self.chat_up);
+                self.chat_up = bindings;
+            }
+        }
+        if (keybinds_value.object.get("chat_down")) |chat_down_value| {
+            if (self.parseOverrideValue(chat_down_value, "chat_down")) |bindings| {
+                self.allocator.free(self.chat_down);
+                self.chat_down = bindings;
+            }
+        }
+        if (keybinds_value.object.get("chat_page_up")) |chat_page_up_value| {
+            if (self.parseOverrideValue(chat_page_up_value, "chat_page_up")) |bindings| {
+                self.allocator.free(self.chat_page_up);
+                self.chat_page_up = bindings;
+            }
+        }
+        if (keybinds_value.object.get("chat_page_down")) |chat_page_down_value| {
+            if (self.parseOverrideValue(chat_page_down_value, "chat_page_down")) |bindings| {
+                self.allocator.free(self.chat_page_down);
+                self.chat_page_down = bindings;
             }
         }
     }
@@ -227,6 +279,30 @@ fn cloneDefaultTerminalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultBrowserKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Ctrl+B"),
+    });
+}
+
+fn cloneDefaultChatUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Up"),
+    });
+}
+
+fn cloneDefaultChatDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Down"),
+    });
+}
+
+fn cloneDefaultChatPageUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("PageUp"),
+    });
+}
+
+fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("PageDown"),
     });
 }
 
@@ -534,4 +610,44 @@ test "default browser keybind uses ctrl plus b" {
     try std.testing.expect(!config.toggle_browser[0].meta);
     try std.testing.expect(!config.toggle_browser[0].primary);
     try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
+}
+
+test "default chat scroll keybinds use arrows and paging keys" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.chat_up.len);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_down.len);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_page_up.len);
+    try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
+    try std.testing.expectEqual(sdl.Keycode.up, config.chat_up[0].key);
+    try std.testing.expectEqual(sdl.Keycode.down, config.chat_down[0].key);
+    try std.testing.expectEqual(sdl.Keycode.pageup, config.chat_page_up[0].key);
+    try std.testing.expectEqual(sdl.Keycode.pagedown, config.chat_page_down[0].key);
+}
+
+test "chat page down keybind override accepts a single accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            try keybinds.put("chat_page_down", .{ .string = "Shift+J" });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
+    try std.testing.expect(config.chat_page_down[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.j, config.chat_page_down[0].key);
 }

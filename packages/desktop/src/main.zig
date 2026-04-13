@@ -549,7 +549,26 @@ fn handleKeyboardAction(
         .open_default => state.runDefaultOpenAction(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
+        .chat_up => if (canHandleTranscriptScrollAction(state)) {
+            state.requestTranscriptLineScroll(-1);
+        },
+        .chat_down => if (canHandleTranscriptScrollAction(state)) {
+            state.requestTranscriptLineScroll(1);
+        },
+        .chat_page_up => if (canHandleTranscriptScrollAction(state)) {
+            state.requestTranscriptPageScroll(-1);
+        },
+        .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
+            state.requestTranscriptPageScroll(1);
+        },
     }
+}
+
+fn canHandleTranscriptScrollAction(state: *const AppState) bool {
+    if (state.projects.items.len == 0) return false;
+    if (state.isBrowserPaneFocused()) return false;
+    if (state.terminal_focused) return false;
+    return !zgui.io.getWantCaptureKeyboard();
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
