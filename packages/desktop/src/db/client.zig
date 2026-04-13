@@ -50,7 +50,7 @@ pub const Client = struct {
 
     pub fn load(self: *const Self, backing_allocator: std.mem.Allocator) !?LoadedState {
         const row = try self.conn.row(
-            "select selected_project_index from app_state where id = 1",
+            "select selected_project_index, sidebar_collapsed from app_state where id = 1",
             .{},
         );
         if (row == null) return null;
@@ -62,6 +62,7 @@ pub const Client = struct {
             var state_row = row.?;
             defer state_row.deinit();
             loaded.value.selected_project_index = @intCast(state_row.int(0));
+            loaded.value.sidebar_collapsed = state_row.int(1) != 0;
         }
 
         const arena = loaded.allocator();
@@ -107,8 +108,11 @@ pub const Client = struct {
         );
 
         try self.conn.exec(
-            "insert into app_state (id, selected_project_index) values (1, ?1)",
-            .{@as(i64, @intCast(state.selected_project_index))},
+            "insert into app_state (id, selected_project_index, sidebar_collapsed) values (1, ?1, ?2)",
+            .{
+                @as(i64, @intCast(state.selected_project_index)),
+                boolToInt(state.sidebar_collapsed),
+            },
         );
 
         for (state.projects, 0..) |project, project_index| {

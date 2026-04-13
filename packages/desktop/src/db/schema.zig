@@ -8,7 +8,8 @@ pub const INIT_SQL: [:0]const u8 =
     \\pragma journal_mode = wal;
     \\create table if not exists app_state (
     \\    id integer primary key check (id = 1),
-    \\    selected_project_index integer not null
+    \\    selected_project_index integer not null,
+    \\    sidebar_collapsed integer not null default 0
     \\);
     \\create table if not exists projects (
     \\    id integer primary key,
@@ -61,6 +62,7 @@ pub const INIT_SQL: [:0]const u8 =
 pub fn initialize(conn: zqlite.Conn) !void {
     try conn.busyTimeout(5000);
     try conn.execNoArgs(INIT_SQL);
+    try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
     try ensureColumn(conn, "projects", "archived", "alter table projects add column archived integer not null default 0");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
 }
