@@ -691,6 +691,8 @@ pub const AppState = struct {
     sidebar_collapsed: bool,
     composer_focused: bool,
     terminal_focused: bool,
+    terminal_resize_drag_active: bool,
+    terminal_resize_drag_origin_height: f32,
     debug_terminal_window_focused: bool,
     debug_terminal_hitbox_focused: bool,
     debug_terminal_hitbox_active: bool,
@@ -759,6 +761,8 @@ pub const AppState = struct {
             .sidebar_collapsed = false,
             .composer_focused = false,
             .terminal_focused = false,
+            .terminal_resize_drag_active = false,
+            .terminal_resize_drag_origin_height = 0.0,
             .debug_terminal_window_focused = false,
             .debug_terminal_hitbox_focused = false,
             .debug_terminal_hitbox_active = false,
@@ -1633,6 +1637,9 @@ pub const AppState = struct {
             loaded.archived = project.archived;
             loaded.collapsed = project.collapsed orelse false;
             loaded.thread_list_expanded = project.thread_list_expanded orelse false;
+            if (project.terminal_height) |height| {
+                loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
+            }
             for (loaded.threads.items) |*thread| {
                 thread.deinit(self.allocator);
             }
@@ -1800,6 +1807,7 @@ pub const AppState = struct {
             .unread_count = project.unread_count,
             .collapsed = project.collapsed,
             .thread_list_expanded = project.thread_list_expanded,
+            .terminal_height = project.terminal_dock.preferred_height,
             .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
             .threads = try threads.toOwnedSlice(allocator),
         };
@@ -2360,6 +2368,30 @@ pub const AppState = struct {
         return self.currentProjectTerminal().effectiveHeight(available_height);
     }
 
+    pub fn setCurrentProjectTerminalHeight(self: *AppState, available_height: f32, height: f32) void {
+        if (self.projects.items.len == 0) return;
+        if (self.currentProjectTerminalMutable().setPreferredHeight(available_height, height)) {
+            self.markDirty();
+        }
+    }
+
+    pub fn beginTerminalResizeDrag(self: *AppState, available_height: f32) void {
+        if (!self.isTerminalVisible()) return;
+        self.terminal_resize_drag_active = true;
+        self.terminal_resize_drag_origin_height = self.terminalPanelHeight(available_height);
+        self.noteInteraction();
+    }
+
+    pub fn updateTerminalResizeDrag(self: *AppState, available_height: f32, drag_delta_y: f32) void {
+        if (!self.terminal_resize_drag_active or !self.isTerminalVisible()) return;
+        self.setCurrentProjectTerminalHeight(available_height, self.terminal_resize_drag_origin_height - drag_delta_y);
+    }
+
+    pub fn endTerminalResizeDrag(self: *AppState) void {
+        self.terminal_resize_drag_active = false;
+        self.terminal_resize_drag_origin_height = 0.0;
+    }
+
     pub fn toggleCurrentProjectTerminal(self: *AppState) void {
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No project selected.");
@@ -2377,6 +2409,7 @@ pub const AppState = struct {
         }
 
         const is_visible = dock.toggle();
+        if (!is_visible) self.endTerminalResizeDrag();
         self.terminal_focused = is_visible;
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }

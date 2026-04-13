@@ -80,9 +80,14 @@ pub const Dock = struct {
     }
 
     pub fn effectiveHeight(self: *const Dock, available_height: f32) f32 {
-        const max_allowed = @min(MAX_DOCK_HEIGHT, available_height * 0.42);
-        const max_height = @max(MIN_DOCK_HEIGHT, max_allowed);
-        return clampf(self.preferred_height, MIN_DOCK_HEIGHT, max_height);
+        return clampHeightForAvailable(self.preferred_height, available_height);
+    }
+
+    pub fn setPreferredHeight(self: *Dock, available_height: f32, requested_height: f32) bool {
+        const next_height = clampHeightForAvailable(requested_height, available_height);
+        if (@abs(self.preferred_height - next_height) < 0.5) return false;
+        self.preferred_height = next_height;
+        return true;
     }
 
     pub fn ensureSession(self: *Dock, allocator: std.mem.Allocator, project_path: []const u8) !void {
@@ -177,6 +182,16 @@ pub const Dock = struct {
         return false;
     }
 };
+
+pub fn clampPreferredHeight(height: f32) f32 {
+    return clampf(height, MIN_DOCK_HEIGHT, MAX_DOCK_HEIGHT);
+}
+
+pub fn clampHeightForAvailable(height: f32, available_height: f32) f32 {
+    const max_allowed = @min(MAX_DOCK_HEIGHT, available_height * 0.42);
+    const max_height = @max(MIN_DOCK_HEIGHT, max_allowed);
+    return clampf(height, MIN_DOCK_HEIGHT, max_height);
+}
 
 const UnsupportedSession = struct {
     pub fn create(_: std.mem.Allocator, _: []const u8, _: u16, _: u16) !*UnsupportedSession {

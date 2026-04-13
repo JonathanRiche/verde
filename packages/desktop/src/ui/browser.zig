@@ -101,6 +101,13 @@ fn renderToolbar(state: *app_state.AppState) void {
         .buf = browser_state.addressBuffer(),
         .flags = .{ .enter_returns_true = true },
     });
+    const address_focused = zgui.isItemFocused();
+    const address_active = zgui.isItemActive();
+    if (address_focused or address_active) {
+        state.terminal_focused = false;
+        state.composer_focused = false;
+        state.unfocusBrowserPane();
+    }
     zgui.popItemWidth();
     zgui.popStyleVar(.{ .count = 1 });
     if (submitted) {
