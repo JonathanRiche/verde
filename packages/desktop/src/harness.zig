@@ -85,3 +85,7 @@ pub fn connect(
         .codex => |config| .{ .codex = try codex.Client.init(allocator, config) },
     };
 }
+
+pub fn shutdownOwnedProviderProcesses() void {
+    opencode.shutdownOwnedServer();
+}

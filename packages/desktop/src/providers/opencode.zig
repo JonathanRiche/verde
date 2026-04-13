@@ -24,11 +24,17 @@ pub const Config = struct {
     launch_if_missing: bool = false,
 };
 
+const SharedServerState = struct {
+    mutex: std.Thread.Mutex = .{},
+    child: ?std.process.Child = null,
+    owns_child: bool = false,
+};
+
+var shared_server_state: SharedServerState = .{};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    child: ?std.process.Child = null,
-    owns_child: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         var client: Client = .{
@@ -40,14 +46,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        if (self.child) |*child| {
-            if (self.owns_child) {
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-            }
-            self.child = null;
-            self.owns_child = false;
-        }
+        _ = self;
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
@@ -200,16 +199,29 @@ pub const Client = struct {
             return error.OpencodeServerUnavailable;
         }
 
-        try self.spawnServer();
+        shared_server_state.mutex.lock();
+        defer shared_server_state.mutex.unlock();
 
-        var attempt: usize = 0;
-        while (attempt < MAX_HEALTH_WAIT_ATTEMPTS) : (attempt += 1) {
+        if (self.checkHealth()) {
+            return;
+        }
+
+        if (shared_server_state.owns_child) {
+            if (self.waitForHealth(MAX_HEALTH_WAIT_ATTEMPTS)) {
+                return;
+            }
+            stopOwnedServerLocked();
             if (self.checkHealth()) {
                 return;
             }
-            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
 
+        try self.spawnServer();
+        if (self.waitForHealth(MAX_HEALTH_WAIT_ATTEMPTS)) {
+            return;
+        }
+
+        stopOwnedServerLocked();
         return error.OpencodeServerUnavailable;
     }
 
@@ -223,8 +235,19 @@ pub const Client = struct {
         }
     }
 
+    fn waitForHealth(self: *Client, attempts: usize) bool {
+        var attempt: usize = 0;
+        while (attempt < attempts) : (attempt += 1) {
+            if (self.checkHealth()) {
+                return true;
+            }
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        return false;
+    }
+
     fn spawnServer(self: *Client) !void {
-        if (self.child != null) return;
+        if (shared_server_state.child != null) return;
 
         const uri = try std.Uri.parse(self.config.base_url);
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
@@ -266,8 +289,8 @@ pub const Client = struct {
         child.env_map = null;
         child.argv = &.{};
 
-        self.child = child;
-        self.owns_child = true;
+        shared_server_state.child = child;
+        shared_server_state.owns_child = true;
     }
 
     fn createSession(self: *Client, allocator: std.mem.Allocator, title: ?[]const u8) ![]u8 {
@@ -703,6 +726,23 @@ pub const Client = struct {
         return makeAuthorizationHeaderAlloc(self.allocator, self.config);
     }
 };
+
+pub fn shutdownOwnedServer() void {
+    shared_server_state.mutex.lock();
+    defer shared_server_state.mutex.unlock();
+    stopOwnedServerLocked();
+}
+
+fn stopOwnedServerLocked() void {
+    if (shared_server_state.child) |*child| {
+        if (shared_server_state.owns_child) {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
+        shared_server_state.child = null;
+        shared_server_state.owns_child = false;
+    }
+}
 
 const HttpResponse = struct {
     status: std.http.Status,
