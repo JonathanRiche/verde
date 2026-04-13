@@ -677,6 +677,10 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     zgui.endChild();
     zgui.popStyleVar(.{ .count = 1 });
 
+    if (applyPendingTranscriptScroll(state, height)) {
+        return;
+    }
+
     // Hold bottom-scroll requests for a couple of frames so startup and thread
     // switches still land correctly after nested child layout settles.
     if (state.scroll_transcript_to_bottom_frames > 0) {
@@ -685,6 +689,26 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     } else if (should_follow_stream) {
         zgui.setScrollY(zgui.getScrollMaxY());
     }
+}
+
+fn applyPendingTranscriptScroll(state: *app_state.AppState, viewport_height: f32) bool {
+    if (state.pending_transcript_line_scroll_steps == 0 and state.pending_transcript_page_scroll_steps == 0) {
+        return false;
+    }
+
+    const line_step = theme.scaledUi(56.0);
+    const page_step = @max(viewport_height - theme.scaledUi(48.0), theme.scaledUi(120.0));
+    const delta_y =
+        @as(f32, @floatFromInt(state.pending_transcript_line_scroll_steps)) * line_step +
+        @as(f32, @floatFromInt(state.pending_transcript_page_scroll_steps)) * page_step;
+
+    state.pending_transcript_line_scroll_steps = 0;
+    state.pending_transcript_page_scroll_steps = 0;
+
+    const scroll_max_y = zgui.getScrollMaxY();
+    const next_scroll_y = std.math.clamp(zgui.getScrollY() + delta_y, 0.0, scroll_max_y);
+    zgui.setScrollY(next_scroll_y);
+    return true;
 }
 
 /// Renders the pending approval prompt from the provider.

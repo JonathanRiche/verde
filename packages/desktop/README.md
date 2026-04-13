@@ -235,12 +235,16 @@ Current supported config includes UI font size, keybind overrides, and the defau
     "refresh": ["CommandOrControl+R", "F5"],
     "open": "Alt+O",
     "browser": "Ctrl+B",
-    "terminal": "CommandOrControl+J"
+    "terminal": "CommandOrControl+J",
+    "chat_up": "Up",
+    "chat_down": "Down",
+    "chat_page_up": "PageUp",
+    "chat_page_down": "PageDown"
   }
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Refresh reloads app state from disk, config, and keybinds.
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
 
 `open.default` accepts lower-case string values:
 
