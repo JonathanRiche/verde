@@ -331,7 +331,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 );
             }
             const action = keyboard.actionForEvent(&event.key);
-            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar) {
+            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .new_thread) {
                 handleKeyboardAction(state, keyboard, action.?);
                 return true;
             }
@@ -547,6 +547,7 @@ fn handleKeyboardAction(
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
         .open_default => state.runDefaultOpenAction(),
+        .new_thread => state.createThreadForProject(state.selected_project_index),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
