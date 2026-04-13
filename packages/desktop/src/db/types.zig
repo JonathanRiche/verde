@@ -70,6 +70,7 @@ pub const PersistedProject = struct {
     collapsed: ?bool = null,
     thread_list_expanded: ?bool = null,
     terminal_height: ?f32 = null,
+    terminal_layout_json: ?[]const u8 = null,
     selected_thread_index: usize = 0,
     threads: ?[]const PersistedThread = null,
     provider: Provider = .opencode,

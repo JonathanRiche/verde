@@ -690,6 +690,7 @@ pub const AppState = struct {
     import_notice_storage: [256:0]u8,
     sidebar_collapsed: bool,
     composer_focused: bool,
+    composer_focus_requested: bool,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -760,6 +761,7 @@ pub const AppState = struct {
             .import_notice_storage = std.mem.zeroes([256:0]u8),
             .sidebar_collapsed = false,
             .composer_focused = false,
+            .composer_focus_requested = false,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1253,6 +1255,7 @@ pub const AppState = struct {
         if (self.findThreadIndexByProviderThreadId(project_index, provider, trimmed_id)) |thread_index| {
             self.selected_project_index = project_index;
             self.projects.items[project_index].selected_thread_index = thread_index;
+            self.requestComposerFocus();
             self.requestTranscriptScrollToBottom();
             self.setSidebarNotice(duplicateThreadNotice(provider));
             self.cancelThreadImport();
@@ -1310,6 +1313,7 @@ pub const AppState = struct {
         };
         self.selected_project_index = project_index;
         self.projects.items[project_index].selected_thread_index = self.projects.items[project_index].threads.items.len - 1;
+        self.requestComposerFocus();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
         self.setSidebarNotice(threadImportedNotice(provider));
@@ -1374,6 +1378,7 @@ pub const AppState = struct {
 
         self.selected_project_index = project_index;
         self.projects.items[project_index].selected_thread_index = thread_index;
+        self.requestComposerFocus();
         self.syncRenameBuffer();
         self.requestTranscriptScrollToBottom();
         self.markDirty();
@@ -1499,6 +1504,7 @@ pub const AppState = struct {
             return;
         };
         self.selected_project_index = index;
+        self.requestComposerFocus();
         self.syncRenameBuffer();
         self.setSidebarNotice("New thread ready.");
         self.markDirty();
@@ -1639,6 +1645,11 @@ pub const AppState = struct {
             loaded.thread_list_expanded = project.thread_list_expanded orelse false;
             if (project.terminal_height) |height| {
                 loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
+            }
+            if (project.terminal_layout_json) |layout_json| {
+                loaded.terminal_dock.applyPersistedLayoutJson(self.allocator, layout_json) catch |err| {
+                    log.warn("failed to restore terminal layout: {s}", .{@errorName(err)});
+                };
             }
             for (loaded.threads.items) |*thread| {
                 thread.deinit(self.allocator);
@@ -1790,6 +1801,8 @@ pub const AppState = struct {
     fn persistedProjectSnapshot(self: *const AppState, allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
         var threads: std.ArrayList(PersistedThread) = .empty;
         defer threads.deinit(allocator);
+        const terminal_layout_json = try project.terminal_dock.persistedLayoutJson(allocator);
+        errdefer if (terminal_layout_json) |value| allocator.free(value);
 
         for (project.threads.items) |thread| {
             if (!project.archived and !thread.committed) continue;
@@ -1808,6 +1821,7 @@ pub const AppState = struct {
             .collapsed = project.collapsed,
             .thread_list_expanded = project.thread_list_expanded,
             .terminal_height = project.terminal_dock.preferred_height,
+            .terminal_layout_json = terminal_layout_json,
             .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
             .threads = try threads.toOwnedSlice(allocator),
         };
@@ -2850,9 +2864,7 @@ pub const AppState = struct {
         defer self.allocator.free(resolved_next_draft);
 
         self.setDraft(resolved_next_draft);
-        self.composer_focused = true;
-        self.terminal_focused = false;
-        self.browser_pane_focused = false;
+        self.requestComposerFocus();
         self.setSidebarNotice("Browser inspector prompt added to the current chat draft.");
     }
 
@@ -3038,7 +3050,10 @@ pub const AppState = struct {
 
     pub fn handleTerminalKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         if (!self.terminal_focused or !self.isTerminalVisible()) return false;
-        return self.currentProjectTerminalMutable().handleKeyDown(event);
+        var dock = self.currentProjectTerminalMutable();
+        const handled = dock.handleKeyDown(self.allocator, event);
+        if (dock.consumeWorkspaceChange()) self.markDirty();
+        return handled;
     }
 
     pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
@@ -3084,6 +3099,18 @@ pub const AppState = struct {
 
     pub fn currentThreadMutable(self: *AppState) *ChatThread {
         return self.currentProjectMutable().currentThreadMutable();
+    }
+
+    pub fn requestComposerFocus(self: *AppState) void {
+        self.composer_focus_requested = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+    }
+
+    pub fn consumeComposerFocusRequest(self: *AppState) bool {
+        const requested = self.composer_focus_requested;
+        self.composer_focus_requested = false;
+        return requested;
     }
 
     pub fn draftBuffer(self: *AppState) [:0]u8 {

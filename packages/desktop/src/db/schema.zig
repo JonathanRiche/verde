@@ -22,6 +22,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    collapsed integer not null default 0,
     \\    thread_list_expanded integer not null default 0,
     \\    terminal_height real,
+    \\    terminal_layout_json text,
     \\    selected_thread_index integer not null default 0
     \\);
     \\create unique index if not exists projects_sort_index_idx on projects(sort_index);
@@ -66,6 +67,7 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
     try ensureColumn(conn, "projects", "archived", "alter table projects add column archived integer not null default 0");
     try ensureColumn(conn, "projects", "terminal_height", "alter table projects add column terminal_height real");
+    try ensureColumn(conn, "projects", "terminal_layout_json", "alter table projects add column terminal_layout_json text");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
 }
 

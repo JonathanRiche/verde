@@ -35,13 +35,88 @@ const DeviceAttributes = @typeInfo(
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
+pub const MIN_SPLIT_RATIO: f32 = 0.12;
+
+pub const SplitAxis = enum(u8) {
+    horizontal,
+    vertical,
+};
+
+pub const SplitDirection = enum(u8) {
+    up,
+    down,
+    left,
+    right,
+};
+
+pub const PersistedWorkspace = struct {
+    active_tab_index: usize = 0,
+    tabs: []const PersistedTab = &.{},
+};
+
+pub const PersistedTab = struct {
+    title: ?[]const u8 = null,
+    active_pane_id: u32 = 0,
+    root_node_id: u32 = 0,
+    nodes: []const PersistedNode = &.{},
+};
+
+pub const PersistedNodeKind = enum(u8) {
+    leaf,
+    split,
+};
+
+pub const PersistedNode = struct {
+    node_id: u32,
+    kind: PersistedNodeKind,
+    pane_id: u32 = 0,
+    axis: ?SplitAxis = null,
+    ratio: ?f32 = null,
+    first_node_id: ?u32 = null,
+    second_node_id: ?u32 = null,
+};
+
+pub const PaneLeaf = struct {
+    id: u32,
+    session: ?*Session = null,
+};
+
+pub const PaneSplit = struct {
+    axis: SplitAxis,
+    ratio: f32 = 0.5,
+    first: *PaneNode,
+    second: *PaneNode,
+};
+
+pub const PaneNode = union(enum) {
+    leaf: PaneLeaf,
+    split: PaneSplit,
+};
+
+pub const Tab = struct {
+    id: u32,
+    title: ?[]u8 = null,
+    root: *PaneNode,
+    active_pane_id: u32,
+
+    fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
+        if (self.title) |title| allocator.free(title);
+        deinitPaneNode(self.root, allocator);
+    }
+};
 
 pub const Dock = struct {
     visible: bool = false,
     preferred_height: f32 = DEFAULT_DOCK_HEIGHT,
     font_scale: f32 = DEFAULT_FONT_SCALE,
     cwd: ?[]u8 = null,
-    session: ?*Session = null,
+    tabs: std.ArrayList(Tab) = .empty,
+    active_tab_index: usize = 0,
+    next_tab_id: u32 = 1,
+    next_pane_id: u32 = 1,
+    rename_tab_id: ?u32 = null,
+    rename_storage: [96:0]u8 = std.mem.zeroes([96:0]u8),
+    workspace_changed: bool = false,
     focus_requested: bool = false,
 
     pub fn init(_: std.mem.Allocator) !Dock {
@@ -49,15 +124,14 @@ pub const Dock = struct {
     }
 
     pub fn deinit(self: *Dock, allocator: std.mem.Allocator) void {
-        if (self.session) |session| {
-            session.deinit(allocator);
-            allocator.destroy(session);
-            self.session = null;
-        }
         if (self.cwd) |cwd| {
             allocator.free(cwd);
             self.cwd = null;
         }
+        for (self.tabs.items) |*tab| {
+            tab.deinit(allocator);
+        }
+        self.tabs.deinit(allocator);
     }
 
     pub fn toggle(self: *Dock) bool {
@@ -74,8 +148,10 @@ pub const Dock = struct {
         if (!SESSION_SUPPORTED) {
             return "Native shell embedding is only enabled on Linux and macOS.";
         }
-        if (self.session) |session| {
-            return session.statusText(buf);
+        if (self.activePaneConst()) |pane| {
+            if (pane.session) |session| {
+                return session.statusText(buf);
+            }
         }
         return if (self.visible) "Starting shell..." else "Hidden until toggled.";
     }
@@ -102,31 +178,22 @@ pub const Dock = struct {
             self.cwd = try allocator.dupe(u8, project_path);
         }
 
-        if (self.session) |session| {
-            if (!session.isRunning()) {
-                session.deinit(allocator);
-                allocator.destroy(session);
-                self.session = null;
-            }
-        }
-
-        if (self.session == null) {
-            self.session = try Session.create(allocator, project_path, INITIAL_COLS, INITIAL_ROWS);
-        }
+        try self.ensureWorkspace(allocator);
     }
 
     pub fn poll(self: *Dock, allocator: std.mem.Allocator) !void {
-        if (self.session) |session| {
-            try session.poll(allocator);
+        for (self.tabs.items) |*tab| {
+            try pollPaneNode(tab.root, allocator);
         }
     }
 
-    pub fn resizeToFit(self: *Dock, allocator: std.mem.Allocator, width: f32, height: f32) !void {
-        if (self.session) |session| {
+    pub fn resizePaneToFit(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, width: f32, height: f32) !void {
+        const pane = self.findPaneById(pane_id) orelse return;
+        if (pane.session) |session| {
             const cols = columnsForWidth(width, self.font_scale);
             const rows = rowsForHeight(height, self.font_scale);
             if (cols == 0 or rows == 0) {
-                log.warn("skipping terminal resize for invalid dock size width={d:.2} height={d:.2}", .{ width, height });
+                log.warn("skipping terminal resize for invalid pane size width={d:.2} height={d:.2}", .{ width, height });
                 return;
             }
             try session.resize(
@@ -139,15 +206,23 @@ pub const Dock = struct {
         }
     }
 
-    pub fn renderState(self: *const Dock) ?*const ghostty_vt.RenderState {
-        if (self.session) |session| {
-            return session.renderState();
+    pub fn activeRenderState(self: *const Dock) ?*const ghostty_vt.RenderState {
+        if (self.activePaneConst()) |pane| {
+            if (pane.session) |session| return session.renderState();
         }
         return null;
     }
 
+    pub fn renderStateForPane(self: *const Dock, pane_id: u32) ?*const ghostty_vt.RenderState {
+        const pane = self.findPaneByIdConst(pane_id) orelse return null;
+        if (pane.session) |session| return session.renderState();
+        return null;
+    }
+
     pub fn hasRunningSession(self: *const Dock) bool {
-        if (self.session) |session| return session.isRunning();
+        for (self.tabs.items) |*tab| {
+            if (paneNodeHasRunningSession(tab.root)) return true;
+        }
         return false;
     }
 
@@ -157,32 +232,608 @@ pub const Dock = struct {
         return requested;
     }
 
+    pub fn consumeWorkspaceChange(self: *Dock) bool {
+        const changed = self.workspace_changed;
+        self.workspace_changed = false;
+        return changed;
+    }
+
     pub fn handleTextInput(self: *Dock, input_text: []const u8) bool {
         if (input_text.len == 0 or isAsciiTerminalText(input_text)) return false;
-        if (self.session) |session| {
-            return session.writeInput(input_text) catch |err| {
-                log.warn("terminal text input failed: {s}", .{@errorName(err)});
-                return false;
-            };
+        if (self.activePane()) |pane| {
+            if (pane.session) |session| {
+                return session.writeInput(input_text) catch |err| {
+                    log.warn("terminal text input failed: {s}", .{@errorName(err)});
+                    return false;
+                };
+            }
         }
         return false;
     }
 
-    pub fn handleKeyDown(self: *Dock, event: *const sdl.KeyboardEvent) bool {
+    pub fn handleKeyDown(self: *Dock, allocator: std.mem.Allocator, event: *const sdl.KeyboardEvent) bool {
         if (terminalZoomDelta(event)) |delta| {
             self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
             return true;
         }
 
-        if (self.session) |session| {
-            return session.handleKeyDown(event) catch |err| {
-                log.warn("terminal key input failed: {s}", .{@errorName(err)});
-                return false;
-            };
+        if (self.handleWorkspaceShortcut(allocator, event) catch |err| {
+            log.warn("terminal workspace shortcut failed: {s}", .{@errorName(err)});
+            return false;
+        }) {
+            return true;
+        }
+
+        if (self.activePane()) |pane| {
+            if (pane.session) |session| {
+                return session.handleKeyDown(event) catch |err| {
+                    log.warn("terminal key input failed: {s}", .{@errorName(err)});
+                    return false;
+                };
+            }
         }
         return false;
     }
+
+    pub fn activeTab(self: *Dock) ?*Tab {
+        if (self.tabs.items.len == 0 or self.active_tab_index >= self.tabs.items.len) return null;
+        return &self.tabs.items[self.active_tab_index];
+    }
+
+    pub fn activeTabConst(self: *const Dock) ?*const Tab {
+        if (self.tabs.items.len == 0 or self.active_tab_index >= self.tabs.items.len) return null;
+        return &self.tabs.items[self.active_tab_index];
+    }
+
+    pub fn activePane(self: *Dock) ?*PaneLeaf {
+        const tab = self.activeTab() orelse return null;
+        return findPaneLeaf(tab.root, tab.active_pane_id) orelse findFirstPaneLeaf(tab.root);
+    }
+
+    pub fn activePaneConst(self: *const Dock) ?*const PaneLeaf {
+        const tab = self.activeTabConst() orelse return null;
+        return findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root);
+    }
+
+    pub fn focusPane(self: *Dock, pane_id: u32) void {
+        const tab = self.activeTab() orelse return;
+        if (findPaneLeaf(tab.root, pane_id) == null) return;
+        tab.active_pane_id = pane_id;
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn selectTab(self: *Dock, index: usize) void {
+        if (index >= self.tabs.items.len) return;
+        self.active_tab_index = index;
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn createTab(self: *Dock, allocator: std.mem.Allocator) !void {
+        try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
+        self.active_tab_index = self.tabs.items.len - 1;
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
+        if (index >= self.tabs.items.len) return;
+        var removed = self.tabs.orderedRemove(index);
+        removed.deinit(allocator);
+        if (self.tabs.items.len == 0) {
+            try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
+            self.active_tab_index = 0;
+        } else if (self.active_tab_index >= self.tabs.items.len) {
+            self.active_tab_index = self.tabs.items.len - 1;
+        } else if (index <= self.active_tab_index and self.active_tab_index > 0) {
+            self.active_tab_index -= 1;
+        }
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn closeActiveTab(self: *Dock, allocator: std.mem.Allocator) !void {
+        if (self.active_tab_index >= self.tabs.items.len) return;
+        try self.closeTab(allocator, self.active_tab_index);
+    }
+
+    pub fn splitActivePane(self: *Dock, allocator: std.mem.Allocator, direction: SplitDirection) !void {
+        const tab = self.activeTab() orelse return;
+        tab.active_pane_id = try self.replacePaneWithSplit(allocator, tab.root, tab.active_pane_id, direction);
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn closeActivePaneOrTab(self: *Dock, allocator: std.mem.Allocator) !void {
+        const tab = self.activeTab() orelse return;
+        if (isSinglePaneTree(tab.root)) {
+            if (self.tabs.items.len > 1) try self.closeActiveTab(allocator);
+            return;
+        }
+        try self.closeActivePane(allocator);
+    }
+
+    pub fn closeActivePane(self: *Dock, allocator: std.mem.Allocator) !void {
+        const tab = self.activeTab() orelse return;
+        if (isSinglePaneTree(tab.root)) return;
+        try removePaneFromTree(allocator, &tab.root, tab.active_pane_id);
+        if (findPaneLeaf(tab.root, tab.active_pane_id) == null) {
+            if (findFirstPaneLeaf(tab.root)) |leaf| tab.active_pane_id = leaf.id;
+        }
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
+    pub fn tabTitle(self: *const Dock, index: usize, buffer: *[64]u8) []const u8 {
+        if (index >= self.tabs.items.len) return "";
+        const tab = &self.tabs.items[index];
+        if (tab.title) |tab_title| return tab_title;
+        return std.fmt.bufPrint(buffer, "Tab {d}", .{index + 1}) catch "Tab";
+    }
+
+    pub fn beginRenameTab(self: *Dock, tab_id: u32) void {
+        self.rename_tab_id = tab_id;
+        @memset(&self.rename_storage, 0);
+        if (self.findTabIndexById(tab_id)) |index| {
+            var title_buf: [64]u8 = undefined;
+            const tab_label = self.tabTitle(index, &title_buf);
+            const len = @min(tab_label.len, self.rename_storage.len - 1);
+            @memcpy(self.rename_storage[0..len], tab_label[0..len]);
+        }
+    }
+
+    pub fn cancelRenameTab(self: *Dock) void {
+        self.rename_tab_id = null;
+        self.rename_storage[0] = 0;
+    }
+
+    pub fn renameBuffer(self: *Dock) [:0]u8 {
+        return self.rename_storage[0 .. self.rename_storage.len - 1 :0];
+    }
+
+    pub fn finishRenameTab(self: *Dock, allocator: std.mem.Allocator) !void {
+        const tab_id = self.rename_tab_id orelse return;
+        const index = self.findTabIndexById(tab_id) orelse {
+            self.cancelRenameTab();
+            return;
+        };
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(self.rename_storage[0..], 0), &std.ascii.whitespace);
+        var tab = &self.tabs.items[index];
+        if (tab.title) |tab_title| {
+            allocator.free(tab_title);
+            tab.title = null;
+        }
+        if (trimmed.len > 0) {
+            tab.title = try allocator.dupe(u8, trimmed);
+        }
+        self.workspace_changed = true;
+        self.cancelRenameTab();
+    }
+
+    pub fn persistedLayoutJson(self: *const Dock, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.tabs.items.len == 0) return null;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        var persisted_tabs: std.ArrayList(PersistedTab) = .empty;
+        defer persisted_tabs.deinit(arena_allocator);
+
+        for (self.tabs.items) |tab| {
+            var nodes: std.ArrayList(PersistedNode) = .empty;
+            defer nodes.deinit(arena_allocator);
+            var next_node_id: u32 = 1;
+            const root_node_id = try serializePaneNode(arena_allocator, tab.root, &nodes, &next_node_id);
+            try persisted_tabs.append(arena_allocator, .{
+                .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
+                .active_pane_id = tab.active_pane_id,
+                .root_node_id = root_node_id,
+                .nodes = try nodes.toOwnedSlice(arena_allocator),
+            });
+        }
+
+        return try std.json.Stringify.valueAlloc(allocator, PersistedWorkspace{
+            .active_tab_index = self.active_tab_index,
+            .tabs = try persisted_tabs.toOwnedSlice(arena_allocator),
+        }, .{});
+    }
+
+    pub fn applyPersistedLayoutJson(self: *Dock, allocator: std.mem.Allocator, json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(PersistedWorkspace, allocator, json, .{});
+        defer parsed.deinit();
+
+        self.clearTabs(allocator);
+
+        var max_pane_id: u32 = 0;
+        for (parsed.value.tabs) |persisted_tab| {
+            const root = try buildPaneNodeFromPersisted(allocator, persisted_tab.nodes, persisted_tab.root_node_id, &max_pane_id);
+            var tab = Tab{
+                .id = self.allocateTabId(),
+                .title = if (persisted_tab.title) |tab_title| try allocator.dupe(u8, tab_title) else null,
+                .root = root,
+                .active_pane_id = persisted_tab.active_pane_id,
+            };
+            if (findPaneLeaf(root, tab.active_pane_id) == null) {
+                if (findFirstPaneLeaf(root)) |leaf| tab.active_pane_id = leaf.id;
+            }
+            try self.tabs.append(allocator, tab);
+        }
+
+        if (self.tabs.items.len == 0) {
+            try self.tabs.append(allocator, try self.buildSinglePaneTabWithoutSession(allocator));
+        }
+
+        self.active_tab_index = @min(parsed.value.active_tab_index, self.tabs.items.len - 1);
+        self.next_pane_id = @max(self.next_pane_id, max_pane_id + 1);
+    }
+
+    fn ensureWorkspace(self: *Dock, allocator: std.mem.Allocator) !void {
+        if (self.tabs.items.len == 0) {
+            try self.tabs.append(allocator, try self.buildSinglePaneTabWithoutSession(allocator));
+        }
+        for (self.tabs.items) |*tab| {
+            try self.ensureSessionsInNode(allocator, tab.root);
+            if (findPaneLeaf(tab.root, tab.active_pane_id) == null) {
+                if (findFirstPaneLeaf(tab.root)) |leaf| tab.active_pane_id = leaf.id;
+            }
+        }
+        if (self.active_tab_index >= self.tabs.items.len) {
+            self.active_tab_index = self.tabs.items.len - 1;
+        }
+    }
+
+    fn clearTabs(self: *Dock, allocator: std.mem.Allocator) void {
+        for (self.tabs.items) |*tab| tab.deinit(allocator);
+        self.tabs.clearRetainingCapacity();
+        self.active_tab_index = 0;
+        self.rename_tab_id = null;
+    }
+
+    fn buildSinglePaneTab(self: *Dock, allocator: std.mem.Allocator) !Tab {
+        const tab = try self.buildSinglePaneTabWithoutSession(allocator);
+        try self.ensureSessionsInNode(allocator, tab.root);
+        return tab;
+    }
+
+    fn buildSinglePaneTabWithoutSession(self: *Dock, allocator: std.mem.Allocator) !Tab {
+        const root = try self.createLeafNode(allocator, false);
+        return .{
+            .id = self.allocateTabId(),
+            .title = null,
+            .root = root,
+            .active_pane_id = root.leaf.id,
+        };
+    }
+
+    fn createLeafNode(self: *Dock, allocator: std.mem.Allocator, ensure_session: bool) !*PaneNode {
+        const node = try allocator.create(PaneNode);
+        node.* = .{ .leaf = .{ .id = self.allocatePaneId(), .session = null } };
+        if (ensure_session) {
+            try self.ensureLeafSession(allocator, &node.leaf);
+        }
+        return node;
+    }
+
+    fn ensureLeafSession(self: *Dock, allocator: std.mem.Allocator, leaf: *PaneLeaf) !void {
+        if (leaf.session != null) return;
+        const cwd = self.cwd orelse return;
+        leaf.session = try Session.create(allocator, cwd, INITIAL_COLS, INITIAL_ROWS);
+    }
+
+    fn ensureSessionsInNode(self: *Dock, allocator: std.mem.Allocator, node: *PaneNode) !void {
+        switch (node.*) {
+            .leaf => |*leaf| try self.ensureLeafSession(allocator, leaf),
+            .split => |*split| {
+                try self.ensureSessionsInNode(allocator, split.first);
+                try self.ensureSessionsInNode(allocator, split.second);
+            },
+        }
+    }
+
+    fn allocateTabId(self: *Dock) u32 {
+        const id = self.next_tab_id;
+        self.next_tab_id += 1;
+        return id;
+    }
+
+    fn allocatePaneId(self: *Dock) u32 {
+        const id = self.next_pane_id;
+        self.next_pane_id += 1;
+        return id;
+    }
+
+    fn findTabIndexById(self: *const Dock, tab_id: u32) ?usize {
+        for (self.tabs.items, 0..) |tab, index| {
+            if (tab.id == tab_id) return index;
+        }
+        return null;
+    }
+
+    fn findPaneById(self: *Dock, pane_id: u32) ?*PaneLeaf {
+        for (self.tabs.items) |*tab| {
+            if (findPaneLeaf(tab.root, pane_id)) |leaf| return leaf;
+        }
+        return null;
+    }
+
+    fn findPaneByIdConst(self: *const Dock, pane_id: u32) ?*const PaneLeaf {
+        for (self.tabs.items) |*tab| {
+            if (findPaneLeafConst(tab.root, pane_id)) |leaf| return leaf;
+        }
+        return null;
+    }
+
+    fn replacePaneWithSplit(self: *Dock, allocator: std.mem.Allocator, node: *PaneNode, target_pane_id: u32, direction: SplitDirection) !u32 {
+        return switch (node.*) {
+            .leaf => |leaf| blk: {
+                if (leaf.id != target_pane_id) break :blk error.PaneNotFound;
+
+                const existing_leaf_node = try allocator.create(PaneNode);
+                existing_leaf_node.* = .{ .leaf = leaf };
+                const new_leaf_node = try self.createLeafNode(allocator, true);
+                const new_pane_id = new_leaf_node.leaf.id;
+                node.* = .{
+                    .split = .{
+                        .axis = axisForDirection(direction),
+                        .ratio = 0.5,
+                        .first = if (direction == .left or direction == .up) new_leaf_node else existing_leaf_node,
+                        .second = if (direction == .left or direction == .up) existing_leaf_node else new_leaf_node,
+                    },
+                };
+                break :blk new_pane_id;
+            },
+            .split => |*split| {
+                if (paneNodeContains(split.first, target_pane_id)) {
+                    return try self.replacePaneWithSplit(allocator, split.first, target_pane_id, direction);
+                }
+                if (paneNodeContains(split.second, target_pane_id)) {
+                    return try self.replacePaneWithSplit(allocator, split.second, target_pane_id, direction);
+                }
+                return error.PaneNotFound;
+            },
+        };
+    }
+
+    fn handleWorkspaceShortcut(self: *Dock, allocator: std.mem.Allocator, event: *const sdl.KeyboardEvent) !bool {
+        if (!event.down or event.repeat) return false;
+
+        const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+        const shift = modifierPressed(event.mod, sdl.Keymod.shift);
+        const alt = modifierPressed(event.mod, sdl.Keymod.alt);
+        const super = modifierPressed(event.mod, sdl.Keymod.gui);
+        if (!ctrl or super) return false;
+
+        if (shift and !alt) {
+            switch (event.scancode) {
+                .t => {
+                    try self.createTab(allocator);
+                    return true;
+                },
+                .w => {
+                    try self.closeActivePaneOrTab(allocator);
+                    return true;
+                },
+                .r => {
+                    if (self.activeTab()) |tab| self.beginRenameTab(tab.id);
+                    return true;
+                },
+                .pageup => {
+                    if (self.active_tab_index > 0) self.selectTab(self.active_tab_index - 1);
+                    return true;
+                },
+                .pagedown => {
+                    if (self.active_tab_index + 1 < self.tabs.items.len) self.selectTab(self.active_tab_index + 1);
+                    return true;
+                },
+                .e, .down => {
+                    try self.splitActivePane(allocator, .down);
+                    return true;
+                },
+                .o, .right => {
+                    try self.splitActivePane(allocator, .right);
+                    return true;
+                },
+                .up => {
+                    try self.splitActivePane(allocator, .up);
+                    return true;
+                },
+                .left => {
+                    try self.splitActivePane(allocator, .left);
+                    return true;
+                },
+                else => {},
+            }
+        }
+
+        return false;
+    }
 };
+
+fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.session) |session| {
+                session.deinit(allocator);
+                allocator.destroy(session);
+                leaf.session = null;
+            }
+            allocator.destroy(node);
+        },
+        .split => |*split| {
+            deinitPaneNode(split.first, allocator);
+            deinitPaneNode(split.second, allocator);
+            allocator.destroy(node);
+        },
+    }
+}
+
+fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.session) |session| try session.poll(allocator);
+        },
+        .split => |*split| {
+            try pollPaneNode(split.first, allocator);
+            try pollPaneNode(split.second, allocator);
+        },
+    }
+}
+
+fn paneNodeHasRunningSession(node: *const PaneNode) bool {
+    return switch (node.*) {
+        .leaf => |leaf| if (leaf.session) |session| session.isRunning() else false,
+        .split => |split| paneNodeHasRunningSession(split.first) or paneNodeHasRunningSession(split.second),
+    };
+}
+
+fn findPaneLeaf(node: *PaneNode, pane_id: u32) ?*PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| if (leaf.id == pane_id) leaf else null,
+        .split => |*split| findPaneLeaf(split.first, pane_id) orelse findPaneLeaf(split.second, pane_id),
+    };
+}
+
+fn findPaneLeafConst(node: *const PaneNode, pane_id: u32) ?*const PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| if (leaf.id == pane_id) leaf else null,
+        .split => |*split| findPaneLeafConst(split.first, pane_id) orelse findPaneLeafConst(split.second, pane_id),
+    };
+}
+
+fn findFirstPaneLeaf(node: *PaneNode) ?*PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| leaf,
+        .split => |*split| findFirstPaneLeaf(split.first) orelse findFirstPaneLeaf(split.second),
+    };
+}
+
+fn findFirstPaneLeafConst(node: *const PaneNode) ?*const PaneLeaf {
+    return switch (node.*) {
+        .leaf => |*leaf| leaf,
+        .split => |*split| findFirstPaneLeafConst(split.first) orelse findFirstPaneLeafConst(split.second),
+    };
+}
+
+fn paneNodeContains(node: *PaneNode, pane_id: u32) bool {
+    return findPaneLeaf(node, pane_id) != null;
+}
+
+fn isSinglePaneTree(node: *const PaneNode) bool {
+    return switch (node.*) {
+        .leaf => true,
+        .split => false,
+    };
+}
+
+fn removePaneFromTree(allocator: std.mem.Allocator, root: **PaneNode, pane_id: u32) !void {
+    const node = root.*;
+    switch (node.*) {
+        .leaf => return,
+        .split => |*split| {
+            if (paneNodeContains(split.first, pane_id)) {
+                if (split.first.* == .leaf and split.first.leaf.id == pane_id) {
+                    deinitPaneNode(split.first, allocator);
+                    const sibling = split.second;
+                    allocator.destroy(node);
+                    root.* = sibling;
+                    return;
+                }
+                return removePaneFromTree(allocator, &split.first, pane_id);
+            }
+            if (paneNodeContains(split.second, pane_id)) {
+                if (split.second.* == .leaf and split.second.leaf.id == pane_id) {
+                    deinitPaneNode(split.second, allocator);
+                    const sibling = split.first;
+                    allocator.destroy(node);
+                    root.* = sibling;
+                    return;
+                }
+                return removePaneFromTree(allocator, &split.second, pane_id);
+            }
+        },
+    }
+}
+
+fn axisForDirection(direction: SplitDirection) SplitAxis {
+    return switch (direction) {
+        .left, .right => .vertical,
+        .up, .down => .horizontal,
+    };
+}
+
+fn sanitizeSplitRatio(ratio: f32) f32 {
+    return clampf(ratio, MIN_SPLIT_RATIO, 1.0 - MIN_SPLIT_RATIO);
+}
+
+fn serializePaneNode(
+    allocator: std.mem.Allocator,
+    node: *const PaneNode,
+    nodes: *std.ArrayList(PersistedNode),
+    next_node_id: *u32,
+) !u32 {
+    const node_id = next_node_id.*;
+    next_node_id.* += 1;
+
+    switch (node.*) {
+        .leaf => |leaf| {
+            try nodes.append(allocator, .{
+                .node_id = node_id,
+                .kind = .leaf,
+                .pane_id = leaf.id,
+            });
+        },
+        .split => |split| {
+            const first_node_id = try serializePaneNode(allocator, split.first, nodes, next_node_id);
+            const second_node_id = try serializePaneNode(allocator, split.second, nodes, next_node_id);
+            try nodes.append(allocator, .{
+                .node_id = node_id,
+                .kind = .split,
+                .axis = split.axis,
+                .ratio = split.ratio,
+                .first_node_id = first_node_id,
+                .second_node_id = second_node_id,
+            });
+        },
+    }
+
+    return node_id;
+}
+
+fn buildPaneNodeFromPersisted(
+    allocator: std.mem.Allocator,
+    nodes: []const PersistedNode,
+    root_node_id: u32,
+    max_pane_id: *u32,
+) !*PaneNode {
+    for (nodes) |persisted| {
+        if (persisted.node_id != root_node_id) continue;
+
+        const node = try allocator.create(PaneNode);
+        switch (persisted.kind) {
+            .leaf => {
+                max_pane_id.* = @max(max_pane_id.*, persisted.pane_id);
+                node.* = .{ .leaf = .{ .id = @max(persisted.pane_id, 1), .session = null } };
+            },
+            .split => {
+                const first_id = persisted.first_node_id orelse return error.InvalidPersistedTerminalLayout;
+                const second_id = persisted.second_node_id orelse return error.InvalidPersistedTerminalLayout;
+                node.* = .{
+                    .split = .{
+                        .axis = persisted.axis orelse .vertical,
+                        .ratio = sanitizeSplitRatio(persisted.ratio orelse 0.5),
+                        .first = try buildPaneNodeFromPersisted(allocator, nodes, first_id, max_pane_id),
+                        .second = try buildPaneNodeFromPersisted(allocator, nodes, second_id, max_pane_id),
+                    },
+                };
+            },
+        }
+        return node;
+    }
+
+    return error.InvalidPersistedTerminalLayout;
+}
 
 pub fn clampPreferredHeight(height: f32) f32 {
     return clampf(height, MIN_DOCK_HEIGHT, MAX_DOCK_HEIGHT);
