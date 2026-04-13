@@ -1556,6 +1556,9 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
 
     const cursor_before = zgui.getCursorScreenPos();
     const buf = state.draftBuffer();
+    if (state.consumeComposerFocusRequest()) {
+        zgui.setKeyboardFocusHere(0);
+    }
     const submitted = zgui.inputTextMultiline("##chat-draft", .{
         .buf = buf,
         .w = content_width,

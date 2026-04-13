@@ -7,6 +7,16 @@ const terminal = @import("../terminal/terminal.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 
+const RENAME_TAB_POPUP_ID: [:0]const u8 = "TerminalRenameTabPopup";
+
+const RenderContext = struct {
+    state: *app_state.AppState,
+    dock: *terminal.Dock,
+    hitbox_focused: bool = false,
+    hitbox_active: bool = false,
+    clicked: bool = false,
+};
+
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     if (state.projects.items.len == 0) return;
 
@@ -32,6 +42,9 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
 
     renderHeader(dock);
     zgui.separator();
+    renderTabStrip(state, dock);
+    zgui.separator();
+    renderRenameTabPopup(state, dock, width, height);
 
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = dock_bg });
@@ -41,11 +54,7 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     }
 
     const focus_requested = dock.takeFocusRequest();
-    if (focus_requested) {
-        zgui.setNextWindowFocus();
-    }
-
-    _ = zgui.beginChild("TerminalDockViewport", .{
+    _ = zgui.beginChild("TerminalDockWorkspaceArea", .{
         .w = 0.0,
         .h = 0.0,
         .child_flags = .{
@@ -59,87 +68,410 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     });
     defer zgui.endChild();
 
-    dock.resizeToFit(
-        state.allocator,
-        zgui.getContentRegionAvail()[0],
-        zgui.getContentRegionAvail()[1],
-    ) catch |err| {
-        app_state.log.warn("failed to resize terminal dock: {s}", .{@errorName(err)});
+    const window_focused = zgui.isWindowFocused(.{});
+    var context: RenderContext = .{
+        .state = state,
+        .dock = dock,
     };
 
-    const viewport_cursor = zgui.getCursorPos();
-    const viewport_avail = zgui.getContentRegionAvail();
-    const hitbox_w = @max(viewport_avail[0], 1.0);
-    const hitbox_h = @max(viewport_avail[1], 1.0);
-    zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.rgba(0, 0, 0, 0) });
-    zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = colors.rgba(0, 0, 0, 0) });
-    zgui.pushStyleColor4f(.{ .idx = .header_active, .c = colors.rgba(0, 0, 0, 0) });
-    if (focus_requested) {
-        zgui.setKeyboardFocusHere(0);
-    }
-    const terminal_clicked = zgui.selectable("##TerminalDockViewportFocus", .{
-        .selected = false,
-        .flags = .{ .allow_overlap = true },
-        .w = hitbox_w,
-        .h = hitbox_h,
-    });
-    const terminal_hitbox_active = zgui.isItemActive();
-    const terminal_hitbox_focused = zgui.isItemFocused();
-    const terminal_window_focused = zgui.isWindowFocused(.{});
-    zgui.popStyleColor(.{ .count = 3 });
-    if (terminal_clicked) {
-        dock.focus_requested = true;
-        zgui.setWindowFocus("TerminalDockViewport");
-    }
-    state.noteTerminalViewportDebug(
-        terminal_window_focused,
-        terminal_hitbox_focused,
-        terminal_hitbox_active,
-        terminal_clicked,
-        focus_requested or dock.focus_requested,
-    );
-    if (terminal_window_focused or terminal_hitbox_active or terminal_hitbox_focused or terminal_clicked) {
-        state.terminal_focused = true;
-        state.composer_focused = false;
-    }
-    zgui.setCursorPos(viewport_cursor);
-
-    if (dock.renderState()) |render_state| {
-        renderViewport(render_state);
+    if (dock.activeTab()) |tab| {
+        const origin = zgui.getCursorScreenPos();
+        const avail = zgui.getContentRegionAvail();
+        renderPaneNode(&context, tab.root, origin, .{
+            @max(avail[0], 1.0),
+            @max(avail[1], 1.0),
+        });
     } else {
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Starting shell...", .{});
+    }
+
+    state.noteTerminalViewportDebug(
+        window_focused,
+        context.hitbox_focused,
+        context.hitbox_active,
+        context.clicked,
+        focus_requested,
+    );
+    if (focus_requested or window_focused or context.hitbox_active or context.hitbox_focused or context.clicked) {
+        state.terminal_focused = true;
+        state.composer_focused = false;
     }
 }
 
 fn dockBackgroundColor(dock: *const terminal.Dock) [4]f32 {
-    if (dock.renderState()) |render_state| {
+    if (dock.activeRenderState()) |render_state| {
         return rgbToVec4(render_state.colors.background, 1.0);
     }
     return colors.rgba(0, 0, 0, 255);
 }
 
 fn renderHeader(dock: *const terminal.Dock) void {
-    zgui.setCursorPosX(0.0);
-    if (theme.heading_font) |font| {
-        zgui.pushFont(font, 17);
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{dock.title()});
-        zgui.popFont();
-    } else {
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{dock.title()});
+    const header_height = theme.scaledUi(30.0);
+    _ = zgui.beginChild("TerminalDockHeader", .{
+        .w = 0.0,
+        .h = header_height,
+        .child_flags = .{
+            .border = false,
+            .always_use_window_padding = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+        },
+    });
+    defer zgui.endChild();
+
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(10.0), theme.scaledUi(6.0) } });
+    defer zgui.popStyleVar(.{ .count = 1 });
+
+    zgui.setCursorPos(.{ theme.scaledUi(10.0), theme.scaledUi(4.0) });
+    zgui.textColored(theme.COLOR_WHITE, "{s}", .{dock.title()});
+
+    var status_buf: [192]u8 = undefined;
+    const status = dock.statusText(&status_buf);
+    const status_size = zgui.calcTextSize(status, .{});
+    const avail = zgui.getWindowSize()[0];
+    zgui.sameLine(.{});
+    zgui.setCursorPosX(@max(theme.scaledUi(120.0), avail - status_size[0] - theme.scaledUi(14.0)));
+    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{status});
+}
+
+fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
+    const strip_height = theme.scaledUi(36.0);
+    _ = zgui.beginChild("TerminalDockTabs", .{
+        .w = 0.0,
+        .h = strip_height,
+        .child_flags = .{
+            .border = false,
+            .always_use_window_padding = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+        },
+    });
+    defer zgui.endChild();
+
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(4.0) } });
+    defer zgui.popStyleVar(.{ .count = 1 });
+
+    for (dock.tabs.items, 0..) |tab, index| {
+        var title_buf: [64]u8 = undefined;
+        const title = dock.tabTitle(index, &title_buf);
+        const active = dock.active_tab_index == index;
+        const button_width = theme.clampf(
+            zgui.calcTextSize(title, .{})[0] + theme.scaledUi(28.0),
+            theme.scaledUi(82.0),
+            theme.scaledUi(180.0),
+        );
+
+        zgui.pushStyleColor4f(.{ .idx = .button, .c = if (active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT });
+        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (active) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+        zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (active) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+        if (zgui.button(zgui.formatZ("{s}##terminal-tab-{d}", .{ title, tab.id }), .{ .w = button_width, .h = theme.scaledUi(28.0) })) {
+            dock.selectTab(index);
+            state.markDirty();
+        }
+        zgui.popStyleColor(.{ .count = 3 });
+
+        if (zgui.beginPopupContextItem()) {
+            dock.selectTab(index);
+            if (zgui.selectable("New Tab", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+                dock.createTab(state.allocator) catch |err| {
+                    app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)});
+                };
+                state.markDirty();
+                zgui.closeCurrentPopup();
+            }
+            if (zgui.selectable("Rename Tab", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+                dock.beginRenameTab(tab.id);
+                zgui.closeCurrentPopup();
+            }
+            if (zgui.selectable("Close Tab", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+                dock.closeTab(state.allocator, index) catch |err| {
+                    app_state.log.warn("failed to close terminal tab: {s}", .{@errorName(err)});
+                };
+                state.markDirty();
+                zgui.closeCurrentPopup();
+            }
+            zgui.endPopup();
+        }
+
+        zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
+    }
+
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("+##terminal-new-tab", .{ .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) })) {
+        dock.createTab(state.allocator) catch |err| {
+            app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)});
+        };
+        state.markDirty();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn renderRenameTabPopup(state: *app_state.AppState, dock: *terminal.Dock, width: f32, height: f32) void {
+    if (dock.rename_tab_id == null) return;
+    if (!zgui.isPopupOpen(RENAME_TAB_POPUP_ID, .{})) {
+        zgui.openPopup(RENAME_TAB_POPUP_ID, .{});
+    }
+
+    zgui.setNextWindowPos(.{
+        .x = width * 0.5,
+        .y = height * 0.5,
+        .cond = .appearing,
+        .pivot_x = 0.5,
+        .pivot_y = 0.5,
+    });
+    zgui.setNextWindowSize(.{
+        .w = theme.clampf(width * 0.26, theme.scaledUi(280.0), theme.scaledUi(380.0)),
+        .h = 0.0,
+        .cond = .appearing,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(12.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(16.0), theme.scaledUi(16.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ theme.scaledUi(10.0), theme.scaledUi(10.0) } });
+    var open = true;
+    if (!zgui.beginPopupModal(RENAME_TAB_POPUP_ID, .{
+        .popen = &open,
+        .flags = .{ .no_saved_settings = true },
+    })) {
+        if (!open) dock.cancelRenameTab();
+        zgui.popStyleVar(.{ .count = 3 });
+        return;
+    }
+    defer {
+        zgui.endPopup();
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+
+    if (zgui.isWindowAppearing()) {
+        zgui.setKeyboardFocusHere(0);
+    }
+
+    zgui.textColored(theme.COLOR_WHITE, "Rename tab", .{});
+    _ = zgui.inputTextWithHint("##terminal-rename-tab", .{
+        .hint = "Tab label",
+        .buf = dock.renameBuffer(),
+        .flags = .{ .enter_returns_true = true },
+    });
+
+    const modal_width = zgui.getContentRegionAvail()[0];
+    const button_width = @max((modal_width - theme.scaledUi(10.0)) * 0.5, theme.scaledUi(92.0));
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
+    if (zgui.button("Cancel", .{ .w = button_width, .h = theme.scaledUi(32.0) })) {
+        dock.cancelRenameTab();
+        zgui.closeCurrentPopup();
+        zgui.popStyleColor(.{ .count = 3 });
+        return;
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+
+    zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    if (zgui.button("Save", .{ .w = button_width, .h = theme.scaledUi(32.0) })) {
+        dock.finishRenameTab(state.allocator) catch |err| {
+            app_state.log.warn("failed to rename terminal tab: {s}", .{@errorName(err)});
+        };
+        state.markDirty();
+        zgui.closeCurrentPopup();
+        zgui.popStyleColor(.{ .count = 3 });
+        return;
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn renderPaneNode(context: *RenderContext, node: *terminal.PaneNode, min: [2]f32, size: [2]f32) void {
+    switch (node.*) {
+        .leaf => |leaf| renderPaneLeaf(context, leaf.id, min, size),
+        .split => |*split| {
+            const handle = theme.scaledUi(8.0);
+            const primary_size = if (split.axis == .vertical) size[0] else size[1];
+            const available = @max(primary_size - handle, 1.0);
+            const min_primary = theme.scaledUi(96.0);
+            const min_ratio = theme.clampf(min_primary / available, terminal.MIN_SPLIT_RATIO, 0.45);
+            split.ratio = theme.clampf(split.ratio, min_ratio, 1.0 - min_ratio);
+
+            const first_primary = available * split.ratio;
+            const second_primary = available - first_primary;
+
+            if (split.axis == .vertical) {
+                renderPaneNode(context, split.first, min, .{ first_primary, size[1] });
+                renderSplitHandle(context, split, .{
+                    min[0] + first_primary,
+                    min[1],
+                }, .{ handle, size[1] });
+                renderPaneNode(context, split.second, .{
+                    min[0] + first_primary + handle,
+                    min[1],
+                }, .{ second_primary, size[1] });
+            } else {
+                renderPaneNode(context, split.first, min, .{ size[0], first_primary });
+                renderSplitHandle(context, split, .{
+                    min[0],
+                    min[1] + first_primary,
+                }, .{ size[0], handle });
+                renderPaneNode(context, split.second, .{
+                    min[0],
+                    min[1] + first_primary + handle,
+                }, .{ size[0], second_primary });
+            }
+        },
     }
 }
 
-fn renderViewport(render_state: *const ghostty_vt.RenderState) void {
-    if (render_state.rows == 0 or render_state.cols == 0) {
-        zgui.textColored(theme.COLOR_TEXT_MUTED, "Waiting for terminal frame...", .{});
-        return;
+fn renderPaneLeaf(context: *RenderContext, pane_id: u32, min: [2]f32, size: [2]f32) void {
+    const draw_list = zgui.getWindowDrawList();
+    const pane_size = .{ @max(size[0], 1.0), @max(size[1], 1.0) };
+
+    context.dock.resizePaneToFit(context.state.allocator, pane_id, pane_size[0], pane_size[1]) catch |err| {
+        app_state.log.warn("failed to resize terminal pane {d}: {s}", .{ pane_id, @errorName(err) });
+    };
+
+    zgui.setCursorScreenPos(min);
+    const clicked = zgui.invisibleButton(zgui.formatZ("##terminal-pane-{d}", .{pane_id}), .{
+        .w = pane_size[0],
+        .h = pane_size[1],
+    });
+    const focused = zgui.isItemFocused();
+    const active = zgui.isItemActive();
+    if (clicked) {
+        context.dock.focusPane(pane_id);
+        context.state.markDirty();
+    }
+    context.hitbox_focused = context.hitbox_focused or focused;
+    context.hitbox_active = context.hitbox_active or active;
+    context.clicked = context.clicked or clicked;
+
+    if (zgui.beginPopupContextItem()) {
+        context.dock.focusPane(pane_id);
+        if (zgui.selectable("New Tab", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.createTab(context.state.allocator) catch |err| {
+                app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.selectable("Split Up", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.splitActivePane(context.state.allocator, .up) catch |err| {
+                app_state.log.warn("failed to split terminal pane up: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.selectable("Split Down", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.splitActivePane(context.state.allocator, .down) catch |err| {
+                app_state.log.warn("failed to split terminal pane down: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.selectable("Split Left", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.splitActivePane(context.state.allocator, .left) catch |err| {
+                app_state.log.warn("failed to split terminal pane left: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.selectable("Split Right", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.splitActivePane(context.state.allocator, .right) catch |err| {
+                app_state.log.warn("failed to split terminal pane right: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        if (zgui.selectable("Close Pane", .{ .selected = false, .h = theme.scaledUi(28.0) })) {
+            context.dock.closeActivePaneOrTab(context.state.allocator) catch |err| {
+                app_state.log.warn("failed to close terminal pane: {s}", .{@errorName(err)});
+            };
+            context.state.markDirty();
+            zgui.closeCurrentPopup();
+        }
+        zgui.endPopup();
     }
 
+    if (context.dock.renderStateForPane(pane_id)) |render_state| {
+        renderViewportRect(render_state, min, pane_size);
+    } else {
+        draw_list.addRectFilled(.{
+            .pmin = min,
+            .pmax = .{ min[0] + pane_size[0], min[1] + pane_size[1] },
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(10, 10, 10, 255)),
+        });
+        draw_list.addText(.{
+            min[0] + theme.scaledUi(10.0),
+            min[1] + theme.scaledUi(10.0),
+        }, zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_MUTED), "Starting shell...", .{});
+    }
+
+    const is_active = if (context.dock.activePaneConst()) |pane| pane.id == pane_id else false;
+    draw_list.addRect(.{
+        .pmin = min,
+        .pmax = .{ min[0] + pane_size[0], min[1] + pane_size[1] },
+        .col = zgui.colorConvertFloat4ToU32(if (is_active) theme.COLOR_GREEN else theme.COLOR_PANEL_MUTED),
+        .thickness = if (is_active) 1.8 else 1.0,
+    });
+}
+
+fn renderSplitHandle(context: *RenderContext, split: *terminal.PaneSplit, min: [2]f32, size: [2]f32) void {
     const draw_list = zgui.getWindowDrawList();
-    const origin = zgui.getCursorScreenPos();
-    const avail = zgui.getContentRegionAvail();
-    const width = @max(avail[0], 1.0);
-    const height = @max(avail[1], 1.0);
+    zgui.setCursorScreenPos(min);
+    _ = zgui.invisibleButton(zgui.formatZ("##terminal-split-{d}", .{@intFromPtr(split)}), .{
+        .w = @max(size[0], 1.0),
+        .h = @max(size[1], 1.0),
+    });
+
+    const hovered = zgui.isItemHovered(.{});
+    const active = zgui.isItemActive();
+    if (hovered or active) {
+        zgui.setMouseCursor(if (split.axis == .vertical) .resize_ew else .resize_ns);
+    }
+    if (active) {
+        const delta = zgui.getMouseDragDelta(.left, .{});
+        const primary_size = if (split.axis == .vertical) size[0] else size[1];
+        const drag_delta = if (split.axis == .vertical) delta[0] else delta[1];
+        const new_ratio = split.ratio + (drag_delta / @max(primary_size * 2.0, 1.0));
+        const clamped = theme.clampf(new_ratio, terminal.MIN_SPLIT_RATIO, 1.0 - terminal.MIN_SPLIT_RATIO);
+        if (@abs(clamped - split.ratio) > 0.0001) {
+            split.ratio = clamped;
+            context.state.markDirty();
+        }
+    }
+
+    const center = .{
+        min[0] + size[0] * 0.5,
+        min[1] + size[1] * 0.5,
+    };
+    const line_color = zgui.colorConvertFloat4ToU32(if (active) theme.COLOR_GREEN else if (hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.12) else theme.COLOR_PANEL_MUTED);
+    if (split.axis == .vertical) {
+        draw_list.addLine(.{
+            .p1 = .{ center[0], min[1] + theme.scaledUi(14.0) },
+            .p2 = .{ center[0], min[1] + size[1] - theme.scaledUi(14.0) },
+            .col = line_color,
+            .thickness = 1.0,
+        });
+    } else {
+        draw_list.addLine(.{
+            .p1 = .{ min[0] + theme.scaledUi(14.0), center[1] },
+            .p2 = .{ min[0] + size[0] - theme.scaledUi(14.0), center[1] },
+            .col = line_color,
+            .thickness = 1.0,
+        });
+    }
+}
+
+fn renderViewportRect(render_state: *const ghostty_vt.RenderState, origin: [2]f32, size: [2]f32) void {
+    if (render_state.rows == 0 or render_state.cols == 0) return;
+
+    const draw_list = zgui.getWindowDrawList();
+    const width = @max(size[0], 1.0);
+    const height = @max(size[1], 1.0);
     const cols_f = @as(f32, @floatFromInt(render_state.cols));
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
     const cell_width = width / cols_f;
