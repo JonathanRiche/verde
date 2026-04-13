@@ -338,7 +338,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
-            const terminal_key_handled = state.handleTerminalKeyDown(&event.key);
+            const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
             state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
             if (terminal_key_handled) {
                 return true;

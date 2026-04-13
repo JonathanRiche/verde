@@ -9,6 +9,7 @@ const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
+const keybinds = @import("keybinds.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
@@ -3048,10 +3049,14 @@ pub const AppState = struct {
         return false;
     }
 
-    pub fn handleTerminalKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+    pub fn handleTerminalKeyDown(
+        self: *AppState,
+        keyboard: *const keybinds.NativeKeyboardConfig,
+        event: *const sdl.KeyboardEvent,
+    ) bool {
         if (!self.terminal_focused or !self.isTerminalVisible()) return false;
         var dock = self.currentProjectTerminalMutable();
-        const handled = dock.handleKeyDown(self.allocator, event);
+        const handled = dock.handleKeyDown(self.allocator, keyboard, event);
         if (dock.consumeWorkspaceChange()) self.markDirty();
         return handled;
     }

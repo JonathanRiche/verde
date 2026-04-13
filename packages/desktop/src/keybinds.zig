@@ -20,6 +20,18 @@ pub const NativeKeyboardAction = enum {
     chat_page_down,
 };
 
+pub const NativeTerminalAction = enum {
+    new_tab,
+    close_active,
+    rename_tab,
+    tab_previous,
+    tab_next,
+    split_up,
+    split_down,
+    split_left,
+    split_right,
+};
+
 pub const Keybind = struct {
     alt: bool = false,
     ctrl: bool = false,
@@ -65,6 +77,15 @@ pub const NativeKeyboardConfig = struct {
     chat_down: []Keybind,
     chat_page_up: []Keybind,
     chat_page_down: []Keybind,
+    terminal_new_tab: []Keybind,
+    terminal_close_active: []Keybind,
+    terminal_rename_tab: []Keybind,
+    terminal_tab_previous: []Keybind,
+    terminal_tab_next: []Keybind,
+    terminal_split_up: []Keybind,
+    terminal_split_down: []Keybind,
+    terminal_split_left: []Keybind,
+    terminal_split_right: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -79,6 +100,15 @@ pub const NativeKeyboardConfig = struct {
             .chat_down = try cloneDefaultChatDownKeybinds(allocator),
             .chat_page_up = try cloneDefaultChatPageUpKeybinds(allocator),
             .chat_page_down = try cloneDefaultChatPageDownKeybinds(allocator),
+            .terminal_new_tab = try cloneDefaultTerminalNewTabKeybinds(allocator),
+            .terminal_close_active = try cloneDefaultTerminalCloseActiveKeybinds(allocator),
+            .terminal_rename_tab = try cloneDefaultTerminalRenameTabKeybinds(allocator),
+            .terminal_tab_previous = try cloneDefaultTerminalTabPreviousKeybinds(allocator),
+            .terminal_tab_next = try cloneDefaultTerminalTabNextKeybinds(allocator),
+            .terminal_split_up = try cloneDefaultTerminalSplitUpKeybinds(allocator),
+            .terminal_split_down = try cloneDefaultTerminalSplitDownKeybinds(allocator),
+            .terminal_split_left = try cloneDefaultTerminalSplitLeftKeybinds(allocator),
+            .terminal_split_right = try cloneDefaultTerminalSplitRightKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -104,6 +134,15 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_down);
         self.allocator.free(self.chat_page_up);
         self.allocator.free(self.chat_page_down);
+        self.allocator.free(self.terminal_new_tab);
+        self.allocator.free(self.terminal_close_active);
+        self.allocator.free(self.terminal_rename_tab);
+        self.allocator.free(self.terminal_tab_previous);
+        self.allocator.free(self.terminal_tab_next);
+        self.allocator.free(self.terminal_split_up);
+        self.allocator.free(self.terminal_split_down);
+        self.allocator.free(self.terminal_split_left);
+        self.allocator.free(self.terminal_split_right);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -136,6 +175,38 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.chat_page_down, event)) {
             return .chat_page_down;
+        }
+
+        return null;
+    }
+
+    pub fn terminalActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeTerminalAction {
+        if (matchesAny(self.terminal_new_tab, event)) {
+            return .new_tab;
+        }
+        if (matchesAny(self.terminal_close_active, event)) {
+            return .close_active;
+        }
+        if (matchesAny(self.terminal_rename_tab, event)) {
+            return .rename_tab;
+        }
+        if (matchesAny(self.terminal_tab_previous, event)) {
+            return .tab_previous;
+        }
+        if (matchesAny(self.terminal_tab_next, event)) {
+            return .tab_next;
+        }
+        if (matchesAny(self.terminal_split_up, event)) {
+            return .split_up;
+        }
+        if (matchesAny(self.terminal_split_down, event)) {
+            return .split_down;
+        }
+        if (matchesAny(self.terminal_split_left, event)) {
+            return .split_left;
+        }
+        if (matchesAny(self.terminal_split_right, event)) {
+            return .split_right;
         }
 
         return null;
@@ -184,7 +255,9 @@ pub const NativeKeyboardConfig = struct {
             }
         }
         if (keybinds_value.object.get("terminal")) |terminal_value| {
-            if (self.parseOverrideValue(terminal_value, "terminal")) |bindings| {
+            if (terminal_value == .object) {
+                self.applyTerminalOverrides(terminal_value);
+            } else if (self.parseOverrideValue(terminal_value, "terminal")) |bindings| {
                 self.allocator.free(self.toggle_terminal);
                 self.toggle_terminal = bindings;
             }
@@ -211,6 +284,74 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(chat_page_down_value, "chat_page_down")) |bindings| {
                 self.allocator.free(self.chat_page_down);
                 self.chat_page_down = bindings;
+            }
+        }
+    }
+
+    fn applyTerminalOverrides(self: *NativeKeyboardConfig, terminal_value: std.json.Value) void {
+        if (terminal_value != .object) {
+            log.warn("keybinds.terminal must be an object when provided", .{});
+            return;
+        }
+
+        if (terminal_value.object.get("toggle")) |value| {
+            if (self.parseOverrideValue(value, "terminal.toggle")) |bindings| {
+                self.allocator.free(self.toggle_terminal);
+                self.toggle_terminal = bindings;
+            }
+        }
+        if (terminal_value.object.get("new_tab")) |value| {
+            if (self.parseOverrideValue(value, "terminal.new_tab")) |bindings| {
+                self.allocator.free(self.terminal_new_tab);
+                self.terminal_new_tab = bindings;
+            }
+        }
+        if (terminal_value.object.get("close")) |value| {
+            if (self.parseOverrideValue(value, "terminal.close")) |bindings| {
+                self.allocator.free(self.terminal_close_active);
+                self.terminal_close_active = bindings;
+            }
+        }
+        if (terminal_value.object.get("rename_tab")) |value| {
+            if (self.parseOverrideValue(value, "terminal.rename_tab")) |bindings| {
+                self.allocator.free(self.terminal_rename_tab);
+                self.terminal_rename_tab = bindings;
+            }
+        }
+        if (terminal_value.object.get("tab_previous")) |value| {
+            if (self.parseOverrideValue(value, "terminal.tab_previous")) |bindings| {
+                self.allocator.free(self.terminal_tab_previous);
+                self.terminal_tab_previous = bindings;
+            }
+        }
+        if (terminal_value.object.get("tab_next")) |value| {
+            if (self.parseOverrideValue(value, "terminal.tab_next")) |bindings| {
+                self.allocator.free(self.terminal_tab_next);
+                self.terminal_tab_next = bindings;
+            }
+        }
+        if (terminal_value.object.get("split_up")) |value| {
+            if (self.parseOverrideValue(value, "terminal.split_up")) |bindings| {
+                self.allocator.free(self.terminal_split_up);
+                self.terminal_split_up = bindings;
+            }
+        }
+        if (terminal_value.object.get("split_down")) |value| {
+            if (self.parseOverrideValue(value, "terminal.split_down")) |bindings| {
+                self.allocator.free(self.terminal_split_down);
+                self.terminal_split_down = bindings;
+            }
+        }
+        if (terminal_value.object.get("split_left")) |value| {
+            if (self.parseOverrideValue(value, "terminal.split_left")) |bindings| {
+                self.allocator.free(self.terminal_split_left);
+                self.terminal_split_left = bindings;
+            }
+        }
+        if (terminal_value.object.get("split_right")) |value| {
+            if (self.parseOverrideValue(value, "terminal.split_right")) |bindings| {
+                self.allocator.free(self.terminal_split_right);
+                self.terminal_split_right = bindings;
             }
         }
     }
@@ -341,6 +482,62 @@ fn cloneDefaultChatPageUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("PageDown"),
+    });
+}
+
+fn cloneDefaultTerminalNewTabKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+T"),
+    });
+}
+
+fn cloneDefaultTerminalCloseActiveKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+W"),
+    });
+}
+
+fn cloneDefaultTerminalRenameTabKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+R"),
+    });
+}
+
+fn cloneDefaultTerminalTabPreviousKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+PageUp"),
+    });
+}
+
+fn cloneDefaultTerminalTabNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+PageDown"),
+    });
+}
+
+fn cloneDefaultTerminalSplitUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+Up"),
+    });
+}
+
+fn cloneDefaultTerminalSplitDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+E"),
+        try parseDefaultAccelerator("CommandOrControl+Shift+Down"),
+    });
+}
+
+fn cloneDefaultTerminalSplitLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+Left"),
+    });
+}
+
+fn cloneDefaultTerminalSplitRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Shift+O"),
+        try parseDefaultAccelerator("CommandOrControl+Shift+Right"),
     });
 }
 
@@ -766,4 +963,73 @@ test "chat page down keybind override accepts a single accelerator" {
     try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
     try std.testing.expect(config.chat_page_down[0].shift);
     try std.testing.expectEqual(sdl.Keycode.j, config.chat_page_down[0].key);
+}
+
+test "terminal nested keybind overrides accept workspace actions" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            var terminal = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer terminal.deinit();
+
+            try terminal.put("toggle", .{ .string = "Alt+J" });
+            try terminal.put("new_tab", .{ .string = "Ctrl+Alt+T" });
+            try terminal.put("split_right", .{ .string = "Ctrl+Alt+L" });
+            try keybinds.put("terminal", .{ .object = terminal });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
+    try std.testing.expect(config.toggle_terminal[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.terminal_new_tab.len);
+    try std.testing.expect(config.terminal_new_tab[0].ctrl);
+    try std.testing.expect(config.terminal_new_tab[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.terminal_split_right.len);
+    try std.testing.expect(config.terminal_split_right[0].ctrl);
+    try std.testing.expect(config.terminal_split_right[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.l, config.terminal_split_right[0].key);
+}
+
+test "legacy terminal keybind override still maps to terminal toggle" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            try keybinds.put("terminal", .{ .string = "Ctrl+Alt+J" });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
+    try std.testing.expect(config.toggle_terminal[0].ctrl);
+    try std.testing.expect(config.toggle_terminal[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.j, config.toggle_terminal[0].key);
 }

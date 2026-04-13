@@ -40,8 +40,6 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     });
     defer zgui.endChild();
 
-    renderHeader(dock);
-    zgui.separator();
     renderTabStrip(state, dock);
     zgui.separator();
     renderRenameTabPopup(state, dock, width, height);
@@ -105,39 +103,9 @@ fn dockBackgroundColor(dock: *const terminal.Dock) [4]f32 {
     return colors.rgba(0, 0, 0, 255);
 }
 
-fn renderHeader(dock: *const terminal.Dock) void {
-    const header_height = theme.scaledUi(30.0);
-    _ = zgui.beginChild("TerminalDockHeader", .{
-        .w = 0.0,
-        .h = header_height,
-        .child_flags = .{
-            .border = false,
-            .always_use_window_padding = true,
-        },
-        .window_flags = .{
-            .no_scrollbar = true,
-            .no_scroll_with_mouse = true,
-        },
-    });
-    defer zgui.endChild();
-
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(10.0), theme.scaledUi(6.0) } });
-    defer zgui.popStyleVar(.{ .count = 1 });
-
-    zgui.setCursorPos(.{ theme.scaledUi(10.0), theme.scaledUi(4.0) });
-    zgui.textColored(theme.COLOR_WHITE, "{s}", .{dock.title()});
-
-    var status_buf: [192]u8 = undefined;
-    const status = dock.statusText(&status_buf);
-    const status_size = zgui.calcTextSize(status, .{});
-    const avail = zgui.getWindowSize()[0];
-    zgui.sameLine(.{});
-    zgui.setCursorPosX(@max(theme.scaledUi(120.0), avail - status_size[0] - theme.scaledUi(14.0)));
-    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{status});
-}
-
 fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
-    const strip_height = theme.scaledUi(36.0);
+    const strip_height = theme.scaledUi(30.0);
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(6.0), theme.scaledUi(4.0) } });
     _ = zgui.beginChild("TerminalDockTabs", .{
         .w = 0.0,
         .h = strip_height,
@@ -150,25 +118,30 @@ fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
             .no_scroll_with_mouse = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+        zgui.popStyleVar(.{ .count = 1 });
+    }
 
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(4.0) } });
-    defer zgui.popStyleVar(.{ .count = 1 });
+    const tab_count = dock.tabs.items.len;
+    const tab_spacing = theme.scaledUi(4.0);
+    const new_tab_button_width = theme.scaledUi(22.0);
+    const total_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    const spacing_width = if (tab_count == 0) 0.0 else tab_spacing * @as(f32, @floatFromInt(tab_count));
+    const tab_width = if (tab_count == 0)
+        0.0
+    else
+        @max((total_width - new_tab_button_width - spacing_width) / @as(f32, @floatFromInt(tab_count)), theme.scaledUi(1.0));
 
     for (dock.tabs.items, 0..) |tab, index| {
-        var title_buf: [64]u8 = undefined;
+        var title_buf: [96]u8 = undefined;
         const title = dock.tabTitle(index, &title_buf);
         const active = dock.active_tab_index == index;
-        const button_width = theme.clampf(
-            zgui.calcTextSize(title, .{})[0] + theme.scaledUi(28.0),
-            theme.scaledUi(82.0),
-            theme.scaledUi(180.0),
-        );
 
         zgui.pushStyleColor4f(.{ .idx = .button, .c = if (active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT });
         zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (active) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
         zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (active) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
-        if (zgui.button(zgui.formatZ("{s}##terminal-tab-{d}", .{ title, tab.id }), .{ .w = button_width, .h = theme.scaledUi(28.0) })) {
+        if (zgui.button(zgui.formatZ("{s}##terminal-tab-{d}", .{ title, tab.id }), .{ .w = tab_width, .h = theme.scaledUi(22.0) })) {
             dock.selectTab(index);
             state.markDirty();
         }
@@ -197,13 +170,13 @@ fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
             zgui.endPopup();
         }
 
-        zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
+        zgui.sameLine(.{ .spacing = tab_spacing });
     }
 
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.08) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.14) });
-    if (zgui.button("+##terminal-new-tab", .{ .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) })) {
+    if (zgui.button("+##terminal-new-tab", .{ .w = new_tab_button_width, .h = theme.scaledUi(22.0) })) {
         dock.createTab(state.allocator) catch |err| {
             app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)});
         };
@@ -252,7 +225,7 @@ fn renderRenameTabPopup(state: *app_state.AppState, dock: *terminal.Dock, width:
     }
 
     zgui.textColored(theme.COLOR_WHITE, "Rename tab", .{});
-    _ = zgui.inputTextWithHint("##terminal-rename-tab", .{
+    const submitted = zgui.inputTextWithHint("##terminal-rename-tab", .{
         .hint = "Tab label",
         .buf = dock.renameBuffer(),
         .flags = .{ .enter_returns_true = true },
@@ -275,7 +248,7 @@ fn renderRenameTabPopup(state: *app_state.AppState, dock: *terminal.Dock, width:
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) });
-    if (zgui.button("Save", .{ .w = button_width, .h = theme.scaledUi(32.0) })) {
+    if (submitted or zgui.button("Save", .{ .w = button_width, .h = theme.scaledUi(32.0) })) {
         dock.finishRenameTab(state.allocator) catch |err| {
             app_state.log.warn("failed to rename terminal tab: {s}", .{@errorName(err)});
         };

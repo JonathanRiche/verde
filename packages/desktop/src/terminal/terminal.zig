@@ -2,12 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
+const keybinds = @import("../keybinds.zig");
 
 const log = std.log.scoped(.native_terminal);
 
 pub const DEFAULT_DOCK_HEIGHT: f32 = 136.0;
 pub const MIN_DOCK_HEIGHT: f32 = 96.0;
-pub const MAX_DOCK_HEIGHT: f32 = 380.0;
+pub const MAX_DOCK_HEIGHT: f32 = 900.0;
 
 const SESSION_SUPPORTED = builtin.os.tag == .linux or builtin.os.tag == .macos;
 const INITIAL_COLS: u16 = 96;
@@ -140,10 +141,6 @@ pub const Dock = struct {
         return self.visible;
     }
 
-    pub fn title(_: *const Dock) []const u8 {
-        return "Terminal";
-    }
-
     pub fn statusText(self: *const Dock, buf: *[192]u8) []const u8 {
         if (!SESSION_SUPPORTED) {
             return "Native shell embedding is only enabled on Linux and macOS.";
@@ -251,13 +248,18 @@ pub const Dock = struct {
         return false;
     }
 
-    pub fn handleKeyDown(self: *Dock, allocator: std.mem.Allocator, event: *const sdl.KeyboardEvent) bool {
+    pub fn handleKeyDown(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        keyboard: *const keybinds.NativeKeyboardConfig,
+        event: *const sdl.KeyboardEvent,
+    ) bool {
         if (terminalZoomDelta(event)) |delta| {
             self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
             return true;
         }
 
-        if (self.handleWorkspaceShortcut(allocator, event) catch |err| {
+        if (self.handleWorkspaceShortcut(allocator, keyboard, event) catch |err| {
             log.warn("terminal workspace shortcut failed: {s}", .{@errorName(err)});
             return false;
         }) {
@@ -365,18 +367,22 @@ pub const Dock = struct {
         self.focus_requested = true;
     }
 
-    pub fn tabTitle(self: *const Dock, index: usize, buffer: *[64]u8) []const u8 {
+    pub fn tabTitle(self: *const Dock, index: usize, buffer: *[96]u8) []const u8 {
         if (index >= self.tabs.items.len) return "";
         const tab = &self.tabs.items[index];
         if (tab.title) |tab_title| return tab_title;
-        return std.fmt.bufPrint(buffer, "Tab {d}", .{index + 1}) catch "Tab";
+        if (findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root)) |pane| {
+            if (pane.session) |session| return session.tabTitle(buffer);
+        }
+        if (self.cwd) |cwd| return pathLabel(cwd);
+        return "Shell";
     }
 
     pub fn beginRenameTab(self: *Dock, tab_id: u32) void {
         self.rename_tab_id = tab_id;
         @memset(&self.rename_storage, 0);
         if (self.findTabIndexById(tab_id)) |index| {
-            var title_buf: [64]u8 = undefined;
+            var title_buf: [96]u8 = undefined;
             const tab_label = self.tabTitle(index, &title_buf);
             const len = @min(tab_label.len, self.rename_storage.len - 1);
             @memcpy(self.rename_storage[0..len], tab_label[0..len]);
@@ -596,58 +602,25 @@ pub const Dock = struct {
         };
     }
 
-    fn handleWorkspaceShortcut(self: *Dock, allocator: std.mem.Allocator, event: *const sdl.KeyboardEvent) !bool {
-        if (!event.down or event.repeat) return false;
-
-        const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
-        const shift = modifierPressed(event.mod, sdl.Keymod.shift);
-        const alt = modifierPressed(event.mod, sdl.Keymod.alt);
-        const super = modifierPressed(event.mod, sdl.Keymod.gui);
-        if (!ctrl or super) return false;
-
-        if (shift and !alt) {
-            switch (event.scancode) {
-                .t => {
-                    try self.createTab(allocator);
-                    return true;
-                },
-                .w => {
-                    try self.closeActivePaneOrTab(allocator);
-                    return true;
-                },
-                .r => {
-                    if (self.activeTab()) |tab| self.beginRenameTab(tab.id);
-                    return true;
-                },
-                .pageup => {
-                    if (self.active_tab_index > 0) self.selectTab(self.active_tab_index - 1);
-                    return true;
-                },
-                .pagedown => {
-                    if (self.active_tab_index + 1 < self.tabs.items.len) self.selectTab(self.active_tab_index + 1);
-                    return true;
-                },
-                .e, .down => {
-                    try self.splitActivePane(allocator, .down);
-                    return true;
-                },
-                .o, .right => {
-                    try self.splitActivePane(allocator, .right);
-                    return true;
-                },
-                .up => {
-                    try self.splitActivePane(allocator, .up);
-                    return true;
-                },
-                .left => {
-                    try self.splitActivePane(allocator, .left);
-                    return true;
-                },
-                else => {},
-            }
+    fn handleWorkspaceShortcut(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        keyboard: *const keybinds.NativeKeyboardConfig,
+        event: *const sdl.KeyboardEvent,
+    ) !bool {
+        const action = keyboard.terminalActionForEvent(event) orelse return false;
+        switch (action) {
+            .new_tab => try self.createTab(allocator),
+            .close_active => try self.closeActivePaneOrTab(allocator),
+            .rename_tab => if (self.activeTab()) |tab| self.beginRenameTab(tab.id),
+            .tab_previous => if (self.active_tab_index > 0) self.selectTab(self.active_tab_index - 1),
+            .tab_next => if (self.active_tab_index + 1 < self.tabs.items.len) self.selectTab(self.active_tab_index + 1),
+            .split_up => try self.splitActivePane(allocator, .up),
+            .split_down => try self.splitActivePane(allocator, .down),
+            .split_left => try self.splitActivePane(allocator, .left),
+            .split_right => try self.splitActivePane(allocator, .right),
         }
-
-        return false;
+        return true;
     }
 };
 
@@ -840,7 +813,7 @@ pub fn clampPreferredHeight(height: f32) f32 {
 }
 
 pub fn clampHeightForAvailable(height: f32, available_height: f32) f32 {
-    const max_allowed = @min(MAX_DOCK_HEIGHT, available_height * 0.42);
+    const max_allowed = @min(MAX_DOCK_HEIGHT, available_height * 0.82);
     const max_height = @max(MIN_DOCK_HEIGHT, max_allowed);
     return clampf(height, MIN_DOCK_HEIGHT, max_height);
 }
@@ -862,6 +835,10 @@ const UnsupportedSession = struct {
 
     pub fn statusText(_: *const UnsupportedSession, _: *[192]u8) []const u8 {
         return "Native shell embedding is only enabled on Linux and macOS.";
+    }
+
+    pub fn tabTitle(_: *const UnsupportedSession, _: *[96]u8) []const u8 {
+        return "Shell";
     }
 
     pub fn isRunning(_: *const UnsupportedSession) bool {
@@ -996,6 +973,35 @@ const UnixSession = struct {
             }
         }
         return "Shell exited.";
+    }
+
+    pub fn tabTitle(self: *const UnixSession, buffer: *[96]u8) []const u8 {
+        if (builtin.os.tag == .linux) {
+            var proc_path_buf: [64]u8 = undefined;
+            const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{self.child_pid}) catch "";
+            if (proc_path.len > 0) {
+                var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.posix.readlink(proc_path, &cwd_buf)) |cwd| {
+                    const label = pathLabel(cwd);
+                    if (label.len > 0) {
+                        const clipped = label[0..@min(label.len, buffer.len)];
+                        return std.fmt.bufPrint(buffer, "{s}", .{clipped}) catch "Shell";
+                    }
+                } else |_| {}
+            }
+        }
+        if (self.terminal.getPwd()) |pwd| {
+            const label = pathLabel(pwd);
+            if (label.len > 0) return label;
+        }
+        if (self.terminal.getTitle()) |title| {
+            const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
+            if (trimmed.len > 0) {
+                if (trimmed.len <= buffer.len) return trimmed;
+                return std.fmt.bufPrint(buffer, "{s}", .{trimmed[0..buffer.len]}) catch "Shell";
+            }
+        }
+        return "Shell";
     }
 
     pub fn isRunning(self: *const UnixSession) bool {
@@ -1580,6 +1586,13 @@ fn sanitizeViewportDimension(value: f32) ?f32 {
 
 fn sanitizeCellCount(value: u16, min_value: u16) u16 {
     return @max(value, min_value);
+}
+
+fn pathLabel(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimRight(u8, path, std.fs.path.sep_str);
+    if (trimmed.len == 0) return std.fs.path.sep_str;
+    const base = std.fs.path.basename(trimmed);
+    return if (base.len > 0) base else trimmed;
 }
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {

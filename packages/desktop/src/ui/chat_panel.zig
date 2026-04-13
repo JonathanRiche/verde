@@ -131,7 +131,7 @@ fn computeWorkspaceLayout(state: *app_state.AppState, available_width: f32, avai
     const terminal_visible = state.isTerminalVisible();
     const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
     const terminal_handle_height = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
-    const minimum_workspace = theme.scaledUi(220.0);
+    const minimum_workspace = theme.scaledUi(120.0);
     const preferred_terminal_height = if (terminal_visible) state.terminalPanelHeight(available_height) else 0.0;
     var terminal_height = preferred_terminal_height;
     const available_terminal_height = @max(available_height - minimum_workspace - terminal_gap - terminal_handle_height, 0.0);
