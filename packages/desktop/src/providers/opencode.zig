@@ -7,10 +7,10 @@ const provider_types = @import("../provider_types.zig");
 const log = std.log.scoped(.native_opencode);
 
 const MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024;
-const MAX_DB_QUERY_BYTES = 12 * 1024 * 1024;
 const MAX_HEALTH_WAIT_ATTEMPTS = 30;
 const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const MESSAGE_POLL_LIMIT = 12;
+const IMPORT_MESSAGE_LIMIT = 100_000;
 const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 12_000;
 
@@ -81,15 +81,24 @@ pub const Client = struct {
 
         var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
         defer threads.deinit(allocator);
+        var saw_directory = false;
 
-        for (parsed.value.array.items) |item| {
-            if (item != .object) continue;
-            const id = getOptionalObjectString(item, "id") orelse continue;
-            const title = getOptionalObjectString(item, "title") orelse id;
+        for (parsed.value.array.items) |session_value| {
+            if (session_value != .object) continue;
+            const directory = getOptionalObjectString(session_value, "directory");
+            if (directory != null) saw_directory = true;
+            if (!sessionMatchesWorkingDirectory(self.config.working_directory, directory)) continue;
+
+            const id = getOptionalObjectString(session_value, "id") orelse continue;
+            const title = getOptionalObjectString(session_value, "title") orelse id;
             try threads.append(allocator, .{
                 .id = try allocator.dupe(u8, id),
                 .title = try allocator.dupe(u8, title),
             });
+        }
+
+        if (threads.items.len == 0 and self.config.working_directory != null and saw_directory) {
+            return allocator.alloc(provider_types.ChatThreadSummary, 0);
         }
 
         return threads.toOwnedSlice(allocator);
@@ -112,54 +121,37 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
-        const escaped_thread_id = try sqlStringLiteralAlloc(self.allocator, thread_id);
-        defer self.allocator.free(escaped_thread_id);
+        const session_response = try self.requestJson(.GET, "/session", null);
+        defer self.allocator.free(session_response.body);
+        if (session_response.status != .ok) return error.OpencodeRequestFailed;
 
-        const session_query = try std.fmt.allocPrint(
+        var parsed_sessions = try std.json.parseFromSlice(std.json.Value, self.allocator, session_response.body, .{});
+        defer parsed_sessions.deinit();
+
+        const session_value = findSessionById(parsed_sessions.value, thread_id) orelse return error.MissingSessionId;
+        const session_id = getOptionalObjectString(session_value, "id") orelse return error.MissingSessionId;
+        const session_title = getOptionalObjectString(session_value, "title") orelse session_id;
+
+        const messages_path = try std.fmt.allocPrint(
             self.allocator,
-            "select id, title, time_updated from session where id = {s} limit 1",
-            .{escaped_thread_id},
+            "/session/{s}/message?limit={d}",
+            .{ session_id, IMPORT_MESSAGE_LIMIT },
         );
-        defer self.allocator.free(session_query);
+        defer self.allocator.free(messages_path);
 
-        const session_rows = try self.runDbQueryAlloc(allocator, session_query);
-        defer allocator.free(session_rows);
+        const messages_response = try self.requestJson(.GET, messages_path, null);
+        defer self.allocator.free(messages_response.body);
+        if (messages_response.status != .ok) return error.OpencodeRequestFailed;
 
-        var parsed_session = try std.json.parseFromSlice(std.json.Value, self.allocator, session_rows, .{});
-        defer parsed_session.deinit();
-
-        const session_row = firstDbRow(parsed_session.value) orelse return error.MissingSessionId;
-        const session_id = getOptionalObjectString(session_row, "id") orelse return error.MissingSessionId;
-        const session_title = getOptionalObjectString(session_row, "title") orelse session_id;
-
-        const message_query = try std.fmt.allocPrint(
-            self.allocator,
-            "select m.id as message_id, m.data as message_data, p.time_created as part_created, p.data as part_data " ++
-                "from message m left join part p on p.message_id = m.id " ++
-                "where m.session_id = {s} order by m.time_created asc, p.time_created asc",
-            .{escaped_thread_id},
-        );
-        defer self.allocator.free(message_query);
-
-        const message_rows = try self.runDbQueryAlloc(allocator, message_query);
-        defer allocator.free(message_rows);
-
-        var parsed_messages = try std.json.parseFromSlice(std.json.Value, self.allocator, message_rows, .{});
+        var parsed_messages = try std.json.parseFromSlice(std.json.Value, self.allocator, messages_response.body, .{});
         defer parsed_messages.deinit();
 
-        const imported_messages = try parseImportedMessagesAlloc(allocator, parsed_messages.value);
-        errdefer {
-            for (imported_messages) |message| {
-                allocator.free(message.author);
-                allocator.free(message.body);
-            }
-            allocator.free(imported_messages);
-        }
+        const imported_messages = try parseImportedApiMessagesAlloc(allocator, parsed_messages.value);
 
         return .{
             .thread_id = try allocator.dupe(u8, session_id),
             .title = try allocator.dupe(u8, session_title),
-            .updated_at = normalizeUnixTimestamp(jsonInteger(getObjectField(session_row, "time_updated"))),
+            .updated_at = extractSessionUpdatedAt(session_value),
             .messages = imported_messages,
         };
     }
@@ -660,31 +652,6 @@ pub const Client = struct {
         return .busy;
     }
 
-    fn runDbQueryAlloc(self: *Client, allocator: std.mem.Allocator, query: []const u8) ![]u8 {
-        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
-        defer env_map.deinit();
-
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
-        defer self.allocator.free(executable);
-
-        const result = try std.process.Child.run(.{
-            .allocator = self.allocator,
-            .argv = &.{ executable, "db", query, "--format", "json" },
-            .cwd = self.config.working_directory,
-            .env_map = &env_map,
-            .max_output_bytes = MAX_DB_QUERY_BYTES,
-        });
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
-
-        switch (result.term) {
-            .Exited => |code| if (code != 0) return error.OpencodeRequestFailed,
-            else => return error.OpencodeRequestFailed,
-        }
-
-        return allocator.dupe(u8, result.stdout);
-    }
-
     fn requestJson(
         self: *Client,
         method: std.http.Method,
@@ -846,13 +813,7 @@ fn getOptionalObjectString(value: std.json.Value, field: []const u8) ?[]const u8
     };
 }
 
-fn firstDbRow(value: std.json.Value) ?std.json.Value {
-    if (value != .array or value.array.items.len == 0) return null;
-    const row = value.array.items[0];
-    return if (row == .object) row else null;
-}
-
-fn parseImportedMessagesAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ChatMessage {
+fn parseImportedApiMessagesAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ChatMessage {
     if (value != .array) return allocator.alloc(provider_types.ChatMessage, 0);
 
     var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
@@ -864,67 +825,39 @@ fn parseImportedMessagesAlloc(allocator: std.mem.Allocator, value: std.json.Valu
         messages.deinit(allocator);
     }
 
-    var current_message_id: ?[]const u8 = null;
-    var current_role: ?provider_types.MessageRole = null;
-    var current_body: std.ArrayList(u8) = .empty;
-    defer current_body.deinit(allocator);
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const info = getObjectField(item, "info") orelse continue;
+        const role = parseImportedApiMessageRole(info) orelse continue;
+        const parts = getObjectField(item, "parts") orelse continue;
+        if (parts != .array) continue;
 
-    for (value.array.items) |row| {
-        if (row != .object) continue;
-        const message_id = getOptionalObjectString(row, "message_id") orelse continue;
-        if (current_message_id == null or !std.mem.eql(u8, current_message_id.?, message_id)) {
-            try flushImportedDbMessage(allocator, &messages, current_role, &current_body);
-            current_message_id = message_id;
-            current_role = try parseImportedMessageRole(row);
-            current_body.clearRetainingCapacity();
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+
+        for (parts.array.items) |part| {
+            try appendImportedPartText(allocator, &body, part);
         }
 
-        if (current_role == null) continue;
-        const part_json = switch (getObjectField(row, "part_data") orelse continue) {
-            .string => |text| text,
-            else => continue,
-        };
+        const trimmed = std.mem.trim(u8, body.items, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
 
-        var parsed_part = try std.json.parseFromSlice(std.json.Value, allocator, part_json, .{});
-        defer parsed_part.deinit();
-        try appendImportedPartText(allocator, &current_body, parsed_part.value);
+        try messages.append(allocator, .{
+            .role = role,
+            .author = try allocator.dupe(u8, importedAuthorForRole(role)),
+            .body = try allocator.dupe(u8, trimmed),
+        });
     }
 
-    try flushImportedDbMessage(allocator, &messages, current_role, &current_body);
     return messages.toOwnedSlice(allocator);
 }
 
-fn parseImportedMessageRole(row: std.json.Value) !?provider_types.MessageRole {
-    const message_data = switch (getObjectField(row, "message_data") orelse return null) {
-        .string => |text| text,
-        else => return null,
-    };
-
-    var parsed_message = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, message_data, .{});
-    defer parsed_message.deinit();
-
-    const role = getOptionalObjectString(parsed_message.value, "role") orelse return null;
+fn parseImportedApiMessageRole(info: std.json.Value) ?provider_types.MessageRole {
+    const role = getOptionalObjectString(info, "role") orelse return null;
     if (std.mem.eql(u8, role, "user")) return .user;
     if (std.mem.eql(u8, role, "assistant")) return .assistant;
     if (std.mem.eql(u8, role, "system")) return .system;
     return null;
-}
-
-fn flushImportedDbMessage(
-    allocator: std.mem.Allocator,
-    messages: *std.ArrayList(provider_types.ChatMessage),
-    role: ?provider_types.MessageRole,
-    body: *std.ArrayList(u8),
-) !void {
-    const resolved_role = role orelse return;
-    const trimmed = std.mem.trim(u8, body.items, &std.ascii.whitespace);
-    if (trimmed.len == 0) return;
-
-    try messages.append(allocator, .{
-        .role = resolved_role,
-        .author = try allocator.dupe(u8, importedAuthorForRole(resolved_role)),
-        .body = try allocator.dupe(u8, trimmed),
-    });
 }
 
 fn importedAuthorForRole(role: provider_types.MessageRole) []const u8 {
@@ -987,16 +920,43 @@ fn normalizeUnixTimestamp(value: ?i64) ?i64 {
     return timestamp;
 }
 
-fn sqlStringLiteralAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var builder: std.ArrayList(u8) = .empty;
-    errdefer builder.deinit(allocator);
-
-    try builder.append(allocator, '\'');
-    for (value) |char| {
-        if (char == '\'') try builder.appendSlice(allocator, "''") else try builder.append(allocator, char);
+fn findSessionById(value: std.json.Value, thread_id: []const u8) ?std.json.Value {
+    if (value != .array) return null;
+    for (value.array.items) |item| {
+        if (item != .object) continue;
+        const id = getOptionalObjectString(item, "id") orelse continue;
+        if (std.mem.eql(u8, id, thread_id)) return item;
     }
-    try builder.append(allocator, '\'');
-    return builder.toOwnedSlice(allocator);
+    return null;
+}
+
+fn extractSessionUpdatedAt(value: std.json.Value) ?i64 {
+    if (jsonInteger(getObjectField(value, "time_updated"))) |time_updated| {
+        return normalizeUnixTimestamp(time_updated);
+    }
+
+    const time_value = getObjectField(value, "time") orelse return null;
+    if (time_value == .object) {
+        if (jsonInteger(getObjectField(time_value, "updated"))) |updated| {
+            return normalizeUnixTimestamp(updated);
+        }
+        if (jsonInteger(getObjectField(time_value, "created"))) |created| {
+            return normalizeUnixTimestamp(created);
+        }
+    }
+
+    return null;
+}
+
+fn sessionMatchesWorkingDirectory(working_directory: ?[]const u8, session_directory: ?[]const u8) bool {
+    const root = working_directory orelse return true;
+    const candidate = session_directory orelse return true;
+    if (std.mem.eql(u8, candidate, root)) return true;
+    if (candidate.len <= root.len) return false;
+    if (!std.mem.startsWith(u8, candidate, root)) return false;
+
+    const separator = std.fs.path.sep;
+    return candidate[root.len] == separator;
 }
 
 fn parseConfiguredModelsAlloc(allocator: std.mem.Allocator, root: std.json.Value) ![]provider_types.ModelInfo {
