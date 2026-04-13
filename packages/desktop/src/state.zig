@@ -3349,6 +3349,7 @@ pub const AppState = struct {
         self.finishAllSendThreads();
         self.pollSend();
         self.flushDirtyNow();
+        ai_harness.shutdownOwnedProviderProcesses();
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
         self.browser_state.deinit();
