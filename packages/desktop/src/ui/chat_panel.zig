@@ -830,7 +830,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, id: u32, role: app_state.
         return;
     }
 
-    const bubble_height = transcriptBubbleHeight(role, author, body, image);
+    const bubble_height = transcriptBubbleHeight(state, role, author, body, image);
     const bubble_theme = transcriptBubbleTheme(role);
     const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
@@ -871,7 +871,13 @@ fn renderTranscriptMessage(state: *app_state.AppState, id: u32, role: app_state.
 
 /// Draws a generic transcript bubble with optional muted body text.
 fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, author: []const u8, body: []const u8, image: anytype, muted_body: bool) void {
-    const bubble_height = transcriptBubbleHeightGeneric(role, author, body, image);
+    const bubble_height = transcriptBubbleHeightGeneric(
+        role,
+        author,
+        body,
+        image,
+        shouldRenderCodexFileReferenceBody(state, role, body, muted_body),
+    );
     const bubble_theme = transcriptBubbleTheme(role);
     const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
@@ -970,6 +976,96 @@ fn renderCodexFileReferenceBody(state: *app_state.AppState, body: []const u8) vo
     const used_height = @max(layout.cursor_y - layout.base_screen[1] + layout.line_height, zgui.getTextLineHeight());
     zgui.setCursorScreenPos(base_screen);
     zgui.dummy(.{ .w = available_width, .h = used_height });
+}
+
+const CodexInlineMeasure = struct {
+    cursor_x: f32 = 0.0,
+    cursor_y: f32 = 0.0,
+    max_x: f32,
+    line_height: f32,
+};
+
+fn codexFileReferenceBodyHeight(body: []const u8, available_width: f32) f32 {
+    const line_height = @max(zgui.getTextLineHeightWithSpacing(), theme.scaledUi(28.0));
+    var layout: CodexInlineMeasure = .{
+        .max_x = available_width,
+        .line_height = line_height,
+    };
+
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var first_line = true;
+    while (lines.next()) |line| {
+        if (!first_line) {
+            advanceCodexInlineMeasureLine(&layout);
+        } else {
+            first_line = false;
+        }
+        if (line.len == 0) continue;
+        measureCodexFileReferenceLine(line, &layout);
+    }
+
+    return @max(layout.cursor_y + layout.line_height, zgui.getTextLineHeight());
+}
+
+fn advanceCodexInlineMeasureLine(layout: *CodexInlineMeasure) void {
+    layout.cursor_x = 0.0;
+    layout.cursor_y += layout.line_height;
+}
+
+fn measureCodexFileReferenceLine(line: []const u8, layout: *CodexInlineMeasure) void {
+    var cursor: usize = 0;
+    while (cursor < line.len) {
+        if (findNextCodexFileReference(line, cursor)) |file_ref| {
+            measureCodexTextRun(line[cursor..file_ref.start], layout);
+            measureCodexFileReferenceToken(file_ref, layout);
+            cursor = file_ref.end;
+            continue;
+        }
+
+        measureCodexTextRun(line[cursor..], layout);
+        break;
+    }
+}
+
+fn measureCodexTextRun(text: []const u8, layout: *CodexInlineMeasure) void {
+    var cursor: usize = 0;
+    while (cursor < text.len) {
+        const is_space = std.ascii.isWhitespace(text[cursor]);
+        var end = cursor + 1;
+        while (end < text.len and std.ascii.isWhitespace(text[end]) == is_space) : (end += 1) {}
+        measureCodexTextToken(text[cursor..end], is_space, layout);
+        cursor = end;
+    }
+}
+
+fn measureCodexTextToken(token: []const u8, is_space: bool, layout: *CodexInlineMeasure) void {
+    if (is_space) {
+        if (layout.cursor_x <= 0.0) return;
+        const width = zgui.calcTextSize(token, .{})[0];
+        if (layout.cursor_x + width > layout.max_x) {
+            advanceCodexInlineMeasureLine(layout);
+            return;
+        }
+        layout.cursor_x += width;
+        return;
+    }
+
+    const width = zgui.calcTextSize(token, .{})[0];
+    if (layout.cursor_x > 0.0 and layout.cursor_x + width > layout.max_x) {
+        advanceCodexInlineMeasureLine(layout);
+    }
+    layout.cursor_x += width;
+}
+
+fn measureCodexFileReferenceToken(file_ref: CodexFileReference, layout: *CodexInlineMeasure) void {
+    const text_size = zgui.calcTextSize(file_ref.label, .{});
+    const padding_x = theme.scaledUi(8.0);
+    const chip_width = text_size[0] + padding_x * 2.0;
+
+    if (layout.cursor_x > 0.0 and layout.cursor_x + chip_width > layout.max_x) {
+        advanceCodexInlineMeasureLine(layout);
+    }
+    layout.cursor_x += chip_width;
 }
 
 fn renderCodexFileReferenceLine(state: *app_state.AppState, line: []const u8, layout: *CodexInlineLayout) void {
@@ -1770,23 +1866,32 @@ fn transcriptShouldAutoFollow(state: anytype) bool {
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
-fn transcriptBubbleHeight(role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) f32 {
-    return transcriptBubbleHeightGeneric(role, author, body, image);
+fn transcriptBubbleHeight(state: *app_state.AppState, role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) f32 {
+    return transcriptBubbleHeightGeneric(
+        role,
+        author,
+        body,
+        image,
+        shouldRenderCodexFileReferenceBody(state, role, body, false),
+    );
 }
 
 /// Measures the height needed for a transcript bubble.
-fn transcriptBubbleHeightGeneric(role: anytype, author: []const u8, body: []const u8, image: anytype) f32 {
+fn transcriptBubbleHeightGeneric(role: anytype, author: []const u8, body: []const u8, image: anytype, use_codex_file_reference_layout: bool) f32 {
     const style = zgui.getStyle();
     const bubble_width = transcriptBubbleWidth(role);
     const inner_width = @max(bubble_width - (theme.TRANSCRIPT_BUBBLE_PADDING_X * 2.0), 64.0);
     const author_size = if (shouldShowBubbleAuthor(author)) zgui.calcTextSize(author, .{}) else .{ 0.0, 0.0 };
-    const body_size = zgui.calcTextSize(body, .{ .wrap_width = inner_width });
+    const body_height = if (use_codex_file_reference_layout)
+        codexFileReferenceBodyHeight(body, inner_width)
+    else
+        zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
     const image_height: f32 = if (image != null) theme.clampf(inner_width * 0.46, theme.scaledUi(132.0), theme.scaledUi(220.0)) else 0.0;
     const image_gap: f32 = if (image != null and body.len > 0) theme.scaledUi(8.0) else 0.0;
     const vertical_padding = theme.TRANSCRIPT_BUBBLE_PADDING_Y * 2.0;
     const text_gap = if (shouldShowBubbleAuthor(author)) 2.0 + style.item_spacing[1] else 0.0;
     const border_allowance = 4.0;
-    return @max(author_size[1] + body_size[1] + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
+    return @max(author_size[1] + body_height + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
 }
 
 fn transcriptBubbleWidth(role: anytype) f32 {
