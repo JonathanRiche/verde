@@ -19,6 +19,7 @@ const WorkspaceLayout = struct {
     browser_gap: f32,
     browser_width: f32,
     terminal_gap: f32,
+    terminal_handle_height: f32,
     terminal_height: f32,
 };
 
@@ -86,6 +87,7 @@ fn inner_workspace(state: *app_state.AppState) void {
 
     if (layout.terminal_height > 0.0) {
         zgui.dummy(.{ .w = 0.0, .h = layout.terminal_gap });
+        renderTerminalResizeHandle(state, content[0], content[1], layout.terminal_handle_height);
         terminal_panel.renderDock(state, content[0], layout.terminal_height);
     }
 }
@@ -128,14 +130,15 @@ fn computeWorkspaceLayout(state: *app_state.AppState, available_width: f32, avai
     const browser_gap = if (browser_visible) theme.scaledUi(12.0) else 0.0;
     const terminal_visible = state.isTerminalVisible();
     const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
+    const terminal_handle_height = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
     const minimum_workspace = theme.scaledUi(220.0);
     const preferred_terminal_height = if (terminal_visible) state.terminalPanelHeight(available_height) else 0.0;
     var terminal_height = preferred_terminal_height;
-    const available_terminal_height = @max(available_height - minimum_workspace - terminal_gap, 0.0);
+    const available_terminal_height = @max(available_height - minimum_workspace - terminal_gap - terminal_handle_height, 0.0);
     if (terminal_height > available_terminal_height) {
         terminal_height = available_terminal_height;
     }
-    const body_height = @max(available_height - terminal_gap - terminal_height, theme.scaledUi(120.0));
+    const body_height = @max(available_height - terminal_gap - terminal_handle_height - terminal_height, theme.scaledUi(120.0));
     const browser_width = if (browser_visible)
         @min(
             state.browserPanelWidth(available_width - browser_gap),
@@ -149,8 +152,62 @@ fn computeWorkspaceLayout(state: *app_state.AppState, available_width: f32, avai
         .browser_gap = if (browser_width > 0.0) browser_gap else 0.0,
         .browser_width = browser_width,
         .terminal_gap = if (terminal_height > 0.0) terminal_gap else 0.0,
+        .terminal_handle_height = if (terminal_height > 0.0) terminal_handle_height else 0.0,
         .terminal_height = terminal_height,
     };
+}
+
+fn renderTerminalResizeHandle(state: *app_state.AppState, width: f32, available_height: f32, height: f32) void {
+    if (height <= 0.0) return;
+
+    const draw_list = zgui.getWindowDrawList();
+    const handle_pos = zgui.getCursorScreenPos();
+    _ = zgui.invisibleButton("##terminal-resize-handle", .{ .w = width, .h = height });
+
+    const hovered = zgui.isItemHovered(.{});
+    const active = zgui.isItemActive();
+    if (hovered or active) {
+        zgui.setMouseCursor(.resize_ns);
+    }
+
+    if (zgui.isItemActivated()) {
+        state.beginTerminalResizeDrag(available_height);
+        zgui.resetMouseDragDelta(.left);
+    }
+
+    if (active) {
+        const drag_delta = zgui.getMouseDragDelta(.left, .{});
+        state.updateTerminalResizeDrag(available_height, drag_delta[1]);
+    } else if (zgui.isItemDeactivated() or !zgui.isMouseDown(.left)) {
+        state.endTerminalResizeDrag();
+    }
+
+    const handle_min = handle_pos;
+    const handle_max = .{ handle_pos[0] + width, handle_pos[1] + height };
+    const line_color = if (active)
+        zgui.colorConvertFloat4ToU32(theme.COLOR_GREEN)
+    else if (hovered)
+        zgui.colorConvertFloat4ToU32(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10))
+    else
+        zgui.colorConvertFloat4ToU32(theme.COLOR_PANEL_MUTED);
+    const grip_width = theme.clampf(width * 0.12, theme.scaledUi(40.0), theme.scaledUi(84.0));
+    const grip_height = theme.scaledUi(3.0);
+    const center_y = handle_min[1] + height * 0.5;
+    const grip_min = .{ handle_min[0] + (width - grip_width) * 0.5, center_y - grip_height * 0.5 };
+    const grip_max = .{ grip_min[0] + grip_width, grip_min[1] + grip_height };
+
+    draw_list.addLine(.{
+        .p1 = .{ handle_min[0], center_y },
+        .p2 = .{ handle_max[0], center_y },
+        .col = line_color,
+        .thickness = 1.0,
+    });
+    draw_list.addRectFilled(.{
+        .pmin = grip_min,
+        .pmax = grip_max,
+        .col = line_color,
+        .rounding = grip_height * 0.5,
+    });
 }
 
 /// Renders the chat workspace shell beside the sidebar.
