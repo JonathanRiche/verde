@@ -33,7 +33,10 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const content = zgui.getContentRegionAvail();
     // const gap = theme.clampf(content[0] * 0.012, theme.scaledUi(10.0), theme.scaledUi(18.0));
     const gap = 0;
-    const sidebar_width = theme.clampf(content[0] * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), content[0] * 0.38));
+    const sidebar_width = if (state.isSidebarCollapsed())
+        theme.clampf(content[0] * 0.07, theme.scaledUi(60.0), theme.scaledUi(76.0))
+    else
+        theme.clampf(content[0] * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), content[0] * 0.38));
     const workspace_width = @max(content[0] - sidebar_width - gap, theme.scaledUi(320.0));
     zgui.setCursorPos(.{ 0.0, 0.0 });
     sidebar.render(state, sidebar_width, 0.0);

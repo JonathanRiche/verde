@@ -79,6 +79,7 @@ pub const PersistedProject = struct {
 
 pub const PersistedState = struct {
     selected_project_index: usize = 0,
+    sidebar_collapsed: bool = false,
     projects: []const PersistedProject = &.{},
     provider: ?Provider = null,
     harness: ?Harness = null,

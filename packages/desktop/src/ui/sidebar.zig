@@ -11,7 +11,8 @@ const Provider = native_state.Provider;
 /// Renders the full project rail and thread list.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     _ = height;
-    const horiz_pad = theme.scaledUi(25.0);
+    const is_sidebar_collapsed = state.isSidebarCollapsed();
+    const horiz_pad = if (is_sidebar_collapsed) theme.scaledUi(10.0) else theme.scaledUi(25.0);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 0.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     defer zgui.popStyleVar(.{ .count = 2 });
@@ -30,7 +31,8 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     defer zgui.unindent(.{ .indent_w = horiz_pad });
 
     const pad_top = theme.scaledUi(20.0);
-    const rail_width = @max(width - 2 * horiz_pad, theme.scaledUi(100.0));
+    const rail_min_width = if (is_sidebar_collapsed) theme.scaledUi(36.0) else theme.scaledUi(100.0);
+    const rail_width = @max(width - 2 * horiz_pad, rail_min_width);
     zgui.setCursorPos(.{ horiz_pad, pad_top });
 
     {
@@ -47,9 +49,22 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         });
     }
 
+    if (is_sidebar_collapsed) {
+        renderCompactRail(state, width, rail_width);
+        return;
+    }
+
     const project_header_button_width = theme.clampf(rail_width * 0.11, theme.scaledUi(28.0), theme.scaledUi(38.0));
     const rail_inner_width = @max(rail_width, theme.scaledUi(140.0));
+    const brand_start = zgui.getCursorPos();
     renderBrand(state, width);
+    const brand_end = zgui.getCursorPos();
+    zgui.setCursorPos(.{
+        width - horiz_pad - project_header_button_width,
+        brand_start[1] + theme.scaledUi(2.0),
+    });
+    _ = renderSidebarShellToggleButton(state, "Collapse sidebar", "<", project_header_button_width, theme.scaledUi(24.0));
+    zgui.setCursorPos(brand_end);
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(18.0) });
     zgui.textColored(theme.COLOR_TEXT_MUTED, "PROJECTS", .{});
     zgui.sameLine(.{ .spacing = 0.0 });
@@ -221,31 +236,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
             if (zgui.beginPopupContextItem()) {
                 defer zgui.endPopup();
-
-                state.noteInteraction();
-                state.selected_project_index = index;
-                state.syncRenameBuffer();
-
-                if (zgui.menuItem("Rename project", .{})) {
-                    state.beginProjectRename(index);
-                    zgui.openPopup(runtime.PROJECT_RENAME_MODAL_ID, .{});
-                    zgui.closeCurrentPopup();
-                }
-                if (zgui.menuItem("Import Codex thread", .{})) {
-                    state.beginThreadImport(index, .codex);
-                    zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
-                    zgui.closeCurrentPopup();
-                }
-                if (zgui.menuItem("Import OpenCode thread", .{})) {
-                    state.beginThreadImport(index, .opencode);
-                    zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
-                    zgui.closeCurrentPopup();
-                }
-                if (zgui.menuItem("Archive project", .{})) {
-                    state.archiveProjectAtIndex(index);
-                    zgui.closeCurrentPopup();
-                    break;
-                }
+                if (renderProjectContextMenu(state, index)) break;
             }
         }
 
@@ -307,6 +298,166 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     }
 }
 
+fn renderCompactRail(state: *runtime.AppState, width: f32, rail_width: f32) void {
+    const button_size = @max(rail_width, theme.scaledUi(34.0));
+    const button_height = theme.scaledUi(32.0);
+
+    renderCompactBrand(state, width, button_size);
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(12.0) });
+
+    _ = renderSidebarShellToggleButton(state, "Expand sidebar", ">", button_size, button_height);
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
+
+    zgui.beginDisabled(.{ .disabled = state.projects.items.len == 0 });
+    if (renderThreadEditButton(state, button_size, button_height)) {
+        state.createThreadForProject(state.selected_project_index);
+    }
+    zgui.endDisabled();
+    if (zgui.isItemHovered(.{ .delay_normal = true })) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted("Start a new chat");
+        zgui.endTooltip();
+    }
+
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) });
+    if (zgui.button("+", .{ .w = button_size, .h = button_height })) {
+        state.show_project_creator = true;
+        state.setSidebarCollapsed(false);
+        state.setSidebarNotice("");
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+    if (zgui.isItemHovered(.{ .delay_normal = true })) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted("Add a project");
+        zgui.endTooltip();
+    }
+
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(14.0) });
+    var index: usize = 0;
+    while (index < state.projects.items.len) : (index += 1) {
+        if (renderCompactProjectButton(state, index, button_size)) break;
+        zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
+    }
+}
+
+fn renderCompactBrand(state: *runtime.AppState, width: f32, button_size: f32) void {
+    const start = zgui.getCursorPos();
+    if (state.logo_texture) |cached| {
+        const logo_size = @min(button_size, theme.scaledUi(28.0));
+        const x = start[0] + (width - 2.0 * start[0] - logo_size) * 0.5;
+        zgui.setCursorPos(.{ x, start[1] });
+        zgui.image(runtime.textureRefFromGlId(cached.texture_id), .{
+            .w = logo_size,
+            .h = logo_size,
+        });
+        zgui.setCursorPos(.{ start[0], start[1] + logo_size });
+        return;
+    }
+
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.COLOR_PANEL_ALT });
+    _ = zgui.button("V", .{ .w = button_size, .h = button_size });
+    zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn renderCompactProjectButton(state: *runtime.AppState, index: usize, button_size: f32) bool {
+    const project = &state.projects.items[index];
+    const is_selected = state.selected_project_index == index;
+    var monogram_buf = std.mem.zeroes([4:0]u8);
+
+    zgui.pushIntId(@intCast(index));
+    defer zgui.popId();
+
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = if (is_selected) colors.CHAT_BLACK else theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = if (is_selected) theme.lighten(colors.CHAT_BLACK, 0.06) else theme.lighten(theme.COLOR_PANEL_ALT, 0.06) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = if (is_selected) theme.lighten(colors.CHAT_BLACK, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.12) });
+    if (zgui.button(projectMonogram(&monogram_buf, project.label), .{
+        .w = button_size,
+        .h = theme.scaledUi(34.0),
+    })) {
+        state.noteInteraction();
+        state.selected_project_index = index;
+        state.syncRenameBuffer();
+        state.requestTranscriptScrollToBottom();
+    }
+    zgui.popStyleColor(.{ .count = 3 });
+
+    if (project.unread_count > 0) {
+        const draw_list = zgui.getWindowDrawList();
+        const min = zgui.getItemRectMin();
+        draw_list.addCircleFilled(.{
+            .p = .{
+                min[0] + button_size - theme.scaledUi(5.0),
+                min[1] + theme.scaledUi(5.0),
+            },
+            .r = theme.scaledUi(3.0),
+            .col = zgui.colorConvertFloat4ToU32(theme.COLOR_YELLOW),
+        });
+    }
+
+    if (zgui.beginPopupContextItem()) {
+        defer zgui.endPopup();
+        if (renderProjectContextMenu(state, index)) return true;
+    }
+
+    if (zgui.isItemHovered(.{ .delay_normal = true })) {
+        var saved_buf: [32]u8 = undefined;
+        _ = zgui.beginTooltip();
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{project.label});
+        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{project.path});
+        zgui.separator();
+        const saved_label = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCount()}) catch "saved chats";
+        zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{saved_label});
+        if (project.unread_count > 0) {
+            zgui.textColored(theme.COLOR_YELLOW, "{d} pending", .{project.unread_count});
+        }
+        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Right-click for project actions", .{});
+        zgui.endTooltip();
+    }
+
+    return false;
+}
+
+fn renderProjectContextMenu(state: *runtime.AppState, index: usize) bool {
+    state.noteInteraction();
+    state.selected_project_index = index;
+    state.syncRenameBuffer();
+
+    if (zgui.menuItem("Start a new chat", .{})) {
+        state.createThreadForProject(index);
+        zgui.closeCurrentPopup();
+        return false;
+    }
+    if (zgui.menuItem("Rename project", .{})) {
+        state.beginProjectRename(index);
+        zgui.openPopup(runtime.PROJECT_RENAME_MODAL_ID, .{});
+        zgui.closeCurrentPopup();
+        return false;
+    }
+    if (zgui.menuItem("Import Codex thread", .{})) {
+        state.beginThreadImport(index, .codex);
+        zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
+        zgui.closeCurrentPopup();
+        return false;
+    }
+    if (zgui.menuItem("Import OpenCode thread", .{})) {
+        state.beginThreadImport(index, .opencode);
+        zgui.openPopup(runtime.THREAD_IMPORT_MODAL_ID, .{});
+        zgui.closeCurrentPopup();
+        return false;
+    }
+    if (zgui.menuItem("Archive project", .{})) {
+        state.archiveProjectAtIndex(index);
+        zgui.closeCurrentPopup();
+        return true;
+    }
+    return false;
+}
+
 /// New-thread button using the loaded edit texture, transparent bg with hover highlight.
 fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) bool {
     const start = zgui.getCursorScreenPos();
@@ -336,6 +487,23 @@ fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) boo
         });
     }
 
+    return clicked;
+}
+
+fn renderSidebarShellToggleButton(state: *runtime.AppState, tooltip: []const u8, label: [:0]const u8, width: f32, height: f32) bool {
+    zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
+    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.06) });
+    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.12) });
+    const clicked = zgui.button(label, .{ .w = width, .h = height });
+    zgui.popStyleColor(.{ .count = 3 });
+    if (clicked) {
+        state.toggleSidebarCollapsed();
+    }
+    if (zgui.isItemHovered(.{ .delay_normal = true })) {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted(tooltip);
+        zgui.endTooltip();
+    }
     return clicked;
 }
 
@@ -389,6 +557,49 @@ fn renderBrand(state: *runtime.AppState, sidebar_width: f32) void {
     }
     // Restore cursor for left-aligned content below
     zgui.setCursorPos(.{ start[0], start[1] + row_height });
+}
+
+fn projectMonogram(buffer: *[4:0]u8, value: []const u8) [:0]const u8 {
+    @memset(buffer, 0);
+
+    var count: usize = 0;
+    var take_next = true;
+    var first_letter: u8 = 0;
+    for (value) |char| {
+        if (!std.ascii.isAlphanumeric(char)) {
+            take_next = true;
+            continue;
+        }
+
+        const upper = std.ascii.toUpper(char);
+        if (count == 0) first_letter = upper;
+        if (take_next) {
+            buffer[count] = upper;
+            count += 1;
+            if (count == 2) break;
+        }
+        take_next = false;
+    }
+
+    if (count == 0) {
+        buffer[0] = '?';
+        buffer[1] = 0;
+        return buffer[0..1 :0];
+    }
+
+    if (count == 1) {
+        for (value) |char| {
+            if (!std.ascii.isAlphanumeric(char)) continue;
+            const upper = std.ascii.toUpper(char);
+            if (upper == first_letter) continue;
+            buffer[1] = upper;
+            count = 2;
+            break;
+        }
+    }
+
+    buffer[count] = 0;
+    return buffer[0..count :0];
 }
 
 /// Draws one saved thread row under the active project.

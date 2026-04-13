@@ -10,6 +10,7 @@ const log = std.log.scoped(.native_keybinds);
 pub const NativeKeyboardAction = enum {
     refresh,
     open_default,
+    toggle_sidebar,
     toggle_browser,
     toggle_terminal,
     chat_up,
@@ -55,6 +56,7 @@ pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
     open_default: []Keybind,
+    toggle_sidebar: []Keybind,
     toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
     chat_up: []Keybind,
@@ -67,6 +69,7 @@ pub const NativeKeyboardConfig = struct {
             .allocator = allocator,
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
+            .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
             .chat_up = try cloneDefaultChatUpKeybinds(allocator),
@@ -90,6 +93,7 @@ pub const NativeKeyboardConfig = struct {
     pub fn deinit(self: *NativeKeyboardConfig) void {
         self.allocator.free(self.refresh);
         self.allocator.free(self.open_default);
+        self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
         self.allocator.free(self.chat_up);
@@ -104,6 +108,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.open_default, event)) {
             return .open_default;
+        }
+        if (matchesAny(self.toggle_sidebar, event)) {
+            return .toggle_sidebar;
         }
         if (matchesAny(self.toggle_browser, event)) {
             return .toggle_browser;
@@ -149,6 +156,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(open_value, "open")) |bindings| {
                 self.allocator.free(self.open_default);
                 self.open_default = bindings;
+            }
+        }
+        if (keybinds_value.object.get("sidebar")) |sidebar_value| {
+            if (self.parseOverrideValue(sidebar_value, "sidebar")) |bindings| {
+                self.allocator.free(self.toggle_sidebar);
+                self.toggle_sidebar = bindings;
             }
         }
         if (keybinds_value.object.get("browser")) |browser_value| {
@@ -267,6 +280,12 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+O"),
+    });
+}
+
+fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+S"),
     });
 }
 
@@ -588,6 +607,33 @@ test "browser keybind override accepts a single accelerator" {
     try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
 }
 
+test "sidebar keybind override accepts a single accelerator" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    const root: std.json.Value = .{
+        .object = blk: {
+            var object = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer object.deinit();
+
+            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
+            errdefer keybinds.deinit();
+
+            try keybinds.put("sidebar", .{ .string = "Ctrl+Shift+M" });
+            try object.put("keybinds", .{ .object = keybinds });
+            break :blk object;
+        },
+    };
+    defer root.object.deinit();
+
+    config.applyOverrides(root);
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar.len);
+    try std.testing.expect(config.toggle_sidebar[0].ctrl);
+    try std.testing.expect(config.toggle_sidebar[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.m, config.toggle_sidebar[0].key);
+}
+
 test "default open keybind uses alt plus o" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -610,6 +656,18 @@ test "default browser keybind uses ctrl plus b" {
     try std.testing.expect(!config.toggle_browser[0].meta);
     try std.testing.expect(!config.toggle_browser[0].primary);
     try std.testing.expectEqual(sdl.Keycode.b, config.toggle_browser[0].key);
+}
+
+test "default sidebar keybind uses primary plus s" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar.len);
+    try std.testing.expect(!config.toggle_sidebar[0].alt);
+    try std.testing.expect(!config.toggle_sidebar[0].ctrl);
+    try std.testing.expect(!config.toggle_sidebar[0].meta);
+    try std.testing.expect(config.toggle_sidebar[0].primary);
+    try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar[0].key);
 }
 
 test "default chat scroll keybinds use arrows and paging keys" {

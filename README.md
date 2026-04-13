@@ -228,6 +228,7 @@ Example config:
   },
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
+    "sidebar": "CommandOrControl+S",
     "browser": "Ctrl+B"
   }
 }

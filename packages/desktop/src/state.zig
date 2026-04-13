@@ -688,6 +688,7 @@ pub const AppState = struct {
     sidebar_notice_storage: [256:0]u8,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
+    sidebar_collapsed: bool,
     composer_focused: bool,
     terminal_focused: bool,
     debug_terminal_window_focused: bool,
@@ -755,6 +756,7 @@ pub const AppState = struct {
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
             .import_notice_storage = std.mem.zeroes([256:0]u8),
+            .sidebar_collapsed = false,
             .composer_focused = false,
             .terminal_focused = false,
             .debug_terminal_window_focused = false,
@@ -1611,6 +1613,7 @@ pub const AppState = struct {
     }
 
     fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
+        self.sidebar_collapsed = persisted.sidebar_collapsed;
         if (persisted.projects.len == 0) {
             self.selected_project_index = 0;
             self.next_project_number = 1;
@@ -1771,6 +1774,7 @@ pub const AppState = struct {
 
         loaded.value = .{
             .selected_project_index = self.selected_project_index,
+            .sidebar_collapsed = self.sidebar_collapsed,
             .projects = try projects.toOwnedSlice(arena),
         };
         return loaded;
@@ -2335,6 +2339,20 @@ pub const AppState = struct {
 
     pub fn isTerminalVisible(self: *const AppState) bool {
         return self.projects.items.len > 0 and self.currentProjectTerminal().visible;
+    }
+
+    pub fn isSidebarCollapsed(self: *const AppState) bool {
+        return self.sidebar_collapsed;
+    }
+
+    pub fn setSidebarCollapsed(self: *AppState, collapsed: bool) void {
+        if (self.sidebar_collapsed == collapsed) return;
+        self.sidebar_collapsed = collapsed;
+        self.markDirty();
+    }
+
+    pub fn toggleSidebarCollapsed(self: *AppState) void {
+        self.setSidebarCollapsed(!self.sidebar_collapsed);
     }
 
     pub fn terminalPanelHeight(self: *const AppState, available_height: f32) f32 {
