@@ -32,6 +32,7 @@ const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler
 const DeviceAttributes = @typeInfo(
     std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.device_attributes))),
 ).@"fn".return_type.?;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 
@@ -542,6 +543,10 @@ const UnixSession = struct {
         std.posix.chdir(cwd) catch {
             std.c._exit(127);
         };
+
+        if (std.posix.getenv("TERM") == null) {
+            _ = setenv("TERM", "xterm-256color", 1);
+        }
 
         const shell = std.posix.getenv("SHELL") orelse "/bin/bash";
         const argv = [_:null]?[*:0]const u8{
