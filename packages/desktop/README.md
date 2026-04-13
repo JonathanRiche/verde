@@ -236,7 +236,18 @@ Current supported config includes UI font size, keybind overrides, and the defau
     "open": "Alt+O",
     "sidebar": "CommandOrControl+S",
     "browser": "Ctrl+B",
-    "terminal": "CommandOrControl+J",
+    "terminal": {
+      "toggle":       "CommandOrControl+J",
+      "new_tab":      "CommandOrControl+Shift+T",
+      "close":        "CommandOrControl+Shift+W",
+      "rename_tab":   "CommandOrControl+Shift+R",
+      "tab_previous": "CommandOrControl+Shift+PageUp",
+      "tab_next":     "CommandOrControl+Shift+PageDown",
+      "split_up":     "CommandOrControl+Shift+Up",
+      "split_down":   ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
+      "split_left":   "CommandOrControl+Shift+Left",
+      "split_right":  ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"]
+    },
     "chat_up": "Up",
     "chat_down": "Down",
     "chat_page_up": "PageUp",
@@ -245,7 +256,9 @@ Current supported config includes UI font size, keybind overrides, and the defau
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in sidebar toggle binding is `CommandOrControl+S`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in sidebar toggle binding is `CommandOrControl+S`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in terminal workspace bindings are `CommandOrControl+Shift+T`, `W`, `R`, `PageUp`, `PageDown`, `Up`, `Left`, `E`/`Down`, and `O`/`Right`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
+
+For backward compatibility, `keybinds.terminal` still accepts a string or string array to override only the terminal toggle shortcut.
 
 `open.default` accepts lower-case string values:
 
