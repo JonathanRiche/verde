@@ -4,7 +4,6 @@ const std = @import("std");
 const zgui = @import("zgui");
 
 const app_state = @import("../state.zig");
-const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
@@ -94,12 +93,19 @@ fn renderToolbar(state: *app_state.AppState) void {
     const frame_pad_y = (button_size - zgui.getFontSize()) * 0.5;
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), frame_pad_y } });
     zgui.pushItemWidth(field_width);
-    _ = zgui.inputTextWithHint("##browser-address", .{
+    if (zgui.isWindowAppearing()) {
+        zgui.setKeyboardFocusHere(0);
+    }
+    const submitted = zgui.inputTextWithHint("##browser-address", .{
         .hint = "https://example.com",
         .buf = browser_state.addressBuffer(),
+        .flags = .{ .enter_returns_true = true },
     });
     zgui.popItemWidth();
     zgui.popStyleVar(.{ .count = 1 });
+    if (submitted) {
+        state.navigateBrowserFromAddress();
+    }
 
     zgui.sameLine(.{ .spacing = gap });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_SECONDARY_GREEN });
@@ -306,46 +312,8 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
         pane_hovered,
     );
 
-    renderPanePlaceholder(
-        browser_state.controller.runtimeKind(),
-        browser_state.controller.runtimeInitialized(),
-        browser_state.controller.paneSessionId(),
-        browser_state.controller.sdkConfigured(),
-    );
+    renderPanePlaceholder();
 }
 
-/// Renders browser-pane scaffold details until the real CEF paint path is wired.
-fn renderPanePlaceholder(
-    runtime_kind: browser_runtime.RuntimeKind,
-    runtime_initialized: bool,
-    session_id: ?browser_runtime.SessionId,
-    sdk_configured: bool,
-) void {
-    zgui.textColored(theme.COLOR_WHITE, "Browser Pane", .{});
-    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Runtime: {s}", .{runtimeKindLabel(runtime_kind)});
-    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Lazy init: {s}", .{if (runtime_initialized) "warm" else "cold"});
-    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "CEF SDK: {s}", .{if (sdk_configured) "configured" else "not configured"});
-    if (session_id) |id| {
-        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Session: {}", .{id});
-    } else {
-        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Session: not created yet", .{});
-    }
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
-    if (runtime_kind == .legacy_native) {
-        zgui.textWrapped("The current native helper backend is active. On Linux it now feeds browser snapshots into this pane directly, so URL navigation and rendered page content stay inside the app layout.", .{});
-        return;
-    }
-    if (!sdk_configured) {
-        zgui.textWrapped("The in-app pane preview is active without a real CEF SDK. You can validate pane layout, lazy init, session creation, and texture presentation here before Chromium is wired in.", .{});
-        return;
-    }
-    zgui.textWrapped("CEF is now the target runtime for the in-app browser pane. The dock is reserving a real viewport region here while the paint, input, and process bootstrap layers are integrated.", .{});
-}
-
-// Converts the runtime enum into a compact label for the browser dock.
-fn runtimeKindLabel(kind: browser_runtime.RuntimeKind) []const u8 {
-    return switch (kind) {
-        .legacy_native => "Legacy native",
-        .cef => "CEF",
-    };
-}
+/// Keeps the pane visually blank until the first browser frame arrives.
+fn renderPanePlaceholder() void {}
