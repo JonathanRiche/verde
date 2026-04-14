@@ -5,13 +5,13 @@ import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
 export default function Header() {
   return (
     <header class="site-header">
-      <nav class="page-wrap site-nav" aria-label="Primary">
-        <Link to="/" class="site-brand">
-          <img src={verdeLogo} alt="Verde" class="site-brand-logo" />
+      <nav class="wrap header-inner" aria-label="Primary">
+        <Link to="/" class="brand">
+          <img src={verdeLogo} alt="Verde" class="brand-logo" />
           <span>verde</span>
         </Link>
 
-        <div class="site-links">
+        <div class="nav-links">
           <a href="/#product" class="nav-link">
             Product
           </a>
