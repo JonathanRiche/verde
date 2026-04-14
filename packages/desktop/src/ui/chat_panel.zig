@@ -268,31 +268,48 @@ fn renderHeader(state: anytype) void {
     else
         "No project selected";
 
+    const button_height = theme.scaledUi(30.0);
+    const button_gap = theme.scaledUi(8.0);
+    const title_actions_gap = theme.scaledUi(16.0);
+    const open_label = if (has_project) state.defaultOpenButtonLabel() else "";
+    const open_icon_texture = if (has_project) state.defaultOpenIconTexture() else null;
+    const open_draw_folder_icon = if (has_project) state.defaultOpenShowsFolderIcon() else false;
+    const open_has_icon = open_draw_folder_icon or open_icon_texture != null;
+    const open_button_width = if (has_project)
+        theme.clampf(
+            zgui.calcTextSize(open_label, .{})[0] + theme.scaledUi(if (open_has_icon) 54.0 else 28.0),
+            theme.scaledUi(82.0),
+            theme.scaledUi(184.0),
+        )
+    else
+        0.0;
+    const menu_button_width = if (has_project) theme.scaledUi(30.0) else 0.0;
+    const browser_button_width = if (has_project) theme.scaledUi(106.0) else 0.0;
+    const actions_width = if (has_project)
+        open_button_width + menu_button_width + browser_button_width + button_gap * 2.0
+    else
+        0.0;
+    const action_x = header_start_x + if (has_project)
+        @max(theme.scaledUi(180.0), header_content_width - actions_width)
+    else
+        header_content_width;
+    const title_max_width = if (has_project)
+        @max(action_x - header_start_x - title_actions_gap, theme.scaledUi(96.0))
+    else
+        header_content_width;
+    var title_buf: [256]u8 = undefined;
+    const display_title = truncateTextToWidth(&title_buf, title_text, title_max_width);
+
     if (theme.heading_font) |font| {
         zgui.pushFont(font, 18);
         defer zgui.popFont();
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{title_text});
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{display_title});
     } else {
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{title_text});
+        zgui.textColored(theme.COLOR_WHITE, "{s}", .{display_title});
     }
 
     if (!has_project) return;
 
-    const button_height = theme.scaledUi(30.0);
-    const button_gap = theme.scaledUi(8.0);
-    const open_label = state.defaultOpenButtonLabel();
-    const open_icon_texture = state.defaultOpenIconTexture();
-    const open_draw_folder_icon = state.defaultOpenShowsFolderIcon();
-    const open_has_icon = open_draw_folder_icon or open_icon_texture != null;
-    const open_button_width = theme.clampf(
-        zgui.calcTextSize(open_label, .{})[0] + theme.scaledUi(if (open_has_icon) 54.0 else 28.0),
-        theme.scaledUi(82.0),
-        theme.scaledUi(184.0),
-    );
-    const menu_button_width = theme.scaledUi(30.0);
-    const browser_button_width = theme.scaledUi(106.0);
-    const actions_width = open_button_width + menu_button_width + browser_button_width + button_gap * 2.0;
-    const action_x = header_start_x + @max(theme.scaledUi(180.0), header_content_width - actions_width);
     const base_y = header_start[1];
     const can_open_folder = state.canOpenCurrentProjectDirectory();
     const can_open_configured = state.canOpenCurrentProjectEditor(.configured);
@@ -380,6 +397,36 @@ fn renderHeader(state: anytype) void {
         zgui.textUnformatted("Open the browser controls and native webview runtime");
         zgui.endTooltip();
     }
+}
+
+fn truncateTextToWidth(buffer: []u8, value: []const u8, max_width: f32) []const u8 {
+    if (buffer.len == 0 or max_width <= 0.0) return "";
+    if (zgui.calcTextSize(value, .{})[0] <= max_width) return value;
+
+    const ellipsis = "...";
+    const ellipsis_width = zgui.calcTextSize(ellipsis, .{})[0];
+    if (ellipsis_width > max_width) return "";
+    if (buffer.len <= ellipsis.len) return ellipsis;
+
+    const max_prefix_len = @min(value.len, buffer.len - ellipsis.len);
+    var low: usize = 0;
+    var high: usize = max_prefix_len;
+
+    while (low < high) {
+        const mid = low + @divFloor(high - low + 1, 2);
+        @memcpy(buffer[0..mid], value[0..mid]);
+        @memcpy(buffer[mid .. mid + ellipsis.len], ellipsis);
+        const candidate = buffer[0 .. mid + ellipsis.len];
+        if (zgui.calcTextSize(candidate, .{})[0] <= max_width) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    @memcpy(buffer[0..low], value[0..low]);
+    @memcpy(buffer[low .. low + ellipsis.len], ellipsis);
+    return buffer[0 .. low + ellipsis.len];
 }
 
 fn renderHeaderActionButton(
