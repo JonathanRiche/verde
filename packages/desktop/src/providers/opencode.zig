@@ -387,6 +387,10 @@ pub const Client = struct {
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
             var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
             defer latest_snapshot.deinit(self.allocator);
+            const stream_idle = if (event_stream_context) |context|
+                eventStreamReachedIdle(context)
+            else
+                false;
             if (event_stream_context) |context| {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
@@ -419,7 +423,7 @@ pub const Client = struct {
             }
 
             if (!has_pending_permissions and
-                (status == .idle or latest_snapshot.isTerminalForPrompt(baseline_assistant_id)))
+                (status == .idle or stream_idle or latest_snapshot.isTerminalForPrompt(baseline_assistant_id)))
             {
                 break;
             }
@@ -831,6 +835,7 @@ const EventStreamContext = struct {
     condition: std.Thread.Condition = .{},
     open_state: EventStreamOpenState = .starting,
     stop_requested: bool = false,
+    session_idle: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
@@ -1358,6 +1363,7 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
     const envelope = parseEventEnvelope(parsed.value, raw_event_name) orelse return false;
 
     if (std.mem.eql(u8, envelope.event_type, "session.idle")) {
+        signalEventStreamIdle(context);
         return false;
     }
 
@@ -1376,6 +1382,18 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
     }
 
     return false;
+}
+
+fn signalEventStreamIdle(context: *EventStreamContext) void {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    context.session_idle = true;
+}
+
+fn eventStreamReachedIdle(context: *EventStreamContext) bool {
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    return context.session_idle;
 }
 
 const EventEnvelope = struct {
