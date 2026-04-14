@@ -146,3 +146,9 @@ pub const InterruptThreadRequest = struct {
     thread_id: []const u8,
     turn_id: ?[]const u8 = null,
 };
+
+pub const SteerThreadRequest = struct {
+    thread_id: []const u8,
+    turn_id: []const u8,
+    prompt: []const u8,
+};

@@ -672,6 +672,7 @@ pub const SendState = struct {
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
     pending_approval: ?PendingApproval = null,
     pending_followup: ?PendingFollowup = null,
+    pending_followup_signal_sent: bool = false,
     approval_decision: ?ai_harness.ApprovalDecision = null,
     stop_requested: bool = false,
     stop_signal_sent: bool = false,
@@ -1639,6 +1640,7 @@ pub const AppState = struct {
         defer send_state.mutex.unlock();
 
         freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.pending_followup_signal_sent = false;
         send_state.pending_followup = .{
             .kind = kind,
             .prompt = self.allocator.dupe(u8, draft) catch {
@@ -1646,19 +1648,12 @@ pub const AppState = struct {
                 return;
             },
         };
-        if (kind == .steer) {
-            send_state.stop_requested = true;
-            if (send_state.pending_approval != null) {
-                send_state.approval_decision = .deny;
-                send_state.condition.broadcast();
-            }
-        }
 
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.setSidebarNotice(switch (kind) {
             .queue => "Queued for the next OpenCode turn.",
-            .steer => "Steer queued. Waiting to stop the current Codex turn.",
+            .steer => "Steer queued. Waiting for Codex to accept it.",
         });
     }
 
@@ -1756,6 +1751,30 @@ pub const AppState = struct {
         });
     }
 
+    fn steerThreadViaHarness(
+        self: *AppState,
+        project_path: []const u8,
+        thread_id: []const u8,
+        turn_id: []const u8,
+        prompt: []const u8,
+    ) !void {
+        const provider_config = ai_harness.ProviderConfig{
+            .codex = .{
+                .cwd = project_path,
+                .launch_on_connect = true,
+            },
+        };
+
+        var client = try ai_harness.connect(self.allocator, provider_config);
+        defer client.deinit();
+
+        return client.steerThread(.{
+            .thread_id = thread_id,
+            .turn_id = turn_id,
+            .prompt = prompt,
+        });
+    }
+
     fn beginSendForThread(self: *AppState, project_path: []const u8, thread: *ChatThread, prompt: []const u8) !void {
         _ = self;
         const page_alloc = std.heap.page_allocator;
@@ -1805,6 +1824,7 @@ pub const AppState = struct {
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
         freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
         send_state.approval_decision = null;
+        send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
         send_state.stop_signal_sent = false;
         send_state.worker = try std.Thread.spawn(.{}, sendWorker, .{ send_state, request });
@@ -3799,6 +3819,7 @@ pub const AppState = struct {
 
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
         self.capturePendingProviderThreadId(thread);
+        self.issuePendingCodexSteer(self.projects.items[project_index].path, project_index, thread_index, thread);
         self.issuePendingThreadStop(self.projects.items[project_index].path, thread);
 
         var completed_result: ?SendResultPayload = null;
@@ -4010,11 +4031,103 @@ pub const AppState = struct {
         };
     }
 
+    fn issuePendingCodexSteer(
+        self: *AppState,
+        project_path: []const u8,
+        project_index: usize,
+        thread_index: usize,
+        thread: *ChatThread,
+    ) void {
+        if (thread.provider != .codex) return;
+
+        var thread_id: ?[]u8 = null;
+        var turn_id: ?[]u8 = null;
+        var prompt: ?[]u8 = null;
+
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        if (send_state.status == .pending and
+            !send_state.stop_requested and
+            send_state.pending_followup != null and
+            send_state.pending_followup.?.kind == .steer and
+            !send_state.pending_followup_signal_sent)
+        {
+            const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
+                existing
+            else if (send_state.provisional_provider_thread_id) |provisional|
+                provisional
+            else
+                null;
+            if (pending_thread_id) |resolved_thread_id| {
+                if (send_state.active_turn_id) |active_turn_id| {
+                    thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
+                    turn_id = self.allocator.dupe(u8, active_turn_id) catch null;
+                    prompt = self.allocator.dupe(u8, send_state.pending_followup.?.prompt) catch null;
+                    send_state.pending_followup_signal_sent = thread_id != null and turn_id != null and prompt != null;
+                    if (!send_state.pending_followup_signal_sent) {
+                        if (thread_id) |owned_thread_id| {
+                            self.allocator.free(owned_thread_id);
+                            thread_id = null;
+                        }
+                        if (turn_id) |owned_turn_id| {
+                            self.allocator.free(owned_turn_id);
+                            turn_id = null;
+                        }
+                        if (prompt) |owned_prompt| {
+                            self.allocator.free(owned_prompt);
+                            prompt = null;
+                        }
+                    }
+                }
+            }
+        }
+        send_state.mutex.unlock();
+
+        const owned_thread_id = thread_id orelse return;
+        const owned_turn_id = turn_id orelse {
+            self.allocator.free(owned_thread_id);
+            return;
+        };
+        const owned_prompt = prompt orelse {
+            self.allocator.free(owned_thread_id);
+            self.allocator.free(owned_turn_id);
+            return;
+        };
+        defer self.allocator.free(owned_thread_id);
+        defer self.allocator.free(owned_turn_id);
+        defer self.allocator.free(owned_prompt);
+
+        self.steerThreadViaHarness(project_path, owned_thread_id, owned_turn_id, owned_prompt) catch |err| {
+            send_state.mutex.lock();
+            defer send_state.mutex.unlock();
+            send_state.pending_followup_signal_sent = true;
+            self.setSidebarNotice(switch (err) {
+                error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. It will send after the current reply finishes.",
+                else => "Failed to send Codex steer. It will send after the current reply finishes.",
+            });
+            return;
+        };
+
+        send_state.mutex.lock();
+        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.pending_followup_signal_sent = false;
+        send_state.mutex.unlock();
+
+        self.appendMessageToThread(thread, .user, "You", owned_prompt, null) catch |err| {
+            log.err("failed to append steered Codex prompt: {s}", .{@errorName(err)});
+        };
+        if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+            self.requestTranscriptScrollToBottom();
+        }
+        self.setSidebarNotice("Codex steer sent.");
+    }
+
     fn dispatchPendingFollowup(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
         const send_state = thread.send_state;
         send_state.mutex.lock();
         const pending = send_state.pending_followup;
         send_state.pending_followup = null;
+        send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
         send_state.stop_signal_sent = false;
         send_state.mutex.unlock();
@@ -4037,7 +4150,7 @@ pub const AppState = struct {
         }
         self.setSidebarNotice(switch (followup.kind) {
             .queue => "Queued OpenCode message sent.",
-            .steer => "Codex follow-up sent.",
+            .steer => "Codex follow-up sent as a new turn.",
         });
     }
 
@@ -4046,6 +4159,7 @@ pub const AppState = struct {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
         send_state.stop_signal_sent = false;
     }

@@ -23,6 +23,7 @@ pub const StreamEvent = types.StreamEvent;
 pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
 pub const InterruptThreadRequest = types.InterruptThreadRequest;
+pub const SteerThreadRequest = types.SteerThreadRequest;
 pub const freeModelInfos = types.freeModelInfos;
 
 pub const ProviderConfig = union(Provider) {
@@ -80,6 +81,13 @@ pub const ProviderClient = union(Provider) {
         return switch (self.*) {
             .opencode => |*client| client.interruptThread(request),
             .codex => |*client| client.interruptThread(request),
+        };
+    }
+
+    pub fn steerThread(self: *ProviderClient, request: SteerThreadRequest) !void {
+        return switch (self.*) {
+            .opencode => |*client| client.steerThread(request),
+            .codex => |*client| client.steerThread(request),
         };
     }
 };

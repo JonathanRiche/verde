@@ -237,6 +237,14 @@ pub const Client = struct {
         self.allocator.free(payload);
     }
 
+    pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
+        try self.ensureConnected();
+        try self.ensureThreadLoaded(request.thread_id);
+
+        const payload = try self.callTurnSteerForResultAlloc(request);
+        defer self.allocator.free(payload);
+    }
+
     fn ensureConnected(self: *Client) !void {
         if (self.stream == null) {
             switch (self.config.transport) {
@@ -681,6 +689,34 @@ pub const Client = struct {
         return id;
     }
 
+    fn callTurnSteerForResultAlloc(self: *Client, request: provider_types.SteerThreadRequest) ![]u8 {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const id = try self.sendRequest("turn/steer", .{
+                .threadId = request.thread_id,
+                .input = .{
+                    .{
+                        .type = "text",
+                        .text = request.prompt,
+                    },
+                },
+                .expectedTurnId = request.turn_id,
+            });
+            const maybe_payload = self.awaitTurnSteerResultPayloadAlloc(id);
+            if (maybe_payload) |payload| {
+                return payload;
+            } else |err| switch (err) {
+                error.ServerOverloaded => {
+                    if (attempt + 1 >= MAX_RPC_RETRIES) return err;
+                    const backoff_ms: u64 = @min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500);
+                    std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+                    continue;
+                },
+                else => return err,
+            }
+        }
+    }
+
     fn callRpcForResultAlloc(self: *Client, method: []const u8, params: anytype) ![]u8 {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
@@ -718,6 +754,43 @@ pub const Client = struct {
             if (getObjectField(root, "error")) |rpc_error| {
                 if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                     if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
+                }
+                return error.CodexRpcFailed;
+            }
+
+            const result = getObjectField(root, "result") orelse return error.MissingRpcResult;
+            return try stringifyAlloc(self.allocator, result);
+        }
+    }
+
+    fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
+        while (true) {
+            const message = try self.readTextMessageAlloc(self.allocator);
+            errdefer self.allocator.free(message);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            const response_id = parseMessageId(root) orelse {
+                continue;
+            };
+
+            if (response_id != id) continue;
+
+            if (getObjectField(root, "error")) |_| {
+                if (std.mem.indexOf(u8, message, "activeTurnNotSteerable") != null or
+                    std.mem.indexOf(u8, message, "active_turn_not_steerable") != null or
+                    std.mem.indexOf(u8, message, "active turn not steerable") != null)
+                {
+                    return error.CodexActiveTurnNotSteerable;
+                }
+                if (std.mem.indexOf(u8, message, "code") != null) {
+                    if (getObjectField(getObjectField(root, "error").?, "code")) |code_value| {
+                        if (code_value == .integer and code_value.integer == OVERLOAD_ERROR_CODE) {
+                            return error.ServerOverloaded;
+                        }
+                    }
                 }
                 return error.CodexRpcFailed;
             }
