@@ -214,9 +214,44 @@ The desktop app talks to local provider CLIs rather than bundling its own backen
 
 If prompt sending fails, the first thing to check is that the relevant CLI is installed, on your `PATH`, and already authenticated.
 
+## Crash logs and traces
+
+On Linux, Verde now writes desktop runtime logs under the SDL pref path:
+
+- `~/.local/share/verde/Native/logs/verde.stderr.log`
+- `~/.local/share/verde/Native/logs/last-crash.log`
+
+Those files capture:
+
+- Zig panic output from the desktop shell
+- stderr from spawned Codex and OpenCode helper processes
+- the last panic marker written before the app aborted
+
+If a user reports a crash, ask them to collect:
+
+```bash
+tail -n 200 ~/.local/share/verde/Native/logs/verde.stderr.log
+cat ~/.local/share/verde/Native/logs/last-crash.log
+coredumpctl --no-pager --reverse | rg verde
+```
+
+If there is a matching coredump entry, ask them for the detailed trace too:
+
+```bash
+coredumpctl --no-pager info <PID>
+```
+
+For local repro work, launch the app from the repo root so the log file and any panic output are both easy to inspect:
+
+```bash
+zig build run
+tail -f ~/.local/share/verde/Native/logs/verde.stderr.log
+```
+
 ## Config and saved state
 
-- App state is saved through SDL's pref path as `state.json`.
+- App state is saved through SDL's pref path in `state.sqlite`.
+- Legacy installs may still have an older `state.json` alongside the SQLite database.
 - User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json`.
 
 Example config:

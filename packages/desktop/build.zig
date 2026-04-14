@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.build_id = .sha1;
     exe.each_lib_rpath = false;
     const build_fff = b.addSystemCommand(&.{
         "cargo",
@@ -158,6 +159,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        browser_helper.build_id = .sha1;
         browser_helper.linkLibC();
         browser_helper.addCSourceFile(.{
             .file = b.path("src/browser/platform/linux_webkitgtk.c"),
@@ -272,6 +274,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe_tests.build_id = .sha1;
     exe_tests.step.dependOn(&build_fff.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));

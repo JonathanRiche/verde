@@ -283,8 +283,8 @@ pub const Client = struct {
 
         var child = std.process.Child.init(argv[0..], self.allocator);
         child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
         child.cwd = self.config.cwd;
         child.env_map = &env_map;
         try child.spawn();
