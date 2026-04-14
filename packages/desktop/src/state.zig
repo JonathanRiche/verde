@@ -3418,12 +3418,13 @@ pub const AppState = struct {
     }
 
     pub fn deinit(self: *AppState) void {
+        self.preparePendingSendsForShutdown();
+        ai_harness.shutdownOwnedProviderProcesses();
         self.finishPickerThread();
         self.finishOpencodeModelCacheThread();
         self.finishAllSendThreads();
         self.pollSend();
         self.flushDirtyNow();
-        ai_harness.shutdownOwnedProviderProcesses();
         self.file_search_state.deinit(self.allocator);
         self.clearProjects();
         self.browser_state.deinit();
@@ -3433,6 +3434,25 @@ pub const AppState = struct {
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
+    }
+
+    fn preparePendingSendsForShutdown(self: *AppState) void {
+        for (self.projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                prepareThreadSendForShutdown(thread);
+            }
+            for (project.archived_threads.items) |*thread| {
+                prepareThreadSendForShutdown(thread);
+            }
+        }
+        for (self.archived_projects.items) |*project| {
+            for (project.threads.items) |*thread| {
+                prepareThreadSendForShutdown(thread);
+            }
+            for (project.archived_threads.items) |*thread| {
+                prepareThreadSendForShutdown(thread);
+            }
+        }
     }
 
     pub fn pollPicker(self: *AppState) void {
@@ -3692,6 +3712,16 @@ pub const AppState = struct {
                 thread.finishSendThread();
             }
         }
+    }
+
+    fn prepareThreadSendForShutdown(thread: *ChatThread) void {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+
+        if (send_state.status != .pending) return;
+        send_state.approval_decision = .deny;
+        send_state.condition.broadcast();
     }
 
     pub fn hasPendingStream(self: *AppState) bool {
