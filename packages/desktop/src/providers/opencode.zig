@@ -281,8 +281,8 @@ pub const Client = struct {
 
         var child = std.process.Child.init(argv[0..], self.allocator);
         child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
         child.cwd = self.config.working_directory;
         child.env_map = &env_map;
         try child.spawn();
@@ -1213,7 +1213,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     var child = std.process.Child.init(argv.items, context.allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
     child.env_map = &env_map;
     try child.spawn();
     child.env_map = null;

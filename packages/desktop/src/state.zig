@@ -3590,6 +3590,7 @@ pub const AppState = struct {
                     if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
                         self.requestTranscriptScrollToBottom();
                     }
+                    self.flushDirtyNow();
                 }
             },
             .failed => {
@@ -3605,6 +3606,7 @@ pub const AppState = struct {
                 } else {
                     self.setSidebarNotice("Provider request failed.");
                 }
+                self.flushDirtyNow();
             },
             else => {},
         }

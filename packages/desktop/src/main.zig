@@ -9,6 +9,7 @@ const app_config = @import("config.zig");
 const browser_runtime = @import("browser/mod.zig");
 const chat_threads = @import("chat/threads.zig");
 const keybinds = @import("keybinds.zig");
+const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
@@ -20,6 +21,12 @@ const AppState = native_state.AppState;
 const Storage = native_state.Storage;
 
 const log = native_state.log;
+
+pub const std_options: std.Options = .{
+    .enable_segfault_handler = true,
+};
+
+pub const panic = std.debug.FullPanic(runtime_log.panicFn);
 
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
 
@@ -82,6 +89,12 @@ pub fn main() !void {
 
     var storage = try Storage.init(allocator);
     defer storage.deinit();
+    runtime_log.init(storage.pref_path) catch |err| {
+        log.warn("failed to initialize runtime logging: {s}", .{@errorName(err)});
+    };
+    if (runtime_log.stderrLogPath()) |path| {
+        log.info("runtime stderr redirected to {s}", .{path});
+    }
 
     try sdl.gl.setAttribute(.context_major_version, 3);
     try sdl.gl.setAttribute(.context_minor_version, 3);
