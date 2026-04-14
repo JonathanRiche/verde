@@ -493,7 +493,7 @@ fn renderViewportRect(render_state: *const ghostty_vt.RenderState, origin: [2]f3
             const cell_span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
             const cell_rect_min = .{ cell_x, row_y };
             const cell_rect_max = .{ cell_x + cell_width * cell_span, row_y + cell_height };
-            const cell_style = resolvedStyle(raw_cell, row_styles[x]);
+            const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
             var fg = cell_style.fg(.{
                 .default = render_state.colors.foreground,
@@ -536,7 +536,7 @@ fn renderViewportRect(render_state: *const ghostty_vt.RenderState, origin: [2]f3
             const cell_span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
             const cell_rect_min = .{ cell_x, row_y };
             const cell_rect_max = .{ cell_x + cell_width * cell_span, row_y + cell_height };
-            const cell_style = resolvedStyle(raw_cell, row_styles[x]);
+            const cell_style = styleForCell(raw_cell, row_styles, x);
             var fg = cell_style.fg(.{
                 .default = render_state.colors.foreground,
                 .palette = &render_state.colors.palette,
@@ -551,7 +551,7 @@ fn renderViewportRect(render_state: *const ghostty_vt.RenderState, origin: [2]f3
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
 
             var text_buf: [128]u8 = undefined;
-            const text = cellText(raw_cell, row_graphemes[x], &text_buf) orelse continue;
+            const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
             const glyph_clip_rect: ?[4]f32 = if (glyphNeedsRelaxedClip(raw_cell.codepoint()))
                 null
             else
@@ -634,11 +634,34 @@ fn cellWidthCells(cell: ghostty_vt.Cell) u2 {
     };
 }
 
-fn resolvedStyle(cell: ghostty_vt.Cell, maybe_style: ghostty_vt.Style) ghostty_vt.Style {
+fn styleForCell(
+    cell: ghostty_vt.Cell,
+    styles: []const ghostty_vt.Style,
+    index: usize,
+) ghostty_vt.Style {
     return switch (cell.content_tag) {
-        .bg_color_palette, .bg_color_rgb => maybe_style,
-        else => if (cell.hasStyling()) maybe_style else .{},
+        .bg_color_palette => .{
+            .bg_color = .{
+                .palette = cell.content.color_palette,
+            },
+        },
+        .bg_color_rgb => .{
+            .bg_color = .{ .rgb = .{
+                .r = cell.content.color_rgb.r,
+                .g = cell.content.color_rgb.g,
+                .b = cell.content.color_rgb.b,
+            } },
+        },
+        else => if (cell.hasStyling()) styles[index] else .{},
     };
+}
+
+fn graphemesForCell(
+    cell: ghostty_vt.Cell,
+    graphemes: []const []const u21,
+    index: usize,
+) []const u21 {
+    return if (cell.hasGrapheme()) graphemes[index] else &.{};
 }
 
 fn cellText(
@@ -696,4 +719,36 @@ fn blendChannel(a: u8, b: u8, t: f32) u8 {
     const lhs = @as(f32, @floatFromInt(a));
     const rhs = @as(f32, @floatFromInt(b));
     return @intFromFloat(lhs + (rhs - lhs) * t);
+}
+
+test "styleForCell ignores uninitialized style storage for default cells" {
+    const testing = std.testing;
+
+    var styles: [1]ghostty_vt.Style = undefined;
+    const cell = ghostty_vt.Cell.init('a');
+
+    const style = styleForCell(cell, &styles, 0);
+    try testing.expect(style.eql(.{}));
+}
+
+test "styleForCell synthesizes background-only styles from the raw cell" {
+    const testing = std.testing;
+
+    var styles: [1]ghostty_vt.Style = undefined;
+    const cell: ghostty_vt.Cell = .{
+        .content_tag = .bg_color_palette,
+        .content = .{ .color_palette = 7 },
+    };
+
+    const style = styleForCell(cell, &styles, 0);
+    try testing.expect(style.bg_color.eql(.{ .palette = 7 }));
+}
+
+test "graphemesForCell returns empty for non-grapheme cells" {
+    const testing = std.testing;
+
+    var graphemes: [1][]const u21 = undefined;
+    const cell = ghostty_vt.Cell.init('x');
+
+    try testing.expectEqual(@as(usize, 0), graphemesForCell(cell, &graphemes, 0).len);
 }
