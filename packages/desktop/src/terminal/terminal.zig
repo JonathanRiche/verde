@@ -94,6 +94,19 @@ pub const PaneNode = union(enum) {
     split: PaneSplit,
 };
 
+const PaneRect = struct {
+    pane_id: u32,
+    min: [2]f32,
+    max: [2]f32,
+};
+
+const PaneFocusCandidate = struct {
+    pane_id: u32,
+    overlap: f32,
+    primary_distance: f32,
+    secondary_distance: f32,
+};
+
 pub const Tab = struct {
     id: u32,
     title: ?[]u8 = null,
@@ -303,6 +316,16 @@ pub const Dock = struct {
         tab.active_pane_id = pane_id;
         self.workspace_changed = true;
         self.focus_requested = true;
+    }
+
+    pub fn focusAdjacentPane(self: *Dock, allocator: std.mem.Allocator, direction: SplitDirection) !bool {
+        const tab = self.activeTab() orelse return false;
+        const next_pane_id = try findAdjacentPaneId(allocator, tab.root, tab.active_pane_id, direction) orelse return false;
+        if (next_pane_id == tab.active_pane_id) return false;
+        tab.active_pane_id = next_pane_id;
+        self.workspace_changed = true;
+        self.focus_requested = true;
+        return true;
     }
 
     pub fn selectTab(self: *Dock, index: usize) void {
@@ -619,6 +642,10 @@ pub const Dock = struct {
             .split_down => try self.splitActivePane(allocator, .down),
             .split_left => try self.splitActivePane(allocator, .left),
             .split_right => try self.splitActivePane(allocator, .right),
+            .focus_up => _ = try self.focusAdjacentPane(allocator, .up),
+            .focus_down => _ = try self.focusAdjacentPane(allocator, .down),
+            .focus_left => _ = try self.focusAdjacentPane(allocator, .left),
+            .focus_right => _ = try self.focusAdjacentPane(allocator, .right),
         }
         return true;
     }
@@ -727,6 +754,127 @@ fn removePaneFromTree(allocator: std.mem.Allocator, root: **PaneNode, pane_id: u
             }
         },
     }
+}
+
+fn findAdjacentPaneId(
+    allocator: std.mem.Allocator,
+    root: *const PaneNode,
+    current_pane_id: u32,
+    direction: SplitDirection,
+) !?u32 {
+    var pane_rects: std.ArrayList(PaneRect) = .empty;
+    defer pane_rects.deinit(allocator);
+    try collectPaneRects(allocator, root, .{ 0.0, 0.0 }, .{ 1.0, 1.0 }, &pane_rects);
+
+    var current_rect: ?PaneRect = null;
+    for (pane_rects.items) |pane_rect| {
+        if (pane_rect.pane_id == current_pane_id) {
+            current_rect = pane_rect;
+            break;
+        }
+    }
+    const current = current_rect orelse return null;
+
+    var best: ?PaneFocusCandidate = null;
+    for (pane_rects.items) |pane_rect| {
+        if (pane_rect.pane_id == current_pane_id) continue;
+        const candidate = paneFocusCandidate(current, pane_rect, direction) orelse continue;
+        if (best == null or paneFocusCandidateBetter(candidate, best.?)) {
+            best = candidate;
+        }
+    }
+    return if (best) |candidate| candidate.pane_id else null;
+}
+
+fn collectPaneRects(
+    allocator: std.mem.Allocator,
+    node: *const PaneNode,
+    min: [2]f32,
+    max: [2]f32,
+    pane_rects: *std.ArrayList(PaneRect),
+) !void {
+    switch (node.*) {
+        .leaf => |leaf| try pane_rects.append(allocator, .{
+            .pane_id = leaf.id,
+            .min = min,
+            .max = max,
+        }),
+        .split => |split| {
+            if (split.axis == .vertical) {
+                const split_x = min[0] + (max[0] - min[0]) * split.ratio;
+                try collectPaneRects(allocator, split.first, min, .{ split_x, max[1] }, pane_rects);
+                try collectPaneRects(allocator, split.second, .{ split_x, min[1] }, max, pane_rects);
+            } else {
+                const split_y = min[1] + (max[1] - min[1]) * split.ratio;
+                try collectPaneRects(allocator, split.first, min, .{ max[0], split_y }, pane_rects);
+                try collectPaneRects(allocator, split.second, .{ min[0], split_y }, max, pane_rects);
+            }
+        },
+    }
+}
+
+fn paneFocusCandidate(current: PaneRect, candidate: PaneRect, direction: SplitDirection) ?PaneFocusCandidate {
+    const epsilon = 0.0001;
+    const current_center = .{
+        (current.min[0] + current.max[0]) * 0.5,
+        (current.min[1] + current.max[1]) * 0.5,
+    };
+    const candidate_center = .{
+        (candidate.min[0] + candidate.max[0]) * 0.5,
+        (candidate.min[1] + candidate.max[1]) * 0.5,
+    };
+
+    return switch (direction) {
+        .left => blk: {
+            if (candidate.max[0] > current.min[0] + epsilon) break :blk null;
+            break :blk .{
+                .pane_id = candidate.pane_id,
+                .overlap = rectAxisOverlap(current.min[1], current.max[1], candidate.min[1], candidate.max[1]),
+                .primary_distance = current.min[0] - candidate.max[0],
+                .secondary_distance = @abs(current_center[1] - candidate_center[1]),
+            };
+        },
+        .right => blk: {
+            if (candidate.min[0] < current.max[0] - epsilon) break :blk null;
+            break :blk .{
+                .pane_id = candidate.pane_id,
+                .overlap = rectAxisOverlap(current.min[1], current.max[1], candidate.min[1], candidate.max[1]),
+                .primary_distance = candidate.min[0] - current.max[0],
+                .secondary_distance = @abs(current_center[1] - candidate_center[1]),
+            };
+        },
+        .up => blk: {
+            if (candidate.max[1] > current.min[1] + epsilon) break :blk null;
+            break :blk .{
+                .pane_id = candidate.pane_id,
+                .overlap = rectAxisOverlap(current.min[0], current.max[0], candidate.min[0], candidate.max[0]),
+                .primary_distance = current.min[1] - candidate.max[1],
+                .secondary_distance = @abs(current_center[0] - candidate_center[0]),
+            };
+        },
+        .down => blk: {
+            if (candidate.min[1] < current.max[1] - epsilon) break :blk null;
+            break :blk .{
+                .pane_id = candidate.pane_id,
+                .overlap = rectAxisOverlap(current.min[0], current.max[0], candidate.min[0], candidate.max[0]),
+                .primary_distance = candidate.min[1] - current.max[1],
+                .secondary_distance = @abs(current_center[0] - candidate_center[0]),
+            };
+        },
+    };
+}
+
+fn paneFocusCandidateBetter(candidate: PaneFocusCandidate, current_best: PaneFocusCandidate) bool {
+    const epsilon = 0.0001;
+    if (candidate.overlap > current_best.overlap + epsilon) return true;
+    if (candidate.overlap + epsilon < current_best.overlap) return false;
+    if (candidate.primary_distance + epsilon < current_best.primary_distance) return true;
+    if (candidate.primary_distance > current_best.primary_distance + epsilon) return false;
+    return candidate.secondary_distance + epsilon < current_best.secondary_distance;
+}
+
+fn rectAxisOverlap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) f32 {
+    return @max(0.0, @min(a_max, b_max) - @max(a_min, b_min));
 }
 
 fn axisForDirection(direction: SplitDirection) SplitAxis {
@@ -1597,6 +1745,23 @@ fn pathLabel(path: []const u8) []const u8 {
 
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
+}
+
+test "focus adjacent pane uses split direction" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    try dock.tabs.append(allocator, try dock.buildSinglePaneTabWithoutSession(allocator));
+    const left_id = dock.activePaneConst().?.id;
+    try dock.splitActivePane(allocator, .right);
+    const right_id = dock.activePaneConst().?.id;
+
+    try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
+    try std.testing.expect(try dock.focusAdjacentPane(allocator, .left));
+    try std.testing.expectEqual(left_id, dock.activePaneConst().?.id);
+    try std.testing.expect(try dock.focusAdjacentPane(allocator, .right));
+    try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
 }
 
 test "unix session PTY smoke" {
