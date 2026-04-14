@@ -166,6 +166,10 @@ pub const Client = struct {
             try self.createSession(allocator, request.thread_title);
         errdefer allocator.free(session_id);
 
+        if (request.on_thread_id) |on_thread_id| {
+            on_thread_id(request.stream_context, session_id);
+        }
+
         if (request.thread_title) |thread_title| {
             try self.ensureSessionTitle(session_id, thread_title);
         }

@@ -130,6 +130,7 @@ pub const SendPromptRequest = struct {
     approval_policy: ?ApprovalPolicy = null,
     sandbox_mode: ?SandboxMode = null,
     stream_context: ?*anyopaque = null,
+    on_thread_id: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_delta: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_event: ?*const fn (?*anyopaque, StreamEvent) void = null,
     on_approval_request: ?*const fn (?*anyopaque, ApprovalRequest) ApprovalDecision = null,
