@@ -131,6 +131,7 @@ pub const SendPromptRequest = struct {
     sandbox_mode: ?SandboxMode = null,
     stream_context: ?*anyopaque = null,
     on_thread_id: ?*const fn (?*anyopaque, []const u8) void = null,
+    on_turn_id: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_delta: ?*const fn (?*anyopaque, []const u8) void = null,
     on_stream_event: ?*const fn (?*anyopaque, StreamEvent) void = null,
     on_approval_request: ?*const fn (?*anyopaque, ApprovalRequest) ApprovalDecision = null,
@@ -139,4 +140,9 @@ pub const SendPromptRequest = struct {
 pub const SendPromptResult = struct {
     thread_id: []const u8,
     reply_text: []const u8,
+};
+
+pub const InterruptThreadRequest = struct {
+    thread_id: []const u8,
+    turn_id: ?[]const u8 = null,
 };

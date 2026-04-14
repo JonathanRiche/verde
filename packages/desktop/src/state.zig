@@ -300,6 +300,11 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(thread_id);
             self.send_state.provisional_provider_thread_id = null;
         }
+        if (self.send_state.active_turn_id) |turn_id| {
+            std.heap.page_allocator.free(turn_id);
+            self.send_state.active_turn_id = null;
+        }
+        freePendingFollowup(std.heap.page_allocator, &self.send_state.pending_followup);
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
@@ -642,7 +647,16 @@ pub const SendStatus = enum {
     idle,
     pending,
     completed,
+    aborted,
     failed,
+};
+pub const FollowupKind = enum {
+    queue,
+    steer,
+};
+pub const PendingFollowup = struct {
+    kind: FollowupKind,
+    prompt: []u8,
 };
 pub const SendState = struct {
     mutex: std.Thread.Mutex = .{},
@@ -652,11 +666,15 @@ pub const SendState = struct {
     error_message: ?[]u8 = null,
     provider: ?Provider = null,
     provisional_provider_thread_id: ?[]u8 = null,
+    active_turn_id: ?[]u8 = null,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
     pending_approval: ?PendingApproval = null,
+    pending_followup: ?PendingFollowup = null,
     approval_decision: ?ai_harness.ApprovalDecision = null,
+    stop_requested: bool = false,
+    stop_signal_sent: bool = false,
     worker: ?std.Thread = null,
 };
 pub const PendingApproval = struct {
@@ -680,6 +698,13 @@ pub const SendResultPayload = struct {
     provider_thread_id: []const u8,
     reply_text: []const u8,
 };
+
+fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup) void {
+    if (followup.*) |pending| {
+        allocator.free(pending.prompt);
+        followup.* = null;
+    }
+}
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1027,8 +1052,14 @@ pub const AppState = struct {
         return .created;
     }
 
-    fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
-        const thread = self.currentThreadMutable();
+    fn appendMessageToThread(
+        self: *AppState,
+        thread: *ChatThread,
+        role: ChatRole,
+        author: []const u8,
+        body: []const u8,
+        image: ?*const ChatImageAttachment,
+    ) !void {
         self.trimThreadMessages(thread, 1);
 
         try thread.messages.append(self.allocator, .{
@@ -1042,6 +1073,10 @@ pub const AppState = struct {
         });
         thread.touch();
         self.markDirty();
+    }
+
+    fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
+        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image);
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
@@ -1544,11 +1579,110 @@ pub const AppState = struct {
             try thread.commitFromPrompt(self.allocator, if (trimmed_title.len > 0) trimmed_title else "Image");
         }
         var draft_image_copy = draft_image;
-        try self.appendMessage(.user, "You", draft, if (draft_image_copy) |*image| image else null);
-        try self.beginSendDraft(draft);
+        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null);
+        try self.beginSendForThread(self.currentProject().path, thread, draft);
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.setSidebarNotice("Waiting for provider reply...");
+    }
+
+    pub fn abortCurrentThreadSend(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const send_state = self.currentThread().send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+
+        if (send_state.status != .pending) {
+            self.setSidebarNotice("This chat is not running.");
+            return;
+        }
+
+        if (send_state.stop_requested) {
+            self.setSidebarNotice("Stopping provider reply...");
+            return;
+        }
+
+        send_state.stop_requested = true;
+        if (send_state.pending_approval != null) {
+            send_state.approval_decision = .deny;
+            send_state.condition.broadcast();
+        }
+        self.setSidebarNotice("Stopping provider reply...");
+    }
+
+    pub fn queueOrSteerDraftDuringSend(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const thread = self.currentThreadMutable();
+        if (!thread.isSendPending()) {
+            self.setSidebarNotice("This chat is not running.");
+            return;
+        }
+
+        const draft = thread.currentDraft();
+        if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) {
+            self.setSidebarNotice("Type a message first.");
+            return;
+        }
+
+        if (thread.draft_image != null) {
+            self.setSidebarNotice("Queued follow-up messages do not support image attachments yet.");
+            return;
+        }
+
+        const kind: FollowupKind = switch (thread.provider) {
+            .codex => .steer,
+            .opencode => .queue,
+        };
+
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+
+        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.pending_followup = .{
+            .kind = kind,
+            .prompt = self.allocator.dupe(u8, draft) catch {
+                self.setSidebarNotice("Failed to store the pending follow-up.");
+                return;
+            },
+        };
+        if (kind == .steer) {
+            send_state.stop_requested = true;
+            if (send_state.pending_approval != null) {
+                send_state.approval_decision = .deny;
+                send_state.condition.broadcast();
+            }
+        }
+
+        self.clearDraft();
+        thread.clearDraftImage(self.allocator);
+        self.setSidebarNotice(switch (kind) {
+            .queue => "Queued for the next OpenCode turn.",
+            .steer => "Steer queued. Waiting to stop the current Codex turn.",
+        });
+    }
+
+    pub fn pendingFollowupSnapshot(self: *AppState) !?PendingFollowup {
+        if (self.projects.items.len == 0) return null;
+        const send_state = self.currentThread().send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+
+        const pending = send_state.pending_followup orelse return null;
+        return .{
+            .kind = pending.kind,
+            .prompt = try self.allocator.dupe(u8, pending.prompt),
+        };
+    }
+
+    pub fn pendingFollowupHint(self: *const AppState) ?[:0]const u8 {
+        if (self.projects.items.len == 0) return null;
+        const thread = self.currentThread();
+        if (!thread.isSendPending()) return null;
+        return switch (thread.provider) {
+            .codex => "Tab to steer",
+            .opencode => "Tab to queue",
+        };
     }
 
     fn sendPromptViaHarness(self: *AppState, prompt: []const u8) !ai_harness.SendPromptResult {
@@ -1590,10 +1724,41 @@ pub const AppState = struct {
         });
     }
 
-    fn beginSendDraft(self: *AppState, prompt: []const u8) !void {
+    fn interruptThreadViaHarness(
+        self: *AppState,
+        project_path: []const u8,
+        provider: Provider,
+        thread_id: []const u8,
+        turn_id: ?[]const u8,
+    ) !void {
+        const provider_config = switch (provider) {
+            .opencode => ai_harness.ProviderConfig{
+                .opencode = .{
+                    .allocator = self.allocator,
+                    .working_directory = project_path,
+                    .launch_if_missing = true,
+                },
+            },
+            .codex => ai_harness.ProviderConfig{
+                .codex = .{
+                    .cwd = project_path,
+                    .launch_on_connect = true,
+                },
+            },
+        };
+
+        var client = try ai_harness.connect(self.allocator, provider_config);
+        defer client.deinit();
+
+        return client.interruptThread(.{
+            .thread_id = thread_id,
+            .turn_id = turn_id,
+        });
+    }
+
+    fn beginSendForThread(self: *AppState, project_path: []const u8, thread: *ChatThread, prompt: []const u8) !void {
+        _ = self;
         const page_alloc = std.heap.page_allocator;
-        const project = self.currentProject();
-        const thread = self.currentThread();
 
         const request = try page_alloc.create(SendWorkerRequest);
         errdefer page_alloc.destroy(request);
@@ -1601,7 +1766,7 @@ pub const AppState = struct {
             .send_state_ptr = thread.send_state,
             .provider = thread.provider,
             .harness = thread.harness,
-            .project_path = try page_alloc.dupe(u8, project.path),
+            .project_path = try page_alloc.dupe(u8, project_path),
             .prompt = try page_alloc.dupe(u8, prompt),
             .image_path = if (thread.draft_image) |image| try page_alloc.dupe(u8, image.path) else null,
             .provider_thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
@@ -1631,12 +1796,22 @@ pub const AppState = struct {
             page_alloc.free(thread_id);
             send_state.provisional_provider_thread_id = null;
         }
+        if (send_state.active_turn_id) |turn_id| {
+            page_alloc.free(turn_id);
+            send_state.active_turn_id = null;
+        }
         send_state.partial_text.clearRetainingCapacity();
         freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
         freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
         send_state.approval_decision = null;
+        send_state.stop_requested = false;
+        send_state.stop_signal_sent = false;
         send_state.worker = try std.Thread.spawn(.{}, sendWorker, .{ send_state, request });
+    }
+
+    fn beginSendDraft(self: *AppState, prompt: []const u8) !void {
+        return self.beginSendForThread(self.currentProject().path, self.currentThreadMutable(), prompt);
     }
 
     fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
@@ -3624,6 +3799,7 @@ pub const AppState = struct {
 
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
         self.capturePendingProviderThreadId(thread);
+        self.issuePendingThreadStop(self.projects.items[project_index].path, thread);
 
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
@@ -3641,6 +3817,10 @@ pub const AppState = struct {
                     std.heap.page_allocator.free(thread_id);
                     send_state.provisional_provider_thread_id = null;
                 }
+                if (send_state.active_turn_id) |turn_id| {
+                    std.heap.page_allocator.free(turn_id);
+                    send_state.active_turn_id = null;
+                }
                 flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
                 completed_events = send_state.pending_events;
                 send_state.pending_events = .empty;
@@ -3652,12 +3832,36 @@ pub const AppState = struct {
                 send_state.status = .idle;
                 next_status = .completed;
             },
+            .aborted => {
+                if (send_state.provisional_provider_thread_id) |thread_id| {
+                    std.heap.page_allocator.free(thread_id);
+                    send_state.provisional_provider_thread_id = null;
+                }
+                if (send_state.active_turn_id) |turn_id| {
+                    std.heap.page_allocator.free(turn_id);
+                    send_state.active_turn_id = null;
+                }
+                flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+                completed_events = send_state.pending_events;
+                send_state.pending_events = .empty;
+                completed_diff_files = send_state.pending_diff_files;
+                send_state.pending_diff_files = .empty;
+                freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
+                send_state.approval_decision = null;
+                send_state.provider = null;
+                send_state.status = .idle;
+                next_status = .aborted;
+            },
             .failed => {
                 failed_message = send_state.error_message;
                 send_state.error_message = null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
                     std.heap.page_allocator.free(thread_id);
                     send_state.provisional_provider_thread_id = null;
+                }
+                if (send_state.active_turn_id) |turn_id| {
+                    std.heap.page_allocator.free(turn_id);
+                    send_state.active_turn_id = null;
                 }
                 send_state.partial_text.clearRetainingCapacity();
                 completed_events = send_state.pending_events;
@@ -3715,7 +3919,26 @@ pub const AppState = struct {
                 }
                 self.flushDirtyNow();
             },
+            .aborted => {
+                defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
+                defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
+                appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
+                    log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
+                };
+                thread.touch();
+                self.markDirty();
+                self.setSidebarNotice("Provider reply stopped.");
+                self.flushDirtyNow();
+            },
             else => {},
+        }
+
+        if (next_status == .failed) {
+            self.clearPendingFollowupAfterFailure(thread);
+        }
+        if (next_status == .completed or next_status == .aborted) {
+            self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
     }
 
@@ -3733,6 +3956,85 @@ pub const AppState = struct {
         thread.provider_thread_id = thread_id orelse return;
         self.markDirty();
         self.flushDirtyNow();
+    }
+
+    fn issuePendingThreadStop(self: *AppState, project_path: []const u8, thread: *ChatThread) void {
+        var provider: Provider = undefined;
+        var thread_id: ?[]u8 = null;
+        var turn_id: ?[]u8 = null;
+
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        if (send_state.status == .pending and send_state.stop_requested and !send_state.stop_signal_sent) {
+            provider = thread.provider;
+            const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
+                existing
+            else if (send_state.provisional_provider_thread_id) |provisional|
+                provisional
+            else
+                null;
+            if (pending_thread_id) |resolved_thread_id| {
+                if (provider == .opencode or send_state.active_turn_id != null) {
+                    thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
+                    turn_id = if (send_state.active_turn_id) |active_turn_id|
+                        self.allocator.dupe(u8, active_turn_id) catch null
+                    else
+                        null;
+                    send_state.stop_signal_sent = thread_id != null;
+                }
+            }
+        }
+        send_state.mutex.unlock();
+
+        const owned_thread_id = thread_id orelse return;
+        defer self.allocator.free(owned_thread_id);
+        defer if (turn_id) |owned_turn_id| self.allocator.free(owned_turn_id);
+
+        self.interruptThreadViaHarness(project_path, provider, owned_thread_id, turn_id) catch |err| {
+            log.warn("failed to interrupt provider turn: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to stop provider reply.");
+            return;
+        };
+    }
+
+    fn dispatchPendingFollowup(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        const pending = send_state.pending_followup;
+        send_state.pending_followup = null;
+        send_state.stop_requested = false;
+        send_state.stop_signal_sent = false;
+        send_state.mutex.unlock();
+
+        const followup = pending orelse return;
+        defer self.allocator.free(followup.prompt);
+
+        self.appendMessageToThread(thread, .user, "You", followup.prompt, null) catch |err| {
+            log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to append the pending follow-up.");
+            return;
+        };
+        self.beginSendForThread(self.projects.items[project_index].path, thread, followup.prompt) catch |err| {
+            log.err("failed to start pending follow-up: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to send the pending follow-up.");
+            return;
+        };
+        if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+            self.requestTranscriptScrollToBottom();
+        }
+        self.setSidebarNotice(switch (followup.kind) {
+            .queue => "Queued OpenCode message sent.",
+            .steer => "Codex follow-up sent.",
+        });
+    }
+
+    fn clearPendingFollowupAfterFailure(self: *AppState, thread: *ChatThread) void {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.stop_requested = false;
+        send_state.stop_signal_sent = false;
     }
 
     fn finishPickerThread(self: *AppState) void {

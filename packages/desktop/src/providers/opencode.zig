@@ -200,6 +200,18 @@ pub const Client = struct {
         };
     }
 
+    pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/abort", .{request.thread_id});
+        defer self.allocator.free(path);
+
+        const response = try self.requestJson(.POST, path, null);
+        defer self.allocator.free(response.body);
+
+        if (response.status != .ok and response.status != .no_content) {
+            return error.OpencodeRequestFailed;
+        }
+    }
+
     fn ensureServer(self: *Client) !void {
         if (self.checkHealth()) {
             return;
