@@ -8,6 +8,8 @@ const runtime = @import("runtime.zig");
 const native_state = @import("../state.zig");
 const Provider = native_state.Provider;
 
+const log = std.log.scoped(.native_ui_sidebar);
+
 /// Renders the full project rail and thread list.
 pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     _ = height;
@@ -638,6 +640,12 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         .w = row_width - timestamp_width - chat_icon_space,
         .h = row_height,
     })) {
+        log.info("selected thread project_index={d} thread_index={d} provider={s} title={s}", .{
+            project_index,
+            thread_index,
+            @tagName(thread.provider),
+            thread.title,
+        });
         state.noteInteraction();
         state.selected_project_index = project_index;
         state.projects.items[project_index].selected_thread_index = thread_index;

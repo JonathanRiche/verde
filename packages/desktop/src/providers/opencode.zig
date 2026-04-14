@@ -181,7 +181,13 @@ pub const Client = struct {
 
         try self.startPromptAsync(session_id, request);
 
-        const reply_text = try self.waitForPromptResult(allocator, session_id, baseline.message_id, request, event_stream == null);
+        const reply_text = try self.waitForPromptResult(
+            allocator,
+            session_id,
+            baseline.message_id,
+            request,
+            if (event_stream) |handle| handle.context else null,
+        );
         errdefer allocator.free(reply_text);
 
         return .{
@@ -355,7 +361,7 @@ pub const Client = struct {
         session_id: []const u8,
         baseline_assistant_id: ?[]const u8,
         request: provider_types.SendPromptRequest,
-        stream_assistant_snapshots: bool,
+        event_stream_context: ?*EventStreamContext,
     ) ![]u8 {
         var handled_permission_ids: std.ArrayList([]u8) = .empty;
         defer {
@@ -377,9 +383,10 @@ pub const Client = struct {
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
             var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
             defer latest_snapshot.deinit(self.allocator);
-            if (stream_assistant_snapshots) {
-                try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
+            if (event_stream_context) |context| {
+                try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
+            try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
             try self.emitDiffProgress(session_id, request, &last_diff_payload);
 
             const status = try self.fetchSessionStatus(session_id);
@@ -437,6 +444,21 @@ pub const Client = struct {
         }
 
         return allocator.dupe(u8, "");
+    }
+
+    fn syncStreamedTextFromEventStream(
+        self: *Client,
+        context: *EventStreamContext,
+        streamed_text: *[]u8,
+    ) !void {
+        context.mutex.lock();
+        defer context.mutex.unlock();
+
+        if (context.streamed_text.items.len <= streamed_text.*.len) return;
+        if (!std.mem.startsWith(u8, context.streamed_text.items, streamed_text.*)) return;
+
+        self.allocator.free(streamed_text.*);
+        streamed_text.* = try self.allocator.dupe(u8, context.streamed_text.items);
     }
 
     fn emitAssistantProgress(
@@ -800,6 +822,7 @@ const EventStreamContext = struct {
     baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
     child: ?std.process.Child = null,
+    streamed_text: std.ArrayListUnmanaged(u8) = .empty,
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -808,6 +831,7 @@ const EventStreamContext = struct {
     fn deinit(self: *EventStreamContext) void {
         self.allocator.free(self.session_id);
         if (self.baseline_assistant_id) |message_id| self.allocator.free(message_id);
+        self.streamed_text.deinit(self.allocator);
     }
 };
 
@@ -1224,6 +1248,8 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     context.mutex.unlock();
     defer cleanupEventStreamChild(context);
 
+    log.info("OpenCode event stream started for session {s} pid={d}", .{ context.session_id, child.id });
+
     opened = true;
     signalEventStreamOpenState(context, .ready);
 
@@ -1284,6 +1310,7 @@ fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpe
 }
 
 fn signalEventStreamStop(handle: EventStreamHandle) void {
+    log.info("stopping OpenCode event stream for session {s}", .{handle.context.session_id});
     handle.context.mutex.lock();
     handle.context.stop_requested = true;
     if (handle.context.child) |*child| {
@@ -1314,6 +1341,8 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     if (maybe_child) |*owned_child| {
         _ = owned_child.wait() catch {};
     }
+
+    log.info("OpenCode event stream exited for session {s}", .{context.session_id});
 }
 
 fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !bool {
@@ -1396,6 +1425,11 @@ fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Val
 
     const delta = getOptionalObjectString(properties, "delta") orelse return;
     if (delta.len == 0) return;
+
+    context.mutex.lock();
+    errdefer context.mutex.unlock();
+    try context.streamed_text.appendSlice(context.allocator, delta);
+    context.mutex.unlock();
 
     const on_stream_delta = context.request.on_stream_delta orelse return;
     on_stream_delta(context.request.stream_context, delta);

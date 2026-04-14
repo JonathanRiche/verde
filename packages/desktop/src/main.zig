@@ -156,6 +156,9 @@ pub fn main() !void {
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
 
+    log.info("verde main loop starting", .{});
+    defer log.info("verde main loop exiting", .{});
+
     var running = true;
     while (running) {
         syncWindowTextInput(window, &state);
