@@ -212,6 +212,31 @@ pub const Client = struct {
         };
     }
 
+    pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
+        try self.ensureConnected();
+
+        if (request.turn_id) |turn_id| {
+            const payload = self.callRpcForResultAlloc("turn/interrupt", .{
+                .threadId = request.thread_id,
+                .turnId = turn_id,
+            }) catch |err| switch (err) {
+                error.CodexRpcFailed => blk: {
+                    break :blk try self.callRpcForResultAlloc("turn/interrupt", .{
+                        .threadId = request.thread_id,
+                    });
+                },
+                else => return err,
+            };
+            self.allocator.free(payload);
+            return;
+        }
+
+        const payload = try self.callRpcForResultAlloc("turn/interrupt", .{
+            .threadId = request.thread_id,
+        });
+        self.allocator.free(payload);
+    }
+
     fn ensureConnected(self: *Client) !void {
         if (self.stream == null) {
             switch (self.config.transport) {
@@ -518,6 +543,9 @@ pub const Client = struct {
                 if (started_turn_id == null) {
                     if (extractTurnIdFromStartResponse(root)) |turn_id| {
                         started_turn_id = try allocator.dupe(u8, turn_id);
+                        if (request.on_turn_id) |on_turn_id| {
+                            on_turn_id(request.stream_context, turn_id);
+                        }
                     }
                 }
                 continue;
@@ -528,6 +556,9 @@ pub const Client = struct {
             if (started_turn_id == null) {
                 if (extractTurnIdFromStartedNotification(root, thread_id)) |turn_id| {
                     started_turn_id = try allocator.dupe(u8, turn_id);
+                    if (request.on_turn_id) |on_turn_id| {
+                        on_turn_id(request.stream_context, turn_id);
+                    }
                 }
             }
 
@@ -1244,44 +1275,57 @@ fn emitItemEvent(
 }
 
 fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
-    const on_approval_request = request.on_approval_request orelse return;
-    const body = extractCommandApprovalSummary(root) orelse "Codex requested command approval.";
-    const decision = on_approval_request(request.stream_context, .{
-        .call_id = "",
-        .title = "Command approval",
-        .body = body,
-    });
+    const decision = if (shouldAutoApproveRequest(request))
+        .approve
+    else blk: {
+        const on_approval_request = request.on_approval_request orelse return;
+        const body = extractCommandApprovalSummary(root) orelse "Codex requested command approval.";
+        break :blk on_approval_request(request.stream_context, .{
+            .call_id = "",
+            .title = "Command approval",
+            .body = body,
+        });
+    };
 
     try respondToServerRequest(request_id, self, .{
-        .decision = commandApprovalDecisionString(decision),
+        .decision = approvalDecisionString(decision),
     });
 }
 
 fn handleFileChangeApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
-    const on_approval_request = request.on_approval_request orelse return;
-    const body = extractFileChangeApprovalSummary(root) orelse "Codex requested file change approval.";
-    const decision = on_approval_request(request.stream_context, .{
-        .call_id = "",
-        .title = "File change approval",
-        .body = body,
-    });
+    const decision = if (shouldAutoApproveRequest(request))
+        .approve
+    else blk: {
+        const on_approval_request = request.on_approval_request orelse return;
+        const body = extractFileChangeApprovalSummary(root) orelse "Codex requested file change approval.";
+        break :blk on_approval_request(request.stream_context, .{
+            .call_id = "",
+            .title = "File change approval",
+            .body = body,
+        });
+    };
 
     try respondToServerRequest(request_id, self, .{
-        .decision = fileChangeApprovalDecisionString(decision),
+        .decision = approvalDecisionString(decision),
     });
 }
 
 fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
-    const on_approval_request = request.on_approval_request orelse return;
-    const body = extractPermissionsApprovalSummary(root) orelse "Codex requested additional permissions.";
-    const decision = on_approval_request(request.stream_context, .{
-        .call_id = "",
-        .title = "Permissions request",
-        .body = body,
-    });
+    const decision = if (shouldAutoApproveRequest(request))
+        .approve
+    else blk: {
+        const on_approval_request = request.on_approval_request orelse return;
+        const body = extractPermissionsApprovalSummary(root) orelse "Codex requested additional permissions.";
+        break :blk on_approval_request(request.stream_context, .{
+            .call_id = "",
+            .title = "Permissions request",
+            .body = body,
+        });
+    };
 
-    _ = decision;
-    try respondServerError(request_id, self, -32000, "Permissions approval is not implemented yet");
+    try respondToServerRequest(request_id, self, .{
+        .decision = approvalDecisionString(decision),
+    });
 }
 
 fn respondToServerRequest(request_id: u64, self: *Client, result: anytype) !void {
@@ -1618,6 +1662,10 @@ fn approvalPolicyString(value: provider_types.ApprovalPolicy) []const u8 {
     };
 }
 
+fn shouldAutoApproveRequest(request: provider_types.SendPromptRequest) bool {
+    return (request.approval_policy orelse .on_request) == .never;
+}
+
 fn sandboxModeString(value: provider_types.SandboxMode) []const u8 {
     return switch (value) {
         .workspace_write => "workspace-write",
@@ -1625,14 +1673,7 @@ fn sandboxModeString(value: provider_types.SandboxMode) []const u8 {
     };
 }
 
-fn commandApprovalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
-    return switch (value) {
-        .approve => "accept",
-        .deny => "decline",
-    };
-}
-
-fn fileChangeApprovalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
+fn approvalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
     return switch (value) {
         .approve => "accept",
         .deny => "decline",
@@ -1719,6 +1760,12 @@ test "appendImportedMessagesForItem maps transcript items into chat messages" {
     try std.testing.expectEqualStrings("git status", messages.items[2].body);
     try std.testing.expectEqualStrings("Changed files", messages.items[3].author);
     try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[3].body);
+}
+
+test "shouldAutoApproveRequest follows approval policy" {
+    try std.testing.expect(shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .never }));
+    try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .on_request }));
+    try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi" }));
 }
 
 test "detectTurnTerminalState recognizes thread idle fallback for the active thread" {
