@@ -724,6 +724,7 @@ pub const AppState = struct {
     sidebar_collapsed: bool,
     composer_focused: bool,
     composer_focus_requested: bool,
+    composer_input_nonce: u32,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -798,6 +799,7 @@ pub const AppState = struct {
             .sidebar_collapsed = false,
             .composer_focused = false,
             .composer_focus_requested = false,
+            .composer_input_nonce = 0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1584,6 +1586,7 @@ pub const AppState = struct {
         try self.beginSendForThread(self.currentProject().path, thread, draft);
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
+        self.resetComposerInputWidget();
         self.setSidebarNotice("Waiting for provider reply...");
     }
 
@@ -1651,6 +1654,7 @@ pub const AppState = struct {
 
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
+        self.resetComposerInputWidget();
         self.setSidebarNotice(switch (kind) {
             .queue => "Queued for the next OpenCode turn.",
             .steer => "Steer queued. Waiting for Codex to accept it.",
@@ -3403,6 +3407,10 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    fn resetComposerInputWidget(self: *AppState) void {
+        self.composer_input_nonce +%= 1;
+    }
+
     pub fn updateFileSearch(self: *AppState) void {
         if (self.projects.items.len == 0) {
             self.clearFileSearch();
@@ -3702,18 +3710,18 @@ pub const AppState = struct {
     fn preparePendingSendsForShutdown(self: *AppState) void {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
-                prepareThreadSendForShutdown(thread);
+                self.prepareThreadSendForShutdown(project.path, thread);
             }
             for (project.archived_threads.items) |*thread| {
-                prepareThreadSendForShutdown(thread);
+                self.prepareThreadSendForShutdown(project.path, thread);
             }
         }
         for (self.archived_projects.items) |*project| {
             for (project.threads.items) |*thread| {
-                prepareThreadSendForShutdown(thread);
+                self.prepareThreadSendForShutdown(project.path, thread);
             }
             for (project.archived_threads.items) |*thread| {
-                prepareThreadSendForShutdown(thread);
+                self.prepareThreadSendForShutdown(project.path, thread);
             }
         }
     }
@@ -4211,14 +4219,20 @@ pub const AppState = struct {
         }
     }
 
-    fn prepareThreadSendForShutdown(thread: *ChatThread) void {
+    fn prepareThreadSendForShutdown(self: *AppState, project_path: []const u8, thread: *ChatThread) void {
         const send_state = thread.send_state;
         send_state.mutex.lock();
-        defer send_state.mutex.unlock();
-
-        if (send_state.status != .pending) return;
+        if (send_state.status != .pending) {
+            send_state.mutex.unlock();
+            return;
+        }
+        send_state.stop_requested = true;
+        send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
+        send_state.mutex.unlock();
+
+        self.issuePendingThreadStop(project_path, thread);
     }
 
     pub fn hasPendingStream(self: *AppState) bool {
