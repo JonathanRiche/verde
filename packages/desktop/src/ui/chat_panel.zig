@@ -1638,6 +1638,8 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     if (state.consumeComposerFocusRequest()) {
         zgui.setKeyboardFocusHere(0);
     }
+    zgui.pushIntId(@intCast(state.composer_input_nonce));
+    defer zgui.popId();
     const submitted = zgui.inputTextMultiline("##chat-draft", .{
         .buf = buf,
         .w = content_width,
