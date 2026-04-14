@@ -174,7 +174,7 @@ pub const Client = struct {
             try self.ensureSessionTitle(session_id, thread_title);
         }
 
-        var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id);
+        var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id, null);
         defer baseline.deinit(allocator);
 
         const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
@@ -379,13 +379,16 @@ pub const Client = struct {
         var last_diff_payload = try self.allocator.dupe(u8, "");
         defer self.allocator.free(last_diff_payload);
 
+        var last_task_summary: ?[]u8 = null;
+        defer if (last_task_summary) |summary| self.allocator.free(summary);
+
         var last_retry_message: ?[]u8 = null;
         defer if (last_retry_message) |message| self.allocator.free(message);
 
         var attempt: usize = 0;
         while (attempt < MAX_POLL_ATTEMPTS) : (attempt += 1) {
             const has_pending_permissions = try self.handlePendingPermissions(session_id, request, &handled_permission_ids);
-            var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
+            var latest_snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id, baseline_assistant_id);
             defer latest_snapshot.deinit(self.allocator);
             const stream_idle = if (event_stream_context) |context|
                 eventStreamReachedIdle(context)
@@ -394,6 +397,7 @@ pub const Client = struct {
             if (event_stream_context) |context| {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
+            try self.emitTaskProgressFromSnapshot(&latest_snapshot, request, &last_task_summary);
             try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
             try self.emitDiffProgress(session_id, request, &last_diff_payload);
 
@@ -433,7 +437,7 @@ pub const Client = struct {
             return error.OpencodeRequestTimedOut;
         }
 
-        var final_snapshot = try self.fetchLatestAssistantSnapshot(allocator, session_id);
+        var final_snapshot = try self.fetchLatestAssistantSnapshot(allocator, session_id, baseline_assistant_id);
         defer final_snapshot.deinit(allocator);
 
         if (final_snapshot.message_id) |message_id| {
@@ -476,9 +480,31 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
         streamed_text: *[]u8,
     ) !void {
-        var snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id);
+        var snapshot = try self.fetchLatestAssistantSnapshot(self.allocator, session_id, baseline_assistant_id);
         defer snapshot.deinit(self.allocator);
         try self.emitAssistantProgressFromSnapshot(&snapshot, baseline_assistant_id, request, streamed_text);
+    }
+
+    fn emitTaskProgressFromSnapshot(
+        self: *Client,
+        snapshot: *const AssistantSnapshot,
+        request: provider_types.SendPromptRequest,
+        last_task_summary: *?[]u8,
+    ) !void {
+        const on_stream_event = request.on_stream_event orelse return;
+        const summary = snapshot.task_summary orelse return;
+
+        if (last_task_summary.*) |existing| {
+            if (std.mem.eql(u8, existing, summary)) return;
+            self.allocator.free(existing);
+            last_task_summary.* = null;
+        }
+
+        on_stream_event(request.stream_context, .{ .message = .{
+            .title = "OpenCode task",
+            .body = summary,
+        } });
+        last_task_summary.* = try self.allocator.dupe(u8, summary);
     }
 
     fn emitAssistantProgressFromSnapshot(
@@ -650,6 +676,7 @@ pub const Client = struct {
         self: *Client,
         allocator: std.mem.Allocator,
         session_id: []const u8,
+        baseline_assistant_id: ?[]const u8,
     ) !AssistantSnapshot {
         const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/message?limit={d}", .{ session_id, MESSAGE_POLL_LIMIT });
         defer self.allocator.free(path);
@@ -676,6 +703,7 @@ pub const Client = struct {
             .text = try extractAssistantTextAlloc(allocator, latest),
             .error_message = try extractAssistantErrorMessageAlloc(allocator, latest),
             .finish = try extractAssistantFinishAlloc(allocator, latest),
+            .task_summary = try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, baseline_assistant_id),
         };
     }
 
@@ -793,12 +821,14 @@ const AssistantSnapshot = struct {
     text: []u8,
     error_message: ?[]u8 = null,
     finish: ?[]u8 = null,
+    task_summary: ?[]u8 = null,
 
     fn deinit(self: *AssistantSnapshot, allocator: std.mem.Allocator) void {
         if (self.message_id) |id| allocator.free(id);
         allocator.free(self.text);
         if (self.error_message) |message| allocator.free(message);
         if (self.finish) |finish| allocator.free(finish);
+        if (self.task_summary) |summary| allocator.free(summary);
     }
 
     fn isTerminalForPrompt(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
@@ -1149,6 +1179,70 @@ fn extractAssistantFinishAlloc(allocator: std.mem.Allocator, value: std.json.Val
     const info = getObjectField(value, "info") orelse return null;
     const finish = getOptionalObjectString(info, "finish") orelse return null;
     return try allocator.dupe(u8, finish);
+}
+
+fn extractLatestAssistantTaskSummaryAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    baseline_assistant_id: ?[]const u8,
+) !?[]u8 {
+    if (value != .array) return null;
+
+    var index = value.array.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = value.array.items[index];
+        if (item != .object) continue;
+        const info = getObjectField(item, "info") orelse continue;
+        const role = getOptionalObjectString(info, "role") orelse continue;
+        if (!std.mem.eql(u8, role, "assistant")) continue;
+
+        const message_id = getOptionalObjectString(info, "id");
+        if (baseline_assistant_id != null and message_id != null and std.mem.eql(u8, baseline_assistant_id.?, message_id.?)) continue;
+
+        if (try extractAssistantTaskSummaryAlloc(allocator, item)) |summary| {
+            return summary;
+        }
+    }
+
+    return null;
+}
+
+fn extractAssistantTaskSummaryAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    const parts = getObjectField(value, "parts") orelse return null;
+    if (parts != .array) return null;
+
+    var index = parts.array.items.len;
+    while (index > 0) {
+        index -= 1;
+        const part = parts.array.items[index];
+        if (part != .object) continue;
+        const part_type = getOptionalObjectString(part, "type") orelse continue;
+        if (!std.mem.eql(u8, part_type, "tool")) continue;
+        const tool_name = getOptionalObjectString(part, "tool") orelse continue;
+        if (!std.mem.eql(u8, tool_name, "task")) continue;
+
+        const state = getObjectField(part, "state") orelse continue;
+        const status = getOptionalObjectString(state, "status") orelse continue;
+        const title = getOptionalObjectString(state, "title") orelse blk: {
+            const input = getObjectField(state, "input") orelse break :blk null;
+            break :blk getOptionalObjectString(input, "description");
+        } orelse "OpenCode task";
+
+        if (std.mem.eql(u8, status, "running")) {
+            return try std.fmt.allocPrint(allocator, "Running subtask: {s}", .{title});
+        }
+        if (std.mem.eql(u8, status, "completed")) {
+            return try std.fmt.allocPrint(allocator, "Completed subtask: {s}", .{title});
+        }
+        if (std.mem.eql(u8, status, "failed")) {
+            return try std.fmt.allocPrint(allocator, "Failed subtask: {s}", .{title});
+        }
+
+        return try std.fmt.allocPrint(allocator, "{s} subtask: {s}", .{ status, title });
+    }
+
+    return null;
 }
 
 fn startEventStream(self: *Client, allocator: std.mem.Allocator, session_id: []const u8, baseline_assistant_id: ?[]const u8, request: provider_types.SendPromptRequest) !?EventStreamHandle {
@@ -1541,18 +1635,108 @@ fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u
 }
 
 fn appendSessionDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_types.StreamDiffFile)) !void {
-    if (value != .array) return;
-
-    for (value.array.items) |item| {
-        if (item != .object) continue;
-        const path = getOptionalObjectString(item, "file") orelse continue;
-        try files.append(std.heap.page_allocator, .{
-            .path = path,
-            .additions = jsonInteger(getObjectField(item, "additions")) orelse 0,
-            .deletions = jsonInteger(getObjectField(item, "deletions")) orelse 0,
-            .patch = null,
-        });
+    switch (value) {
+        .array => |items| {
+            for (items.items) |item| {
+                try appendSessionDiffFile(item, files);
+            }
+        },
+        .object => {
+            if (getObjectField(value, "files")) |nested| {
+                try appendSessionDiffFiles(nested, files);
+                return;
+            }
+            try appendSessionDiffFile(value, files);
+        },
+        else => {},
     }
+}
+
+fn appendSessionDiffFile(item: std.json.Value, files: *std.ArrayList(provider_types.StreamDiffFile)) !void {
+    if (item != .object) return;
+
+    const path = getOptionalObjectString(item, "file") orelse
+        getOptionalObjectString(item, "path") orelse
+        findFirstStringByField(item, "path") orelse
+        findFirstStringByField(item, "file") orelse return;
+    const patch_text = findFirstStringByField(item, "patch") orelse
+        findFirstStringByField(item, "diff");
+    const patch = if (patch_text) |text|
+        if (text.len > 0) text else null
+    else
+        null;
+
+    try files.append(std.heap.page_allocator, .{
+        .path = path,
+        .additions = jsonInteger(getObjectField(item, "additions")) orelse
+            findFirstIntegerByField(item, "additions") orelse
+            countPatchLines(patch, '+'),
+        .deletions = jsonInteger(getObjectField(item, "deletions")) orelse
+            findFirstIntegerByField(item, "deletions") orelse
+            countPatchLines(patch, '-'),
+        .patch = patch,
+    });
+}
+
+fn findFirstStringByField(value: std.json.Value, field: []const u8) ?[]const u8 {
+    switch (value) {
+        .object => |obj| {
+            if (obj.get(field)) |candidate| {
+                if (candidate == .string) return candidate.string;
+            }
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (findFirstStringByField(entry.value_ptr.*, field)) |text| return text;
+            }
+            return null;
+        },
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (findFirstStringByField(item, field)) |text| return text;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn findFirstIntegerByField(value: std.json.Value, field: []const u8) ?i64 {
+    switch (value) {
+        .object => |obj| {
+            if (obj.get(field)) |candidate| {
+                return switch (candidate) {
+                    .integer => |number| number,
+                    .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+                    else => null,
+                };
+            }
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (findFirstIntegerByField(entry.value_ptr.*, field)) |number| return number;
+            }
+            return null;
+        },
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (findFirstIntegerByField(item, field)) |number| return number;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn countPatchLines(patch: ?[]const u8, prefix: u8) i64 {
+    const diff = patch orelse return 0;
+    var count: i64 = 0;
+    var it = std.mem.tokenizeScalar(u8, diff, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        if (line[0] != prefix) continue;
+        if (line.len >= 3 and std.mem.eql(u8, line[0..3], if (prefix == '+') "+++" else "---")) continue;
+        count += 1;
+    }
+    return count;
 }
 
 fn containsString(items: []const []u8, needle: []const u8) bool {
@@ -1657,6 +1841,51 @@ test "extractAssistantTextAlloc joins text parts" {
     const text = try extractAssistantTextAlloc(allocator, parsed.value);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello world", text);
+}
+
+test "extractAssistantTaskSummaryAlloc summarizes task tool state" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"parts":[{"type":"tool","tool":"task","state":{"status":"running","title":"Explore website package"}}]}
+    , .{});
+    defer parsed.deinit();
+
+    const summary = (try extractAssistantTaskSummaryAlloc(allocator, parsed.value)).?;
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings("Running subtask: Explore website package", summary);
+}
+
+test "extractLatestAssistantTaskSummaryAlloc skips baseline assistant message" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"info":{"role":"assistant","id":"baseline"},"parts":[{"type":"tool","tool":"task","state":{"status":"completed","title":"Old task"}}]},
+        \\  {"info":{"role":"assistant","id":"next"},"parts":[{"type":"tool","tool":"task","state":{"status":"running","title":"New task"}}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const summary = (try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, "baseline")).?;
+    defer allocator.free(summary);
+    try std.testing.expectEqualStrings("Running subtask: New task", summary);
+}
+
+test "appendSessionDiffFiles keeps nested patch bodies and derives counts" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"files":[{"file":{"path":"packages/desktop/src/ui/chat_panel.zig"},"diff":"@@ -1 +1 @@\n-old\n+new\n"}]}
+    , .{});
+    defer parsed.deinit();
+
+    var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+    defer files.deinit(std.heap.page_allocator);
+
+    try appendSessionDiffFiles(parsed.value, &files);
+    try std.testing.expectEqual(@as(usize, 1), files.items.len);
+    try std.testing.expectEqualStrings("packages/desktop/src/ui/chat_panel.zig", files.items[0].path);
+    try std.testing.expectEqual(@as(i64, 1), files.items[0].additions);
+    try std.testing.expectEqual(@as(i64, 1), files.items[0].deletions);
+    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
 }
 
 test "parseConfiguredModelsAlloc reads configured providers and models" {

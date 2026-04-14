@@ -363,6 +363,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 state.attachClipboardImageToCurrentDraft();
                 return true;
             }
+            if (handleTranscriptSelectionShortcut(state, &event.key)) {
+                return true;
+            }
             if (handleFileSearchNavigation(state, &event.key)) {
                 return true;
             }
@@ -548,6 +551,15 @@ fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent)
         return state.moveFileSearchSelection(1);
     }
     return false;
+}
+
+fn handleTranscriptSelectionShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isTranscriptFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (event.scancode != .a) return false;
+    if (!isCtrlPressed()) return false;
+    state.openCurrentTranscriptSelectionModal();
+    return true;
 }
 
 fn isCtrlPressed() bool {
