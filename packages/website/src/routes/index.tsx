@@ -7,10 +7,11 @@ import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
 import neovimLogo from '../../../desktop/src/assets/editor_logos/neovim.png'
 import vscodeLogo from '../../../desktop/src/assets/editor_logos/vscode.png'
 import zedLogo from '../../../desktop/src/assets/editor_logos/zed.png'
+import appScreenshot from '../../../../assets/app_screenshot.png'
 
 export const Route = createFileRoute('/')({ component: App })
 
-const workspaceSignals = [
+const features = [
   {
     title: 'Local providers, no hosted middle layer',
     description:
@@ -19,7 +20,7 @@ const workspaceSignals = [
   {
     title: 'Browser and terminal beside the thread',
     description:
-      'Keep the browser pane open for inspection, drop the embedded terminal with CommandOrControl+J, and stay inside the same desktop session.',
+      'Keep the browser pane open for inspection, drop the embedded terminal with Ctrl+J, and stay inside the same desktop session.',
   },
   {
     title: 'Built for long coding sessions',
@@ -34,21 +35,24 @@ const workflowSteps = [
     title: 'Import the repo you already work in',
     description:
       'Point Verde at a project directory and keep the provider runtime scoped to that workspace from the first prompt onward.',
-    detail: 'Project-scoped state, thread history, and file search stay attached to the repo.',
+    detail:
+      'Project-scoped state, thread history, and file search stay attached to the repo.',
   },
   {
     index: '02',
     title: 'Switch providers without leaving the desktop shell',
     description:
       'Run Codex or OpenCode from the same app and keep the surrounding browser, chat, and terminal context intact.',
-    detail: 'Codex threads can boot codex app-server automatically; OpenCode threads can boot opencode serve.',
+    detail:
+      'Codex threads can boot codex app-server automatically; OpenCode threads can boot opencode serve.',
   },
   {
     index: '03',
     title: 'Read, test, and iterate in one window',
     description:
       'Use the browser pane for inspection, the transcript for agent work, and the bottom terminal dock for commands that belong to the repo.',
-    detail: 'The terminal opens in the selected project directory and leaves sidebar width untouched.',
+    detail:
+      'The terminal opens in the selected project directory and leaves sidebar width untouched.',
   },
 ]
 
@@ -61,235 +65,191 @@ const editors = [
 
 function App() {
   return (
-    <main class="marketing-page">
-      <section class="hero-shell">
-        <div class="hero-field" aria-hidden="true" />
+    <main>
+      {/* ── Hero ── */}
+      <section class="hero">
+        <div class="hero-backdrop" aria-hidden="true" />
 
-        <div class="page-wrap hero-layout">
-          <div class="hero-copy rise-in">
-            <p class="eyebrow">Desktop workspace for coding agents</p>
-            <h1 class="hero-title">
-              Verde keeps the thread, the browser, and the terminal in one
-              place.
+        <div class="wrap">
+          <div class="hero-content rise">
+            <p class="tag">Desktop workspace for coding agents</p>
+            <h1 class="display">
+              One native shell for the thread, browser, and terminal.
             </h1>
-            <p class="hero-body">
+            <p class="lead">
               Import a repo, connect Codex or OpenCode through the local CLIs
               you already use, and work inside a native desktop shell built for
               longer sessions.
             </p>
-
             <div class="hero-actions">
               <a
                 href="https://github.com/JonathanRiche/verde/releases"
                 target="_blank"
                 rel="noreferrer"
-                class="action-primary"
+                class="btn btn-primary"
               >
                 Install Verde
               </a>
-              <a href="#install" class="action-secondary">
-                Build From Source
+              <a href="#install" class="btn btn-ghost">
+                Build from source
               </a>
             </div>
-
-            <ul class="hero-points" aria-label="Verde highlights">
+            <ul class="hero-highlights stagger" aria-label="Verde highlights">
               <li>Codex and OpenCode</li>
               <li>Embedded browser pane</li>
               <li>Project-scoped terminal dock</li>
             </ul>
           </div>
+        </div>
 
-          <div class="workspace-stage rise-in" style={{ 'animation-delay': '120ms' }}>
-            <div class="workspace-topbar">
-              <div class="workspace-brand">
-                <img src={verdeLogo} alt="Verde" class="workspace-brand-logo" />
-                <span>verde</span>
-              </div>
-              <div class="workspace-project">~/development/verde</div>
-              <div class="workspace-window-controls" aria-hidden="true">
-                <span />
-                <span />
-                <span />
-              </div>
-            </div>
+        {/* Full-width workspace mockup */}
+        <div class="stage-wrap">
+          <div class="app-frame rise" style={{ 'animation-delay': '180ms' }}>
+            <img
+              src={appScreenshot}
+              alt="Verde desktop app with a project sidebar, agent thread, browser pane, and terminal dock."
+              class="app-screenshot"
+            />
+          </div>
+        </div>
+      </section>
 
-            <div class="workspace-body">
-              <aside class="workspace-sidebar">
-                <p class="mini-label">Workspace</p>
-                <div class="workspace-nav">
-                  <div class="workspace-nav-item is-active">
-                    <span>chat</span>
-                    <strong>verde</strong>
-                  </div>
-                  <div class="workspace-nav-item">
-                    <span>browser</span>
-                    <strong>docs and app flow</strong>
-                  </div>
-                  <div class="workspace-nav-item">
-                    <span>terminal</span>
-                    <strong>project shell</strong>
-                  </div>
-                </div>
+      {/* ── Features (bento grid) ── */}
+      <section id="product" class="band">
+        <div class="wrap">
+          <div class="band-header">
+            <p class="tag">What's inside</p>
+            <h2 class="heading">
+              Local tools, native performance, one workspace.
+            </h2>
+            <p class="band-body">
+              Verde is structured around how the desktop app works: local
+              provider CLIs, imported project directories, and a UI that keeps
+              the moving pieces visible.
+            </p>
+          </div>
 
-                <div class="provider-stack">
-                  <div class="provider-pill">
+          <div class="bento stagger">
+            {/* Wide card – providers */}
+            <article class="bento-card bento-wide">
+              <div class="card-visual">
+                <div class="card-providers">
+                  <div class="card-pill">
                     <img src={openAiLogo} alt="" />
                     <span>Codex CLI</span>
                   </div>
-                  <div class="provider-pill provider-pill-text">
-                    <span>OC</span>
+                  <div class="card-pill">
+                    <span
+                      class="provider-pill-badge"
+                      style={{
+                        width: '1.1rem',
+                        height: '1.1rem',
+                        'font-size': '0.55rem',
+                      }}
+                    >
+                      OC
+                    </span>
                     <span>OpenCode</span>
                   </div>
                 </div>
-              </aside>
-
-              <div class="workspace-columns">
-                <section class="surface-panel transcript-panel">
-                  <div class="surface-header">
-                    <span>Thread</span>
-                    <strong>Provider runtime</strong>
-                  </div>
-
-                  <div class="transcript-stream">
-                    <div class="transcript-bubble transcript-bubble-agent">
-                      <p class="bubble-author">Codex</p>
-                      <p>
-                        App server ready. Imported project detected at{' '}
-                        <code>/home/rtg/development/verde</code>.
-                      </p>
-                    </div>
-                    <div class="transcript-bubble transcript-bubble-user">
-                      <p class="bubble-author">You</p>
-                      <p>
-                        Keep the browser open on the docs and drop a terminal
-                        below the thread.
-                      </p>
-                    </div>
-                    <div class="transcript-bubble transcript-bubble-agent">
-                      <p class="bubble-author">Verde</p>
-                      <p>
-                        Browser pane synced. Terminal dock toggled with{' '}
-                        <code>CommandOrControl+J</code>.
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section class="surface-panel browser-panel">
-                  <div class="surface-header">
-                    <span>Browser pane</span>
-                    <strong>Embedded alongside the thread</strong>
-                  </div>
-
-                  <div class="browser-shell">
-                    <div class="browser-toolbar">
-                      <span class="browser-dot" />
-                      <span class="browser-dot" />
-                      <span class="browser-dot" />
-                      <div class="browser-address">
-                        github.com/JonathanRiche/verde
-                      </div>
-                    </div>
-
-                    <div class="browser-canvas">
-                      <div class="browser-note">
-                        <p>Inspect docs, review agent output, keep context live.</p>
-                      </div>
-
-                      <div class="browser-lines" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                        <span />
-                      </div>
-                    </div>
-                  </div>
-                </section>
               </div>
-            </div>
-
-            <div class="terminal-dock">
-              <div class="surface-header">
-                <span>Terminal dock</span>
-                <strong>Scoped to the selected project</strong>
+              <div class="card-body">
+                <h3>{features[0].title}</h3>
+                <p>{features[0].description}</p>
               </div>
+            </article>
 
-              <div class="terminal-lines">
-                <p>
-                  <span class="prompt">$</span> zig build run
-                </p>
-                <p>
-                  <span class="prompt">$</span> codex login
-                </p>
-                <p>
-                  <span class="prompt">$</span> opencode serve --hostname
-                  127.0.0.1 --port 4096
-                </p>
+            {/* Browser card */}
+            <article class="bento-card">
+              <div class="card-visual">
+                <div class="card-browser">
+                  <div class="card-browser-bar">
+                    <div class="dots">
+                      <span />
+                      <span />
+                      <span />
+                    </div>
+                    <div class="url">localhost:3000</div>
+                  </div>
+                  <div class="card-browser-content">
+                    <div class="skeleton">
+                      <span style={{ width: '72%' }} />
+                      <span style={{ width: '88%' }} />
+                      <span style={{ width: '55%' }} />
+                      <span style={{ width: '40%' }} />
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
+              <div class="card-body">
+                <h3>{features[1].title}</h3>
+                <p>{features[1].description}</p>
+              </div>
+            </article>
+
+            {/* Terminal card */}
+            <article class="bento-card">
+              <div class="card-visual">
+                <div class="card-terminal">
+                  <div class="card-terminal-bar">
+                    <span class="tab-active">shell</span>
+                    <span>build</span>
+                  </div>
+                  <div class="card-terminal-content">
+                    <p>
+                      <span class="prompt">$</span> zig build run
+                    </p>
+                    <p>
+                      <span class="prompt">$</span> zig build test
+                    </p>
+                    <p style={{ color: 'var(--diff-add)' }}>
+                      47 passed, 0 failed
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div class="card-body">
+                <h3>{features[2].title}</h3>
+                <p>{features[2].description}</p>
+              </div>
+            </article>
           </div>
         </div>
       </section>
 
-      <section id="product" class="section-band">
-        <div class="page-wrap split-layout">
-          <div class="section-copy">
-            <p class="eyebrow">Native shell</p>
-            <h2 class="section-title">
-              Use local tools without stitching them together by hand.
-            </h2>
-            <p class="section-body">
-              Verde is already structured around the way the desktop app works:
-              local provider CLIs, imported project directories, and a UI that
-              keeps the moving pieces visible instead of scattering them across
-              terminal tabs and browser windows.
-            </p>
-          </div>
-
-          <div class="signal-list">
-            <For each={workspaceSignals}>
-              {(item) => (
-                <article class="signal-row">
-                  <h3>{item.title}</h3>
-                  <p>{item.description}</p>
-                </article>
-              )}
-            </For>
-          </div>
-        </div>
-      </section>
-
-      <section id="flow" class="section-band section-band-contrast">
-        <div class="page-wrap flow-layout">
-          <div class="flow-copy">
-            <p class="eyebrow">Workflow</p>
-            <h2 class="section-title">
-              One desktop workspace from first prompt to final command.
-            </h2>
-            <p class="section-body">
-              The product story is simple: bring the repo in, start the provider
-              you want, keep the browser pane next to the transcript, and pull
-              the terminal up only when the work needs it.
-            </p>
-
-            <div class="editor-strip" aria-label="Editor compatibility">
-              <For each={editors}>
-                {(editor) => (
-                  <div class="editor-chip">
-                    <img src={editor.logo} alt="" />
-                    <span>{editor.name}</span>
-                  </div>
-                )}
-              </For>
+      {/* ── Workflow ── */}
+      <section id="flow" class="band band-alt">
+        <div class="wrap flow-grid">
+          <div class="flow-aside">
+            <div class="flow-aside-sticky">
+              <p class="tag">Workflow</p>
+              <h2 class="heading">
+                One desktop workspace from first prompt to final command.
+              </h2>
+              <p class="band-body">
+                The product story is simple: bring the repo in, start the
+                provider you want, keep the browser pane next to the transcript,
+                and pull the terminal up only when the work needs it.
+              </p>
+              <div class="editor-strip" aria-label="Editor compatibility">
+                <For each={editors}>
+                  {(editor) => (
+                    <div class="editor-chip">
+                      <img src={editor.logo} alt="" />
+                      <span>{editor.name}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
             </div>
           </div>
 
-          <div class="workflow-list">
+          <div class="flow-steps stagger">
             <For each={workflowSteps}>
               {(step) => (
-                <article class="workflow-step">
-                  <div class="workflow-index">{step.index}</div>
-                  <div class="workflow-content">
+                <article class="step">
+                  <div class="step-num">{step.index}</div>
+                  <div class="step-body">
                     <h3>{step.title}</h3>
                     <p>{step.description}</p>
                     <small>{step.detail}</small>
@@ -301,23 +261,23 @@ function App() {
         </div>
       </section>
 
-      <section id="install" class="section-band">
-        <div class="page-wrap install-layout">
-          <div class="install-copy">
-            <p class="eyebrow">Install</p>
-            <h2 class="section-title">
+      {/* ── Install ── */}
+      <section id="install" class="band">
+        <div class="wrap">
+          <div class="band-header">
+            <p class="tag">Install</p>
+            <h2 class="heading">
               Ship it from releases or build it straight from the repo.
             </h2>
-            <p class="section-body">
-              Verde already has release artifacts for Linux and macOS, plus a
-              direct source path when you want to run the app locally while you
-              build on top of it.
+            <p class="band-body">
+              Verde has release artifacts for Linux and macOS, plus a direct
+              source path for running the app locally.
             </p>
           </div>
 
-          <div class="install-shelf">
-            <article class="install-panel">
-              <div class="surface-header">
+          <div class="install-grid stagger">
+            <article class="term-card">
+              <div class="term-card-header">
                 <span>Release path</span>
                 <strong>Download and install</strong>
               </div>
@@ -332,8 +292,8 @@ function App() {
               </a>
             </article>
 
-            <article class="install-panel">
-              <div class="surface-header">
+            <article class="term-card">
+              <div class="term-card-header">
                 <span>Source path</span>
                 <strong>Run locally</strong>
               </div>
@@ -344,26 +304,26 @@ zig build run`}</code>
               </pre>
             </article>
 
-            <article class="install-panel install-panel-wide">
-              <div class="surface-header">
+            <article class="term-card term-card-span">
+              <div class="term-card-header">
                 <span>CLI prerequisites</span>
                 <strong>Bring your provider runtime</strong>
               </div>
               <p>
-                To actually use Verde, install and authenticate at least one
-                local provider first.
+                Install and authenticate at least one local provider to use
+                Verde.
               </p>
-              <div class="install-commands">
+              <div class="install-prereqs">
                 <div>
                   <strong>Codex</strong>
                   <pre>
-                    <code>{`codex login`}</code>
+                    <code>codex login</code>
                   </pre>
                 </div>
                 <div>
                   <strong>OpenCode</strong>
                   <pre>
-                    <code>{`opencode`}</code>
+                    <code>opencode</code>
                   </pre>
                 </div>
               </div>
@@ -371,6 +331,34 @@ zig build run`}</code>
           </div>
         </div>
       </section>
+
+      {/* ── Footer ── */}
+      <footer class="site-footer">
+        <div class="wrap footer-inner">
+          <div class="footer-brand">
+            <img src={verdeLogo} alt="" />
+            <span>verde</span>
+          </div>
+          <div class="footer-links">
+            <a
+              href="https://github.com/JonathanRiche/verde"
+              target="_blank"
+              rel="noreferrer"
+              class="footer-link"
+            >
+              GitHub
+            </a>
+            <a
+              href="https://github.com/JonathanRiche/verde/releases"
+              target="_blank"
+              rel="noreferrer"
+              class="footer-link"
+            >
+              Releases
+            </a>
+          </div>
+        </div>
+      </footer>
     </main>
   )
 }
