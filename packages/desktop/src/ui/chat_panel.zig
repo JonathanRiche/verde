@@ -770,10 +770,11 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         }
 
         if (has_pending_stream) {
-            renderPendingApproval(state);
             renderPendingDiffCard(state);
             renderPendingTimelineEvents(state);
             renderPendingTranscriptBubble(state);
+            renderPendingApproval(state);
+            renderPendingFollowup(state);
             zgui.dummy(.{ .w = 0.0, .h = 6.0 });
         }
     }
@@ -838,6 +839,26 @@ fn renderPendingApproval(state: anytype) void {
         zgui.popStyleColor(.{ .count = 3 });
         zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
     }
+}
+
+fn renderPendingFollowup(state: *app_state.AppState) void {
+    var snapshot = state.pendingFollowupSnapshot() catch null;
+    defer if (snapshot) |pending| state.allocator.free(pending.prompt);
+
+    const pending = snapshot orelse return;
+    renderTranscriptBubble(
+        state,
+        "pending-followup-body",
+        .system,
+        switch (pending.kind) {
+            .queue => "Queued next message",
+            .steer => "Steer pending",
+        },
+        pending.prompt,
+        null,
+        false,
+    );
+    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
 }
 
 /// Renders streamed timeline events while a send is pending.
@@ -1644,6 +1665,14 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
     composer_pickers.render(state);
+    const pending = runtime.isSendPending(state);
+    if (pending) {
+        if (state.pendingFollowupHint()) |hint| {
+            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{hint});
+            zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
+            zgui.textColored(theme.COLOR_TEXT_MUTED, "to hold a follow-up while this thread is running", .{});
+        }
+    }
 
     const send_btn_size = theme.scaledUi(32.0);
     zgui.sameLine(.{ .spacing = 0.0 });
@@ -1653,7 +1682,6 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     }
 
     {
-        const pending = runtime.isSendPending(state);
         const btn_pos = zgui.getCursorScreenPos();
         const clicked = zgui.invisibleButton("##send-btn", .{ .w = send_btn_size, .h = send_btn_size });
         const hovered = zgui.isItemHovered(.{});
@@ -1675,11 +1703,14 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         });
 
         if (pending) {
-            const dot_r = theme.scaledUi(2.0);
             const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
-            draw_list.addCircleFilled(.{ .p = .{ cx - theme.scaledUi(6.0), cy }, .r = dot_r, .col = white });
-            draw_list.addCircleFilled(.{ .p = .{ cx, cy }, .r = dot_r, .col = white });
-            draw_list.addCircleFilled(.{ .p = .{ cx + theme.scaledUi(6.0), cy }, .r = dot_r, .col = white });
+            const stop_half = theme.scaledUi(5.5);
+            draw_list.addRectFilled(.{
+                .pmin = .{ cx - stop_half, cy - stop_half },
+                .pmax = .{ cx + stop_half, cy + stop_half },
+                .col = white,
+                .rounding = theme.scaledUi(2.0),
+            });
         } else {
             const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
             const arrow_half_w = theme.scaledUi(5.5);
@@ -1701,13 +1732,17 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
             });
         }
 
-        if ((clicked or submitted) and !pending) {
+        if (clicked and pending) {
+            state.abortCurrentThreadSend();
+        } else if ((clicked or submitted) and !pending) {
             if (submitted and state.acceptPrimaryFileSearchResult()) {
                 return;
             }
             state.sendDraft() catch |err| {
                 runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
             };
+        } else if (submitted and pending) {
+            state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
         }
     }
 
