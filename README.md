@@ -4,6 +4,9 @@
 
 This repo currently contains the desktop app in [`packages/desktop/`](packages/desktop). If you clone the repo and want to run the app locally in development, that is the directory you want.
 
+<img width="2560" height="1080" alt="image" src="https://github.com/user-attachments/assets/252b51ed-2780-4362-b3d5-afdf72e5087d" />
+
+
 ## Getting started
 
 Verde talks to local provider CLIs rather than bundling its own backend.
