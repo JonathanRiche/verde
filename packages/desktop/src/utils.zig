@@ -445,6 +445,7 @@ pub fn runSendWorker(
         .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),
         .sandbox_mode = sandboxModeForMode(request.provider, request.access_mode),
         .stream_context = request.send_state_ptr,
+        .on_thread_id = handleSendThreadId,
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
         .on_approval_request = handleSendApprovalRequest,
@@ -866,6 +867,22 @@ pub fn sandboxModeForMode(provider: app_state.Provider, mode: app_state.AccessMo
         .full_access => .danger_full_access,
         .supervised => .workspace_write,
     };
+}
+fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
+    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const page_alloc = std.heap.page_allocator;
+
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return;
+
+    if (send_state.provisional_provider_thread_id) |existing| {
+        if (std.mem.eql(u8, existing, thread_id)) return;
+        page_alloc.free(existing);
+        send_state.provisional_provider_thread_id = null;
+    }
+
+    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch null;
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1453,4 +1470,20 @@ pub fn extensionForImageMime(mime: []const u8) []const u8 {
     if (std.mem.eql(u8, mime, "image/gif")) return "gif";
     if (std.mem.eql(u8, mime, "image/bmp")) return "bmp";
     return "img";
+}
+
+test "handleSendThreadId stores provisional provider thread id while pending" {
+    var send_state = app_state.SendState{ .status = .pending };
+    defer if (send_state.provisional_provider_thread_id) |thread_id| std.heap.page_allocator.free(thread_id);
+
+    handleSendThreadId(&send_state, "ses_123");
+    try std.testing.expect(send_state.provisional_provider_thread_id != null);
+    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
+
+    handleSendThreadId(&send_state, "ses_123");
+    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
+
+    send_state.status = .idle;
+    handleSendThreadId(&send_state, "ses_456");
+    try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
 }

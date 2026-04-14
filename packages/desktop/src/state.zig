@@ -295,6 +295,10 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(message);
             self.send_state.error_message = null;
         }
+        if (self.send_state.provisional_provider_thread_id) |thread_id| {
+            std.heap.page_allocator.free(thread_id);
+            self.send_state.provisional_provider_thread_id = null;
+        }
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
         freePendingDiffFiles(std.heap.page_allocator, &self.send_state.pending_diff_files);
@@ -646,6 +650,7 @@ pub const SendState = struct {
     result: ?SendResultPayload = null,
     error_message: ?[]u8 = null,
     provider: ?Provider = null,
+    provisional_provider_thread_id: ?[]u8 = null,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
@@ -1615,6 +1620,10 @@ pub const AppState = struct {
         send_state.result = null;
         send_state.error_message = null;
         send_state.provider = thread.provider;
+        if (send_state.provisional_provider_thread_id) |thread_id| {
+            page_alloc.free(thread_id);
+            send_state.provisional_provider_thread_id = null;
+        }
         send_state.partial_text.clearRetainingCapacity();
         freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
@@ -3526,6 +3535,8 @@ pub const AppState = struct {
     }
 
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+        self.capturePendingProviderThreadId(thread);
+
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
         var next_status: SendStatus = .idle;
@@ -3538,6 +3549,10 @@ pub const AppState = struct {
             .completed => {
                 completed_result = send_state.result;
                 send_state.result = null;
+                if (send_state.provisional_provider_thread_id) |thread_id| {
+                    std.heap.page_allocator.free(thread_id);
+                    send_state.provisional_provider_thread_id = null;
+                }
                 flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
                 completed_events = send_state.pending_events;
                 send_state.pending_events = .empty;
@@ -3552,6 +3567,10 @@ pub const AppState = struct {
             .failed => {
                 failed_message = send_state.error_message;
                 send_state.error_message = null;
+                if (send_state.provisional_provider_thread_id) |thread_id| {
+                    std.heap.page_allocator.free(thread_id);
+                    send_state.provisional_provider_thread_id = null;
+                }
                 send_state.partial_text.clearRetainingCapacity();
                 completed_events = send_state.pending_events;
                 send_state.pending_events = .empty;
@@ -3610,6 +3629,22 @@ pub const AppState = struct {
             },
             else => {},
         }
+    }
+
+    fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {
+        if (thread.provider_thread_id != null) return;
+
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        const thread_id = if (send_state.status == .pending and send_state.provisional_provider_thread_id != null)
+            self.allocator.dupeZ(u8, send_state.provisional_provider_thread_id.?) catch null
+        else
+            null;
+        send_state.mutex.unlock();
+
+        thread.provider_thread_id = thread_id orelse return;
+        self.markDirty();
+        self.flushDirtyNow();
     }
 
     fn finishPickerThread(self: *AppState) void {

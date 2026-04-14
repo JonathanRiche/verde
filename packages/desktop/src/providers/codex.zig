@@ -197,6 +197,10 @@ pub const Client = struct {
             try self.startThread(allocator, request);
         errdefer allocator.free(thread_id);
 
+        if (request.on_thread_id) |on_thread_id| {
+            on_thread_id(request.stream_context, thread_id);
+        }
+
         try self.ensureThreadLoaded(thread_id);
 
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
