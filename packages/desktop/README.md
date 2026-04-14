@@ -246,7 +246,11 @@ Current supported config includes UI font size, keybind overrides, and the defau
       "split_up":     "CommandOrControl+Shift+Up",
       "split_down":   ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
       "split_left":   "CommandOrControl+Shift+Left",
-      "split_right":  ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"]
+      "split_right":  ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
+      "focus_up":     "CommandOrControl+Alt+Up",
+      "focus_down":   "CommandOrControl+Alt+Down",
+      "focus_left":   "CommandOrControl+Alt+Left",
+      "focus_right":  "CommandOrControl+Alt+Right"
     },
     "chat_up": "Up",
     "chat_down": "Down",
@@ -256,7 +260,9 @@ Current supported config includes UI font size, keybind overrides, and the defau
 }
 ```
 
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in sidebar toggle binding is `CommandOrControl+S`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in terminal workspace bindings are `CommandOrControl+Shift+T`, `W`, `R`, `PageUp`, `PageDown`, `Up`, `Left`, `E`/`Down`, and `O`/`Right`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
+Keybinds are read from the user config on startup and on app refresh. Use a string for one shortcut or a string array for multiple shortcuts for the same action.
+
+Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in sidebar toggle binding is `CommandOrControl+S`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in terminal workspace bindings are `CommandOrControl+Shift+T`, `W`, `R`, `PageUp`, `PageDown`, `Up`, `Left`, `E`/`Down`, `O`/`Right`, plus pane focus on `CommandOrControl+Alt+Arrow`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
 
 For backward compatibility, `keybinds.terminal` still accepts a string or string array to override only the terminal toggle shortcut.
 

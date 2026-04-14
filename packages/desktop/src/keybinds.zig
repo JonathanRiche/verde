@@ -30,6 +30,10 @@ pub const NativeTerminalAction = enum {
     split_down,
     split_left,
     split_right,
+    focus_up,
+    focus_down,
+    focus_left,
+    focus_right,
 };
 
 pub const Keybind = struct {
@@ -86,6 +90,10 @@ pub const NativeKeyboardConfig = struct {
     terminal_split_down: []Keybind,
     terminal_split_left: []Keybind,
     terminal_split_right: []Keybind,
+    terminal_focus_up: []Keybind,
+    terminal_focus_down: []Keybind,
+    terminal_focus_left: []Keybind,
+    terminal_focus_right: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -109,6 +117,10 @@ pub const NativeKeyboardConfig = struct {
             .terminal_split_down = try cloneDefaultTerminalSplitDownKeybinds(allocator),
             .terminal_split_left = try cloneDefaultTerminalSplitLeftKeybinds(allocator),
             .terminal_split_right = try cloneDefaultTerminalSplitRightKeybinds(allocator),
+            .terminal_focus_up = try cloneDefaultTerminalFocusUpKeybinds(allocator),
+            .terminal_focus_down = try cloneDefaultTerminalFocusDownKeybinds(allocator),
+            .terminal_focus_left = try cloneDefaultTerminalFocusLeftKeybinds(allocator),
+            .terminal_focus_right = try cloneDefaultTerminalFocusRightKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -143,6 +155,10 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.terminal_split_down);
         self.allocator.free(self.terminal_split_left);
         self.allocator.free(self.terminal_split_right);
+        self.allocator.free(self.terminal_focus_up);
+        self.allocator.free(self.terminal_focus_down);
+        self.allocator.free(self.terminal_focus_left);
+        self.allocator.free(self.terminal_focus_right);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -207,6 +223,18 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.terminal_split_right, event)) {
             return .split_right;
+        }
+        if (matchesAny(self.terminal_focus_up, event)) {
+            return .focus_up;
+        }
+        if (matchesAny(self.terminal_focus_down, event)) {
+            return .focus_down;
+        }
+        if (matchesAny(self.terminal_focus_left, event)) {
+            return .focus_left;
+        }
+        if (matchesAny(self.terminal_focus_right, event)) {
+            return .focus_right;
         }
 
         return null;
@@ -352,6 +380,30 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(value, "terminal.split_right")) |bindings| {
                 self.allocator.free(self.terminal_split_right);
                 self.terminal_split_right = bindings;
+            }
+        }
+        if (terminal_value.object.get("focus_up")) |value| {
+            if (self.parseOverrideValue(value, "terminal.focus_up")) |bindings| {
+                self.allocator.free(self.terminal_focus_up);
+                self.terminal_focus_up = bindings;
+            }
+        }
+        if (terminal_value.object.get("focus_down")) |value| {
+            if (self.parseOverrideValue(value, "terminal.focus_down")) |bindings| {
+                self.allocator.free(self.terminal_focus_down);
+                self.terminal_focus_down = bindings;
+            }
+        }
+        if (terminal_value.object.get("focus_left")) |value| {
+            if (self.parseOverrideValue(value, "terminal.focus_left")) |bindings| {
+                self.allocator.free(self.terminal_focus_left);
+                self.terminal_focus_left = bindings;
+            }
+        }
+        if (terminal_value.object.get("focus_right")) |value| {
+            if (self.parseOverrideValue(value, "terminal.focus_right")) |bindings| {
+                self.allocator.free(self.terminal_focus_right);
+                self.terminal_focus_right = bindings;
             }
         }
     }
@@ -538,6 +590,30 @@ fn cloneDefaultTerminalSplitRightKeybinds(allocator: std.mem.Allocator) ![]Keybi
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Shift+O"),
         try parseDefaultAccelerator("CommandOrControl+Shift+Right"),
+    });
+}
+
+fn cloneDefaultTerminalFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+Up"),
+    });
+}
+
+fn cloneDefaultTerminalFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+Down"),
+    });
+}
+
+fn cloneDefaultTerminalFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+Left"),
+    });
+}
+
+fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+Right"),
     });
 }
 
@@ -983,6 +1059,7 @@ test "terminal nested keybind overrides accept workspace actions" {
             try terminal.put("toggle", .{ .string = "Alt+J" });
             try terminal.put("new_tab", .{ .string = "Ctrl+Alt+T" });
             try terminal.put("split_right", .{ .string = "Ctrl+Alt+L" });
+            try terminal.put("focus_right", .{ .string = "Alt+Shift+L" });
             try keybinds.put("terminal", .{ .object = terminal });
             try object.put("keybinds", .{ .object = keybinds });
             break :blk object;
@@ -1005,6 +1082,11 @@ test "terminal nested keybind overrides accept workspace actions" {
     try std.testing.expect(config.terminal_split_right[0].ctrl);
     try std.testing.expect(config.terminal_split_right[0].alt);
     try std.testing.expectEqual(sdl.Keycode.l, config.terminal_split_right[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.terminal_focus_right.len);
+    try std.testing.expect(config.terminal_focus_right[0].alt);
+    try std.testing.expect(config.terminal_focus_right[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.l, config.terminal_focus_right[0].key);
 }
 
 test "legacy terminal keybind override still maps to terminal toggle" {

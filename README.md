@@ -229,10 +229,28 @@ Example config:
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
     "sidebar": "CommandOrControl+S",
-    "browser": "Ctrl+B"
+    "browser": "Ctrl+B",
+    "terminal": {
+      "toggle":       "CommandOrControl+J",
+      "new_tab":      "CommandOrControl+Shift+T",
+      "close":        "CommandOrControl+Shift+W",
+      "rename_tab":   "CommandOrControl+Shift+R",
+      "tab_previous": "CommandOrControl+Shift+PageUp",
+      "tab_next":     "CommandOrControl+Shift+PageDown",
+      "split_up":     "CommandOrControl+Shift+Up",
+      "split_down":   ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
+      "split_left":   "CommandOrControl+Shift+Left",
+      "split_right":  ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
+      "focus_up":     "CommandOrControl+Alt+Up",
+      "focus_down":   "CommandOrControl+Alt+Down",
+      "focus_left":   "CommandOrControl+Alt+Left",
+      "focus_right":  "CommandOrControl+Alt+Right"
+    }
   }
 }
 ```
+
+Keybinds are loaded from the user config on startup and on app refresh. Use a string for one shortcut or a string array for multiple shortcuts for the same action.
 
 ## Third-Party Components
 
