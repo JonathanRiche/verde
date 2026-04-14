@@ -383,6 +383,14 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
     defer state.mutex.unlock();
 
     if (result) |payload| {
+        if (state.stop_requested) {
+            std.heap.page_allocator.free(payload.provider_thread_id);
+            std.heap.page_allocator.free(payload.reply_text);
+            state.result = null;
+            state.error_message = null;
+            state.status = .aborted;
+            return;
+        }
         state.result = payload;
         state.error_message = null;
         state.status = .completed;

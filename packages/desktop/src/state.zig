@@ -3803,6 +3803,7 @@ pub const AppState = struct {
 
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
+        var had_pending_followup = false;
         var next_status: SendStatus = .idle;
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
@@ -3833,6 +3834,7 @@ pub const AppState = struct {
                 next_status = .completed;
             },
             .aborted => {
+                had_pending_followup = send_state.pending_followup != null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
                     std.heap.page_allocator.free(thread_id);
                     send_state.provisional_provider_thread_id = null;
@@ -3926,6 +3928,17 @@ pub const AppState = struct {
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
+                if (!had_pending_followup) {
+                    self.appendMessageToThread(
+                        thread,
+                        .system,
+                        "Conversation interrupted",
+                        "Tell the model what to do differently.",
+                        null,
+                    ) catch |err| {
+                        log.err("failed to append interruption notice: {s}", .{@errorName(err)});
+                    };
+                }
                 thread.touch();
                 self.markDirty();
                 self.setSidebarNotice("Provider reply stopped.");
