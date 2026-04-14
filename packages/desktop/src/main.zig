@@ -369,6 +369,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleFileSearchNavigation(state, &event.key)) {
                 return true;
             }
+            if (handlePendingThreadFollowupShortcut(state, &event.key)) {
+                return true;
+            }
             if (action) |resolved_action| {
                 handleKeyboardAction(state, keyboard, resolved_action);
             }
@@ -551,6 +554,23 @@ fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent)
         return state.moveFileSearchSelection(1);
     }
     return false;
+}
+
+fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.composer_focused) return false;
+    if (!state.hasPendingStream()) return false;
+    if (!event.down or event.repeat) return false;
+    if (event.scancode != .tab) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return false;
+    }
+
+    state.queueOrSteerDraftDuringSend();
+    return true;
 }
 
 fn handleTranscriptSelectionShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

@@ -22,6 +22,7 @@ pub const StreamDiffFile = types.StreamDiffFile;
 pub const StreamEvent = types.StreamEvent;
 pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
+pub const InterruptThreadRequest = types.InterruptThreadRequest;
 pub const freeModelInfos = types.freeModelInfos;
 
 pub const ProviderConfig = union(Provider) {
@@ -72,6 +73,13 @@ pub const ProviderClient = union(Provider) {
         return switch (self.*) {
             .opencode => |*client| client.sendPrompt(allocator, request),
             .codex => |*client| client.sendPrompt(allocator, request),
+        };
+    }
+
+    pub fn interruptThread(self: *ProviderClient, request: InterruptThreadRequest) !void {
+        return switch (self.*) {
+            .opencode => |*client| client.interruptThread(request),
+            .codex => |*client| client.interruptThread(request),
         };
     }
 };

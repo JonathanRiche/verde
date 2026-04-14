@@ -842,7 +842,7 @@ fn renderPendingApproval(state: anytype) void {
 }
 
 fn renderPendingFollowup(state: *app_state.AppState) void {
-    var snapshot = state.pendingFollowupSnapshot() catch null;
+    const snapshot = state.pendingFollowupSnapshot() catch null;
     defer if (snapshot) |pending| state.allocator.free(pending.prompt);
 
     const pending = snapshot orelse return;

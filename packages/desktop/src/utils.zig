@@ -387,6 +387,12 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         state.error_message = null;
         state.status = .completed;
     } else |err| {
+        if (err == error.CodexTurnInterrupted and state.stop_requested) {
+            state.error_message = null;
+            state.result = null;
+            state.status = .aborted;
+            return;
+        }
         const message = formatSendWorkerError(page_alloc, request.provider, err) catch null;
         state.error_message = message;
         state.result = null;
@@ -446,6 +452,7 @@ pub fn runSendWorker(
         .sandbox_mode = sandboxModeForMode(request.provider, request.access_mode),
         .stream_context = request.send_state_ptr,
         .on_thread_id = handleSendThreadId,
+        .on_turn_id = handleSendTurnId,
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
         .on_approval_request = handleSendApprovalRequest,
@@ -883,6 +890,22 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
     }
 
     send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch null;
+}
+fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
+    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
+    const page_alloc = std.heap.page_allocator;
+
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return;
+
+    if (send_state.active_turn_id) |existing| {
+        if (std.mem.eql(u8, existing, turn_id)) return;
+        page_alloc.free(existing);
+        send_state.active_turn_id = null;
+    }
+
+    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch null;
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
