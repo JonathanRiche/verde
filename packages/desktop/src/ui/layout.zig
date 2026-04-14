@@ -43,6 +43,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     zgui.sameLine(.{ .spacing = gap });
     chat_panel.renderWorkspace(state, workspace_width, content[1]);
     renderImageModal(state, width, height);
+    renderTranscriptSelectionModal(state, width, height);
     renderProjectRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     debug_window.render(state, width, height);
@@ -243,6 +244,80 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
         return;
     }
     zgui.popStyleColor(.{ .count = 3 });
+}
+
+fn renderTranscriptSelectionModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const transcript_text = state.transcriptSelectionBuffer() orelse return;
+    if (state.consumeTranscriptSelectionModalRequest()) {
+        zgui.openPopup(runtime.TRANSCRIPT_SELECTION_MODAL_ID, .{});
+    }
+
+    zgui.setNextWindowPos(.{
+        .x = width * 0.5,
+        .y = height * 0.5,
+        .cond = .appearing,
+        .pivot_x = 0.5,
+        .pivot_y = 0.5,
+    });
+    zgui.setNextWindowSize(.{
+        .w = @min(width * 0.76, theme.scaledUi(980.0)),
+        .h = @min(height * 0.8, theme.scaledUi(760.0)),
+        .cond = .appearing,
+    });
+    zgui.pushStyleVar1f(.{ .idx = .window_rounding, .v = theme.scaledUi(16.0) });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(18.0) } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ theme.scaledUi(10.0), theme.scaledUi(10.0) } });
+    var modal_open = true;
+    if (!zgui.beginPopupModal(runtime.TRANSCRIPT_SELECTION_MODAL_ID, .{
+        .popen = &modal_open,
+        .flags = .{ .no_saved_settings = true },
+    })) {
+        if (!modal_open) state.closeTranscriptSelectionModal();
+        zgui.popStyleVar(.{ .count = 3 });
+        return;
+    }
+    defer {
+        zgui.endPopup();
+        zgui.popStyleVar(.{ .count = 3 });
+    }
+
+    zgui.textColored(theme.COLOR_WHITE, "Thread text", .{});
+    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Ctrl+C copies the current selection.", .{});
+
+    const close_button_width = theme.scaledUi(112.0);
+    const text_height = @max(zgui.getContentRegionAvail()[1] - theme.scaledUi(44.0), theme.scaledUi(160.0));
+
+    zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 0.0 });
+    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(12.0), theme.scaledUi(10.0) } });
+    defer zgui.popStyleVar(.{ .count = 2 });
+
+    if (zgui.isWindowAppearing()) {
+        zgui.setKeyboardFocusHere(0);
+    }
+    _ = zgui.inputTextMultiline("##transcript-selection-modal-text", .{
+        .buf = transcript_text,
+        .w = 0.0,
+        .h = text_height,
+        .flags = transcriptSelectionModalFlags(),
+    });
+
+    if (zgui.button("Close", .{ .w = close_button_width, .h = theme.scaledUi(34.0) })) {
+        state.closeTranscriptSelectionModal();
+        zgui.closeCurrentPopup();
+        return;
+    }
+}
+
+fn transcriptSelectionModalFlags() zgui.InputTextFlags {
+    const base: zgui.InputTextFlags = .{
+        .read_only = true,
+        .auto_select_all = true,
+        .no_horizontal_scroll = true,
+        .no_undo_redo = true,
+    };
+    const word_wrap_mask: c_int = 1 << 24;
+    const bits: c_int = @bitCast(base);
+    return @bitCast(bits | word_wrap_mask);
 }
 
 fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) void {

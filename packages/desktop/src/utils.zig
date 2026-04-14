@@ -976,11 +976,10 @@ fn upsertPendingDiffFileLocked(
 
         existing.additions = file.additions;
         existing.deletions = file.deletions;
-        if (existing.patch) |patch| {
-            allocator.free(patch);
-            existing.patch = null;
-        }
         if (file.patch) |patch| {
+            if (existing.patch) |existing_patch| {
+                allocator.free(existing_patch);
+            }
             existing.patch = try allocator.dupe(u8, patch);
         }
         return;
@@ -1486,4 +1485,26 @@ test "handleSendThreadId stores provisional provider thread id while pending" {
     send_state.status = .idle;
     handleSendThreadId(&send_state, "ses_456");
     try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
+}
+
+test "upsertPendingDiffFileLocked preserves patch when later updates omit it" {
+    const allocator = std.testing.allocator;
+    var files: std.ArrayListUnmanaged(app_state.PendingDiffFile) = .empty;
+    defer freePendingDiffFiles(allocator, &files);
+
+    try upsertPendingDiffFileLocked(allocator, &files, .{
+        .path = "packages/desktop/src/ui/chat_panel.zig",
+        .additions = 12,
+        .deletions = 0,
+        .patch = "@@ -1 +1 @@\n-old\n+new\n",
+    });
+    try upsertPendingDiffFileLocked(allocator, &files, .{
+        .path = "packages/desktop/src/ui/chat_panel.zig",
+        .additions = 12,
+        .deletions = 0,
+        .patch = null,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), files.items.len);
+    try std.testing.expectEqualStrings("@@ -1 +1 @@\n-old\n+new\n", files.items[0].patch.?);
 }

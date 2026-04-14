@@ -37,6 +37,7 @@ pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
+pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
@@ -740,8 +741,11 @@ pub const AppState = struct {
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
+    transcript_focused: bool,
+    transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
     transcript_thread_index: ?usize,
+    transcript_selection_text: ?[:0]u8,
     scroll_transcript_to_bottom_frames: u8,
     pending_transcript_line_scroll_steps: i16,
     pending_transcript_page_scroll_steps: i16,
@@ -811,8 +815,11 @@ pub const AppState = struct {
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
+            .transcript_focused = false,
+            .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
             .transcript_thread_index = null,
+            .transcript_selection_text = null,
             .scroll_transcript_to_bottom_frames = 8,
             .pending_transcript_line_scroll_steps = 0,
             .pending_transcript_page_scroll_steps = 0,
@@ -2315,6 +2322,65 @@ pub const AppState = struct {
         }
     }
 
+    pub fn openCurrentTranscriptSelectionModal(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const next_text = self.buildCurrentTranscriptSelectionText() catch return;
+        if (self.transcript_selection_text) |existing| {
+            self.allocator.free(existing);
+        }
+        self.transcript_selection_text = next_text;
+        self.transcript_selection_modal_requested = true;
+    }
+
+    pub fn closeTranscriptSelectionModal(self: *AppState) void {
+        self.transcript_selection_modal_requested = false;
+        if (self.transcript_selection_text) |text| {
+            self.allocator.free(text);
+            self.transcript_selection_text = null;
+        }
+    }
+
+    pub fn transcriptSelectionBuffer(self: *AppState) ?[:0]u8 {
+        return self.transcript_selection_text;
+    }
+
+    pub fn consumeTranscriptSelectionModalRequest(self: *AppState) bool {
+        const requested = self.transcript_selection_modal_requested;
+        self.transcript_selection_modal_requested = false;
+        return requested;
+    }
+
+    pub fn isTranscriptFocused(self: *const AppState) bool {
+        return self.transcript_focused and !self.composer_focused and !self.terminal_focused and !self.browser_pane_focused;
+    }
+
+    fn buildCurrentTranscriptSelectionText(self: *AppState) ![:0]u8 {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(self.allocator);
+
+        const thread = self.currentThread();
+        for (thread.messages.items, 0..) |message, index| {
+            if (index > 0) {
+                try buffer.appendSlice(self.allocator, "\n\n");
+            }
+            try buffer.appendSlice(self.allocator, message.author);
+
+            if (message.image) |image| {
+                try std.fmt.format(buffer.writer(self.allocator), "\n[Image: {s}]", .{image.file_name});
+            }
+            if (message.body.len > 0) {
+                try buffer.append(self.allocator, '\n');
+                try buffer.appendSlice(self.allocator, message.body);
+            }
+        }
+
+        if (buffer.items.len == 0) {
+            try buffer.appendSlice(self.allocator, "No messages yet.");
+        }
+
+        return try self.allocator.dupeZ(u8, buffer.items);
+    }
+
     fn writeClipboardImageToStorage(self: *AppState, mime: []const u8, bytes: []const u8) ![]u8 {
         const images_dir = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, "clipboard-images" });
         defer self.allocator.free(images_dir);
@@ -3082,6 +3148,7 @@ pub const AppState = struct {
         self.debug_terminal_hitbox_clicked = false;
         self.debug_terminal_focus_requested = false;
         self.browser_pane_hovered = false;
+        self.transcript_focused = false;
     }
 
     pub fn noteTerminalViewportDebug(
@@ -3426,6 +3493,7 @@ pub const AppState = struct {
         self.pollSend();
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
+        self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.browser_state.deinit();
         self.releaseAllImageTextures();
@@ -3934,6 +4002,7 @@ pub const AppState = struct {
         }
         self.clearImageTextureCache();
         self.closeImageModal();
+        self.closeTranscriptSelectionModal();
         for (self.projects.items) |*project| {
             project.deinit(self.allocator);
         }

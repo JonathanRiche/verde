@@ -780,6 +780,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
 
     zgui.endChild();
     zgui.popStyleVar(.{ .count = 1 });
+    state.transcript_focused = zgui.isWindowFocused(.{ .child_windows = true });
 
     if (applyPendingTranscriptScroll(state, height)) {
         return;
@@ -924,7 +925,14 @@ fn renderPendingTranscriptBubble(state: *app_state.AppState) void {
 }
 
 /// Dispatches a transcript item to the right visual treatment.
-fn renderTranscriptMessage(state: *app_state.AppState, id: u32, role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) void {
+fn renderTranscriptMessage(
+    state: *app_state.AppState,
+    id: u32,
+    role: app_state.ChatRole,
+    author: []const u8,
+    body: []const u8,
+    image: ?app_state.ChatImageAttachment,
+) void {
     if (role == .system and std.mem.eql(u8, author, "Changed files")) {
         renderChangedFilesCardId(id, body);
         return;
@@ -1312,15 +1320,17 @@ fn codexFileReferencePath(target: []const u8) []const u8 {
 
 /// Draws a compact system row for command execution events.
 fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
-    const row_height: f32 = 38.0;
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 9.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(28, 29, 34, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
-        .h = row_height,
-        .child_flags = .{ .border = true },
+        .h = 0.0,
+        .child_flags = .{
+            .border = true,
+            .auto_resize_y = true,
+        },
         .window_flags = .{
             .no_scrollbar = true,
             .no_scroll_with_mouse = true,
@@ -1349,7 +1359,6 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
     var entries = parseChangedFileEntries(body);
     const totals = summarizeChangedFiles(entries);
     const has_patch_details = changedFilesEntriesHavePatch(entries.items);
-    const card_height = if (has_patch_details) detailedChangedFilesCardHeight(entries.items) else changedFilesCardHeight(entries.items.len);
     var open_all = false;
     var close_all = false;
 
@@ -1359,8 +1368,11 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
-        .h = card_height,
-        .child_flags = .{ .border = true },
+        .h = 0.0,
+        .child_flags = .{
+            .border = true,
+            .auto_resize_y = true,
+        },
         .window_flags = .{ .no_saved_settings = true },
     });
     defer {
@@ -1371,8 +1383,8 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
     }
 
     renderChangedFilesHeader(entries.items.len, totals.additions, totals.deletions);
-    zgui.sameLine(.{ .spacing = 12.0 });
     if (has_patch_details) {
+        zgui.sameLine(.{ .spacing = 12.0 });
         if (renderChangedFilesAction("Collapse all")) {
             close_all = true;
         }
@@ -1381,9 +1393,8 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
             open_all = true;
         }
     } else {
-        _ = renderChangedFilesAction("Collapse all");
-        zgui.sameLine(.{ .spacing = 8.0 });
-        _ = renderChangedFilesAction("View diff");
+        zgui.sameLine(.{ .spacing = 12.0 });
+        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Summary only", .{});
     }
     zgui.dummy(.{ .w = 0.0, .h = 4.0 });
 
@@ -2021,15 +2032,6 @@ fn shouldShowBubbleAuthor(author: []const u8) bool {
 }
 
 /// Returns the compact height for a simple changed-files card.
-fn changedFilesCardHeight(file_count: usize) f32 {
-    return 52.0 + (@as(f32, @floatFromInt(file_count)) * 26.0);
-}
-
-/// Returns the collapsed height for detailed changed-file entries.
-fn detailedChangedFilesCardHeight(entries: anytype) f32 {
-    return 52.0 + (@as(f32, @floatFromInt(entries.len)) * 28.0);
-}
-
 /// Estimates the current live diff card height.
 fn pendingDiffCardHeight(files: anytype) f32 {
     var height: f32 = 52.0;
