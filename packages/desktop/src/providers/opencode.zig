@@ -212,6 +212,12 @@ pub const Client = struct {
         }
     }
 
+    pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
+        _ = self;
+        _ = request;
+        return error.UnsupportedOperation;
+    }
+
     fn ensureServer(self: *Client) !void {
         if (self.checkHealth()) {
             return;
