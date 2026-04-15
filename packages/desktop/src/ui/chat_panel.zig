@@ -846,13 +846,18 @@ fn renderPendingFollowup(state: *app_state.AppState) void {
     defer if (snapshot) |pending| state.allocator.free(pending.prompt);
 
     const pending = snapshot orelse return;
+    if (pending.kind == .steer and pending.state == .sent_inline) return;
     renderTranscriptBubble(
         state,
         "pending-followup-body",
         .system,
         switch (pending.kind) {
             .queue => "Queued next message",
-            .steer => "Steer pending",
+            .steer => switch (pending.state) {
+                .pending => "Steer pending",
+                .sent_inline => "Steering current turn",
+                .fallback_next_turn => "Steer unavailable, queued next turn",
+            },
         },
         pending.prompt,
         null,
@@ -877,6 +882,8 @@ fn renderPendingTimelineEvents(state: *app_state.AppState) void {
 
 /// Renders the live diff summary card for streamed file changes.
 fn renderPendingDiffCard(state: *app_state.AppState) void {
+    if (state.currentThread().provider == .opencode) return;
+
     const send_state = state.currentThread().send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
@@ -955,6 +962,7 @@ fn renderTranscriptMessage(
     image: ?app_state.ChatImageAttachment,
 ) void {
     if (role == .system and std.mem.eql(u8, author, "Changed files")) {
+        if (state.currentThread().provider == .opencode) return;
         renderChangedFilesCardId(id, body);
         return;
     }

@@ -254,7 +254,6 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             zgui.endTooltip();
         }
 
-        const active_thread = state.projects.items[index].currentThread();
         const sub_indent = theme.scaledUi(20.0);
         if (!is_collapsed) zgui.indent(.{ .indent_w = sub_indent });
         if (!is_collapsed) {
@@ -268,10 +267,23 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
             const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.items.len <= runtime.SIDEBAR_VISIBLE_THREAD_LIMIT;
             const visible_count = if (show_all_threads) sorted_indices.items.len else @min(sorted_indices.items.len, runtime.SIDEBAR_VISIBLE_THREAD_LIMIT);
+            var thread_list_invalidated = false;
 
             for (sorted_indices.items[0..visible_count]) |thread_index| {
+                if (thread_index >= state.projects.items[index].threads.items.len) {
+                    thread_list_invalidated = true;
+                    break;
+                }
                 const thread = &state.projects.items[index].threads.items[thread_index];
-                renderThreadRow(state, index, rail_width - sub_indent, thread, thread_index);
+                if (renderThreadRow(state, index, rail_width - sub_indent, thread, thread_index)) {
+                    thread_list_invalidated = true;
+                    break;
+                }
+            }
+
+            if (thread_list_invalidated) {
+                if (!is_collapsed) zgui.unindent(.{ .indent_w = sub_indent });
+                return;
             }
 
             if (sorted_indices.items.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
@@ -285,7 +297,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                 }
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
             }
-            if (sorted_indices.items.len == 0 and is_selected and !active_thread.committed) {
+            if (sorted_indices.items.len == 0 and is_selected and !state.projects.items[index].currentThread().committed) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "New chat will appear here after the first prompt.", .{});
             } else if (sorted_indices.items.len == 0) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No saved threads yet", .{});
@@ -605,7 +617,7 @@ fn projectMonogram(buffer: *[4:0]u8, value: []const u8) [:0]const u8 {
 }
 
 /// Draws one saved thread row under the active project.
-fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: anytype, thread_index: usize) void {
+fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: anytype, thread_index: usize) bool {
     const project = &state.projects.items[project_index];
     const thread_selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
     const row_width = @max(width - theme.scaledUi(42.0), theme.scaledUi(120.0));
@@ -613,6 +625,7 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
     const timestamp_width = zgui.calcTextSize(relative_time, .{})[0] + theme.scaledUi(6.0);
     const title_width_chars: usize = @intFromFloat(@max((row_width - timestamp_width - theme.scaledUi(30.0)) / @max(zgui.getFontSize() * 0.42, 6.0), 10.0));
+    var thread_list_invalidated = false;
 
     zgui.pushIntId(@intCast(thread_index + 1000));
     defer zgui.popId();
@@ -621,6 +634,7 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         zgui.pushStyleColor4f(.{ .idx = .header, .c = colors.DARK_BLUE });
         zgui.pushStyleColor4f(.{ .idx = .header_hovered, .c = theme.lighten(colors.DARK_BLUE, 0.06) });
         zgui.pushStyleColor4f(.{ .idx = .header_active, .c = theme.lighten(colors.DARK_BLUE, 0.12) });
+        defer zgui.popStyleColor(.{ .count = 3 });
     }
 
     // Provider logo drawn before the selectable row
@@ -632,7 +646,9 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
 
     // Indent the selectable past the icon
     zgui.indent(.{ .indent_w = chat_icon_space });
+    defer zgui.unindent(.{ .indent_w = chat_icon_space });
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(8.0), theme.scaledUi(6.0) } });
+    defer zgui.popStyleVar(.{ .count = 1 });
     var title_buf = std.mem.zeroes([64:0]u8);
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_width_chars);
     if (zgui.selectable(row_label, .{
@@ -670,17 +686,13 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         if (zgui.menuItem("Archive thread", .{})) {
             state.archiveThreadAtIndex(project_index, thread_index);
             zgui.closeCurrentPopup();
+            thread_list_invalidated = true;
         }
     }
-    zgui.popStyleVar(.{ .count = 1 });
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
     zgui.textColored(colors.TIME_LABEL, "{s}", .{relative_time});
-    zgui.unindent(.{ .indent_w = chat_icon_space });
-
-    if (thread_selected) {
-        zgui.popStyleColor(.{ .count = 3 });
-    }
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
+    return thread_list_invalidated;
 }
 
 /// Returns the latest message preview for a project.

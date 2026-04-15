@@ -488,11 +488,20 @@ pub const Project = struct {
         return project;
     }
 
+    fn currentThreadIndex(self: *const Project) usize {
+        std.debug.assert(self.threads.items.len > 0);
+        return @min(self.selected_thread_index, self.threads.items.len - 1);
+    }
+
     pub fn currentThread(self: *const Project) *const ChatThread {
-        return &self.threads.items[self.selected_thread_index];
+        return &self.threads.items[self.currentThreadIndex()];
     }
 
     pub fn currentThreadMutable(self: *Project) *ChatThread {
+        std.debug.assert(self.threads.items.len > 0);
+        if (self.selected_thread_index >= self.threads.items.len) {
+            self.selected_thread_index = self.threads.items.len - 1;
+        }
         return &self.threads.items[self.selected_thread_index];
     }
 
@@ -654,8 +663,14 @@ pub const FollowupKind = enum {
     queue,
     steer,
 };
+pub const FollowupState = enum {
+    pending,
+    sent_inline,
+    fallback_next_turn,
+};
 pub const PendingFollowup = struct {
     kind: FollowupKind,
+    state: FollowupState = .pending,
     prompt: []u8,
 };
 pub const SendState = struct {
@@ -1646,6 +1661,7 @@ pub const AppState = struct {
         send_state.pending_followup_signal_sent = false;
         send_state.pending_followup = .{
             .kind = kind,
+            .state = .pending,
             .prompt = self.allocator.dupe(u8, draft) catch {
                 self.setSidebarNotice("Failed to store the pending follow-up.");
                 return;
@@ -1670,6 +1686,7 @@ pub const AppState = struct {
         const pending = send_state.pending_followup orelse return null;
         return .{
             .kind = pending.kind,
+            .state = pending.state,
             .prompt = try self.allocator.dupe(u8, pending.prompt),
         };
     }
@@ -3920,7 +3937,9 @@ pub const AppState = struct {
                     defer std.heap.page_allocator.free(result.reply_text);
                     defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                     defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                    appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                    if (thread.provider != .opencode) {
+                        appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                    }
                     const should_append_reply_text = !pendingTimelineEventsContainAssistant(completed_events.items);
                     self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                         log.err("failed to apply timeline events: {s}", .{@errorName(err)});
@@ -3938,7 +3957,9 @@ pub const AppState = struct {
             .failed => {
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                if (thread.provider != .opencode) {
+                    appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                }
                 if (failed_message) |message| {
                     defer std.heap.page_allocator.free(message);
                     self.applySendFailure(thread, &completed_events, message) catch |err| {
@@ -3953,7 +3974,9 @@ pub const AppState = struct {
             .aborted => {
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
                 defer freePendingDiffFiles(std.heap.page_allocator, &completed_diff_files);
-                appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                if (thread.provider != .opencode) {
+                    appendPendingDiffSummaryEvent(std.heap.page_allocator, &completed_events, completed_diff_files.items);
+                }
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
@@ -4108,7 +4131,10 @@ pub const AppState = struct {
         self.steerThreadViaHarness(project_path, owned_thread_id, owned_turn_id, owned_prompt) catch |err| {
             send_state.mutex.lock();
             defer send_state.mutex.unlock();
-            send_state.pending_followup_signal_sent = true;
+            if (send_state.pending_followup) |*pending_followup| {
+                pending_followup.state = .fallback_next_turn;
+            }
+            send_state.pending_followup_signal_sent = false;
             self.setSidebarNotice(switch (err) {
                 error.CodexActiveTurnNotSteerable => "Codex could not steer this turn. It will send after the current reply finishes.",
                 else => "Failed to send Codex steer. It will send after the current reply finishes.",
@@ -4117,17 +4143,32 @@ pub const AppState = struct {
         };
 
         send_state.mutex.lock();
-        freePendingFollowup(self.allocator, &send_state.pending_followup);
-        send_state.pending_followup_signal_sent = false;
+        if (send_state.pending_followup) |*pending_followup| {
+            pending_followup.state = .sent_inline;
+        }
+        send_state.pending_followup_signal_sent = true;
+        flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+        const owned_author = std.heap.page_allocator.dupe(u8, "Steering current turn") catch null;
+        const owned_body = std.heap.page_allocator.dupe(u8, owned_prompt) catch null;
+        if (owned_author) |author| {
+            if (owned_body) |body| {
+                send_state.pending_events.append(std.heap.page_allocator, .{
+                    .role = .system,
+                    .author = author,
+                    .body = body,
+                }) catch {
+                    std.heap.page_allocator.free(author);
+                    std.heap.page_allocator.free(body);
+                };
+            } else {
+                std.heap.page_allocator.free(author);
+            }
+        }
         send_state.mutex.unlock();
-
-        self.appendMessageToThread(thread, .user, "You", owned_prompt, null) catch |err| {
-            log.err("failed to append steered Codex prompt: {s}", .{@errorName(err)});
-        };
         if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
             self.requestTranscriptScrollToBottom();
         }
-        self.setSidebarNotice("Codex steer sent.");
+        self.setSidebarNotice("Codex steer sent. Waiting for the current turn to update.");
     }
 
     fn dispatchPendingFollowup(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
@@ -4142,6 +4183,11 @@ pub const AppState = struct {
 
         const followup = pending orelse return;
         defer self.allocator.free(followup.prompt);
+
+        if (followup.kind == .steer and followup.state == .sent_inline) {
+            self.setSidebarNotice("Codex steer applied.");
+            return;
+        }
 
         self.appendMessageToThread(thread, .user, "You", followup.prompt, null) catch |err| {
             log.err("failed to append pending follow-up: {s}", .{@errorName(err)});

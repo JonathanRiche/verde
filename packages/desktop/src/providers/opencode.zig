@@ -176,6 +176,8 @@ pub const Client = struct {
 
         var baseline = try self.fetchLatestAssistantSnapshot(allocator, session_id, null);
         defer baseline.deinit(allocator);
+        const baseline_diff_payload = try self.fetchSessionDiffPayloadAlloc(session_id);
+        defer self.allocator.free(baseline_diff_payload);
 
         const event_stream = startEventStream(self, allocator, session_id, baseline.message_id, request) catch |err| blk: {
             log.warn("failed to start OpenCode event stream: {s}", .{@errorName(err)});
@@ -189,6 +191,7 @@ pub const Client = struct {
             allocator,
             session_id,
             baseline.message_id,
+            baseline_diff_payload,
             request,
             if (event_stream) |handle| handle.context else null,
         );
@@ -382,6 +385,7 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         session_id: []const u8,
         baseline_assistant_id: ?[]const u8,
+        baseline_diff_payload: []const u8,
         request: provider_types.SendPromptRequest,
         event_stream_context: ?*EventStreamContext,
     ) ![]u8 {
@@ -394,7 +398,7 @@ pub const Client = struct {
         var streamed_text = try self.allocator.dupe(u8, "");
         defer self.allocator.free(streamed_text);
 
-        var last_diff_payload = try self.allocator.dupe(u8, "");
+        var last_diff_payload = try self.allocator.dupe(u8, baseline_diff_payload);
         defer self.allocator.free(last_diff_payload);
 
         var last_task_summary: ?[]u8 = null;
@@ -417,7 +421,7 @@ pub const Client = struct {
             }
             try self.emitTaskProgressFromSnapshot(&latest_snapshot, request, &last_task_summary);
             try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
-            try self.emitDiffProgress(session_id, request, &last_diff_payload);
+            try self.emitDiffProgress(session_id, request, baseline_diff_payload, &last_diff_payload);
 
             const status = try self.fetchSessionStatus(session_id);
             switch (status) {
@@ -553,38 +557,54 @@ pub const Client = struct {
         self: *Client,
         session_id: []const u8,
         request: provider_types.SendPromptRequest,
+        baseline_diff_payload: []const u8,
         last_diff_payload: *[]u8,
     ) !void {
         const on_stream_event = request.on_stream_event orelse return;
 
+        const current_payload = try self.fetchSessionDiffPayloadAlloc(session_id);
+        defer self.allocator.free(current_payload);
+        if (std.mem.eql(u8, current_payload, last_diff_payload.*)) return;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, current_payload, .{});
+        defer parsed.deinit();
+
+        var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+        defer files.deinit(std.heap.page_allocator);
+        try appendSessionDiffFiles(parsed.value, &files);
+        var baseline_files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+        defer baseline_files.deinit(std.heap.page_allocator);
+        try appendSessionDiffFilesFromPayload(self.allocator, baseline_diff_payload, &baseline_files);
+
+        var changed_files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
+        defer changed_files.deinit(std.heap.page_allocator);
+        try appendChangedSessionDiffFiles(&changed_files, files.items, baseline_files.items);
+
+        if (changed_files.items.len == 0) {
+            self.allocator.free(last_diff_payload.*);
+            last_diff_payload.* = try self.allocator.dupe(u8, current_payload);
+            return;
+        }
+
+        on_stream_event(request.stream_context, .{ .diff = .{
+            .files = changed_files.items,
+        } });
+
+        self.allocator.free(last_diff_payload.*);
+        last_diff_payload.* = try self.allocator.dupe(u8, current_payload);
+    }
+
+    fn fetchSessionDiffPayloadAlloc(self: *Client, session_id: []const u8) ![]u8 {
         const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/diff", .{session_id});
         defer self.allocator.free(path);
 
         const response = try self.requestJson(.GET, path, null);
         defer self.allocator.free(response.body);
 
-        if (response.status != .ok) return;
-        if (std.mem.eql(u8, response.body, last_diff_payload.*)) return;
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
-        defer parsed.deinit();
-
-        var files: std.ArrayList(provider_types.StreamDiffFile) = .empty;
-        defer files.deinit(std.heap.page_allocator);
-
-        try appendSessionDiffFiles(parsed.value, &files);
-        if (files.items.len == 0) {
-            self.allocator.free(last_diff_payload.*);
-            last_diff_payload.* = try self.allocator.dupe(u8, response.body);
-            return;
+        if (response.status != .ok) {
+            return self.allocator.dupe(u8, "");
         }
-
-        on_stream_event(request.stream_context, .{ .diff = .{
-            .files = files.items,
-        } });
-
-        self.allocator.free(last_diff_payload.*);
-        last_diff_payload.* = try self.allocator.dupe(u8, response.body);
+        return self.allocator.dupe(u8, response.body);
     }
 
     fn handlePendingPermissions(
@@ -734,9 +754,9 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .object) return .busy;
-        const status_value = parsed.value.object.get(session_id) orelse return .busy;
-        if (status_value != .object) return .busy;
+        if (parsed.value != .object) return .idle;
+        const status_value = parsed.value.object.get(session_id) orelse return .idle;
+        if (status_value != .object) return .idle;
 
         const type_name = getOptionalObjectString(status_value, "type") orelse return .busy;
         if (std.mem.eql(u8, type_name, "idle")) return .idle;
@@ -1435,11 +1455,7 @@ fn signalEventStreamStop(handle: EventStreamHandle) void {
     handle.context.mutex.lock();
     handle.context.stop_requested = true;
     if (handle.context.child) |*child| {
-        if (@import("builtin").os.tag == .windows) {
-            _ = child.kill() catch {};
-        } else {
-            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
-        }
+        _ = child.kill() catch {};
     }
     handle.context.mutex.unlock();
     handle.worker.join();
@@ -1668,6 +1684,50 @@ fn appendSessionDiffFiles(value: std.json.Value, files: *std.ArrayList(provider_
         },
         else => {},
     }
+}
+
+fn appendSessionDiffFilesFromPayload(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    files: *std.ArrayList(provider_types.StreamDiffFile),
+) !void {
+    if (std.mem.trim(u8, payload, &std.ascii.whitespace).len == 0) return;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    try appendSessionDiffFiles(parsed.value, files);
+}
+
+fn appendChangedSessionDiffFiles(
+    target: *std.ArrayList(provider_types.StreamDiffFile),
+    current: []const provider_types.StreamDiffFile,
+    baseline: []const provider_types.StreamDiffFile,
+) !void {
+    for (current) |file| {
+        const existing = findDiffFileByPath(baseline, file.path);
+        if (existing) |before| {
+            if (diffFilesEqual(before, file)) continue;
+        }
+        try target.append(std.heap.page_allocator, file);
+    }
+}
+
+fn findDiffFileByPath(files: []const provider_types.StreamDiffFile, path: []const u8) ?provider_types.StreamDiffFile {
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, path)) return file;
+    }
+    return null;
+}
+
+fn diffFilesEqual(a: provider_types.StreamDiffFile, b: provider_types.StreamDiffFile) bool {
+    if (a.additions != b.additions or a.deletions != b.deletions) return false;
+    return optionalStringsEqual(a.patch, b.patch);
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn appendSessionDiffFile(item: std.json.Value, files: *std.ArrayList(provider_types.StreamDiffFile)) !void {
