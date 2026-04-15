@@ -91,6 +91,11 @@ pub const SandboxMode = enum(u8) {
     danger_full_access,
 };
 
+pub const ServiceTier = enum(u8) {
+    fast,
+    flex,
+};
+
 pub const ApprovalDecision = enum(u8) {
     approve,
     deny,
@@ -127,6 +132,7 @@ pub const SendPromptRequest = struct {
     cwd: ?[]const u8 = null,
     model: ?[]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
+    service_tier: ?ServiceTier = null,
     approval_policy: ?ApprovalPolicy = null,
     sandbox_mode: ?SandboxMode = null,
     stream_context: ?*anyopaque = null,

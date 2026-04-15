@@ -477,6 +477,10 @@ pub const Client = struct {
             try stringify.objectField("model");
             try stringify.write(selected_model);
         }
+        if (request.service_tier) |service_tier| {
+            try stringify.objectField("serviceTier");
+            try stringify.write(service_tier);
+        }
         if (request.approval_policy) |approval_policy| {
             try stringify.objectField("approvalPolicy");
             try stringify.write(approvalPolicyString(approval_policy));
@@ -625,6 +629,10 @@ pub const Client = struct {
         if (request.model) |selected_model| {
             try stringify.objectField("model");
             try stringify.write(selected_model);
+        }
+        if (request.service_tier) |service_tier| {
+            try stringify.objectField("serviceTier");
+            try stringify.write(service_tier);
         }
         if (request.reasoning_effort) |effort| {
             try stringify.objectField("effort");

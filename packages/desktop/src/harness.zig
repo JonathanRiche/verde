@@ -16,6 +16,7 @@ pub const ReadThreadResult = types.ReadThreadResult;
 pub const ReasoningEffort = types.ReasoningEffort;
 pub const ApprovalPolicy = types.ApprovalPolicy;
 pub const SandboxMode = types.SandboxMode;
+pub const ServiceTier = types.ServiceTier;
 pub const ApprovalDecision = types.ApprovalDecision;
 pub const ApprovalRequest = types.ApprovalRequest;
 pub const StreamDiffFile = types.StreamDiffFile;
