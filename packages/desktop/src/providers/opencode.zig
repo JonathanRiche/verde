@@ -13,6 +13,7 @@ const MESSAGE_POLL_LIMIT = 12;
 const IMPORT_MESSAGE_LIMIT = 100_000;
 const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 12_000;
+const EMPTY_IDLE_GRACE_POLLS: usize = 16;
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
@@ -416,6 +417,7 @@ pub const Client = struct {
                 eventStreamReachedIdle(context)
             else
                 false;
+            const can_complete_from_status_idle = event_stream_context == null;
             if (event_stream_context) |context| {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
@@ -448,10 +450,26 @@ pub const Client = struct {
                 },
             }
 
+            const has_output_activity =
+                std.mem.trim(u8, streamed_text, &std.ascii.whitespace).len > 0 or
+                latest_snapshot.task_summary != null or
+                latest_snapshot.hasRenderablePostBaselineContent(baseline_assistant_id);
+
             if (!has_pending_permissions and
-                (status == .idle or stream_idle or latest_snapshot.isTerminalForPrompt(baseline_assistant_id)))
+                (stream_idle or
+                    latest_snapshot.isTerminalForPrompt(baseline_assistant_id) or
+                    (can_complete_from_status_idle and status == .idle and has_output_activity)))
             {
                 break;
+            }
+
+            if (!has_pending_permissions and
+                can_complete_from_status_idle and
+                status == .idle and
+                !has_output_activity and
+                attempt + 1 >= EMPTY_IDLE_GRACE_POLLS)
+            {
+                return error.OpencodeEmptyReply;
             }
 
             std.Thread.sleep(POLL_INTERVAL_MS * std.time.ns_per_ms);
@@ -877,6 +895,16 @@ const AssistantSnapshot = struct {
 
         const finish = self.finish orelse return false;
         return !std.mem.eql(u8, finish, "tool-calls");
+    }
+
+    fn hasRenderablePostBaselineContent(self: *const AssistantSnapshot, baseline_assistant_id: ?[]const u8) bool {
+        const message_id = self.message_id orelse return false;
+        if (baseline_assistant_id) |baseline_id| {
+            if (std.mem.eql(u8, message_id, baseline_id)) return false;
+        }
+
+        if (std.mem.trim(u8, self.text, &std.ascii.whitespace).len > 0) return true;
+        return self.error_message != null;
     }
 };
 

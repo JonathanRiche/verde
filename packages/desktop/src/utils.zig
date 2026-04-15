@@ -851,6 +851,10 @@ fn formatSendWorkerError(
             u8,
             "OpenCode did not start. Ensure the opencode CLI is installed, authenticated, and reachable from this session.",
         ),
+        error.OpencodeEmptyReply => allocator.dupe(
+            u8,
+            "OpenCode ended the turn without producing any output. Please retry the prompt.",
+        ),
         else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
     };
 }
