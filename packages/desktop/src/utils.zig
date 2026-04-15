@@ -456,6 +456,7 @@ pub fn runSendWorker(
         .cwd = request.project_path,
         .model = request.model_ref,
         .reasoning_effort = request.reasoning_effort,
+        .service_tier = serviceTierForMode(request.provider, request.fast_mode),
         .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),
         .sandbox_mode = sandboxModeForMode(request.provider, request.access_mode),
         .stream_context = request.send_state_ptr,
@@ -880,6 +881,15 @@ pub fn approvalPolicyForMode(_: app_state.Provider, mode: app_state.AccessMode) 
         .supervised => .on_request,
     };
 }
+
+pub fn serviceTierForMode(provider: app_state.Provider, fast_mode: app_state.FastMode) ?ai_harness.ServiceTier {
+    if (provider != .codex) return null;
+    return switch (fast_mode) {
+        .on => .fast,
+        .off => null,
+    };
+}
+
 pub fn sandboxModeForMode(provider: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.SandboxMode {
     if (provider != .codex) return null;
     return switch (mode) {

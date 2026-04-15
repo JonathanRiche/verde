@@ -71,6 +71,7 @@ const freePendingTimelineEventsLocked = utils.freePendingTimelineEventsLocked;
 const pendingTimelineEventsContainAssistant = utils.pendingTimelineEventsContainAssistant;
 const pickerWorker = utils.pickerWorker;
 const sandboxModeForMode = utils.sandboxModeForMode;
+const serviceTierForMode = utils.serviceTierForMode;
 const sendWorker = utils.sendWorker;
 const uploadTexture = utils.uploadTexture;
 
@@ -1735,6 +1736,7 @@ pub const AppState = struct {
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
             .reasoning_effort = thread.reasoning_effort,
+            .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
             .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
             .sandbox_mode = sandboxModeForMode(thread.provider, thread.access_mode),
         });
