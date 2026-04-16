@@ -372,6 +372,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handlePendingThreadFollowupShortcut(state, &event.key)) {
                 return true;
             }
+            if (event.key.repeat) {
+                if (keyboard.transcriptScrollActionForEvent(&event.key)) |repeat_action| {
+                    handleKeyboardAction(state, keyboard, repeat_action);
+                    return true;
+                }
+            }
             if (action) |resolved_action| {
                 handleKeyboardAction(state, keyboard, resolved_action);
             }
