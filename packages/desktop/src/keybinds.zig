@@ -58,6 +58,21 @@ pub const Keybind = struct {
             return false;
         }
 
+        return self.matchesWithRepeatPolicy(event, false);
+    }
+
+    fn matchesAllowRepeat(self: Keybind, event: *const sdl.KeyboardEvent) bool {
+        return self.matchesWithRepeatPolicy(event, true);
+    }
+
+    fn matchesWithRepeatPolicy(self: Keybind, event: *const sdl.KeyboardEvent, allow_repeat: bool) bool {
+        if (!event.down or event.key != self.key) {
+            return false;
+        }
+        if (!allow_repeat and event.repeat) {
+            return false;
+        }
+
         const primary_uses_meta = builtin.os.tag == .macos;
         const expected_ctrl = self.ctrl or (self.primary and !primary_uses_meta);
         const expected_meta = self.meta or (self.primary and primary_uses_meta);
@@ -190,6 +205,23 @@ pub const NativeKeyboardConfig = struct {
             return .chat_page_up;
         }
         if (matchesAny(self.chat_page_down, event)) {
+            return .chat_page_down;
+        }
+
+        return null;
+    }
+
+    pub fn transcriptScrollActionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
+        if (matchesAnyAllowRepeat(self.chat_up, event)) {
+            return .chat_up;
+        }
+        if (matchesAnyAllowRepeat(self.chat_down, event)) {
+            return .chat_down;
+        }
+        if (matchesAnyAllowRepeat(self.chat_page_up, event)) {
+            return .chat_page_up;
+        }
+        if (matchesAnyAllowRepeat(self.chat_page_down, event)) {
             return .chat_page_down;
         }
 
@@ -624,6 +656,16 @@ fn parseDefaultAccelerator(binding: []const u8) !Keybind {
 fn matchesAny(bindings: []const Keybind, event: *const sdl.KeyboardEvent) bool {
     for (bindings) |binding| {
         if (binding.matches(event)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn matchesAnyAllowRepeat(bindings: []const Keybind, event: *const sdl.KeyboardEvent) bool {
+    for (bindings) |binding| {
+        if (binding.matchesAllowRepeat(event)) {
             return true;
         }
     }
