@@ -99,6 +99,12 @@ jobs:
           echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
           bun --version
 
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install tree-sitter
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -113,6 +119,7 @@ jobs:
             clang \
             g++ \
             cmake \
+            libtree-sitter-dev \
             ninja-build \
             patchelf \
             pkg-config \
