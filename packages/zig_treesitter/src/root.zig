@@ -4,6 +4,8 @@ const std = @import("std");
 
 pub const c = @import("c.zig").bindings;
 pub const grammars = struct {
+    pub const javascript = @import("grammars/javascript.zig");
+    pub const json = @import("grammars/json.zig");
     pub const typescript = @import("grammars/typescript.zig");
 };
 
@@ -398,6 +400,39 @@ test "typescript highlights query compiles" {
 
     try std.testing.expect(query.captureCount() > 0);
     try std.testing.expect(query.captureName(0) != null);
+}
+
+test "javascript grammar parses a simple source file" {
+    var parser = try Parser.init();
+    defer parser.deinit();
+
+    try std.testing.expect(parser.setLanguage(grammars.javascript.language()));
+    var tree = parser.parseString("const value = call(input);\n", null) orelse return error.UnexpectedNull;
+    defer tree.deinit();
+
+    try std.testing.expectEqualStrings("program", tree.rootNode().kind());
+}
+
+test "tsx grammar parses jsx syntax" {
+    var parser = try Parser.init();
+    defer parser.deinit();
+
+    try std.testing.expect(parser.setLanguage(grammars.typescript.tsxLanguage()));
+    var tree = parser.parseString("export const view = <Card title=\"verde\" />;\n", null) orelse return error.UnexpectedNull;
+    defer tree.deinit();
+
+    try std.testing.expectEqualStrings("program", tree.rootNode().kind());
+}
+
+test "json grammar parses a simple object" {
+    var parser = try Parser.init();
+    defer parser.deinit();
+
+    try std.testing.expect(parser.setLanguage(grammars.json.language()));
+    var tree = parser.parseString("{\"ready\":true,\"count\":2}\n", null) orelse return error.UnexpectedNull;
+    defer tree.deinit();
+
+    try std.testing.expectEqualStrings("document", tree.rootNode().kind());
 }
 
 test {

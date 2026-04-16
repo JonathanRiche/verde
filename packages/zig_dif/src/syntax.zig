@@ -51,8 +51,8 @@ pub fn tokenizeLine(
     language: Language,
     line: []const u8,
 ) std.mem.Allocator.Error![]const Token {
-    if (language == .typescript) {
-        if (tokenizeTypeScriptLine(allocator, line)) |tokens| return tokens;
+    if (treeSitterConfigForLanguage(language)) |config| {
+        if (tokenizeTreeSitterLine(allocator, config, line)) |tokens| return tokens;
     }
     return tokenizeLineHeuristic(allocator, language, line);
 }
@@ -125,18 +125,61 @@ const TokenSpan = struct {
     kind: TokenKind,
 };
 
-fn tokenizeTypeScriptLine(allocator: std.mem.Allocator, line: []const u8) ?[]const Token {
+const TreeSitterFamily = enum {
+    script,
+    json,
+};
+
+const TreeSitterConfig = struct {
+    parser_language: zig_treesitter.Language,
+    highlights_query: []const u8,
+    family: TreeSitterFamily,
+};
+
+fn treeSitterConfigForLanguage(language: Language) ?TreeSitterConfig {
+    return switch (language) {
+        .javascript => .{
+            .parser_language = zig_treesitter.grammars.javascript.language(),
+            .highlights_query = zig_treesitter.grammars.javascript.highlights_query,
+            .family = .script,
+        },
+        .jsx => .{
+            .parser_language = zig_treesitter.grammars.javascript.language(),
+            .highlights_query = zig_treesitter.grammars.javascript.jsx_highlights_query,
+            .family = .script,
+        },
+        .typescript => .{
+            .parser_language = zig_treesitter.grammars.typescript.language(),
+            .highlights_query = zig_treesitter.grammars.typescript.highlights_query,
+            .family = .script,
+        },
+        .tsx => .{
+            .parser_language = zig_treesitter.grammars.typescript.tsxLanguage(),
+            .highlights_query = zig_treesitter.grammars.typescript.tsx_highlights_query,
+            .family = .script,
+        },
+        .json => .{
+            .parser_language = zig_treesitter.grammars.json.language(),
+            .highlights_query = zig_treesitter.grammars.json.highlights_query,
+            .family = .json,
+        },
+        else => null,
+    };
+}
+
+fn tokenizeTreeSitterLine(
+    allocator: std.mem.Allocator,
+    config: TreeSitterConfig,
+    line: []const u8,
+) ?[]const Token {
     var parser = zig_treesitter.Parser.init() catch return null;
     defer parser.deinit();
-    if (!parser.setLanguage(zig_treesitter.grammars.typescript.language())) return null;
+    if (!parser.setLanguage(config.parser_language)) return null;
 
     var tree = parser.parseString(line, null) orelse return null;
     defer tree.deinit();
 
-    var query = zig_treesitter.Query.init(
-        zig_treesitter.grammars.typescript.language(),
-        zig_treesitter.grammars.typescript.highlights_query,
-    ) catch return null;
+    var query = zig_treesitter.Query.init(config.parser_language, config.highlights_query) catch return null;
     defer query.deinit();
 
     var query_cursor = zig_treesitter.QueryCursor.init() catch return null;
@@ -150,7 +193,7 @@ fn tokenizeTypeScriptLine(allocator: std.mem.Allocator, line: []const u8) ?[]con
         defer match.deinit(allocator);
         for (match.captures) |capture| {
             const capture_name = query.captureName(capture.index) orelse continue;
-            const token_kind = classifyTypeScriptCapture(capture_name, capture.node.utf8Text(line));
+            const token_kind = classifyTreeSitterCapture(config.family, capture_name, capture.node.utf8Text(line));
             if (token_kind == .plain) continue;
 
             const start = @as(usize, @intCast(capture.node.startByte()));
@@ -191,7 +234,14 @@ fn tokenizeTypeScriptLine(allocator: std.mem.Allocator, line: []const u8) ?[]con
     return tokens.toOwnedSlice(allocator) catch null;
 }
 
-fn classifyTypeScriptCapture(capture_name: []const u8, text: []const u8) TokenKind {
+fn classifyTreeSitterCapture(family: TreeSitterFamily, capture_name: []const u8, text: []const u8) TokenKind {
+    return switch (family) {
+        .script => classifyScriptCapture(capture_name, text),
+        .json => classifyJsonCapture(capture_name, text),
+    };
+}
+
+fn classifyScriptCapture(capture_name: []const u8, text: []const u8) TokenKind {
     if (std.mem.eql(u8, capture_name, "constructor") and !startsUppercase(text)) return .plain;
     if (std.mem.eql(u8, capture_name, "constant") and !looksLikeUpperSnake(text)) return .plain;
     if (std.mem.eql(u8, capture_name, "variable.builtin") and !isTypeScriptBuiltinVariable(text)) return .plain;
@@ -221,6 +271,16 @@ fn classifyTypeScriptCapture(capture_name: []const u8, text: []const u8) TokenKi
     }
     if (std.mem.startsWith(u8, capture_name, "punctuation")) return .punctuation;
     if (std.mem.eql(u8, capture_name, "operator")) return .operator;
+    if (text.len == 1 and isPunctuation(text[0])) return .punctuation;
+    return .plain;
+}
+
+fn classifyJsonCapture(capture_name: []const u8, text: []const u8) TokenKind {
+    if (std.mem.startsWith(u8, capture_name, "comment")) return .comment;
+    if (std.mem.startsWith(u8, capture_name, "string.special.key")) return .property_name;
+    if (std.mem.startsWith(u8, capture_name, "string") or std.mem.startsWith(u8, capture_name, "escape")) return .string;
+    if (std.mem.startsWith(u8, capture_name, "number")) return .number;
+    if (std.mem.startsWith(u8, capture_name, "constant")) return .keyword;
     if (text.len == 1 and isPunctuation(text[0])) return .punctuation;
     return .plain;
 }
@@ -466,6 +526,42 @@ test "tokenize json line uses heuristic keywords and numbers" {
     try std.testing.expect(testTokenKindsContain(tokens, .number, "42"));
     try std.testing.expect(testTokenKindsContain(tokens, .keyword, "true"));
     try std.testing.expect(testTokenKindsContain(tokens, .keyword, "null"));
+}
+
+test "tokenize javascript line uses tree-sitter captures" {
+    const allocator = std.testing.allocator;
+    const line = "const output = console.log(items.length);";
+    const tokens = try tokenizeLine(allocator, .javascript, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
+    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "output"));
+    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "console"));
+    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "log"));
+    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "length"));
+}
+
+test "tokenize jsx line highlights tags and strings" {
+    const allocator = std.testing.allocator;
+    const line = "return <Card title=\"verde\">ok</Card>;";
+    const tokens = try tokenizeLine(allocator, .jsx, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Card"));
+    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "title"));
+    try std.testing.expect(testTokenKindsContain(tokens, .string, "\"verde\""));
+}
+
+test "tokenize tsx line highlights jsx tags and types" {
+    const allocator = std.testing.allocator;
+    const line = "export const view = <Card count={items.length} />;";
+    const tokens = try tokenizeLine(allocator, .tsx, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "export"));
+    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Card"));
+    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "count"));
+    try std.testing.expect(testTokenKindsContain(tokens, .property_name, "length"));
 }
 
 test "tokenize zig line uses heuristic function and type names" {

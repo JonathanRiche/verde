@@ -47,7 +47,14 @@ pub const PatchView = struct {
 pub const SideBySideCell = struct {
     kind: DisplayLineKind,
     line_number: ?usize = null,
+    text: []const u8,
     tokens: []const syntax.Token,
+    emphasis_ranges: []const InlineRange = &.{},
+};
+
+pub const InlineRange = struct {
+    start: usize,
+    end: usize,
 };
 
 pub const SideBySideRowKind = enum {
@@ -169,10 +176,12 @@ pub fn buildSideBySidePatchView(allocator: std.mem.Allocator, input: []const u8)
     }
 
     for (document.files) |file| {
-        try rows.append(arena, .{
-            .kind = .file_header,
-            .tokens = try singleTokenLine(arena, .plain, fileDisplayLabel(file)),
-        });
+        if (fileDisplayLabel(file)) |label| {
+            try rows.append(arena, .{
+                .kind = .file_header,
+                .tokens = try singleTokenLine(arena, .plain, label),
+            });
+        }
 
         const language = syntax.inferLanguage(file.new_path orelse file.old_path orelse "");
         for (file.hunks) |hunk| {
@@ -189,14 +198,16 @@ pub fn buildSideBySidePatchView(allocator: std.mem.Allocator, input: []const u8)
                 switch (diff_line.kind) {
                     .context => {
                         const cell = try buildCodeCell(arena, language, .context, diff_line, old_line);
+                        const right_cell: SideBySideCell = .{
+                            .kind = .context,
+                            .line_number = new_line,
+                            .text = diff_line.text,
+                            .tokens = cell.tokens,
+                        };
                         try rows.append(arena, .{
                             .kind = .code,
                             .left = cell,
-                            .right = .{
-                                .kind = .context,
-                                .line_number = new_line,
-                                .tokens = cell.tokens,
-                            },
+                            .right = right_cell,
                         });
                         max_old_line = @max(max_old_line, old_line);
                         max_new_line = @max(max_new_line, new_line);
@@ -226,14 +237,15 @@ pub fn buildSideBySidePatchView(allocator: std.mem.Allocator, input: []const u8)
                         const row_count = @max(deletion_count, addition_count);
                         var pair_index: usize = 0;
                         while (pair_index < row_count) : (pair_index += 1) {
-                            const left = if (pair_index < deletion_count)
+                            var left = if (pair_index < deletion_count)
                                 try buildCodeCell(arena, language, .deletion, hunk.lines[deletion_start + pair_index], old_line + pair_index)
                             else
                                 null;
-                            const right = if (pair_index < addition_count)
+                            var right = if (pair_index < addition_count)
                                 try buildCodeCell(arena, language, .addition, hunk.lines[addition_start + pair_index], new_line + pair_index)
                             else
                                 null;
+                            try assignInlineEmphasis(arena, if (left != null) &left.? else null, if (right != null) &right.? else null);
 
                             try rows.append(arena, .{
                                 .kind = .code,
@@ -305,22 +317,137 @@ fn buildCodeCell(
     return .{
         .kind = kind,
         .line_number = line_number,
+        .text = diff_line.text,
         .tokens = try syntax.tokenizeLine(allocator, language, diff_line.text),
     };
 }
 
-fn fileDisplayLabel(file: ast.File) []const u8 {
-    return file.new_path orelse file.old_path orelse if (file.header_lines.len > 0) file.header_lines[0] else "(patch)";
+fn fileDisplayLabel(file: ast.File) ?[]const u8 {
+    if (file.new_path) |value| return value;
+    if (file.old_path) |value| return value;
+    return null;
 }
 
 fn testCellTextEquals(cell: SideBySideCell, expected: []const u8) bool {
-    var cursor: usize = 0;
-    for (cell.tokens) |token| {
-        if (cursor + token.text.len > expected.len) return false;
-        if (!std.mem.eql(u8, token.text, expected[cursor .. cursor + token.text.len])) return false;
-        cursor += token.text.len;
+    return std.mem.eql(u8, cell.text, expected);
+}
+
+const ChunkKind = enum {
+    whitespace,
+    word,
+    punctuation,
+};
+
+const Chunk = struct {
+    start: usize,
+    end: usize,
+    kind: ChunkKind,
+};
+
+const InlineEmphasisPair = struct {
+    left: []const InlineRange = &.{},
+    right: []const InlineRange = &.{},
+};
+
+fn assignInlineEmphasis(
+    arena: std.mem.Allocator,
+    left: ?*SideBySideCell,
+    right: ?*SideBySideCell,
+) std.mem.Allocator.Error!void {
+    if (left == null and right == null) return;
+    if (left != null and right != null) {
+        const pair = try buildInlineEmphasisPair(arena, left.?.text, right.?.text);
+        left.?.emphasis_ranges = pair.left;
+        right.?.emphasis_ranges = pair.right;
+        return;
     }
-    return cursor == expected.len;
+    if (left) |cell| {
+        cell.emphasis_ranges = try fullLineEmphasis(arena, cell.text);
+    }
+    if (right) |cell| {
+        cell.emphasis_ranges = try fullLineEmphasis(arena, cell.text);
+    }
+}
+
+fn fullLineEmphasis(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const InlineRange {
+    if (text.len == 0) return &.{};
+    const ranges = try arena.alloc(InlineRange, 1);
+    ranges[0] = .{ .start = 0, .end = text.len };
+    return ranges;
+}
+
+fn buildInlineEmphasisPair(
+    arena: std.mem.Allocator,
+    left_text: []const u8,
+    right_text: []const u8,
+) std.mem.Allocator.Error!InlineEmphasisPair {
+    if (std.mem.eql(u8, left_text, right_text)) return .{};
+
+    const left_chunks = try chunkLine(arena, left_text);
+    const right_chunks = try chunkLine(arena, right_text);
+
+    var prefix_count: usize = 0;
+    while (prefix_count < left_chunks.len and prefix_count < right_chunks.len) : (prefix_count += 1) {
+        const left_chunk = left_chunks[prefix_count];
+        const right_chunk = right_chunks[prefix_count];
+        if (left_chunk.kind != right_chunk.kind) break;
+        if (!std.mem.eql(u8, left_text[left_chunk.start..left_chunk.end], right_text[right_chunk.start..right_chunk.end])) break;
+    }
+
+    var left_suffix_limit = left_chunks.len;
+    var right_suffix_limit = right_chunks.len;
+    while (left_suffix_limit > prefix_count and right_suffix_limit > prefix_count) {
+        const left_chunk = left_chunks[left_suffix_limit - 1];
+        const right_chunk = right_chunks[right_suffix_limit - 1];
+        if (left_chunk.kind != right_chunk.kind) break;
+        if (!std.mem.eql(u8, left_text[left_chunk.start..left_chunk.end], right_text[right_chunk.start..right_chunk.end])) break;
+        left_suffix_limit -= 1;
+        right_suffix_limit -= 1;
+    }
+
+    return .{
+        .left = try buildInlineRangesFromChunks(arena, left_text, left_chunks, prefix_count, left_suffix_limit),
+        .right = try buildInlineRangesFromChunks(arena, right_text, right_chunks, prefix_count, right_suffix_limit),
+    };
+}
+
+fn chunkLine(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const Chunk {
+    var chunks: std.ArrayListUnmanaged(Chunk) = .empty;
+    var cursor: usize = 0;
+    while (cursor < text.len) {
+        const kind = classifyChunkByte(text[cursor]);
+        const start = cursor;
+        cursor += 1;
+        while (cursor < text.len and classifyChunkByte(text[cursor]) == kind) : (cursor += 1) {}
+        try chunks.append(arena, .{ .start = start, .end = cursor, .kind = kind });
+    }
+    return chunks.toOwnedSlice(arena);
+}
+
+fn classifyChunkByte(char: u8) ChunkKind {
+    if (std.ascii.isWhitespace(char)) return .whitespace;
+    if (std.ascii.isAlphanumeric(char) or char == '_') return .word;
+    return .punctuation;
+}
+
+fn buildInlineRangesFromChunks(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    chunks: []const Chunk,
+    prefix_count: usize,
+    suffix_limit: usize,
+) std.mem.Allocator.Error![]const InlineRange {
+    if (chunks.len == 0 or prefix_count >= suffix_limit) return &.{};
+
+    var start = chunks[prefix_count].start;
+    var end = chunks[suffix_limit - 1].end;
+    while (start < end and std.ascii.isWhitespace(text[start])) : (start += 1) {}
+    while (end > start and std.ascii.isWhitespace(text[end - 1])) : (end -= 1) {}
+    if (end <= start) return &.{};
+
+    const ranges = try arena.alloc(InlineRange, 1);
+    ranges[0] = .{ .start = start, .end = end };
+    return ranges;
 }
 
 fn singleTokenLine(
@@ -529,4 +656,26 @@ test "build side by side patch view carries typed tokens into cells" {
     try std.testing.expect(found_type);
     try std.testing.expect(found_function);
     try std.testing.expect(found_constant);
+}
+
+test "build side by side patch view marks inline emphasis ranges" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\diff --git a/main.rs b/main.rs
+        \\--- a/main.rs
+        \\+++ b/main.rs
+        \\@@ -4 +4 @@
+        \\-    io::stdin().read_line(&mut name).unwrap();
+        \\+    io::stdin().read_line(&mut name).expect("read error");
+    ;
+
+    var view = try buildSideBySidePatchView(allocator, input);
+    defer view.deinit();
+
+    const left = view.rows[2].left.?;
+    const right = view.rows[2].right.?;
+    try std.testing.expect(left.emphasis_ranges.len > 0);
+    try std.testing.expect(right.emphasis_ranges.len > 0);
+    try std.testing.expect(left.emphasis_ranges[0].start > 0);
+    try std.testing.expect(right.emphasis_ranges[0].end <= right.text.len);
 }
