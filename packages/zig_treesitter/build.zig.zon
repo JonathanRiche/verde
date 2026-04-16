@@ -1,0 +1,13 @@
+.{
+    .name = .zig_treesitter,
+    .version = "0.0.0",
+    .fingerprint = 0xbfcb7d00341f4ce9,
+    .paths = .{
+        "AGENTS.md",
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}

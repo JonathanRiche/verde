@@ -1,6 +1,7 @@
 //! Lightweight syntax tokenization for diff line rendering.
 
 const std = @import("std");
+const zig_treesitter = @import("zig_treesitter");
 
 pub const Language = enum {
     plain,
@@ -21,6 +22,9 @@ pub const TokenKind = enum {
     comment,
     type_name,
     function_name,
+    property_name,
+    variable_name,
+    constant_name,
     operator,
     punctuation,
 };
@@ -43,6 +47,17 @@ pub fn inferLanguage(path: []const u8) Language {
 }
 
 pub fn tokenizeLine(
+    allocator: std.mem.Allocator,
+    language: Language,
+    line: []const u8,
+) std.mem.Allocator.Error![]const Token {
+    if (language == .typescript) {
+        if (tokenizeTypeScriptLine(allocator, line)) |tokens| return tokens;
+    }
+    return tokenizeLineHeuristic(allocator, language, line);
+}
+
+fn tokenizeLineHeuristic(
     allocator: std.mem.Allocator,
     language: Language,
     line: []const u8,
@@ -102,6 +117,137 @@ pub fn tokenizeLine(
     }
 
     return tokens.toOwnedSlice(allocator);
+}
+
+const TokenSpan = struct {
+    start: usize,
+    end: usize,
+    kind: TokenKind,
+};
+
+fn tokenizeTypeScriptLine(allocator: std.mem.Allocator, line: []const u8) ?[]const Token {
+    var parser = zig_treesitter.Parser.init() catch return null;
+    defer parser.deinit();
+    if (!parser.setLanguage(zig_treesitter.grammars.typescript.language())) return null;
+
+    var tree = parser.parseString(line, null) orelse return null;
+    defer tree.deinit();
+
+    var query = zig_treesitter.Query.init(
+        zig_treesitter.grammars.typescript.language(),
+        zig_treesitter.grammars.typescript.highlights_query,
+    ) catch return null;
+    defer query.deinit();
+
+    var query_cursor = zig_treesitter.QueryCursor.init() catch return null;
+    defer query_cursor.deinit();
+    query_cursor.exec(query, tree.rootNode());
+
+    var spans: std.ArrayListUnmanaged(TokenSpan) = .empty;
+    defer spans.deinit(allocator);
+
+    while ((query_cursor.nextMatch(allocator) catch return null)) |match| {
+        defer match.deinit(allocator);
+        for (match.captures) |capture| {
+            const capture_name = query.captureName(capture.index) orelse continue;
+            const token_kind = classifyTypeScriptCapture(capture_name, capture.node.utf8Text(line));
+            if (token_kind == .plain) continue;
+
+            const start = @as(usize, @intCast(capture.node.startByte()));
+            const end = @as(usize, @intCast(capture.node.endByte()));
+            if (end <= start or start >= line.len) continue;
+
+            spans.append(allocator, .{
+                .start = start,
+                .end = end,
+                .kind = token_kind,
+            }) catch return null;
+        }
+    }
+
+    std.sort.heap(TokenSpan, spans.items, {}, tokenSpanLessThan);
+
+    var tokens: std.ArrayListUnmanaged(Token) = .empty;
+    errdefer tokens.deinit(allocator);
+    var cursor: usize = 0;
+
+    for (spans.items) |span| {
+        if (span.end <= span.start or span.start >= line.len) continue;
+        const start = @min(span.start, line.len);
+        const end = @min(span.end, line.len);
+        if (end <= cursor) continue;
+        if (start > cursor) {
+            appendToken(&tokens, allocator, .plain, line[cursor..start]) catch return null;
+        }
+        const effective_start = @max(start, cursor);
+        appendToken(&tokens, allocator, span.kind, line[effective_start..end]) catch return null;
+        cursor = end;
+    }
+
+    if (cursor < line.len) {
+        appendToken(&tokens, allocator, .plain, line[cursor..]) catch return null;
+    }
+
+    return tokens.toOwnedSlice(allocator) catch null;
+}
+
+fn classifyTypeScriptCapture(capture_name: []const u8, text: []const u8) TokenKind {
+    if (std.mem.eql(u8, capture_name, "constructor") and !startsUppercase(text)) return .plain;
+    if (std.mem.eql(u8, capture_name, "constant") and !looksLikeUpperSnake(text)) return .plain;
+    if (std.mem.eql(u8, capture_name, "variable.builtin") and !isTypeScriptBuiltinVariable(text)) return .plain;
+    if (std.mem.eql(u8, capture_name, "function.builtin") and !isTypeScriptBuiltinFunction(text)) return .plain;
+    if (std.mem.eql(u8, capture_name, "type") and !startsUppercase(text)) return .plain;
+
+    if (std.mem.startsWith(u8, capture_name, "comment")) return .comment;
+    if (std.mem.startsWith(u8, capture_name, "string")) return .string;
+    if (std.mem.startsWith(u8, capture_name, "constant.numeric") or std.mem.eql(u8, capture_name, "number")) {
+        return .number;
+    }
+    if (std.mem.startsWith(u8, capture_name, "keyword")) return .keyword;
+    if (std.mem.startsWith(u8, capture_name, "variable.parameter")) return .variable_name;
+    if (std.mem.startsWith(u8, capture_name, "variable.builtin")) return .constant_name;
+    if (std.mem.startsWith(u8, capture_name, "variable")) return .variable_name;
+    if (std.mem.startsWith(u8, capture_name, "property")) return .property_name;
+    if (std.mem.startsWith(u8, capture_name, "constant")) return .constant_name;
+    if (std.mem.startsWith(u8, capture_name, "function") or
+        std.mem.startsWith(u8, capture_name, "method") or
+        std.mem.eql(u8, capture_name, "function.builtin"))
+    {
+        return .function_name;
+    }
+    if (std.mem.eql(u8, capture_name, "constructor")) return .type_name;
+    if (std.mem.startsWith(u8, capture_name, "type") or std.mem.startsWith(u8, capture_name, "tag")) {
+        return .type_name;
+    }
+    if (std.mem.startsWith(u8, capture_name, "punctuation")) return .punctuation;
+    if (std.mem.eql(u8, capture_name, "operator")) return .operator;
+    if (text.len == 1 and isPunctuation(text[0])) return .punctuation;
+    return .plain;
+}
+
+fn tokenSpanLessThan(_: void, left: TokenSpan, right: TokenSpan) bool {
+    if (left.start == right.start and left.end == right.end) {
+        return tokenKindPriority(left.kind) > tokenKindPriority(right.kind);
+    }
+    if (left.start == right.start) return left.end > right.end;
+    return left.start < right.start;
+}
+
+fn tokenKindPriority(kind: TokenKind) u8 {
+    return switch (kind) {
+        .comment => 11,
+        .string => 10,
+        .number => 9,
+        .keyword => 8,
+        .function_name => 7,
+        .constant_name => 6,
+        .type_name => 5,
+        .property_name => 4,
+        .variable_name => 3,
+        .operator => 2,
+        .punctuation => 1,
+        .plain => 0,
+    };
 }
 
 fn appendToken(
@@ -212,6 +358,32 @@ fn startsUppercase(identifier: []const u8) bool {
     return std.ascii.isUpper(identifier[0]);
 }
 
+fn looksLikeUpperSnake(identifier: []const u8) bool {
+    if (identifier.len == 0) return false;
+    var saw_upper = false;
+    for (identifier) |char| {
+        if (std.ascii.isUpper(char)) {
+            saw_upper = true;
+            continue;
+        }
+        if (std.ascii.isDigit(char) or char == '_') continue;
+        return false;
+    }
+    return saw_upper;
+}
+
+fn isTypeScriptBuiltinVariable(identifier: []const u8) bool {
+    return std.mem.eql(u8, identifier, "arguments") or
+        std.mem.eql(u8, identifier, "module") or
+        std.mem.eql(u8, identifier, "console") or
+        std.mem.eql(u8, identifier, "window") or
+        std.mem.eql(u8, identifier, "document");
+}
+
+fn isTypeScriptBuiltinFunction(identifier: []const u8) bool {
+    return std.mem.eql(u8, identifier, "require");
+}
+
 fn isKeyword(language: Language, identifier: []const u8) bool {
     const keywords = switch (language) {
         .zig => zig_keywords[0..],
@@ -268,6 +440,45 @@ const ts_keywords = [_][]const u8{
     "typeof",   "using",   "var",       "void",      "while",      "with",   "yield",
 };
 
+fn testTokenKindsContain(tokens: []const Token, kind: TokenKind, text: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind == kind and std.mem.eql(u8, token.text, text)) return true;
+    }
+    return false;
+}
+
+test "infer language maps common extensions" {
+    try std.testing.expectEqual(Language.typescript, inferLanguage("src/example.ts"));
+    try std.testing.expectEqual(Language.tsx, inferLanguage("src/example.tsx"));
+    try std.testing.expectEqual(Language.javascript, inferLanguage("src/example.js"));
+    try std.testing.expectEqual(Language.json, inferLanguage("data/config.json"));
+    try std.testing.expectEqual(Language.markdown, inferLanguage("README.md"));
+    try std.testing.expectEqual(Language.plain, inferLanguage("Dockerfile"));
+}
+
+test "tokenize json line uses heuristic keywords and numbers" {
+    const allocator = std.testing.allocator;
+    const line = "{ \"count\": 42, \"active\": true, \"value\": null }";
+    const tokens = try tokenizeLine(allocator, .json, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .string, "\"count\""));
+    try std.testing.expect(testTokenKindsContain(tokens, .number, "42"));
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "true"));
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "null"));
+}
+
+test "tokenize zig line uses heuristic function and type names" {
+    const allocator = std.testing.allocator;
+    const line = "const Parser = try buildParser(source);";
+    const tokens = try tokenizeLine(allocator, .zig, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
+    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Parser"));
+    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "buildParser"));
+}
+
 test "tokenize typescript line classifies keywords and strings" {
     const allocator = std.testing.allocator;
     const line = "export const review = async (csvPath: string) => \"ok\";";
@@ -276,5 +487,43 @@ test "tokenize typescript line classifies keywords and strings" {
 
     try std.testing.expectEqual(@as(TokenKind, .keyword), tokens[0].kind);
     try std.testing.expectEqualStrings("export", tokens[0].text);
-    try std.testing.expectEqual(@as(TokenKind, .string), tokens[tokens.len - 2].kind);
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "async"));
+    try std.testing.expect(testTokenKindsContain(tokens, .string, "\"ok\""));
+    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "string"));
+}
+
+test "tokenize typescript line uses tree-sitter highlight captures for functions" {
+    const allocator = std.testing.allocator;
+    const line = "const result = reviewCampaign(csvPath);";
+    const tokens = try tokenizeLine(allocator, .typescript, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .keyword, "const"));
+    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "reviewCampaign"));
+    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "result"));
+    try std.testing.expect(testTokenKindsContain(tokens, .variable_name, "csvPath"));
+}
+
+test "tokenize typescript line classifies properties and constants" {
+    const allocator = std.testing.allocator;
+    const line = "const keys = Object.keys(CONSTANT_VALUE);";
+    const tokens = try tokenizeLine(allocator, .typescript, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .type_name, "Object"));
+    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "keys"));
+    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "CONSTANT_VALUE"));
+}
+
+test "tokenize typescript line classifies builtins punctuation and operators" {
+    const allocator = std.testing.allocator;
+    const line = "console.log(items?.length ?? 0);";
+    const tokens = try tokenizeLine(allocator, .typescript, line);
+    defer allocator.free(tokens);
+
+    try std.testing.expect(testTokenKindsContain(tokens, .constant_name, "console"));
+    try std.testing.expect(testTokenKindsContain(tokens, .function_name, "log"));
+    try std.testing.expect(testTokenKindsContain(tokens, .punctuation, "?."));
+    try std.testing.expect(testTokenKindsContain(tokens, .operator, "??"));
+    try std.testing.expect(testTokenKindsContain(tokens, .number, "0"));
 }
