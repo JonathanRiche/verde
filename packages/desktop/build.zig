@@ -17,6 +17,10 @@ pub fn build(b: *std.Build) void {
     };
     const fff_lib_path = b.path(b.pathJoin(&.{ "../../vendor/fff/target/release", fff_lib_name }));
 
+    const zig_dif = b.dependency("zig_dif", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const zgui = b.dependency("zgui", .{
         .backend = .sdl3_opengl3,
         .shared = false,
@@ -77,6 +81,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
+                .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
@@ -268,6 +273,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
+                .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
