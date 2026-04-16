@@ -678,6 +678,7 @@ pub const SendState = struct {
     mutex: std.Thread.Mutex = .{},
     condition: std.Thread.Condition = .{},
     status: SendStatus = .idle,
+    started_at_ms: i64 = 0,
     result: ?SendResultPayload = null,
     error_message: ?[]u8 = null,
     provider: ?Provider = null,
@@ -789,6 +790,7 @@ pub const AppState = struct {
     transcript_project_index: ?usize,
     transcript_thread_index: ?usize,
     transcript_selection_text: ?[:0]u8,
+    transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
     pending_transcript_line_scroll_steps: i16,
     pending_transcript_page_scroll_steps: i16,
@@ -864,6 +866,7 @@ pub const AppState = struct {
             .transcript_project_index = null,
             .transcript_thread_index = null,
             .transcript_selection_text = null,
+            .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
             .pending_transcript_line_scroll_steps = 0,
             .pending_transcript_page_scroll_steps = 0,
@@ -1831,6 +1834,7 @@ pub const AppState = struct {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         send_state.status = .pending;
+        send_state.started_at_ms = std.time.milliTimestamp();
         send_state.result = null;
         send_state.error_message = null;
         send_state.provider = thread.provider;
@@ -3562,12 +3566,14 @@ pub const AppState = struct {
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
+        self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
     }
 
     pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
         if (delta == 0) return;
         self.noteInteraction();
+        self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
         const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
         self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
@@ -3576,6 +3582,7 @@ pub const AppState = struct {
     pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
         if (delta == 0) return;
         self.noteInteraction();
+        self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
         const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
         self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
@@ -3878,6 +3885,7 @@ pub const AppState = struct {
                 freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
                 send_state.approval_decision = null;
                 send_state.provider = null;
+                send_state.started_at_ms = 0;
                 send_state.status = .idle;
                 next_status = .completed;
             },
@@ -3899,6 +3907,7 @@ pub const AppState = struct {
                 freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
                 send_state.approval_decision = null;
                 send_state.provider = null;
+                send_state.started_at_ms = 0;
                 send_state.status = .idle;
                 next_status = .aborted;
             },
@@ -3921,6 +3930,7 @@ pub const AppState = struct {
                 freePendingApprovalLocked(std.heap.page_allocator, &send_state.pending_approval);
                 send_state.approval_decision = null;
                 send_state.provider = null;
+                send_state.started_at_ms = 0;
                 send_state.status = .idle;
                 next_status = .failed;
             },

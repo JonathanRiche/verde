@@ -741,8 +741,9 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     });
     defer zgui.endChild();
 
-    const should_follow_stream = transcriptShouldAutoFollow(state);
     const has_pending_stream = runtime.isSendPending(state);
+    updateTranscriptAutoFollow(state, has_pending_stream);
+    const should_follow_stream = state.transcript_auto_follow_pending and has_pending_stream;
 
     // Inner content wrapper with horizontal padding; auto-resizes vertically so the
     // outer Transcript child handles scrolling while content stays centered.
@@ -782,6 +783,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     zgui.endChild();
     zgui.popStyleVar(.{ .count = 1 });
     state.transcript_focused = zgui.isWindowFocused(.{ .child_windows = true });
+    zgui.dummy(.{ .w = 0.0, .h = 0.0 });
 
     if (applyPendingTranscriptScroll(state, height)) {
         return;
@@ -790,10 +792,10 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     // Hold bottom-scroll requests for a couple of frames so startup and thread
     // switches still land correctly after nested child layout settles.
     if (state.scroll_transcript_to_bottom_frames > 0) {
-        zgui.setScrollY(zgui.getScrollMaxY());
+        jumpTranscriptToTail();
         state.scroll_transcript_to_bottom_frames -= 1;
     } else if (should_follow_stream) {
-        zgui.setScrollY(zgui.getScrollMaxY());
+        smoothScrollTranscriptToTail();
     }
 }
 
@@ -941,11 +943,13 @@ fn renderPendingTranscriptBubble(state: *app_state.AppState) void {
     if (send_state.status != .pending) return;
 
     const stream_text = send_state.partial_text.items;
+    var status_buf: [32]u8 = undefined;
+    const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms);
     renderTranscriptBubble(
         state,
         "pending-assistant",
         .assistant,
-        runtime.providerLabel(state.currentThread().provider),
+        working_label,
         if (stream_text.len > 0) stream_text else "Waiting for streamed output...",
         null,
         stream_text.len == 0,
@@ -2019,13 +2023,61 @@ fn transcriptBubbleTheme(role: anytype) TranscriptBubbleTheme {
     };
 }
 
-/// Decides whether streamed output should keep auto-scrolling.
-fn transcriptShouldAutoFollow(state: anytype) bool {
-    if (!state.hasPendingStream()) return false;
+/// Updates the sticky auto-follow latch for the live transcript tail.
+fn updateTranscriptAutoFollow(state: *app_state.AppState, has_pending_stream: bool) void {
+    if (!has_pending_stream) {
+        state.transcript_auto_follow_pending = false;
+        return;
+    }
+
+    if (state.scroll_transcript_to_bottom_frames > 0 or transcriptIsNearBottom()) {
+        state.transcript_auto_follow_pending = true;
+    }
+}
+
+/// Checks whether the transcript viewport is already near the tail.
+fn transcriptIsNearBottom() bool {
     const scroll_max_y = zgui.getScrollMaxY();
     if (scroll_max_y <= 0.0) return true;
     const scroll_y = zgui.getScrollY();
     return (scroll_max_y - scroll_y) <= theme.scaledUi(72.0);
+}
+
+fn jumpTranscriptToTail() void {
+    zgui.setScrollY(zgui.getScrollMaxY());
+}
+
+fn smoothScrollTranscriptToTail() void {
+    const target_y = zgui.getScrollMaxY();
+    const current_y = zgui.getScrollY();
+    const remaining = target_y - current_y;
+    if (remaining <= 0.5) {
+        zgui.setScrollY(target_y);
+        return;
+    }
+
+    const step = std.math.clamp(
+        remaining * 0.42,
+        theme.scaledUi(10.0),
+        theme.scaledUi(160.0),
+    );
+    const next_y = @min(current_y + step, target_y);
+    zgui.setScrollY(next_y);
+}
+
+fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
+    const now_ms = std.time.milliTimestamp();
+    const safe_started_at_ms = @max(started_at_ms, 0);
+    const elapsed_ms = @max(now_ms - safe_started_at_ms, 0);
+    const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
+    const hours = total_seconds / 3600;
+    const minutes = (total_seconds / 60) % 60;
+    const seconds = total_seconds % 60;
+
+    if (hours > 0) {
+        return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "Working - 0:00";
+    }
+    return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}", .{ minutes, seconds }) catch "Working - 0:00";
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
