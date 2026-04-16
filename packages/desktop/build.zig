@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zig_markdown = b.dependency("zig_markdown", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const zgui = b.dependency("zgui", .{
         .backend = .sdl3_opengl3,
         .shared = false,
@@ -35,6 +39,16 @@ pub fn build(b: *std.Build) void {
     const zqlite = b.dependency("zqlite", .{
         .target = target,
         .optimize = optimize,
+    });
+    const chat_markdown = b.createModule(.{
+        .root_source_file = b.path("src/ui/chat_markdown.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
+            .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
+            .{ .name = "zgui", .module = zgui.module("root") },
+        },
     });
     const imgui = zgui.artifact("imgui");
     const build_options = b.addOptions();
@@ -82,6 +96,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
+                .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
@@ -264,6 +279,20 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const chat_markdown_tests = b.addTest(.{
+        .root_module = chat_markdown,
+    });
+    chat_markdown_tests.linkLibrary(imgui);
+    chat_markdown_tests.linkLibC();
+    if (target.result.os.tag == .linux) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+            chat_markdown_tests.addLibraryPath(sdl3_prebuilt.path("lib"));
+        }
+        chat_markdown_tests.linkSystemLibrary("SDL3");
+        chat_markdown_tests.linkSystemLibrary("GL");
+        chat_markdown_tests.linkSystemLibrary("util");
+    }
+    test_step.dependOn(&b.addRunArtifact(chat_markdown_tests).step);
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
