@@ -18,6 +18,8 @@ pub const Token = syntax.Token;
 pub const TokenKind = syntax.TokenKind;
 pub const DisplayLine = view.DisplayLine;
 pub const DisplayLineKind = view.DisplayLineKind;
+pub const BuildOptions = view.BuildOptions;
+pub const CollapsedContext = view.CollapsedContext;
 pub const PatchView = view.PatchView;
 pub const SideBySideCell = view.SideBySideCell;
 pub const SideBySideRow = view.SideBySideRow;
@@ -34,9 +36,21 @@ pub fn buildPatchView(allocator: std.mem.Allocator, input: []const u8) ParseErro
     return view.buildPatchView(allocator, input);
 }
 
+pub fn buildPatchViewWithOptions(allocator: std.mem.Allocator, input: []const u8, options: BuildOptions) ParseError!PatchView {
+    return view.buildPatchViewWithOptions(allocator, input, options);
+}
+
 /// Parses unified diff text into an aligned side-by-side view.
 pub fn buildSideBySidePatchView(allocator: std.mem.Allocator, input: []const u8) ParseError!SideBySidePatchView {
     return view.buildSideBySidePatchView(allocator, input);
+}
+
+pub fn buildSideBySidePatchViewWithOptions(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    options: BuildOptions,
+) ParseError!SideBySidePatchView {
+    return view.buildSideBySidePatchViewWithOptions(allocator, input, options);
 }
 
 test {
