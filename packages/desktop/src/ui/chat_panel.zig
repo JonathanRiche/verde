@@ -1565,8 +1565,8 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
     const patch_height = pendingDiffPatchHeight(patch);
 
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
-    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 10.0, 10.0 } });
+    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 8.0 });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 8.0, 8.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     _ = zgui.beginChildId(@intCast(80_000 + index), .{
@@ -1581,7 +1581,9 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
         zgui.popStyleVar(.{ .count = 2 });
     }
 
-    var view = zig_dif.buildSideBySidePatchView(std.heap.page_allocator, patch) catch {
+    var view = zig_dif.buildSideBySidePatchViewWithOptions(std.heap.page_allocator, patch, .{
+        .context_lines = 2,
+    }) catch {
         renderPendingDiffPatchFallback(patch);
         return;
     };
@@ -1614,9 +1616,10 @@ fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
 fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_width: f32) void {
     const row_height = switch (row.kind) {
         .file_header => theme.scaledUi(28.0),
-        .hunk_header => theme.scaledUi(24.0),
-        .note => theme.scaledUi(22.0),
-        .prelude => theme.scaledUi(22.0),
+        .hunk_header => theme.scaledUi(20.0),
+        .context_gap => theme.scaledUi(20.0),
+        .note => theme.scaledUi(20.0),
+        .prelude => theme.scaledUi(20.0),
         .code => unreachable,
     };
     const origin = zgui.getCursorScreenPos();
@@ -1631,8 +1634,17 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_widt
         .pmin = origin,
         .pmax = row_max,
         .col = zgui.colorConvertFloat4ToU32(patchMetaBackground(row.kind)),
-        .rounding = if (row.kind == .file_header) theme.scaledUi(7.0) else 0.0,
+        .rounding = if (row.kind == .file_header) theme.scaledUi(6.0) else 0.0,
     });
+
+    if (row.kind == .hunk_header or row.kind == .context_gap) {
+        draw_list.addLine(.{
+            .p1 = .{ origin[0], row_max[1] - 1.0 },
+            .p2 = .{ row_max[0], row_max[1] - 1.0 },
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(58, 60, 68, 255)),
+            .thickness = 1.0,
+        });
+    }
 
     draw_list.pushClipRect(.{
         .pmin = origin,
@@ -1645,7 +1657,7 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_widt
         .kind = patchDisplayLineKindForRow(row.kind),
         .text = "",
         .tokens = row.tokens,
-    }, draw_list, origin[0] + theme.scaledUi(12.0), origin[1] + (row_height - zgui.getTextLineHeight()) * 0.5, row_max[0] - theme.scaledUi(12.0));
+    }, draw_list, origin[0] + theme.scaledUi(10.0), origin[1] + (row_height - zgui.getTextLineHeight()) * 0.5, row_max[0] - theme.scaledUi(10.0));
 }
 
 // Renders one side-by-side code row with independent left and right cells.
@@ -1653,7 +1665,7 @@ fn renderPatchCodeRow(view: zig_dif.SideBySidePatchView, row: zig_dif.SideBySide
     const row_height = theme.scaledUi(24.0);
     const origin = zgui.getCursorScreenPos();
     const width = @max(@max(zgui.getContentRegionAvail()[0], content_width), 1.0);
-    const gap = theme.scaledUi(12.0);
+    const gap = theme.scaledUi(8.0);
     const half_width = @max((width - gap) * 0.5, theme.scaledUi(120.0));
     var id_buf: [64]u8 = undefined;
     const button_id = std.fmt.bufPrintZ(&id_buf, "##patch-code-{d}", .{row_index}) catch return;
@@ -1684,7 +1696,7 @@ fn drawPatchCell(
     max: [2]f32,
     digits: usize,
 ) void {
-    const pad_x = theme.scaledUi(10.0);
+    const pad_x = theme.scaledUi(8.0);
     const line_height = max[1] - min[1];
     const number_width = patchNumberColumnWidth(digits);
     const text_y = min[1] + (line_height - zgui.getTextLineHeight()) * 0.5;
@@ -1722,7 +1734,7 @@ fn drawPatchCell(
             number_text,
         );
 
-        drawPatchTokenRun(value, draw_list, min[0] + pad_x + number_width + theme.scaledUi(10.0), text_y, max[0] - pad_x);
+        drawPatchTokenRun(value, draw_list, min[0] + pad_x + number_width + theme.scaledUi(8.0), text_y, max[0] - pad_x);
     }
 }
 
@@ -1790,9 +1802,10 @@ fn drawPatchInlineHighlights(
 fn patchMetaBackground(kind: zig_dif.SideBySideRowKind) [4]f32 {
     return switch (kind) {
         .file_header => colors.rgba(32, 34, 40, 255),
-        .hunk_header => colors.rgba(27, 29, 34, 255),
-        .note => colors.rgba(24, 24, 28, 255),
-        .prelude => colors.rgba(20, 20, 24, 255),
+        .hunk_header => colors.rgba(21, 22, 26, 255),
+        .context_gap => colors.rgba(19, 20, 24, 255),
+        .note => colors.rgba(22, 22, 26, 255),
+        .prelude => colors.rgba(18, 18, 22, 255),
         .code => colors.rgba(24, 24, 28, 255),
     };
 }
@@ -1802,7 +1815,7 @@ fn patchCellBackground(kind: ?zig_dif.DisplayLineKind) [4]f32 {
         .addition => colors.rgba(30, 52, 43, 255),
         .deletion => colors.rgba(57, 34, 36, 255),
         .context => colors.rgba(24, 24, 28, 255),
-        .file_header, .hunk_header, .note, .prelude => colors.rgba(24, 24, 28, 255),
+        .context_gap, .file_header, .hunk_header, .note, .prelude => colors.rgba(24, 24, 28, 255),
     };
 }
 
@@ -1819,6 +1832,7 @@ fn patchDisplayLineKindForRow(kind: zig_dif.SideBySideRowKind) zig_dif.DisplayLi
         .prelude => .prelude,
         .file_header => .file_header,
         .hunk_header => .hunk_header,
+        .context_gap => .context_gap,
         .note => .note,
         .code => .context,
     };
@@ -1830,7 +1844,7 @@ fn patchNumberColumnWidth(digits: usize) f32 {
 }
 
 fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
-    const gap = theme.scaledUi(12.0);
+    const gap = theme.scaledUi(8.0);
     const left_digits = maxLineNumberDigits(view.max_old_line);
     const right_digits = maxLineNumberDigits(view.max_new_line);
     var max_left: f32 = theme.scaledUi(240.0);
@@ -1842,7 +1856,7 @@ fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
                 max_right = @max(max_right, patchCellContentWidth(row.right, right_digits));
             },
             else => {
-                const width = patchMetaTokensWidth(row.tokens) + theme.scaledUi(24.0);
+                const width = patchMetaTokensWidth(row.tokens) + theme.scaledUi(20.0);
                 max_left = @max(max_left, width);
             },
         }
@@ -1852,7 +1866,7 @@ fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
 
 fn patchCellContentWidth(cell: ?zig_dif.SideBySideCell, digits: usize) f32 {
     const text = if (cell) |value| value.text else "";
-    return theme.scaledUi(20.0) + patchNumberColumnWidth(digits) + theme.scaledUi(10.0) + zgui.calcTextSize(text, .{})[0];
+    return theme.scaledUi(16.0) + patchNumberColumnWidth(digits) + theme.scaledUi(8.0) + zgui.calcTextSize(text, .{})[0];
 }
 
 fn patchMetaTokensWidth(tokens: []const zig_dif.Token) f32 {
@@ -1862,7 +1876,8 @@ fn patchMetaTokensWidth(tokens: []const zig_dif.Token) f32 {
 }
 
 fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.TokenKind) [4]f32 {
-    if (line_kind == .hunk_header) return theme.COLOR_YELLOW;
+    if (line_kind == .hunk_header) return colors.rgb(0xC7, 0xA3, 0x3A);
+    if (line_kind == .context_gap) return theme.COLOR_TEXT_SUBTLE;
     if (line_kind == .note) return theme.COLOR_TEXT_SUBTLE;
     if (line_kind == .file_header or line_kind == .prelude) return theme.COLOR_TEXT_MUTED;
 

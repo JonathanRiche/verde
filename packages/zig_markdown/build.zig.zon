@@ -1,0 +1,11 @@
+.{
+    .name = .zig_markdown,
+    .version = "0.0.0",
+    .fingerprint = 0xf37dc163d508b748,
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
