@@ -134,7 +134,7 @@ fn parseFencedCode(
                     },
                     .fence = open.fence,
                     .info = open.info,
-                    .language = fencedCodeLanguage(open.info),
+                    .language = fenceLanguage(open.info),
                     .code = source[content_start..content_end],
                 },
             });
@@ -158,13 +158,13 @@ fn parseFencedCode(
             },
             .fence = open.fence,
             .info = open.info,
-            .language = fencedCodeLanguage(open.info),
+            .language = fenceLanguage(open.info),
             .code = source[content_start..content_end],
         },
     });
 }
 
-fn fencedCodeLanguage(info: []const u8) ?[]const u8 {
+pub fn fenceLanguage(info: []const u8) ?[]const u8 {
     var tokens = std.mem.tokenizeAny(u8, info, " \t");
     return tokens.next();
 }

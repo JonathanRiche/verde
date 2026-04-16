@@ -7,6 +7,7 @@ const zgui = @import("zgui");
 
 const colors = @import("colors.zig");
 const browser_panel = @import("browser.zig");
+const chat_markdown = @import("chat_markdown.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
@@ -1022,6 +1023,7 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
         author,
         body,
         image,
+        muted_body,
         shouldRenderCodexFileReferenceBody(state, role, body, muted_body),
     );
     const bubble_theme = transcriptBubbleTheme(role);
@@ -1068,6 +1070,10 @@ fn renderTranscriptBody(state: *app_state.AppState, role: anytype, body: []const
         return;
     }
 
+    if (!muted_body and renderMarkdownTranscriptBody(body)) {
+        return;
+    }
+
     zgui.pushTextWrapPos(0.0);
     defer zgui.popTextWrapPos();
     if (muted_body) {
@@ -1075,6 +1081,17 @@ fn renderTranscriptBody(state: *app_state.AppState, role: anytype, body: []const
     } else {
         zgui.textWrapped("{s}", .{body});
     }
+}
+
+fn renderMarkdownTranscriptBody(body: []const u8) bool {
+    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return false;
+    defer view.deinit(std.heap.page_allocator);
+
+    chat_markdown.renderBody(view, .{
+        .code_font = theme.terminal_font,
+        .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
+    });
+    return true;
 }
 
 fn shouldRenderCodexFileReferenceBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) bool {
@@ -1601,11 +1618,11 @@ fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
     zgui.pushFont(terminal_font, terminal_font_size);
     defer zgui.popFont();
 
-    const content_width = patchViewContentWidth(view);
+    const layout = patchViewLayout(view);
     for (view.rows, 0..) |row, row_index| {
         switch (row.kind) {
-            .code => renderPatchCodeRow(view, row, row_index, content_width),
-            else => renderPatchMetaRow(row, row_index, content_width),
+            .code => renderPatchCodeRow(view, row, row_index, layout),
+            else => renderPatchMetaRow(row, row_index, layout.total),
         }
     }
 
@@ -1616,8 +1633,8 @@ fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
 fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_width: f32) void {
     const row_height = switch (row.kind) {
         .file_header => theme.scaledUi(28.0),
-        .hunk_header => theme.scaledUi(20.0),
-        .context_gap => theme.scaledUi(20.0),
+        .hunk_header => theme.scaledUi(24.0),
+        .context_gap => theme.scaledUi(24.0),
         .note => theme.scaledUi(20.0),
         .prelude => theme.scaledUi(20.0),
         .code => unreachable,
@@ -1637,21 +1654,48 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_widt
         .rounding = if (row.kind == .file_header) theme.scaledUi(6.0) else 0.0,
     });
 
-    if (row.kind == .hunk_header or row.kind == .context_gap) {
-        draw_list.addLine(.{
-            .p1 = .{ origin[0], row_max[1] - 1.0 },
-            .p2 = .{ row_max[0], row_max[1] - 1.0 },
-            .col = zgui.colorConvertFloat4ToU32(colors.rgba(58, 60, 68, 255)),
-            .thickness = 1.0,
-        });
-    }
-
     draw_list.pushClipRect(.{
         .pmin = origin,
         .pmax = row_max,
         .intersect_with_current = true,
     });
     defer draw_list.popClipRect();
+
+    var label_buf: [192]u8 = undefined;
+    const label = patchMetaRowLabel(row, &label_buf);
+    const label_color = patchMetaLabelColor(row.kind);
+
+    if (row.kind == .hunk_header or row.kind == .context_gap) {
+        const label_size = zgui.calcTextSize(label, .{});
+        const pill_pad_x = theme.scaledUi(12.0);
+        const pill_pad_y = theme.scaledUi(4.0);
+        const pill_width = label_size[0] + pill_pad_x * 2.0;
+        const pill_height = zgui.getTextLineHeight() + pill_pad_y * 2.0;
+        const pill_min = .{
+            origin[0] + @max((width - pill_width) * 0.5, theme.scaledUi(8.0)),
+            origin[1] + @max((row_height - pill_height) * 0.5, 0.0),
+        };
+        const pill_max = .{ pill_min[0] + pill_width, pill_min[1] + pill_height };
+        draw_list.addRectFilled(.{
+            .pmin = pill_min,
+            .pmax = pill_max,
+            .col = zgui.colorConvertFloat4ToU32(patchMetaPillBackground(row.kind)),
+            .rounding = theme.scaledUi(6.0),
+        });
+        draw_list.addRect(.{
+            .pmin = pill_min,
+            .pmax = pill_max,
+            .col = zgui.colorConvertFloat4ToU32(patchMetaPillBorder(row.kind)),
+            .rounding = theme.scaledUi(6.0),
+            .thickness = 1.0,
+        });
+        draw_list.addTextUnformatted(
+            .{ pill_min[0] + pill_pad_x, pill_min[1] + (pill_height - zgui.getTextLineHeight()) * 0.5 },
+            zgui.colorConvertFloat4ToU32(label_color),
+            label,
+        );
+        return;
+    }
 
     drawPatchTokenRun(.{
         .kind = patchDisplayLineKindForRow(row.kind),
@@ -1661,21 +1705,22 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_widt
 }
 
 // Renders one side-by-side code row with independent left and right cells.
-fn renderPatchCodeRow(view: zig_dif.SideBySidePatchView, row: zig_dif.SideBySideRow, row_index: usize, content_width: f32) void {
-    const row_height = theme.scaledUi(24.0);
+fn renderPatchCodeRow(view: zig_dif.SideBySidePatchView, row: zig_dif.SideBySideRow, row_index: usize, layout: PatchColumnLayout) void {
+    const row_height = theme.scaledUi(26.0);
     const origin = zgui.getCursorScreenPos();
-    const width = @max(@max(zgui.getContentRegionAvail()[0], content_width), 1.0);
+    const width = @max(@max(zgui.getContentRegionAvail()[0], layout.total), 1.0);
     const gap = theme.scaledUi(8.0);
-    const half_width = @max((width - gap) * 0.5, theme.scaledUi(120.0));
+    const left_width = layout.left;
+    const right_width = layout.right;
     var id_buf: [64]u8 = undefined;
     const button_id = std.fmt.bufPrintZ(&id_buf, "##patch-code-{d}", .{row_index}) catch return;
     _ = zgui.invisibleButton(button_id, .{ .w = width, .h = row_height });
 
     const draw_list = zgui.getWindowDrawList();
     const left_min = origin;
-    const left_max = .{ origin[0] + half_width, origin[1] + row_height };
+    const left_max = .{ origin[0] + left_width, origin[1] + row_height };
     const right_min = .{ left_max[0] + gap, origin[1] };
-    const right_max = .{ origin[0] + width, origin[1] + row_height };
+    const right_max = .{ right_min[0] + right_width, origin[1] + row_height };
 
     drawPatchCell(draw_list, row.left, left_min, left_max, maxLineNumberDigits(view.max_old_line));
     drawPatchCell(draw_list, row.right, right_min, right_max, maxLineNumberDigits(view.max_new_line));
@@ -1697,6 +1742,8 @@ fn drawPatchCell(
     digits: usize,
 ) void {
     const pad_x = theme.scaledUi(8.0);
+    const gutter_pad_x = theme.scaledUi(10.0);
+    const text_pad_x = theme.scaledUi(8.0);
     const line_height = max[1] - min[1];
     const number_width = patchNumberColumnWidth(digits);
     const text_y = min[1] + (line_height - zgui.getTextLineHeight()) * 0.5;
@@ -1708,6 +1755,7 @@ fn drawPatchCell(
     });
 
     if (cell) |value| {
+        const gutter_width = pad_x + number_width + gutter_pad_x;
         if (value.kind == .addition or value.kind == .deletion) {
             draw_list.addRectFilled(.{
                 .pmin = .{ min[0], min[1] },
@@ -1723,6 +1771,18 @@ fn drawPatchCell(
         });
         defer draw_list.popClipRect();
 
+        draw_list.addRectFilled(.{
+            .pmin = min,
+            .pmax = .{ min[0] + gutter_width, max[1] },
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(20, 21, 25, 255)),
+        });
+        draw_list.addLine(.{
+            .p1 = .{ min[0] + gutter_width, min[1] },
+            .p2 = .{ min[0] + gutter_width, max[1] },
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(58, 60, 68, 255)),
+            .thickness = 1.0,
+        });
+
         var number_buf: [32]u8 = undefined;
         const number_text = if (value.line_number) |line_number|
             std.fmt.bufPrint(&number_buf, "{d: >[1]}", .{ line_number, digits }) catch ""
@@ -1734,7 +1794,7 @@ fn drawPatchCell(
             number_text,
         );
 
-        drawPatchTokenRun(value, draw_list, min[0] + pad_x + number_width + theme.scaledUi(8.0), text_y, max[0] - pad_x);
+        drawPatchTokenRun(value, draw_list, min[0] + gutter_width + text_pad_x, text_y, max[0] - pad_x);
     }
 }
 
@@ -1750,12 +1810,13 @@ fn drawPatchTokenRun(
     var text_offset: usize = 0;
     for (cell.tokens) |token| {
         if (token.text.len == 0) continue;
+        const emphasized = patchTokenIsEmphasized(cell, text_offset, token.text.len);
         const width = zgui.calcTextSize(token.text, .{})[0];
         if (cursor_x >= max_x) break;
         drawPatchInlineHighlights(draw_list, cell, token, text_offset, cursor_x, start_y);
         draw_list.addTextUnformatted(
             .{ cursor_x, start_y },
-            zgui.colorConvertFloat4ToU32(patchTokenColor(cell.kind, token.kind)),
+            zgui.colorConvertFloat4ToU32(patchTokenColor(cell.kind, token.kind, emphasized)),
             token.text,
         );
         cursor_x += width;
@@ -1788,13 +1849,13 @@ fn drawPatchInlineHighlights(
         if (highlight_width <= 0.0) continue;
 
         draw_list.addRectFilled(.{
-            .pmin = .{ token_x + prefix_width, token_y + theme.scaledUi(1.0) },
+            .pmin = .{ token_x + prefix_width, token_y + theme.scaledUi(0.5) },
             .pmax = .{
                 token_x + prefix_width + highlight_width,
-                token_y + zgui.getTextLineHeight() - theme.scaledUi(1.0),
+                token_y + zgui.getTextLineHeight() - theme.scaledUi(0.5),
             },
             .col = zgui.colorConvertFloat4ToU32(highlight_color),
-            .rounding = theme.scaledUi(3.0),
+            .rounding = theme.scaledUi(4.0),
         });
     }
 }
@@ -1802,11 +1863,27 @@ fn drawPatchInlineHighlights(
 fn patchMetaBackground(kind: zig_dif.SideBySideRowKind) [4]f32 {
     return switch (kind) {
         .file_header => colors.rgba(32, 34, 40, 255),
-        .hunk_header => colors.rgba(21, 22, 26, 255),
+        .hunk_header => colors.rgba(20, 21, 25, 255),
         .context_gap => colors.rgba(19, 20, 24, 255),
         .note => colors.rgba(22, 22, 26, 255),
         .prelude => colors.rgba(18, 18, 22, 255),
         .code => colors.rgba(24, 24, 28, 255),
+    };
+}
+
+fn patchMetaPillBackground(kind: zig_dif.SideBySideRowKind) [4]f32 {
+    return switch (kind) {
+        .hunk_header => colors.rgba(31, 27, 18, 255),
+        .context_gap => colors.rgba(22, 23, 28, 255),
+        else => patchMetaBackground(kind),
+    };
+}
+
+fn patchMetaPillBorder(kind: zig_dif.SideBySideRowKind) [4]f32 {
+    return switch (kind) {
+        .hunk_header => colors.rgba(113, 89, 30, 255),
+        .context_gap => colors.rgba(62, 64, 72, 255),
+        else => colors.rgba(58, 60, 68, 255),
     };
 }
 
@@ -1844,11 +1921,22 @@ fn patchNumberColumnWidth(digits: usize) f32 {
 }
 
 fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
+    return patchViewLayout(view).total;
+}
+
+const PatchColumnLayout = struct {
+    left: f32,
+    right: f32,
+    total: f32,
+};
+
+fn patchViewLayout(view: zig_dif.SideBySidePatchView) PatchColumnLayout {
     const gap = theme.scaledUi(8.0);
     const left_digits = maxLineNumberDigits(view.max_old_line);
     const right_digits = maxLineNumberDigits(view.max_new_line);
-    var max_left: f32 = theme.scaledUi(240.0);
-    var max_right: f32 = theme.scaledUi(240.0);
+    var max_left: f32 = theme.scaledUi(300.0);
+    var max_right: f32 = theme.scaledUi(300.0);
+    var max_meta: f32 = theme.scaledUi(300.0);
     for (view.rows) |row| {
         switch (row.kind) {
             .code => {
@@ -1856,17 +1944,21 @@ fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
                 max_right = @max(max_right, patchCellContentWidth(row.right, right_digits));
             },
             else => {
-                const width = patchMetaTokensWidth(row.tokens) + theme.scaledUi(20.0);
-                max_left = @max(max_left, width);
+                max_meta = @max(max_meta, patchMetaRowWidth(row));
             },
         }
     }
-    return max_left + gap + max_right;
+    const total = @max(max_left + gap + max_right, max_meta);
+    return .{
+        .left = max_left,
+        .right = max_right,
+        .total = total,
+    };
 }
 
 fn patchCellContentWidth(cell: ?zig_dif.SideBySideCell, digits: usize) f32 {
     const text = if (cell) |value| value.text else "";
-    return theme.scaledUi(16.0) + patchNumberColumnWidth(digits) + theme.scaledUi(8.0) + zgui.calcTextSize(text, .{})[0];
+    return theme.scaledUi(8.0) + patchNumberColumnWidth(digits) + theme.scaledUi(10.0) + theme.scaledUi(8.0) + zgui.calcTextSize(text, .{})[0];
 }
 
 fn patchMetaTokensWidth(tokens: []const zig_dif.Token) f32 {
@@ -1875,7 +1967,104 @@ fn patchMetaTokensWidth(tokens: []const zig_dif.Token) f32 {
     return width;
 }
 
-fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.TokenKind) [4]f32 {
+fn patchMetaRowWidth(row: zig_dif.SideBySideRow) f32 {
+    return switch (row.kind) {
+        .hunk_header, .context_gap => blk: {
+            var label_buf: [192]u8 = undefined;
+            const label = patchMetaRowLabel(row, &label_buf);
+            break :blk zgui.calcTextSize(label, .{})[0] + theme.scaledUi(32.0);
+        },
+        else => patchMetaTokensWidth(row.tokens) + theme.scaledUi(32.0),
+    };
+}
+
+fn patchMetaRowLabel(row: zig_dif.SideBySideRow, buf: []u8) []const u8 {
+    const raw = patchTokensText(row.tokens, buf);
+    return switch (row.kind) {
+        .hunk_header => patchCleanHunkLabel(raw, buf),
+        .context_gap => patchCleanContextGapLabel(raw, buf),
+        else => raw,
+    };
+}
+
+fn patchTokensText(tokens: []const zig_dif.Token, buf: []u8) []const u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    const writer = stream.writer();
+    for (tokens) |token| {
+        writer.writeAll(token.text) catch return "";
+    }
+    return buf[0..stream.pos];
+}
+
+fn patchCleanHunkLabel(text: []const u8, buf: []u8) []const u8 {
+    const parsed = parsePatchHunkHeader(text) orelse return std.mem.trim(u8, text, " @");
+    const old_end = parsed.old.start + parsed.old.count - 1;
+    const new_end = parsed.new.start + parsed.new.count - 1;
+    return std.fmt.bufPrint(buf, "{d}-{d} -> {d}-{d}", .{
+        parsed.old.start,
+        old_end,
+        parsed.new.start,
+        new_end,
+    }) catch std.mem.trim(u8, text, " @");
+}
+
+fn patchCleanContextGapLabel(text: []const u8, buf: []u8) []const u8 {
+    const count = parseFirstUnsigned(text) orelse return std.mem.trim(u8, text, " .");
+    return std.fmt.bufPrint(buf, "{d} unchanged {s}", .{
+        count,
+        if (count == 1) "line" else "lines",
+    }) catch std.mem.trim(u8, text, " .");
+}
+
+const PatchHunkRange = struct {
+    start: usize,
+    count: usize,
+};
+
+const PatchHunkHeader = struct {
+    old: PatchHunkRange,
+    new: PatchHunkRange,
+};
+
+fn parsePatchHunkHeader(text: []const u8) ?PatchHunkHeader {
+    if (!std.mem.startsWith(u8, text, "@@")) return null;
+
+    var parts = std.mem.tokenizeAny(u8, text, " \t");
+    _ = parts.next() orelse return null;
+    const old_text = parts.next() orelse return null;
+    const new_text = parts.next() orelse return null;
+    const old_range = parsePatchRange(old_text) orelse return null;
+    const new_range = parsePatchRange(new_text) orelse return null;
+    return .{ .old = old_range, .new = new_range };
+}
+
+fn parsePatchRange(text: []const u8) ?PatchHunkRange {
+    if (text.len < 2) return null;
+    const trimmed = std.mem.trim(u8, text, ",");
+    const signless = trimmed[1..];
+    var parts = std.mem.splitScalar(u8, signless, ',');
+    const start_text = parts.next() orelse return null;
+    const start = std.fmt.parseInt(usize, start_text, 10) catch return null;
+    const count = if (parts.next()) |count_text|
+        std.fmt.parseInt(usize, count_text, 10) catch return null
+    else
+        1;
+    return .{
+        .start = start,
+        .count = @max(count, 1),
+    };
+}
+
+fn parseFirstUnsigned(text: []const u8) ?usize {
+    var index: usize = 0;
+    while (index < text.len and !std.ascii.isDigit(text[index])) : (index += 1) {}
+    if (index >= text.len) return null;
+    const start = index;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+    return std.fmt.parseInt(usize, text[start..index], 10) catch null;
+}
+
+fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.TokenKind, emphasized: bool) [4]f32 {
     if (line_kind == .hunk_header) return colors.rgb(0xC7, 0xA3, 0x3A);
     if (line_kind == .context_gap) return theme.COLOR_TEXT_SUBTLE;
     if (line_kind == .note) return theme.COLOR_TEXT_SUBTLE;
@@ -1886,6 +2075,22 @@ fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.Token
         .deletion => theme.COLOR_DIFF_REMOVE,
         else => theme.COLOR_TEXT_MUTED,
     };
+
+    if (emphasized) {
+        return switch (token_kind) {
+            .plain => theme.COLOR_WHITE,
+            .comment => theme.COLOR_TEXT_SUBTLE,
+            .string => theme.lighten(theme.COLOR_GREEN, 0.18),
+            .number => colors.rgb(0xFF, 0xC9, 0x75),
+            .keyword => theme.lighten(theme.COLOR_YELLOW, 0.15),
+            .type_name => theme.lighten(colors.rgb(0x7D, 0xC4, 0xE4), 0.16),
+            .function_name => theme.lighten(colors.rgb(0x56, 0xB6, 0xC2), 0.16),
+            .property_name => theme.lighten(colors.rgb(0x61, 0xAF, 0xEF), 0.16),
+            .variable_name => theme.COLOR_WHITE,
+            .constant_name => theme.lighten(colors.rgb(0xE5, 0xC0, 0x7B), 0.16),
+            .operator, .punctuation => theme.COLOR_WHITE,
+        };
+    }
 
     return switch (token_kind) {
         .plain => base,
@@ -1899,6 +2104,26 @@ fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.Token
         .variable_name => theme.COLOR_TEXT_MUTED,
         .constant_name => colors.rgb(0xE5, 0xC0, 0x7B),
         .operator, .punctuation => base,
+    };
+}
+
+fn patchTokenIsEmphasized(cell: zig_dif.SideBySideCell, token_start: usize, token_len: usize) bool {
+    if (cell.emphasis_ranges.len == 0) return false;
+    const token_end = token_start + token_len;
+    for (cell.emphasis_ranges) |range| {
+        if (range.start < token_end and range.end > token_start) return true;
+    }
+    return false;
+}
+
+fn patchMetaLabelColor(kind: zig_dif.SideBySideRowKind) [4]f32 {
+    return switch (kind) {
+        .hunk_header => colors.rgb(0xE0, 0xB8, 0x5A),
+        .context_gap => theme.COLOR_TEXT_SUBTLE,
+        .file_header => theme.COLOR_TEXT_MUTED,
+        .note => theme.COLOR_TEXT_SUBTLE,
+        .prelude => theme.COLOR_TEXT_MUTED,
+        .code => theme.COLOR_TEXT_MUTED,
     };
 }
 
@@ -2423,18 +2648,28 @@ fn transcriptBubbleHeight(state: *app_state.AppState, role: app_state.ChatRole, 
         author,
         body,
         image,
+        false,
         shouldRenderCodexFileReferenceBody(state, role, body, false),
     );
 }
 
 /// Measures the height needed for a transcript bubble.
-fn transcriptBubbleHeightGeneric(role: anytype, author: []const u8, body: []const u8, image: anytype, use_codex_file_reference_layout: bool) f32 {
+fn transcriptBubbleHeightGeneric(
+    role: anytype,
+    author: []const u8,
+    body: []const u8,
+    image: anytype,
+    muted_body: bool,
+    use_codex_file_reference_layout: bool,
+) f32 {
     const style = zgui.getStyle();
     const bubble_width = transcriptBubbleWidth(role);
     const inner_width = @max(bubble_width - (theme.TRANSCRIPT_BUBBLE_PADDING_X * 2.0), 64.0);
     const author_size = if (shouldShowBubbleAuthor(author)) zgui.calcTextSize(author, .{}) else .{ 0.0, 0.0 };
     const body_height = if (use_codex_file_reference_layout)
         codexFileReferenceBodyHeight(body, inner_width)
+    else if (!muted_body)
+        measureMarkdownTranscriptBodyHeight(body, inner_width)
     else
         zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
     const image_height: f32 = if (image != null) theme.clampf(inner_width * 0.46, theme.scaledUi(132.0), theme.scaledUi(220.0)) else 0.0;
@@ -2443,6 +2678,18 @@ fn transcriptBubbleHeightGeneric(role: anytype, author: []const u8, body: []cons
     const text_gap = if (shouldShowBubbleAuthor(author)) 2.0 + style.item_spacing[1] else 0.0;
     const border_allowance = 4.0;
     return @max(author_size[1] + body_height + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
+}
+
+fn measureMarkdownTranscriptBodyHeight(body: []const u8, inner_width: f32) f32 {
+    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
+        return zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
+    };
+    defer view.deinit(std.heap.page_allocator);
+
+    return chat_markdown.measureBodyHeight(view, inner_width, .{
+        .code_font = theme.terminal_font,
+        .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
+    });
 }
 
 fn transcriptBubbleWidth(role: anytype) f32 {

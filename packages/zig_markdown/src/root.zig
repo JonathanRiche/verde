@@ -18,6 +18,10 @@ pub fn parse(allocator: Allocator, source: []const u8) !Document {
     return parser.parseDocument(allocator, source);
 }
 
+pub fn fenceLanguage(info: []const u8) ?[]const u8 {
+    return parser.fenceLanguage(info);
+}
+
 test "parses paragraphs, blank lines, and fenced code blocks" {
     const allocator = std.testing.allocator;
     const source =
@@ -91,6 +95,11 @@ test "extracts the fenced code language from info text" {
         },
         else => unreachable,
     }
+}
+
+test "extracts the first fenced code language token" {
+    try std.testing.expectEqualStrings("zig", fenceLanguage("zig  async preview").?);
+    try std.testing.expect(fenceLanguage("   ") == null);
 }
 
 test "keeps soft wrapped paragraph lines together" {
