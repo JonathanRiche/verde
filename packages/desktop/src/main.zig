@@ -372,6 +372,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handlePendingThreadFollowupShortcut(state, &event.key)) {
                 return true;
             }
+            if (handleComposerFocusShortcut(state, &event.key)) {
+                return true;
+            }
             if (event.key.repeat) {
                 if (keyboard.transcriptScrollActionForEvent(&event.key)) |repeat_action| {
                     handleKeyboardAction(state, keyboard, repeat_action);
@@ -585,6 +588,23 @@ fn handleTranscriptSelectionShortcut(state: *AppState, event: *const sdl.Keyboar
     if (event.scancode != .a) return false;
     if (!isCtrlPressed()) return false;
     state.openCurrentTranscriptSelectionModal();
+    return true;
+}
+
+fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (state.composer_focused) return false;
+    if (!state.isTranscriptFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (event.scancode != .tab) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return false;
+    }
+
+    state.requestComposerFocus();
     return true;
 }
 
