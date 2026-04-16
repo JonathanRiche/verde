@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   build:
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -20,6 +21,9 @@ jobs:
           - macos-arm64
 
     runs-on: ${{ matrix.target == 'linux-x86_64' && 'ubuntu-24.04' || matrix.target == 'macos-x86_64' && 'macos-15-intel' || 'macos-14' }}
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
+      VERDE_CEF_CACHE_DIR: ${{ github.workspace }}/.cache/verde/cef-sdk
 
     steps:
       - uses: actions/checkout@v4
@@ -27,13 +31,23 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.cache/zig
+            .cache/zig-global
+            .zig-cache
+            packages/desktop/.zig-cache
             ~/.cargo/registry
             ~/.cargo/git
             vendor/fff/target
-          key: ${{ runner.os }}-${{ runner.arch }}-release-zig-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-release-build-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml', 'scripts/release/package-linux.sh', 'scripts/release/package-macos-app.sh') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-release-zig-cache-
+            ${{ runner.os }}-${{ runner.arch }}-release-build-cache-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/verde/cef-sdk
+          key: ${{ runner.os }}-${{ runner.arch }}-release-cef-sdk-${{ hashFiles('scripts/release/cef-common.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-release-cef-sdk-
 
       - name: Install Zig
         shell: bash
@@ -103,7 +117,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install tree-sitter
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -162,8 +176,6 @@ jobs:
       - name: Build release artifact
         shell: bash
         run: |
-          export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP:-/tmp}/zig-cache"
-
           case "${{ matrix.target }}" in
             linux-x86_64)
               PACKAGE_SCRIPT="scripts/release/package-linux.sh"
