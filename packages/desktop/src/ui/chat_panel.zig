@@ -1573,7 +1573,7 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
         .w = 0.0,
         .h = patch_height,
         .child_flags = .{ .border = true },
-        .window_flags = .{ .no_saved_settings = true },
+        .window_flags = .{ .no_saved_settings = true, .horizontal_scrollbar = true },
     });
     defer {
         zgui.endChild();
@@ -1599,10 +1599,11 @@ fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
     zgui.pushFont(terminal_font, terminal_font_size);
     defer zgui.popFont();
 
+    const content_width = patchViewContentWidth(view);
     for (view.rows, 0..) |row, row_index| {
         switch (row.kind) {
-            .code => renderPatchCodeRow(view, row, row_index),
-            else => renderPatchMetaRow(row, row_index),
+            .code => renderPatchCodeRow(view, row, row_index, content_width),
+            else => renderPatchMetaRow(row, row_index, content_width),
         }
     }
 
@@ -1610,7 +1611,7 @@ fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
 }
 
 // Renders one full-width metadata row inside the split diff card.
-fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize) void {
+fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize, content_width: f32) void {
     const row_height = switch (row.kind) {
         .file_header => theme.scaledUi(28.0),
         .hunk_header => theme.scaledUi(24.0),
@@ -1619,7 +1620,7 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize) void {
         .code => unreachable,
     };
     const origin = zgui.getCursorScreenPos();
-    const width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    const width = @max(@max(zgui.getContentRegionAvail()[0], content_width), 1.0);
     var id_buf: [64]u8 = undefined;
     const button_id = std.fmt.bufPrintZ(&id_buf, "##patch-meta-{d}", .{row_index}) catch return;
     _ = zgui.invisibleButton(button_id, .{ .w = width, .h = row_height });
@@ -1640,21 +1641,18 @@ fn renderPatchMetaRow(row: zig_dif.SideBySideRow, row_index: usize) void {
     });
     defer draw_list.popClipRect();
 
-    drawPatchTokenRun(
-        draw_list,
-        row.tokens,
-        patchDisplayLineKindForRow(row.kind),
-        origin[0] + theme.scaledUi(12.0),
-        origin[1] + (row_height - zgui.getTextLineHeight()) * 0.5,
-        row_max[0] - theme.scaledUi(12.0),
-    );
+    drawPatchTokenRun(.{
+        .kind = patchDisplayLineKindForRow(row.kind),
+        .text = "",
+        .tokens = row.tokens,
+    }, draw_list, origin[0] + theme.scaledUi(12.0), origin[1] + (row_height - zgui.getTextLineHeight()) * 0.5, row_max[0] - theme.scaledUi(12.0));
 }
 
 // Renders one side-by-side code row with independent left and right cells.
-fn renderPatchCodeRow(view: zig_dif.SideBySidePatchView, row: zig_dif.SideBySideRow, row_index: usize) void {
+fn renderPatchCodeRow(view: zig_dif.SideBySidePatchView, row: zig_dif.SideBySideRow, row_index: usize, content_width: f32) void {
     const row_height = theme.scaledUi(24.0);
     const origin = zgui.getCursorScreenPos();
-    const width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    const width = @max(@max(zgui.getContentRegionAvail()[0], content_width), 1.0);
     const gap = theme.scaledUi(12.0);
     const half_width = @max((width - gap) * 0.5, theme.scaledUi(120.0));
     var id_buf: [64]u8 = undefined;
@@ -1724,37 +1722,68 @@ fn drawPatchCell(
             number_text,
         );
 
-        drawPatchTokenRun(
-            draw_list,
-            value.tokens,
-            value.kind,
-            min[0] + pad_x + number_width + theme.scaledUi(10.0),
-            text_y,
-            max[0] - pad_x,
-        );
+        drawPatchTokenRun(value, draw_list, min[0] + pad_x + number_width + theme.scaledUi(10.0), text_y, max[0] - pad_x);
     }
 }
 
 // Draws one run of syntax tokens directly into the current draw list.
 fn drawPatchTokenRun(
+    cell: zig_dif.SideBySideCell,
     draw_list: anytype,
-    tokens: []const zig_dif.Token,
-    line_kind: zig_dif.DisplayLineKind,
     start_x: f32,
     start_y: f32,
     max_x: f32,
 ) void {
     var cursor_x = start_x;
-    for (tokens) |token| {
+    var text_offset: usize = 0;
+    for (cell.tokens) |token| {
         if (token.text.len == 0) continue;
         const width = zgui.calcTextSize(token.text, .{})[0];
         if (cursor_x >= max_x) break;
+        drawPatchInlineHighlights(draw_list, cell, token, text_offset, cursor_x, start_y);
         draw_list.addTextUnformatted(
             .{ cursor_x, start_y },
-            zgui.colorConvertFloat4ToU32(patchTokenColor(line_kind, token.kind)),
+            zgui.colorConvertFloat4ToU32(patchTokenColor(cell.kind, token.kind)),
             token.text,
         );
         cursor_x += width;
+        text_offset += token.text.len;
+    }
+}
+
+fn drawPatchInlineHighlights(
+    draw_list: anytype,
+    cell: zig_dif.SideBySideCell,
+    token: zig_dif.Token,
+    token_start: usize,
+    token_x: f32,
+    token_y: f32,
+) void {
+    if (cell.emphasis_ranges.len == 0) return;
+    const token_end = token_start + token.text.len;
+    const highlight_color = patchInlineHighlightColor(cell.kind);
+    if (highlight_color[3] <= 0.0) return;
+
+    for (cell.emphasis_ranges) |range| {
+        const overlap_start = @max(range.start, token_start);
+        const overlap_end = @min(range.end, token_end);
+        if (overlap_end <= overlap_start) continue;
+
+        const local_start = overlap_start - token_start;
+        const local_end = overlap_end - token_start;
+        const prefix_width = if (local_start > 0) zgui.calcTextSize(token.text[0..local_start], .{})[0] else 0.0;
+        const highlight_width = zgui.calcTextSize(token.text[local_start..local_end], .{})[0];
+        if (highlight_width <= 0.0) continue;
+
+        draw_list.addRectFilled(.{
+            .pmin = .{ token_x + prefix_width, token_y + theme.scaledUi(1.0) },
+            .pmax = .{
+                token_x + prefix_width + highlight_width,
+                token_y + zgui.getTextLineHeight() - theme.scaledUi(1.0),
+            },
+            .col = zgui.colorConvertFloat4ToU32(highlight_color),
+            .rounding = theme.scaledUi(3.0),
+        });
     }
 }
 
@@ -1777,6 +1806,14 @@ fn patchCellBackground(kind: ?zig_dif.DisplayLineKind) [4]f32 {
     };
 }
 
+fn patchInlineHighlightColor(kind: zig_dif.DisplayLineKind) [4]f32 {
+    return switch (kind) {
+        .addition => colors.rgba(52, 224, 148, 56),
+        .deletion => colors.rgba(255, 100, 100, 56),
+        else => colors.rgba(255, 255, 255, 0),
+    };
+}
+
 fn patchDisplayLineKindForRow(kind: zig_dif.SideBySideRowKind) zig_dif.DisplayLineKind {
     return switch (kind) {
         .prelude => .prelude,
@@ -1790,6 +1827,38 @@ fn patchDisplayLineKindForRow(kind: zig_dif.SideBySideRowKind) zig_dif.DisplayLi
 fn patchNumberColumnWidth(digits: usize) f32 {
     const width_per_digit = zgui.calcTextSize("0", .{})[0];
     return width_per_digit * @as(f32, @floatFromInt(@max(digits, 1)));
+}
+
+fn patchViewContentWidth(view: zig_dif.SideBySidePatchView) f32 {
+    const gap = theme.scaledUi(12.0);
+    const left_digits = maxLineNumberDigits(view.max_old_line);
+    const right_digits = maxLineNumberDigits(view.max_new_line);
+    var max_left: f32 = theme.scaledUi(240.0);
+    var max_right: f32 = theme.scaledUi(240.0);
+    for (view.rows) |row| {
+        switch (row.kind) {
+            .code => {
+                max_left = @max(max_left, patchCellContentWidth(row.left, left_digits));
+                max_right = @max(max_right, patchCellContentWidth(row.right, right_digits));
+            },
+            else => {
+                const width = patchMetaTokensWidth(row.tokens) + theme.scaledUi(24.0);
+                max_left = @max(max_left, width);
+            },
+        }
+    }
+    return max_left + gap + max_right;
+}
+
+fn patchCellContentWidth(cell: ?zig_dif.SideBySideCell, digits: usize) f32 {
+    const text = if (cell) |value| value.text else "";
+    return theme.scaledUi(20.0) + patchNumberColumnWidth(digits) + theme.scaledUi(10.0) + zgui.calcTextSize(text, .{})[0];
+}
+
+fn patchMetaTokensWidth(tokens: []const zig_dif.Token) f32 {
+    var width: f32 = 0.0;
+    for (tokens) |token| width += zgui.calcTextSize(token.text, .{})[0];
+    return width;
 }
 
 fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.TokenKind) [4]f32 {
