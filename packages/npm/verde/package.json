@@ -1,6 +1,6 @@
 {
   "name": "verde-app",
-  "version": "0.0.0-dev",
+  "version": "0.1.27",
   "description": "Developer-friendly launcher for the Verde desktop app",
   "license": "MIT",
   "homepage": "https://github.com/JonathanRiche/verde",
@@ -22,9 +22,9 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "verde-app-darwin-arm64": "0.0.0-dev",
-    "verde-app-darwin-x64": "0.0.0-dev",
-    "verde-app-linux-x64": "0.0.0-dev"
+    "verde-app-darwin-arm64": "0.1.27",
+    "verde-app-darwin-x64": "0.1.27",
+    "verde-app-linux-x64": "0.1.27"
   },
   "keywords": [
     "verde",

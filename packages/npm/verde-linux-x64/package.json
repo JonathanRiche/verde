@@ -1,6 +1,6 @@
 {
   "name": "verde-app-linux-x64",
-  "version": "0.0.0-dev",
+  "version": "0.1.27",
   "description": "Linux x64 runtime package for Verde",
   "license": "MIT",
   "homepage": "https://github.com/JonathanRiche/verde",
