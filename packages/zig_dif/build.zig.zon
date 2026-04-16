@@ -1,0 +1,10 @@
+.{
+    .name = .zig_dif,
+    .version = "0.0.0",
+    .fingerprint = 0x1dc3cd5f9ad986ae,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
