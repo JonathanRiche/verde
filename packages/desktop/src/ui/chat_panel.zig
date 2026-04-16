@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 
 const colors = @import("colors.zig");
@@ -1580,6 +1581,113 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
         zgui.popStyleVar(.{ .count = 2 });
     }
 
+    var view = zig_dif.buildPatchView(std.heap.page_allocator, patch) catch {
+        renderPendingDiffPatchFallback(patch);
+        return;
+    };
+    defer view.deinit();
+
+    if (renderPatchView(view)) return;
+    renderPendingDiffPatchFallback(patch);
+}
+
+fn renderPatchView(view: zig_dif.PatchView) bool {
+    if (view.lines.len == 0) return false;
+
+    const terminal_font = theme.terminal_font orelse zgui.getFont();
+    const terminal_font_size = if (theme.terminal_font != null) theme.terminal_font_size else zgui.getFontSize();
+    zgui.pushFont(terminal_font, terminal_font_size);
+    defer zgui.popFont();
+
+    for (view.lines) |line| {
+        renderPatchViewLine(view, line);
+    }
+
+    return true;
+}
+
+fn renderPatchViewLine(view: zig_dif.PatchView, line: zig_dif.DisplayLine) void {
+    const old_digits = maxLineNumberDigits(view.max_old_line);
+    const new_digits = maxLineNumberDigits(view.max_new_line);
+
+    renderPatchLineNumberCell(line.old_line, old_digits);
+    zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
+    renderPatchLineNumberCell(line.new_line, new_digits);
+    zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
+
+    if (line.prefix()) |prefix| {
+        const prefix_color = switch (line.kind) {
+            .addition => theme.COLOR_DIFF_ADD,
+            .deletion => theme.COLOR_DIFF_REMOVE,
+            else => theme.COLOR_TEXT_SUBTLE,
+        };
+        zgui.textColored(prefix_color, "{c}", .{prefix});
+    } else {
+        zgui.textColored(theme.COLOR_TEXT_SUBTLE, " ", .{});
+    }
+    zgui.sameLine(.{ .spacing = theme.scaledUi(10.0) });
+
+    renderPatchTokenLine(line);
+}
+
+fn renderPatchLineNumberCell(value: ?usize, digits: usize) void {
+    var buffer: [32]u8 = undefined;
+    const text = if (value) |line_number|
+        std.fmt.bufPrint(&buffer, "{d: >[1]}", .{ line_number, digits }) catch ""
+    else
+        std.fmt.bufPrint(&buffer, "{s: >[1]}", .{ "", digits }) catch "";
+    zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{text});
+}
+
+fn renderPatchTokenLine(line: zig_dif.DisplayLine) void {
+    if (line.tokens.len == 0) {
+        zgui.textColored(theme.COLOR_TEXT_MUTED, " ", .{});
+        return;
+    }
+
+    for (line.tokens, 0..) |token, index| {
+        if (index != 0) zgui.sameLine(.{ .spacing = 0.0 });
+        zgui.textColored(patchTokenColor(line.kind, token.kind), "{s}", .{token.text});
+    }
+}
+
+fn patchTokenColor(line_kind: zig_dif.DisplayLineKind, token_kind: zig_dif.TokenKind) [4]f32 {
+    if (line_kind == .hunk_header) return theme.COLOR_YELLOW;
+    if (line_kind == .note) return theme.COLOR_TEXT_SUBTLE;
+    if (line_kind == .file_header or line_kind == .prelude) return theme.COLOR_TEXT_MUTED;
+
+    const base = switch (line_kind) {
+        .addition => theme.COLOR_DIFF_ADD,
+        .deletion => theme.COLOR_DIFF_REMOVE,
+        else => theme.COLOR_TEXT_MUTED,
+    };
+
+    return switch (token_kind) {
+        .plain => base,
+        .comment => theme.COLOR_TEXT_SUBTLE,
+        .string => theme.lighten(theme.COLOR_GREEN, 0.08),
+        .number => theme.lighten(theme.COLOR_WHITE, 0.02),
+        .keyword => theme.COLOR_YELLOW,
+        .type_name => theme.lighten(theme.COLOR_WHITE, 0.12),
+        .function_name => theme.COLOR_WHITE,
+        .operator, .punctuation => base,
+    };
+}
+
+fn maxLineNumberDigits(value: usize) usize {
+    if (value == 0) return 1;
+    return std.math.log10_int(value) + 1;
+}
+
+fn renderPatchTextLine(color: [4]f32, line: []const u8) void {
+    if (line.len == 0) {
+        zgui.textColored(color, " ", .{});
+        return;
+    }
+    zgui.textColored(color, "{s}", .{line});
+}
+
+fn renderPendingDiffPatchFallback(patch: []const u8) void {
     var lines = std.mem.tokenizeScalar(u8, patch, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) {
