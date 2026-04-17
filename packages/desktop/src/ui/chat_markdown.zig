@@ -12,6 +12,9 @@ const Allocator = std.mem.Allocator;
 pub const RenderOptions = struct {
     heading_font: ?zgui.Font = null,
     heading_font_size: ?f32 = null,
+    bold_font: ?zgui.Font = null,
+    italic_font: ?zgui.Font = null,
+    bold_italic_font: ?zgui.Font = null,
     code_font: ?zgui.Font = null,
     code_font_size: ?f32 = null,
 };
@@ -1036,13 +1039,32 @@ fn textBlockFontSpecWithOptions(style: TextStyle, options: RenderOptions) FontSp
 }
 
 fn inlineFontSpec(block_style: TextStyle, inline_style: InlineStyle, options: RenderOptions) FontSpec {
+    const base = textBlockFontSpecWithOptions(block_style, options);
     if (inline_style.code) {
         return .{
             .font = options.code_font,
             .size = options.code_font_size,
         };
     }
-    return textBlockFontSpecWithOptions(block_style, options);
+    if (inline_style.strong and inline_style.emphasis) {
+        return .{
+            .font = options.bold_italic_font orelse options.bold_font orelse options.italic_font,
+            .size = base.size,
+        };
+    }
+    if (inline_style.strong) {
+        return .{
+            .font = options.bold_font,
+            .size = base.size,
+        };
+    }
+    if (inline_style.emphasis) {
+        return .{
+            .font = options.italic_font,
+            .size = base.size,
+        };
+    }
+    return base;
 }
 
 fn lineHeightForSpec(spec: FontSpec) f32 {
