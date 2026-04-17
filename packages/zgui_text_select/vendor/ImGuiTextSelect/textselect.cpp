@@ -161,7 +161,7 @@ static inline const char* CalcWordWrapNextLineStartA(const char* text, const cha
 // result.size() is never 0.
 static ImVector<std::string_view> wrapText(std::string_view text, float wrapWidth) {
     ImFont* font = ImGui::GetCurrentContext()->Font;
-    const float size = ImGui::GetFontBaked()->Size;
+    const float size = ImGui::GetFontSize();
 
     ImVector<std::string_view> result;
 
