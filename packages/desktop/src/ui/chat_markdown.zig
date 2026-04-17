@@ -29,11 +29,6 @@ pub const SelectionRange = struct {
     focus: SelectionPoint,
 };
 
-pub const SelectionBounds = struct {
-    first: SelectionPoint,
-    last: SelectionPoint,
-};
-
 pub const SelectionRenderOutput = struct {
     hovered: bool = false,
     hovered_point: ?SelectionPoint = null,
@@ -280,43 +275,6 @@ pub fn renderBody(view: BodyView, options: RenderOptions) void {
 
         previous = block;
     }
-}
-
-pub fn measureSelectableBounds(allocator: Allocator, view: BodyView, options: RenderOptions) ?SelectionBounds {
-    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
-
-    var output: SelectionRenderOutput = .{};
-    var global_line_index: usize = 0;
-    var previous: ?BlockView = null;
-
-    for (view.blocks) |block| {
-        if (previous) |prior| {
-            if (prior.kind() != .blank and block.kind() != .blank) {
-                noteSelectableLineBounds(&output, global_line_index, 0);
-                global_line_index += 1;
-            }
-        }
-
-        switch (block) {
-            .blank => {
-                noteSelectableLineBounds(&output, global_line_index, 0);
-                global_line_index += 1;
-            },
-            .text => |text_block| {
-                measureSelectableTextBlockBounds(allocator, &output, &global_line_index, text_block, available_width, options) catch return null;
-            },
-            .fenced_code, .thematic_break => {},
-        }
-
-        previous = block;
-    }
-
-    const first = output.first_point orelse return null;
-    const last = output.last_point orelse return null;
-    return .{
-        .first = first,
-        .last = last,
-    };
 }
 
 /// Measures a parsed markdown body using the current font metrics and code font options.
@@ -1417,25 +1375,6 @@ fn renderSelectableBlankLine(
         }
     }
     zgui.dummy(.{ .w = 0.0, .h = height });
-}
-
-fn measureSelectableTextBlockBounds(
-    allocator: Allocator,
-    output: *SelectionRenderOutput,
-    global_line_index: *usize,
-    block: TextBlockView,
-    available_width: f32,
-    options: RenderOptions,
-) !void {
-    const indent = indentWidth(block.indent);
-    const width = @max(available_width - indent, 1.0);
-    const lines = try buildSelectableTextLines(allocator, block, width, options);
-    defer deinitSelectableLines(allocator, lines);
-
-    for (lines) |line| {
-        noteSelectableLineBounds(output, global_line_index.*, line.total_columns);
-        global_line_index.* += 1;
-    }
 }
 
 fn renderSelectableTextBlock(
