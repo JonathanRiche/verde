@@ -19,6 +19,31 @@ pub const RenderOptions = struct {
     code_font_size: ?f32 = null,
 };
 
+pub const SelectionPoint = struct {
+    line_index: usize,
+    column: usize,
+};
+
+pub const SelectionRange = struct {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+};
+
+pub const SelectionRenderOutput = struct {
+    hovered: bool = false,
+    hovered_point: ?SelectionPoint = null,
+    first_point: ?SelectionPoint = null,
+    last_point: ?SelectionPoint = null,
+    copied_text: ?[:0]u8 = null,
+
+    pub fn deinit(self: *SelectionRenderOutput, allocator: Allocator) void {
+        if (self.copied_text) |text| {
+            allocator.free(text);
+            self.copied_text = null;
+        }
+    }
+};
+
 pub const TextStyle = enum {
     paragraph,
     heading_1,
@@ -276,6 +301,93 @@ pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOp
     }
 
     return total;
+}
+
+pub fn renderSelectableBody(
+    allocator: Allocator,
+    view: BodyView,
+    options: RenderOptions,
+    selection: ?SelectionRange,
+    copy_selection: bool,
+) SelectionRenderOutput {
+    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    const mouse_pos = zgui.getMousePos();
+    const hovered = zgui.isWindowHovered(.{});
+    const ordered_selection = if (selection) |active| orderSelection(active) else null;
+
+    var output: SelectionRenderOutput = .{ .hovered = hovered };
+    var copy_builder = std.ArrayList(u8).empty;
+    defer if (copy_selection) copy_builder.deinit(allocator);
+    var copied_any_line = false;
+    var global_line_index: usize = 0;
+    var previous: ?BlockView = null;
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap() else blockGap();
+                renderSelectableBlankLine(
+                    &output,
+                    ordered_selection,
+                    copy_selection,
+                    &copy_builder,
+                    &copied_any_line,
+                    mouse_pos,
+                    hovered,
+                    global_line_index,
+                    gap_height,
+                );
+                global_line_index += 1;
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                renderSelectableBlankLine(
+                    &output,
+                    ordered_selection,
+                    copy_selection,
+                    &copy_builder,
+                    &copied_any_line,
+                    mouse_pos,
+                    hovered,
+                    global_line_index,
+                    blankBlockHeight(),
+                );
+                global_line_index += 1;
+            },
+            .text => |text_block| {
+                renderSelectableTextBlock(
+                    allocator,
+                    &output,
+                    ordered_selection,
+                    copy_selection,
+                    &copy_builder,
+                    &copied_any_line,
+                    mouse_pos,
+                    hovered,
+                    &global_line_index,
+                    text_block,
+                    available_width,
+                    options,
+                ) catch renderTextBlock(text_block, available_width, options);
+            },
+            .fenced_code => |code_block| {
+                renderFencedCodeBlock(code_block, available_width, options);
+            },
+            .thematic_break => |rule| {
+                renderThematicBreakBlock(rule, available_width);
+            },
+        }
+
+        previous = block;
+    }
+
+    if (copy_selection and copied_any_line) {
+        output.copied_text = allocator.dupeZ(u8, copy_builder.items) catch null;
+    }
+
+    return output;
 }
 
 fn appendMarkdownBlocks(
@@ -914,6 +1026,396 @@ fn renderTextBlockLayout(
         .draw_list = draw_list,
         .start = start,
     }, RenderContext.onStep);
+}
+
+const OrderedSelection = struct {
+    start: SelectionPoint,
+    end: SelectionPoint,
+};
+
+const SelectableLineChunk = struct {
+    text: []const u8,
+    block_style: TextStyle,
+    inline_style: InlineStyle,
+    font_spec: FontSpec,
+    x: f32,
+    width: f32,
+    line_height: f32,
+    start_column: usize,
+    end_column: usize,
+};
+
+const SelectableLine = struct {
+    y: f32,
+    height: f32,
+    total_columns: usize,
+    chunks: []SelectableLineChunk,
+};
+
+fn orderSelection(selection: SelectionRange) OrderedSelection {
+    if (selectionPointLessThan(selection.focus, selection.anchor)) {
+        return .{
+            .start = selection.focus,
+            .end = selection.anchor,
+        };
+    }
+    return .{
+        .start = selection.anchor,
+        .end = selection.focus,
+    };
+}
+
+fn selectionPointLessThan(lhs: SelectionPoint, rhs: SelectionPoint) bool {
+    return lhs.line_index < rhs.line_index or
+        (lhs.line_index == rhs.line_index and lhs.column < rhs.column);
+}
+
+fn selectionColumnsForLine(selection: OrderedSelection, line_index: usize, total_columns: usize) ?struct { start: usize, end: usize } {
+    if (line_index < selection.start.line_index or line_index > selection.end.line_index) return null;
+    return .{
+        .start = if (line_index == selection.start.line_index) selection.start.column else 0,
+        .end = if (line_index == selection.end.line_index) selection.end.column else total_columns,
+    };
+}
+
+fn countColumns(text: []const u8) usize {
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return text.len;
+        index += width;
+        columns += 1;
+    }
+    return columns;
+}
+
+fn byteOffsetForColumn(text: []const u8, column: usize) usize {
+    var index: usize = 0;
+    var current: usize = 0;
+    while (index < text.len and current < column) {
+        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return text.len;
+        index += width;
+        current += 1;
+    }
+    return index;
+}
+
+fn sliceForColumns(text: []const u8, start_column: usize, end_column: usize) []const u8 {
+    const start = byteOffsetForColumn(text, start_column);
+    const end = byteOffsetForColumn(text, end_column);
+    return text[start..@min(end, text.len)];
+}
+
+fn textWidthForColumns(spec: FontSpec, text: []const u8, column: usize) f32 {
+    return textWidthForSpec(spec, text[0..byteOffsetForColumn(text, column)]);
+}
+
+fn columnForX(spec: FontSpec, text: []const u8, x: f32) usize {
+    if (x <= 0.0) return 0;
+    const total_columns = countColumns(text);
+    if (total_columns == 0) return 0;
+
+    var low: usize = 0;
+    var high: usize = total_columns;
+    while (low < high) {
+        const mid = (low + high + 1) / 2;
+        if (textWidthForColumns(spec, text, mid) <= x) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    if (low >= total_columns) return total_columns;
+
+    const current_width = textWidthForColumns(spec, text, low);
+    const next_width = textWidthForColumns(spec, text, low + 1);
+    return if (@abs(x - current_width) <= @abs(next_width - x)) low else low + 1;
+}
+
+fn deinitSelectableLines(allocator: Allocator, lines: []SelectableLine) void {
+    for (lines) |line| allocator.free(line.chunks);
+    allocator.free(lines);
+}
+
+fn buildSelectableTextLines(
+    allocator: Allocator,
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) ![]SelectableLine {
+    const Builder = struct {
+        allocator: Allocator,
+        lines: std.ArrayList(SelectableLine) = .empty,
+        current_chunks: std.ArrayList(SelectableLineChunk) = .empty,
+        current_y: ?f32 = null,
+        current_height: f32 = 0.0,
+        current_columns: usize = 0,
+        failed: ?Allocator.Error = null,
+
+        fn finalize(self: *@This()) void {
+            if (self.failed != null) return;
+            const current_y = self.current_y orelse return;
+            const owned_chunks = self.current_chunks.toOwnedSlice(self.allocator) catch {
+                self.failed = error.OutOfMemory;
+                return;
+            };
+            self.lines.append(self.allocator, .{
+                .y = current_y,
+                .height = self.current_height,
+                .total_columns = self.current_columns,
+                .chunks = owned_chunks,
+            }) catch {
+                self.allocator.free(owned_chunks);
+                self.failed = error.OutOfMemory;
+                return;
+            };
+            self.current_y = null;
+            self.current_height = 0.0;
+            self.current_columns = 0;
+            self.current_chunks = .empty;
+        }
+
+        fn onStep(self: *@This(), step: TextBlockLayoutStep) void {
+            if (self.failed != null) return;
+            if (self.current_y) |current_y| {
+                if (step.y != current_y) {
+                    self.finalize();
+                    if (self.failed != null) return;
+                }
+            }
+            if (self.current_y == null) {
+                self.current_y = step.y;
+                self.current_height = step.line_height;
+                self.current_columns = 0;
+            }
+
+            const chunk_columns = countColumns(step.text);
+            self.current_chunks.append(self.allocator, .{
+                .text = step.text,
+                .block_style = step.block_style,
+                .inline_style = step.inline_style,
+                .font_spec = step.font_spec,
+                .x = step.x,
+                .width = step.width,
+                .line_height = step.line_height,
+                .start_column = self.current_columns,
+                .end_column = self.current_columns + chunk_columns,
+            }) catch {
+                self.failed = error.OutOfMemory;
+                return;
+            };
+            self.current_height = @max(self.current_height, step.line_height);
+            self.current_columns += chunk_columns;
+        }
+    };
+
+    var builder: Builder = .{ .allocator = allocator };
+    errdefer {
+        builder.current_chunks.deinit(allocator);
+        deinitSelectableLines(allocator, builder.lines.items);
+        builder.lines.deinit(allocator);
+    }
+
+    _ = walkTextBlockLayout(block, available_width, options, &builder, Builder.onStep);
+    if (builder.failed) |err| return err;
+    builder.finalize();
+    if (builder.failed) |err| return err;
+
+    if (builder.lines.items.len == 0) {
+        const base_line_height = lineHeightForSpec(textBlockFontSpecWithOptions(block.style, options));
+        try builder.lines.append(allocator, .{
+            .y = 0.0,
+            .height = base_line_height,
+            .total_columns = 0,
+            .chunks = try allocator.alloc(SelectableLineChunk, 0),
+        });
+    }
+
+    return builder.lines.toOwnedSlice(allocator);
+}
+
+fn noteSelectableLineBounds(output: *SelectionRenderOutput, line_index: usize, total_columns: usize) void {
+    if (output.first_point == null) {
+        output.first_point = .{ .line_index = line_index, .column = 0 };
+    }
+    output.last_point = .{ .line_index = line_index, .column = total_columns };
+}
+
+fn hoveredColumnForLine(line: SelectableLine, local_x: f32) usize {
+    if (line.chunks.len == 0) return 0;
+
+    const x = @max(local_x, 0.0);
+    var previous_end_x: ?f32 = null;
+    var previous_end_column: usize = 0;
+    for (line.chunks) |chunk| {
+        if (x <= chunk.x) {
+            if (previous_end_x) |end_x| {
+                return if (@abs(x - end_x) <= @abs(chunk.x - x)) previous_end_column else chunk.start_column;
+            }
+            return chunk.start_column;
+        }
+
+        const chunk_end_x = chunk.x + chunk.width;
+        if (x <= chunk_end_x) {
+            return chunk.start_column + columnForX(chunk.font_spec, chunk.text, x - chunk.x);
+        }
+
+        previous_end_x = chunk_end_x;
+        previous_end_column = chunk.end_column;
+    }
+    return line.total_columns;
+}
+
+fn renderSelectableLine(
+    draw_list: anytype,
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    start: [2]f32,
+    line_index: usize,
+    line: SelectableLine,
+) void {
+    noteSelectableLineBounds(output, line_index, line.total_columns);
+
+    const top = start[1] + line.y;
+    const bottom = top + line.height;
+    if (hovered and output.hovered_point == null and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
+        output.hovered_point = .{
+            .line_index = line_index,
+            .column = hoveredColumnForLine(line, mouse_pos[0] - start[0]),
+        };
+    }
+
+    if (selection) |ordered| {
+        if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
+            if (columns.start != columns.end) {
+                const selection_col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72));
+                for (line.chunks) |chunk| {
+                    const chunk_start = @max(columns.start, chunk.start_column);
+                    const chunk_end = @min(columns.end, chunk.end_column);
+                    if (chunk_start >= chunk_end) continue;
+
+                    const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
+                    const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
+                    if (x1 > x0) {
+                        draw_list.addRectFilled(.{
+                            .pmin = .{ x0, top },
+                            .pmax = .{ x1, bottom },
+                            .col = selection_col,
+                            .rounding = 2.0,
+                        });
+                    }
+                }
+            }
+
+            if (copy_selection) {
+                if (copied_any_line.*) {
+                    copy_builder.append(copy_builder.allocator, '\n') catch {};
+                } else {
+                    copied_any_line.* = true;
+                }
+                for (line.chunks) |chunk| {
+                    const chunk_start = @max(columns.start, chunk.start_column);
+                    const chunk_end = @min(columns.end, chunk.end_column);
+                    if (chunk_start >= chunk_end) continue;
+                    copy_builder.appendSlice(copy_builder.allocator, sliceForColumns(chunk.text, chunk_start - chunk.start_column, chunk_end - chunk.start_column)) catch {};
+                }
+            }
+        }
+    }
+
+    for (line.chunks) |chunk| {
+        renderStyledChunk(
+            draw_list,
+            .{ start[0] + chunk.x, top },
+            chunk.text,
+            chunk.block_style,
+            chunk.inline_style,
+            chunk.font_spec,
+            chunk.width,
+            chunk.line_height,
+        );
+    }
+}
+
+fn renderSelectableBlankLine(
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    line_index: usize,
+    height: f32,
+) void {
+    const start = zgui.getCursorScreenPos();
+    noteSelectableLineBounds(output, line_index, 0);
+    if (hovered and output.hovered_point == null and mouse_pos[1] >= start[1] and mouse_pos[1] <= start[1] + height) {
+        output.hovered_point = .{ .line_index = line_index, .column = 0 };
+    }
+    if (copy_selection and selection) |ordered| {
+        if (selectionColumnsForLine(ordered, line_index, 0) != null) {
+            if (copied_any_line.*) {
+                copy_builder.append(copy_builder.allocator, '\n') catch {};
+            } else {
+                copied_any_line.* = true;
+            }
+        }
+    }
+    zgui.dummy(.{ .w = 0.0, .h = height });
+}
+
+fn renderSelectableTextBlock(
+    allocator: Allocator,
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    global_line_index: *usize,
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) !void {
+    const indent = indentWidth(block.indent);
+    if (indent > 0.0) {
+        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
+    }
+
+    const start = zgui.getCursorScreenPos();
+    const width = @max(available_width - indent, 1.0);
+    const draw_list = zgui.getWindowDrawList();
+    const lines = try buildSelectableTextLines(allocator, block, width, options);
+    defer deinitSelectableLines(allocator, lines);
+
+    var height: f32 = 0.0;
+    for (lines, 0..) |line, index| {
+        renderSelectableLine(
+            draw_list,
+            output,
+            selection,
+            copy_selection,
+            copy_builder,
+            copied_any_line,
+            mouse_pos,
+            hovered,
+            start,
+            global_line_index.* + index,
+            line,
+        );
+        height = @max(height, line.y + line.height);
+    }
+
+    zgui.dummy(.{ .w = width, .h = height });
+    global_line_index.* += lines.len;
 }
 
 fn renderStyledChunk(

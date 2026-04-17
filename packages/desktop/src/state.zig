@@ -2,6 +2,7 @@ const std = @import("std");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const zgui_text_select = @import("zgui_text_select");
+const chat_markdown = @import("ui/chat_markdown.zig");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
 const browser_inspector = @import("browser/inspector.zig");
@@ -871,6 +872,12 @@ pub const AppState = struct {
     transcript_project_index: ?usize,
     transcript_thread_index: ?usize,
     transcript_selection_text: ?[:0]u8,
+    transcript_markdown_selection_project_index: ?usize,
+    transcript_markdown_selection_thread_index: ?usize,
+    transcript_markdown_selection_message_index: ?usize,
+    transcript_markdown_selection_anchor: ?chat_markdown.SelectionPoint,
+    transcript_markdown_selection_focus: ?chat_markdown.SelectionPoint,
+    transcript_markdown_selection_dragging: bool,
     transcript_selectable_project_index: ?usize,
     transcript_selectable_thread_index: ?usize,
     transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
@@ -950,6 +957,12 @@ pub const AppState = struct {
             .transcript_project_index = null,
             .transcript_thread_index = null,
             .transcript_selection_text = null,
+            .transcript_markdown_selection_project_index = null,
+            .transcript_markdown_selection_thread_index = null,
+            .transcript_markdown_selection_message_index = null,
+            .transcript_markdown_selection_anchor = null,
+            .transcript_markdown_selection_focus = null,
+            .transcript_markdown_selection_dragging = false,
             .transcript_selectable_project_index = null,
             .transcript_selectable_thread_index = null,
             .transcript_selectable_entries = .empty,
@@ -2661,6 +2674,95 @@ pub const AppState = struct {
 
     pub fn isTranscriptFocused(self: *const AppState) bool {
         return self.transcript_focused and !self.composer_focused and !self.terminal_focused and !self.browser_pane_focused;
+    }
+
+    fn ensureTranscriptMarkdownSelectionCurrent(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.clearTranscriptMarkdownSelection();
+            return;
+        }
+
+        const project_index = self.selected_project_index;
+        const thread_index = self.currentProject().selected_thread_index;
+        if (self.transcript_markdown_selection_project_index == project_index and
+            self.transcript_markdown_selection_thread_index == thread_index)
+        {
+            return;
+        }
+
+        self.clearTranscriptMarkdownSelection();
+    }
+
+    pub fn transcriptMarkdownSelectionForMessage(self: *AppState, message_index: usize) ?chat_markdown.SelectionRange {
+        self.ensureTranscriptMarkdownSelectionCurrent();
+        if (self.transcript_markdown_selection_message_index != message_index) return null;
+        const anchor = self.transcript_markdown_selection_anchor orelse return null;
+        const focus = self.transcript_markdown_selection_focus orelse return null;
+        return .{
+            .anchor = anchor,
+            .focus = focus,
+        };
+    }
+
+    pub fn transcriptMarkdownSelectionMessageIndex(self: *AppState) ?usize {
+        self.ensureTranscriptMarkdownSelectionCurrent();
+        return self.transcript_markdown_selection_message_index;
+    }
+
+    pub fn transcriptMarkdownSelectionDragging(self: *AppState) bool {
+        self.ensureTranscriptMarkdownSelectionCurrent();
+        return self.transcript_markdown_selection_dragging;
+    }
+
+    pub fn transcriptMarkdownSelectionActiveForMessage(self: *AppState, message_index: usize) bool {
+        self.ensureTranscriptMarkdownSelectionCurrent();
+        return self.transcript_markdown_selection_message_index == message_index and
+            self.transcript_markdown_selection_anchor != null and
+            self.transcript_markdown_selection_focus != null;
+    }
+
+    pub fn beginTranscriptMarkdownSelection(self: *AppState, message_index: usize, point: chat_markdown.SelectionPoint) void {
+        if (self.projects.items.len == 0) return;
+        self.transcript_markdown_selection_project_index = self.selected_project_index;
+        self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
+        self.transcript_markdown_selection_message_index = message_index;
+        self.transcript_markdown_selection_anchor = point;
+        self.transcript_markdown_selection_focus = point;
+        self.transcript_markdown_selection_dragging = true;
+    }
+
+    pub fn updateTranscriptMarkdownSelection(self: *AppState, point: chat_markdown.SelectionPoint) void {
+        self.ensureTranscriptMarkdownSelectionCurrent();
+        if (self.transcript_markdown_selection_message_index == null or self.transcript_markdown_selection_anchor == null) return;
+        self.transcript_markdown_selection_focus = point;
+    }
+
+    pub fn endTranscriptMarkdownSelection(self: *AppState) void {
+        self.transcript_markdown_selection_dragging = false;
+    }
+
+    pub fn selectAllTranscriptMarkdownSelection(
+        self: *AppState,
+        message_index: usize,
+        first: chat_markdown.SelectionPoint,
+        last: chat_markdown.SelectionPoint,
+    ) void {
+        if (self.projects.items.len == 0) return;
+        self.transcript_markdown_selection_project_index = self.selected_project_index;
+        self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
+        self.transcript_markdown_selection_message_index = message_index;
+        self.transcript_markdown_selection_anchor = first;
+        self.transcript_markdown_selection_focus = last;
+        self.transcript_markdown_selection_dragging = false;
+    }
+
+    pub fn clearTranscriptMarkdownSelection(self: *AppState) void {
+        self.transcript_markdown_selection_project_index = null;
+        self.transcript_markdown_selection_thread_index = null;
+        self.transcript_markdown_selection_message_index = null;
+        self.transcript_markdown_selection_anchor = null;
+        self.transcript_markdown_selection_focus = null;
+        self.transcript_markdown_selection_dragging = false;
     }
 
     pub fn transcriptBodyTextSelector(self: *AppState, message_index: usize, body: []const u8) ?*zgui_text_select.TextSelect {
@@ -4657,6 +4759,7 @@ pub const AppState = struct {
         self.clearImageTextureCache();
         self.closeImageModal();
         self.closeTranscriptSelectionModal();
+        self.clearTranscriptMarkdownSelection();
         self.clearTranscriptSelectableEntries();
         for (self.projects.items) |*project| {
             project.deinit(self.allocator);

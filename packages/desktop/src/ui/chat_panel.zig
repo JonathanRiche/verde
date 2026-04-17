@@ -784,6 +784,9 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     zgui.endChild();
     zgui.popStyleVar(.{ .count = 1 });
     state.transcript_focused = zgui.isWindowFocused(.{ .child_windows = true });
+    if (!zgui.isMouseDown(.left)) {
+        state.endTranscriptMarkdownSelection();
+    }
     zgui.dummy(.{ .w = 0.0, .h = 0.0 });
 
     if (applyPendingTranscriptScroll(state, height)) {
@@ -1071,6 +1074,9 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role:
     }
 
     if (message_index) |index| {
+        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, body)) {
+            return;
+        }
         if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
             if (renderSelectablePlainTranscriptBody(state, index, body, muted_body)) {
                 return;
@@ -1147,6 +1153,90 @@ fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index
     }
 
     selector.update();
+    return true;
+}
+
+fn renderSelectableMarkdownTranscriptBody(state: *app_state.AppState, message_index: usize, body: []const u8) bool {
+    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return false;
+    defer view.deinit(std.heap.page_allocator);
+
+    const selection = state.transcriptMarkdownSelectionForMessage(message_index);
+    const selection_active = state.transcriptMarkdownSelectionActiveForMessage(message_index);
+    const ctrl_pressed = zgui.isKeyDown(.left_ctrl) or zgui.isKeyDown(.right_ctrl);
+    const copy_selection = selection_active and ctrl_pressed and zgui.isKeyPressed(.c, false);
+    const select_all_requested = ctrl_pressed and zgui.isKeyPressed(.a, false);
+    const style = zgui.getStyle();
+
+    zgui.pushIntId(@intCast(message_index + 1));
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ style.item_spacing[0], 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+    defer {
+        zgui.popStyleColor(.{ .count = 1 });
+        zgui.popStyleVar(.{ .count = 2 });
+        zgui.popId();
+    }
+
+    _ = zgui.beginChild("##selectable-markdown-body", .{
+        .w = 0.0,
+        .h = 0.0,
+        .child_flags = .{
+            .auto_resize_y = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+            .no_saved_settings = true,
+            .no_move = true,
+        },
+    });
+    defer zgui.endChild();
+
+    var result = chat_markdown.renderSelectableBody(
+        std.heap.page_allocator,
+        view,
+        .{
+            .heading_font = theme.heading_font,
+            .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
+            .bold_font = theme.bold_font,
+            .italic_font = theme.italic_font,
+            .bold_italic_font = theme.bold_italic_font,
+            .code_font = theme.terminal_font,
+            .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
+        },
+        selection,
+        copy_selection,
+    );
+    defer result.deinit(std.heap.page_allocator);
+
+    if (result.hovered) {
+        zgui.setMouseCursor(.text_input);
+    }
+    if (zgui.isMouseClicked(.left)) {
+        if (result.hovered_point) |point| {
+            state.beginTranscriptMarkdownSelection(message_index, point);
+        } else if (result.hovered) {
+            state.clearTranscriptMarkdownSelection();
+        }
+    } else if (selection_active and state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
+        if (result.hovered_point) |point| {
+            state.updateTranscriptMarkdownSelection(point);
+        }
+    }
+
+    if (select_all_requested and (selection_active or result.hovered)) {
+        if (result.first_point) |first| {
+            if (result.last_point) |last| {
+                state.selectAllTranscriptMarkdownSelection(message_index, first, last);
+            }
+        }
+    }
+    if (copy_selection) {
+        if (result.copied_text) |copied| {
+            zgui.setClipboardText(copied);
+        }
+    }
+
     return true;
 }
 
