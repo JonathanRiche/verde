@@ -780,61 +780,109 @@ fn renderThematicBreakBlock(rule: ThematicBreakView, available_width: f32) void 
     zgui.dummy(.{ .w = width, .h = thematicBreakHeight() });
 }
 
-fn measureTextBlockLayout(
+const TextBlockLayoutState = struct {
+    base_line_height: f32,
+    x: f32,
+    y: f32,
+    line_height: f32,
+    line_start: bool,
+
+    fn init(base_line_height: f32) TextBlockLayoutState {
+        return .{
+            .base_line_height = base_line_height,
+            .x = 0.0,
+            .y = 0.0,
+            .line_height = base_line_height,
+            .line_start = true,
+        };
+    }
+
+    fn advanceLine(self: *TextBlockLayoutState) void {
+        self.y += self.line_height;
+        self.x = 0.0;
+        self.line_height = self.base_line_height;
+        self.line_start = true;
+    }
+
+    fn totalHeight(self: TextBlockLayoutState) f32 {
+        return self.y + self.line_height;
+    }
+};
+
+const TextBlockLayoutStep = struct {
+    text: []const u8,
+    block_style: TextStyle,
+    inline_style: InlineStyle,
+    font_spec: FontSpec,
+    x: f32,
+    y: f32,
+    width: f32,
+    line_height: f32,
+};
+
+fn walkTextBlockLayout(
     block: TextBlockView,
     available_width: f32,
     options: RenderOptions,
+    context: anytype,
+    comptime on_step: fn (@TypeOf(context), TextBlockLayoutStep) void,
 ) f32 {
     const width = @max(available_width, 1.0);
     const block_font = textBlockFontSpecWithOptions(block.style, options);
-    const base_line_height = lineHeightForSpec(block_font);
-    var line_height = base_line_height;
-    var x: f32 = 0.0;
-    var y: f32 = 0.0;
-    var line_start = true;
+    var state = TextBlockLayoutState.init(lineHeightForSpec(block_font));
 
     for (block.runs) |run| {
         switch (run) {
-            .line_break => {
-                y += line_height;
-                x = 0.0;
-                line_height = base_line_height;
-                line_start = true;
-            },
+            .line_break => state.advanceLine(),
             .text => |text_run| {
+                const spec = inlineFontSpec(block.style, text_run.style, options);
+                const chunk_line_height = lineHeightForSpec(spec);
                 const slice = block.text[text_run.start..text_run.end];
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const spec = inlineFontSpec(block.style, text_run.style, options);
                     const chunk_width = textWidthForSpec(spec, chunk.text);
-                    const chunk_line_height = lineHeightForSpec(spec);
 
-                    if (chunk.is_whitespace and line_start) {
+                    if (chunk.is_whitespace and state.line_start) {
                         continue;
                     }
 
-                    if (!chunk.is_whitespace and !line_start and x + chunk_width > width) {
-                        y += line_height;
-                        x = 0.0;
-                        line_height = base_line_height;
-                        line_start = true;
-                    } else if (chunk.is_whitespace and x + chunk_width > width) {
-                        y += line_height;
-                        x = 0.0;
-                        line_height = base_line_height;
-                        line_start = true;
+                    if (!chunk.is_whitespace and !state.line_start and state.x + chunk_width > width) {
+                        state.advanceLine();
+                    } else if (chunk.is_whitespace and state.x + chunk_width > width) {
+                        state.advanceLine();
                         continue;
                     }
 
-                    x += chunk_width;
-                    line_height = @max(line_height, chunk_line_height);
-                    line_start = false;
+                    on_step(context, .{
+                        .text = chunk.text,
+                        .block_style = block.style,
+                        .inline_style = text_run.style,
+                        .font_spec = spec,
+                        .x = state.x,
+                        .y = state.y,
+                        .width = chunk_width,
+                        .line_height = chunk_line_height,
+                    });
+
+                    state.x += chunk_width;
+                    state.line_height = @max(state.line_height, chunk_line_height);
+                    state.line_start = false;
                 }
             },
         }
     }
 
-    return y + line_height;
+    return state.totalHeight();
+}
+
+fn ignoreTextBlockLayoutStep(_: void, _: TextBlockLayoutStep) void {}
+
+fn measureTextBlockLayout(
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) f32 {
+    return walkTextBlockLayout(block, available_width, options, {}, ignoreTextBlockLayoutStep);
 }
 
 fn renderTextBlockLayout(
@@ -844,67 +892,28 @@ fn renderTextBlockLayout(
     available_width: f32,
     options: RenderOptions,
 ) f32 {
-    const width = @max(available_width, 1.0);
-    const block_font = textBlockFontSpecWithOptions(block.style, options);
-    const base_line_height = lineHeightForSpec(block_font);
-    var line_height = base_line_height;
-    var x: f32 = 0.0;
-    var y: f32 = 0.0;
-    var line_start = true;
+    const RenderContext = struct {
+        draw_list: @TypeOf(draw_list),
+        start: [2]f32,
 
-    for (block.runs) |run| {
-        switch (run) {
-            .line_break => {
-                y += line_height;
-                x = 0.0;
-                line_height = base_line_height;
-                line_start = true;
-            },
-            .text => |text_run| {
-                const slice = block.text[text_run.start..text_run.end];
-                var chunk_start: usize = 0;
-                while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const spec = inlineFontSpec(block.style, text_run.style, options);
-                    const chunk_width = textWidthForSpec(spec, chunk.text);
-                    const chunk_line_height = lineHeightForSpec(spec);
-
-                    if (chunk.is_whitespace and line_start) {
-                        continue;
-                    }
-
-                    if (!chunk.is_whitespace and !line_start and x + chunk_width > width) {
-                        y += line_height;
-                        x = 0.0;
-                        line_height = base_line_height;
-                        line_start = true;
-                    } else if (chunk.is_whitespace and x + chunk_width > width) {
-                        y += line_height;
-                        x = 0.0;
-                        line_height = base_line_height;
-                        line_start = true;
-                        continue;
-                    }
-
-                    renderStyledChunk(
-                        draw_list,
-                        .{ start[0] + x, start[1] + y },
-                        chunk.text,
-                        block.style,
-                        text_run.style,
-                        spec,
-                        chunk_width,
-                        chunk_line_height,
-                    );
-
-                    x += chunk_width;
-                    line_height = @max(line_height, chunk_line_height);
-                    line_start = false;
-                }
-            },
+        fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
+            renderStyledChunk(
+                ctx.draw_list,
+                .{ ctx.start[0] + step.x, ctx.start[1] + step.y },
+                step.text,
+                step.block_style,
+                step.inline_style,
+                step.font_spec,
+                step.width,
+                step.line_height,
+            );
         }
-    }
+    };
 
-    return y + line_height;
+    return walkTextBlockLayout(block, available_width, options, RenderContext{
+        .draw_list = draw_list,
+        .start = start,
+    }, RenderContext.onStep);
 }
 
 fn renderStyledChunk(
