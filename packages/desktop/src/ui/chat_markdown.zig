@@ -10,6 +10,8 @@ const zgui = @import("zgui");
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
+    heading_font: ?zgui.Font = null,
+    heading_font_size: ?f32 = null,
     code_font: ?zgui.Font = null,
     code_font_size: ?f32 = null,
 };
@@ -25,12 +27,48 @@ pub const TextStyle = enum {
     quote,
 };
 
+pub const InlineStyle = struct {
+    strong: bool = false,
+    emphasis: bool = false,
+    code: bool = false,
+    link: bool = false,
+};
+
+pub const TextRunView = struct {
+    start: usize,
+    end: usize,
+    style: InlineStyle,
+};
+
+pub const InlineRunView = union(enum) {
+    text: TextRunView,
+    line_break: zig_markdown.LineBreakKind,
+};
+
 pub const TextBlockView = struct {
     span: zig_markdown.Span,
     text: []const u8,
+    runs: []InlineRunView,
     style: TextStyle,
     indent: usize = 0,
     compact: bool = false,
+
+    pub fn deinit(self: *TextBlockView, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.runs);
+        self.* = undefined;
+    }
+};
+
+const TextContent = struct {
+    text: []const u8,
+    runs: []InlineRunView,
+
+    pub fn deinit(self: *TextContent, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.runs);
+        self.* = undefined;
+    }
 };
 
 pub const CodeLineView = struct {
@@ -155,6 +193,16 @@ const FlattenContext = struct {
     }
 };
 
+const FontSpec = struct {
+    font: ?zgui.Font = null,
+    size: ?f32 = null,
+};
+
+const Chunk = struct {
+    text: []const u8,
+    is_whitespace: bool,
+};
+
 /// Parses markdown into a reusable body view with flattened text, rule, and code blocks.
 pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
     var document = try zig_markdown.parse(allocator, source);
@@ -192,7 +240,7 @@ pub fn renderBody(view: BodyView, options: RenderOptions) void {
 
         switch (block) {
             .blank => renderBlankBlock(),
-            .text => |text| renderTextBlock(text, available_width),
+            .text => |text| renderTextBlock(text, available_width, options),
             .fenced_code => |code| renderFencedCodeBlock(code, available_width, options),
             .thematic_break => |rule| renderThematicBreakBlock(rule, available_width),
         }
@@ -216,7 +264,7 @@ pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOp
 
         total += switch (block) {
             .blank => blankBlockHeight(),
-            .text => |text| measureTextBlockHeight(text, width),
+            .text => |text| measureTextBlockHeight(text, width, options),
             .fenced_code => |code| measureFencedCodeHeight(code, width, options),
             .thematic_break => |rule| measureThematicBreakHeight(rule),
         };
@@ -237,29 +285,27 @@ fn appendMarkdownBlocks(
         switch (block) {
             .blank => |span| try blocks.append(allocator, .{ .blank = span }),
             .paragraph => |paragraph| {
-                const text = try flattenInlinesToText(allocator, paragraph.inlines);
-                errdefer allocator.free(text);
-                try blocks.append(allocator, .{
-                    .text = .{
-                        .span = paragraph.span,
-                        .text = text,
-                        .style = if (context.quote_depth > 0) .quote else .paragraph,
-                        .indent = context.indent,
-                        .compact = context.compact,
-                    },
+                var content = try buildTextContent(allocator, paragraph.inlines);
+                errdefer content.deinit(allocator);
+                try appendOwnedTextBlock(allocator, blocks, .{
+                    .span = paragraph.span,
+                    .text = content.text,
+                    .runs = content.runs,
+                    .style = if (context.quote_depth > 0) .quote else .paragraph,
+                    .indent = context.indent,
+                    .compact = context.compact,
                 });
             },
             .heading => |heading| {
-                const text = try flattenInlinesToText(allocator, heading.inlines);
-                errdefer allocator.free(text);
-                try blocks.append(allocator, .{
-                    .text = .{
-                        .span = heading.span,
-                        .text = text,
-                        .style = headingStyle(heading.level),
-                        .indent = context.indent,
-                        .compact = context.compact,
-                    },
+                var content = try buildTextContent(allocator, heading.inlines);
+                errdefer content.deinit(allocator);
+                try appendOwnedTextBlock(allocator, blocks, .{
+                    .span = heading.span,
+                    .text = content.text,
+                    .runs = content.runs,
+                    .style = headingStyle(heading.level),
+                    .indent = context.indent,
+                    .compact = context.compact,
                 });
             },
             .fenced_code => |code| try blocks.append(allocator, .{
@@ -289,9 +335,12 @@ fn appendListBlock(
         defer allocator.free(marker);
 
         if (item.blocks.len == 0) {
+            var content = try buildPlainTextContent(allocator, marker, .{});
+            errdefer content.deinit(allocator);
             try appendOwnedTextBlock(allocator, blocks, .{
                 .span = item.span,
-                .text = try allocator.dupe(u8, marker),
+                .text = content.text,
+                .runs = content.runs,
                 .style = if (context.quote_depth > 0) .quote else .paragraph,
                 .indent = context.indent,
                 .compact = true,
@@ -301,11 +350,14 @@ fn appendListBlock(
 
         switch (item.blocks[0]) {
             .paragraph => |paragraph| {
-                const base = try flattenInlinesToText(allocator, paragraph.inlines);
-                defer allocator.free(base);
+                var base = try buildTextContent(allocator, paragraph.inlines);
+                defer base.deinit(allocator);
+                var prefixed = try prefixTextContent(allocator, marker, base);
+                errdefer prefixed.deinit(allocator);
                 try appendOwnedTextBlock(allocator, blocks, .{
                     .span = paragraph.span,
-                    .text = try prefixText(allocator, marker, base),
+                    .text = prefixed.text,
+                    .runs = prefixed.runs,
                     .style = if (context.quote_depth > 0) .quote else .paragraph,
                     .indent = context.indent,
                     .compact = true,
@@ -315,11 +367,14 @@ fn appendListBlock(
                 }
             },
             .heading => |heading| {
-                const base = try flattenInlinesToText(allocator, heading.inlines);
-                defer allocator.free(base);
+                var base = try buildTextContent(allocator, heading.inlines);
+                defer base.deinit(allocator);
+                var prefixed = try prefixTextContent(allocator, marker, base);
+                errdefer prefixed.deinit(allocator);
                 try appendOwnedTextBlock(allocator, blocks, .{
                     .span = heading.span,
-                    .text = try prefixText(allocator, marker, base),
+                    .text = prefixed.text,
+                    .runs = prefixed.runs,
                     .style = headingStyle(heading.level),
                     .indent = context.indent,
                     .compact = true,
@@ -329,9 +384,12 @@ fn appendListBlock(
                 }
             },
             else => {
+                var content = try buildPlainTextContent(allocator, marker, .{});
+                errdefer content.deinit(allocator);
                 try appendOwnedTextBlock(allocator, blocks, .{
                     .span = item.span,
-                    .text = try allocator.dupe(u8, marker),
+                    .text = content.text,
+                    .runs = content.runs,
                     .style = if (context.quote_depth > 0) .quote else .paragraph,
                     .indent = context.indent,
                     .compact = true,
@@ -347,8 +405,165 @@ fn appendOwnedTextBlock(
     blocks: *std.ArrayListUnmanaged(BlockView),
     text_block: TextBlockView,
 ) Allocator.Error!void {
-    errdefer allocator.free(text_block.text);
-    try blocks.append(allocator, .{ .text = text_block });
+    var owned = text_block;
+    errdefer owned.deinit(allocator);
+    try blocks.append(allocator, .{ .text = owned });
+}
+
+fn buildTextContent(
+    allocator: Allocator,
+    inlines: []const zig_markdown.Inline,
+) Allocator.Error!TextContent {
+    var text_builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_builder.deinit(allocator);
+
+    var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
+    errdefer runs.deinit(allocator);
+
+    try appendInlineRuns(allocator, &text_builder, &runs, inlines, .{});
+    return .{
+        .text = try text_builder.toOwnedSlice(allocator),
+        .runs = try runs.toOwnedSlice(allocator),
+    };
+}
+
+fn buildPlainTextContent(
+    allocator: Allocator,
+    text: []const u8,
+    style: InlineStyle,
+) Allocator.Error!TextContent {
+    var builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer builder.deinit(allocator);
+
+    var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
+    errdefer runs.deinit(allocator);
+
+    try appendStyledText(allocator, &builder, &runs, text, style);
+    return .{
+        .text = try builder.toOwnedSlice(allocator),
+        .runs = try runs.toOwnedSlice(allocator),
+    };
+}
+
+fn prefixTextContent(
+    allocator: Allocator,
+    prefix: []const u8,
+    content: TextContent,
+) Allocator.Error!TextContent {
+    var text_builder: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text_builder.deinit(allocator);
+
+    var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
+    errdefer runs.deinit(allocator);
+
+    try appendStyledText(allocator, &text_builder, &runs, prefix, .{});
+    const prefix_len = text_builder.items.len;
+    try text_builder.appendSlice(allocator, content.text);
+
+    for (content.runs) |run| {
+        switch (run) {
+            .text => |text_run| try runs.append(allocator, .{
+                .text = .{
+                    .start = prefix_len + text_run.start,
+                    .end = prefix_len + text_run.end,
+                    .style = text_run.style,
+                },
+            }),
+            .line_break => |kind| try runs.append(allocator, .{ .line_break = kind }),
+        }
+    }
+
+    return .{
+        .text = try text_builder.toOwnedSlice(allocator),
+        .runs = try runs.toOwnedSlice(allocator),
+    };
+}
+
+fn appendInlineRuns(
+    allocator: Allocator,
+    text_builder: *std.ArrayListUnmanaged(u8),
+    runs: *std.ArrayListUnmanaged(InlineRunView),
+    inlines: []const zig_markdown.Inline,
+    style: InlineStyle,
+) Allocator.Error!void {
+    for (inlines) |item| {
+        switch (item) {
+            .text => |text| try appendStyledText(allocator, text_builder, runs, text.text, style),
+            .emphasis => |container| try appendInlineRuns(
+                allocator,
+                text_builder,
+                runs,
+                container.children,
+                mergeInlineStyle(style, .{ .emphasis = true }),
+            ),
+            .strong => |container| try appendInlineRuns(
+                allocator,
+                text_builder,
+                runs,
+                container.children,
+                mergeInlineStyle(style, .{ .strong = true }),
+            ),
+            .code => |code| try appendStyledText(
+                allocator,
+                text_builder,
+                runs,
+                code.text,
+                mergeInlineStyle(style, .{ .code = true }),
+            ),
+            .link => |link| {
+                const link_style = mergeInlineStyle(style, .{ .link = true });
+                if (link.children.len > 0) {
+                    try appendInlineRuns(allocator, text_builder, runs, link.children, link_style);
+                } else {
+                    try appendStyledText(allocator, text_builder, runs, link.label, link_style);
+                }
+            },
+            .line_break => |kind| try runs.append(allocator, .{ .line_break = kind }),
+        }
+    }
+}
+
+fn appendStyledText(
+    allocator: Allocator,
+    text_builder: *std.ArrayListUnmanaged(u8),
+    runs: *std.ArrayListUnmanaged(InlineRunView),
+    text: []const u8,
+    style: InlineStyle,
+) Allocator.Error!void {
+    if (text.len == 0) return;
+
+    const start = text_builder.items.len;
+    try text_builder.appendSlice(allocator, text);
+    const end = text_builder.items.len;
+
+    if (runs.items.len > 0) {
+        switch (runs.items[runs.items.len - 1]) {
+            .text => |*last| {
+                if (std.meta.eql(last.style, style) and last.end == start) {
+                    last.end = end;
+                    return;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try runs.append(allocator, .{
+        .text = .{
+            .start = start,
+            .end = end,
+            .style = style,
+        },
+    });
+}
+
+fn mergeInlineStyle(base: InlineStyle, extra: InlineStyle) InlineStyle {
+    return .{
+        .strong = base.strong or extra.strong,
+        .emphasis = base.emphasis or extra.emphasis,
+        .code = base.code or extra.code,
+        .link = base.link or extra.link,
+    };
 }
 
 fn buildFencedCodeView(
@@ -382,47 +597,15 @@ fn buildFencedCodeView(
     };
 }
 
-fn flattenInlinesToText(
-    allocator: Allocator,
-    inlines: []const zig_markdown.Inline,
-) Allocator.Error![]const u8 {
-    var builder: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer builder.deinit(allocator);
-
-    try appendInlineText(allocator, &builder, inlines);
-    return try builder.toOwnedSlice(allocator);
-}
-
-fn appendInlineText(
-    allocator: Allocator,
-    builder: *std.ArrayListUnmanaged(u8),
-    inlines: []const zig_markdown.Inline,
-) Allocator.Error!void {
-    for (inlines) |item| {
-        switch (item) {
-            .text => |text| try builder.appendSlice(allocator, text.text),
-            .emphasis => |container| try appendInlineText(allocator, builder, container.children),
-            .strong => |container| try appendInlineText(allocator, builder, container.children),
-            .code => |code| try builder.appendSlice(allocator, code.text),
-            .link => |link| {
-                if (link.children.len > 0) {
-                    try appendInlineText(allocator, builder, link.children);
-                } else {
-                    try builder.appendSlice(allocator, link.label);
-                }
-            },
-            .line_break => try builder.append(allocator, '\n'),
-        }
-    }
-}
-
-fn prefixText(allocator: Allocator, prefix: []const u8, text: []const u8) Allocator.Error![]const u8 {
-    var builder: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer builder.deinit(allocator);
-
-    try builder.appendSlice(allocator, prefix);
-    try builder.appendSlice(allocator, text);
-    return try builder.toOwnedSlice(allocator);
+fn headingStyle(level: u8) TextStyle {
+    return switch (level) {
+        1 => .heading_1,
+        2 => .heading_2,
+        3 => .heading_3,
+        4 => .heading_4,
+        5 => .heading_5,
+        else => .heading_6,
+    };
 }
 
 fn listItemMarker(
@@ -436,21 +619,13 @@ fn listItemMarker(
     };
 }
 
-fn headingStyle(level: u8) TextStyle {
-    return switch (level) {
-        1 => .heading_1,
-        2 => .heading_2,
-        3 => .heading_3,
-        4 => .heading_4,
-        5 => .heading_5,
-        else => .heading_6,
-    };
-}
-
 fn deinitBlockViews(allocator: Allocator, blocks: []BlockView) void {
     for (blocks) |block| {
         switch (block) {
-            .text => |text| allocator.free(text.text),
+            .text => |text| {
+                var owned = text;
+                owned.deinit(allocator);
+            },
             .fenced_code => |code| {
                 var code_copy = code;
                 code_copy.deinit(allocator);
@@ -514,20 +689,18 @@ fn renderBlankBlock() void {
     zgui.dummy(.{ .w = 0.0, .h = blankBlockHeight() });
 }
 
-fn renderTextBlock(block: TextBlockView, available_width: f32) void {
+fn renderTextBlock(block: TextBlockView, available_width: f32, options: RenderOptions) void {
     const indent = indentWidth(block.indent);
     if (indent > 0.0) {
         zgui.setCursorPosX(zgui.getCursorPosX() + indent);
     }
 
-    const color = textBlockColor(block.style);
-    zgui.pushStyleColor4f(.{ .idx = .text, .c = color });
-    defer zgui.popStyleColor(.{ .count = 1 });
+    const start = zgui.getCursorScreenPos();
+    const width = @max(available_width - indent, 1.0);
+    const draw_list = zgui.getWindowDrawList();
+    const height = renderTextBlockLayout(draw_list, .{ start[0], start[1] }, block, width, options);
 
-    zgui.pushTextWrapPos(0.0);
-    defer zgui.popTextWrapPos();
-    _ = available_width;
-    zgui.textWrapped("{s}", .{block.text});
+    zgui.dummy(.{ .w = width, .h = height });
 }
 
 fn renderFencedCodeBlock(block: FencedCodeView, available_width: f32, options: RenderOptions) void {
@@ -538,7 +711,10 @@ fn renderFencedCodeBlock(block: FencedCodeView, available_width: f32, options: R
 
     const start = zgui.getCursorScreenPos();
     const width = @max(available_width - indent, minimumCodeBlockWidth());
-    const pushed_font = pushCodeFont(options);
+    const pushed_font = pushFontSpec(.{
+        .font = options.code_font,
+        .size = options.code_font_size,
+    });
     defer if (pushed_font) zgui.popFont();
 
     const line_height = zgui.getTextLineHeightWithSpacing();
@@ -601,6 +777,177 @@ fn renderThematicBreakBlock(rule: ThematicBreakView, available_width: f32) void 
     zgui.dummy(.{ .w = width, .h = thematicBreakHeight() });
 }
 
+fn measureTextBlockLayout(
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) f32 {
+    const width = @max(available_width, 1.0);
+    const block_font = textBlockFontSpecWithOptions(block.style, options);
+    const base_line_height = lineHeightForSpec(block_font);
+    var line_height = base_line_height;
+    var x: f32 = 0.0;
+    var y: f32 = 0.0;
+    var line_start = true;
+
+    for (block.runs) |run| {
+        switch (run) {
+            .line_break => {
+                y += line_height;
+                x = 0.0;
+                line_height = base_line_height;
+                line_start = true;
+            },
+            .text => |text_run| {
+                const slice = block.text[text_run.start..text_run.end];
+                var chunk_start: usize = 0;
+                while (nextChunk(slice, &chunk_start)) |chunk| {
+                    const spec = inlineFontSpec(block.style, text_run.style, options);
+                    const chunk_width = textWidthForSpec(spec, chunk.text);
+                    const chunk_line_height = lineHeightForSpec(spec);
+
+                    if (chunk.is_whitespace and line_start) {
+                        continue;
+                    }
+
+                    if (!chunk.is_whitespace and !line_start and x + chunk_width > width) {
+                        y += line_height;
+                        x = 0.0;
+                        line_height = base_line_height;
+                        line_start = true;
+                    } else if (chunk.is_whitespace and x + chunk_width > width) {
+                        y += line_height;
+                        x = 0.0;
+                        line_height = base_line_height;
+                        line_start = true;
+                        continue;
+                    }
+
+                    x += chunk_width;
+                    line_height = @max(line_height, chunk_line_height);
+                    line_start = false;
+                }
+            },
+        }
+    }
+
+    return y + line_height;
+}
+
+fn renderTextBlockLayout(
+    draw_list: anytype,
+    start: [2]f32,
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) f32 {
+    const width = @max(available_width, 1.0);
+    const block_font = textBlockFontSpecWithOptions(block.style, options);
+    const base_line_height = lineHeightForSpec(block_font);
+    var line_height = base_line_height;
+    var x: f32 = 0.0;
+    var y: f32 = 0.0;
+    var line_start = true;
+
+    for (block.runs) |run| {
+        switch (run) {
+            .line_break => {
+                y += line_height;
+                x = 0.0;
+                line_height = base_line_height;
+                line_start = true;
+            },
+            .text => |text_run| {
+                const slice = block.text[text_run.start..text_run.end];
+                var chunk_start: usize = 0;
+                while (nextChunk(slice, &chunk_start)) |chunk| {
+                    const spec = inlineFontSpec(block.style, text_run.style, options);
+                    const chunk_width = textWidthForSpec(spec, chunk.text);
+                    const chunk_line_height = lineHeightForSpec(spec);
+
+                    if (chunk.is_whitespace and line_start) {
+                        continue;
+                    }
+
+                    if (!chunk.is_whitespace and !line_start and x + chunk_width > width) {
+                        y += line_height;
+                        x = 0.0;
+                        line_height = base_line_height;
+                        line_start = true;
+                    } else if (chunk.is_whitespace and x + chunk_width > width) {
+                        y += line_height;
+                        x = 0.0;
+                        line_height = base_line_height;
+                        line_start = true;
+                        continue;
+                    }
+
+                    renderStyledChunk(
+                        draw_list,
+                        .{ start[0] + x, start[1] + y },
+                        chunk.text,
+                        block.style,
+                        text_run.style,
+                        spec,
+                        chunk_width,
+                        chunk_line_height,
+                    );
+
+                    x += chunk_width;
+                    line_height = @max(line_height, chunk_line_height);
+                    line_start = false;
+                }
+            },
+        }
+    }
+
+    return y + line_height;
+}
+
+fn renderStyledChunk(
+    draw_list: anytype,
+    position: [2]f32,
+    text: []const u8,
+    block_style: TextStyle,
+    inline_style: InlineStyle,
+    font_spec: FontSpec,
+    width: f32,
+    line_height: f32,
+) void {
+    const pushed_font = pushFontSpec(font_spec);
+    defer if (pushed_font) zgui.popFont();
+
+    const color = inlineTextColor(textBlockColor(block_style), inline_style);
+    const color_u32 = zgui.colorConvertFloat4ToU32(color);
+
+    if (inline_style.code) {
+        draw_list.addRectFilled(.{
+            .pmin = .{ position[0] - 3.0, position[1] + 1.0 },
+            .pmax = .{ position[0] + width + 3.0, position[1] + line_height - 1.0 },
+            .col = zgui.colorConvertFloat4ToU32(colors.rgba(36, 39, 46, 255)),
+            .rounding = 4.0,
+        });
+    }
+
+    draw_list.addTextUnformatted(position, color_u32, text);
+    if (inline_style.strong) {
+        draw_list.addTextUnformatted(.{ position[0] + 0.75, position[1] }, color_u32, text);
+    }
+
+    if (inline_style.link or inline_style.emphasis) {
+        const underline_color = if (inline_style.link)
+            zgui.colorConvertFloat4ToU32(colors.rgb(0x7A, 0xCA, 0xFF))
+        else
+            color_u32;
+        draw_list.addLine(.{
+            .p1 = .{ position[0], position[1] + line_height - 2.0 },
+            .p2 = .{ position[0] + width, position[1] + line_height - 2.0 },
+            .col = underline_color,
+            .thickness = if (inline_style.link) 1.5 else 1.0,
+        });
+    }
+}
+
 fn renderCodeLine(draw_list: anytype, line: CodeLineView, layout: CodeLineLayout) void {
     var cursor_x = layout.x;
     for (line.tokens) |token| {
@@ -623,14 +970,17 @@ const CodeLineLayout = struct {
     max_x: f32,
 };
 
-fn measureTextBlockHeight(block: TextBlockView, available_width: f32) f32 {
+fn measureTextBlockHeight(block: TextBlockView, available_width: f32, options: RenderOptions) f32 {
     const width = @max(available_width - indentWidth(block.indent), 1.0);
-    return @max(zgui.calcTextSize(block.text, .{ .wrap_width = width })[1], zgui.getTextLineHeight());
+    return measureTextBlockLayout(block, width, options);
 }
 
 fn measureFencedCodeHeight(block: FencedCodeView, available_width: f32, options: RenderOptions) f32 {
     _ = available_width;
-    const pushed_font = pushCodeFont(options);
+    const pushed_font = pushFontSpec(.{
+        .font = options.code_font,
+        .size = options.code_font_size,
+    });
     defer if (pushed_font) zgui.popFont();
     const line_height = zgui.getTextLineHeightWithSpacing();
     return codeBlockHeight(block, line_height, codeBlockPaddingY());
@@ -641,12 +991,97 @@ fn measureThematicBreakHeight(rule: ThematicBreakView) f32 {
     return thematicBreakHeight();
 }
 
-fn pushCodeFont(options: RenderOptions) bool {
-    if (options.code_font) |font| {
-        zgui.pushFont(font, options.code_font_size orelse zgui.getFontSize());
+fn pushFontSpec(spec: FontSpec) bool {
+    if (spec.font != null or spec.size != null) {
+        zgui.pushFont(spec.font orelse zgui.getFont(), spec.size orelse zgui.getFontSize());
         return true;
     }
     return false;
+}
+
+fn textBlockFontSpec(style: TextStyle) FontSpec {
+    const base_size = zgui.getFontSize();
+    const heading_size = base_size;
+
+    return switch (style) {
+        .paragraph, .quote => .{},
+        .heading_1 => .{ .font = null, .size = heading_size * 1.18 },
+        .heading_2 => .{ .font = null, .size = heading_size * 1.08 },
+        .heading_3 => .{ .font = null, .size = @max(base_size * 1.20, heading_size * 0.94) },
+        .heading_4 => .{ .font = null, .size = @max(base_size * 1.12, heading_size * 0.86) },
+        .heading_5 => .{ .font = null, .size = @max(base_size * 1.06, heading_size * 0.8) },
+        .heading_6 => .{ .font = null, .size = @max(base_size * 1.02, heading_size * 0.76) },
+    };
+}
+
+fn textBlockFontSpecWithOptions(style: TextStyle, options: RenderOptions) FontSpec {
+    const base = textBlockFontSpec(style);
+    if (style == .paragraph or style == .quote) return base;
+
+    return .{
+        .font = options.heading_font orelse base.font,
+        .size = if (options.heading_font_size) |heading_size|
+            switch (style) {
+                .heading_1 => heading_size * 1.18,
+                .heading_2 => heading_size * 1.08,
+                .heading_3 => @max(zgui.getFontSize() * 1.20, heading_size * 0.94),
+                .heading_4 => @max(zgui.getFontSize() * 1.12, heading_size * 0.86),
+                .heading_5 => @max(zgui.getFontSize() * 1.06, heading_size * 0.8),
+                .heading_6 => @max(zgui.getFontSize() * 1.02, heading_size * 0.76),
+                else => base.size,
+            }
+        else
+            base.size,
+    };
+}
+
+fn inlineFontSpec(block_style: TextStyle, inline_style: InlineStyle, options: RenderOptions) FontSpec {
+    if (inline_style.code) {
+        return .{
+            .font = options.code_font,
+            .size = options.code_font_size,
+        };
+    }
+    return textBlockFontSpecWithOptions(block_style, options);
+}
+
+fn lineHeightForSpec(spec: FontSpec) f32 {
+    const pushed_font = pushFontSpec(spec);
+    defer if (pushed_font) zgui.popFont();
+    return zgui.getTextLineHeight();
+}
+
+fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
+    const pushed_font = pushFontSpec(spec);
+    defer if (pushed_font) zgui.popFont();
+    return zgui.calcTextSize(text, .{})[0];
+}
+
+fn nextChunk(text: []const u8, index: *usize) ?Chunk {
+    if (index.* >= text.len) return null;
+
+    const start = index.*;
+    const initial_is_whitespace = isInlineWhitespace(text[start]);
+    var end = start + 1;
+    while (end < text.len and isInlineWhitespace(text[end]) == initial_is_whitespace) : (end += 1) {}
+    index.* = end;
+    return .{
+        .text = text[start..end],
+        .is_whitespace = initial_is_whitespace,
+    };
+}
+
+fn isInlineWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t';
+}
+
+fn inlineTextColor(base_color: [4]f32, style: InlineStyle) [4]f32 {
+    var color = base_color;
+    if (style.code) color = colors.rgb(0xF5, 0xD0, 0x7A);
+    if (style.link) color = colors.rgb(0x7A, 0xCA, 0xFF);
+    if (style.emphasis and !style.code) color = lighten(color, 0.08);
+    if (style.strong and !style.code) color = lighten(color, 0.12);
+    return color;
 }
 
 fn textBlockColor(style: TextStyle) [4]f32 {
@@ -716,13 +1151,22 @@ fn codeTokenColor(kind: zig_dif.TokenKind) [4]f32 {
     };
 }
 
+fn lighten(color: [4]f32, amount: f32) [4]f32 {
+    return .{
+        @min(color[0] + amount, 1.0),
+        @min(color[1] + amount, 1.0),
+        @min(color[2] + amount, 1.0),
+        color[3],
+    };
+}
+
 test "builds a body view with headings lists and fenced code" {
     const allocator = std.testing.allocator;
     const source =
         \\## Review
         \\
         \\- first item
-        \\- second item with **bold**
+        \\- second item with **bold** and *soft*
         \\
         \\```ts
         \\const result = reviewCampaign(csvPath);
@@ -754,7 +1198,28 @@ test "builds a body view with headings lists and fenced code" {
     }
 
     switch (body.blockAt(3)) {
-        .text => |text| try std.testing.expectEqualStrings("- second item with bold", text.text),
+        .text => |text| {
+            try std.testing.expectEqualStrings("- second item with bold and soft", text.text);
+
+            var found_bold = false;
+            var found_soft = false;
+            for (text.runs) |run| switch (run) {
+                .text => |span| {
+                    const slice = text.text[span.start..span.end];
+                    if (std.mem.eql(u8, slice, "bold")) {
+                        found_bold = true;
+                        try std.testing.expect(span.style.strong);
+                    }
+                    if (std.mem.eql(u8, slice, "soft")) {
+                        found_soft = true;
+                        try std.testing.expect(span.style.emphasis);
+                    }
+                },
+                else => {},
+            };
+            try std.testing.expect(found_bold);
+            try std.testing.expect(found_soft);
+        },
         else => unreachable,
     }
 
@@ -763,6 +1228,38 @@ test "builds a body view with headings lists and fenced code" {
             try std.testing.expectEqual(zig_dif.Language.typescript, code.language);
             try std.testing.expectEqual(@as(usize, 1), code.lines.len);
             try std.testing.expectEqualStrings("const result = reviewCampaign(csvPath);", code.lines[0].text);
+        },
+        else => unreachable,
+    }
+}
+
+test "preserves links and inline code runs" {
+    const allocator = std.testing.allocator;
+    const source = "Use `npm run check` and visit [docs](https://example.com).";
+
+    var body = try buildBodyView(allocator, source);
+    defer body.deinit(allocator);
+
+    switch (body.blockAt(0)) {
+        .text => |text| {
+            var found_code = false;
+            var found_link = false;
+            for (text.runs) |run| switch (run) {
+                .text => |span| {
+                    const slice = text.text[span.start..span.end];
+                    if (std.mem.eql(u8, slice, "npm run check")) {
+                        found_code = true;
+                        try std.testing.expect(span.style.code);
+                    }
+                    if (std.mem.eql(u8, slice, "docs")) {
+                        found_link = true;
+                        try std.testing.expect(span.style.link);
+                    }
+                },
+                else => {},
+            };
+            try std.testing.expect(found_code);
+            try std.testing.expect(found_link);
         },
         else => unreachable,
     }

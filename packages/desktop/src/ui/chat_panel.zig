@@ -1088,6 +1088,8 @@ fn renderMarkdownTranscriptBody(body: []const u8) bool {
     defer view.deinit(std.heap.page_allocator);
 
     chat_markdown.renderBody(view, .{
+        .heading_font = theme.heading_font,
+        .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
         .code_font = theme.terminal_font,
         .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
     });
@@ -2712,6 +2714,8 @@ fn measureMarkdownTranscriptBodyHeight(body: []const u8, inner_width: f32) f32 {
     defer view.deinit(std.heap.page_allocator);
 
     return chat_markdown.measureBodyHeight(view, inner_width, .{
+        .heading_font = theme.heading_font,
+        .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
         .code_font = theme.terminal_font,
         .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
     });
