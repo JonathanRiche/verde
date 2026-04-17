@@ -42,25 +42,33 @@ yay -S verde-bin
 
 Package page: [verde-bin on the AUR](https://aur.archlinux.org/packages/verde-bin)
 
-### Build from source
+## Install with npm
+
+For developers who prefer npm-style tools, Verde can also be distributed as a platform-specific npm package with a thin launcher.
+
+Typical usage:
 
 ```bash
-git clone https://github.com/JonathanRiche/verde
-cd verde
-zig build run
+npx verde-app
+npm install -g verde-app
+verde
 ```
 
-That launches the app in development mode.
+The npm path is intended for developer machines on:
 
-## Prerequisites
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+
+## Install on Linux or macOS from source
+
+### Prerequisites
 
 - Zig `0.15.x` (`0.15.2` is confirmed working in this repo)
 - OpenGL development libraries for your platform
 - SDL3 available for your platform
   - Linux and Windows: install SDL3 development files
   - macOS: the build uses the bundled SDL3 framework from the Zig dependency
-
-## Install on Linux or macOS from source
 
 The root build now forwards Zig install prefixes into `packages/desktop`, so you can build and install from the repo root with one command.
 
@@ -131,48 +139,6 @@ That builds `Verde.app` and copies it into `~/Applications` by default. To insta
 ```
 
 Release `.zip` artifacts on macOS already contain `Verde.app`, so end users can also unzip and drag the app bundle into `Applications`.
-
-## Install with npm
-
-For developers who prefer npm-style tools, Verde can also be distributed as a platform-specific npm package with a thin launcher.
-
-Typical usage:
-
-```bash
-npx verde-app
-npm install -g verde-app
-verde
-```
-
-The npm path is intended for developer machines on:
-
-- macOS Apple Silicon
-- macOS Intel
-- Linux x86_64
-
-## Development
-
-From the repo root:
-
-```bash
-zig build
-zig build run
-zig build run -Dui-debug=true
-zig build test
-zig build -Doptimize=ReleaseSafe
-zig build -Doptimize=ReleaseFast
-```
-
-- `zig build` builds the app
-- `zig build run` builds and launches it
-- `zig build run -Dui-debug=true` launches it with the native UI debug window enabled
-- `zig build test` runs the Zig tests and the format check
-
-The built binary is written to:
-
-```bash
-packages/desktop/zig-out/bin/verde
-```
 
 ## Release builds
 
@@ -289,6 +255,42 @@ Example config:
 ```
 
 Keybinds are loaded from the user config on startup and on app refresh. Use a string for one shortcut or a string array for multiple shortcuts for the same action.
+
+## Development
+
+If you want to work on Verde itself, the desktop app in this repo lives in [`packages/desktop/`](packages/desktop).
+
+Quick local run:
+
+```bash
+git clone https://github.com/JonathanRiche/verde
+cd verde
+zig build run
+```
+
+That launches the app in development mode.
+
+From the repo root:
+
+```bash
+zig build
+zig build run
+zig build run -Dui-debug=true
+zig build test
+zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseFast
+```
+
+- `zig build` builds the app
+- `zig build run` builds and launches it
+- `zig build run -Dui-debug=true` launches it with the native UI debug window enabled
+- `zig build test` runs the Zig tests and the format check
+
+The built binary is written to:
+
+```bash
+packages/desktop/zig-out/bin/verde
+```
 
 ## Third-Party Components
 
