@@ -1057,7 +1057,7 @@ fn renderTranscriptMessage(
         return;
     }
 
-    const bubble_height = transcriptBubbleHeight(state, role, author, body, image);
+    const bubble_height = transcriptBubbleHeight(state, message_index, role, author, body, image);
     const bubble_theme = transcriptBubbleTheme(role);
     const bubble_width = transcriptBubbleWidth(role);
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = theme.TRANSCRIPT_BUBBLE_ROUNDING });
@@ -1100,6 +1100,8 @@ fn renderTranscriptMessage(
 /// Draws a generic transcript bubble with optional muted body text.
 fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, author: []const u8, body: []const u8, image: anytype, muted_body: bool) void {
     const bubble_height = transcriptBubbleHeightGeneric(
+        null,
+        null,
         role,
         author,
         body,
@@ -1167,7 +1169,7 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role:
         }
     }
 
-    if (!muted_body and renderMarkdownTranscriptBody(body)) {
+    if (!muted_body and renderMarkdownTranscriptBody(state, message_index, body)) {
         return;
     }
 
@@ -1275,18 +1277,8 @@ fn localTranscriptMarkdownSelectionForMessage(
     };
 }
 
-fn renderSelectableMarkdownTranscriptBody(
-    state: *app_state.AppState,
-    message_index: usize,
-    body: []const u8,
-    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
-    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
-) bool {
-    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return false;
-    defer view.deinit(std.heap.page_allocator);
-
-    const style = zgui.getStyle();
-    const options: chat_markdown.RenderOptions = .{
+fn transcriptMarkdownRenderOptions() chat_markdown.RenderOptions {
+    return .{
         .heading_font = theme.heading_font,
         .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
         .bold_font = theme.bold_font,
@@ -1295,6 +1287,32 @@ fn renderSelectableMarkdownTranscriptBody(
         .code_font = theme.terminal_font,
         .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
     };
+}
+
+fn transcriptMarkdownBodyView(state: *app_state.AppState, message_index: ?usize, body: []const u8, fallback_view: *?chat_markdown.BodyView) ?chat_markdown.BodyView {
+    if (message_index) |index| {
+        if (state.transcriptMarkdownBodyView(index, body)) |cached| {
+            return cached.*;
+        }
+    }
+
+    fallback_view.* = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return null;
+    return fallback_view.*;
+}
+
+fn renderSelectableMarkdownTranscriptBody(
+    state: *app_state.AppState,
+    message_index: usize,
+    body: []const u8,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) bool {
+    var fallback_view: ?chat_markdown.BodyView = null;
+    defer if (fallback_view) |*view| view.deinit(std.heap.page_allocator);
+    const view = transcriptMarkdownBodyView(state, message_index, body, &fallback_view) orelse return false;
+
+    const style = zgui.getStyle();
+    const options = transcriptMarkdownRenderOptions();
     const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
     const selection_active = selection != null;
     const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
@@ -1363,19 +1381,12 @@ fn renderSelectableMarkdownTranscriptBody(
     return true;
 }
 
-fn renderMarkdownTranscriptBody(body: []const u8) bool {
-    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return false;
-    defer view.deinit(std.heap.page_allocator);
+fn renderMarkdownTranscriptBody(state: *app_state.AppState, message_index: ?usize, body: []const u8) bool {
+    var fallback_view: ?chat_markdown.BodyView = null;
+    defer if (fallback_view) |*view| view.deinit(std.heap.page_allocator);
+    const view = transcriptMarkdownBodyView(state, message_index, body, &fallback_view) orelse return false;
 
-    chat_markdown.renderBody(view, .{
-        .heading_font = theme.heading_font,
-        .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
-        .bold_font = theme.bold_font,
-        .italic_font = theme.italic_font,
-        .bold_italic_font = theme.bold_italic_font,
-        .code_font = theme.terminal_font,
-        .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
-    });
+    chat_markdown.renderBody(view, transcriptMarkdownRenderOptions());
     return true;
 }
 
@@ -2952,8 +2963,10 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
-fn transcriptBubbleHeight(state: *app_state.AppState, role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) f32 {
+fn transcriptBubbleHeight(state: *app_state.AppState, message_index: ?usize, role: app_state.ChatRole, author: []const u8, body: []const u8, image: ?app_state.ChatImageAttachment) f32 {
     return transcriptBubbleHeightGeneric(
+        state,
+        message_index,
         role,
         author,
         body,
@@ -2965,6 +2978,8 @@ fn transcriptBubbleHeight(state: *app_state.AppState, role: app_state.ChatRole, 
 
 /// Measures the height needed for a transcript bubble.
 fn transcriptBubbleHeightGeneric(
+    state: ?*app_state.AppState,
+    message_index: ?usize,
     role: anytype,
     author: []const u8,
     body: []const u8,
@@ -2979,7 +2994,7 @@ fn transcriptBubbleHeightGeneric(
     const body_height = if (use_codex_file_reference_layout)
         codexFileReferenceBodyHeight(body, inner_width)
     else if (!muted_body)
-        measureMarkdownTranscriptBodyHeight(body, inner_width)
+        measureMarkdownTranscriptBodyHeight(state, message_index, body, inner_width)
     else
         zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
     const image_height: f32 = if (image != null) theme.clampf(inner_width * 0.46, theme.scaledUi(132.0), theme.scaledUi(220.0)) else 0.0;
@@ -2990,21 +3005,20 @@ fn transcriptBubbleHeightGeneric(
     return @max(author_size[1] + body_height + image_height + image_gap + vertical_padding + text_gap + border_allowance, theme.scaledUi(56.0));
 }
 
-fn measureMarkdownTranscriptBodyHeight(body: []const u8, inner_width: f32) f32 {
-    var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
-        return zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
-    };
-    defer view.deinit(std.heap.page_allocator);
+fn measureMarkdownTranscriptBodyHeight(state: ?*app_state.AppState, message_index: ?usize, body: []const u8, inner_width: f32) f32 {
+    var fallback_view: ?chat_markdown.BodyView = null;
+    defer if (fallback_view) |*view| view.deinit(std.heap.page_allocator);
 
-    return chat_markdown.measureBodyHeight(view, inner_width, .{
-        .heading_font = theme.heading_font,
-        .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
-        .bold_font = theme.bold_font,
-        .italic_font = theme.italic_font,
-        .bold_italic_font = theme.bold_italic_font,
-        .code_font = theme.terminal_font,
-        .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
-    });
+    const view = if (state) |app|
+        transcriptMarkdownBodyView(app, message_index, body, &fallback_view) orelse return zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1]
+    else blk: {
+        fallback_view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
+            return zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
+        };
+        break :blk fallback_view.?;
+    };
+
+    return chat_markdown.measureBodyHeight(view, inner_width, transcriptMarkdownRenderOptions());
 }
 
 fn transcriptBubbleWidth(role: anytype) f32 {

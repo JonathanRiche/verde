@@ -121,6 +121,17 @@ const TranscriptSelectableText = struct {
     }
 };
 
+const TranscriptMarkdownBody = struct {
+    owned_body: []u8,
+    view: chat_markdown.BodyView,
+
+    fn deinit(self: *TranscriptMarkdownBody, allocator: std.mem.Allocator) void {
+        self.view.deinit(allocator);
+        allocator.free(self.owned_body);
+        allocator.destroy(self);
+    }
+};
+
 pub const TranscriptMarkdownSelectionPoint = struct {
     message_index: usize,
     point: chat_markdown.SelectionPoint,
@@ -887,6 +898,9 @@ pub const AppState = struct {
     transcript_markdown_selection_anchor: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_focus: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_dragging: bool,
+    transcript_markdown_project_index: ?usize,
+    transcript_markdown_thread_index: ?usize,
+    transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_selectable_project_index: ?usize,
     transcript_selectable_thread_index: ?usize,
     transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
@@ -971,6 +985,9 @@ pub const AppState = struct {
             .transcript_markdown_selection_anchor = null,
             .transcript_markdown_selection_focus = null,
             .transcript_markdown_selection_dragging = false,
+            .transcript_markdown_project_index = null,
+            .transcript_markdown_thread_index = null,
+            .transcript_markdown_entries = .empty,
             .transcript_selectable_project_index = null,
             .transcript_selectable_thread_index = null,
             .transcript_selectable_entries = .empty,
@@ -2777,6 +2794,11 @@ pub const AppState = struct {
         self.transcript_markdown_selection_dragging = false;
     }
 
+    pub fn transcriptMarkdownBodyView(self: *AppState, message_index: usize, body: []const u8) ?*const chat_markdown.BodyView {
+        const entry = self.transcriptMarkdownBodyEntry(message_index, body) orelse return null;
+        return &entry.view;
+    }
+
     pub fn transcriptBodyTextSelector(self: *AppState, message_index: usize, body: []const u8) ?*zgui_text_select.TextSelect {
         const entry = self.transcriptBodyTextEntry(message_index, body) orelse return null;
         return entry.selector;
@@ -2790,6 +2812,69 @@ pub const AppState = struct {
     pub fn transcriptBodyTextLineAt(self: *AppState, message_index: usize, body: []const u8, line_index: usize) []const u8 {
         const entry = self.transcriptBodyTextEntry(message_index, body) orelse return "";
         return entry.lineSlice(line_index);
+    }
+
+    fn ensureTranscriptMarkdownEntries(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.clearTranscriptMarkdownEntries();
+            return;
+        }
+
+        const project_index = self.selected_project_index;
+        const thread_index = self.currentProject().selected_thread_index;
+        const message_count = self.currentThread().messages.items.len;
+        if (self.transcript_markdown_project_index == project_index and
+            self.transcript_markdown_thread_index == thread_index and
+            self.transcript_markdown_entries.items.len == message_count)
+        {
+            return;
+        }
+
+        self.clearTranscriptMarkdownEntries();
+        self.transcript_markdown_entries.appendNTimes(self.allocator, null, message_count) catch return;
+        self.transcript_markdown_project_index = project_index;
+        self.transcript_markdown_thread_index = thread_index;
+    }
+
+    fn clearTranscriptMarkdownEntries(self: *AppState) void {
+        for (self.transcript_markdown_entries.items) |entry| {
+            if (entry) |owned| owned.deinit(self.allocator);
+        }
+        self.transcript_markdown_entries.clearRetainingCapacity();
+        self.transcript_markdown_project_index = null;
+        self.transcript_markdown_thread_index = null;
+    }
+
+    fn transcriptMarkdownBodyEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
+        if (body.len == 0) return null;
+        self.ensureTranscriptMarkdownEntries();
+        if (message_index >= self.transcript_markdown_entries.items.len) return null;
+
+        if (self.transcript_markdown_entries.items[message_index]) |entry| {
+            if (!std.mem.eql(u8, entry.owned_body, body)) {
+                entry.deinit(self.allocator);
+                self.transcript_markdown_entries.items[message_index] = null;
+            } else {
+                return entry;
+            }
+        }
+
+        const created = self.createTranscriptMarkdownBody(body) catch return null;
+        self.transcript_markdown_entries.items[message_index] = created;
+        return created;
+    }
+
+    fn createTranscriptMarkdownBody(self: *AppState, body: []const u8) !*TranscriptMarkdownBody {
+        const entry = try self.allocator.create(TranscriptMarkdownBody);
+        errdefer self.allocator.destroy(entry);
+
+        entry.owned_body = try self.allocator.dupe(u8, body);
+        errdefer self.allocator.free(entry.owned_body);
+
+        entry.view = try chat_markdown.buildBodyView(self.allocator, entry.owned_body);
+        errdefer entry.view.deinit(self.allocator);
+
+        return entry;
     }
 
     fn ensureTranscriptSelectableEntries(self: *AppState) void {
@@ -3990,6 +4075,7 @@ pub const AppState = struct {
         self.file_search_state.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
+        self.transcript_markdown_entries.deinit(self.allocator);
         self.transcript_selectable_entries.deinit(self.allocator);
         self.browser_state.deinit();
         self.releaseAllImageTextures();
@@ -4772,6 +4858,7 @@ pub const AppState = struct {
         self.closeImageModal();
         self.closeTranscriptSelectionModal();
         self.clearTranscriptMarkdownSelection();
+        self.clearTranscriptMarkdownEntries();
         self.clearTranscriptSelectableEntries();
         for (self.projects.items) |*project| {
             project.deinit(self.allocator);
