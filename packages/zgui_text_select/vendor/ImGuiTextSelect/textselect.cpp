@@ -160,10 +160,18 @@ static inline const char* CalcWordWrapNextLineStartA(const char* text, const cha
 // Split `text` that does not fit in `wrapWidth` into multiple lines.
 // result.size() is never 0.
 static ImVector<std::string_view> wrapText(std::string_view text, float wrapWidth) {
-    ImFont* font = ImGui::GetCurrentContext()->Font;
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    ImFont* font = ctx ? ctx->Font : nullptr;
     const float size = ImGui::GetFontSize();
 
     ImVector<std::string_view> result;
+    if (font == nullptr) {
+        result.push_back({ text.data(), text.size() });
+        return result;
+    }
+    if (ctx != nullptr && ctx->Font == font && ctx->FontBaked != nullptr) {
+        font->LastBaked = ctx->FontBaked;
+    }
 
     const char* textEnd = text.data() + text.size();
     const char* wrappedLineStart = text.data();
