@@ -121,6 +121,16 @@ const TranscriptSelectableText = struct {
     }
 };
 
+pub const TranscriptMarkdownSelectionPoint = struct {
+    message_index: usize,
+    point: chat_markdown.SelectionPoint,
+};
+
+pub const TranscriptMarkdownSelection = struct {
+    anchor: TranscriptMarkdownSelectionPoint,
+    focus: TranscriptMarkdownSelectionPoint,
+};
+
 fn transcriptSelectableGetLine(context: ?*anyopaque, index: usize) callconv(.c) zgui_text_select.LineSlice {
     const raw = context orelse return .{};
     const entry: *TranscriptSelectableText = @ptrCast(@alignCast(raw));
@@ -874,9 +884,8 @@ pub const AppState = struct {
     transcript_selection_text: ?[:0]u8,
     transcript_markdown_selection_project_index: ?usize,
     transcript_markdown_selection_thread_index: ?usize,
-    transcript_markdown_selection_message_index: ?usize,
-    transcript_markdown_selection_anchor: ?chat_markdown.SelectionPoint,
-    transcript_markdown_selection_focus: ?chat_markdown.SelectionPoint,
+    transcript_markdown_selection_anchor: ?TranscriptMarkdownSelectionPoint,
+    transcript_markdown_selection_focus: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_dragging: bool,
     transcript_selectable_project_index: ?usize,
     transcript_selectable_thread_index: ?usize,
@@ -959,7 +968,6 @@ pub const AppState = struct {
             .transcript_selection_text = null,
             .transcript_markdown_selection_project_index = null,
             .transcript_markdown_selection_thread_index = null,
-            .transcript_markdown_selection_message_index = null,
             .transcript_markdown_selection_anchor = null,
             .transcript_markdown_selection_focus = null,
             .transcript_markdown_selection_dragging = false,
@@ -2693,9 +2701,8 @@ pub const AppState = struct {
         self.clearTranscriptMarkdownSelection();
     }
 
-    pub fn transcriptMarkdownSelectionForMessage(self: *AppState, message_index: usize) ?chat_markdown.SelectionRange {
+    pub fn transcriptMarkdownSelection(self: *AppState) ?TranscriptMarkdownSelection {
         self.ensureTranscriptMarkdownSelectionCurrent();
-        if (self.transcript_markdown_selection_message_index != message_index) return null;
         const anchor = self.transcript_markdown_selection_anchor orelse return null;
         const focus = self.transcript_markdown_selection_focus orelse return null;
         return .{
@@ -2704,37 +2711,37 @@ pub const AppState = struct {
         };
     }
 
-    pub fn transcriptMarkdownSelectionMessageIndex(self: *AppState) ?usize {
-        self.ensureTranscriptMarkdownSelectionCurrent();
-        return self.transcript_markdown_selection_message_index;
-    }
-
     pub fn transcriptMarkdownSelectionDragging(self: *AppState) bool {
         self.ensureTranscriptMarkdownSelectionCurrent();
         return self.transcript_markdown_selection_dragging;
     }
 
-    pub fn transcriptMarkdownSelectionActiveForMessage(self: *AppState, message_index: usize) bool {
+    pub fn transcriptMarkdownSelectionActive(self: *AppState) bool {
         self.ensureTranscriptMarkdownSelectionCurrent();
-        return self.transcript_markdown_selection_message_index == message_index and
-            self.transcript_markdown_selection_anchor != null and
+        return self.transcript_markdown_selection_anchor != null and
             self.transcript_markdown_selection_focus != null;
     }
 
     pub fn beginTranscriptMarkdownSelection(self: *AppState, message_index: usize, point: chat_markdown.SelectionPoint) void {
         if (self.projects.items.len == 0) return;
+        const selection_point: TranscriptMarkdownSelectionPoint = .{
+            .message_index = message_index,
+            .point = point,
+        };
         self.transcript_markdown_selection_project_index = self.selected_project_index;
         self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
-        self.transcript_markdown_selection_message_index = message_index;
-        self.transcript_markdown_selection_anchor = point;
-        self.transcript_markdown_selection_focus = point;
+        self.transcript_markdown_selection_anchor = selection_point;
+        self.transcript_markdown_selection_focus = selection_point;
         self.transcript_markdown_selection_dragging = true;
     }
 
-    pub fn updateTranscriptMarkdownSelection(self: *AppState, point: chat_markdown.SelectionPoint) void {
+    pub fn updateTranscriptMarkdownSelection(self: *AppState, message_index: usize, point: chat_markdown.SelectionPoint) void {
         self.ensureTranscriptMarkdownSelectionCurrent();
-        if (self.transcript_markdown_selection_message_index == null or self.transcript_markdown_selection_anchor == null) return;
-        self.transcript_markdown_selection_focus = point;
+        if (self.transcript_markdown_selection_anchor == null) return;
+        self.transcript_markdown_selection_focus = .{
+            .message_index = message_index,
+            .point = point,
+        };
     }
 
     pub fn endTranscriptMarkdownSelection(self: *AppState) void {
@@ -2743,23 +2750,28 @@ pub const AppState = struct {
 
     pub fn selectAllTranscriptMarkdownSelection(
         self: *AppState,
-        message_index: usize,
+        first_message_index: usize,
         first: chat_markdown.SelectionPoint,
+        last_message_index: usize,
         last: chat_markdown.SelectionPoint,
     ) void {
         if (self.projects.items.len == 0) return;
         self.transcript_markdown_selection_project_index = self.selected_project_index;
         self.transcript_markdown_selection_thread_index = self.currentProject().selected_thread_index;
-        self.transcript_markdown_selection_message_index = message_index;
-        self.transcript_markdown_selection_anchor = first;
-        self.transcript_markdown_selection_focus = last;
+        self.transcript_markdown_selection_anchor = .{
+            .message_index = first_message_index,
+            .point = first,
+        };
+        self.transcript_markdown_selection_focus = .{
+            .message_index = last_message_index,
+            .point = last,
+        };
         self.transcript_markdown_selection_dragging = false;
     }
 
     pub fn clearTranscriptMarkdownSelection(self: *AppState) void {
         self.transcript_markdown_selection_project_index = null;
         self.transcript_markdown_selection_thread_index = null;
-        self.transcript_markdown_selection_message_index = null;
         self.transcript_markdown_selection_anchor = null;
         self.transcript_markdown_selection_focus = null;
         self.transcript_markdown_selection_dragging = false;

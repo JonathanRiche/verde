@@ -24,6 +24,31 @@ const WorkspaceLayout = struct {
     terminal_height: f32,
 };
 
+const TranscriptMarkdownCopyFrame = struct {
+    requested: bool,
+    builder: std.ArrayList(u8) = .empty,
+    copied_any: bool = false,
+
+    fn deinit(self: *TranscriptMarkdownCopyFrame, allocator: std.mem.Allocator) void {
+        self.builder.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn append(self: *TranscriptMarkdownCopyFrame, allocator: std.mem.Allocator, text: []const u8) void {
+        if (text.len == 0) return;
+        if (self.copied_any) {
+            self.builder.appendSlice(allocator, "\n\n") catch return;
+        }
+        self.builder.appendSlice(allocator, text) catch return;
+        self.copied_any = true;
+    }
+};
+
+const OrderedTranscriptMarkdownSelection = struct {
+    start: app_state.TranscriptMarkdownSelectionPoint,
+    end: app_state.TranscriptMarkdownSelectionPoint,
+};
+
 // Renders the transcript, composer, and any bottom-docked workspace panels.
 fn inner_workspace(state: *app_state.AppState) void {
     //INNER UI FOR CHAT WORKSPACE
@@ -762,12 +787,18 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         },
     });
 
+    const ctrl_pressed = zgui.isKeyDown(.left_ctrl) or zgui.isKeyDown(.right_ctrl);
+    var markdown_copy_frame: TranscriptMarkdownCopyFrame = .{
+        .requested = ctrl_pressed and zgui.isKeyPressed(.c, false) and state.transcriptMarkdownSelectionActive(),
+    };
+    defer markdown_copy_frame.deinit(std.heap.page_allocator);
+
     if (state.currentThread().messages.items.len == 0 and !has_pending_stream) {
         zgui.textColored(theme.COLOR_WHITE, "No messages yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
     } else {
         for (state.currentThread().messages.items, 0..) |message, index| {
-            renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image);
+            renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image, &markdown_copy_frame);
             zgui.dummy(.{ .w = 0.0, .h = 10.0 });
         }
 
@@ -778,6 +809,14 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
             renderPendingApproval(state);
             renderPendingFollowup(state);
             zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+        }
+    }
+
+    if (markdown_copy_frame.requested and markdown_copy_frame.copied_any) {
+        const copied = std.heap.page_allocator.dupeZ(u8, markdown_copy_frame.builder.items) catch null;
+        if (copied) |text| {
+            defer std.heap.page_allocator.free(text);
+            zgui.setClipboardText(text);
         }
     }
 
@@ -881,7 +920,7 @@ fn renderPendingTimelineEvents(state: *app_state.AppState) void {
     if (send_state.status != .pending) return;
 
     for (send_state.pending_events.items, 0..) |event, index| {
-        renderTranscriptMessage(state, @intCast(50_000 + index), null, event.role, event.author, event.body, null);
+        renderTranscriptMessage(state, @intCast(50_000 + index), null, event.role, event.author, event.body, null, null);
         zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     }
 }
@@ -969,6 +1008,7 @@ fn renderTranscriptMessage(
     author: []const u8,
     body: []const u8,
     image: ?app_state.ChatImageAttachment,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
 ) void {
     if (role == .system and std.mem.eql(u8, author, "Changed files")) {
         if (state.currentThread().provider == .opencode) return;
@@ -1016,7 +1056,7 @@ fn renderTranscriptMessage(
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    renderTranscriptBody(state, message_index, role, body, false);
+    renderTranscriptBody(state, message_index, role, body, false, markdown_copy_frame);
 }
 
 /// Draws a generic transcript bubble with optional muted body text.
@@ -1064,17 +1104,17 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    renderTranscriptBody(state, null, role, body, muted_body);
+    renderTranscriptBody(state, null, role, body, muted_body, null);
 }
 
-fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool) void {
+fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame) void {
     if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
         renderCodexFileReferenceBody(state, body);
         return;
     }
 
     if (message_index) |index| {
-        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, body)) {
+        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame)) {
             return;
         }
         if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
@@ -1156,84 +1196,121 @@ fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index
     return true;
 }
 
-fn renderSelectableMarkdownTranscriptBody(state: *app_state.AppState, message_index: usize, body: []const u8) bool {
+fn transcriptMarkdownSelectionPointLessThan(lhs: app_state.TranscriptMarkdownSelectionPoint, rhs: app_state.TranscriptMarkdownSelectionPoint) bool {
+    if (lhs.message_index != rhs.message_index) return lhs.message_index < rhs.message_index;
+    return lhs.point.line_index < rhs.point.line_index or
+        (lhs.point.line_index == rhs.point.line_index and lhs.point.column < rhs.point.column);
+}
+
+fn orderedTranscriptMarkdownSelection(selection: app_state.TranscriptMarkdownSelection) OrderedTranscriptMarkdownSelection {
+    if (transcriptMarkdownSelectionPointLessThan(selection.focus, selection.anchor)) {
+        return .{
+            .start = selection.focus,
+            .end = selection.anchor,
+        };
+    }
+    return .{
+        .start = selection.anchor,
+        .end = selection.focus,
+    };
+}
+
+fn localTranscriptMarkdownSelectionForMessage(
+    selection: ?app_state.TranscriptMarkdownSelection,
+    message_index: usize,
+    bounds: ?chat_markdown.SelectionBounds,
+) ?chat_markdown.SelectionRange {
+    const active = selection orelse return null;
+    const message_bounds = bounds orelse return null;
+    const ordered = orderedTranscriptMarkdownSelection(active);
+    if (message_index < ordered.start.message_index or message_index > ordered.end.message_index) return null;
+
+    return .{
+        .anchor = if (message_index == ordered.start.message_index) ordered.start.point else message_bounds.first,
+        .focus = if (message_index == ordered.end.message_index) ordered.end.point else message_bounds.last,
+    };
+}
+
+fn renderSelectableMarkdownTranscriptBody(
+    state: *app_state.AppState,
+    message_index: usize,
+    body: []const u8,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+) bool {
     var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch return false;
     defer view.deinit(std.heap.page_allocator);
 
-    const selection = state.transcriptMarkdownSelectionForMessage(message_index);
-    const selection_active = state.transcriptMarkdownSelectionActiveForMessage(message_index);
-    const ctrl_pressed = zgui.isKeyDown(.left_ctrl) or zgui.isKeyDown(.right_ctrl);
-    const copy_selection = selection_active and ctrl_pressed and zgui.isKeyPressed(.c, false);
-    const select_all_requested = ctrl_pressed and zgui.isKeyPressed(.a, false);
     const style = zgui.getStyle();
+    const options: chat_markdown.RenderOptions = .{
+        .heading_font = theme.heading_font,
+        .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
+        .bold_font = theme.bold_font,
+        .italic_font = theme.italic_font,
+        .bold_italic_font = theme.bold_italic_font,
+        .code_font = theme.terminal_font,
+        .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
+    };
+    const bounds = chat_markdown.measureSelectableBounds(std.heap.page_allocator, view, options);
+    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index, bounds);
+    const selection_active = selection != null;
+    const ctrl_pressed = zgui.isKeyDown(.left_ctrl) or zgui.isKeyDown(.right_ctrl);
+    const select_all_requested = ctrl_pressed and zgui.isKeyPressed(.a, false);
+    const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
 
     zgui.pushIntId(@intCast(message_index + 1));
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ style.item_spacing[0], 0.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
     defer {
-        zgui.popStyleColor(.{ .count = 1 });
         zgui.popStyleVar(.{ .count = 2 });
         zgui.popId();
     }
 
-    _ = zgui.beginChild("##selectable-markdown-body", .{
-        .w = 0.0,
-        .h = 0.0,
-        .child_flags = .{
-            .auto_resize_y = true,
-        },
-        .window_flags = .{
-            .no_scrollbar = true,
-            .no_scroll_with_mouse = true,
-            .no_saved_settings = true,
-            .no_move = true,
-        },
-    });
-    defer zgui.endChild();
-
+    const body_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    const body_start = zgui.getCursorScreenPos();
     var result = chat_markdown.renderSelectableBody(
         std.heap.page_allocator,
         view,
-        .{
-            .heading_font = theme.heading_font,
-            .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
-            .bold_font = theme.bold_font,
-            .italic_font = theme.italic_font,
-            .bold_italic_font = theme.bold_italic_font,
-            .code_font = theme.terminal_font,
-            .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
-        },
+        options,
         selection,
         copy_selection,
     );
     defer result.deinit(std.heap.page_allocator);
 
-    if (result.hovered) {
+    const body_end = zgui.getCursorScreenPos();
+    const body_height = @max(body_end[1] - body_start[1], zgui.getTextLineHeight());
+    zgui.setCursorScreenPos(body_start);
+    _ = zgui.invisibleButton("##selectable-markdown-hitbox", .{ .w = body_width, .h = body_height });
+    const body_hovered = zgui.isItemHovered(.{});
+    const body_active = zgui.isItemActive();
+    zgui.setCursorScreenPos(body_end);
+
+    if (body_hovered or body_active) {
         zgui.setMouseCursor(.text_input);
     }
-    if (zgui.isMouseClicked(.left)) {
+    if (zgui.isItemActivated()) {
         if (result.hovered_point) |point| {
             state.beginTranscriptMarkdownSelection(message_index, point);
-        } else if (result.hovered) {
+        } else if (body_hovered) {
             state.clearTranscriptMarkdownSelection();
         }
-    } else if (selection_active and state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
-        if (result.hovered_point) |point| {
-            state.updateTranscriptMarkdownSelection(point);
-        }
-    }
-
-    if (select_all_requested and (selection_active or result.hovered)) {
-        if (result.first_point) |first| {
-            if (result.last_point) |last| {
-                state.selectAllTranscriptMarkdownSelection(message_index, first, last);
+    } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
+        if (body_hovered or body_active) {
+            if (result.hovered_point) |point| {
+                state.updateTranscriptMarkdownSelection(message_index, point);
             }
         }
     }
+
+    if (select_all_requested and (body_hovered or body_active or selection_active)) {
+        if (bounds) |message_bounds| {
+            state.selectAllTranscriptMarkdownSelection(message_index, message_bounds.first, message_index, message_bounds.last);
+        }
+    }
     if (copy_selection) {
-        if (result.copied_text) |copied| {
-            zgui.setClipboardText(copied);
+        if (markdown_copy_frame) |frame| {
+            if (result.copied_text) |copied| {
+                frame.append(std.heap.page_allocator, copied);
+            }
         }
     }
 

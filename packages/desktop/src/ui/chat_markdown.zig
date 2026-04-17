@@ -29,6 +29,11 @@ pub const SelectionRange = struct {
     focus: SelectionPoint,
 };
 
+pub const SelectionBounds = struct {
+    first: SelectionPoint,
+    last: SelectionPoint,
+};
+
 pub const SelectionRenderOutput = struct {
     hovered: bool = false,
     hovered_point: ?SelectionPoint = null,
@@ -277,6 +282,43 @@ pub fn renderBody(view: BodyView, options: RenderOptions) void {
     }
 }
 
+pub fn measureSelectableBounds(allocator: Allocator, view: BodyView, options: RenderOptions) ?SelectionBounds {
+    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+
+    var output: SelectionRenderOutput = .{};
+    var global_line_index: usize = 0;
+    var previous: ?BlockView = null;
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                noteSelectableLineBounds(&output, global_line_index, 0);
+                global_line_index += 1;
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                noteSelectableLineBounds(&output, global_line_index, 0);
+                global_line_index += 1;
+            },
+            .text => |text_block| {
+                measureSelectableTextBlockBounds(allocator, &output, &global_line_index, text_block, available_width, options) catch return null;
+            },
+            .fenced_code, .thematic_break => {},
+        }
+
+        previous = block;
+    }
+
+    const first = output.first_point orelse return null;
+    const last = output.last_point orelse return null;
+    return .{
+        .first = first,
+        .last = last,
+    };
+}
+
 /// Measures a parsed markdown body using the current font metrics and code font options.
 pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOptions) f32 {
     const width = @max(available_width, 1.0);
@@ -327,6 +369,7 @@ pub fn renderSelectableBody(
             if (prior.kind() != .blank and block.kind() != .blank) {
                 const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap() else blockGap();
                 renderSelectableBlankLine(
+                    allocator,
                     &output,
                     ordered_selection,
                     copy_selection,
@@ -344,6 +387,7 @@ pub fn renderSelectableBody(
         switch (block) {
             .blank => {
                 renderSelectableBlankLine(
+                    allocator,
                     &output,
                     ordered_selection,
                     copy_selection,
@@ -1268,6 +1312,7 @@ fn hoveredColumnForLine(line: SelectableLine, local_x: f32) usize {
 }
 
 fn renderSelectableLine(
+    allocator: Allocator,
     draw_list: anytype,
     output: *SelectionRenderOutput,
     selection: ?OrderedSelection,
@@ -1315,7 +1360,7 @@ fn renderSelectableLine(
 
             if (copy_selection) {
                 if (copied_any_line.*) {
-                    copy_builder.append(copy_builder.allocator, '\n') catch {};
+                    copy_builder.append(allocator, '\n') catch {};
                 } else {
                     copied_any_line.* = true;
                 }
@@ -1323,7 +1368,7 @@ fn renderSelectableLine(
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
                     if (chunk_start >= chunk_end) continue;
-                    copy_builder.appendSlice(copy_builder.allocator, sliceForColumns(chunk.text, chunk_start - chunk.start_column, chunk_end - chunk.start_column)) catch {};
+                    copy_builder.appendSlice(allocator, sliceForColumns(chunk.text, chunk_start - chunk.start_column, chunk_end - chunk.start_column)) catch {};
                 }
             }
         }
@@ -1344,6 +1389,7 @@ fn renderSelectableLine(
 }
 
 fn renderSelectableBlankLine(
+    allocator: Allocator,
     output: *SelectionRenderOutput,
     selection: ?OrderedSelection,
     copy_selection: bool,
@@ -1359,16 +1405,37 @@ fn renderSelectableBlankLine(
     if (hovered and output.hovered_point == null and mouse_pos[1] >= start[1] and mouse_pos[1] <= start[1] + height) {
         output.hovered_point = .{ .line_index = line_index, .column = 0 };
     }
-    if (copy_selection and selection) |ordered| {
-        if (selectionColumnsForLine(ordered, line_index, 0) != null) {
-            if (copied_any_line.*) {
-                copy_builder.append(copy_builder.allocator, '\n') catch {};
-            } else {
-                copied_any_line.* = true;
+    if (copy_selection) {
+        if (selection) |ordered| {
+            if (selectionColumnsForLine(ordered, line_index, 0) != null) {
+                if (copied_any_line.*) {
+                    copy_builder.append(allocator, '\n') catch {};
+                } else {
+                    copied_any_line.* = true;
+                }
             }
         }
     }
     zgui.dummy(.{ .w = 0.0, .h = height });
+}
+
+fn measureSelectableTextBlockBounds(
+    allocator: Allocator,
+    output: *SelectionRenderOutput,
+    global_line_index: *usize,
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) !void {
+    const indent = indentWidth(block.indent);
+    const width = @max(available_width - indent, 1.0);
+    const lines = try buildSelectableTextLines(allocator, block, width, options);
+    defer deinitSelectableLines(allocator, lines);
+
+    for (lines) |line| {
+        noteSelectableLineBounds(output, global_line_index.*, line.total_columns);
+        global_line_index.* += 1;
+    }
 }
 
 fn renderSelectableTextBlock(
@@ -1399,6 +1466,7 @@ fn renderSelectableTextBlock(
     var height: f32 = 0.0;
     for (lines, 0..) |line, index| {
         renderSelectableLine(
+            allocator,
             draw_list,
             output,
             selection,
