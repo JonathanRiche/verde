@@ -3875,9 +3875,8 @@ pub const AppState = struct {
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
-        self.clearTranscriptSelectableEntries();
-        self.transcript_selectable_entries.deinit(self.allocator);
         self.clearProjects();
+        self.transcript_selectable_entries.deinit(self.allocator);
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
