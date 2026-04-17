@@ -1095,7 +1095,32 @@ fn renderMarkdownTranscriptBody(body: []const u8) bool {
 }
 
 fn shouldRenderCodexFileReferenceBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) bool {
-    return !muted_body and role == .assistant and state.currentThread().provider == .codex and std.mem.indexOf(u8, body, "](/") != null;
+    return !muted_body and
+        role == .assistant and
+        state.currentThread().provider == .codex and
+        std.mem.indexOf(u8, body, "](/") != null and
+        !bodyLikelyUsesMarkdownBlocks(body);
+}
+
+fn bodyLikelyUsesMarkdownBlocks(body: []const u8) bool {
+    if (std.mem.indexOf(u8, body, "```") != null) return true;
+    if (std.mem.indexOf(u8, body, "\n~~~") != null) return true;
+    if (std.mem.indexOf(u8, body, "\n- ") != null) return true;
+    if (std.mem.indexOf(u8, body, "\n* ") != null) return true;
+    if (std.mem.indexOf(u8, body, "\n> ") != null) return true;
+    if (std.mem.indexOf(u8, body, "\n#") != null) return true;
+
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (std.ascii.isDigit(trimmed[0])) {
+            var index: usize = 1;
+            while (index < trimmed.len and std.ascii.isDigit(trimmed[index])) : (index += 1) {}
+            if (index < trimmed.len - 1 and trimmed[index] == '.' and trimmed[index + 1] == ' ') return true;
+        }
+    }
+    return false;
 }
 
 const CodexFileReference = struct {
