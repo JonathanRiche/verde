@@ -1092,17 +1092,11 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role:
 }
 
 fn shouldRenderSelectablePlainTranscriptBody(body: []const u8, muted_body: bool) bool {
-    if (muted_body) return true;
-    if (body.len == 0) return false;
-    if (std.mem.indexOfAny(u8, body, "`") != null) return false;
-    if (std.mem.indexOf(u8, body, "**") != null) return false;
-    if (std.mem.indexOf(u8, body, "__") != null) return false;
-    if (std.mem.indexOf(u8, body, "*") != null) return false;
-    if (std.mem.indexOf(u8, body, "[") != null) return false;
-    if (std.mem.indexOf(u8, body, "](") != null) return false;
-    if (std.mem.indexOf(u8, body, "\n#") != null) return false;
-    if (std.mem.indexOf(u8, body, "\n> ") != null) return false;
-    return true;
+    _ = body;
+    _ = muted_body;
+    // Disabled until transcript selection uses our own layout model instead of
+    // the vendor word-wrap path, which is unstable on the current ImGui build.
+    return false;
 }
 
 fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index: usize, body: []const u8, muted_body: bool) bool {
