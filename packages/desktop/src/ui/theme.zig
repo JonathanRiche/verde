@@ -70,6 +70,9 @@ pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
 
 pub var heading_font: ?zgui.Font = null;
 pub var terminal_font: ?zgui.Font = null;
+pub var bold_font: ?zgui.Font = null;
+pub var italic_font: ?zgui.Font = null;
+pub var bold_italic_font: ?zgui.Font = null;
 // pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
 
 pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 2.22;
@@ -149,11 +152,28 @@ fn terminalFontCandidates() []const [:0]const u8 {
 }
 
 /// Installs the default, icon, and heading fonts for the native UI.
-pub fn installFonts(font_bytes: []const u8, codicon_font_bytes: []const u8, nerd_font_bytes: []const u8, font_size: f32) void {
+pub fn installFonts(
+    font_bytes: []const u8,
+    bold_font_bytes: []const u8,
+    italic_font_bytes: []const u8,
+    bold_italic_font_bytes: []const u8,
+    codicon_font_bytes: []const u8,
+    nerd_font_bytes: []const u8,
+    font_size: f32,
+) void {
     const font = zgui.io.addFontFromMemory(font_bytes, font_size);
     mergeIconFont(codicon_font_bytes, font_size, codicon_glyph_ranges[0..]);
     mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
     zgui.io.setDefaultFont(font);
+    bold_font = zgui.io.addFontFromMemory(bold_font_bytes, font_size);
+    mergeIconFont(codicon_font_bytes, font_size, codicon_glyph_ranges[0..]);
+    mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
+    italic_font = zgui.io.addFontFromMemory(italic_font_bytes, font_size);
+    mergeIconFont(codicon_font_bytes, font_size, codicon_glyph_ranges[0..]);
+    mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
+    bold_italic_font = zgui.io.addFontFromMemory(bold_italic_font_bytes, font_size);
+    mergeIconFont(codicon_font_bytes, font_size, codicon_glyph_ranges[0..]);
+    mergeIconFont(nerd_font_bytes, font_size, nerd_font_glyph_ranges[0..]);
     heading_font_size = font_size * 1.28;
     heading_font = zgui.io.addFontFromMemory(font_bytes, heading_font_size);
     mergeIconFont(codicon_font_bytes, heading_font_size, codicon_glyph_ranges[0..]);

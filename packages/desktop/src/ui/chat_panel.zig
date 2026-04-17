@@ -1090,6 +1090,9 @@ fn renderMarkdownTranscriptBody(body: []const u8) bool {
     chat_markdown.renderBody(view, .{
         .heading_font = theme.heading_font,
         .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
+        .bold_font = theme.bold_font,
+        .italic_font = theme.italic_font,
+        .bold_italic_font = theme.bold_italic_font,
         .code_font = theme.terminal_font,
         .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
     });
@@ -2716,6 +2719,9 @@ fn measureMarkdownTranscriptBodyHeight(body: []const u8, inner_width: f32) f32 {
     return chat_markdown.measureBodyHeight(view, inner_width, .{
         .heading_font = theme.heading_font,
         .heading_font_size = if (theme.heading_font != null) theme.heading_font_size else null,
+        .bold_font = theme.bold_font,
+        .italic_font = theme.italic_font,
+        .bold_italic_font = theme.bold_italic_font,
         .code_font = theme.terminal_font,
         .code_font_size = if (theme.terminal_font != null) theme.terminal_font_size else null,
     });
