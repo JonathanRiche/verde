@@ -4,7 +4,6 @@ const std = @import("std");
 
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
-
 const colors = @import("colors.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
@@ -768,7 +767,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
     } else {
         for (state.currentThread().messages.items, 0..) |message, index| {
-            renderTranscriptMessage(state, @intCast(index + 1), message.role, message.author, message.body, message.image);
+            renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image);
             zgui.dummy(.{ .w = 0.0, .h = 10.0 });
         }
 
@@ -879,7 +878,7 @@ fn renderPendingTimelineEvents(state: *app_state.AppState) void {
     if (send_state.status != .pending) return;
 
     for (send_state.pending_events.items, 0..) |event, index| {
-        renderTranscriptMessage(state, @intCast(50_000 + index), event.role, event.author, event.body, null);
+        renderTranscriptMessage(state, @intCast(50_000 + index), null, event.role, event.author, event.body, null);
         zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     }
 }
@@ -962,6 +961,7 @@ fn renderPendingTranscriptBubble(state: *app_state.AppState) void {
 fn renderTranscriptMessage(
     state: *app_state.AppState,
     id: u32,
+    message_index: ?usize,
     role: app_state.ChatRole,
     author: []const u8,
     body: []const u8,
@@ -1013,7 +1013,7 @@ fn renderTranscriptMessage(
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    renderTranscriptBody(state, role, body, false);
+    renderTranscriptBody(state, message_index, role, body, false);
 }
 
 /// Draws a generic transcript bubble with optional muted body text.
@@ -1061,13 +1061,21 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    renderTranscriptBody(state, role, body, muted_body);
+    renderTranscriptBody(state, null, role, body, muted_body);
 }
 
-fn renderTranscriptBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) void {
+fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool) void {
     if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
         renderCodexFileReferenceBody(state, body);
         return;
+    }
+
+    if (message_index) |index| {
+        if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
+            if (renderSelectablePlainTranscriptBody(state, index, body, muted_body)) {
+                return;
+            }
+        }
     }
 
     if (!muted_body and renderMarkdownTranscriptBody(body)) {
@@ -1081,6 +1089,71 @@ fn renderTranscriptBody(state: *app_state.AppState, role: anytype, body: []const
     } else {
         zgui.textWrapped("{s}", .{body});
     }
+}
+
+fn shouldRenderSelectablePlainTranscriptBody(body: []const u8, muted_body: bool) bool {
+    if (muted_body) return true;
+    if (body.len == 0) return false;
+    if (std.mem.indexOfAny(u8, body, "`") != null) return false;
+    if (std.mem.indexOf(u8, body, "**") != null) return false;
+    if (std.mem.indexOf(u8, body, "__") != null) return false;
+    if (std.mem.indexOf(u8, body, "*") != null) return false;
+    if (std.mem.indexOf(u8, body, "[") != null) return false;
+    if (std.mem.indexOf(u8, body, "](") != null) return false;
+    if (std.mem.indexOf(u8, body, "\n#") != null) return false;
+    if (std.mem.indexOf(u8, body, "\n> ") != null) return false;
+    return true;
+}
+
+fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index: usize, body: []const u8, muted_body: bool) bool {
+    const selector = state.transcriptBodyTextSelector(message_index, body) orelse return false;
+    const line_count = state.transcriptBodyTextLineCount(message_index, body);
+    if (line_count == 0) return false;
+
+    const style = zgui.getStyle();
+    zgui.pushIntId(@intCast(message_index + 1));
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
+    zgui.pushStyleVar2f(.{ .idx = .item_spacing, .v = .{ style.item_spacing[0], 0.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(0, 0, 0, 0) });
+    defer {
+        zgui.popStyleColor(.{ .count = 1 });
+        zgui.popStyleVar(.{ .count = 2 });
+        zgui.popId();
+    }
+
+    _ = zgui.beginChild("##selectable-transcript-body", .{
+        .w = 0.0,
+        .h = 0.0,
+        .child_flags = .{
+            .auto_resize_y = true,
+        },
+        .window_flags = .{
+            .no_scrollbar = true,
+            .no_scroll_with_mouse = true,
+            .no_saved_settings = true,
+            .no_move = true,
+        },
+    });
+    defer zgui.endChild();
+
+    zgui.pushTextWrapPos(0.0);
+    defer zgui.popTextWrapPos();
+
+    for (0..line_count) |line_index| {
+        const line = state.transcriptBodyTextLineAt(message_index, body, line_index);
+        if (line.len == 0) {
+            zgui.dummy(.{ .w = 0.0, .h = zgui.getTextLineHeight() });
+            continue;
+        }
+        if (muted_body) {
+            zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{line});
+        } else {
+            zgui.textWrapped("{s}", .{line});
+        }
+    }
+
+    selector.update();
+    return true;
 }
 
 fn renderMarkdownTranscriptBody(body: []const u8) bool {
