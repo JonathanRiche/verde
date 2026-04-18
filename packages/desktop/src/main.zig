@@ -349,11 +349,12 @@ fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Nati
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.hasAnyPendingSends() or
         state.isPickerPending() or
-        state.hasVisibleTerminalSessions();
+        state.hasVisibleTerminalSessions() or
+        state.transcriptMarkdownSelectionDragging();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
