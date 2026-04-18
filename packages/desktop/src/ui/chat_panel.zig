@@ -1148,18 +1148,14 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
 }
 
 fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool, bubble_hovered: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame, markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame) void {
+    _ = bubble_hovered;
     if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
         renderCodexFileReferenceBody(state, body);
         return;
     }
 
     if (message_index) |index| {
-        const thread_selection = state.transcriptMarkdownSelection();
-        const local_selection = if (!muted_body) localTranscriptMarkdownSelectionForMessage(thread_selection, index) else null;
-        const use_selectable_markdown = !muted_body and (bubble_hovered or
-            local_selection != null or
-            (markdown_select_all_frame != null and markdown_select_all_frame.?.requested));
-        if (use_selectable_markdown and renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
             return;
         }
         if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
