@@ -312,7 +312,7 @@ pub fn renderSelectableBody(
 ) SelectionRenderOutput {
     const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
     const mouse_pos = zgui.getMousePos();
-    const hovered = zgui.isWindowHovered(.{});
+    const hovered = zgui.isWindowHovered(.{ .allow_when_blocked_by_active_item = true });
     const ordered_selection = if (selection) |active| orderSelection(active) else null;
 
     var output: SelectionRenderOutput = .{ .hovered = hovered };
