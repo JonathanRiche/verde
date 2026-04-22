@@ -277,6 +277,71 @@ pub fn renderBody(view: BodyView, options: RenderOptions) void {
     }
 }
 
+pub fn selectionRangeForClickCount(
+    allocator: Allocator,
+    view: BodyView,
+    available_width: f32,
+    options: RenderOptions,
+    point: SelectionPoint,
+    click_count: usize,
+) ?SelectionRange {
+    if (click_count < 2) return null;
+
+    const width = @max(available_width, 1.0);
+    var global_line_index: usize = 0;
+    var previous: ?BlockView = null;
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                if (global_line_index == point.line_index) {
+                    return if (click_count >= 3)
+                        .{
+                            .anchor = .{ .line_index = point.line_index, .column = 0 },
+                            .focus = .{ .line_index = point.line_index, .column = 0 },
+                        }
+                    else
+                        null;
+                }
+                global_line_index += 1;
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                if (global_line_index == point.line_index) {
+                    return if (click_count >= 3)
+                        .{
+                            .anchor = .{ .line_index = point.line_index, .column = 0 },
+                            .focus = .{ .line_index = point.line_index, .column = 0 },
+                        }
+                    else
+                        null;
+                }
+                global_line_index += 1;
+            },
+            .text => |text_block| {
+                const indent = indentWidth(text_block.indent);
+                const line_width = @max(width - indent, 1.0);
+                const lines = buildSelectableTextLines(allocator, text_block, line_width, options) catch return null;
+                defer deinitSelectableLines(allocator, lines);
+
+                for (lines) |line| {
+                    if (global_line_index == point.line_index) {
+                        return selectionRangeForSelectableLine(allocator, point.line_index, line, point.column, click_count);
+                    }
+                    global_line_index += 1;
+                }
+            },
+            .fenced_code, .thematic_break => {},
+        }
+
+        previous = block;
+    }
+
+    return null;
+}
+
 /// Measures a parsed markdown body using the current font metrics and code font options.
 pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOptions) f32 {
     const width = @max(available_width, 1.0);
@@ -1135,9 +1200,102 @@ fn columnForX(spec: FontSpec, text: []const u8, x: f32) usize {
     return if (@abs(x - current_width) <= @abs(next_width - x)) low else low + 1;
 }
 
+const ClickSelectionClass = enum {
+    whitespace,
+    word,
+    other,
+};
+
+const ClickSelectionCodepoint = struct {
+    start_byte: usize,
+    end_byte: usize,
+    class: ClickSelectionClass,
+};
+
 fn deinitSelectableLines(allocator: Allocator, lines: []SelectableLine) void {
     for (lines) |line| allocator.free(line.chunks);
     allocator.free(lines);
+}
+
+fn clickSelectionClass(text: []const u8) ClickSelectionClass {
+    if (text.len == 0) return .other;
+    if (text.len == 1) {
+        const byte = text[0];
+        if (std.ascii.isWhitespace(byte)) return .whitespace;
+        if (std.ascii.isAlphanumeric(byte) or byte == '_') return .word;
+        return .other;
+    }
+    return .word;
+}
+
+fn collectSelectableLineText(allocator: Allocator, line: SelectableLine) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    for (line.chunks) |chunk| {
+        try buffer.appendSlice(allocator, chunk.text);
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn selectionRangeForSelectableLine(
+    allocator: Allocator,
+    line_index: usize,
+    line: SelectableLine,
+    column: usize,
+    click_count: usize,
+) ?SelectionRange {
+    if (click_count >= 3) {
+        return .{
+            .anchor = .{ .line_index = line_index, .column = 0 },
+            .focus = .{ .line_index = line_index, .column = line.total_columns },
+        };
+    }
+    if (click_count < 2) return null;
+    if (line.total_columns == 0) {
+        return .{
+            .anchor = .{ .line_index = line_index, .column = 0 },
+            .focus = .{ .line_index = line_index, .column = 0 },
+        };
+    }
+
+    const line_text = collectSelectableLineText(allocator, line) catch return null;
+    defer allocator.free(line_text);
+
+    var codepoints = std.ArrayList(ClickSelectionCodepoint).empty;
+    defer codepoints.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < line_text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(line_text[index]) catch return null;
+        const next = @min(index + width, line_text.len);
+        codepoints.append(allocator, .{
+            .start_byte = index,
+            .end_byte = next,
+            .class = clickSelectionClass(line_text[index..next]),
+        }) catch return null;
+        index = next;
+    }
+
+    if (codepoints.items.len == 0) {
+        return .{
+            .anchor = .{ .line_index = line_index, .column = 0 },
+            .focus = .{ .line_index = line_index, .column = 0 },
+        };
+    }
+
+    const target_column = if (column >= codepoints.items.len) codepoints.items.len - 1 else column;
+    const target_class = codepoints.items[target_column].class;
+
+    var start_column = target_column;
+    while (start_column > 0 and codepoints.items[start_column - 1].class == target_class) : (start_column -= 1) {}
+
+    var end_column = target_column + 1;
+    while (end_column < codepoints.items.len and codepoints.items[end_column].class == target_class) : (end_column += 1) {}
+
+    return .{
+        .anchor = .{ .line_index = line_index, .column = start_column },
+        .focus = .{ .line_index = line_index, .column = end_column },
+    };
 }
 
 fn buildSelectableTextLines(

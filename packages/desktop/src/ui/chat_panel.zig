@@ -1338,14 +1338,20 @@ fn renderSelectableMarkdownTranscriptBody(
     _ = zgui.invisibleButton("##selectable-markdown-hitbox", .{ .w = body_width, .h = body_height });
     const body_hovered = zgui.isItemHovered(.{});
     const body_active = zgui.isItemActive();
+    const body_activated = zgui.isItemActivated();
+    const click_count: usize = if (body_activated) @intCast(@max(zgui.getMouseClickedCount(.left), 0)) else 0;
     zgui.setCursorScreenPos(body_end);
 
     if (body_hovered or body_active) {
         zgui.setMouseCursor(.text_input);
     }
-    if (zgui.isItemActivated()) {
+    if (body_activated) {
         if (result.hovered_point) |point| {
-            state.beginTranscriptMarkdownSelection(message_index, point);
+            if (chat_markdown.selectionRangeForClickCount(std.heap.page_allocator, view, body_width, options, point, click_count)) |expanded| {
+                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+            } else {
+                state.beginTranscriptMarkdownSelection(message_index, point);
+            }
         } else if (body_hovered) {
             state.clearTranscriptMarkdownSelection();
         }
