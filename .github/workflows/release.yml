@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
