@@ -12,6 +12,7 @@ const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
+const MAX_CONNECT_WAIT_ATTEMPTS = 30;
 
 pub const Transport = enum(u8) {
     websocket,
@@ -26,11 +27,17 @@ pub const Config = struct {
     launch_on_connect: bool = true,
 };
 
+const SharedServerState = struct {
+    mutex: std.Thread.Mutex = .{},
+    child: ?std.process.Child = null,
+    owns_child: bool = false,
+};
+
+var shared_server_state: SharedServerState = .{};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    child: ?std.process.Child = null,
-    owns_child: bool = false,
     stream: ?std.net.Stream = null,
     initialized: bool = false,
     next_request_id: u64 = 1,
@@ -47,7 +54,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        self.closeConnection();
+        self.closeStream();
         self.freeLoadedThreads();
         self.loaded_threads.deinit();
     }
@@ -258,7 +265,7 @@ pub const Client = struct {
         }
     }
 
-    fn closeConnection(self: *Client) void {
+    fn closeStream(self: *Client) void {
         if (self.stream) |stream| {
             self.writeCloseFrame(stream) catch {};
             stream.close();
@@ -266,15 +273,6 @@ pub const Client = struct {
         }
 
         self.initialized = false;
-
-        if (self.child) |*child| {
-            if (self.owns_child) {
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
-            }
-            self.child = null;
-            self.owns_child = false;
-        }
     }
 
     fn connectWebSocket(self: *Client) !void {
@@ -290,20 +288,54 @@ pub const Client = struct {
             return error.UnsupportedWebSocketScheme;
         }
 
-        if (self.config.launch_on_connect) {
-            try self.spawnWebSocketServer(raw_url);
+        const port = uri.port orelse 80;
+        if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            self.stream = stream;
+            return;
         }
 
-        const port = uri.port orelse 80;
-        const stream = try self.connectWithRetry(host, port);
-        errdefer stream.close();
+        if (!self.config.launch_on_connect) {
+            return error.NotConnected;
+        }
 
-        try self.performWebSocketHandshake(stream, uri, host, port);
-        self.stream = stream;
+        shared_server_state.mutex.lock();
+        defer shared_server_state.mutex.unlock();
+
+        if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            self.stream = stream;
+            return;
+        }
+
+        if (shared_server_state.owns_child) {
+            if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+                self.stream = stream;
+                return;
+            }
+            stopOwnedServerLocked();
+            if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+                self.stream = stream;
+                return;
+            }
+        }
+
+        try self.spawnWebSocketServer(raw_url);
+
+        if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+            self.stream = stream;
+            return;
+        }
+
+        stopOwnedServerLocked();
+        if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            self.stream = stream;
+            return;
+        }
+
+        return error.NotConnected;
     }
 
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
-        if (self.child != null) return;
+        if (shared_server_state.child != null) return;
 
         var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
         defer env_map.deinit();
@@ -328,25 +360,39 @@ pub const Client = struct {
         child.env_map = null;
         child.argv = &.{};
 
-        self.child = child;
-        self.owns_child = true;
+        log.info("Codex app-server started pid={d} listen={s}", .{ child.id, url });
+        shared_server_state.child = child;
+        shared_server_state.owns_child = true;
     }
 
-    fn connectWithRetry(self: *Client, host: []const u8, port: u16) !std.net.Stream {
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            const result = std.net.tcpConnectToHost(self.allocator, host, port);
-            if (result) |stream| {
-                return stream;
-            } else |err| {
-                if (!self.owns_child or attempt >= 29) {
-                    return err;
-                }
+    fn tryConnectWebSocket(
+        self: *Client,
+        uri: std.Uri,
+        host: []const u8,
+        port: u16,
+    ) !?std.net.Stream {
+        const stream = std.net.tcpConnectToHost(self.allocator, host, port) catch return null;
+        errdefer stream.close();
 
-                const backoff_ms: u64 = @min(@as(u64, 50) * (@as(u64, 1) << @intCast(@min(attempt, 5))), 800);
-                std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+        try self.performWebSocketHandshake(stream, uri, host, port);
+        return stream;
+    }
+
+    fn waitForWebSocket(
+        self: *Client,
+        uri: std.Uri,
+        host: []const u8,
+        port: u16,
+        attempts: usize,
+    ) !?std.net.Stream {
+        var attempt: usize = 0;
+        while (attempt < attempts) : (attempt += 1) {
+            if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+                return stream;
             }
+            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
+        return null;
     }
 
     fn performWebSocketHandshake(
@@ -884,6 +930,24 @@ pub const Client = struct {
         }
     }
 };
+
+pub fn shutdownOwnedServer() void {
+    shared_server_state.mutex.lock();
+    defer shared_server_state.mutex.unlock();
+    stopOwnedServerLocked();
+}
+
+fn stopOwnedServerLocked() void {
+    if (shared_server_state.child) |*child| {
+        if (shared_server_state.owns_child) {
+            log.info("stopping owned Codex app-server pid={d}", .{child.id});
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
+        shared_server_state.child = null;
+        shared_server_state.owns_child = false;
+    }
+}
 
 const FrameOpcode = enum(u4) {
     continuation = 0,
