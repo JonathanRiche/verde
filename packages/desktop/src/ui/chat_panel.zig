@@ -1049,7 +1049,7 @@ fn renderTranscriptMessage(
 ) void {
     if (role == .system and std.mem.eql(u8, author, "Changed files")) {
         if (state.currentThread().provider == .opencode) return;
-        renderChangedFilesCardId(id, body);
+        renderChangedFilesCardId(state, id, message_index, body, markdown_copy_frame, markdown_select_all_frame);
         return;
     }
     if (role == .system and (std.mem.eql(u8, author, "Ran command") or std.mem.eql(u8, author, "Command failed"))) {
@@ -1275,6 +1275,184 @@ fn localTranscriptMarkdownSelectionForMessage(
     return .{
         .anchor = if (message_index == ordered.start.message_index) ordered.start.point else whole_message_start,
         .focus = if (message_index == ordered.end.message_index) ordered.end.point else whole_message_end,
+    };
+}
+
+fn renderSelectableMutedLineList(
+    state: *app_state.AppState,
+    message_index: usize,
+    lines: []const ChangedFilesSelectionLine,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) bool {
+    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
+    const selection_active = selection != null;
+    const ordered_selection = if (selection) |active| codexOrderSelection(active) else null;
+    const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
+
+    const draw_list = zgui.getWindowDrawList();
+    const start = zgui.getCursorScreenPos();
+    const mouse_pos = zgui.getMousePos();
+    const hovered = zgui.isWindowHovered(.{ .allow_when_blocked_by_active_item = true });
+    const line_height = zgui.getTextLineHeight();
+    var total_height: f32 = 0.0;
+
+    var hovered_point: ?chat_markdown.SelectionPoint = null;
+    var first_point: ?chat_markdown.SelectionPoint = null;
+    var last_point: ?chat_markdown.SelectionPoint = null;
+    var copy_builder = std.ArrayList(u8).empty;
+    defer if (copy_selection) copy_builder.deinit(std.heap.page_allocator);
+    var copied_any = false;
+
+    for (lines, 0..) |line, line_index| {
+        const top = start[1] + total_height;
+        const bottom = top + line_height;
+        const total_columns = codexCountColumns(line.text);
+        if (first_point == null) {
+            first_point = .{ .line_index = line_index, .column = 0 };
+        }
+        last_point = .{ .line_index = line_index, .column = total_columns };
+
+        if (hovered and hovered_point == null and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
+            hovered_point = .{
+                .line_index = line_index,
+                .column = codexColumnForX(line.text, mouse_pos[0] - start[0]),
+            };
+        }
+
+        if (ordered_selection) |ordered| {
+            if (codexSelectionColumnsForLine(ordered, line_index, total_columns)) |columns| {
+                if (columns.start != columns.end) {
+                    const x0 = start[0] + codexTextWidthForColumns(line.text, columns.start);
+                    const x1 = start[0] + codexTextWidthForColumns(line.text, columns.end);
+                    if (x1 > x0) {
+                        draw_list.addRectFilled(.{
+                            .pmin = .{ x0, top },
+                            .pmax = .{ x1, bottom },
+                            .col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72)),
+                            .rounding = 2.0,
+                        });
+                    }
+                }
+
+                if (copy_selection) {
+                    if (copied_any) {
+                        copy_builder.append(std.heap.page_allocator, '\n') catch {};
+                    } else {
+                        copied_any = true;
+                    }
+                    copy_builder.appendSlice(std.heap.page_allocator, codexSliceForColumns(line.text, columns.start, columns.end)) catch {};
+                }
+            }
+        }
+
+        if (line.text.len > 0) {
+            draw_list.addTextUnformatted(
+                .{ start[0], top },
+                zgui.colorConvertFloat4ToU32(line.color),
+                line.text,
+            );
+        }
+        total_height += line_height;
+    }
+
+    zgui.dummy(.{ .w = 0.0, .h = total_height });
+
+    if (hovered and hovered_point != null) {
+        zgui.setMouseCursor(.text_input);
+    }
+
+    if (hovered and zgui.isMouseClicked(.left)) {
+        if (hovered_point) |point| {
+            const click_count: usize = @intCast(@max(zgui.getMouseClickedCount(.left), 0));
+            if (simpleLineSelectionRangeForClickCount(std.heap.page_allocator, lines, point, click_count)) |expanded| {
+                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+            } else {
+                state.beginTranscriptMarkdownSelection(message_index, point);
+            }
+        } else {
+            state.clearTranscriptMarkdownSelection();
+        }
+    } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
+        if (hovered) {
+            if (hovered_point) |point| {
+                state.updateTranscriptMarkdownSelection(message_index, point);
+            }
+        }
+    }
+
+    if (markdown_select_all_frame) |frame| {
+        if (frame.requested) {
+            if (first_point) |first| {
+                if (last_point) |last| {
+                    frame.noteMessage(message_index, first, last);
+                }
+            }
+        }
+    }
+    if (copy_selection and copied_any) {
+        if (markdown_copy_frame) |frame| {
+            const copied = std.heap.page_allocator.dupeZ(u8, copy_builder.items) catch return true;
+            defer std.heap.page_allocator.free(copied);
+            frame.append(std.heap.page_allocator, copied);
+        }
+    }
+
+    return true;
+}
+
+fn simpleLineSelectionRangeForClickCount(
+    allocator: std.mem.Allocator,
+    lines: []const ChangedFilesSelectionLine,
+    point: chat_markdown.SelectionPoint,
+    click_count: usize,
+) ?chat_markdown.SelectionRange {
+    if (click_count < 2) return null;
+    if (point.line_index >= lines.len) return null;
+
+    const line = lines[point.line_index].text;
+    const total_columns = codexCountColumns(line);
+    if (click_count >= 3) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = total_columns },
+        };
+    }
+    if (total_columns == 0) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = 0 },
+        };
+    }
+
+    var codepoints = std.ArrayList(CodexClickSelectionClass).empty;
+    defer codepoints.deinit(allocator);
+    var index: usize = 0;
+    while (index < line.len) {
+        const width = std.unicode.utf8ByteSequenceLength(line[index]) catch return null;
+        const next = @min(index + width, line.len);
+        codepoints.append(allocator, codexClickSelectionClass(line[index..next])) catch return null;
+        index = next;
+    }
+
+    if (codepoints.items.len == 0) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = 0 },
+        };
+    }
+
+    const target_column = if (point.column >= codepoints.items.len) codepoints.items.len - 1 else point.column;
+    const target_class = codepoints.items[target_column];
+    var start_column = target_column;
+    while (start_column > 0 and codepoints.items[start_column - 1] == target_class) : (start_column -= 1) {}
+
+    var end_column = target_column + 1;
+    while (end_column < codepoints.items.len and codepoints.items[end_column] == target_class) : (end_column += 1) {}
+
+    return .{
+        .anchor = .{ .line_index = point.line_index, .column = start_column },
+        .focus = .{ .line_index = point.line_index, .column = end_column },
     };
 }
 
@@ -2400,7 +2578,14 @@ fn renderCommandEventRowId(
 }
 
 /// Renders a persisted changed-files message as a rich card.
-fn renderChangedFilesCardId(id: u32, body: []const u8) void {
+fn renderChangedFilesCardId(
+    state: *app_state.AppState,
+    id: u32,
+    message_index: ?usize,
+    body: []const u8,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) void {
     var entries = parseChangedFileEntries(body);
     const totals = summarizeChangedFiles(entries);
     const has_patch_details = changedFilesEntriesHavePatch(entries.items);
@@ -2443,6 +2628,14 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
     }
     zgui.dummy(.{ .w = 0.0, .h = 4.0 });
 
+    if (!has_patch_details) {
+        if (message_index) |index| {
+            if (renderSelectableChangedFilesSummary(state, index, entries.items, totals, markdown_copy_frame, markdown_select_all_frame)) {
+                return;
+            }
+        }
+    }
+
     if (has_patch_details) {
         for (entries.items, 0..) |entry, index| {
             renderChangedFilesDetailedEntry(entry, id, index, open_all, close_all);
@@ -2459,6 +2652,46 @@ fn renderChangedFilesCardId(id: u32, body: []const u8) void {
         }
         renderChangedFilesEntry(entry);
     }
+}
+
+const ChangedFilesSelectionLine = struct {
+    text: []const u8,
+    color: [4]f32,
+};
+
+fn renderSelectableChangedFilesSummary(
+    state: *app_state.AppState,
+    message_index: usize,
+    entries: []const runtime.ChangedFileEntry,
+    totals: struct { additions: i64, deletions: i64 },
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) bool {
+    var lines = std.ArrayList(ChangedFilesSelectionLine).empty;
+    defer lines.deinit(std.heap.page_allocator);
+    _ = totals;
+
+    var last_parent: ?[]const u8 = null;
+    for (entries) |entry| {
+        const parent = std.fs.path.dirname(entry.path) orelse ".";
+        if (last_parent == null or !std.mem.eql(u8, last_parent.?, parent)) {
+            const folder_line = std.fmt.allocPrint(std.heap.page_allocator, "v  {s}", .{parent}) catch return false;
+            defer std.heap.page_allocator.free(folder_line);
+            lines.append(std.heap.page_allocator, .{ .text = folder_line, .color = theme.COLOR_TEXT_MUTED }) catch return false;
+            last_parent = parent;
+        }
+
+        const file_name = std.fs.path.basename(entry.path);
+        const entry_line = std.fmt.allocPrint(std.heap.page_allocator, "    {s} +{d} / -{d}", .{
+            file_name,
+            entry.additions,
+            entry.deletions,
+        }) catch return false;
+        defer std.heap.page_allocator.free(entry_line);
+        lines.append(std.heap.page_allocator, .{ .text = entry_line, .color = theme.COLOR_TEXT_MUTED }) catch return false;
+    }
+
+    return renderSelectableMutedLineList(state, message_index, lines.items, markdown_copy_frame, markdown_select_all_frame);
 }
 
 /// Draws the header for changed-file summaries.
