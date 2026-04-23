@@ -328,12 +328,25 @@ pub fn selectionRangeForClickCount(
 
                 for (lines) |line| {
                     if (global_line_index == point.line_index) {
-                        return selectionRangeForSelectableLine(allocator, point.line_index, line, point.column, click_count);
+                        const line_text = collectSelectableLineText(allocator, line) catch return null;
+                        defer allocator.free(line_text);
+                        return selectionRangeForRawLine(allocator, point.line_index, line_text, line.total_columns, point.column, click_count);
                     }
                     global_line_index += 1;
                 }
             },
-            .fenced_code, .thematic_break => {},
+            .fenced_code => |code_block| {
+                const lines = buildSelectableCodeLines(allocator, code_block, options) catch return null;
+                defer deinitSelectableCodeLines(allocator, lines);
+
+                for (lines) |line| {
+                    if (global_line_index == point.line_index) {
+                        return selectionRangeForRawLine(allocator, point.line_index, line.text, line.total_columns, point.column, click_count);
+                    }
+                    global_line_index += 1;
+                }
+            },
+            .thematic_break => {},
         }
 
         previous = block;
@@ -440,7 +453,20 @@ pub fn renderSelectableBody(
                 ) catch renderTextBlock(text_block, available_width, options);
             },
             .fenced_code => |code_block| {
-                renderFencedCodeBlock(code_block, available_width, options);
+                renderSelectableCodeBlock(
+                    allocator,
+                    &output,
+                    ordered_selection,
+                    copy_selection,
+                    &copy_builder,
+                    &copied_any_line,
+                    mouse_pos,
+                    hovered,
+                    &global_line_index,
+                    code_block,
+                    available_width,
+                    options,
+                ) catch renderFencedCodeBlock(code_block, available_width, options);
             },
             .thematic_break => |rule| {
                 renderThematicBreakBlock(rule, available_width);
@@ -1119,6 +1145,24 @@ const SelectableLine = struct {
     chunks: []SelectableLineChunk,
 };
 
+const SelectableCodeLineChunk = struct {
+    text: []const u8,
+    token_kind: zig_dif.TokenKind,
+    font_spec: FontSpec,
+    x: f32,
+    width: f32,
+    start_column: usize,
+    end_column: usize,
+};
+
+const SelectableCodeLine = struct {
+    text: []const u8,
+    y: f32,
+    height: f32,
+    total_columns: usize,
+    chunks: []SelectableCodeLineChunk,
+};
+
 fn orderSelection(selection: SelectionRange) OrderedSelection {
     if (selectionPointLessThan(selection.focus, selection.anchor)) {
         return .{
@@ -1217,6 +1261,11 @@ fn deinitSelectableLines(allocator: Allocator, lines: []SelectableLine) void {
     allocator.free(lines);
 }
 
+fn deinitSelectableCodeLines(allocator: Allocator, lines: []SelectableCodeLine) void {
+    for (lines) |line| allocator.free(line.chunks);
+    allocator.free(lines);
+}
+
 fn clickSelectionClass(text: []const u8) ClickSelectionClass {
     if (text.len == 0) return .other;
     if (text.len == 1) {
@@ -1237,29 +1286,27 @@ fn collectSelectableLineText(allocator: Allocator, line: SelectableLine) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
-fn selectionRangeForSelectableLine(
+fn selectionRangeForRawLine(
     allocator: Allocator,
     line_index: usize,
-    line: SelectableLine,
+    line_text: []const u8,
+    total_columns: usize,
     column: usize,
     click_count: usize,
 ) ?SelectionRange {
     if (click_count >= 3) {
         return .{
             .anchor = .{ .line_index = line_index, .column = 0 },
-            .focus = .{ .line_index = line_index, .column = line.total_columns },
+            .focus = .{ .line_index = line_index, .column = total_columns },
         };
     }
     if (click_count < 2) return null;
-    if (line.total_columns == 0) {
+    if (total_columns == 0) {
         return .{
             .anchor = .{ .line_index = line_index, .column = 0 },
             .focus = .{ .line_index = line_index, .column = 0 },
         };
     }
-
-    const line_text = collectSelectableLineText(allocator, line) catch return null;
-    defer allocator.free(line_text);
 
     var codepoints = std.ArrayList(ClickSelectionCodepoint).empty;
     defer codepoints.deinit(allocator);
@@ -1577,6 +1624,248 @@ fn renderSelectableTextBlock(
             line,
         );
         height = @max(height, line.y + line.height);
+    }
+
+    zgui.dummy(.{ .w = width, .h = height });
+    global_line_index.* += lines.len;
+}
+
+fn buildSelectableCodeLines(
+    allocator: Allocator,
+    block: FencedCodeView,
+    options: RenderOptions,
+) ![]SelectableCodeLine {
+    const code_spec: FontSpec = .{
+        .font = options.code_font,
+        .size = options.code_font_size,
+    };
+    const pushed_font = pushFontSpec(code_spec);
+    defer if (pushed_font) zgui.popFont();
+
+    const line_height = zgui.getTextLineHeightWithSpacing();
+    var lines = std.ArrayList(SelectableCodeLine).empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line.chunks);
+        lines.deinit(allocator);
+    }
+
+    for (block.lines, 0..) |line, index| {
+        var chunks = std.ArrayList(SelectableCodeLineChunk).empty;
+        errdefer chunks.deinit(allocator);
+
+        var cursor_x: f32 = 0.0;
+        var cursor_column: usize = 0;
+        for (line.tokens) |token| {
+            if (token.text.len == 0) continue;
+            const token_columns = countColumns(token.text);
+            const token_width = zgui.calcTextSize(token.text, .{})[0];
+            try chunks.append(allocator, .{
+                .text = token.text,
+                .token_kind = token.kind,
+                .font_spec = code_spec,
+                .x = cursor_x,
+                .width = token_width,
+                .start_column = cursor_column,
+                .end_column = cursor_column + token_columns,
+            });
+            cursor_x += token_width;
+            cursor_column += token_columns;
+        }
+
+        try lines.append(allocator, .{
+            .text = line.text,
+            .y = line_height * @as(f32, @floatFromInt(index)),
+            .height = line_height,
+            .total_columns = countColumns(line.text),
+            .chunks = try chunks.toOwnedSlice(allocator),
+        });
+    }
+
+    if (lines.items.len == 0) {
+        try lines.append(allocator, .{
+            .text = "",
+            .y = 0.0,
+            .height = line_height,
+            .total_columns = 0,
+            .chunks = try allocator.alloc(SelectableCodeLineChunk, 0),
+        });
+    }
+
+    return lines.toOwnedSlice(allocator);
+}
+
+fn hoveredColumnForCodeLine(line: SelectableCodeLine, local_x: f32) usize {
+    if (line.chunks.len == 0) return 0;
+
+    const x = @max(local_x, 0.0);
+    var previous_end_x: ?f32 = null;
+    var previous_end_column: usize = 0;
+    for (line.chunks) |chunk| {
+        if (x <= chunk.x) {
+            if (previous_end_x) |end_x| {
+                return if (@abs(x - end_x) <= @abs(chunk.x - x)) previous_end_column else chunk.start_column;
+            }
+            return chunk.start_column;
+        }
+
+        const chunk_end_x = chunk.x + chunk.width;
+        if (x <= chunk_end_x) {
+            return chunk.start_column + columnForX(chunk.font_spec, chunk.text, x - chunk.x);
+        }
+
+        previous_end_x = chunk_end_x;
+        previous_end_column = chunk.end_column;
+    }
+    return line.total_columns;
+}
+
+fn renderSelectableCodeLine(
+    allocator: Allocator,
+    draw_list: anytype,
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    start: [2]f32,
+    line_index: usize,
+    line: SelectableCodeLine,
+) void {
+    noteSelectableLineBounds(output, line_index, line.total_columns);
+
+    const top = start[1] + line.y;
+    const bottom = top + line.height;
+    if (hovered and output.hovered_point == null and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
+        output.hovered_point = .{
+            .line_index = line_index,
+            .column = hoveredColumnForCodeLine(line, mouse_pos[0] - start[0]),
+        };
+    }
+
+    if (selection) |ordered| {
+        if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
+            if (columns.start != columns.end) {
+                const selection_col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72));
+                for (line.chunks) |chunk| {
+                    const chunk_start = @max(columns.start, chunk.start_column);
+                    const chunk_end = @min(columns.end, chunk.end_column);
+                    if (chunk_start >= chunk_end) continue;
+
+                    const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
+                    const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
+                    if (x1 > x0) {
+                        draw_list.addRectFilled(.{
+                            .pmin = .{ x0, top },
+                            .pmax = .{ x1, bottom },
+                            .col = selection_col,
+                            .rounding = 2.0,
+                        });
+                    }
+                }
+            }
+
+            if (copy_selection) {
+                if (copied_any_line.*) {
+                    copy_builder.append(allocator, '\n') catch {};
+                } else {
+                    copied_any_line.* = true;
+                }
+                for (line.chunks) |chunk| {
+                    const chunk_start = @max(columns.start, chunk.start_column);
+                    const chunk_end = @min(columns.end, chunk.end_column);
+                    if (chunk_start >= chunk_end) continue;
+                    copy_builder.appendSlice(allocator, sliceForColumns(chunk.text, chunk_start - chunk.start_column, chunk_end - chunk.start_column)) catch {};
+                }
+            }
+        }
+    }
+
+    for (line.chunks) |chunk| {
+        draw_list.addTextUnformatted(
+            .{ start[0] + chunk.x, top },
+            zgui.colorConvertFloat4ToU32(codeTokenColor(chunk.token_kind)),
+            chunk.text,
+        );
+    }
+}
+
+fn renderSelectableCodeBlock(
+    allocator: Allocator,
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    global_line_index: *usize,
+    block: FencedCodeView,
+    available_width: f32,
+    options: RenderOptions,
+) !void {
+    const indent = indentWidth(block.indent);
+    if (indent > 0.0) {
+        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
+    }
+
+    const start = zgui.getCursorScreenPos();
+    const width = @max(available_width - indent, minimumCodeBlockWidth());
+    const code_spec: FontSpec = .{
+        .font = options.code_font,
+        .size = options.code_font_size,
+    };
+    const pushed_font = pushFontSpec(code_spec);
+    defer if (pushed_font) zgui.popFont();
+
+    const line_height = zgui.getTextLineHeightWithSpacing();
+    const pad_x = codeBlockPaddingX();
+    const pad_y = codeBlockPaddingY();
+    const height = codeBlockHeight(block, line_height, pad_y);
+    const max_pos = .{ start[0] + width, start[1] + height };
+    const draw_list = zgui.getWindowDrawList();
+
+    draw_list.addRectFilled(.{
+        .pmin = start,
+        .pmax = max_pos,
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(24, 24, 28, 255)),
+        .rounding = codeBlockRounding(),
+    });
+    draw_list.addRect(.{
+        .pmin = start,
+        .pmax = max_pos,
+        .col = zgui.colorConvertFloat4ToU32(colors.rgba(52, 54, 62, 255)),
+        .rounding = codeBlockRounding(),
+        .thickness = 1.0,
+    });
+
+    draw_list.pushClipRect(.{
+        .pmin = start,
+        .pmax = max_pos,
+        .intersect_with_current = true,
+    });
+    defer draw_list.popClipRect();
+
+    const lines = try buildSelectableCodeLines(allocator, block, options);
+    defer deinitSelectableCodeLines(allocator, lines);
+
+    const content_start = .{ start[0] + pad_x, start[1] + pad_y };
+    for (lines, 0..) |line, index| {
+        renderSelectableCodeLine(
+            allocator,
+            draw_list,
+            output,
+            selection,
+            copy_selection,
+            copy_builder,
+            copied_any_line,
+            mouse_pos,
+            hovered,
+            content_start,
+            global_line_index.* + index,
+            line,
+        );
     }
 
     zgui.dummy(.{ .w = width, .h = height });
@@ -1968,4 +2257,22 @@ test "maps markdown fence tags to syntax languages" {
     try std.testing.expectEqual(zig_dif.Language.json, codeLanguageForTag("json"));
     try std.testing.expectEqual(zig_dif.Language.markdown, codeLanguageForTag("markdown"));
     try std.testing.expectEqual(zig_dif.Language.plain, codeLanguageForTag(null));
+}
+
+test "double click selection expands to a code word on raw lines" {
+    const allocator = std.testing.allocator;
+    const line = "const answer = 42;";
+    const selection = selectionRangeForRawLine(allocator, 3, line, countColumns(line), 7, 2).?;
+
+    try std.testing.expectEqual(@as(usize, 3), selection.anchor.line_index);
+    try std.testing.expectEqualStrings("answer", sliceForColumns(line, selection.anchor.column, selection.focus.column));
+}
+
+test "triple click selection expands to the full raw line" {
+    const allocator = std.testing.allocator;
+    const line = "hello world";
+    const selection = selectionRangeForRawLine(allocator, 2, line, countColumns(line), 4, 3).?;
+
+    try std.testing.expectEqual(@as(usize, 0), selection.anchor.column);
+    try std.testing.expectEqual(@as(usize, countColumns(line)), selection.focus.column);
 }

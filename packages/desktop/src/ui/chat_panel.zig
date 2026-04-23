@@ -1053,7 +1053,7 @@ fn renderTranscriptMessage(
         return;
     }
     if (role == .system and (std.mem.eql(u8, author, "Ran command") or std.mem.eql(u8, author, "Command failed"))) {
-        renderCommandEventRowId(id, author, body);
+        renderCommandEventRowId(state, id, message_index, author, body, markdown_copy_frame, markdown_select_all_frame);
         return;
     }
 
@@ -1150,6 +1150,11 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
 fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool, bubble_hovered: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame, markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame) void {
     _ = bubble_hovered;
     if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
+        if (message_index) |index| {
+            if (renderSelectableCodexFileReferenceBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+                return;
+            }
+        }
         renderCodexFileReferenceBody(state, body);
         return;
     }
@@ -1428,6 +1433,53 @@ const CodexFileReference = struct {
     path: []const u8,
 };
 
+const CodexSelectableChunkKind = enum {
+    text,
+    chip,
+};
+
+const CodexSelectableChunk = struct {
+    kind: CodexSelectableChunkKind,
+    text: []const u8,
+    path: ?[]const u8 = null,
+    x: f32,
+    width: f32,
+    visible_width: f32,
+    start_column: usize,
+    end_column: usize,
+};
+
+const CodexSelectableLine = struct {
+    y: f32,
+    height: f32,
+    total_columns: usize,
+    chunks: []CodexSelectableChunk,
+};
+
+const CodexSelectableLayout = struct {
+    lines: []CodexSelectableLine,
+    total_height: f32,
+
+    fn deinit(self: *CodexSelectableLayout, allocator: std.mem.Allocator) void {
+        for (self.lines) |line| allocator.free(line.chunks);
+        allocator.free(self.lines);
+        self.* = undefined;
+    }
+};
+
+const CodexSelectionRenderOutput = struct {
+    hovered_point: ?chat_markdown.SelectionPoint = null,
+    first_point: ?chat_markdown.SelectionPoint = null,
+    last_point: ?chat_markdown.SelectionPoint = null,
+    copied_text: ?[:0]u8 = null,
+    hovered_file_ref_path: ?[]const u8 = null,
+
+    fn deinit(self: *CodexSelectionRenderOutput, allocator: std.mem.Allocator) void {
+        if (self.copied_text) |text| allocator.free(text);
+        self.* = undefined;
+    }
+};
+
 const CodexInlineLayout = struct {
     base_screen: [2]f32,
     cursor_x: f32,
@@ -1462,6 +1514,612 @@ fn renderCodexFileReferenceBody(state: *app_state.AppState, body: []const u8) vo
     const used_height = @max(layout.cursor_y - layout.base_screen[1] + layout.line_height, zgui.getTextLineHeight());
     zgui.setCursorScreenPos(base_screen);
     zgui.dummy(.{ .w = available_width, .h = used_height });
+}
+
+fn renderSelectableCodexFileReferenceBody(
+    state: *app_state.AppState,
+    message_index: usize,
+    body: []const u8,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) bool {
+    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    var layout = buildCodexSelectableLayout(std.heap.page_allocator, body, available_width) catch return false;
+    defer layout.deinit(std.heap.page_allocator);
+
+    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
+    const selection_active = selection != null;
+    const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
+
+    var result = renderCodexSelectableLayout(std.heap.page_allocator, layout, selection, copy_selection);
+    defer result.deinit(std.heap.page_allocator);
+
+    const hovered = zgui.isWindowHovered(.{ .allow_when_blocked_by_active_item = true });
+    if (hovered and result.hovered_point != null) {
+        zgui.setMouseCursor(.text_input);
+    }
+
+    if (hovered and zgui.isMouseClicked(.left)) {
+        if (result.hovered_point) |point| {
+            const click_count: usize = @intCast(@max(zgui.getMouseClickedCount(.left), 0));
+            if (codexSelectionRangeForClickCount(std.heap.page_allocator, layout, point, click_count)) |expanded| {
+                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+            } else {
+                state.beginTranscriptMarkdownSelection(message_index, point);
+            }
+        } else {
+            state.clearTranscriptMarkdownSelection();
+        }
+    } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
+        if (hovered) {
+            if (result.hovered_point) |point| {
+                state.updateTranscriptMarkdownSelection(message_index, point);
+            }
+        }
+    }
+
+    if (result.hovered_file_ref_path) |path| {
+        _ = zgui.beginTooltip();
+        zgui.textUnformatted(path);
+        zgui.endTooltip();
+
+        if (hovered and zgui.isMouseReleased(.left) and !zgui.isMouseDragging(.left, 4.0)) {
+            state.openTranscriptFileReference(path);
+        }
+    }
+
+    if (markdown_select_all_frame) |frame| {
+        if (frame.requested) {
+            if (result.first_point) |first| {
+                if (result.last_point) |last| {
+                    frame.noteMessage(message_index, first, last);
+                }
+            }
+        }
+    }
+    if (copy_selection) {
+        if (markdown_copy_frame) |frame| {
+            if (result.copied_text) |copied| {
+                frame.append(std.heap.page_allocator, copied);
+            }
+        }
+    }
+
+    return true;
+}
+
+fn buildCodexSelectableLayout(allocator: std.mem.Allocator, body: []const u8, available_width: f32) !CodexSelectableLayout {
+    const line_height = @max(zgui.getTextLineHeightWithSpacing(), theme.scaledUi(28.0));
+    const max_width = @max(available_width, 1.0);
+
+    var lines = std.ArrayList(CodexSelectableLine).empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line.chunks);
+        lines.deinit(allocator);
+    }
+
+    var current_chunks = std.ArrayList(CodexSelectableChunk).empty;
+    defer current_chunks.deinit(allocator);
+    var current_x: f32 = 0.0;
+    var current_y: f32 = 0.0;
+    var current_columns: usize = 0;
+
+    const Builder = struct {
+        fn advanceLine(
+            allocator_inner: std.mem.Allocator,
+            lines_inner: *std.ArrayList(CodexSelectableLine),
+            chunks_inner: *std.ArrayList(CodexSelectableChunk),
+            x: *f32,
+            y: *f32,
+            columns: *usize,
+            line_height_inner: f32,
+        ) !void {
+            try lines_inner.append(allocator_inner, .{
+                .y = y.*,
+                .height = line_height_inner,
+                .total_columns = columns.*,
+                .chunks = try chunks_inner.toOwnedSlice(allocator_inner),
+            });
+            chunks_inner.* = .empty;
+            x.* = 0.0;
+            y.* += line_height_inner;
+            columns.* = 0;
+        }
+
+        fn appendTextToken(
+            allocator_inner: std.mem.Allocator,
+            lines_inner: *std.ArrayList(CodexSelectableLine),
+            chunks_inner: *std.ArrayList(CodexSelectableChunk),
+            token: []const u8,
+            x: *f32,
+            y: *f32,
+            columns: *usize,
+            max_width_inner: f32,
+            line_height_inner: f32,
+        ) !void {
+            if (token.len == 0) return;
+            const is_space = std.ascii.isWhitespace(token[0]);
+            const width = zgui.calcTextSize(token, .{})[0];
+            const token_columns = codexCountColumns(token);
+
+            if (is_space and x.* <= 0.0) return;
+            if (!is_space and x.* > 0.0 and x.* + width > max_width_inner) {
+                try advanceLine(allocator_inner, lines_inner, chunks_inner, x, y, columns, line_height_inner);
+            } else if (is_space and x.* + width > max_width_inner) {
+                try advanceLine(allocator_inner, lines_inner, chunks_inner, x, y, columns, line_height_inner);
+                return;
+            }
+
+            try chunks_inner.append(allocator_inner, .{
+                .kind = .text,
+                .text = token,
+                .x = x.*,
+                .width = width,
+                .visible_width = width,
+                .start_column = columns.*,
+                .end_column = columns.* + token_columns,
+            });
+            x.* += width;
+            columns.* += token_columns;
+        }
+
+        fn appendFileRef(
+            allocator_inner: std.mem.Allocator,
+            lines_inner: *std.ArrayList(CodexSelectableLine),
+            chunks_inner: *std.ArrayList(CodexSelectableChunk),
+            file_ref: CodexFileReference,
+            x: *f32,
+            y: *f32,
+            columns: *usize,
+            max_width_inner: f32,
+            line_height_inner: f32,
+        ) !void {
+            const padding_x = theme.scaledUi(8.0);
+            const label_width = zgui.calcTextSize(file_ref.label, .{})[0];
+            const chip_width = label_width + padding_x * 2.0;
+            const token_columns = codexCountColumns(file_ref.label);
+
+            if (x.* > 0.0 and x.* + chip_width > max_width_inner) {
+                try advanceLine(allocator_inner, lines_inner, chunks_inner, x, y, columns, line_height_inner);
+            }
+
+            try chunks_inner.append(allocator_inner, .{
+                .kind = .chip,
+                .text = file_ref.label,
+                .path = file_ref.path,
+                .x = x.*,
+                .width = chip_width,
+                .visible_width = label_width,
+                .start_column = columns.*,
+                .end_column = columns.* + token_columns,
+            });
+            x.* += chip_width;
+            columns.* += token_columns;
+        }
+    };
+
+    var start: usize = 0;
+    while (start <= body.len) {
+        const newline = std.mem.indexOfScalarPos(u8, body, start, '\n') orelse body.len;
+        const source_line = body[start..newline];
+
+        var cursor: usize = 0;
+        while (cursor < source_line.len) {
+            if (findNextCodexFileReference(source_line, cursor)) |file_ref| {
+                try appendCodexTextRun(
+                    allocator,
+                    &lines,
+                    &current_chunks,
+                    source_line[cursor..file_ref.start],
+                    &current_x,
+                    &current_y,
+                    &current_columns,
+                    max_width,
+                    line_height,
+                    Builder.appendTextToken,
+                );
+                try Builder.appendFileRef(
+                    allocator,
+                    &lines,
+                    &current_chunks,
+                    file_ref,
+                    &current_x,
+                    &current_y,
+                    &current_columns,
+                    max_width,
+                    line_height,
+                );
+                cursor = file_ref.end;
+                continue;
+            }
+
+            try appendCodexTextRun(
+                allocator,
+                &lines,
+                &current_chunks,
+                source_line[cursor..],
+                &current_x,
+                &current_y,
+                &current_columns,
+                max_width,
+                line_height,
+                Builder.appendTextToken,
+            );
+            break;
+        }
+
+        try Builder.advanceLine(allocator, &lines, &current_chunks, &current_x, &current_y, &current_columns, line_height);
+        if (newline == body.len) break;
+        start = newline + 1;
+    }
+
+    if (lines.items.len == 0) {
+        try lines.append(allocator, .{
+            .y = 0.0,
+            .height = line_height,
+            .total_columns = 0,
+            .chunks = try allocator.alloc(CodexSelectableChunk, 0),
+        });
+        current_y = line_height;
+    }
+
+    return .{
+        .lines = try lines.toOwnedSlice(allocator),
+        .total_height = @max(current_y, zgui.getTextLineHeight()),
+    };
+}
+
+fn appendCodexTextRun(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList(CodexSelectableLine),
+    chunks: *std.ArrayList(CodexSelectableChunk),
+    text: []const u8,
+    cursor_x: *f32,
+    cursor_y: *f32,
+    columns: *usize,
+    max_width: f32,
+    line_height: f32,
+    comptime append_token: fn (std.mem.Allocator, *std.ArrayList(CodexSelectableLine), *std.ArrayList(CodexSelectableChunk), []const u8, *f32, *f32, *usize, f32, f32) anyerror!void,
+) !void {
+    var index: usize = 0;
+    while (index < text.len) {
+        const is_space = std.ascii.isWhitespace(text[index]);
+        var end = index + 1;
+        while (end < text.len and std.ascii.isWhitespace(text[end]) == is_space) : (end += 1) {}
+        try append_token(allocator, lines, chunks, text[index..end], cursor_x, cursor_y, columns, max_width, line_height);
+        index = end;
+    }
+}
+
+fn renderCodexSelectableLayout(
+    allocator: std.mem.Allocator,
+    layout: CodexSelectableLayout,
+    selection: ?chat_markdown.SelectionRange,
+    copy_selection: bool,
+) CodexSelectionRenderOutput {
+    const draw_list = zgui.getWindowDrawList();
+    const start = zgui.getCursorScreenPos();
+    const mouse_pos = zgui.getMousePos();
+    const hovered = zgui.isWindowHovered(.{ .allow_when_blocked_by_active_item = true });
+    const ordered_selection = if (selection) |active| codexOrderSelection(active) else null;
+
+    var output: CodexSelectionRenderOutput = .{};
+    var copy_builder = std.ArrayList(u8).empty;
+    defer if (copy_selection) copy_builder.deinit(allocator);
+    var copied_any = false;
+
+    for (layout.lines, 0..) |line, line_index| {
+        codexNoteLineBounds(&output, line_index, line.total_columns);
+        const top = start[1] + line.y;
+        const bottom = top + line.height;
+
+        if (hovered and output.hovered_point == null and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
+            output.hovered_point = .{
+                .line_index = line_index,
+                .column = hoveredCodexColumnForLine(line, mouse_pos[0] - start[0]),
+            };
+        }
+
+        if (hovered and output.hovered_file_ref_path == null) {
+            for (line.chunks) |chunk| {
+                if (chunk.kind != .chip) continue;
+                if (mouse_pos[0] >= start[0] + chunk.x and mouse_pos[0] <= start[0] + chunk.x + chunk.width and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
+                    output.hovered_file_ref_path = chunk.path;
+                    break;
+                }
+            }
+        }
+
+        if (ordered_selection) |ordered| {
+            if (codexSelectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
+                if (columns.start != columns.end) {
+                    const selection_col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72));
+                    for (line.chunks) |chunk| {
+                        const chunk_start = @max(columns.start, chunk.start_column);
+                        const chunk_end = @min(columns.end, chunk.end_column);
+                        if (chunk_start >= chunk_end) continue;
+
+                        if (chunk.kind == .chip) {
+                            draw_list.addRectFilled(.{
+                                .pmin = .{ start[0] + chunk.x, top + (line.height - theme.scaledUi(24.0)) * 0.5 },
+                                .pmax = .{ start[0] + chunk.x + chunk.width, top + (line.height - theme.scaledUi(24.0)) * 0.5 + theme.scaledUi(24.0) },
+                                .col = selection_col,
+                                .rounding = theme.scaledUi(7.0),
+                            });
+                        } else {
+                            const x0 = start[0] + chunk.x + codexTextWidthForColumns(chunk.text, chunk_start - chunk.start_column);
+                            const x1 = start[0] + chunk.x + codexTextWidthForColumns(chunk.text, chunk_end - chunk.start_column);
+                            if (x1 > x0) {
+                                draw_list.addRectFilled(.{
+                                    .pmin = .{ x0, top },
+                                    .pmax = .{ x1, bottom },
+                                    .col = selection_col,
+                                    .rounding = 2.0,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if (copy_selection) {
+                    if (copied_any) {
+                        copy_builder.append(allocator, '\n') catch {};
+                    } else {
+                        copied_any = true;
+                    }
+                    for (line.chunks) |chunk| {
+                        const chunk_start = @max(columns.start, chunk.start_column);
+                        const chunk_end = @min(columns.end, chunk.end_column);
+                        if (chunk_start >= chunk_end) continue;
+                        copy_builder.appendSlice(allocator, codexSliceForColumns(chunk.text, chunk_start - chunk.start_column, chunk_end - chunk.start_column)) catch {};
+                    }
+                }
+            }
+        }
+
+        for (line.chunks) |chunk| {
+            switch (chunk.kind) {
+                .text => {
+                    if (chunk.text.len == 0) continue;
+                    draw_list.addTextUnformatted(
+                        .{ start[0] + chunk.x, top + (line.height - zgui.getTextLineHeight()) * 0.5 },
+                        zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_MUTED),
+                        chunk.text,
+                    );
+                },
+                .chip => {
+                    const chip_height = theme.scaledUi(24.0);
+                    const chip_pos = .{ start[0] + chunk.x, top + (line.height - chip_height) * 0.5 };
+                    const is_hovered_chip = output.hovered_file_ref_path != null and std.mem.eql(u8, output.hovered_file_ref_path.?, chunk.path.?);
+                    const bg = if (is_hovered_chip)
+                        theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08)
+                    else
+                        theme.COLOR_SECONDARY_GREEN;
+                    draw_list.addRectFilled(.{
+                        .pmin = chip_pos,
+                        .pmax = .{ chip_pos[0] + chunk.width, chip_pos[1] + chip_height },
+                        .col = zgui.colorConvertFloat4ToU32(bg),
+                        .rounding = theme.scaledUi(7.0),
+                    });
+                    draw_list.addTextUnformatted(
+                        .{
+                            chip_pos[0] + theme.scaledUi(8.0),
+                            chip_pos[1] + (chip_height - zgui.getTextLineHeight()) * 0.5,
+                        },
+                        zgui.colorConvertFloat4ToU32(theme.COLOR_DIFF_ADD),
+                        chunk.text,
+                    );
+                },
+            }
+        }
+    }
+
+    zgui.dummy(.{ .w = @max(zgui.getContentRegionAvail()[0], 1.0), .h = layout.total_height });
+    if (copy_selection and copied_any) {
+        output.copied_text = allocator.dupeZ(u8, copy_builder.items) catch null;
+    }
+    return output;
+}
+
+const OrderedCodexSelection = struct {
+    start: chat_markdown.SelectionPoint,
+    end: chat_markdown.SelectionPoint,
+};
+
+fn codexOrderSelection(selection: chat_markdown.SelectionRange) OrderedCodexSelection {
+    if (codexSelectionPointLessThan(selection.focus, selection.anchor)) {
+        return .{ .start = selection.focus, .end = selection.anchor };
+    }
+    return .{ .start = selection.anchor, .end = selection.focus };
+}
+
+fn codexSelectionPointLessThan(lhs: chat_markdown.SelectionPoint, rhs: chat_markdown.SelectionPoint) bool {
+    return lhs.line_index < rhs.line_index or
+        (lhs.line_index == rhs.line_index and lhs.column < rhs.column);
+}
+
+fn codexSelectionColumnsForLine(selection: OrderedCodexSelection, line_index: usize, total_columns: usize) ?struct { start: usize, end: usize } {
+    if (line_index < selection.start.line_index or line_index > selection.end.line_index) return null;
+    return .{
+        .start = if (line_index == selection.start.line_index) selection.start.column else 0,
+        .end = if (line_index == selection.end.line_index) selection.end.column else total_columns,
+    };
+}
+
+fn codexNoteLineBounds(output: *CodexSelectionRenderOutput, line_index: usize, total_columns: usize) void {
+    if (output.first_point == null) {
+        output.first_point = .{ .line_index = line_index, .column = 0 };
+    }
+    output.last_point = .{ .line_index = line_index, .column = total_columns };
+}
+
+fn hoveredCodexColumnForLine(line: CodexSelectableLine, local_x: f32) usize {
+    if (line.chunks.len == 0) return 0;
+
+    const x = @max(local_x, 0.0);
+    var previous_end_x: ?f32 = null;
+    var previous_end_column: usize = 0;
+    for (line.chunks) |chunk| {
+        if (x <= chunk.x) {
+            if (previous_end_x) |end_x| {
+                return if (@abs(x - end_x) <= @abs(chunk.x - x)) previous_end_column else chunk.start_column;
+            }
+            return chunk.start_column;
+        }
+
+        const chunk_end_x = chunk.x + chunk.width;
+        if (x <= chunk_end_x) {
+            return switch (chunk.kind) {
+                .text => chunk.start_column + codexColumnForX(chunk.text, x - chunk.x),
+                .chip => codexHoveredColumnForChip(chunk, x - chunk.x),
+            };
+        }
+
+        previous_end_x = chunk_end_x;
+        previous_end_column = chunk.end_column;
+    }
+    return line.total_columns;
+}
+
+fn codexHoveredColumnForChip(chunk: CodexSelectableChunk, local_x: f32) usize {
+    const padding_x = theme.scaledUi(8.0);
+    const inner_x = theme.clampf(local_x - padding_x, 0.0, chunk.visible_width);
+    return chunk.start_column + codexColumnForX(chunk.text, inner_x);
+}
+
+const CodexClickSelectionClass = enum {
+    whitespace,
+    word,
+    other,
+};
+
+fn codexSelectionRangeForClickCount(
+    allocator: std.mem.Allocator,
+    layout: CodexSelectableLayout,
+    point: chat_markdown.SelectionPoint,
+    click_count: usize,
+) ?chat_markdown.SelectionRange {
+    if (click_count < 2) return null;
+    if (point.line_index >= layout.lines.len) return null;
+
+    const line = layout.lines[point.line_index];
+    if (click_count >= 3) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = line.total_columns },
+        };
+    }
+    if (line.total_columns == 0) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = 0 },
+        };
+    }
+
+    const line_text = codexCollectLineText(allocator, line) catch return null;
+    defer allocator.free(line_text);
+
+    var codepoints = std.ArrayList(CodexClickSelectionClass).empty;
+    defer codepoints.deinit(allocator);
+    var index: usize = 0;
+    while (index < line_text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(line_text[index]) catch return null;
+        const next = @min(index + width, line_text.len);
+        codepoints.append(allocator, codexClickSelectionClass(line_text[index..next])) catch return null;
+        index = next;
+    }
+
+    if (codepoints.items.len == 0) {
+        return .{
+            .anchor = .{ .line_index = point.line_index, .column = 0 },
+            .focus = .{ .line_index = point.line_index, .column = 0 },
+        };
+    }
+
+    const target_column = if (point.column >= codepoints.items.len) codepoints.items.len - 1 else point.column;
+    const target_class = codepoints.items[target_column];
+    var start_column = target_column;
+    while (start_column > 0 and codepoints.items[start_column - 1] == target_class) : (start_column -= 1) {}
+
+    var end_column = target_column + 1;
+    while (end_column < codepoints.items.len and codepoints.items[end_column] == target_class) : (end_column += 1) {}
+
+    return .{
+        .anchor = .{ .line_index = point.line_index, .column = start_column },
+        .focus = .{ .line_index = point.line_index, .column = end_column },
+    };
+}
+
+fn codexCollectLineText(allocator: std.mem.Allocator, line: CodexSelectableLine) ![]u8 {
+    var builder = std.ArrayList(u8).empty;
+    errdefer builder.deinit(allocator);
+    for (line.chunks) |chunk| try builder.appendSlice(allocator, chunk.text);
+    return builder.toOwnedSlice(allocator);
+}
+
+fn codexClickSelectionClass(text: []const u8) CodexClickSelectionClass {
+    if (text.len == 0) return .other;
+    if (text.len == 1) {
+        const byte = text[0];
+        if (std.ascii.isWhitespace(byte)) return .whitespace;
+        if (std.ascii.isAlphanumeric(byte) or byte == '_') return .word;
+        return .other;
+    }
+    return .word;
+}
+
+fn codexCountColumns(text: []const u8) usize {
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return text.len;
+        index += width;
+        columns += 1;
+    }
+    return columns;
+}
+
+fn codexByteOffsetForColumn(text: []const u8, column: usize) usize {
+    var index: usize = 0;
+    var current: usize = 0;
+    while (index < text.len and current < column) {
+        const width = std.unicode.utf8ByteSequenceLength(text[index]) catch return text.len;
+        index += width;
+        current += 1;
+    }
+    return index;
+}
+
+fn codexSliceForColumns(text: []const u8, start_column: usize, end_column: usize) []const u8 {
+    const start = codexByteOffsetForColumn(text, start_column);
+    const end = codexByteOffsetForColumn(text, end_column);
+    return text[start..@min(end, text.len)];
+}
+
+fn codexTextWidthForColumns(text: []const u8, column: usize) f32 {
+    return zgui.calcTextSize(text[0..codexByteOffsetForColumn(text, column)], .{})[0];
+}
+
+fn codexColumnForX(text: []const u8, x: f32) usize {
+    if (x <= 0.0) return 0;
+    const total_columns = codexCountColumns(text);
+    if (total_columns == 0) return 0;
+
+    var low: usize = 0;
+    var high: usize = total_columns;
+    while (low < high) {
+        const mid = (low + high + 1) / 2;
+        if (codexTextWidthForColumns(text, mid) <= x) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    if (low >= total_columns) return total_columns;
+    const current_width = codexTextWidthForColumns(text, low);
+    const next_width = codexTextWidthForColumns(text, low + 1);
+    return if (@abs(x - current_width) <= @abs(next_width - x)) low else low + 1;
 }
 
 const CodexInlineMeasure = struct {
@@ -1693,7 +2351,15 @@ fn codexFileReferencePath(target: []const u8) []const u8 {
 }
 
 /// Draws a compact system row for command execution events.
-fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
+fn renderCommandEventRowId(
+    state: *app_state.AppState,
+    id: u32,
+    message_index: ?usize,
+    author: []const u8,
+    body: []const u8,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) void {
     zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 10.0 });
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 9.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(28, 29, 34, 255) });
@@ -1723,6 +2389,11 @@ fn renderCommandEventRowId(id: u32, author: []const u8, body: []const u8) void {
     zgui.sameLine(.{ .spacing = 8.0 });
     zgui.textColored(theme.COLOR_TEXT_SUBTLE, "-", .{});
     zgui.sameLine(.{ .spacing = 8.0 });
+    if (message_index) |index| {
+        if (renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+            return;
+        }
+    }
     zgui.pushTextWrapPos(0.0);
     zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{body});
     zgui.popTextWrapPos();
