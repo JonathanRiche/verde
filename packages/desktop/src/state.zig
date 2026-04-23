@@ -1347,7 +1347,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = true,
+                    .launch_on_connect = false,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -1462,7 +1462,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = true,
+                    .launch_on_connect = false,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -1537,7 +1537,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = true,
+                    .launch_on_connect = false,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -1849,7 +1849,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = true,
+                    .launch_on_connect = false,
                 },
             },
         };
@@ -1888,7 +1888,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project_path,
-                    .launch_on_connect = true,
+                    .launch_on_connect = false,
                 },
             },
         };
@@ -1912,7 +1912,7 @@ pub const AppState = struct {
         const provider_config = ai_harness.ProviderConfig{
             .codex = .{
                 .cwd = project_path,
-                .launch_on_connect = true,
+                .launch_on_connect = false,
             },
         };
 

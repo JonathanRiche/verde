@@ -105,4 +105,5 @@ pub fn connect(
 
 pub fn shutdownOwnedProviderProcesses() void {
     opencode.shutdownOwnedServer();
+    codex.shutdownOwnedServer();
 }
