@@ -1083,18 +1083,28 @@ fn renderTranscriptMessage(
         zgui.popStyleVar(.{ .count = 2 });
     }
 
+    var body_line_offset: usize = 0;
     if (shouldShowBubbleAuthor(author)) {
-        zgui.textColored(bubble_theme.author, "{s}", .{author});
+        if (message_index) |index| {
+            const author_line = [_]SelectableColoredLine{
+                .{ .text = author, .color = bubble_theme.author },
+            };
+            _ = renderSelectableColoredLineList(state, index, &author_line, body_line_offset, markdown_copy_frame, markdown_select_all_frame);
+        } else {
+            zgui.textColored(bubble_theme.author, "{s}", .{author});
+        }
+        body_line_offset += 1;
         zgui.dummy(.{ .w = 0.0, .h = 2.0 });
     }
     if (image) |attachment| {
-        renderImageAttachmentCard(state, attachment, false);
+        renderImageAttachmentCard(state, attachment, false, message_index, body_line_offset, markdown_copy_frame, markdown_select_all_frame);
+        body_line_offset += imageAttachmentTextLineCount(false);
         if (body.len > 0) {
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
     const bubble_hovered = zgui.isWindowHovered(.{});
-    renderTranscriptBody(state, message_index, role, body, false, bubble_hovered, markdown_copy_frame, markdown_select_all_frame);
+    renderTranscriptBody(state, message_index, body_line_offset, role, body, false, bubble_hovered, markdown_copy_frame, markdown_select_all_frame);
 }
 
 /// Draws a generic transcript bubble with optional muted body text.
@@ -1139,19 +1149,19 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
         zgui.dummy(.{ .w = 0.0, .h = 2.0 });
     }
     if (image) |attachment| {
-        renderImageAttachmentCard(state, attachment, false);
+        renderImageAttachmentCard(state, attachment, false, null, 0, null, null);
         if (body.len > 0) {
             zgui.dummy(.{ .w = 0.0, .h = 8.0 });
         }
     }
-    renderTranscriptBody(state, null, role, body, muted_body, false, null, null);
+    renderTranscriptBody(state, null, 0, role, body, muted_body, false, null, null);
 }
 
-fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role: anytype, body: []const u8, muted_body: bool, bubble_hovered: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame, markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame) void {
+fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, line_offset: usize, role: anytype, body: []const u8, muted_body: bool, bubble_hovered: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame, markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame) void {
     _ = bubble_hovered;
     if (shouldRenderCodexFileReferenceBody(state, role, body, muted_body)) {
         if (message_index) |index| {
-            if (renderSelectableCodexFileReferenceBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+            if (renderSelectableCodexFileReferenceBody(state, index, line_offset, body, markdown_copy_frame, markdown_select_all_frame)) {
                 return;
             }
         }
@@ -1160,7 +1170,7 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, role:
     }
 
     if (message_index) |index| {
-        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, line_offset, body, markdown_copy_frame, markdown_select_all_frame)) {
             return;
         }
         if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
@@ -1278,14 +1288,72 @@ fn localTranscriptMarkdownSelectionForMessage(
     };
 }
 
-fn renderSelectableMutedLineList(
+fn localTranscriptMarkdownSelectionForComponent(
+    selection: ?app_state.TranscriptMarkdownSelection,
+    message_index: usize,
+    line_offset: usize,
+    line_count: ?usize,
+) ?chat_markdown.SelectionRange {
+    const active = selection orelse return null;
+    const ordered = orderedTranscriptMarkdownSelection(active);
+    if (message_index < ordered.start.message_index or message_index > ordered.end.message_index) return null;
+
+    if (message_index == ordered.end.message_index and ordered.end.point.line_index < line_offset) return null;
+    if (line_count) |count| {
+        if (count == 0) return null;
+        if (message_index == ordered.start.message_index and ordered.start.point.line_index >= line_offset + count) return null;
+    }
+
+    const whole_component_start: chat_markdown.SelectionPoint = .{ .line_index = 0, .column = 0 };
+    const whole_component_end: chat_markdown.SelectionPoint = .{ .line_index = std.math.maxInt(usize), .column = std.math.maxInt(usize) };
+
+    return .{
+        .anchor = if (message_index == ordered.start.message_index and ordered.start.point.line_index >= line_offset)
+            .{
+                .line_index = ordered.start.point.line_index - line_offset,
+                .column = ordered.start.point.column,
+            }
+        else
+            whole_component_start,
+        .focus = if (message_index == ordered.end.message_index and ordered.end.point.line_index >= line_offset and
+            (line_count == null or ordered.end.point.line_index < line_offset + line_count.?))
+            .{
+                .line_index = ordered.end.point.line_index - line_offset,
+                .column = ordered.end.point.column,
+            }
+        else
+            whole_component_end,
+    };
+}
+
+fn transcriptSelectionPointWithLineOffset(point: chat_markdown.SelectionPoint, line_offset: usize) chat_markdown.SelectionPoint {
+    return .{
+        .line_index = point.line_index + line_offset,
+        .column = point.column,
+    };
+}
+
+fn transcriptSelectionRangeWithLineOffset(range: chat_markdown.SelectionRange, line_offset: usize) chat_markdown.SelectionRange {
+    return .{
+        .anchor = transcriptSelectionPointWithLineOffset(range.anchor, line_offset),
+        .focus = transcriptSelectionPointWithLineOffset(range.focus, line_offset),
+    };
+}
+
+const SelectableColoredLine = struct {
+    text: []const u8,
+    color: [4]f32,
+};
+
+fn renderSelectableColoredLineList(
     state: *app_state.AppState,
     message_index: usize,
-    lines: []const ChangedFilesSelectionLine,
+    lines: []const SelectableColoredLine,
+    line_offset: usize,
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
 ) bool {
-    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
+    const selection = localTranscriptMarkdownSelectionForComponent(state.transcriptMarkdownSelection(), message_index, line_offset, lines.len);
     const selection_active = selection != null;
     const ordered_selection = if (selection) |active| codexOrderSelection(active) else null;
     const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
@@ -1366,9 +1434,10 @@ fn renderSelectableMutedLineList(
         if (hovered_point) |point| {
             const click_count: usize = @intCast(@max(zgui.getMouseClickedCount(.left), 0));
             if (simpleLineSelectionRangeForClickCount(std.heap.page_allocator, lines, point, click_count)) |expanded| {
-                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+                const offset_selection = transcriptSelectionRangeWithLineOffset(expanded, line_offset);
+                state.selectAllTranscriptMarkdownSelection(message_index, offset_selection.anchor, message_index, offset_selection.focus);
             } else {
-                state.beginTranscriptMarkdownSelection(message_index, point);
+                state.beginTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         } else {
             state.clearTranscriptMarkdownSelection();
@@ -1376,7 +1445,7 @@ fn renderSelectableMutedLineList(
     } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
         if (hovered) {
             if (hovered_point) |point| {
-                state.updateTranscriptMarkdownSelection(message_index, point);
+                state.updateTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         }
     }
@@ -1385,7 +1454,11 @@ fn renderSelectableMutedLineList(
         if (frame.requested) {
             if (first_point) |first| {
                 if (last_point) |last| {
-                    frame.noteMessage(message_index, first, last);
+                    frame.noteMessage(
+                        message_index,
+                        transcriptSelectionPointWithLineOffset(first, line_offset),
+                        transcriptSelectionPointWithLineOffset(last, line_offset),
+                    );
                 }
             }
         }
@@ -1403,7 +1476,7 @@ fn renderSelectableMutedLineList(
 
 fn simpleLineSelectionRangeForClickCount(
     allocator: std.mem.Allocator,
-    lines: []const ChangedFilesSelectionLine,
+    lines: []const SelectableColoredLine,
     point: chat_markdown.SelectionPoint,
     click_count: usize,
 ) ?chat_markdown.SelectionRange {
@@ -1482,6 +1555,7 @@ fn transcriptMarkdownBodyView(state: *app_state.AppState, message_index: ?usize,
 fn renderSelectableMarkdownTranscriptBody(
     state: *app_state.AppState,
     message_index: usize,
+    line_offset: usize,
     body: []const u8,
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
@@ -1492,7 +1566,7 @@ fn renderSelectableMarkdownTranscriptBody(
 
     const style = zgui.getStyle();
     const options = transcriptMarkdownRenderOptions();
-    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
+    const selection = localTranscriptMarkdownSelectionForComponent(state.transcriptMarkdownSelection(), message_index, line_offset, null);
     const selection_active = selection != null;
     const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
 
@@ -1531,9 +1605,10 @@ fn renderSelectableMarkdownTranscriptBody(
     if (body_activated) {
         if (result.hovered_point) |point| {
             if (chat_markdown.selectionRangeForClickCount(std.heap.page_allocator, view, body_width, options, point, click_count)) |expanded| {
-                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+                const offset_selection = transcriptSelectionRangeWithLineOffset(expanded, line_offset);
+                state.selectAllTranscriptMarkdownSelection(message_index, offset_selection.anchor, message_index, offset_selection.focus);
             } else {
-                state.beginTranscriptMarkdownSelection(message_index, point);
+                state.beginTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         } else if (body_hovered) {
             state.clearTranscriptMarkdownSelection();
@@ -1541,7 +1616,7 @@ fn renderSelectableMarkdownTranscriptBody(
     } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
         if (body_hovered or body_active) {
             if (result.hovered_point) |point| {
-                state.updateTranscriptMarkdownSelection(message_index, point);
+                state.updateTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         }
     }
@@ -1550,7 +1625,11 @@ fn renderSelectableMarkdownTranscriptBody(
         if (frame.requested) {
             if (result.first_point) |first| {
                 if (result.last_point) |last| {
-                    frame.noteMessage(message_index, first, last);
+                    frame.noteMessage(
+                        message_index,
+                        transcriptSelectionPointWithLineOffset(first, line_offset),
+                        transcriptSelectionPointWithLineOffset(last, line_offset),
+                    );
                 }
             }
         }
@@ -1697,6 +1776,7 @@ fn renderCodexFileReferenceBody(state: *app_state.AppState, body: []const u8) vo
 fn renderSelectableCodexFileReferenceBody(
     state: *app_state.AppState,
     message_index: usize,
+    line_offset: usize,
     body: []const u8,
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
@@ -1705,7 +1785,7 @@ fn renderSelectableCodexFileReferenceBody(
     var layout = buildCodexSelectableLayout(std.heap.page_allocator, body, available_width) catch return false;
     defer layout.deinit(std.heap.page_allocator);
 
-    const selection = localTranscriptMarkdownSelectionForMessage(state.transcriptMarkdownSelection(), message_index);
+    const selection = localTranscriptMarkdownSelectionForComponent(state.transcriptMarkdownSelection(), message_index, line_offset, layout.lines.len);
     const selection_active = selection != null;
     const copy_selection = if (markdown_copy_frame) |frame| selection_active and frame.requested else false;
 
@@ -1721,9 +1801,10 @@ fn renderSelectableCodexFileReferenceBody(
         if (result.hovered_point) |point| {
             const click_count: usize = @intCast(@max(zgui.getMouseClickedCount(.left), 0));
             if (codexSelectionRangeForClickCount(std.heap.page_allocator, layout, point, click_count)) |expanded| {
-                state.selectAllTranscriptMarkdownSelection(message_index, expanded.anchor, message_index, expanded.focus);
+                const offset_selection = transcriptSelectionRangeWithLineOffset(expanded, line_offset);
+                state.selectAllTranscriptMarkdownSelection(message_index, offset_selection.anchor, message_index, offset_selection.focus);
             } else {
-                state.beginTranscriptMarkdownSelection(message_index, point);
+                state.beginTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         } else {
             state.clearTranscriptMarkdownSelection();
@@ -1731,7 +1812,7 @@ fn renderSelectableCodexFileReferenceBody(
     } else if (state.transcriptMarkdownSelectionDragging() and zgui.isMouseDown(.left)) {
         if (hovered) {
             if (result.hovered_point) |point| {
-                state.updateTranscriptMarkdownSelection(message_index, point);
+                state.updateTranscriptMarkdownSelection(message_index, transcriptSelectionPointWithLineOffset(point, line_offset));
             }
         }
     }
@@ -1750,7 +1831,11 @@ fn renderSelectableCodexFileReferenceBody(
         if (frame.requested) {
             if (result.first_point) |first| {
                 if (result.last_point) |last| {
-                    frame.noteMessage(message_index, first, last);
+                    frame.noteMessage(
+                        message_index,
+                        transcriptSelectionPointWithLineOffset(first, line_offset),
+                        transcriptSelectionPointWithLineOffset(last, line_offset),
+                    );
                 }
             }
         }
@@ -2568,7 +2653,7 @@ fn renderCommandEventRowId(
     zgui.textColored(theme.COLOR_TEXT_SUBTLE, "-", .{});
     zgui.sameLine(.{ .spacing = 8.0 });
     if (message_index) |index| {
-        if (renderSelectableMarkdownTranscriptBody(state, index, body, markdown_copy_frame, markdown_select_all_frame)) {
+        if (renderSelectableMarkdownTranscriptBody(state, index, 0, body, markdown_copy_frame, markdown_select_all_frame)) {
             return;
         }
     }
@@ -2628,16 +2713,29 @@ fn renderChangedFilesCardId(
     }
     zgui.dummy(.{ .w = 0.0, .h = 4.0 });
 
-    _ = state;
-    _ = message_index;
-    _ = markdown_copy_frame;
-    _ = markdown_select_all_frame;
-
     if (has_patch_details) {
+        var patch_line_offset: usize = 0;
         for (entries.items, 0..) |entry, index| {
-            renderChangedFilesDetailedEntry(entry, id, index, open_all, close_all);
+            patch_line_offset += renderChangedFilesDetailedEntry(
+                state,
+                message_index,
+                entry,
+                id,
+                index,
+                open_all,
+                close_all,
+                patch_line_offset,
+                markdown_copy_frame,
+                markdown_select_all_frame,
+            );
         }
         return;
+    }
+
+    if (message_index) |index| {
+        if (renderSelectableChangedFilesSummary(state, index, entries.items, markdown_copy_frame, markdown_select_all_frame)) {
+            return;
+        }
     }
 
     var last_parent: ?[]const u8 = null;
@@ -2651,11 +2749,6 @@ fn renderChangedFilesCardId(
     }
 }
 
-const ChangedFilesSelectionLine = struct {
-    text: []const u8,
-    color: [4]f32,
-};
-
 fn renderSelectableChangedFilesSummary(
     state: *app_state.AppState,
     message_index: usize,
@@ -2663,15 +2756,17 @@ fn renderSelectableChangedFilesSummary(
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
 ) bool {
-    var lines = std.ArrayList(ChangedFilesSelectionLine).empty;
-    defer lines.deinit(std.heap.page_allocator);
+    var lines = std.ArrayList(SelectableColoredLine).empty;
+    defer {
+        for (lines.items) |line| std.heap.page_allocator.free(line.text);
+        lines.deinit(std.heap.page_allocator);
+    }
 
     var last_parent: ?[]const u8 = null;
     for (entries) |entry| {
         const parent = std.fs.path.dirname(entry.path) orelse ".";
         if (last_parent == null or !std.mem.eql(u8, last_parent.?, parent)) {
             const folder_line = std.fmt.allocPrint(std.heap.page_allocator, "v  {s}", .{parent}) catch return false;
-            defer std.heap.page_allocator.free(folder_line);
             lines.append(std.heap.page_allocator, .{ .text = folder_line, .color = theme.COLOR_TEXT_MUTED }) catch return false;
             last_parent = parent;
         }
@@ -2682,11 +2777,10 @@ fn renderSelectableChangedFilesSummary(
             entry.additions,
             entry.deletions,
         }) catch return false;
-        defer std.heap.page_allocator.free(entry_line);
         lines.append(std.heap.page_allocator, .{ .text = entry_line, .color = theme.COLOR_TEXT_MUTED }) catch return false;
     }
 
-    return renderSelectableMutedLineList(state, message_index, lines.items, markdown_copy_frame, markdown_select_all_frame);
+    return renderSelectableColoredLineList(state, message_index, lines.items, 0, markdown_copy_frame, markdown_select_all_frame);
 }
 
 /// Draws the header for changed-file summaries.
@@ -2736,7 +2830,18 @@ fn renderChangedFilesEntry(entry: anytype) void {
 }
 
 /// Draws one expandable changed-file row with its patch.
-fn renderChangedFilesDetailedEntry(entry: anytype, message_id: u32, index: usize, open_all: bool, close_all: bool) void {
+fn renderChangedFilesDetailedEntry(
+    state: *app_state.AppState,
+    message_index: ?usize,
+    entry: anytype,
+    message_id: u32,
+    index: usize,
+    open_all: bool,
+    close_all: bool,
+    patch_line_offset: usize,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) usize {
     var header_storage: [512]u8 = undefined;
     const header_label = std.fmt.bufPrintZ(&header_storage, "{s}  +{d} / -{d}##changed-files-{d}-{d}", .{
         entry.path,
@@ -2744,7 +2849,7 @@ fn renderChangedFilesDetailedEntry(entry: anytype, message_id: u32, index: usize
         entry.deletions,
         message_id,
         index,
-    }) catch return;
+    }) catch return 0;
 
     if (open_all) {
         zgui.setNextItemOpen(.{ .is_open = true, .cond = .always });
@@ -2754,12 +2859,103 @@ fn renderChangedFilesDetailedEntry(entry: anytype, message_id: u32, index: usize
 
     if (zgui.collapsingHeader(header_label, .{})) {
         if (entry.patch) |patch| {
+            if (message_index) |line_message_index| {
+                return renderSelectableChangedFilesPatch(
+                    state,
+                    line_message_index,
+                    patch_line_offset,
+                    patch,
+                    @as(usize, message_id) * 1000 + index,
+                    markdown_copy_frame,
+                    markdown_select_all_frame,
+                );
+            }
             renderPendingDiffPatch(patch, @as(usize, message_id) * 1000 + index);
         } else {
             zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No patch body available.", .{});
         }
         zgui.dummy(.{ .w = 0.0, .h = 6.0 });
     }
+    return 0;
+}
+
+fn renderSelectableChangedFilesPatch(
+    state: *app_state.AppState,
+    message_index: usize,
+    line_offset: usize,
+    patch: []const u8,
+    index: usize,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) usize {
+    const patch_height = pendingDiffPatchHeight(patch);
+
+    zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 8.0 });
+    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 8.0, 8.0 } });
+    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
+    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    _ = zgui.beginChildId(@intCast(90_000 + index), .{
+        .w = 0.0,
+        .h = patch_height,
+        .child_flags = .{ .border = true },
+        .window_flags = .{ .no_saved_settings = true, .horizontal_scrollbar = true },
+    });
+    defer {
+        zgui.endChild();
+        zgui.popStyleColor(.{ .count = 2 });
+        zgui.popStyleVar(.{ .count = 2 });
+    }
+
+    var lines = std.ArrayList(SelectableColoredLine).empty;
+    defer lines.deinit(std.heap.page_allocator);
+    var iter = std.mem.splitScalar(u8, patch, '\n');
+    while (iter.next()) |line| {
+        lines.append(std.heap.page_allocator, .{
+            .text = line,
+            .color = patchSelectableLineColor(line),
+        }) catch break;
+    }
+    if (lines.items.len == 0) {
+        lines.append(std.heap.page_allocator, .{
+            .text = "",
+            .color = theme.COLOR_TEXT_MUTED,
+        }) catch {};
+    }
+
+    const terminal_font = theme.terminal_font orelse zgui.getFont();
+    const terminal_font_size = if (theme.terminal_font != null) theme.terminal_font_size else zgui.getFontSize();
+    zgui.pushFont(terminal_font, terminal_font_size);
+    defer zgui.popFont();
+
+    _ = renderSelectableColoredLineList(
+        state,
+        message_index,
+        lines.items,
+        line_offset,
+        markdown_copy_frame,
+        markdown_select_all_frame,
+    );
+    zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+    return lines.items.len;
+}
+
+fn patchSelectableLineColor(line: []const u8) [4]f32 {
+    if (line.len == 0) return theme.COLOR_TEXT_MUTED;
+    if (std.mem.startsWith(u8, line, "@@")) return colors.rgba(115, 168, 255, 255);
+    if (std.mem.startsWith(u8, line, "diff --git") or
+        std.mem.startsWith(u8, line, "index ") or
+        std.mem.startsWith(u8, line, "--- ") or
+        std.mem.startsWith(u8, line, "+++ "))
+    {
+        return theme.COLOR_TEXT_SUBTLE;
+    }
+
+    return switch (line[0]) {
+        '+' => theme.COLOR_DIFF_ADD,
+        '-' => theme.COLOR_DIFF_REMOVE,
+        else => theme.COLOR_TEXT_MUTED,
+    };
 }
 
 /// Draws one pending diff file row in the live stream card.
@@ -3676,7 +3872,7 @@ fn renderComposerAttachmentPreview(state: *app_state.AppState, image: app_state.
     zgui.beginGroup();
     defer zgui.endGroup();
 
-    renderImageAttachmentCard(state, image, true);
+    renderImageAttachmentCard(state, image, true, null, 0, null, null);
     zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
     zgui.pushStyleColor4f(.{ .idx = .button, .c = colors.rgba(52, 54, 61, 255) });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = colors.rgba(74, 76, 84, 255) });
@@ -3688,7 +3884,15 @@ fn renderComposerAttachmentPreview(state: *app_state.AppState, image: app_state.
 }
 
 /// Draws an image attachment card in transcript or composer mode.
-fn renderImageAttachmentCard(state: *app_state.AppState, image: app_state.ChatImageAttachment, compact: bool) void {
+fn renderImageAttachmentCard(
+    state: *app_state.AppState,
+    image: app_state.ChatImageAttachment,
+    compact: bool,
+    message_index: ?usize,
+    line_offset: usize,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) void {
     const avail_width = @max(zgui.getContentRegionAvail()[0], theme.scaledUi(120.0));
     const card_width: f32 = if (compact)
         theme.clampf(avail_width, theme.scaledUi(196.0), theme.scaledUi(320.0))
@@ -3766,15 +3970,36 @@ fn renderImageAttachmentCard(state: *app_state.AppState, image: app_state.ChatIm
 
     if (compact) {
         zgui.setCursorScreenPos(.{ start[0] + card_padding + preview_width + theme.scaledUi(10.0), start[1] + theme.scaledUi(11.0) });
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{image.file_name});
-        zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}  {s}", .{ image.mime, byte_size_text });
-        zgui.textColored(theme.COLOR_TEXT_SUBTLE, "Clipboard image", .{});
     } else {
         zgui.setCursorScreenPos(.{ start[0] + theme.scaledUi(12.0), start[1] + card_padding + preview_height + theme.scaledUi(10.0) });
-        zgui.textColored(theme.COLOR_WHITE, "{s}", .{image.file_name});
-        zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}  {s}", .{ image.mime, byte_size_text });
+    }
+    var metadata_buf: [160]u8 = undefined;
+    const metadata = std.fmt.bufPrint(&metadata_buf, "{s}  {s}", .{ image.mime, byte_size_text }) catch image.mime;
+    const selectable_lines = [_]SelectableColoredLine{
+        .{ .text = image.file_name, .color = theme.COLOR_WHITE },
+        .{ .text = metadata, .color = theme.COLOR_TEXT_MUTED },
+        .{ .text = if (compact) "Clipboard image" else "", .color = theme.COLOR_TEXT_SUBTLE },
+    };
+    const selectable_line_count = imageAttachmentTextLineCount(compact);
+    if (message_index) |index| {
+        _ = renderSelectableColoredLineList(
+            state,
+            index,
+            selectable_lines[0..selectable_line_count],
+            line_offset,
+            markdown_copy_frame,
+            markdown_select_all_frame,
+        );
+    } else {
+        for (selectable_lines[0..selectable_line_count]) |line| {
+            zgui.textColored(line.color, "{s}", .{line.text});
+        }
     }
     zgui.setCursorScreenPos(.{ start[0], start[1] + card_height });
+}
+
+fn imageAttachmentTextLineCount(compact: bool) usize {
+    return if (compact) 3 else 2;
 }
 
 const TranscriptBubbleTheme = struct {
