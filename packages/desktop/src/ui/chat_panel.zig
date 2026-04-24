@@ -2628,13 +2628,10 @@ fn renderChangedFilesCardId(
     }
     zgui.dummy(.{ .w = 0.0, .h = 4.0 });
 
-    if (!has_patch_details) {
-        if (message_index) |index| {
-            if (renderSelectableChangedFilesSummary(state, index, entries.items, totals, markdown_copy_frame, markdown_select_all_frame)) {
-                return;
-            }
-        }
-    }
+    _ = state;
+    _ = message_index;
+    _ = markdown_copy_frame;
+    _ = markdown_select_all_frame;
 
     if (has_patch_details) {
         for (entries.items, 0..) |entry, index| {
@@ -2663,13 +2660,11 @@ fn renderSelectableChangedFilesSummary(
     state: *app_state.AppState,
     message_index: usize,
     entries: []const runtime.ChangedFileEntry,
-    totals: struct { additions: i64, deletions: i64 },
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
 ) bool {
     var lines = std.ArrayList(ChangedFilesSelectionLine).empty;
     defer lines.deinit(std.heap.page_allocator);
-    _ = totals;
 
     var last_parent: ?[]const u8 = null;
     for (entries) |entry| {
