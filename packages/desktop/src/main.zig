@@ -166,14 +166,22 @@ pub fn main() !void {
     defer log.info("verde main loop exiting", .{});
 
     var running = true;
+    var needs_render = true;
     while (running) {
         syncWindowTextInput(window, &state);
-        running = processEvents(window, &state, &keyboard);
+        var had_event = false;
+        running = processEvents(window, &state, &keyboard, &had_event);
         state.pollPicker();
         state.pollOpencodeModelOptionsCache();
         state.pollSend();
         state.pollBrowser();
         state.pollTerminals();
+
+        needs_render = needs_render or had_event or appNeedsContinuousFrames(&state);
+        if (!needs_render) {
+            continue;
+        }
+        needs_render = false;
 
         var fb_width: c_int = 0;
         var fb_height: c_int = 0;
@@ -312,21 +320,25 @@ fn normalizeMouseEventCoordinates(window: *sdl.Window, event: *sdl.Event) void {
     }
 }
 
-fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) bool {
+fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, had_event: *bool) bool {
+    had_event.* = false;
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
         if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state))) {
             return true;
         }
+        had_event.* = true;
         normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(window, state, keyboard, &event)) return false;
     } else {
+        had_event.* = true;
         normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(window, state, keyboard, &event)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
+        had_event.* = true;
         normalizeMouseEventCoordinates(window, &event);
         if (!handleEvent(window, state, keyboard, &event)) return false;
     }
@@ -334,8 +346,15 @@ fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Nati
     return true;
 }
 
+fn appNeedsContinuousFrames(state: *AppState) bool {
+    return state.hasAnyPendingSends() or
+        state.isPickerPending() or
+        state.hasVisibleTerminalSessions() or
+        state.transcriptMarkdownSelectionDragging();
+}
+
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
@@ -367,9 +386,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             if (shouldPasteClipboardImage(state, &event.key)) {
                 state.attachClipboardImageToCurrentDraft();
-                return true;
-            }
-            if (handleTranscriptSelectionShortcut(state, &event.key)) {
                 return true;
             }
             if (handleFileSearchNavigation(state, &event.key)) {
@@ -585,15 +601,6 @@ fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.Keybo
     }
 
     state.queueOrSteerDraftDuringSend();
-    return true;
-}
-
-fn handleTranscriptSelectionShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.isTranscriptFocused()) return false;
-    if (!event.down or event.repeat) return false;
-    if (event.scancode != .a) return false;
-    if (!isCtrlPressed()) return false;
-    state.openCurrentTranscriptSelectionModal();
     return true;
 }
 
