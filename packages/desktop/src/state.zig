@@ -304,6 +304,8 @@ pub const ChatThread = struct {
     harness: Harness = .local_cli,
     messages: std.ArrayList(ChatMessage),
     send_state: *SendState,
+    transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
+    transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     draft_image: ?ChatImageAttachment = null,
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
@@ -324,6 +326,8 @@ pub const ChatThread = struct {
             .harness = .local_cli,
             .messages = .empty,
             .send_state = send_state,
+            .transcript_markdown_entries = .empty,
+            .transcript_selectable_entries = .empty,
             .draft_image = null,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
@@ -389,6 +393,44 @@ pub const ChatThread = struct {
         }
     }
 
+    fn ensureTranscriptMarkdownEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
+        const message_count = self.messages.items.len;
+        if (self.transcript_markdown_entries.items.len > message_count) {
+            for (self.transcript_markdown_entries.items[message_count..]) |entry| {
+                if (entry) |owned| owned.deinit(allocator);
+            }
+            self.transcript_markdown_entries.shrinkRetainingCapacity(message_count);
+        } else if (self.transcript_markdown_entries.items.len < message_count) {
+            self.transcript_markdown_entries.appendNTimes(allocator, null, message_count - self.transcript_markdown_entries.items.len) catch return;
+        }
+    }
+
+    fn clearTranscriptMarkdownEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
+        for (self.transcript_markdown_entries.items) |entry| {
+            if (entry) |owned| owned.deinit(allocator);
+        }
+        self.transcript_markdown_entries.clearRetainingCapacity();
+    }
+
+    fn ensureTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
+        const message_count = self.messages.items.len;
+        if (self.transcript_selectable_entries.items.len > message_count) {
+            for (self.transcript_selectable_entries.items[message_count..]) |entry| {
+                if (entry) |owned| owned.deinit(allocator);
+            }
+            self.transcript_selectable_entries.shrinkRetainingCapacity(message_count);
+        } else if (self.transcript_selectable_entries.items.len < message_count) {
+            self.transcript_selectable_entries.appendNTimes(allocator, null, message_count - self.transcript_selectable_entries.items.len) catch return;
+        }
+    }
+
+    fn clearTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
+        for (self.transcript_selectable_entries.items) |entry| {
+            if (entry) |owned| owned.deinit(allocator);
+        }
+        self.transcript_selectable_entries.clearRetainingCapacity();
+    }
+
     fn deinitSendState(self: *ChatThread, allocator: std.mem.Allocator) void {
         self.finishSendThread();
         if (self.send_state.result) |result| {
@@ -418,6 +460,10 @@ pub const ChatThread = struct {
 
     fn deinit(self: *ChatThread, allocator: std.mem.Allocator) void {
         self.deinitSendState(allocator);
+        self.clearTranscriptMarkdownEntries(allocator);
+        self.transcript_markdown_entries.deinit(allocator);
+        self.clearTranscriptSelectableEntries(allocator);
+        self.transcript_selectable_entries.deinit(allocator);
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
@@ -2455,6 +2501,8 @@ pub const AppState = struct {
         while (thread.messages.items.len > 0) {
             self.releaseMessage(thread.messages.pop().?);
         }
+        thread.clearTranscriptMarkdownEntries(self.allocator);
+        thread.clearTranscriptSelectableEntries(self.allocator);
     }
 
     fn replaceThreadWithImportedSnapshot(
@@ -2847,20 +2895,21 @@ pub const AppState = struct {
 
     fn transcriptMarkdownBodyEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptMarkdownBody {
         if (body.len == 0) return null;
-        self.ensureTranscriptMarkdownEntries();
-        if (message_index >= self.transcript_markdown_entries.items.len) return null;
+        const thread = self.currentThreadMutable();
+        thread.ensureTranscriptMarkdownEntries(self.allocator);
+        if (message_index >= thread.transcript_markdown_entries.items.len) return null;
 
-        if (self.transcript_markdown_entries.items[message_index]) |entry| {
+        if (thread.transcript_markdown_entries.items[message_index]) |entry| {
             if (!std.mem.eql(u8, entry.owned_body, body)) {
                 entry.deinit(self.allocator);
-                self.transcript_markdown_entries.items[message_index] = null;
+                thread.transcript_markdown_entries.items[message_index] = null;
             } else {
                 return entry;
             }
         }
 
         const created = self.createTranscriptMarkdownBody(body) catch return null;
-        self.transcript_markdown_entries.items[message_index] = created;
+        thread.transcript_markdown_entries.items[message_index] = created;
         return created;
     }
 
@@ -2875,6 +2924,31 @@ pub const AppState = struct {
         errdefer entry.view.deinit(self.allocator);
 
         return entry;
+    }
+
+    pub fn prewarmThreadTranscriptMarkdown(self: *AppState, project_index: usize, thread_index: usize, max_entries: usize) void {
+        if (max_entries == 0 or project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+
+        const thread = &project.threads.items[thread_index];
+        thread.ensureTranscriptMarkdownEntries(self.allocator);
+
+        var warmed: usize = 0;
+        for (thread.messages.items, 0..) |message, message_index| {
+            if (warmed >= max_entries) break;
+            if (message.body.len == 0 or message_index >= thread.transcript_markdown_entries.items.len) continue;
+
+            if (thread.transcript_markdown_entries.items[message_index]) |entry| {
+                if (std.mem.eql(u8, entry.owned_body, message.body)) continue;
+                entry.deinit(self.allocator);
+                thread.transcript_markdown_entries.items[message_index] = null;
+            }
+
+            const created = self.createTranscriptMarkdownBody(message.body) catch return;
+            thread.transcript_markdown_entries.items[message_index] = created;
+            warmed += 1;
+        }
     }
 
     fn ensureTranscriptSelectableEntries(self: *AppState) void {
@@ -2910,20 +2984,21 @@ pub const AppState = struct {
 
     fn transcriptBodyTextEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptSelectableText {
         if (body.len == 0) return null;
-        self.ensureTranscriptSelectableEntries();
-        if (message_index >= self.transcript_selectable_entries.items.len) return null;
+        const thread = self.currentThreadMutable();
+        thread.ensureTranscriptSelectableEntries(self.allocator);
+        if (message_index >= thread.transcript_selectable_entries.items.len) return null;
 
-        if (self.transcript_selectable_entries.items[message_index]) |entry| {
+        if (thread.transcript_selectable_entries.items[message_index]) |entry| {
             if (!std.mem.eql(u8, entry.owned_body, body)) {
                 entry.deinit(self.allocator);
-                self.transcript_selectable_entries.items[message_index] = null;
+                thread.transcript_selectable_entries.items[message_index] = null;
             } else {
                 return entry;
             }
         }
 
         const created = createTranscriptSelectableText(self.allocator, body) catch return null;
-        self.transcript_selectable_entries.items[message_index] = created;
+        thread.transcript_selectable_entries.items[message_index] = created;
         return created;
     }
 
