@@ -829,9 +829,10 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     };
 
     const messages = state.currentThread().messages.items;
-    const use_virtualized_transcript = shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
+    const force_bottom_window = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive() and !has_pending_stream;
+    const use_virtualized_transcript = force_bottom_window or shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
     const content_width = zgui.getContentRegionAvail()[0];
-    const transcript_scroll_y = if (transcript_changed and use_virtualized_transcript)
+    const transcript_scroll_y = if (should_open_at_bottom and use_virtualized_transcript)
         transcriptInitialScrollY(state, content_width, height, use_virtualized_transcript)
     else
         zgui.getScrollY();
@@ -888,7 +889,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     }
     zgui.dummy(.{ .w = 0.0, .h = 0.0 });
 
-    if (transcript_changed and use_virtualized_transcript) {
+    if (should_open_at_bottom and use_virtualized_transcript) {
         zgui.setScrollY(transcript_scroll_y);
     }
 
@@ -898,8 +899,11 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
 
     // Hold bottom-scroll requests for a couple of frames so startup and thread
     // switches still land correctly after nested child layout settles.
-    if (transcript_changed and !use_virtualized_transcript) {
+    if (should_open_at_bottom and !use_virtualized_transcript) {
         jumpTranscriptToTail();
+        if (state.scroll_transcript_to_bottom_frames > 0) {
+            state.scroll_transcript_to_bottom_frames -= 1;
+        }
     } else if (state.scroll_transcript_to_bottom_frames > 0) {
         jumpTranscriptToTail();
         state.scroll_transcript_to_bottom_frames -= 1;
