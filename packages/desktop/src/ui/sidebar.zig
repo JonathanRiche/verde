@@ -668,7 +668,6 @@ fn renderThreadRow(state: anytype, project_index: usize, width: f32, thread: any
         state.projects.items[project_index].selected_thread_index = thread_index;
         state.requestComposerFocus();
         state.syncRenameBuffer();
-        state.requestTranscriptScrollToBottom();
     }
 
     if (zgui.beginPopupContextItem()) {
