@@ -137,6 +137,7 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
 
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 16.0, 16.0 } });
+    //NOTE: Begin of AttachmentPreviewCanvas
     _ = zgui.beginChild("AttachmentPreviewCanvas", .{
         .w = 0.0,
         .h = 0.0,
@@ -165,6 +166,7 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     } else {
         _ = zgui.button("Preview unavailable", .{ .w = image_max_w, .h = @min(image_max_h, 240.0) });
     }
+    //NOTE: END OF AttachmentPreviewCanvas
 }
 
 /// Shows the modal used to rename the active project.
@@ -387,6 +389,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     zgui.popStyleColor(.{ .count = 3 });
 
     zgui.separator();
+    //NOTE: Begin of ThreadImportList
     _ = zgui.beginChild("ThreadImportList", .{
         .w = 0.0,
         .h = -theme.scaledUi(92.0),
@@ -416,6 +419,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
         }
     }
     zgui.endChild();
+    //NOTE: END OF ThreadImportList
 
     if (state.threadImportNotice().len > 0) {
         zgui.textColored(theme.COLOR_YELLOW, "{s}", .{state.threadImportNotice()});

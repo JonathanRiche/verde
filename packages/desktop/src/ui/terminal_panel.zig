@@ -30,6 +30,7 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
         zgui.popStyleVar(.{ .count = 2 });
     }
 
+    //NOTE: Begin of TerminalDock
     _ = zgui.beginChild("TerminalDock", .{
         .w = width,
         .h = height,
@@ -38,7 +39,9 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
             .always_use_window_padding = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     renderTabStrip(state, dock);
     zgui.separator();
@@ -52,6 +55,7 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     }
 
     const focus_requested = dock.takeFocusRequest();
+    //NOTE: Begin of TerminalDockWorkspaceArea
     _ = zgui.beginChild("TerminalDockWorkspaceArea", .{
         .w = 0.0,
         .h = 0.0,
@@ -64,7 +68,9 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
             .no_scroll_with_mouse = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const window_focused = zgui.isWindowFocused(.{});
     var context: RenderContext = .{
@@ -94,6 +100,8 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
         state.terminal_focused = true;
         state.composer_focused = false;
     }
+    //NOTE: END OF TerminalDockWorkspaceArea
+    //NOTE: END OF TerminalDock
 }
 
 fn dockBackgroundColor(dock: *const terminal.Dock) [4]f32 {
@@ -106,6 +114,7 @@ fn dockBackgroundColor(dock: *const terminal.Dock) [4]f32 {
 fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
     const strip_height = theme.scaledUi(30.0);
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(6.0), theme.scaledUi(4.0) } });
+    //NOTE: Begin of TerminalDockTabs
     _ = zgui.beginChild("TerminalDockTabs", .{
         .w = 0.0,
         .h = strip_height,
@@ -183,6 +192,7 @@ fn renderTabStrip(state: *app_state.AppState, dock: *terminal.Dock) void {
         state.markDirty();
     }
     zgui.popStyleColor(.{ .count = 3 });
+    //NOTE: END OF TerminalDockTabs
 }
 
 fn renderRenameTabPopup(state: *app_state.AppState, dock: *terminal.Dock, width: f32, height: f32) void {
