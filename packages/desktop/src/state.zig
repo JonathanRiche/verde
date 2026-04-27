@@ -35,7 +35,7 @@ pub const log = std.log.scoped(.native_shell);
 pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
-pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.4";
+pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
@@ -237,13 +237,16 @@ const InspectorRectPayload = struct {
 };
 
 pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "GPT-5.5", .value = "opencode/gpt-5.5" },
     .{ .label = "GPT-5.4", .value = "opencode/gpt-5.4" },
+    .{ .label = "Claude Opus 4.7", .value = "opencode/claude-opus-4-7" },
     .{ .label = "Claude Opus 4.6", .value = "opencode/claude-opus-4-6" },
     .{ .label = "Claude Sonnet 4.5", .value = "opencode/claude-sonnet-4-5" },
     .{ .label = "Gemini 3.1 Pro", .value = "opencode/gemini-3.1-pro" },
 };
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "GPT-5.5", .value = "gpt-5.5" },
     .{ .label = "GPT-5.4", .value = "gpt-5.4" },
     .{ .label = "GPT-5.4 Mini", .value = "gpt-5.4-mini" },
     .{ .label = "GPT-5.3 Codex", .value = "gpt-5.3-codex" },
@@ -329,7 +332,7 @@ pub const ChatThread = struct {
             .committed = false,
             .last_activity_at = 0,
             .model_ref = try allocator.dupeZ(u8, DEFAULT_CODEX_MODEL),
-            .reasoning_effort = .high,
+            .reasoning_effort = .medium,
             .fast_mode = .off,
             .access_mode = .full_access,
             .provider = .codex,
