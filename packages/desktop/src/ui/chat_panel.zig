@@ -785,6 +785,11 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         state.transcript_thread_index = selected_thread_index;
     }
 
+    const should_open_at_bottom = transcript_changed or state.scroll_transcript_to_bottom_frames > 0;
+    if (should_open_at_bottom and state.pending_transcript_line_scroll_steps == 0 and state.pending_transcript_page_scroll_steps == 0) {
+        zgui.setNextWindowScroll(0.0, std.math.floatMax(f32));
+    }
+
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     _ = zgui.beginChild("Transcript", .{
         .w = width,
@@ -830,9 +835,6 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         transcriptInitialScrollY(state, content_width, height, use_virtualized_transcript)
     else
         zgui.getScrollY();
-    if (transcript_changed and use_virtualized_transcript) {
-        zgui.setScrollY(transcript_scroll_y);
-    }
     if (messages.len == 0 and !has_pending_stream) {
         zgui.textColored(theme.COLOR_WHITE, "No messages yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
