@@ -506,21 +506,6 @@ fn truncateTextToWidth(buffer: []u8, value: []const u8, max_width: f32) []const 
     return buffer[0 .. low + ellipsis.len];
 }
 
-fn renderHeaderActionButton(
-    label: [:0]const u8,
-    width: f32,
-    height: f32,
-    base_color: [4]f32,
-    hover_color: [4]f32,
-    active_color: [4]f32,
-) bool {
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = base_color });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = hover_color });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = active_color });
-    defer zgui.popStyleColor(.{ .count = 3 });
-    return zgui.button(label, .{ .w = width, .h = height });
-}
-
 /// Browser button with a globe icon to the left of the label.
 fn renderHeaderBrowserButton(width: f32, height: f32) bool {
     const start = zgui.getCursorScreenPos();
