@@ -69,7 +69,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         width - horiz_pad - project_header_button_width,
         brand_start[1] + theme.scaledUi(2.0),
     });
-    _ = renderSidebarShellToggleButton(state, "Collapse sidebar", "<", project_header_button_width, theme.scaledUi(24.0));
+    renderSidebarShellToggleButton(state, "Collapse sidebar", "<", project_header_button_width, theme.scaledUi(24.0));
     zgui.setCursorPos(brand_end);
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(18.0) });
     zgui.textColored(theme.COLOR_TEXT_MUTED, "PROJECTS", .{});
@@ -325,7 +325,7 @@ fn renderCompactRail(state: *runtime.AppState, width: f32, rail_width: f32) void
     renderCompactBrand(state, width, button_size);
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(12.0) });
 
-    _ = renderSidebarShellToggleButton(state, "Expand sidebar", ">", button_size, button_height);
+    renderSidebarShellToggleButton(state, "Expand sidebar", ">", button_size, button_height);
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(8.0) });
 
     zgui.beginDisabled(.{ .disabled = state.projects.items.len == 0 });
@@ -510,7 +510,7 @@ fn renderThreadEditButton(state: *runtime.AppState, width: f32, height: f32) boo
     return clicked;
 }
 
-fn renderSidebarShellToggleButton(state: *runtime.AppState, tooltip: []const u8, label: [:0]const u8, width: f32, height: f32) bool {
+fn renderSidebarShellToggleButton(state: *runtime.AppState, tooltip: []const u8, label: [:0]const u8, width: f32, height: f32) void {
     zgui.pushStyleColor4f(.{ .idx = .button, .c = theme.COLOR_PANEL_ALT });
     zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.06) });
     zgui.pushStyleColor4f(.{ .idx = .button_active, .c = theme.lighten(theme.COLOR_PANEL_ALT, 0.12) });
@@ -524,7 +524,6 @@ fn renderSidebarShellToggleButton(state: *runtime.AppState, tooltip: []const u8,
         zgui.textUnformatted(tooltip);
         zgui.endTooltip();
     }
-    return clicked;
 }
 
 /// Draws the sidebar brand row with logo and title, centered horizontally.
