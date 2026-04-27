@@ -147,6 +147,7 @@ pub fn render(state: *AppState) void {
             const popup_cursor = zgui.getCursorPos();
             zgui.setCursorPos(.{ popup_cursor[0] - popup_padding - provider_panel_shift, popup_cursor[1] });
             const popup_origin = zgui.getCursorScreenPos();
+            //NOTE: Begin of ProviderPanel
             _ = zgui.beginChild("##provider-panel", .{
                 .w = provider_child_width,
                 .h = panel_height,
@@ -173,6 +174,7 @@ pub fn render(state: *AppState) void {
                 zgui.popId();
             }
             zgui.endChild();
+            //NOTE: END OF ProviderPanel
 
             if (active_provider) |provider| {
                 const provider_index = composerProviderIndex(provider);

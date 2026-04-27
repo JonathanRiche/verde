@@ -88,6 +88,7 @@ fn inner_workspace(state: *app_state.AppState) void {
 
     defer zgui.popStyleVar(.{ .count = 1 });
     defer zgui.popStyleColor(.{ .count = 1 });
+    //NOTE: Begin of ChatWorkspaceInner
     _ = zgui.beginChild("ChatWorkspaceInner", .{
         .w = 0.0,
         .h = 0.0,
@@ -97,7 +98,9 @@ fn inner_workspace(state: *app_state.AppState) void {
         },
     });
 
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
     zgui.dummy(.{ .w = 0.0, .h = inner_pad_y });
 
     if (state.projects.items.len == 0) {
@@ -107,6 +110,7 @@ fn inner_workspace(state: *app_state.AppState) void {
         zgui.textColored(theme.COLOR_WHITE, "No projects yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Use the + button in the left rail, browse to a folder, then add its path here.", .{});
         zgui.unindent(.{ .indent_w = empty_pad_x });
+        //NOTE: END OF ChatWorkspaceInner
         return;
     }
 
@@ -121,6 +125,7 @@ fn inner_workspace(state: *app_state.AppState) void {
     if (split_active) {
         zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
         defer zgui.popStyleVar(.{ .count = 1 });
+        //NOTE: Begin of ChatBrowserSplit
         _ = zgui.beginChild("ChatBrowserSplit", .{
             .w = 0.0,
             .h = layout.body_height,
@@ -129,11 +134,14 @@ fn inner_workspace(state: *app_state.AppState) void {
                 .always_use_window_padding = true,
             },
         });
-        defer zgui.endChild();
+        defer {
+            zgui.endChild();
+        }
 
         renderChatColumn(state, chat_column_width, layout.body_height, inner_pad_x);
         zgui.sameLine(.{ .spacing = layout.browser_gap });
         browser_panel.renderDock(state, layout.browser_width, layout.body_height);
+        //NOTE: END OF ChatBrowserSplit
     } else {
         renderChatColumn(state, chat_column_width, layout.body_height, inner_pad_x);
     }
@@ -143,6 +151,7 @@ fn inner_workspace(state: *app_state.AppState) void {
         renderTerminalResizeHandle(state, content[0], content[1], layout.terminal_handle_height);
         terminal_panel.renderDock(state, content[0], layout.terminal_height);
     }
+    //NOTE: END OF ChatWorkspaceInner
 }
 
 // Derives responsive horizontal padding for the chat column so transcript and composer stay usable in split-pane layouts.
@@ -155,6 +164,7 @@ fn chatColumnInnerPadding(column_width: f32, split_active: bool) f32 {
 
 // Renders the transcript and composer column that stays alongside the browser pane.
 fn renderChatColumn(state: *app_state.AppState, width: f32, height: f32, inner_pad_x: f32) void {
+    //NOTE: Begin of ChatBrowserSplitColumn
     _ = zgui.beginChild("ChatBrowserSplitColumn", .{
         .w = width,
         .h = height,
@@ -163,7 +173,9 @@ fn renderChatColumn(state: *app_state.AppState, width: f32, height: f32, inner_p
             .always_use_window_padding = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const composer_gap = theme.scaledUi(8.0);
     const composer_height = theme.clampf(height * 0.27, theme.scaledUi(168.0), @min(height * 0.42, theme.scaledUi(320.0)));
@@ -175,6 +187,7 @@ fn renderChatColumn(state: *app_state.AppState, width: f32, height: f32, inner_p
     const composer_width = @max(width - 2 * inner_pad_x, theme.scaledUi(120.0));
     renderComposer(state, composer_width, @max(height - transcript_height - composer_gap, theme.scaledUi(120.0)));
     zgui.unindent(.{ .indent_w = inner_pad_x });
+    //NOTE: END OF ChatBrowserSplitColumn
 }
 
 // Balances the horizontal browser split against the bottom terminal dock.
@@ -274,18 +287,22 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.CHAT_BLACK });
     defer zgui.popStyleColor(.{ .count = 1 });
     defer zgui.popStyleVar(.{ .count = 2 });
+    //NOTE: Begin of ChatWorkspace
     _ = zgui.beginChild("ChatWorkspace", .{
         .w = width,
         .h = height,
         .child_flags = .{ .border = false },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     renderHeader(state);
     zgui.separator();
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(5.0) });
     //END OUTER UI FOR CHAT WORKSPACE
     inner_workspace(state);
+    //NOTE: END OF ChatWorkspace
 }
 
 /// Renders the current thread title block.
@@ -297,6 +314,7 @@ fn renderHeader(state: anytype) void {
     defer zgui.popStyleVar(.{ .count = 1 });
     defer zgui.popStyleColor(.{ .count = 1 });
 
+    //NOTE: Begin of ChatHeader
     _ = zgui.beginChild("ChatHeader", .{
         .w = 0.0,
         .h = header_height,
@@ -310,7 +328,9 @@ fn renderHeader(state: anytype) void {
             .no_saved_settings = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const header_start = zgui.getCursorPos();
     const header_start_x = zgui.getCursorPosX();
@@ -361,7 +381,10 @@ fn renderHeader(state: anytype) void {
         zgui.textColored(theme.COLOR_WHITE, "{s}", .{display_title});
     }
 
-    if (!has_project) return;
+    if (!has_project) {
+        //NOTE: END OF ChatHeader
+        return;
+    }
 
     const base_y = header_start[1];
     const can_open_folder = state.canOpenCurrentProjectDirectory();
@@ -450,6 +473,7 @@ fn renderHeader(state: anytype) void {
         zgui.textUnformatted("Open the browser controls and native webview runtime");
         zgui.endTooltip();
     }
+    //NOTE: END OF ChatHeader
 }
 
 fn truncateTextToWidth(buffer: []u8, value: []const u8, max_width: f32) []const u8 {
@@ -789,12 +813,15 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     const should_open_at_bottom = transcript_changed or state.scroll_transcript_to_bottom_frames > 0;
 
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
+    //NOTE: Begin of Transcript
     _ = zgui.beginChild("Transcript", .{
         .w = width,
         .h = height,
         .child_flags = .{ .border = false },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const has_pending_stream = runtime.isSendPending(state);
     updateTranscriptAutoFollow(state, has_pending_stream);
@@ -803,6 +830,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     // Inner content wrapper with horizontal padding; auto-resizes vertically so the
     // outer Transcript child handles scrolling while content stays centered.
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ pad_x, 0 } });
+    //NOTE: Begin of TranscriptContent
     _ = zgui.beginChild("TranscriptContent", .{
         .w = 0.0,
         .h = 0.0,
@@ -880,6 +908,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     }
 
     zgui.endChild();
+    //NOTE: END OF TranscriptContent
     zgui.popStyleVar(.{ .count = 1 });
     state.transcript_focused = zgui.isWindowFocused(.{ .child_windows = true });
     if (!zgui.isMouseDown(.left)) {
@@ -888,6 +917,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     zgui.dummy(.{ .w = 0.0, .h = 0.0 });
 
     if (applyPendingTranscriptScroll(state, height)) {
+        //NOTE: END OF Transcript
         return;
     }
 
@@ -897,6 +927,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     } else if (!opening_tail and should_follow_stream) {
         smoothScrollTranscriptToTail();
     }
+    //NOTE: END OF Transcript
 }
 
 fn renderPendingTranscriptTail(state: *app_state.AppState) void {
@@ -1169,6 +1200,7 @@ fn renderPendingDiffCardLocked(files: anytype) void {
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    //NOTE: Begin of PendingDiffCard
     _ = zgui.beginChild("pending-diff-card", .{
         .w = 0.0,
         .h = card_height,
@@ -1195,6 +1227,7 @@ fn renderPendingDiffCardLocked(files: anytype) void {
     for (files.items, 0..) |*file, index| {
         renderPendingDiffFile(file, index);
     }
+    //NOTE: END OF PendingDiffCard
 }
 
 /// Renders the streamed assistant bubble placeholder or partial text.
@@ -1251,6 +1284,7 @@ fn renderTranscriptMessage(
     if (shouldRightAlignBubble(role)) {
         zgui.setCursorPosX(zgui.getCursorPosX() + zgui.getContentRegionAvail()[0] - bubble_width);
     }
+    //NOTE: Begin of TranscriptMessageBubble
     _ = zgui.beginChildId(id, .{
         .w = bubbleWidthForChild(role, bubble_width),
         .h = bubble_height,
@@ -1289,6 +1323,7 @@ fn renderTranscriptMessage(
     }
     const bubble_hovered = zgui.isWindowHovered(.{});
     renderTranscriptBody(state, message_index, body_line_offset, role, body, false, bubble_hovered, markdown_copy_frame, markdown_select_all_frame);
+    //NOTE: END OF TranscriptMessageBubble
 }
 
 /// Draws a generic transcript bubble with optional muted body text.
@@ -1312,6 +1347,7 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
     if (shouldRightAlignBubble(role)) {
         zgui.setCursorPosX(zgui.getCursorPosX() + zgui.getContentRegionAvail()[0] - bubble_width);
     }
+    //NOTE: Begin of TranscriptBubble
     _ = zgui.beginChild(id, .{
         .w = bubbleWidthForChild(role, bubble_width),
         .h = bubble_height,
@@ -1339,6 +1375,7 @@ fn renderTranscriptBubble(state: anytype, id: [:0]const u8, role: anytype, autho
         }
     }
     renderTranscriptBody(state, null, 0, role, body, muted_body, false, null, null);
+    //NOTE: END OF TranscriptBubble
 }
 
 fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, line_offset: usize, role: anytype, body: []const u8, muted_body: bool, bubble_hovered: bool, markdown_copy_frame: ?*TranscriptMarkdownCopyFrame, markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame) void {
@@ -1401,6 +1438,7 @@ fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index
         zgui.popId();
     }
 
+    //NOTE: Begin of SelectableTranscriptBody
     _ = zgui.beginChild("##selectable-transcript-body", .{
         .w = 0.0,
         .h = 0.0,
@@ -1414,7 +1452,9 @@ fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index
             .no_move = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     zgui.pushTextWrapPos(0.0);
     defer zgui.popTextWrapPos();
@@ -1433,6 +1473,7 @@ fn renderSelectablePlainTranscriptBody(state: *app_state.AppState, message_index
     }
 
     selector.update();
+    //NOTE: END OF SelectableTranscriptBody
     return true;
 }
 
@@ -2811,6 +2852,7 @@ fn renderCommandEventRowId(
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 9.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(28, 29, 34, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    //NOTE: Begin of CommandEventRow
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = 0.0,
@@ -2838,12 +2880,14 @@ fn renderCommandEventRowId(
     zgui.sameLine(.{ .spacing = 8.0 });
     if (message_index) |index| {
         if (renderSelectableMarkdownTranscriptBody(state, index, 0, body, markdown_copy_frame, markdown_select_all_frame)) {
+            //NOTE: END OF CommandEventRow
             return;
         }
     }
     zgui.pushTextWrapPos(0.0);
     zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{body});
     zgui.popTextWrapPos();
+    //NOTE: END OF CommandEventRow
 }
 
 /// Renders a persisted changed-files message as a rich card.
@@ -2865,6 +2909,7 @@ fn renderChangedFilesCardId(
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 14.0, 10.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(32, 33, 38, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    //NOTE: Begin of ChangedFilesCard
     _ = zgui.beginChildId(id, .{
         .w = 0.0,
         .h = 0.0,
@@ -2913,11 +2958,13 @@ fn renderChangedFilesCardId(
                 markdown_select_all_frame,
             );
         }
+        //NOTE: END OF ChangedFilesCard
         return;
     }
 
     if (message_index) |index| {
         if (renderSelectableChangedFilesSummary(state, index, entries.items, markdown_copy_frame, markdown_select_all_frame)) {
+            //NOTE: END OF ChangedFilesCard
             return;
         }
     }
@@ -2931,6 +2978,7 @@ fn renderChangedFilesCardId(
         }
         renderChangedFilesEntry(entry);
     }
+    //NOTE: END OF ChangedFilesCard
 }
 
 fn renderSelectableChangedFilesSummary(
@@ -3079,6 +3127,7 @@ fn renderSelectableChangedFilesPatch(
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 8.0, 8.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    //NOTE: Begin of SelectablePendingDiffPatch
     _ = zgui.beginChildId(@intCast(90_000 + index), .{
         .w = 0.0,
         .h = patch_height,
@@ -3121,6 +3170,7 @@ fn renderSelectableChangedFilesPatch(
         markdown_select_all_frame,
     );
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+    //NOTE: END OF SelectablePendingDiffPatch
     return lines.items.len;
 }
 
@@ -3188,6 +3238,7 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 8.0, 8.0 } });
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = colors.rgba(24, 24, 24, 255) });
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
+    //NOTE: Begin of PendingDiffPatch
     _ = zgui.beginChildId(@intCast(80_000 + index), .{
         .w = 0.0,
         .h = patch_height,
@@ -3204,12 +3255,17 @@ fn renderPendingDiffPatch(patch: []const u8, index: usize) void {
         .context_lines = 2,
     }) catch {
         renderPendingDiffPatchFallback(patch);
+        //NOTE: END OF PendingDiffPatch
         return;
     };
     defer view.deinit();
 
-    if (renderPatchView(view)) return;
+    if (renderPatchView(view)) {
+        //NOTE: END OF PendingDiffPatch
+        return;
+    }
     renderPendingDiffPatchFallback(patch);
+    //NOTE: END OF PendingDiffPatch
 }
 
 fn renderPatchView(view: zig_dif.SideBySidePatchView) bool {
@@ -3772,6 +3828,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
 
     zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     const composer_screen_pos = zgui.getCursorScreenPos();
+    //NOTE: Begin of Composer
     _ = zgui.beginChild("Composer", .{
         .w = width,
         .h = height,
@@ -3913,6 +3970,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
             state.abortCurrentThreadSend();
         } else if ((clicked or submitted) and !pending) {
             if (submitted and state.acceptPrimaryFileSearchResult()) {
+                //NOTE: END OF Composer
                 return;
             }
             state.sendDraft() catch |err| {
@@ -3926,6 +3984,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     if (state.hasActiveFileSearch()) {
         renderComposerFileSearchResults(state, composer_screen_pos, width, input_rect_min, input_rect_max);
     }
+    //NOTE: END OF Composer
 }
 
 fn renderComposerFileSearchResults(
@@ -4006,13 +4065,16 @@ fn renderComposerFileSearchResults(
     }
 
     const ensure_selected_visible = state.consumeFileSearchEnsureSelectionVisible();
+    //NOTE: Begin of ComposerFileSearchResults
     _ = zgui.beginChild("ComposerFileSearchResults", .{
         .w = 0.0,
         .h = list_height,
         .child_flags = .{ .border = false },
         .window_flags = .{ .no_saved_settings = true },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     for (results, 0..) |result, index| {
         zgui.pushIntId(@intCast(index));
@@ -4024,6 +4086,7 @@ fn renderComposerFileSearchResults(
         })) {
             zgui.popId();
             _ = state.selectFileSearchResult(index);
+            //NOTE: END OF ComposerFileSearchResults
             return;
         }
 
@@ -4049,6 +4112,7 @@ fn renderComposerFileSearchResults(
         }
         zgui.popId();
     }
+    //NOTE: END OF ComposerFileSearchResults
 }
 
 /// Draws the compact attachment preview above the composer.

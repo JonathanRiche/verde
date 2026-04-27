@@ -19,13 +19,16 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ 0.0, 0.0 } });
     defer zgui.popStyleVar(.{ .count = 2 });
     zgui.setCursorPos(.{ 0.0, 0.0 });
+    //NOTE: Begin of ProjectsRail
     _ = zgui.beginChild("ProjectsRail", .{
         .w = width,
         .h = zgui.getContentRegionAvail()[1],
         .child_flags = .{ .border = false },
         .window_flags = .{ .no_scrollbar = true },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     // Use explicit indent for left padding — window_padding doesn't
     // propagate reliably to child window auto-layout in this zgui version.
@@ -53,6 +56,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     if (is_sidebar_collapsed) {
         renderCompactRail(state, width, rail_width);
+        //NOTE: END OF ProjectsRail
         return;
     }
 
@@ -311,6 +315,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         if (!is_collapsed) zgui.unindent(.{ .indent_w = sub_indent });
         zgui.spacing();
     }
+    //NOTE: END OF ProjectsRail
 }
 
 fn renderCompactRail(state: *runtime.AppState, width: f32, rail_width: f32) void {

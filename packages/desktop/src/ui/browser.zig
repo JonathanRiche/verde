@@ -22,6 +22,7 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
         zgui.popStyleVar(.{ .count = 2 });
     }
 
+    //NOTE: Begin of BrowserDock
     _ = zgui.beginChild("BrowserDock", .{
         .w = width,
         .h = height,
@@ -30,11 +31,17 @@ pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
             .always_use_window_padding = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     renderToolbar(state);
-    if (!state.isBrowserVisible()) return;
+    if (!state.isBrowserVisible()) {
+        //NOTE: END OF BrowserDock
+        return;
+    }
     renderPaneCanvas(state);
+    //NOTE: END OF BrowserDock
 }
 
 /// Draws an icon glyph centered within the last-placed item rect.
@@ -71,6 +78,7 @@ fn renderToolbar(state: *app_state.AppState) void {
         zgui.popStyleColor(.{ .count = 1 });
         zgui.popStyleVar(.{ .count = 1 });
     }
+    //NOTE: Begin of BrowserToolbar
     _ = zgui.beginChild("BrowserToolbar", .{
         .w = 0.0,
         .h = toolbar_height,
@@ -83,7 +91,9 @@ fn renderToolbar(state: *app_state.AppState) void {
             .no_scroll_with_mouse = true,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const browser_state = state.browserState();
     const avail = zgui.getContentRegionAvail()[0];
@@ -215,6 +225,7 @@ fn renderToolbar(state: *app_state.AppState) void {
     }
     drawCenteredIcon(close_icon, theme.COLOR_WHITE);
     zgui.popStyleColor(.{ .count = 3 });
+    //NOTE: END OF BrowserToolbar
 }
 
 fn drawDownChevron(color: [4]f32, start: [2]f32, width: f32, height: f32) void {
@@ -266,6 +277,7 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
         zgui.popStyleColor(.{ .count = 1 });
         zgui.popStyleVar(.{ .count = 1 });
     }
+    //NOTE: Begin of BrowserPaneCanvas
     _ = zgui.beginChild("BrowserPaneCanvas", .{
         .w = 0.0,
         .h = canvas_height,
@@ -273,7 +285,9 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
             .border = false,
         },
     });
-    defer zgui.endChild();
+    defer {
+        zgui.endChild();
+    }
 
     const pane_pos = zgui.getWindowPos();
     const pane_size = zgui.getWindowSize();
@@ -307,6 +321,7 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
                 .w = image_size[0],
                 .h = image_size[1],
             });
+            //NOTE: END OF BrowserPaneCanvas
             return;
         }
     }
@@ -320,6 +335,7 @@ fn renderPaneCanvas(state: *app_state.AppState) void {
     );
 
     renderPanePlaceholder();
+    //NOTE: END OF BrowserPaneCanvas
 }
 
 /// Keeps the pane visually blank until the first browser frame arrives.
