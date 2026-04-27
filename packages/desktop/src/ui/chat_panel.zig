@@ -990,14 +990,44 @@ fn renderVirtualizedTranscriptMessages(
 
     for (messages[visible_start..visible_end], visible_start..) |message, index| {
         const row_start_y = zgui.getCursorPosY();
-        renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image, markdown_copy_frame, markdown_select_all_frame);
-        zgui.dummy(.{ .w = 0.0, .h = row_gap });
-        cacheRenderedTranscriptRowHeight(state, index, message, content_width, row_start_y);
+        if (opening_at_bottom and index == visible_start and prefix_height > 0.0) {
+            const tail_body = transcriptOpeningTailBody(message.body, viewport_height);
+            const tail_author = if (tail_body.ptr == message.body.ptr) message.author else "";
+            const tail_image = if (tail_body.ptr == message.body.ptr) message.image else null;
+            renderTranscriptMessage(state, @intCast(index + 1), null, message.role, tail_author, tail_body, tail_image, null, null);
+            zgui.dummy(.{ .w = 0.0, .h = row_gap });
+        } else {
+            renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image, markdown_copy_frame, markdown_select_all_frame);
+            zgui.dummy(.{ .w = 0.0, .h = row_gap });
+            cacheRenderedTranscriptRowHeight(state, index, message, content_width, row_start_y);
+        }
     }
     const suffix_height = @max(total_height - prefix_height - visible_estimated_height, 0.0);
     if (suffix_height > 0.0) {
         zgui.dummy(.{ .w = 0.0, .h = suffix_height });
     }
+}
+
+fn transcriptOpeningTailBody(body: []const u8, viewport_height: f32) []const u8 {
+    if (body.len == 0) return body;
+
+    const line_height = @max(zgui.getTextLineHeightWithSpacing(), 1.0);
+    const visible_lines = @max(@as(usize, @intFromFloat(viewport_height / line_height)), 1);
+    const line_budget = @max(visible_lines + 8, 24);
+    var lines_seen: usize = 0;
+    var index = body.len;
+    while (index > 0 and lines_seen < line_budget) {
+        index -= 1;
+        if (body[index] == '\n') {
+            lines_seen += 1;
+        }
+    }
+    if (index == 0) return body;
+
+    while (index < body.len and (body[index] == '\n' or body[index] == '\r')) {
+        index += 1;
+    }
+    return body[index..];
 }
 
 fn cachedOrEstimatedTranscriptRowHeight(state: *app_state.AppState, index: usize, message: anytype, content_width: f32, row_gap: f32) f32 {
