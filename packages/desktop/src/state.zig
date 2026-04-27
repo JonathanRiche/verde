@@ -132,6 +132,15 @@ const TranscriptMarkdownBody = struct {
     }
 };
 
+const TranscriptHeightEntry = struct {
+    valid: bool = false,
+    width: f32 = 0.0,
+    body_hash: u64 = 0,
+    author_hash: u64 = 0,
+    image_present: bool = false,
+    height: f32 = 0.0,
+};
+
 pub const TranscriptMarkdownSelectionPoint = struct {
     message_index: usize,
     point: chat_markdown.SelectionPoint,
@@ -306,6 +315,7 @@ pub const ChatThread = struct {
     send_state: *SendState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
+    transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
     draft_image: ?ChatImageAttachment = null,
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
@@ -328,6 +338,7 @@ pub const ChatThread = struct {
             .send_state = send_state,
             .transcript_markdown_entries = .empty,
             .transcript_selectable_entries = .empty,
+            .transcript_height_entries = .empty,
             .draft_image = null,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
@@ -431,6 +442,19 @@ pub const ChatThread = struct {
         self.transcript_selectable_entries.clearRetainingCapacity();
     }
 
+    fn ensureTranscriptHeightEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
+        const message_count = self.messages.items.len;
+        if (self.transcript_height_entries.items.len > message_count) {
+            self.transcript_height_entries.shrinkRetainingCapacity(message_count);
+        } else if (self.transcript_height_entries.items.len < message_count) {
+            self.transcript_height_entries.appendNTimes(allocator, .{}, message_count - self.transcript_height_entries.items.len) catch return;
+        }
+    }
+
+    fn clearTranscriptHeightEntries(self: *ChatThread) void {
+        self.transcript_height_entries.clearRetainingCapacity();
+    }
+
     fn deinitSendState(self: *ChatThread, allocator: std.mem.Allocator) void {
         self.finishSendThread();
         if (self.send_state.result) |result| {
@@ -464,6 +488,7 @@ pub const ChatThread = struct {
         self.transcript_markdown_entries.deinit(allocator);
         self.clearTranscriptSelectableEntries(allocator);
         self.transcript_selectable_entries.deinit(allocator);
+        self.transcript_height_entries.deinit(allocator);
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
@@ -2503,6 +2528,7 @@ pub const AppState = struct {
         }
         thread.clearTranscriptMarkdownEntries(self.allocator);
         thread.clearTranscriptSelectableEntries(self.allocator);
+        thread.clearTranscriptHeightEntries();
     }
 
     fn replaceThreadWithImportedSnapshot(
@@ -2860,6 +2886,51 @@ pub const AppState = struct {
     pub fn transcriptBodyTextLineAt(self: *AppState, message_index: usize, body: []const u8, line_index: usize) []const u8 {
         const entry = self.transcriptBodyTextEntry(message_index, body) orelse return "";
         return entry.lineSlice(line_index);
+    }
+
+    pub fn cachedTranscriptMessageHeight(
+        self: *AppState,
+        message_index: usize,
+        width: f32,
+        body: []const u8,
+        author: []const u8,
+        image_present: bool,
+    ) ?f32 {
+        const thread = self.currentThreadMutable();
+        thread.ensureTranscriptHeightEntries(self.allocator);
+        if (message_index >= thread.transcript_height_entries.items.len) return null;
+
+        const entry = thread.transcript_height_entries.items[message_index];
+        if (!entry.valid) return null;
+        if (@abs(entry.width - width) > 0.5) return null;
+        if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
+        if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
+        if (entry.image_present != image_present) return null;
+        return entry.height;
+    }
+
+    pub fn putTranscriptMessageHeight(
+        self: *AppState,
+        message_index: usize,
+        width: f32,
+        body: []const u8,
+        author: []const u8,
+        image_present: bool,
+        height: f32,
+    ) void {
+        if (height <= 0.0) return;
+        const thread = self.currentThreadMutable();
+        thread.ensureTranscriptHeightEntries(self.allocator);
+        if (message_index >= thread.transcript_height_entries.items.len) return;
+
+        thread.transcript_height_entries.items[message_index] = .{
+            .valid = true,
+            .width = width,
+            .body_hash = std.hash.Wyhash.hash(0, body),
+            .author_hash = std.hash.Wyhash.hash(0, author),
+            .image_present = image_present,
+            .height = height,
+        };
     }
 
     fn ensureTranscriptMarkdownEntries(self: *AppState) void {
