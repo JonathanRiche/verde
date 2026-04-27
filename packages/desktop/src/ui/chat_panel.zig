@@ -783,12 +783,10 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     if (transcript_changed) {
         state.transcript_project_index = selected_project_index;
         state.transcript_thread_index = selected_thread_index;
+        state.scroll_transcript_to_bottom_frames = @max(state.scroll_transcript_to_bottom_frames, 1);
     }
 
     const should_open_at_bottom = transcript_changed or state.scroll_transcript_to_bottom_frames > 0;
-    if (should_open_at_bottom and state.pending_transcript_line_scroll_steps == 0 and state.pending_transcript_page_scroll_steps == 0) {
-        zgui.setNextWindowScroll(0.0, std.math.floatMax(f32));
-    }
 
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     _ = zgui.beginChild("Transcript", .{
@@ -829,7 +827,8 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     };
 
     const messages = state.currentThread().messages.items;
-    const force_bottom_window = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive() and !has_pending_stream;
+    const opening_tail = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive();
+    const force_bottom_window = opening_tail or (should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive());
     const use_virtualized_transcript = force_bottom_window or shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
     const content_width = zgui.getContentRegionAvail()[0];
     const transcript_scroll_y = if (should_open_at_bottom and use_virtualized_transcript)
@@ -844,9 +843,13 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
             state,
             transcript_scroll_y,
             height,
+            opening_tail,
             &markdown_copy_frame,
             &markdown_select_all_frame,
         );
+        if (has_pending_stream) {
+            renderPendingTranscriptTail(state);
+        }
     } else {
         for (messages, 0..) |message, index| {
             const row_start_y = zgui.getCursorPosY();
@@ -856,12 +859,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         }
 
         if (has_pending_stream) {
-            renderPendingDiffCard(state);
-            renderPendingTimelineEvents(state);
-            renderPendingTranscriptBubble(state);
-            renderPendingApproval(state);
-            renderPendingFollowup(state);
-            zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+            renderPendingTranscriptTail(state);
         }
     }
 
@@ -889,27 +887,25 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     }
     zgui.dummy(.{ .w = 0.0, .h = 0.0 });
 
-    if (should_open_at_bottom and use_virtualized_transcript) {
-        zgui.setScrollY(transcript_scroll_y);
-    }
-
     if (applyPendingTranscriptScroll(state, height)) {
         return;
     }
 
-    // Hold bottom-scroll requests for a couple of frames so startup and thread
-    // switches still land correctly after nested child layout settles.
-    if (should_open_at_bottom and !use_virtualized_transcript) {
-        jumpTranscriptToTail();
-        if (state.scroll_transcript_to_bottom_frames > 0) {
-            state.scroll_transcript_to_bottom_frames -= 1;
-        }
-    } else if (state.scroll_transcript_to_bottom_frames > 0) {
+    if (!opening_tail and state.scroll_transcript_to_bottom_frames > 0) {
         jumpTranscriptToTail();
         state.scroll_transcript_to_bottom_frames -= 1;
-    } else if (should_follow_stream) {
+    } else if (!opening_tail and should_follow_stream) {
         smoothScrollTranscriptToTail();
     }
+}
+
+fn renderPendingTranscriptTail(state: *app_state.AppState) void {
+    renderPendingDiffCard(state);
+    renderPendingTimelineEvents(state);
+    renderPendingTranscriptBubble(state);
+    renderPendingApproval(state);
+    renderPendingFollowup(state);
+    zgui.dummy(.{ .w = 0.0, .h = 6.0 });
 }
 
 fn transcriptInitialScrollY(state: *app_state.AppState, content_width: f32, viewport_height: f32, use_virtualized_transcript: bool) f32 {
@@ -934,17 +930,30 @@ fn renderVirtualizedTranscriptMessages(
     state: *app_state.AppState,
     scroll_y: f32,
     viewport_height: f32,
+    opening_at_bottom: bool,
     markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
     markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
 ) void {
     const messages = state.currentThread().messages.items;
     const content_width = zgui.getContentRegionAvail()[0];
     const row_gap = theme.scaledUi(TRANSCRIPT_ROW_GAP);
-    const overscan = @max(viewport_height * 0.75, theme.scaledUi(360.0));
-    const visible_top = @max(scroll_y - overscan, 0.0);
-    const visible_bottom = scroll_y + viewport_height + overscan;
+    const overscan = if (opening_at_bottom) theme.scaledUi(80.0) else @max(viewport_height * 0.75, theme.scaledUi(360.0));
 
     var total_height: f32 = 0.0;
+    for (messages, 0..) |message, index| {
+        total_height += cachedOrEstimatedTranscriptRowHeight(state, index, message, content_width, row_gap);
+    }
+
+    const visible_top = if (opening_at_bottom)
+        @max(total_height - viewport_height - overscan, 0.0)
+    else
+        @max(scroll_y - overscan, 0.0);
+    const visible_bottom = if (opening_at_bottom)
+        total_height
+    else
+        scroll_y + viewport_height + overscan;
+
+    var measured_height: f32 = 0.0;
     var prefix_height: f32 = 0.0;
     var visible_estimated_height: f32 = 0.0;
     var visible_start: usize = messages.len;
@@ -952,7 +961,7 @@ fn renderVirtualizedTranscriptMessages(
 
     for (messages, 0..) |message, index| {
         const row_height = cachedOrEstimatedTranscriptRowHeight(state, index, message, content_width, row_gap);
-        const row_top = total_height;
+        const row_top = measured_height;
         const row_bottom = row_top + row_height;
         if (row_bottom >= visible_top and row_top <= visible_bottom) {
             if (visible_start == messages.len) {
@@ -962,7 +971,7 @@ fn renderVirtualizedTranscriptMessages(
             visible_end = index + 1;
             visible_estimated_height += row_height;
         }
-        total_height = row_bottom;
+        measured_height = row_bottom;
     }
 
     if (visible_start == messages.len) {
@@ -970,7 +979,12 @@ fn renderVirtualizedTranscriptMessages(
         return;
     }
 
-    if (prefix_height > 0.0) {
+    if (opening_at_bottom) {
+        const top_pad = @max(viewport_height - visible_estimated_height, 0.0);
+        if (top_pad > 0.0) {
+            zgui.dummy(.{ .w = 0.0, .h = top_pad });
+        }
+    } else if (prefix_height > 0.0) {
         zgui.dummy(.{ .w = 0.0, .h = prefix_height });
     }
 
