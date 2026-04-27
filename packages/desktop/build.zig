@@ -9,7 +9,6 @@ pub fn build(b: *std.Build) void {
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
     const cef_sdk_configured = cef_sdk_path != null and cef_supported;
     const fff_root = b.path("../../vendor/fff");
-    const inspector_root = b.path("../browser_extensions/inspector");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
         .macos => "libfff_c.dylib",
@@ -38,6 +37,7 @@ pub fn build(b: *std.Build) void {
     const ghostty = b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
+        .@"app-runtime" = .none,
         .@"emit-lib-vt" = true,
     });
     const zqlite = b.dependency("zqlite", .{
@@ -67,17 +67,6 @@ pub fn build(b: *std.Build) void {
     }
 
     const inspector_bundle_files = b.addWriteFiles();
-    if (b.findProgram(&.{"bun"}, &.{})) |bun_path| {
-        const build_inspector_bundle = b.addSystemCommand(&.{
-            bun_path,
-            "run",
-            "build",
-        });
-        build_inspector_bundle.setCwd(inspector_root);
-        inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
-    } else |_| {
-        std.log.warn("bun was not found; using the checked-in inspector bundle", .{});
-    }
     _ = inspector_bundle_files.addCopyFile(
         b.path("../browser_extensions/inspector/dist/inspector.js"),
         "inspector.js",
@@ -113,6 +102,7 @@ pub fn build(b: *std.Build) void {
     const build_fff = b.addSystemCommand(&.{
         "cargo",
         "build",
+        "--quiet",
         "--release",
         "--package",
         "fff-c",
@@ -170,9 +160,7 @@ pub fn build(b: *std.Build) void {
             });
             normalize_fff_needed.addArtifactArg(exe);
             install_exe.step.dependOn(&normalize_fff_needed.step);
-        } else |_| {
-            std.log.warn("patchelf was not found; Linux builds may embed an absolute libfff_c.so dependency", .{});
-        }
+        } else |_| {}
     }
     b.getInstallStep().dependOn(&install_exe.step);
     if (target.result.os.tag == .linux and !cef_sdk_configured) {
