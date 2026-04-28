@@ -59,7 +59,6 @@ extern fn SDL_SetWindowIcon(window: *sdl.Window, icon: *sdl.Surface) bool;
 extern fn SDL_GetDisplayUsableBounds(display_id: sdl.DisplayId, rect: *SdlRect) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeoutMS: c_int) bool;
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
-extern fn SDL_GetWindowDisplayScale(window: *sdl.Window) f32;
 extern fn SDL_SetWindowPosition(window: *sdl.Window, x: c_int, y: c_int) bool;
 extern fn SDL_StartTextInput(window: *sdl.Window) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
@@ -134,7 +133,7 @@ pub fn main() !void {
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
 
-    // Initialize the core ImGui/zgui context and allocate its global state.
+    //NOTE: Initialize the core ImGui/zgui context and allocate its global state.
     zgui.init(allocator);
     defer zgui.deinit();
     // Install the font atlas used by the desktop UI before the backend starts rendering.
@@ -272,7 +271,7 @@ fn getWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) void {
 }
 
 fn currentWindowDisplayScale(window: *sdl.Window) f32 {
-    const scale = SDL_GetWindowDisplayScale(window);
+    const scale = window.getDisplayScale() catch return 1.0;
     if (!std.math.isFinite(scale) or scale <= 0.0) return 1.0;
     return clampf(scale, 1.0, 2.5);
 }
