@@ -47,31 +47,8 @@ const NOTO_SANS_BOLD_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-BoldItalic
 const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
-extern fn SDL_GetPrimaryDisplay() sdl.DisplayId;
-extern fn SDL_CreateSurfaceFrom(
-    width: c_int,
-    height: c_int,
-    format: sdl.PixelFormatEnum,
-    pixels: ?*anyopaque,
-    pitch: c_int,
-) ?*sdl.Surface;
-extern fn SDL_SetWindowIcon(window: *sdl.Window, icon: *sdl.Surface) bool;
-extern fn SDL_GetDisplayUsableBounds(display_id: sdl.DisplayId, rect: *SdlRect) bool;
-extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeoutMS: c_int) bool;
-extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
-extern fn SDL_SetWindowPosition(window: *sdl.Window, x: c_int, y: c_int) bool;
-extern fn SDL_StartTextInput(window: *sdl.Window) bool;
-extern fn SDL_TextInputActive(window: *sdl.Window) bool;
-extern fn SDL_StopTextInput(window: *sdl.Window) bool;
 extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
 extern fn glClear(mask: u32) void;
-
-const SdlRect = extern struct {
-    x: c_int,
-    y: c_int,
-    w: c_int,
-    h: c_int,
-};
 
 const WindowFrame = struct {
     x: c_int,
@@ -118,9 +95,9 @@ pub fn main() !void {
         },
     );
     defer window.destroy();
-    _ = SDL_SetWindowPosition(window, initial_window_frame.x, initial_window_frame.y);
-    _ = SDL_StartTextInput(window);
-    defer _ = SDL_StopTextInput(window);
+    window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
+    sdl.startTextInput(window) catch {};
+    defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
 
     const gl_context = try sdl.gl.createContext(window);
@@ -216,25 +193,25 @@ fn installWindowIcon(window: *sdl.Window) void {
         log.warn("failed to compute window icon pitch", .{});
         return;
     };
-    const surface = SDL_CreateSurfaceFrom(
+    const surface = sdl.createSurfaceFrom(
         loaded.width,
         loaded.height,
         .abgr8888,
         @ptrCast(loaded.pixels),
         pitch,
-    ) orelse {
+    ) catch {
         log.warn("failed to create SDL surface for window icon", .{});
         return;
     };
     defer surface.destroy();
 
-    if (!SDL_SetWindowIcon(window, surface)) {
+    window.setIcon(surface) catch {
         log.warn("failed to set window icon", .{});
-    }
+    };
 }
 
 fn initialWindowFrame() WindowFrame {
-    const display_id = SDL_GetPrimaryDisplay();
+    const display_id = sdl.getPrimaryDisplay();
     if (display_id == .invalid) {
         return .{
             .x = sdl.Window.pos_centered,
@@ -244,15 +221,15 @@ fn initialWindowFrame() WindowFrame {
         };
     }
 
-    var usable_bounds: SdlRect = undefined;
-    if (!SDL_GetDisplayUsableBounds(display_id, &usable_bounds)) {
+    var usable_bounds: sdl.Rect = undefined;
+    sdl.getDisplayUsableBounds(display_id, &usable_bounds) catch {
         return .{
             .x = sdl.Window.pos_centered,
             .y = sdl.Window.pos_centered,
             .w = DEFAULT_WINDOW_WIDTH,
             .h = DEFAULT_WINDOW_HEIGHT,
         };
-    }
+    };
 
     const width = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_bounds.w)) * 0.72), MIN_WINDOW_WIDTH, @min(MAX_WINDOW_WIDTH, usable_bounds.w - 40));
     const height = clampInt(@intFromFloat(@as(f32, @floatFromInt(usable_bounds.h)) * 0.74), MIN_WINDOW_HEIGHT, @min(MAX_WINDOW_HEIGHT, usable_bounds.h - 40));
@@ -262,12 +239,12 @@ fn initialWindowFrame() WindowFrame {
 }
 
 fn getWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) void {
-    if (!SDL_GetWindowSizeInPixels(window, w, h)) {
+    window.getSizeInPixels(w, h) catch {
         window.getSize(w, h) catch {
             if (w) |width| width.* = DEFAULT_WINDOW_WIDTH;
             if (h) |height| height.* = DEFAULT_WINDOW_HEIGHT;
         };
-    }
+    };
 }
 
 fn currentWindowDisplayScale(window: *sdl.Window) f32 {
@@ -324,7 +301,7 @@ fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Nati
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
-        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state))) {
+        if (!sdl.waitEventTimeout(&event, eventWaitTimeoutMs(state))) {
             return true;
         }
         had_event.* = true;
@@ -481,8 +458,8 @@ fn browserInputDebugEnabled() bool {
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
     if (!state.isBrowserPaneFocused()) return;
-    if (SDL_TextInputActive(window)) return;
-    _ = SDL_StartTextInput(window);
+    if (sdl.textInputActive(window)) return;
+    sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
         log.info("browser-input forced SDL_StartTextInput for browser pane focus", .{});
     }

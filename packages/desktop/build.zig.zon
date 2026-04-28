@@ -16,8 +16,8 @@
             .hash = "zgui-0.6.0-dev--L6sZCJKbgBZGCzVMcwD0bNGmpK6yO-UoIESHX5JiRet",
         },
         .zsdl = .{
-            .url = "git+https://github.com/JonathanRiche/zsdl#3e33fbbe0cd33ad594db9d19c0b69e1ac6831ebc",
-            .hash = "zsdl-0.4.0-dev-rFpjE1cJXwB2LO_56l2XTzEYuoqHf2azM6mBKizmblvH",
+            .url = "git+https://github.com/JonathanRiche/zsdl#9ad6f8a301c815946f57e6f55e2f3f9daa7d60d3",
+            .hash = "zsdl-0.4.0-dev-rFpjE3MRXwCwfU4HcQLdjdNSdjnFmSXyQBFjw8s-Ck44",
         },
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig?ref=master#05a88d6758753e1c63fdd45b211dde2057094b0c",
