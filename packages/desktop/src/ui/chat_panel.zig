@@ -799,7 +799,9 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     const should_open_at_bottom = transcript_changed and saved_transcript_scroll_y == null;
     const should_restore_thread_scroll = transcript_changed and saved_transcript_scroll_y != null;
     const should_restore_pending_bottom_scroll = !transcript_changed and state.scroll_transcript_to_bottom_frames > 0 and saved_transcript_scroll_y != null;
-    if (should_restore_thread_scroll or should_restore_pending_bottom_scroll) {
+    if (should_restore_pending_bottom_scroll) {
+        zgui.setNextWindowScroll(0.0, std.math.floatMax(f32));
+    } else if (should_restore_thread_scroll) {
         zgui.setNextWindowScroll(0.0, saved_transcript_scroll_y.?);
     }
 
@@ -851,8 +853,10 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     const force_bottom_window = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive();
     const use_virtualized_transcript = force_bottom_window or shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
     const content_width = zgui.getContentRegionAvail()[0];
-    const transcript_scroll_y = if (should_open_at_bottom and use_virtualized_transcript)
+    const transcript_scroll_y = if ((should_open_at_bottom or should_restore_pending_bottom_scroll) and use_virtualized_transcript)
         transcriptInitialScrollY(state, content_width, height, use_virtualized_transcript)
+    else if (should_restore_thread_scroll and saved_transcript_scroll_y != null)
+        saved_transcript_scroll_y.?
     else
         outer_transcript_scroll_y;
     if (messages.len == 0 and !has_pending_stream) {
