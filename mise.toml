@@ -8,5 +8,4 @@ run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scrip
 
 [tasks.build]
 description = "Builds the desktop app."
-dir = "packages/desktop"
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash ../../scripts/dev/check-desktop-build-deps.sh && source ../../scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" && zig build --release=safe -p \"$HOME/.local\" -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) scripts/release/install-macos-local.sh ;; Linux) scripts/release/install-linux-local-cef.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
