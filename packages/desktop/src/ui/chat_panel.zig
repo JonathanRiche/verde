@@ -862,6 +862,16 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     if (messages.len == 0 and !has_pending_stream) {
         zgui.textColored(theme.COLOR_WHITE, "No messages yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
+    } else if (opening_tail) {
+        renderOpeningTranscriptTailMessages(
+            state,
+            height,
+            &markdown_copy_frame,
+            &markdown_select_all_frame,
+        );
+        if (has_pending_stream) {
+            renderPendingTranscriptTail(state);
+        }
     } else if (use_virtualized_transcript) {
         renderVirtualizedTranscriptMessages(
             state,
@@ -943,6 +953,50 @@ fn renderPendingTranscriptTail(state: *app_state.AppState) void {
     renderPendingApproval(state);
     renderPendingFollowup(state);
     zgui.dummy(.{ .w = 0.0, .h = 6.0 });
+}
+
+fn renderOpeningTranscriptTailMessages(
+    state: *app_state.AppState,
+    viewport_height: f32,
+    markdown_copy_frame: ?*TranscriptMarkdownCopyFrame,
+    markdown_select_all_frame: ?*TranscriptMarkdownSelectAllFrame,
+) void {
+    const messages = state.currentThread().messages.items;
+    if (messages.len == 0) return;
+
+    const content_width = zgui.getContentRegionAvail()[0];
+    const row_gap = theme.scaledUi(TRANSCRIPT_ROW_GAP);
+    const target_height = viewport_height + theme.scaledUi(160.0);
+    var accumulated_height: f32 = 0.0;
+    var start_index = messages.len;
+
+    while (start_index > 0 and accumulated_height < target_height) {
+        start_index -= 1;
+        accumulated_height += cachedOrEstimatedTranscriptRowHeight(state, start_index, messages[start_index], content_width, row_gap);
+    }
+
+    const top_pad = @max(viewport_height - accumulated_height, 0.0);
+    if (top_pad > 0.0) {
+        zgui.dummy(.{ .w = 0.0, .h = top_pad });
+    }
+
+    for (messages[start_index..], start_index..) |message, index| {
+        const row_start_y = zgui.getCursorPosY();
+        const first_row_height = if (index == start_index)
+            cachedOrEstimatedTranscriptRowHeight(state, index, message, content_width, row_gap)
+        else
+            0.0;
+        if (index == start_index and accumulated_height > target_height and first_row_height > viewport_height * 0.75) {
+            const tail_body = transcriptOpeningTailBody(message.body, viewport_height);
+            const tail_author = if (tail_body.ptr == message.body.ptr) message.author else "";
+            const tail_image = if (tail_body.ptr == message.body.ptr) message.image else null;
+            renderTranscriptMessage(state, @intCast(index + 1), null, message.role, tail_author, tail_body, tail_image, null, null);
+        } else {
+            renderTranscriptMessage(state, @intCast(index + 1), index, message.role, message.author, message.body, message.image, markdown_copy_frame, markdown_select_all_frame);
+            cacheRenderedTranscriptRowHeight(state, index, message, content_width, row_start_y);
+        }
+        zgui.dummy(.{ .w = 0.0, .h = row_gap });
+    }
 }
 
 fn transcriptInitialScrollY(state: *app_state.AppState, content_width: f32, viewport_height: f32, use_virtualized_transcript: bool) f32 {
