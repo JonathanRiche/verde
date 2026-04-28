@@ -141,6 +141,7 @@ code {
 }
 
 pre {
+  max-width: 100%;
   margin: 0;
   overflow-x: auto;
   border-radius: var(--radius);
@@ -426,6 +427,59 @@ pre code {
 .btn-ghost:hover {
   border-color: var(--subtle);
   background: rgba(255, 255, 255, 0.03);
+}
+
+.hero-install-preview {
+  width: min(100%, 34rem);
+  margin-top: 1.4rem;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent),
+    rgba(9, 12, 13, 0.72);
+  box-shadow:
+    0 18px 50px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+
+.hero-install-tabs {
+  display: flex;
+  gap: 0.45rem;
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--subtle);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+}
+
+.hero-install-tabs span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.45rem;
+  padding: 0 0.55rem;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.hero-install-tabs span:first-child {
+  color: var(--text);
+  background: var(--accent-wash);
+}
+
+.hero-install-lines {
+  padding: 0.75rem 0.9rem 0.85rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.8;
+}
+
+.hero-install-lines p {
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .hero-highlights {
@@ -1335,10 +1389,12 @@ pre code {
 
 .install-grid {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1.1rem;
 }
 
 .term-card {
+  min-width: 0;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-xl);
   background: var(--panel-strong);
@@ -1413,8 +1469,13 @@ pre code {
 
 .install-prereqs {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
   margin-top: 0.9rem;
+}
+
+.install-prereqs > div {
+  min-width: 0;
 }
 
 .install-prereqs > div strong {
@@ -1540,11 +1601,11 @@ pre code {
   }
 
   .install-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .install-prereqs {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -1634,6 +1695,14 @@ pre code {
     width: 100%;
   }
 
+  .hero-install-tabs {
+    flex-wrap: wrap;
+  }
+
+  .hero-install-lines {
+    font-size: 0.75rem;
+  }
+
   .display {
     font-size: clamp(2.4rem, 8vw, 3.2rem);
   }
@@ -1654,6 +1723,15 @@ pre code {
 
   .heading {
     font-size: clamp(1.8rem, 6vw, 2.4rem);
+  }
+
+  .term-card {
+    padding: 1rem;
+  }
+
+  .term-card pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 }
 

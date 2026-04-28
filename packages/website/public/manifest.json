@@ -1,11 +1,13 @@
 {
-  "short_name": "TanStack App",
-  "name": "Create TanStack App Sample",
+  "short_name": "Verde",
+  "name": "Verde",
+  "description": "Native desktop workspace for coding agents with local provider CLIs, browser, and terminal.",
   "icons": [
     {
-      "src": "favicon.ico",
-      "sizes": "64x64 32x32 24x24 16x16",
-      "type": "image/x-icon"
+      "src": "verde-logo.png",
+      "type": "image/png",
+      "sizes": "105x122",
+      "purpose": "any"
     },
     {
       "src": "logo192.png",
@@ -18,8 +20,8 @@
       "sizes": "512x512"
     }
   ],
-  "start_url": ".",
+  "start_url": "/",
   "display": "standalone",
-  "theme_color": "#000000",
-  "background_color": "#ffffff"
+  "theme_color": "#0d1213",
+  "background_color": "#090c0d"
 }
