@@ -319,6 +319,8 @@ pub const ChatThread = struct {
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
+    transcript_scroll_valid: bool = false,
+    transcript_scroll_y: f32 = 0.0,
     draft_image: ?ChatImageAttachment = null,
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
@@ -342,6 +344,8 @@ pub const ChatThread = struct {
             .transcript_markdown_entries = .empty,
             .transcript_selectable_entries = .empty,
             .transcript_height_entries = .empty,
+            .transcript_scroll_valid = false,
+            .transcript_scroll_y = 0.0,
             .draft_image = null,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
@@ -3902,6 +3906,18 @@ pub const AppState = struct {
 
     pub fn currentThreadMutable(self: *AppState) *ChatThread {
         return self.currentProjectMutable().currentThreadMutable();
+    }
+
+    pub fn rememberCurrentTranscriptScroll(self: *AppState, scroll_y: f32) void {
+        const thread = self.currentThreadMutable();
+        thread.transcript_scroll_valid = true;
+        thread.transcript_scroll_y = @max(scroll_y, 0.0);
+    }
+
+    pub fn currentTranscriptScrollY(self: *const AppState) ?f32 {
+        const thread = self.currentThread();
+        if (!thread.transcript_scroll_valid) return null;
+        return thread.transcript_scroll_y;
     }
 
     pub fn requestComposerFocus(self: *AppState) void {
