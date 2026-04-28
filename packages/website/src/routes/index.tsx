@@ -94,6 +94,20 @@ function App() {
                 Build from source
               </a>
             </div>
+            <div class="hero-install-preview" aria-label="Quick install commands">
+              <div class="hero-install-tabs">
+                <span>Arch Linux</span>
+                <span>macOS / npm</span>
+              </div>
+              <div class="hero-install-lines">
+                <p>
+                  <span class="prompt">$</span> yay -S verde-bin
+                </p>
+                <p>
+                  <span class="prompt">$</span> npm install -g verde-app
+                </p>
+              </div>
+            </div>
             <ul class="hero-highlights stagger" aria-label="Verde highlights">
               <li>Codex and OpenCode</li>
               <li>Embedded browser pane</li>
