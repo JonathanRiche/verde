@@ -2,6 +2,10 @@
 zig = "0.15.2"
 zls = "0.15.2"
 
+[tasks.setup]
+description = "Downloads the CEF SDK into the local build cache."
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scripts/release/cef-common.sh && verde_cef_ensure_sdk linux \"$(uname -m)\" && echo \"CEF SDK cache: $VERDE_CEF_SDK_PATH_RESOLVED\"'"
+
 [tasks.build]
 description = "Builds the desktop app."
 dir = "packages/desktop"
