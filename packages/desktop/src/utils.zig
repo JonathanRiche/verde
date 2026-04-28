@@ -22,6 +22,9 @@ const GL_LINEAR_MIPMAP_LINEAR = 0x2703;
 pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const PERSISTED_DIFF_MARKER = "EDITORTS_DIFF_V1\n";
 
+extern fn verde_macos_clipboard_copy_image(out_bytes: *?[*]u8, out_len: *usize, out_mime: *?[*:0]const u8) c_int;
+extern fn free(ptr: ?*anyopaque) void;
+
 pub const PickDirectoryError = std.process.Child.RunError || std.mem.Allocator.Error || error{
     UnsupportedOperatingSystem,
     FolderPickerUnavailable,
@@ -1203,35 +1206,50 @@ const MacClipboardImageFlavor = struct {
 };
 
 fn captureClipboardImageMacOS(allocator: std.mem.Allocator) !?ClipboardImageCapture {
-    const info_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "osascript", "-e", "clipboard info" },
-        .cwd = ".",
-        .max_output_bytes = 16 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
+    if (try captureClipboardImageMacOSNative(allocator)) |capture| {
+        if (std.mem.eql(u8, capture.mime, "image/tiff")) {
+            return try convertClipboardTiffToPng(allocator, capture);
+        }
+        return capture;
+    }
+
+    const candidates = [_]MacClipboardImageFlavor{
+        .{ .class_code = "PNGf", .mime = "image/png" },
+        .{ .class_code = "JPEG", .mime = "image/jpeg" },
+        .{ .class_code = "TIFF", .mime = "image/tiff" },
     };
-    defer allocator.free(info_result.stdout);
-    defer allocator.free(info_result.stderr);
 
-    switch (info_result.term) {
-        .Exited => |code| if (code != 0) return null,
-        else => return null,
+    for (candidates) |candidate| {
+        const capture = try readMacClipboardImageFlavor(allocator, candidate.class_code, candidate.mime) orelse continue;
+        if (std.mem.eql(u8, capture.mime, "image/tiff")) {
+            return try convertClipboardTiffToPng(allocator, capture);
+        }
+        return capture;
     }
 
-    const preferred = selectMacClipboardImageFlavor(info_result.stdout) orelse return null;
-    var capture = try readMacClipboardImageFlavor(allocator, preferred.class_code, preferred.mime);
-    if (capture == null and std.mem.eql(u8, preferred.class_code, "PNGf")) {
-        capture = try readMacClipboardImageFlavor(allocator, "TIFF", "image/tiff");
-    }
-    if (capture == null) return null;
+    return null;
+}
 
-    if (std.mem.eql(u8, capture.?.mime, "image/tiff")) {
-        return try convertClipboardTiffToPng(allocator, capture.?);
-    }
+fn captureClipboardImageMacOSNative(allocator: std.mem.Allocator) !?ClipboardImageCapture {
+    var native_bytes: ?[*]u8 = null;
+    var native_len: usize = 0;
+    var native_mime: ?[*:0]const u8 = null;
 
-    return capture;
+    const result = verde_macos_clipboard_copy_image(&native_bytes, &native_len, &native_mime);
+    if (result < 0) return error.OutOfMemory;
+    if (result == 0 or native_bytes == null or native_len == 0 or native_mime == null) return null;
+    defer free(native_bytes);
+
+    if (native_len > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
+
+    const bytes = try allocator.dupe(u8, native_bytes.?[0..native_len]);
+    errdefer allocator.free(bytes);
+    const mime = std.mem.span(native_mime.?);
+
+    return .{
+        .bytes = bytes,
+        .mime = mime,
+    };
 }
 
 fn selectMacClipboardImageFlavor(info_output: []const u8) ?MacClipboardImageFlavor {
@@ -1341,7 +1359,10 @@ fn convertClipboardTiffToPng(
 
     const temp_dir = std.fs.path.join(allocator, &.{ "/tmp", "editorts-native-clipboard" }) catch return error.OutOfMemory;
     defer allocator.free(temp_dir);
-    try std.fs.makeDirAbsolute(temp_dir);
+    std.fs.makeDirAbsolute(temp_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
     const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), std.time.milliTimestamp())));
     const input_path = try std.fmt.allocPrint(allocator, "{s}/clipboard-{d}.tiff", .{ temp_dir, timestamp_ms });

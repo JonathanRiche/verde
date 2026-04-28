@@ -146,8 +146,13 @@ pub fn build(b: *std.Build) void {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
                 exe.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
             }
+            exe.addCSourceFile(.{
+                .file = b.path("src/platform/macos_clipboard.m"),
+                .flags = &.{},
+            });
             exe.linkFramework("SDL3");
             exe.linkFramework("OpenGL");
+            exe.linkFramework("AppKit");
         },
         else => {},
     }
@@ -327,6 +332,17 @@ pub fn build(b: *std.Build) void {
         }
         exe_tests.linkSystemLibrary("SDL3");
         exe_tests.linkSystemLibrary("util");
+    } else if (target.result.os.tag == .macos) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+            exe_tests.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+        }
+        exe_tests.addCSourceFile(.{
+            .file = b.path("src/platform/macos_clipboard.m"),
+            .flags = &.{},
+        });
+        exe_tests.linkFramework("SDL3");
+        exe_tests.linkFramework("OpenGL");
+        exe_tests.linkFramework("AppKit");
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 

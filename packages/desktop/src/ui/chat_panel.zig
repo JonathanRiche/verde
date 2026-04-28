@@ -3973,6 +3973,12 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     }
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
+    // Keep this disabled until image file picking has a dedicated UX.
+    // const paste_image_button_width = theme.scaledUi(96.0);
+    // if (zgui.button("Paste image", .{ .w = paste_image_button_width, .h = theme.scaledUi(28.0) })) {
+    //     state.attachClipboardImageToCurrentDraft();
+    // }
+    // zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
     composer_pickers.render(state);
     const pending = runtime.isSendPending(state);
     if (pending) {
