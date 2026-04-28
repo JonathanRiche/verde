@@ -966,13 +966,18 @@ fn renderOpeningTranscriptTailMessages(
 
     const content_width = zgui.getContentRegionAvail()[0];
     const row_gap = theme.scaledUi(TRANSCRIPT_ROW_GAP);
-    const target_height = viewport_height + theme.scaledUi(160.0);
+    const target_height = @max(viewport_height - theme.scaledUi(24.0), theme.scaledUi(120.0));
     var accumulated_height: f32 = 0.0;
     var start_index = messages.len;
 
     while (start_index > 0 and accumulated_height < target_height) {
-        start_index -= 1;
-        accumulated_height += cachedOrEstimatedTranscriptRowHeight(state, start_index, messages[start_index], content_width, row_gap);
+        const candidate_index = start_index - 1;
+        const candidate_height = cachedOrEstimatedTranscriptRowHeight(state, candidate_index, messages[candidate_index], content_width, row_gap);
+        if (accumulated_height > 0.0 and accumulated_height + candidate_height > target_height and candidate_height <= target_height * 0.6) {
+            break;
+        }
+        start_index = candidate_index;
+        accumulated_height += candidate_height;
     }
 
     const top_pad = @max(viewport_height - accumulated_height, 0.0);
@@ -986,7 +991,7 @@ fn renderOpeningTranscriptTailMessages(
             cachedOrEstimatedTranscriptRowHeight(state, index, message, content_width, row_gap)
         else
             0.0;
-        if (index == start_index and accumulated_height > target_height and first_row_height > viewport_height * 0.75) {
+        if (index == start_index and accumulated_height > target_height and first_row_height > target_height * 0.6) {
             const tail_body = transcriptOpeningTailBody(message.body, viewport_height);
             const tail_author = if (tail_body.ptr == message.body.ptr) message.author else "";
             const tail_image = if (tail_body.ptr == message.body.ptr) message.image else null;
