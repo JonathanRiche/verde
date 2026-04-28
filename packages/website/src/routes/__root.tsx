@@ -26,7 +26,11 @@ export const Route = createRootRouteWithContext()({
       },
       { name: 'theme-color', content: '#0d1213' },
     ],
-    links: [{ rel: 'stylesheet', href: styleCss }],
+    links: [
+      { rel: 'icon', type: 'image/png', href: '/verde-logo.png' },
+      { rel: 'apple-touch-icon', href: '/verde-logo.png' },
+      { rel: 'stylesheet', href: styleCss },
+    ],
   }),
   shellComponent: RootComponent,
 })
@@ -36,9 +40,9 @@ function RootComponent() {
     <html lang="en">
       <head>
         <HydrationScript />
+        <HeadContent />
       </head>
       <body>
-        <HeadContent />
         <Suspense>
           <Header />
           <Outlet />
