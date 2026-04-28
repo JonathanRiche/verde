@@ -37,16 +37,12 @@ fn createRootModule(
 
 fn configureModule(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
-    if (hasSystemTreeSitter(b)) {
-        module.linkSystemLibrary("tree-sitter", .{ .use_pkg_config = .force });
-    } else {
-        module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
-        module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
-        module.addCSourceFile(.{
-            .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
-            .flags = &.{},
-        });
-    }
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    module.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &.{},
+    });
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/typescript/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/tsx/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-javascript/src"));
@@ -79,15 +75,4 @@ fn configureModule(b: *std.Build, module: *std.Build.Module) void {
         .file = b.path("vendor/tree-sitter-typescript/tsx/src/scanner.c"),
         .flags = &.{},
     });
-}
-
-fn hasSystemTreeSitter(b: *std.Build) bool {
-    const result = std.process.Child.run(.{
-        .allocator = b.allocator,
-        .argv = &.{ "pkg-config", "--exists", "tree-sitter" },
-    }) catch return false;
-    defer b.allocator.free(result.stdout);
-    defer b.allocator.free(result.stderr);
-
-    return result.term == .Exited and result.term.Exited == 0;
 }

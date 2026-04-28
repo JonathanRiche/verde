@@ -1,22 +1,6 @@
 # zig_treesitter
 
-Typed Zig wrappers around the system Tree-sitter C library.
-
-## Prerequisite
-
-This package expects Tree-sitter to be installed on the development machine.
-
-Linux:
-
-```bash
-sudo apt-get install libtree-sitter-dev pkg-config
-```
-
-macOS:
-
-```bash
-brew install tree-sitter
-```
+Typed Zig wrappers around the bundled Tree-sitter C library.
 
 ## Scope
 
