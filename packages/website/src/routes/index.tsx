@@ -270,8 +270,9 @@ function App() {
               Ship it from releases or build it straight from the repo.
             </h2>
             <p class="band-body">
-              Verde has release artifacts for Linux and macOS, plus a direct
-              source path for running the app locally.
+              Verde has release artifacts for Linux and macOS, an AUR package
+              for Arch, an npm launcher, and source installers for local builds
+              with the embedded browser pane.
             </p>
           </div>
 
@@ -295,13 +296,41 @@ function App() {
             <article class="term-card">
               <div class="term-card-header">
                 <span>Source path</span>
-                <strong>Run locally</strong>
+                <strong>Install from source</strong>
               </div>
               <pre>
-                <code>{`git clone https://github.com/JonathanRiche/verde
-cd verde
-zig build run`}</code>
+                <code>{`# Linux with embedded browser pane
+bash ./scripts/release/install-linux-local-cef.sh
+
+# macOS app bundle with CEF
+./scripts/release/install-macos-local.sh`}</code>
               </pre>
+            </article>
+
+            <article class="term-card term-card-span">
+              <div class="term-card-header">
+                <span>Other install paths</span>
+                <strong>Arch, npm, or plain Zig</strong>
+              </div>
+              <p>
+                Use the AUR package on Arch, the npm launcher on supported
+                developer machines, or install from the repo root with Zig.
+              </p>
+              <div class="install-prereqs">
+                <div>
+                  <strong>Package managers</strong>
+                  <pre>
+                    <code>{`yay -S verde-bin
+npx verde-app`}</code>
+                  </pre>
+                </div>
+                <div>
+                  <strong>Repo root</strong>
+                  <pre>
+                    <code>zig build --release=safe -p ~/.local</code>
+                  </pre>
+                </div>
+              </div>
             </article>
 
             <article class="term-card term-card-span">

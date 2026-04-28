@@ -1,12 +1,12 @@
 {
-  "include": ["**/*.ts", "**/*.tsx"],
+  "include": ["**/*.ts", "**/*.tsx", "alchemy.run.ts", "types/**/*.d.ts"],
   "compilerOptions": {
     "target": "ES2022",
     "jsx": "preserve",
     "jsxImportSource": "solid-js",
     "module": "ESNext",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["vite/client"],
+    "types": ["vite/client", "@cloudflare/workers-types", "./types/env.d.ts"],
 
     /* Bundler mode */
     "moduleResolution": "bundler",
