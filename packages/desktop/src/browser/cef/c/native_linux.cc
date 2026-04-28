@@ -341,6 +341,13 @@ class VerdeApp final : public CefApp, public CefRenderProcessHandler {
       CefRefPtr<CefCommandLine> command_line) override {
     appendSwitchIfMissing(command_line, "no-sandbox");
     appendSwitchIfMissing(command_line, "no-zygote");
+#if defined(__APPLE__)
+    if (process_type.empty()) {
+      appendSwitchIfMissing(command_line, "single-process");
+      appendSwitchIfMissing(command_line, "disable-gpu");
+      appendSwitchIfMissing(command_line, "disable-gpu-compositing");
+    }
+#endif
     if (!process_type.empty()) {
       // Chromium 146 expects non-zygote children to remap the pseudonymization
       // salt descriptor before startup. CEF's subprocess path in this embedder
@@ -723,6 +730,8 @@ extern "C" int verde_cef_execute_subprocess(int argc,
 extern "C" int verde_cef_initialize(int argc,
                                      const char* const* argv,
                                      const char* subprocess_path,
+                                     const char* framework_dir,
+                                     const char* main_bundle_path,
                                      const char* resources_dir,
                                      const char* locales_dir) {
   if (g_runtime.initialized) {
@@ -730,8 +739,10 @@ extern "C" int verde_cef_initialize(int argc,
   }
 
   std::fprintf(stderr,
-               "verde-cef: initialize start subprocess=%s resources=%s locales=%s\n",
+               "verde-cef: initialize start subprocess=%s framework=%s bundle=%s resources=%s locales=%s\n",
                subprocess_path != nullptr ? subprocess_path : "(null)",
+               framework_dir != nullptr ? framework_dir : "(null)",
+               main_bundle_path != nullptr ? main_bundle_path : "(null)",
                resources_dir != nullptr ? resources_dir : "(null)",
                locales_dir != nullptr ? locales_dir : "(null)");
   std::fflush(stderr);
@@ -747,6 +758,10 @@ extern "C" int verde_cef_initialize(int argc,
   const std::string cache_root = defaultCacheRoot();
   const std::string cache_path = cache_root + "/profile";
   CefString(&settings.browser_subprocess_path) = subprocess_path != nullptr ? subprocess_path : "";
+#if defined(__APPLE__)
+  CefString(&settings.framework_dir_path) = framework_dir != nullptr ? framework_dir : "";
+  CefString(&settings.main_bundle_path) = main_bundle_path != nullptr ? main_bundle_path : "";
+#endif
   CefString(&settings.resources_dir_path) = resources_dir != nullptr ? resources_dir : "";
   CefString(&settings.locales_dir_path) = locales_dir != nullptr ? locales_dir : "";
   CefString(&settings.root_cache_path) = cache_root;

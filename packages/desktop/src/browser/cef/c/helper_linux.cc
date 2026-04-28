@@ -27,6 +27,8 @@ extern "C" int verde_cef_execute_subprocess(int argc, const char* const* argv);
 extern "C" int verde_cef_initialize(int argc,
                                      const char* const* argv,
                                      const char* subprocess_path,
+                                     const char* framework_dir,
+                                     const char* main_bundle_path,
                                      const char* resources_dir,
                                      const char* locales_dir);
 extern "C" void verde_cef_shutdown();
@@ -682,10 +684,16 @@ int main(int argc, char** argv) {
   const std::string exe_path = selfExePath();
   const std::string exe_dir = dirnameOf(exe_path);
 #if defined(__APPLE__)
+  const std::string contents_dir = dirnameOf(exe_dir);
+  const std::string main_bundle_path = dirnameOf(contents_dir);
+  const std::string framework_dir =
+      exe_dir + "/Chromium Embedded Framework.framework";
   const std::string resources_dir =
       exe_dir + "/Chromium Embedded Framework.framework/Resources";
   const std::string locales_dir = resources_dir + "/locales";
 #else
+  const std::string framework_dir;
+  const std::string main_bundle_path;
   const std::string resources_dir = exe_dir;
   const std::string locales_dir = exe_dir + "/locales";
 #endif
@@ -725,6 +733,8 @@ int main(int argc, char** argv) {
           argc,
           const_cast<const char* const*>(argv),
           process_helper_path.c_str(),
+          framework_dir.empty() ? nullptr : framework_dir.c_str(),
+          main_bundle_path.empty() ? nullptr : main_bundle_path.c_str(),
           resources_dir.c_str(),
           locales_dir.c_str())) {
     fclose(g_event_output);
