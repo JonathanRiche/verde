@@ -795,7 +795,13 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         state.scroll_transcript_to_bottom_frames = @max(state.scroll_transcript_to_bottom_frames, 1);
     }
 
-    const should_open_at_bottom = transcript_changed or state.scroll_transcript_to_bottom_frames > 0;
+    const saved_transcript_scroll_y = state.currentTranscriptScrollY();
+    const should_open_at_bottom = transcript_changed and saved_transcript_scroll_y == null;
+    const should_restore_thread_scroll = transcript_changed and saved_transcript_scroll_y != null;
+    const should_restore_pending_bottom_scroll = !transcript_changed and state.scroll_transcript_to_bottom_frames > 0 and saved_transcript_scroll_y != null;
+    if (should_restore_thread_scroll or should_restore_pending_bottom_scroll) {
+        zgui.setNextWindowScroll(0.0, saved_transcript_scroll_y.?);
+    }
 
     // Outer scrollable region spans full width so the scrollbar sits at the far right edge.
     //NOTE: Begin of Transcript
@@ -808,6 +814,7 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         zgui.endChild();
     }
 
+    const outer_transcript_scroll_y = zgui.getScrollY();
     const has_pending_stream = runtime.isSendPending(state);
     updateTranscriptAutoFollow(state, has_pending_stream);
     const should_follow_stream = state.transcript_auto_follow_pending and has_pending_stream;
@@ -841,13 +848,13 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
 
     const messages = state.currentThread().messages.items;
     const opening_tail = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive();
-    const force_bottom_window = opening_tail or (should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive());
+    const force_bottom_window = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive();
     const use_virtualized_transcript = force_bottom_window or shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
     const content_width = zgui.getContentRegionAvail()[0];
     const transcript_scroll_y = if (should_open_at_bottom and use_virtualized_transcript)
         transcriptInitialScrollY(state, content_width, height, use_virtualized_transcript)
     else
-        zgui.getScrollY();
+        outer_transcript_scroll_y;
     if (messages.len == 0 and !has_pending_stream) {
         zgui.textColored(theme.COLOR_WHITE, "No messages yet", .{});
         zgui.textColored(theme.COLOR_TEXT_MUTED, "Choose a provider, type a prompt below, and start the first chat for this directory.", .{});
@@ -906,11 +913,21 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
         return;
     }
 
+    const transcript_scroll_y_after_render = zgui.getScrollY();
+    if (opening_tail) {
+        state.rememberCurrentTranscriptScroll(transcript_scroll_y);
+        state.scroll_transcript_to_bottom_frames = 1;
+    } else {
+        state.rememberCurrentTranscriptScroll(transcript_scroll_y_after_render);
+    }
+
     if (!opening_tail and state.scroll_transcript_to_bottom_frames > 0) {
         jumpTranscriptToTail();
+        state.rememberCurrentTranscriptScroll(zgui.getScrollY());
         state.scroll_transcript_to_bottom_frames -= 1;
     } else if (!opening_tail and should_follow_stream) {
         smoothScrollTranscriptToTail();
+        state.rememberCurrentTranscriptScroll(zgui.getScrollY());
     }
     //NOTE: END OF Transcript
 }
