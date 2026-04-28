@@ -792,11 +792,11 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     if (transcript_changed) {
         state.transcript_project_index = selected_project_index;
         state.transcript_thread_index = selected_thread_index;
-        state.scroll_transcript_to_bottom_frames = @max(state.scroll_transcript_to_bottom_frames, 1);
+        state.scroll_transcript_to_bottom_frames = @max(state.scroll_transcript_to_bottom_frames, 2);
     }
 
     const saved_transcript_scroll_y = state.currentTranscriptScrollY();
-    const should_open_at_bottom = transcript_changed and saved_transcript_scroll_y == null;
+    const should_open_at_bottom = saved_transcript_scroll_y == null and (transcript_changed or state.scroll_transcript_to_bottom_frames > 0);
     const should_restore_thread_scroll = transcript_changed and saved_transcript_scroll_y != null;
     const should_restore_pending_bottom_scroll = !transcript_changed and state.scroll_transcript_to_bottom_frames > 0 and saved_transcript_scroll_y != null;
     if (should_restore_pending_bottom_scroll) {
@@ -853,7 +853,9 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
     const force_bottom_window = should_open_at_bottom and !markdown_select_all_frame.requested and !state.transcriptMarkdownSelectionActive();
     const use_virtualized_transcript = force_bottom_window or shouldVirtualizeTranscript(state, markdown_select_all_frame.requested, has_pending_stream);
     const content_width = zgui.getContentRegionAvail()[0];
-    const transcript_scroll_y = if ((should_open_at_bottom or should_restore_pending_bottom_scroll) and use_virtualized_transcript)
+    const transcript_scroll_y = if (opening_tail)
+        0.0
+    else if (should_restore_pending_bottom_scroll and use_virtualized_transcript)
         transcriptInitialScrollY(state, content_width, height, use_virtualized_transcript)
     else if (should_restore_thread_scroll and saved_transcript_scroll_y != null)
         saved_transcript_scroll_y.?
@@ -929,8 +931,11 @@ fn renderTranscript(state: *app_state.AppState, width: f32, height: f32, pad_x: 
 
     const transcript_scroll_y_after_render = zgui.getScrollY();
     if (opening_tail) {
-        state.rememberCurrentTranscriptScroll(transcript_scroll_y);
-        state.scroll_transcript_to_bottom_frames = 1;
+        if (state.scroll_transcript_to_bottom_frames > 1) {
+            state.scroll_transcript_to_bottom_frames -= 1;
+        } else {
+            state.rememberCurrentTranscriptScroll(transcriptInitialScrollY(state, content_width, height, true));
+        }
     } else {
         state.rememberCurrentTranscriptScroll(transcript_scroll_y_after_render);
     }
