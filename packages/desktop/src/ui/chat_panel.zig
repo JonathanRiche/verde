@@ -1086,8 +1086,13 @@ fn renderVirtualizedTranscriptMessages(
 
     for (messages[visible_start..visible_end], visible_start..) |message, index| {
         const row_start_y = zgui.getCursorPosY();
-        if (opening_at_bottom and index == visible_start and prefix_height > 0.0) {
-            const tail_body = transcriptOpeningTailBody(message.body, viewport_height);
+        const row_height = cachedOrEstimatedTranscriptRowHeight(state, index, message, content_width, row_gap);
+        const hidden_row_height = @max(scroll_y - prefix_height, 0.0);
+        const render_row_tail = index == visible_start and
+            row_height > viewport_height * 0.8 and
+            (opening_at_bottom or hidden_row_height > viewport_height * 0.2);
+        if (render_row_tail) {
+            const tail_body = transcriptOpeningTailBody(message.body, @min(viewport_height + theme.scaledUi(160.0), row_height));
             const tail_author = if (tail_body.ptr == message.body.ptr) message.author else "";
             const tail_image = if (tail_body.ptr == message.body.ptr) message.image else null;
             renderTranscriptMessage(state, @intCast(index + 1), null, message.role, tail_author, tail_body, tail_image, null, null);
