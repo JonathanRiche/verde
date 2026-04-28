@@ -1,3 +1,8 @@
 [tools]
 zig = "0.15.2"
 zls = "0.15.2"
+
+[tasks.build]
+description = "Builds the desktop app."
+dir = "packages/desktop"
+run = "zig build --release=safe -p \"$HOME/.local\" -Dcef-sdk-path=\"$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal\""
