@@ -1,12 +1,12 @@
 [tools]
 zig = "0.15.2"
-zls = "0.15.2"
+# zls = "0.15.2"
 
 [tasks.setup]
 description = "Downloads the CEF SDK into the local build cache."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scripts/release/cef-common.sh && verde_cef_ensure_sdk linux \"$(uname -m)\" && echo \"CEF SDK cache: $VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" && echo \"CEF SDK cache: $VERDE_CEF_SDK_PATH_RESOLVED\"'"
 
 [tasks.build]
 description = "Builds the desktop app."
 dir = "packages/desktop"
-run = "zig build --release=safe -p \"$HOME/.local\" -Dcef-sdk-path=\"$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal\""
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash ../../scripts/dev/check-desktop-build-deps.sh && source ../../scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" && zig build --release=safe -p \"$HOME/.local\" -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"

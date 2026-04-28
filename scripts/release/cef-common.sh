@@ -35,6 +35,17 @@ verde_cef_normalize_arch() {
   esac
 }
 
+verde_cef_host_os() {
+  case "$(uname -s)" in
+    Linux) printf '%s\n' "linux" ;;
+    Darwin) printf '%s\n' "macos" ;;
+    *)
+      echo "unsupported CEF host OS: $(uname -s)" >&2
+      return 1
+      ;;
+  esac
+}
+
 verde_cef_platform_suffix() {
   local os="$1"
   local arch="$2"
