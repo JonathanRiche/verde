@@ -22,16 +22,6 @@ Keep this package focused on:
 
 Do not put diff logic or UI code here.
 
-## Development Prerequisite
+## Dependency Model
 
-Developers working on this package need the Tree-sitter C library and headers installed on their machine.
-
-Linux:
-```bash
-sudo apt-get install libtree-sitter-dev pkg-config
-```
-
-macOS:
-```bash
-brew install tree-sitter
-```
+The core Tree-sitter C library is bundled under `vendor/tree-sitter` and compiled into consumers. Do not add a system `pkg-config` dependency for Tree-sitter; release builds must not link to Homebrew or distro Tree-sitter dylibs.

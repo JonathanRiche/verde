@@ -20,7 +20,6 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 PREFIX_DIR="$WORK_DIR/prefix"
 APP_DIR="$WORK_DIR/Verde.app"
-ICONSET_DIR="$WORK_DIR/verde.iconset"
 ICON_FILE="$APP_DIR/Contents/Resources/verde.icns"
 DEST_APP_DIR="$APPLICATIONS_DIR/Verde.app"
 
@@ -42,8 +41,7 @@ fi
 
 mkdir -p \
   "$APP_DIR/Contents/MacOS" \
-  "$APP_DIR/Contents/Resources" \
-  "$ICONSET_DIR"
+  "$APP_DIR/Contents/Resources"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
@@ -59,7 +57,7 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
 
-"$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
+bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -92,17 +90,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-sips -z 16 16 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
-sips -z 32 32 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
-sips -z 32 32 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
-sips -z 64 64 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
-sips -z 128 128 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
-sips -z 256 256 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
-sips -z 256 256 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
-sips -z 512 512 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
-sips -z 1024 1024 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" --out "$ICONSET_DIR/icon_512x512@2x.png" >/dev/null
-iconutil -c icns "$ICONSET_DIR" -o "$ICON_FILE"
+bash "$SCRIPT_DIR/create-macos-icon.sh" \
+  "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" \
+  "$ICON_FILE"
 
 mkdir -p "$APPLICATIONS_DIR"
 rm -rf "$DEST_APP_DIR"
