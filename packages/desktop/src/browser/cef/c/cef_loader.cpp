@@ -11,6 +11,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
+#include "include/wrapper/cef_library_loader.h"
+#endif
+
 bool CefLoader::initialized_ = false;
 
 namespace {
@@ -55,7 +59,14 @@ bool CefLoader::Initialize(const std::string& runtime_dir) {
   }
 
 #if defined(__APPLE__)
-  (void)runtime_dir;
+  const std::string framework_path =
+      runtime_dir +
+      "/Chromium Embedded Framework.framework/Chromium Embedded Framework";
+  if (!cef_load_library(framework_path.c_str())) {
+    std::cerr << "verde-cef-loader: failed to load " << framework_path
+              << std::endl;
+    return false;
+  }
   initialized_ = true;
   return true;
 #else

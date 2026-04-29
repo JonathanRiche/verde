@@ -66,11 +66,19 @@ pub fn build(b: *std.Build) void {
         imgui.root_module.addIncludePath(zsdl.path("libs/sdl3/include"));
     }
 
+    const build_inspector_bundle = b.addSystemCommand(&.{
+        "bun",
+        "run",
+        "build",
+    });
+    build_inspector_bundle.setCwd(b.path("../browser_extensions/inspector"));
+
     const inspector_bundle_files = b.addWriteFiles();
     _ = inspector_bundle_files.addCopyFile(
         b.path("../browser_extensions/inspector/dist/inspector.js"),
         "inspector.js",
     );
+    inspector_bundle_files.step.dependOn(&build_inspector_bundle.step);
     const inspector_bundle_module = b.createModule(.{
         .root_source_file = inspector_bundle_files.add("inspector_bundle.zig",
             \\pub const bundle = @embedFile("inspector.js");
@@ -138,8 +146,13 @@ pub fn build(b: *std.Build) void {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
                 exe.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
             }
+            exe.addCSourceFile(.{
+                .file = b.path("src/platform/macos_clipboard.m"),
+                .flags = &.{},
+            });
             exe.linkFramework("SDL3");
             exe.linkFramework("OpenGL");
+            exe.linkFramework("AppKit");
         },
         else => {},
     }
@@ -187,7 +200,7 @@ pub fn build(b: *std.Build) void {
             "bash",
             "-lc",
             b.fmt(
-                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel",
+                "cmake -S src/browser/cef/c -B .zig-cache/verde-cef-helper -DCMAKE_BUILD_TYPE=Release -DCEF_ROOT={s} -DVERDE_OUTPUT_DIR=$PWD/zig-out/bin && cmake --build .zig-cache/verde-cef-helper --target verde-browser-cef verde-browser-cef-process --parallel \"${{VERDE_CEF_BUILD_JOBS:-2}}\"",
                 .{cef_sdk_path.?},
             ),
         });
@@ -319,6 +332,17 @@ pub fn build(b: *std.Build) void {
         }
         exe_tests.linkSystemLibrary("SDL3");
         exe_tests.linkSystemLibrary("util");
+    } else if (target.result.os.tag == .macos) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
+            exe_tests.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+        }
+        exe_tests.addCSourceFile(.{
+            .file = b.path("src/platform/macos_clipboard.m"),
+            .flags = &.{},
+        });
+        exe_tests.linkFramework("SDL3");
+        exe_tests.linkFramework("OpenGL");
+        exe_tests.linkFramework("AppKit");
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 

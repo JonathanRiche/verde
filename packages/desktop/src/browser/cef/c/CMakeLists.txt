@@ -30,6 +30,15 @@ add_executable(verde-browser-cef-process
   process_helper_linux.cc
 )
 
+if(APPLE)
+  target_sources(verde-browser-cef PRIVATE
+    "${CEF_ROOT}/libcef_dll/wrapper/cef_scoped_library_loader_mac.mm"
+  )
+  target_sources(verde-browser-cef-process PRIVATE
+    "${CEF_ROOT}/libcef_dll/wrapper/cef_scoped_library_loader_mac.mm"
+  )
+endif()
+
 SET_EXECUTABLE_TARGET_PROPERTIES(verde-browser-cef)
 SET_EXECUTABLE_TARGET_PROPERTIES(verde-browser-cef-process)
 

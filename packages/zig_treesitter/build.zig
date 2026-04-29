@@ -37,7 +37,12 @@ fn createRootModule(
 
 fn configureModule(b: *std.Build, module: *std.Build.Module) void {
     module.link_libc = true;
-    module.linkSystemLibrary("tree-sitter", .{ .use_pkg_config = .force });
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    module.addCSourceFile(.{
+        .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
+        .flags = &.{},
+    });
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/typescript/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/tsx/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-javascript/src"));

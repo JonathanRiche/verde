@@ -1,6 +1,7 @@
 //! Minimal native shell prototype for the desktop chat workflow.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
@@ -545,8 +546,8 @@ fn keymodBits(modifier_state: sdl.Keymod) u16 {
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
     if (!state.composer_focused) return false;
     if (!event.down or event.repeat) return false;
-    if (event.scancode != .v) return false;
-    return isCtrlPressed();
+    if (event.scancode != .v and event.key != .v) return false;
+    return isPrimaryModifierPressed(event.mod);
 }
 
 fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {
@@ -600,6 +601,14 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
 fn isCtrlPressed() bool {
     const keyboard_state = sdl.getKeyboardState();
     return keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
+}
+
+fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
+    if (builtin.os.tag != .macos) {
+        return isCtrlPressed();
+    }
+
+    return isKeymodPressed(modifier_state, sdl.Keymod.gui);
 }
 
 fn handleKeyboardAction(
