@@ -36,12 +36,14 @@ fn createRootModule(
 }
 
 fn configureModule(b: *std.Build, module: *std.Build.Module) void {
+    const c_flags = &.{"-DNDEBUG"};
+
     module.link_libc = true;
     module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
     module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/typescript/src"));
     module.addIncludePath(b.path("vendor/tree-sitter-typescript/tsx/src"));
@@ -49,30 +51,30 @@ fn configureModule(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("vendor/tree-sitter-json/src"));
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-javascript/src/parser.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-javascript/src/scanner.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-json/src/parser.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-typescript/typescript/src/parser.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-typescript/typescript/src/scanner.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-typescript/tsx/src/parser.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
     module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-typescript/tsx/src/scanner.c"),
-        .flags = &.{},
+        .flags = c_flags,
     });
 }
