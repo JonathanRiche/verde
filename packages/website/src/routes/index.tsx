@@ -83,9 +83,7 @@ function App() {
             </p>
             <div class="hero-actions">
               <a
-                href="https://github.com/JonathanRiche/verde/releases"
-                target="_blank"
-                rel="noreferrer"
+                href="#install"
                 class="btn btn-primary"
               >
                 Install Verde
@@ -96,15 +94,15 @@ function App() {
             </div>
             <div class="hero-install-preview" aria-label="Quick install commands">
               <div class="hero-install-tabs">
-                <span>Arch Linux</span>
-                <span>macOS / npm</span>
+                <span>Easiest install</span>
+                <span>Linux / macOS</span>
               </div>
               <div class="hero-install-lines">
                 <p>
-                  <span class="prompt">$</span> yay -S verde-bin
+                  <span class="prompt">$</span> curl -fsSL https://openverde.ai/install.sh | sh
                 </p>
                 <p>
-                  <span class="prompt">$</span> npm install -g verde-app
+                  <span class="prompt">#</span> downloads the latest GitHub release
                 </p>
               </div>
             </div>
@@ -281,22 +279,30 @@ function App() {
           <div class="band-header">
             <p class="tag">Install</p>
             <h2 class="heading">
-              Ship it from releases or build it straight from the repo.
+              Install the latest release with one command.
             </h2>
             <p class="band-body">
-              Verde has release artifacts for Linux and macOS, an AUR package
-              for Arch, an npm launcher, and source installers for local builds
-              with the embedded browser pane.
+              The easiest path is the website installer. It detects Linux or
+              macOS, downloads the matching GitHub release artifact, and
+              installs the app locally. Arch, npm, and source installers are
+              still available for developer workflows.
             </p>
           </div>
 
           <div class="install-grid stagger">
             <article class="term-card">
               <div class="term-card-header">
-                <span>Release path</span>
-                <strong>Download and install</strong>
+                <span>Easiest</span>
+                <strong>Install from latest release</strong>
               </div>
-              <p>Grab the latest packaged build from GitHub Releases.</p>
+              <pre>
+                <code>curl -fsSL https://openverde.ai/install.sh | sh</code>
+              </pre>
+              <p>
+                Linux installs into <code>~/.local</code> by default. macOS
+                installs <code>Verde.app</code> into <code>/Applications</code>
+                when writable, otherwise <code>~/Applications</code>.
+              </p>
               <a
                 href="https://github.com/JonathanRiche/verde/releases"
                 target="_blank"
@@ -328,7 +334,7 @@ bash ./scripts/release/install-linux-local-cef.sh
               </div>
               <p>
                 Use the AUR package on Arch, the npm launcher on supported
-                developer machines, or install from the repo root with Zig.
+                developer machines, or customize the release installer prefix.
               </p>
               <div class="install-prereqs">
                 <div>
@@ -339,9 +345,9 @@ npx verde-app`}</code>
                   </pre>
                 </div>
                 <div>
-                  <strong>Repo root</strong>
+                  <strong>Custom Linux prefix</strong>
                   <pre>
-                    <code>zig build --release=safe -p ~/.local</code>
+                    <code>curl -fsSL https://openverde.ai/install.sh | VERDE_INSTALL_PREFIX=~/.local sh</code>
                   </pre>
                 </div>
               </div>
