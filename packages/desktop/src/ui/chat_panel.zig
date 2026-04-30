@@ -1466,7 +1466,7 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, line_
     }
 
     if (message_index) |index| {
-        if (!muted_body and renderSelectableMarkdownTranscriptBody(state, index, line_offset, body, markdown_copy_frame, markdown_select_all_frame)) {
+        if (shouldRenderMarkdownTranscriptBody(role, muted_body) and renderSelectableMarkdownTranscriptBody(state, index, line_offset, body, markdown_copy_frame, markdown_select_all_frame)) {
             return;
         }
         if (shouldRenderSelectablePlainTranscriptBody(body, muted_body)) {
@@ -1476,7 +1476,7 @@ fn renderTranscriptBody(state: *app_state.AppState, message_index: ?usize, line_
         }
     }
 
-    if (!muted_body and renderMarkdownTranscriptBody(state, message_index, body)) {
+    if (shouldRenderMarkdownTranscriptBody(role, muted_body) and renderMarkdownTranscriptBody(state, message_index, body)) {
         return;
     }
 
@@ -1952,6 +1952,10 @@ fn renderMarkdownTranscriptBody(state: *app_state.AppState, message_index: ?usiz
 
     chat_markdown.renderBody(view, transcriptMarkdownRenderOptions());
     return true;
+}
+
+fn shouldRenderMarkdownTranscriptBody(role: anytype, muted_body: bool) bool {
+    return !muted_body and role == .assistant;
 }
 
 fn shouldRenderCodexFileReferenceBody(state: *app_state.AppState, role: anytype, body: []const u8, muted_body: bool) bool {
@@ -4451,7 +4455,7 @@ fn transcriptBubbleHeightGeneric(
     const author_size = if (shouldShowBubbleAuthor(author)) zgui.calcTextSize(author, .{}) else .{ 0.0, 0.0 };
     const body_height = if (use_codex_file_reference_layout)
         codexFileReferenceBodyHeight(body, inner_width)
-    else if (!muted_body)
+    else if (shouldRenderMarkdownTranscriptBody(role, muted_body))
         measureMarkdownTranscriptBodyHeight(state, message_index, body, inner_width)
     else
         zgui.calcTextSize(body, .{ .wrap_width = inner_width })[1];
