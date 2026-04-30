@@ -2954,7 +2954,10 @@ fn renderCommandEventRowId(
     zgui.textColored(theme.COLOR_TEXT_SUBTLE, "-", .{});
     zgui.sameLine(.{ .spacing = 8.0 });
     if (message_index) |index| {
-        if (renderSelectableMarkdownTranscriptBody(state, index, 0, body, markdown_copy_frame, markdown_select_all_frame)) {
+        const body_line = [_]SelectableColoredLine{
+            .{ .text = body, .color = theme.COLOR_TEXT_MUTED },
+        };
+        if (renderSelectableColoredLineList(state, index, &body_line, 0, markdown_copy_frame, markdown_select_all_frame)) {
             //NOTE: END OF CommandEventRow
             return;
         }
