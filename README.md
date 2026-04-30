@@ -20,7 +20,13 @@ If you just want to install the app instead of building it yourself, use one of 
 
 ### Install from releases
 
-Download the latest release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).
+Install the latest release from the website:
+
+```bash
+curl -fsSL https://openverde.ai/install.sh | sh
+```
+
+Or download the latest release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).
 
 - Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run:
 
