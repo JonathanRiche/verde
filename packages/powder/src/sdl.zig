@@ -256,6 +256,10 @@ pub fn renderFillRect(renderer: *Renderer, rect: FRect) Error!void {
     if (!SDL_RenderFillRect(renderer, &mutable_rect)) return error.SdlError;
 }
 
+pub fn renderDebugText(renderer: *Renderer, x: f32, y: f32, text: [:0]const u8) Error!void {
+    if (!SDL_RenderDebugText(renderer, x, y, text.ptr)) return error.SdlError;
+}
+
 pub fn renderPresent(renderer: *Renderer) void {
     _ = SDL_RenderPresent(renderer);
 }
@@ -275,6 +279,7 @@ extern fn SDL_DestroyRenderer(renderer: *Renderer) void;
 extern fn SDL_SetRenderDrawColor(renderer: *Renderer, r: u8, g: u8, b: u8, a: u8) bool;
 extern fn SDL_RenderClear(renderer: *Renderer) bool;
 extern fn SDL_RenderFillRect(renderer: *Renderer, rect: *const FRect) bool;
+extern fn SDL_RenderDebugText(renderer: *Renderer, x: f32, y: f32, str: [*:0]const u8) bool;
 extern fn SDL_RenderPresent(renderer: *Renderer) bool;
 
 test "event union stays SDL sized" {
