@@ -14,6 +14,14 @@ const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 const MAX_CONNECT_WAIT_ATTEMPTS = 30;
 
+fn sleepMs(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
+}
+
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
 
@@ -403,7 +411,7 @@ pub const Client = struct {
             if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
                 return stream;
             }
-            std.atomic.spinLoopHint();
+            sleepMs(100);
         }
         return null;
     }
@@ -776,7 +784,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    std.atomic.spinLoopHint();
+                    sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
                     continue;
                 },
                 else => return err,
@@ -794,7 +802,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    std.atomic.spinLoopHint();
+                    sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
                     continue;
                 },
                 else => return err,
