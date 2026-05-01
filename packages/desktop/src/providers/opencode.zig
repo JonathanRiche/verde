@@ -329,7 +329,8 @@ pub const Client = struct {
             port_text,
         };
 
-        var threaded_spawn = std.Io.Threaded.init_single_threaded;
+        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_spawn.deinit();
         const child = try std.process.spawn(threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
@@ -1423,7 +1424,8 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
     try argv.append(context.allocator, url);
 
-    var threaded_spawn = std.Io.Threaded.init_single_threaded;
+    var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded_spawn.deinit();
     const child = try std.process.spawn(threaded_spawn.io(), .{
         .argv = argv.items,
         .stdin = .ignore,

@@ -584,7 +584,8 @@ fn spawnDetached(
     argv: []const []const u8,
     cwd: ?[]const u8,
 ) std.process.SpawnError!void {
-    var threaded = std.Io.Threaded.init_single_threaded;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
     const child = try std.process.spawn(threaded.io(), .{
         .argv = argv,
         .stdin = .ignore,
@@ -592,7 +593,6 @@ fn spawnDetached(
         .stderr = .ignore,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
     });
-    _ = allocator;
     _ = child;
 }
 
@@ -602,7 +602,8 @@ fn runChild(
     cwd: ?[]const u8,
     max_output_bytes: usize,
 ) !std.process.RunResult {
-    var threaded = std.Io.Threaded.init_single_threaded;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
     return std.process.run(allocator, threaded.io(), .{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
