@@ -216,22 +216,32 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
+        std.debug.print(
+            "[codex-debug] codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}\n",
+            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
+        );
         try self.ensureConnected();
 
-        const thread_id = if (request.thread_id) |existing|
-            try allocator.dupe(u8, existing)
-        else
-            try self.startThread(allocator, request);
+        const thread_id = if (request.thread_id) |existing| blk: {
+            std.debug.print("[codex-debug] codex.sendPrompt using existing thread_id={s}\n", .{existing});
+            break :blk try allocator.dupe(u8, existing);
+        } else blk: {
+            std.debug.print("[codex-debug] codex.sendPrompt starting new thread\n", .{});
+            break :blk try self.startThread(allocator, request);
+        };
         errdefer allocator.free(thread_id);
 
         if (request.on_thread_id) |on_thread_id| {
             on_thread_id(request.stream_context, thread_id);
         }
 
+        std.debug.print("[codex-debug] codex.sendPrompt ensuring thread loaded thread_id={s}\n", .{thread_id});
         try self.ensureThreadLoaded(thread_id);
 
+        std.debug.print("[codex-debug] codex.sendPrompt starting turn thread_id={s}\n", .{thread_id});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
+        std.debug.print("[codex-debug] codex.sendPrompt completed thread_id={s} reply_len={d}\n", .{ thread_id, reply.len });
 
         return .{
             .thread_id = thread_id,
@@ -818,6 +828,7 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
+            std.debug.print("[codex-debug] Codex RPC await id={d} message_len={d}\n", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1173,7 +1184,13 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
         else => len_marker,
     };
 
-    if (payload_len > MAX_WS_MESSAGE_BYTES) return error.WebSocketMessageTooLarge;
+    if (payload_len > MAX_WS_MESSAGE_BYTES) {
+        std.debug.print(
+            "[codex-debug] websocket frame too large opcode={s} masked={} payload_len={d}\n",
+            .{ @tagName(opcode), masked, payload_len },
+        );
+        return error.WebSocketMessageTooLarge;
+    }
     log.debug("Codex websocket frame opcode={s} masked={} payload_len={d}", .{ @tagName(opcode), masked, payload_len });
 
     var mask: [4]u8 = undefined;
@@ -1181,7 +1198,13 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
         try readExact(stream, &mask);
     }
 
-    const payload = try allocator.alloc(u8, payload_len);
+    const payload = allocator.alloc(u8, payload_len) catch |err| {
+        std.debug.print(
+            "[codex-debug] websocket payload alloc failed opcode={s} payload_len={d}: {s}\n",
+            .{ @tagName(opcode), payload_len, @errorName(err) },
+        );
+        return err;
+    };
     errdefer allocator.free(payload);
     try readExact(stream, payload);
 

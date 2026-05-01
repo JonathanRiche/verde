@@ -374,6 +374,17 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.destroy(request);
     }
 
+    std.debug.print(
+        "[codex-debug] sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}\n",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
+
     const result = runSendWorker(page_alloc, request);
 
     state.mutex.lock();
@@ -392,6 +403,16 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         state.error_message = null;
         state.status = .completed;
     } else |err| {
+        std.debug.print(
+            "[codex-debug] sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
         if (err == error.CodexTurnInterrupted and state.stop_requested) {
             state.error_message = null;
             state.result = null;
@@ -455,6 +476,7 @@ pub fn runSendWorker(
 
     var client = try ai_harness.connect(allocator, provider_config);
     defer client.deinit();
+    std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
 
     const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
@@ -474,6 +496,16 @@ pub fn runSendWorker(
         .on_stream_event = handleSendStreamEvent,
         .on_approval_request = handleSendApprovalRequest,
     }) catch |err| {
+        std.debug.print(
+            "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
         log.err(
             "send worker failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
             .{
@@ -955,7 +987,10 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
         send_state.provisional_provider_thread_id = null;
     }
 
-    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch null;
+    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch |err| {
+        std.debug.print("[codex-debug] failed to store provisional thread id len={d}: {s}\n", .{ thread_id.len, @errorName(err) });
+        return;
+    };
 }
 fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -971,7 +1006,10 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
         send_state.active_turn_id = null;
     }
 
-    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch null;
+    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch |err| {
+        std.debug.print("[codex-debug] failed to store active turn id len={d}: {s}\n", .{ turn_id.len, @errorName(err) });
+        return;
+    };
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -980,7 +1018,13 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return;
-    send_state.partial_text.appendSlice(page_alloc, delta) catch return;
+    send_state.partial_text.appendSlice(page_alloc, delta) catch |err| {
+        std.debug.print(
+            "[codex-debug] failed to append stream delta delta_len={d} partial_len={d}: {s}\n",
+            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
+        );
+        return;
+    };
 }
 fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
