@@ -3,6 +3,7 @@
 const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const log = std.log.scoped(.native_codex);
 
@@ -220,13 +221,19 @@ pub const Client = struct {
             "[codex-debug] codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}\n",
             .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
         );
+        runtime_log.diagnostic(
+            "codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}",
+            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
+        );
         try self.ensureConnected();
 
         const thread_id = if (request.thread_id) |existing| blk: {
             std.debug.print("[codex-debug] codex.sendPrompt using existing thread_id={s}\n", .{existing});
+            runtime_log.diagnostic("codex.sendPrompt using existing thread_id={s}", .{existing});
             break :blk try allocator.dupe(u8, existing);
         } else blk: {
             std.debug.print("[codex-debug] codex.sendPrompt starting new thread\n", .{});
+            runtime_log.diagnostic("codex.sendPrompt starting new thread", .{});
             break :blk try self.startThread(allocator, request);
         };
         errdefer allocator.free(thread_id);
@@ -236,12 +243,15 @@ pub const Client = struct {
         }
 
         std.debug.print("[codex-debug] codex.sendPrompt ensuring thread loaded thread_id={s}\n", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id={s}", .{thread_id});
         try self.ensureThreadLoaded(thread_id);
 
         std.debug.print("[codex-debug] codex.sendPrompt starting turn thread_id={s}\n", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt starting turn thread_id={s}", .{thread_id});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
         std.debug.print("[codex-debug] codex.sendPrompt completed thread_id={s} reply_len={d}\n", .{ thread_id, reply.len });
+        runtime_log.diagnostic("codex.sendPrompt completed thread_id={s} reply_len={d}", .{ thread_id, reply.len });
 
         return .{
             .thread_id = thread_id,
@@ -829,6 +839,7 @@ pub const Client = struct {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
             std.debug.print("[codex-debug] Codex RPC await id={d} message_len={d}\n", .{ id, message.len });
+            runtime_log.diagnostic("Codex RPC await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -1189,6 +1200,10 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
             "[codex-debug] websocket frame too large opcode={s} masked={} payload_len={d}\n",
             .{ @tagName(opcode), masked, payload_len },
         );
+        runtime_log.diagnostic(
+            "websocket frame too large opcode={s} masked={} payload_len={d}",
+            .{ @tagName(opcode), masked, payload_len },
+        );
         return error.WebSocketMessageTooLarge;
     }
     log.debug("Codex websocket frame opcode={s} masked={} payload_len={d}", .{ @tagName(opcode), masked, payload_len });
@@ -1201,6 +1216,10 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
     const payload = allocator.alloc(u8, payload_len) catch |err| {
         std.debug.print(
             "[codex-debug] websocket payload alloc failed opcode={s} payload_len={d}: {s}\n",
+            .{ @tagName(opcode), payload_len, @errorName(err) },
+        );
+        runtime_log.diagnostic(
+            "websocket payload alloc failed opcode={s} payload_len={d}: {s}",
             .{ @tagName(opcode), payload_len, @errorName(err) },
         );
         return err;
