@@ -410,14 +410,14 @@ pub const ChatThread = struct {
 
     fn commitFromPrompt(self: *ChatThread, allocator: std.mem.Allocator, prompt: []const u8) !void {
         self.committed = true;
-        self.last_activity_at = 0;
+        self.touch();
         const next_title = try chat_threads.makeThreadTitle(allocator, prompt);
         allocator.free(self.title);
         self.title = next_title;
     }
 
     fn touch(self: *ChatThread) void {
-        self.last_activity_at = 0;
+        self.last_activity_at = unixTimestampSeconds();
     }
 
     fn isSendPending(self: *const ChatThread) bool {
@@ -2084,7 +2084,7 @@ pub const AppState = struct {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         send_state.status = .pending;
-        send_state.started_at_ms = 0;
+        send_state.started_at_ms = unixTimestampMs();
         send_state.result = null;
         send_state.error_message = null;
         send_state.provider = thread.provider;
@@ -5330,4 +5330,15 @@ fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
         .query_start = token_start + 1,
         .end = draft.len,
     };
+}
+
+fn unixTimestampSeconds() i64 {
+    return @divTrunc(unixTimestampMs(), std.time.ms_per_s);
+}
+
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
