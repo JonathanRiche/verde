@@ -1,0 +1,11 @@
+.{
+    .name = .powder,
+    .version = "0.0.0",
+    .fingerprint = 0xbe3538d58812af59,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "examples",
+        "src",
+    },
+}
