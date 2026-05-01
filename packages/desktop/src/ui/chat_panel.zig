@@ -4561,7 +4561,7 @@ fn smoothScrollTranscriptToTail() void {
 }
 
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
-    const now_ms = 0;
+    const now_ms = unixTimestampMs();
     const safe_started_at_ms = @max(started_at_ms, 0);
     const elapsed_ms = @max(now_ms - safe_started_at_ms, 0);
     const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
@@ -4573,6 +4573,13 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
         return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "Working - 0:00";
     }
     return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}", .{ minutes, seconds }) catch "Working - 0:00";
+}
+
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
 
 /// Adapts typed transcript height calculation to the generic helper.
