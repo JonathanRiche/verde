@@ -817,7 +817,7 @@ pub const Client = struct {
     fn awaitResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
-            errdefer self.allocator.free(message);
+            defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -847,7 +847,7 @@ pub const Client = struct {
     fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
-            errdefer self.allocator.free(message);
+            defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
