@@ -65,12 +65,25 @@ pub const Client = struct {
     loaded_threads: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
+        runtime_log.diagnostic(
+            "codex.Client.init begin transport={s} url={s} cwd={s} launch_on_connect={}",
+            .{
+                @tagName(config.transport),
+                config.websocket_url orelse "(null)",
+                config.cwd orelse "(inherit)",
+                config.launch_on_connect,
+            },
+        );
         var client: Client = .{
             .allocator = allocator,
             .config = config,
             .loaded_threads = std.StringHashMap(void).init(allocator),
         };
-        try client.ensureConnected();
+        client.ensureConnected() catch |err| {
+            runtime_log.diagnostic("codex.Client.init ensureConnected failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        runtime_log.diagnostic("codex.Client.init connected initialized={}", .{client.initialized});
         return client;
     }
 
@@ -294,14 +307,23 @@ pub const Client = struct {
 
     fn ensureConnected(self: *Client) !void {
         if (self.stream == null) {
+            runtime_log.diagnostic("codex.ensureConnected stream=null transport={s}", .{@tagName(self.config.transport)});
             switch (self.config.transport) {
-                .websocket => try self.connectWebSocket(),
+                .websocket => self.connectWebSocket() catch |err| {
+                    runtime_log.diagnostic("codex.ensureConnected connectWebSocket failed: {s}", .{@errorName(err)});
+                    return err;
+                },
                 .stdio_jsonl => return error.TransportNotImplemented,
             }
         }
 
         if (!self.initialized) {
-            try self.initializeProtocol();
+            runtime_log.diagnostic("codex.ensureConnected initializing protocol", .{});
+            self.initializeProtocol() catch |err| {
+                runtime_log.diagnostic("codex.ensureConnected initializeProtocol failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            runtime_log.diagnostic("codex.ensureConnected protocol initialized", .{});
         }
     }
 
@@ -318,8 +340,16 @@ pub const Client = struct {
 
     fn connectWebSocket(self: *Client) !void {
         const raw_url = self.config.websocket_url orelse return error.MissingWebSocketUrl;
-        const uri = try std.Uri.parse(raw_url);
-        const host_name = try uri.getHostAlloc(self.allocator);
+        runtime_log.diagnostic("codex.connectWebSocket begin raw_url={s}", .{raw_url});
+        const uri = std.Uri.parse(raw_url) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        const host_name = uri.getHostAlloc(self.allocator) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket getHostAlloc failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        defer self.allocator.free(host_name.bytes);
         const host = host_name.bytes;
 
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "ws")) {
@@ -327,7 +357,9 @@ pub const Client = struct {
         }
 
         const port = uri.port orelse 80;
+        runtime_log.diagnostic("codex.connectWebSocket target host={s} port={d}", .{ host, port });
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected existing server", .{});
             self.stream = stream;
             return;
         }
@@ -338,8 +370,13 @@ pub const Client = struct {
 
         shared_server_state.mutex.lock();
         defer shared_server_state.mutex.unlock();
+        runtime_log.diagnostic("codex.connectWebSocket acquired shared server lock owns_child={} has_child={}", .{
+            shared_server_state.owns_child,
+            shared_server_state.child != null,
+        });
 
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected after lock", .{});
             self.stream = stream;
             return;
         }
@@ -356,9 +393,13 @@ pub const Client = struct {
             }
         }
 
-        try self.spawnWebSocketServer(raw_url);
+        self.spawnWebSocketServer(raw_url) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket spawnWebSocketServer failed: {s}", .{@errorName(err)});
+            return err;
+        };
 
         if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected after spawn", .{});
             self.stream = stream;
             return;
         }
@@ -375,11 +416,19 @@ pub const Client = struct {
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (shared_server_state.child != null) return;
 
-        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        runtime_log.diagnostic("codex.spawnWebSocketServer begin url={s}", .{url});
+        var env_map = process_env.buildAugmentedEnvMap(self.allocator) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer buildAugmentedEnvMap failed: {s}", .{@errorName(err)});
+            return err;
+        };
         defer env_map.deinit();
 
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
+        const executable = process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer resolve executable failed executable={s}: {s}", .{ self.config.executable, @errorName(err) });
+            return err;
+        };
         defer self.allocator.free(executable);
+        runtime_log.diagnostic("codex.spawnWebSocketServer executable={s}", .{executable});
 
         var argv = [_][]const u8{
             executable,
@@ -389,16 +438,20 @@ pub const Client = struct {
         };
 
         var threaded_spawn = std.Io.Threaded.init_single_threaded;
-        const child = try std.process.spawn(threaded_spawn.io(), .{
+        const child = std.process.spawn(threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
             .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
-        });
+        }) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer process.spawn failed: {s}", .{@errorName(err)});
+            return err;
+        };
 
         log.info("Codex app-server started pid={d} listen={s}", .{ child.id orelse -1, url });
+        runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.id orelse -1});
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
     }
