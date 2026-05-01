@@ -5,6 +5,8 @@ const stb_image = @import("stb_image.zig");
 const chat_threads = @import("chat/threads.zig");
 const std = @import("std");
 
+const log = std.log.scoped(.native_utils);
+
 const GL_TEXTURE_2D = 0x0DE1;
 const GL_RGBA = 0x1908;
 const GL_UNSIGNED_BYTE = 0x1401;
@@ -440,10 +442,21 @@ pub fn runSendWorker(
         },
     };
 
+    log.info(
+        "send worker starting provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
+
     var client = try ai_harness.connect(allocator, provider_config);
     defer client.deinit();
 
-    const result = try client.sendPrompt(allocator, .{
+    const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
         .thread_title = request.thread_title,
         .prompt = request.prompt,
@@ -460,7 +473,24 @@ pub fn runSendWorker(
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
         .on_approval_request = handleSendApprovalRequest,
-    });
+    }) catch |err| {
+        log.err(
+            "send worker failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        return err;
+    };
+
+    log.info(
+        "send worker completed provider={s} provider_thread_id={s} reply_len={d}",
+        .{ @tagName(request.provider), result.thread_id, result.reply_text.len },
+    );
 
     return .{
         .provider_thread_id = result.thread_id,
