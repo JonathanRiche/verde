@@ -13,7 +13,7 @@ run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts
 
 [tasks.dev]
 description = "Builds and runs Verde from the repo-local Zig build output."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
 
 [tasks.run]
 description = "Builds and launches Verde in development mode."
