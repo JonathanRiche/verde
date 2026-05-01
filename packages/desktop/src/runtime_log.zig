@@ -139,7 +139,7 @@ fn appendLogEntry(
     args: anytype,
 ) void {
     var entry = LogEntry.empty();
-    entry.timestamp_ms = 0;
+    entry.timestamp_ms = unixTimestampMs();
     entry.level = level;
     entry.truncated = false;
 
@@ -164,7 +164,7 @@ fn appendLogEntry(
 
 fn writeSessionHeader(io: std.Io, file: std.Io.File) !void {
     const pid = processId();
-    const timestamp = 0;
+    const timestamp = unixTimestampMs();
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
     writer.pos = try file.length(io);
@@ -186,7 +186,7 @@ fn writePanicMarker(msg: []const u8, first_trace_addr: ?usize) void {
     defer crash_file.close(io);
 
     const pid = processId();
-    const timestamp = 0;
+    const timestamp = unixTimestampMs();
     var buffer: [512]u8 = undefined;
     var writer = crash_file.writer(io, &buffer);
     writer.pos = crash_file.length(io) catch return;
@@ -206,4 +206,11 @@ fn processId() u32 {
         .windows => 0,
         else => @intCast(std.c.getpid()),
     };
+}
+
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
