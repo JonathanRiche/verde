@@ -87,6 +87,7 @@ pub fn run() !void {
         try title.render(allocator, &batch);
         try composer.render(allocator, &batch);
         try drawBatch(renderer, batch.commands.items);
+        try drawDebugText(allocator, renderer, title.text(), composer.text());
         updateWindowTitle(window, composer, batch.commands.items.len, frame_index);
 
         sdl.delay(16);
@@ -107,13 +108,11 @@ fn drawBatch(renderer: *sdl.Renderer, commands: []const powder.draw.Command) !vo
             .h = command.rect.h,
         });
     }
-
-    sdl.renderPresent(renderer);
 }
 
 fn commandColor(command: powder.draw.Command) [4]u8 {
     if (command.kind == .glyph) {
-        return .{ 190, 206, 230, 255 };
+        return .{ 0, 0, 0, 0 };
     }
     return .{
         floatChannel(command.color.r),
@@ -126,6 +125,30 @@ fn commandColor(command: powder.draw.Command) [4]u8 {
 fn floatChannel(value: f32) u8 {
     const clamped = @min(@max(value, 0.0), 1.0);
     return @intFromFloat(clamped * 255.0);
+}
+
+fn drawDebugText(allocator: std.mem.Allocator, renderer: *sdl.Renderer, title: []const u8, body: []const u8) !void {
+    try sdl.setRenderDrawColor(renderer, 214, 226, 242, 255);
+    try drawDebugLine(allocator, renderer, 40, 28, title);
+
+    try sdl.setRenderDrawColor(renderer, 236, 241, 248, 255);
+    var y: f32 = 82;
+    var start: usize = 0;
+    while (start <= body.len) {
+        const end = std.mem.indexOfScalarPos(u8, body, start, '\n') orelse body.len;
+        try drawDebugLine(allocator, renderer, 40, y, body[start..end]);
+        if (end == body.len) break;
+        start = end + 1;
+        y += 14;
+    }
+
+    sdl.renderPresent(renderer);
+}
+
+fn drawDebugLine(allocator: std.mem.Allocator, renderer: *sdl.Renderer, x: f32, y: f32, text: []const u8) !void {
+    const z_text = try allocator.dupeZ(u8, if (text.len == 0) " " else text);
+    defer allocator.free(z_text);
+    try sdl.renderDebugText(renderer, x, y, z_text);
 }
 
 fn updateWindowTitle(window: *sdl.Window, composer: Composer, command_count: usize, frame_index: usize) void {
