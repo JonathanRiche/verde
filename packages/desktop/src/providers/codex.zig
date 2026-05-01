@@ -437,7 +437,8 @@ pub const Client = struct {
             url,
         };
 
-        var threaded_spawn = std.Io.Threaded.init_single_threaded;
+        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_spawn.deinit();
         const child = std.process.spawn(threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
