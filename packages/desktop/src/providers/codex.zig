@@ -1111,18 +1111,36 @@ fn writeClientFrame(
 }
 
 fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    var no_buffer: [0]u8 = .{};
-    var reader = stream.reader(threaded.io(), &no_buffer);
-    return reader.interface.readSliceShort(buffer);
+    if (buffer.len == 0) return 0;
+
+    while (true) {
+        const result = std.c.recv(stream.socket.handle, buffer.ptr, buffer.len, 0);
+        if (result >= 0) return @intCast(result);
+
+        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            else => error.InputOutput,
+        };
+    }
 }
 
 fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    var write_buffer: [8 * 1024]u8 = undefined;
-    var writer = stream.writer(threaded.io(), &write_buffer);
-    try writer.interface.writeAll(bytes);
-    try writer.interface.flush();
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const result = std.c.send(stream.socket.handle, bytes[index..].ptr, bytes.len - index, 0);
+        if (result > 0) {
+            index += @intCast(result);
+            continue;
+        }
+        if (result == 0) return error.EndOfStream;
+
+        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            else => error.InputOutput,
+        };
+    }
 }
 
 fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !Frame {
