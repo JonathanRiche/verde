@@ -566,8 +566,11 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
+        log.info("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
         try self.writeTextMessage(payload);
-        return try self.awaitResultPayloadAlloc(id);
+        const result = try self.awaitResultPayloadAlloc(id);
+        log.info("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
+        return result;
     }
 
     fn ensureThreadLoaded(self: *Client, thread_id: []const u8) !void {
@@ -728,6 +731,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
+        log.info("Codex RPC turn/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -826,6 +830,7 @@ pub const Client = struct {
             if (response_id != id) continue;
 
             if (getObjectField(root, "error")) |rpc_error| {
+                log.warn("Codex RPC response id={d} returned error: {s}", .{ id, message });
                 if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                     if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                 }
@@ -833,7 +838,9 @@ pub const Client = struct {
             }
 
             const result = getObjectField(root, "result") orelse return error.MissingRpcResult;
-            return try stringifyAlloc(self.allocator, result);
+            const payload = try stringifyAlloc(self.allocator, result);
+            log.info("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
+            return payload;
         }
     }
 
@@ -1167,6 +1174,7 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
     };
 
     if (payload_len > MAX_WS_MESSAGE_BYTES) return error.WebSocketMessageTooLarge;
+    log.debug("Codex websocket frame opcode={s} masked={} payload_len={d}", .{ @tagName(opcode), masked, payload_len });
 
     var mask: [4]u8 = undefined;
     if (masked) {
