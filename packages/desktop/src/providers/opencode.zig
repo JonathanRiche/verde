@@ -1528,8 +1528,10 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     context.mutex.unlock();
 
     if (maybe_child) |*owned_child| {
-        var threaded = std.Io.Threaded.init_single_threaded;
-        _ = owned_child.wait(threaded.io()) catch {};
+        if (owned_child.id != null) {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            _ = owned_child.wait(threaded.io()) catch {};
+        }
     }
 
     log.info("OpenCode event stream exited for session {s}", .{context.session_id});
