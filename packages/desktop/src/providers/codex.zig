@@ -345,11 +345,11 @@ pub const Client = struct {
             runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
             return err;
         };
-        const host_name = uri.getHostAlloc(self.allocator) catch |err| {
-            runtime_log.diagnostic("codex.connectWebSocket getHostAlloc failed: {s}", .{@errorName(err)});
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host_name = uri.getHost(&host_buffer) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket getHost failed: {s}", .{@errorName(err)});
             return err;
         };
-        defer self.allocator.free(host_name.bytes);
         const host = host_name.bytes;
 
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "ws")) {
