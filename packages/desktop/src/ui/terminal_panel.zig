@@ -652,7 +652,7 @@ fn styleForCell(
     return switch (cell.content_tag) {
         .bg_color_palette => .{
             .bg_color = .{
-                .palette = cell.content.color_palette,
+                .palette = @intCast(cell.content.color_palette),
             },
         },
         .bg_color_rgb => .{

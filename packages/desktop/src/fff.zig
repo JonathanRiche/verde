@@ -44,7 +44,8 @@ pub const Finder = struct {
     ) !Finder {
         const db_dir = try std.fs.path.join(allocator, &.{ storage_root, "fff" });
         defer allocator.free(db_dir);
-        std.fs.makeDirAbsolute(db_dir) catch |err| switch (err) {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        std.Io.Dir.createDirAbsolute(threaded.io(), db_dir, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };

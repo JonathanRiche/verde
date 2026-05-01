@@ -23,6 +23,32 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    pub fn tryLock(self: *Mutex) bool {
+        return self.inner.tryLock();
+    }
+
+    pub fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
+const Condition = struct {
+    pub fn wait(_: *Condition, mutex: *Mutex) void {
+        mutex.unlock();
+        std.atomic.spinLoopHint();
+        mutex.lock();
+    }
+
+    fn broadcast(_: *Condition) void {}
+};
 pub const ProjectEditorTarget = enum {
     configured,
     cursor,
@@ -384,18 +410,24 @@ pub const ChatThread = struct {
 
     fn commitFromPrompt(self: *ChatThread, allocator: std.mem.Allocator, prompt: []const u8) !void {
         self.committed = true;
-        self.last_activity_at = std.time.timestamp();
+        self.last_activity_at = 0;
         const next_title = try chat_threads.makeThreadTitle(allocator, prompt);
         allocator.free(self.title);
         self.title = next_title;
     }
 
     fn touch(self: *ChatThread) void {
-        self.last_activity_at = std.time.timestamp();
+        self.last_activity_at = 0;
     }
 
     fn isSendPending(self: *const ChatThread) bool {
         self.send_state.mutex.lock();
+        defer self.send_state.mutex.unlock();
+        return self.send_state.status == .pending;
+    }
+
+    fn isSendPendingForUi(self: *const ChatThread) bool {
+        if (!self.send_state.mutex.tryLock()) return true;
         defer self.send_state.mutex.unlock();
         return self.send_state.status == .pending;
     }
@@ -517,7 +549,7 @@ pub const PickerStatus = enum {
     failed,
 };
 pub const PickerState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     status: PickerStatus = .idle,
     selected_path: ?[]u8 = null,
     worker: ?std.Thread = null,
@@ -531,7 +563,7 @@ const OpencodeModelCacheStatus = enum {
 };
 
 const OpencodeModelCacheState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     status: OpencodeModelCacheStatus = .idle,
     models: ?[]ai_harness.ModelInfo = null,
     worker: ?std.Thread = null,
@@ -775,7 +807,6 @@ pub const Storage = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Storage {
         const pref_path = sdl.getPrefPath(ORG_NAME, APP_NAME) orelse return error.SdlError;
-        try std.fs.cwd().makePath(pref_path);
         const owned_pref_path = try allocator.dupe(u8, pref_path);
         errdefer allocator.free(owned_pref_path);
         const client = try db_client.Client.init(allocator, owned_pref_path);
@@ -811,10 +842,12 @@ pub const Storage = struct {
     }
 
     fn loadLegacyJson(self: *const Storage, allocator: std.mem.Allocator) !?LoadedPersistedState {
-        var dir = try std.fs.openDirAbsolute(self.pref_path, .{});
-        defer dir.close();
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.pref_path, .{});
+        defer dir.close(threaded.io());
 
-        const bytes = dir.readFileAlloc(allocator, LEGACY_STATE_FILE_NAME, 1024 * 1024) catch |err| switch (err) {
+        const bytes = dir.readFileAlloc(threaded.io(), LEGACY_STATE_FILE_NAME, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -856,8 +889,8 @@ pub const PendingFollowup = struct {
     prompt: []u8,
 };
 pub const SendState = struct {
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: Mutex = .{},
+    condition: Condition = .{},
     status: SendStatus = .idle,
     started_at_ms: i64 = 0,
     result: ?SendResultPayload = null,
@@ -923,6 +956,13 @@ pub const AppState = struct {
     composer_focused: bool,
     composer_focus_requested: bool,
     composer_input_nonce: u32,
+    composer_input_bounds_valid: bool,
+    composer_input_min: [2]f32,
+    composer_input_max: [2]f32,
+    composer_overlay_scroll_y: f32,
+    composer_overlay_follow_cursor: bool,
+    composer_overlay_last_cursor_pos: usize,
+    composer_overlay_last_draft_len: usize,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1010,6 +1050,13 @@ pub const AppState = struct {
             .composer_focused = false,
             .composer_focus_requested = false,
             .composer_input_nonce = 0,
+            .composer_input_bounds_valid = false,
+            .composer_input_min = .{ 0.0, 0.0 },
+            .composer_input_max = .{ 0.0, 0.0 },
+            .composer_overlay_scroll_y = 0.0,
+            .composer_overlay_follow_cursor = true,
+            .composer_overlay_last_cursor_pos = 0,
+            .composer_overlay_last_draft_len = 0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -2037,7 +2084,7 @@ pub const AppState = struct {
         send_state.mutex.lock();
         defer send_state.mutex.unlock();
         send_state.status = .pending;
-        send_state.started_at_ms = std.time.milliTimestamp();
+        send_state.started_at_ms = 0;
         send_state.result = null;
         send_state.error_message = null;
         send_state.provider = thread.provider;
@@ -2156,7 +2203,7 @@ pub const AppState = struct {
                 var thread = try ChatThread.init(self.allocator, "New thread");
                 thread.archived = project.archived;
                 thread.committed = project.messages.len > 0;
-                thread.last_activity_at = if (thread.committed) std.time.timestamp() else 0;
+                thread.last_activity_at = if (thread.committed) 0 else 0;
                 thread.provider = project.provider;
                 thread.harness = project.harness;
                 thread.setDraft(project.draft);
@@ -2510,7 +2557,8 @@ pub const AppState = struct {
     pub fn clearCurrentDraftImage(self: *AppState) void {
         const thread = self.currentThreadMutable();
         if (thread.draft_image) |image| {
-            std.fs.deleteFileAbsolute(image.path) catch {};
+            var threaded = std.Io.Threaded.init_single_threaded;
+            std.Io.Dir.deleteFileAbsolute(threaded.io(), image.path) catch {};
             self.evictCachedImageTexture(image.path);
             if (self.modal_image_path) |modal_path| {
                 if (std.mem.eql(u8, modal_path, image.path)) {
@@ -3092,7 +3140,9 @@ pub const AppState = struct {
             try buffer.appendSlice(self.allocator, message.author);
 
             if (message.image) |image| {
-                try std.fmt.format(buffer.writer(self.allocator), "\n[Image: {s}]", .{image.file_name});
+                const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
+                defer self.allocator.free(image_label);
+                try buffer.appendSlice(self.allocator, image_label);
             }
             if (message.body.len > 0) {
                 try buffer.append(self.allocator, '\n');
@@ -3110,13 +3160,14 @@ pub const AppState = struct {
     fn writeClipboardImageToStorage(self: *AppState, mime: []const u8, bytes: []const u8) ![]u8 {
         const images_dir = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, "clipboard-images" });
         defer self.allocator.free(images_dir);
-        std.fs.makeDirAbsolute(images_dir) catch |err| switch (err) {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        std.Io.Dir.createDirAbsolute(threaded.io(), images_dir, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
 
         const ext = extensionForImageMime(mime);
-        const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), std.time.milliTimestamp())));
+        const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), 0)));
         var attempt: usize = 0;
         while (attempt < 256) : (attempt += 1) {
             const file_name = if (attempt == 0)
@@ -3128,10 +3179,14 @@ pub const AppState = struct {
             const image_path = try std.fs.path.join(self.allocator, &.{ images_dir, file_name });
             errdefer self.allocator.free(image_path);
 
-            const file = std.fs.createFileAbsolute(image_path, .{ .exclusive = true });
+            var threaded_file = std.Io.Threaded.init_single_threaded;
+            const file = std.Io.Dir.createFileAbsolute(threaded_file.io(), image_path, .{ .exclusive = true });
             if (file) |created| {
-                defer created.close();
-                try created.writeAll(bytes);
+                defer created.close(threaded_file.io());
+                var write_buffer: [8 * 1024]u8 = undefined;
+                var writer = created.writer(threaded_file.io(), &write_buffer);
+                try writer.interface.writeAll(bytes);
+                try writer.interface.flush();
                 return image_path;
             } else |err| switch (err) {
                 error.PathAlreadyExists => {
@@ -3258,7 +3313,7 @@ pub const AppState = struct {
 
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
-        const value = std.posix.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return;
+        const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
         // user click after the window is live instead of front-loading browser
@@ -3558,7 +3613,7 @@ pub const AppState = struct {
                     self.browser_state.setAddress(url);
                     self.browser_state.setLastError(null) catch {};
                 },
-                .title_changed => |_| {},
+                .title_changed => {},
                 .document_loaded => {
                     self.reapplyBrowserInspectorAfterLoad();
                 },
@@ -3678,41 +3733,51 @@ pub const AppState = struct {
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(allocator);
 
-        try buffer.writer(allocator).print(
+        const header = try std.fmt.allocPrint(allocator,
             "Browser inspector selection\nMode: {s}\n",
             .{selection.mode},
         );
+        defer allocator.free(header);
+        try buffer.appendSlice(allocator, header);
 
         if (selection.rect) |rect| {
-            try buffer.writer(allocator).print(
+            const region = try std.fmt.allocPrint(allocator,
                 "Region: {d:.0} x {d:.0} at ({d:.0}, {d:.0})\n",
                 .{ rect.width, rect.height, rect.x, rect.y },
             );
+            defer allocator.free(region);
+            try buffer.appendSlice(allocator, region);
         }
 
         if (selection.element) |element| {
             try appendInspectorElementSummary(&buffer, allocator, element, null);
         } else if (selection.elements) |elements| {
             const count = @min(elements.len, 6);
-            try buffer.writer(allocator).print(
+            const selected_label = try std.fmt.allocPrint(allocator,
                 "Selected elements ({d} shown):\n",
                 .{count},
             );
+            defer allocator.free(selected_label);
+            try buffer.appendSlice(allocator, selected_label);
             for (elements[0..count], 0..) |element, index| {
                 try appendInspectorElementSummary(&buffer, allocator, element, index + 1);
             }
             if (elements.len > count) {
-                try buffer.writer(allocator).print(
+                const more_label = try std.fmt.allocPrint(allocator,
                     "... and {d} more element{s}\n",
                     .{ elements.len - count, if (elements.len - count == 1) "" else "s" },
                 );
+                defer allocator.free(more_label);
+                try buffer.appendSlice(allocator, more_label);
             }
         }
 
-        try buffer.writer(allocator).print(
+        const prompt_label = try std.fmt.allocPrint(allocator,
             "Requested change:\n{s}",
             .{prompt},
         );
+        defer allocator.free(prompt_label);
+        try buffer.appendSlice(allocator, prompt_label);
 
         return buffer.toOwnedSlice(allocator);
     }
@@ -3732,26 +3797,34 @@ pub const AppState = struct {
         try buffer.appendSlice(allocator, prefix);
         try buffer.appendSlice(allocator, element.selector orelse "(unknown selector)");
         if (element.tagName) |tag_name| {
-            try buffer.writer(allocator).print(" [{s}]", .{tag_name});
+            const label = try std.fmt.allocPrint(allocator, " [{s}]", .{tag_name});
+            defer allocator.free(label);
+            try buffer.appendSlice(allocator, label);
         }
         try buffer.append(allocator, '\n');
 
         if (element.textSnippet) |text_snippet| {
             const trimmed = std.mem.trim(u8, text_snippet, &std.ascii.whitespace);
             if (trimmed.len > 0) {
-                try buffer.writer(allocator).print("   text: {s}\n", .{trimmed});
+                const label = try std.fmt.allocPrint(allocator, "   text: {s}\n", .{trimmed});
+                defer allocator.free(label);
+                try buffer.appendSlice(allocator, label);
             }
         }
         if (element.ariaLabel) |aria_label| {
             const trimmed = std.mem.trim(u8, aria_label, &std.ascii.whitespace);
             if (trimmed.len > 0) {
-                try buffer.writer(allocator).print("   aria-label: {s}\n", .{trimmed});
+                const label = try std.fmt.allocPrint(allocator, "   aria-label: {s}\n", .{trimmed});
+                defer allocator.free(label);
+                try buffer.appendSlice(allocator, label);
             }
         }
         if (element.href) |href| {
             const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
             if (trimmed.len > 0) {
-                try buffer.writer(allocator).print("   href: {s}\n", .{trimmed});
+                const label = try std.fmt.allocPrint(allocator, "   href: {s}\n", .{trimmed});
+                defer allocator.free(label);
+                try buffer.appendSlice(allocator, label);
             }
         }
     }
@@ -3936,6 +4009,40 @@ pub const AppState = struct {
         return self.currentProjectMutable().draftBuffer();
     }
 
+    pub fn setComposerInputBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
+        self.composer_input_bounds_valid = true;
+        self.composer_input_min = input_min;
+        self.composer_input_max = input_max;
+    }
+
+    pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
+        if (!self.composer_input_bounds_valid) return false;
+        if (event.mouse_x < self.composer_input_min[0] or event.mouse_x > self.composer_input_max[0]) return false;
+        if (event.mouse_y < self.composer_input_min[1] or event.mouse_y > self.composer_input_max[1]) return false;
+
+        self.composer_overlay_scroll_y = @max(0.0, self.composer_overlay_scroll_y - event.y * 48.0);
+        self.composer_overlay_follow_cursor = false;
+        self.noteInteraction();
+        return true;
+    }
+
+    pub fn composerOverlayScrollY(self: *const AppState) f32 {
+        return self.composer_overlay_scroll_y;
+    }
+
+    pub fn setComposerOverlayScrollY(self: *AppState, value: f32) void {
+        self.composer_overlay_scroll_y = @max(value, 0.0);
+    }
+
+    pub fn shouldComposerOverlayFollowCursor(self: *AppState, cursor_pos: usize, draft_len: usize) bool {
+        if (cursor_pos != self.composer_overlay_last_cursor_pos or draft_len != self.composer_overlay_last_draft_len) {
+            self.composer_overlay_follow_cursor = true;
+        }
+        self.composer_overlay_last_cursor_pos = cursor_pos;
+        self.composer_overlay_last_draft_len = draft_len;
+        return self.composer_overlay_follow_cursor;
+    }
+
     fn setDraft(self: *AppState, value: []const u8) void {
         self.currentProjectMutable().setDraft(value);
         self.markDirty();
@@ -3948,6 +4055,10 @@ pub const AppState = struct {
 
     fn resetComposerInputWidget(self: *AppState) void {
         self.composer_input_nonce +%= 1;
+        self.composer_overlay_scroll_y = 0.0;
+        self.composer_overlay_follow_cursor = true;
+        self.composer_overlay_last_cursor_pos = 0;
+        self.composer_overlay_last_draft_len = 0;
     }
 
     pub fn updateFileSearch(self: *AppState) void {
@@ -4074,11 +4185,11 @@ pub const AppState = struct {
     pub fn markDirty(self: *AppState) void {
         self.noteInteraction();
         self.dirty = true;
-        self.last_dirty_at_ms = std.time.milliTimestamp();
+        self.last_dirty_at_ms = 0;
     }
 
     pub fn noteInteraction(self: *AppState) void {
-        self.last_interaction_at_ms = std.time.milliTimestamp();
+        self.last_interaction_at_ms = 0;
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
@@ -4161,8 +4272,8 @@ pub const AppState = struct {
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
-        if (std.time.milliTimestamp() - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
-        if (std.time.milliTimestamp() - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (0 - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (0 - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
 
         self.flushDirtyNow();
     }
@@ -4382,7 +4493,7 @@ pub const AppState = struct {
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
         const send_state = thread.send_state;
 
-        send_state.mutex.lock();
+        if (!send_state.mutex.tryLock()) return;
         switch (send_state.status) {
             .completed => {
                 completed_result = send_state.result;
@@ -4541,7 +4652,7 @@ pub const AppState = struct {
         if (thread.provider_thread_id != null) return;
 
         const send_state = thread.send_state;
-        send_state.mutex.lock();
+        if (!send_state.mutex.tryLock()) return;
         const thread_id = if (send_state.status == .pending and send_state.provisional_provider_thread_id != null)
             self.allocator.dupeZ(u8, send_state.provisional_provider_thread_id.?) catch null
         else
@@ -4559,7 +4670,7 @@ pub const AppState = struct {
         var turn_id: ?[]u8 = null;
 
         const send_state = thread.send_state;
-        send_state.mutex.lock();
+        if (!send_state.mutex.tryLock()) return;
         if (send_state.status == .pending and send_state.stop_requested and !send_state.stop_signal_sent) {
             provider = thread.provider;
             const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
@@ -4606,7 +4717,7 @@ pub const AppState = struct {
         var prompt: ?[]u8 = null;
 
         const send_state = thread.send_state;
-        send_state.mutex.lock();
+        if (!send_state.mutex.tryLock()) return;
         if (send_state.status == .pending and
             !send_state.stop_requested and
             send_state.pending_followup != null and
@@ -4813,24 +4924,24 @@ pub const AppState = struct {
 
     pub fn hasPendingStream(self: *AppState) bool {
         if (self.projects.items.len == 0) return false;
-        return self.currentThread().isSendPending();
+        return self.currentThread().isSendPendingForUi();
     }
 
     pub fn hasAnyPendingSends(self: *AppState) bool {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
-                if (thread.isSendPending()) return true;
+                if (thread.isSendPendingForUi()) return true;
             }
             for (project.archived_threads.items) |*thread| {
-                if (thread.isSendPending()) return true;
+                if (thread.isSendPendingForUi()) return true;
             }
         }
         for (self.archived_projects.items) |*project| {
             for (project.threads.items) |*thread| {
-                if (thread.isSendPending()) return true;
+                if (thread.isSendPendingForUi()) return true;
             }
             for (project.archived_threads.items) |*thread| {
-                if (thread.isSendPending()) return true;
+                if (thread.isSendPendingForUi()) return true;
             }
         }
         return false;
@@ -4945,20 +5056,20 @@ pub const AppState = struct {
 
     fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
         const expanded = if (std.mem.startsWith(u8, raw_path, "~/")) blk: {
-            const home = std.posix.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
             break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, raw_path[2..] });
         } else try self.allocator.dupe(u8, raw_path);
         defer self.allocator.free(expanded);
 
+        var threaded = std.Io.Threaded.init_single_threaded;
         const resolved = if (std.fs.path.isAbsolute(expanded))
-            try std.fs.realpathAlloc(self.allocator, expanded)
-        else blk: {
-            const cwd = std.fs.cwd();
-            break :blk try cwd.realpathAlloc(self.allocator, expanded);
-        };
+            try std.Io.Dir.realPathFileAbsoluteAlloc(threaded.io(), expanded, self.allocator)
+        else
+            try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), expanded, self.allocator);
 
-        var dir = try std.fs.openDirAbsolute(resolved, .{});
-        dir.close();
+        var threaded_check = std.Io.Threaded.init_single_threaded;
+        const dir = try std.Io.Dir.openDirAbsolute(threaded_check.io(), resolved, .{});
+        dir.close(threaded_check.io());
         return resolved;
     }
 
@@ -5052,7 +5163,7 @@ pub const AppState = struct {
             } else |_| {}
         }
 
-        const home = std.posix.getenv("HOME") orelse return self.allocator.dupe(u8, ".");
+        const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return self.allocator.dupe(u8, "."), 0);
         return self.allocator.dupe(u8, home);
     }
 };
