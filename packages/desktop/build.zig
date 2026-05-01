@@ -119,40 +119,40 @@ pub fn build(b: *std.Build) void {
     });
     build_fff.setCwd(fff_root);
     exe.step.dependOn(&build_fff.step);
-    exe.linkLibrary(imgui);
-    exe.linkLibC();
+    exe.root_module.linkLibrary(imgui);
+    exe.root_module.link_libc = true;
     exe.root_module.addIncludePath(b.path("../../vendor"));
     exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    exe.addLibraryPath(b.path("../../vendor/fff/target/release"));
-    exe.linkSystemLibrary("fff_c");
-    exe.addCSourceFile(.{
+    exe.root_module.addLibraryPath(b.path("../../vendor/fff/target/release"));
+    exe.root_module.linkSystemLibrary("fff_c", .{});
+    exe.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
     });
     switch (target.result.os.tag) {
         .linux => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-                exe.addLibraryPath(sdl3_prebuilt.path("lib"));
+                exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
             }
-            exe.linkSystemLibrary("SDL3");
-            exe.linkSystemLibrary("GL");
-            exe.linkSystemLibrary("util");
+            exe.root_module.linkSystemLibrary("SDL3", .{});
+            exe.root_module.linkSystemLibrary("GL", .{});
+            exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
-            exe.linkSystemLibrary("SDL3");
-            exe.linkSystemLibrary("opengl32");
+            exe.root_module.linkSystemLibrary("SDL3", .{});
+            exe.root_module.linkSystemLibrary("opengl32", .{});
         },
         .macos => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-                exe.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+                exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
             }
-            exe.addCSourceFile(.{
+            exe.root_module.addCSourceFile(.{
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},
             });
-            exe.linkFramework("SDL3");
-            exe.linkFramework("OpenGL");
-            exe.linkFramework("AppKit");
+            exe.root_module.linkFramework("SDL3", .{});
+            exe.root_module.linkFramework("OpenGL", .{});
+            exe.root_module.linkFramework("AppKit", .{});
         },
         else => {},
     }
@@ -186,8 +186,8 @@ pub fn build(b: *std.Build) void {
             }),
         });
         browser_helper.build_id = .sha1;
-        browser_helper.linkLibC();
-        browser_helper.addCSourceFile(.{
+        browser_helper.root_module.link_libc = true;
+        browser_helper.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/linux_webkitgtk.c"),
             .flags = &.{},
         });
@@ -288,15 +288,15 @@ pub fn build(b: *std.Build) void {
     const chat_markdown_tests = b.addTest(.{
         .root_module = chat_markdown,
     });
-    chat_markdown_tests.linkLibrary(imgui);
-    chat_markdown_tests.linkLibC();
+    chat_markdown_tests.root_module.linkLibrary(imgui);
+    chat_markdown_tests.root_module.link_libc = true;
     if (target.result.os.tag == .linux) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            chat_markdown_tests.addLibraryPath(sdl3_prebuilt.path("lib"));
+            chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
-        chat_markdown_tests.linkSystemLibrary("SDL3");
-        chat_markdown_tests.linkSystemLibrary("GL");
-        chat_markdown_tests.linkSystemLibrary("util");
+        chat_markdown_tests.root_module.linkSystemLibrary("SDL3", .{});
+        chat_markdown_tests.root_module.linkSystemLibrary("GL", .{});
+        chat_markdown_tests.root_module.linkSystemLibrary("util", .{});
     }
     test_step.dependOn(&b.addRunArtifact(chat_markdown_tests).step);
     const exe_tests = b.addTest(.{
@@ -319,30 +319,30 @@ pub fn build(b: *std.Build) void {
     exe_tests.step.dependOn(&build_fff.step);
     exe_tests.root_module.addIncludePath(b.path("../../vendor"));
     exe_tests.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
-    exe_tests.addLibraryPath(b.path("../../vendor/fff/target/release"));
-    exe_tests.linkSystemLibrary("fff_c");
-    exe_tests.addCSourceFile(.{
+    exe_tests.root_module.addLibraryPath(b.path("../../vendor/fff/target/release"));
+    exe_tests.root_module.linkSystemLibrary("fff_c", .{});
+    exe_tests.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
     });
-    exe_tests.linkLibC();
+    exe_tests.root_module.link_libc = true;
     if (target.result.os.tag == .linux) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
-            exe_tests.addLibraryPath(sdl3_prebuilt.path("lib"));
+            exe_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
-        exe_tests.linkSystemLibrary("SDL3");
-        exe_tests.linkSystemLibrary("util");
+        exe_tests.root_module.linkSystemLibrary("SDL3", .{});
+        exe_tests.root_module.linkSystemLibrary("util", .{});
     } else if (target.result.os.tag == .macos) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
-            exe_tests.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
+            exe_tests.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
         }
-        exe_tests.addCSourceFile(.{
+        exe_tests.root_module.addCSourceFile(.{
             .file = b.path("src/platform/macos_clipboard.m"),
             .flags = &.{},
         });
-        exe_tests.linkFramework("SDL3");
-        exe_tests.linkFramework("OpenGL");
-        exe_tests.linkFramework("AppKit");
+        exe_tests.root_module.linkFramework("SDL3", .{});
+        exe_tests.root_module.linkFramework("OpenGL", .{});
+        exe_tests.root_module.linkFramework("AppKit", .{});
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
@@ -360,9 +360,9 @@ fn configureLinuxCefBinary(
 
     compile.root_module.link_libcpp = true;
     compile.root_module.addIncludePath(sdk_root);
-    compile.addLibraryPath(.{ .cwd_relative = release_dir });
-    compile.linkSystemLibrary("cef");
-    compile.addCSourceFile(.{
+    compile.root_module.addLibraryPath(.{ .cwd_relative = release_dir });
+    compile.root_module.linkSystemLibrary("cef", .{});
+    compile.root_module.addCSourceFile(.{
         .file = b.path("src/browser/cef/c/native_linux.cc"),
         .flags = &.{"-std=c++17"},
     });

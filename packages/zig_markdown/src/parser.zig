@@ -290,7 +290,7 @@ fn parseListBlock(
             }
 
             if (item_source.items.len > 0) try item_source.append(allocator, '\n');
-            try item_source.appendSlice(allocator, std.mem.trimLeft(u8, continuation.text, " \t"));
+            try item_source.appendSlice(allocator, std.mem.trimStart(u8, continuation.text, " \t"));
             item_last_line = continuation;
         }
 
@@ -377,7 +377,7 @@ fn parseOpeningFence(line: []const u8) ?FenceOpen {
     while (length < stripped.len and stripped[length] == marker) : (length += 1) {}
     if (length < 3) return null;
 
-    const info = std.mem.trimLeft(u8, stripped[length..], " \t");
+    const info = std.mem.trimStart(u8, stripped[length..], " \t");
     return .{
         .fence = .{
             .marker = marker,
@@ -396,7 +396,7 @@ fn isClosingFence(line: []const u8, fence: model.Fence) bool {
     while (length < stripped.len and stripped[length] == fence.marker) : (length += 1) {}
     if (length < fence.length) return false;
 
-    return std.mem.trimLeft(u8, stripped[length..], " \t").len == 0;
+    return std.mem.trimStart(u8, stripped[length..], " \t").len == 0;
 }
 
 fn isBlank(line: []const u8) bool {
@@ -455,7 +455,7 @@ fn trimMarkdownIndent(line: []const u8) ?[]const u8 {
 fn trimHeadingContent(content: []const u8) []const u8 {
     var trimmed = std.mem.trim(u8, content, " \t");
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '#') {
-        trimmed = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], " \t");
+        trimmed = std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - 1], " \t");
     }
     return trimmed;
 }
@@ -482,7 +482,7 @@ fn isThematicBreak(line: []const u8) bool {
 fn stripBlockQuoteMarker(line: []const u8) ?[]const u8 {
     const trimmed = trimMarkdownIndent(line) orelse return null;
     if (trimmed.len == 0 or trimmed[0] != '>') return null;
-    return std.mem.trimLeft(u8, trimmed[1..], " \t");
+    return std.mem.trimStart(u8, trimmed[1..], " \t");
 }
 
 fn parseListMarker(line: []const u8) ?ListMarker {
@@ -496,7 +496,7 @@ fn parseListMarker(line: []const u8) ?ListMarker {
             .delimiter = 0,
             .bullet = trimmed[0],
             .start_number = 1,
-            .content = std.mem.trimLeft(u8, trimmed[1..], " \t"),
+            .content = std.mem.trimStart(u8, trimmed[1..], " \t"),
         };
     }
 
@@ -513,7 +513,7 @@ fn parseListMarker(line: []const u8) ?ListMarker {
         .delimiter = delimiter,
         .bullet = 0,
         .start_number = std.fmt.parseUnsigned(usize, trimmed[0..digits_end], 10) catch return null,
-        .content = std.mem.trimLeft(u8, trimmed[digits_end + 1 ..], " \t"),
+        .content = std.mem.trimStart(u8, trimmed[digits_end + 1 ..], " \t"),
     };
 }
 
