@@ -214,7 +214,7 @@ fn isHunkLine(line: []const u8) bool {
 }
 
 fn trimCarriageReturn(line: []const u8) []const u8 {
-    return std.mem.trimRight(u8, line, "\r");
+    return std.mem.trimEnd(u8, line, "\r");
 }
 
 fn parseDiffGitPaths(line: []const u8, file: *FileBuilder) void {
