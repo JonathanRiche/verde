@@ -10,15 +10,27 @@ const ipc = @import("linux_ipc.zig");
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
     queue: *SharedQueue,
     frame: *SharedFrame,
-    stdout_file: std.fs.File,
+    stdout_file: std.Io.File,
 };
 
 const SharedQueue = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     events: browser_queue.EventQueue = .{},
 
     /// Releases any queued browser events.
@@ -44,7 +56,7 @@ const SharedQueue = struct {
 };
 
 const SharedFrame = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     path: ?[]u8 = null,
     width: u32 = 0,
     height: u32 = 0,
@@ -94,11 +106,13 @@ const SharedFrame = struct {
         if (self.width == 0 or self.height == 0 or self.byte_len == 0) return;
 
         try frame_buffer.resize(allocator, self.byte_len);
-        const file = try std.fs.openFileAbsolute(frame_path, .{ .mode = .read_only });
-        defer file.close();
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const file = try std.Io.Dir.openFileAbsolute(threaded.io(), frame_path, .{ .mode = .read_only });
+        defer file.close(threaded.io());
 
-        const read_len = try file.preadAll(frame_buffer.items[0..self.byte_len], 0);
-        if (read_len < self.byte_len) return error.UnexpectedFrameEof;
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = file.reader(threaded.io(), &read_buffer);
+        try reader.interface.readSliceAll(frame_buffer.items[0..self.byte_len]);
 
         try texture.uploadBgra(self.width, self.height, frame_buffer.items[0..self.byte_len]);
         self.dirty = false;
@@ -148,8 +162,9 @@ pub const Controller = struct {
             self.reader_thread = null;
         }
         if (self.child) |*child| {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
+            _ = child.wait(threaded.io()) catch {};
             self.child = null;
         }
         if (self.current_url) |url| self.allocator.free(url);
@@ -296,11 +311,13 @@ pub const Controller = struct {
         const helper_path = try browserHelperPath(self.allocator);
         defer self.allocator.free(helper_path);
 
-        var child = std.process.Child.init(&.{helper_path}, self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const child = try std.process.spawn(threaded.io(), .{
+            .argv = &.{helper_path},
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
 
         const stdout_file = child.stdout.?;
         self.child = child;
@@ -325,7 +342,9 @@ pub const Controller = struct {
         defer self.allocator.free(encoded);
 
         var write_buffer: [8 * 1024]u8 = undefined;
-        var writer = stdin_file.writer(&write_buffer);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var writer = stdin_file.writer(threaded.io(), &write_buffer);
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
         try writer.interface.flush();
@@ -335,7 +354,8 @@ pub const Controller = struct {
     fn closeChildStdin(self: *Controller) void {
         const child = if (self.child) |*child| child else return;
         const stdin_file = child.stdin orelse return;
-        stdin_file.close();
+        var threaded = std.Io.Threaded.init_single_threaded;
+        stdin_file.close(threaded.io());
         child.stdin = null;
     }
 
@@ -348,7 +368,8 @@ pub const Controller = struct {
 
 /// Resolves the installed Linux browser helper path beside the running desktop executable.
 fn browserHelperPath(allocator: std.mem.Allocator) ![]u8 {
-    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const exe_dir = try std.process.executableDirPathAlloc(threaded.io(), allocator);
     defer allocator.free(exe_dir);
     return try std.fs.path.join(allocator, &.{ exe_dir, "verde-browser-linux" });
 }
@@ -358,13 +379,14 @@ fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
 
     var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = context.stdout_file.reader(&read_buffer);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var reader = context.stdout_file.reader(threaded.io(), &read_buffer);
 
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
         if (maybe_line == null) return;
 
-        const line = std.mem.trimRight(u8, maybe_line.?, "\r");
+        const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
         if (line.len == 0) continue;
 
         var parsed = try std.json.parseFromSlice(ipc.Event, context.allocator, line, .{ .allocate = .alloc_always });

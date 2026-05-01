@@ -103,5 +103,5 @@ pub fn makeThreadTitle(allocator: std.mem.Allocator, prompt: []const u8) ![:0]co
 /// Restores persisted enum values to a valid known variant.
 pub fn sanitizeEnum(comptime Enum: type, value: *Enum, fallback: Enum) void {
     const raw = @as(*u8, @ptrCast(value)).*;
-    value.* = std.meta.intToEnum(Enum, raw) catch fallback;
+    value.* = std.enums.fromInt(Enum, raw) orelse fallback;
 }

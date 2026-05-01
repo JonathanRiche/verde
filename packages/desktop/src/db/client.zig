@@ -226,7 +226,7 @@ pub const Client = struct {
             .title = "New thread",
             .archived = project.archived,
             .committed = project.messages.len > 0,
-            .last_activity_at = if (project.messages.len > 0) std.time.timestamp() else null,
+            .last_activity_at = if (project.messages.len > 0) 0 else null,
             .provider = project.provider,
             .harness = project.harness,
             .draft = project.draft,
@@ -326,11 +326,19 @@ fn encodeOptionalEnum(value: anytype) ?i64 {
 
 fn decodeOptionalEnum(comptime Enum: type, raw: ?i64) ?Enum {
     const value = raw orelse return null;
-    return std.meta.intToEnum(Enum, @as(u8, @intCast(value))) catch null;
+    const enum_value: u8 = @intCast(value);
+    inline for (std.meta.fields(Enum)) |field| {
+        if (field.value == enum_value) return @enumFromInt(enum_value);
+    }
+    return null;
 }
 
 fn decodeEnumOr(comptime Enum: type, raw: i64, fallback: Enum) Enum {
-    return std.meta.intToEnum(Enum, @as(u8, @intCast(raw))) catch fallback;
+    const enum_value: u8 = @intCast(raw);
+    inline for (std.meta.fields(Enum)) |field| {
+        if (field.value == enum_value) return @enumFromInt(enum_value);
+    }
+    return fallback;
 }
 
 test "save clears orphaned threads left behind by manual db edits" {

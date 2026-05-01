@@ -18,8 +18,8 @@ const HOME_PATH_SUFFIXES = [_][]const u8{
 };
 
 /// Builds an environment map with a PATH that works for packaged GUI launches.
-pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.EnvMap {
-    var env_map = try std.process.getEnvMap(allocator);
+pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var env_map = try std.process.Environ.createMap(currentEnviron(), allocator);
     errdefer env_map.deinit();
 
     const current_path = env_map.get("PATH") orelse "";
@@ -30,7 +30,7 @@ pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.EnvMap {
         try path_builder.appendSlice(allocator, current_path);
     }
 
-    if (std.posix.getenv("HOME")) |home_z| {
+    if (std.c.getenv("HOME")) |home_z| {
         const home = std.mem.sliceTo(home_z, 0);
         for (HOME_PATH_SUFFIXES) |suffix| {
             const dir = try std.fs.path.join(allocator, &.{ home, suffix });
@@ -50,14 +50,19 @@ pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.EnvMap {
     return env_map;
 }
 
+fn currentEnviron() std.process.Environ {
+    if (@import("builtin").os.tag == .windows) return .{ .block = .global };
+    return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
 /// Resolves an executable against the provided environment map.
 pub fn resolveExecutableInEnvMapAlloc(
     allocator: std.mem.Allocator,
-    env_map: *const std.process.EnvMap,
+    env_map: *const std.process.Environ.Map,
     executable: []const u8,
 ) ![]u8 {
     if (isQualifiedExecutablePath(executable)) {
-        try std.posix.access(executable, std.posix.X_OK);
+        try checkExecutableAccess(allocator, executable);
         return allocator.dupe(u8, executable);
     }
 
@@ -69,7 +74,7 @@ pub fn resolveExecutableInEnvMapAlloc(
         const candidate = try std.fs.path.join(allocator, &.{ part, executable });
         errdefer allocator.free(candidate);
 
-        std.posix.access(candidate, std.posix.X_OK) catch |err| switch (err) {
+        checkExecutableAccess(allocator, candidate) catch |err| switch (err) {
             error.FileNotFound, error.AccessDenied => {
                 allocator.free(candidate);
                 continue;
@@ -81,6 +86,17 @@ pub fn resolveExecutableInEnvMapAlloc(
     }
 
     return error.FileNotFound;
+}
+
+fn checkExecutableAccess(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    if (std.c.access(path_z.ptr, std.c.X_OK) == 0) return;
+    return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+        .NOENT, .NOTDIR => error.FileNotFound,
+        .ACCES => error.AccessDenied,
+        else => error.Unexpected,
+    };
 }
 
 /// Returns true when the executable can be found in the augmented PATH.

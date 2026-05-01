@@ -14,6 +14,18 @@ const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 const MAX_CONNECT_WAIT_ATTEMPTS = 30;
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
 pub const Transport = enum(u8) {
     websocket,
     stdio_jsonl,
@@ -28,7 +40,7 @@ pub const Config = struct {
 };
 
 const SharedServerState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     child: ?std.process.Child = null,
     owns_child: bool = false,
 };
@@ -38,7 +50,7 @@ var shared_server_state: SharedServerState = .{};
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    stream: ?std.net.Stream = null,
+    stream: ?std.Io.net.Stream = null,
     initialized: bool = false,
     next_request_id: u64 = 1,
     loaded_threads: std.StringHashMap(void),
@@ -268,7 +280,8 @@ pub const Client = struct {
     fn closeStream(self: *Client) void {
         if (self.stream) |stream| {
             self.writeCloseFrame(stream) catch {};
-            stream.close();
+            var threaded = std.Io.Threaded.init_single_threaded;
+            stream.close(threaded.io());
             self.stream = null;
         }
 
@@ -278,11 +291,8 @@ pub const Client = struct {
     fn connectWebSocket(self: *Client) !void {
         const raw_url = self.config.websocket_url orelse return error.MissingWebSocketUrl;
         const uri = try std.Uri.parse(raw_url);
-        const host = try uri.getHostAlloc(self.allocator);
-        defer if (uri.host != null and host.ptr != switch (uri.host.?) {
-            .raw => |raw| raw.ptr,
-            .percent_encoded => |encoded| encoded.ptr,
-        }) self.allocator.free(host);
+        const host_name = try uri.getHostAlloc(self.allocator);
+        const host = host_name.bytes;
 
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "ws")) {
             return error.UnsupportedWebSocketScheme;
@@ -350,17 +360,17 @@ pub const Client = struct {
             url,
         };
 
-        var child = std.process.Child.init(argv[0..], self.allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        child.cwd = self.config.cwd;
-        child.env_map = &env_map;
-        try child.spawn();
-        child.env_map = null;
-        child.argv = &.{};
+        var threaded_spawn = std.Io.Threaded.init_single_threaded;
+        const child = try std.process.spawn(threaded_spawn.io(), .{
+            .argv = argv[0..],
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+        });
 
-        log.info("Codex app-server started pid={d} listen={s}", .{ child.id, url });
+        log.info("Codex app-server started pid={d} listen={s}", .{ child.id orelse -1, url });
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
     }
@@ -370,9 +380,12 @@ pub const Client = struct {
         uri: std.Uri,
         host: []const u8,
         port: u16,
-    ) !?std.net.Stream {
-        const stream = std.net.tcpConnectToHost(self.allocator, host, port) catch return null;
-        errdefer stream.close();
+    ) !?std.Io.net.Stream {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const address = std.Io.net.IpAddress.parse(host, port) catch
+            std.Io.net.IpAddress.resolve(threaded.io(), host, port) catch return null;
+        const stream = address.connect(threaded.io(), .{ .mode = .stream }) catch return null;
+        errdefer stream.close(threaded.io());
 
         try self.performWebSocketHandshake(stream, uri, host, port);
         return stream;
@@ -384,26 +397,27 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         attempts: usize,
-    ) !?std.net.Stream {
+    ) !?std.Io.net.Stream {
         var attempt: usize = 0;
         while (attempt < attempts) : (attempt += 1) {
             if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
                 return stream;
             }
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.atomic.spinLoopHint();
         }
         return null;
     }
 
     fn performWebSocketHandshake(
         self: *Client,
-        stream: std.net.Stream,
+        stream: std.Io.net.Stream,
         uri: std.Uri,
         host: []const u8,
         port: u16,
     ) !void {
         var nonce: [16]u8 = undefined;
-        std.crypto.random.bytes(&nonce);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        try std.Io.randomSecure(threaded.io(), &nonce);
 
         const key = try encodeBase64Alloc(self.allocator, &nonce);
         defer self.allocator.free(key);
@@ -427,7 +441,7 @@ pub const Client = struct {
         );
         defer self.allocator.free(request);
 
-        try stream.writeAll(request);
+        try streamWriteAll(stream, request);
 
         const status_line = try readHttpLineAlloc(self.allocator, stream);
         defer self.allocator.free(status_line);
@@ -762,8 +776,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    const backoff_ms: u64 = @min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500);
-                    std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+                    std.atomic.spinLoopHint();
                     continue;
                 },
                 else => return err,
@@ -781,8 +794,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    const backoff_ms: u64 = @min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500);
-                    std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+                    std.atomic.spinLoopHint();
                     continue;
                 },
                 else => return err,
@@ -896,7 +908,7 @@ pub const Client = struct {
         try writeClientFrame(self.allocator, stream, payload, .text);
     }
 
-    fn writeCloseFrame(self: *Client, stream: std.net.Stream) !void {
+    fn writeCloseFrame(self: *Client, stream: std.Io.net.Stream) !void {
         try writeClientFrame(self.allocator, stream, "", .connection_close);
     }
 
@@ -940,9 +952,10 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            log.info("stopping owned Codex app-server pid={d}", .{child.id});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            log.info("stopping owned Codex app-server pid={d}", .{child.id orelse -1});
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
+            _ = child.wait(threaded.io()) catch {};
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1014,13 +1027,13 @@ fn buildRequestTargetAlloc(allocator: std.mem.Allocator, uri: std.Uri) ![]u8 {
     return target.toOwnedSlice(allocator);
 }
 
-fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
+fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 
     while (true) {
         var byte: [1]u8 = undefined;
-        const read = try stream.read(&byte);
+        const read = try streamRead(stream, &byte);
         if (read == 0) return error.EndOfStream;
 
         if (byte[0] == '\n') break;
@@ -1033,10 +1046,10 @@ fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8
     return line.toOwnedSlice(allocator);
 }
 
-fn readExact(stream: std.net.Stream, buffer: []u8) !void {
+fn readExact(stream: std.Io.net.Stream, buffer: []u8) !void {
     var index: usize = 0;
     while (index < buffer.len) {
-        const amt = try stream.read(buffer[index..]);
+        const amt = try streamRead(stream, buffer[index..]);
         if (amt == 0) return error.EndOfStream;
         index += amt;
     }
@@ -1044,7 +1057,7 @@ fn readExact(stream: std.net.Stream, buffer: []u8) !void {
 
 fn writeClientFrame(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     payload: []const u8,
     opcode: FrameOpcode,
 ) !void {
@@ -1074,7 +1087,8 @@ fn writeClientFrame(
     }
 
     var mask: [4]u8 = undefined;
-    std.crypto.random.bytes(&mask);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    try std.Io.randomSecure(threaded.io(), &mask);
     @memcpy(header[index .. index + 4], &mask);
     index += 4;
 
@@ -1084,11 +1098,26 @@ fn writeClientFrame(
         masked[i] = byte ^ mask[i % mask.len];
     }
 
-    try stream.writeAll(header[0..index]);
-    try stream.writeAll(masked);
+    try streamWriteAll(stream, header[0..index]);
+    try streamWriteAll(stream, masked);
 }
 
-fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) !Frame {
+fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var no_buffer: [0]u8 = .{};
+    var reader = stream.reader(threaded.io(), &no_buffer);
+    return reader.interface.readSliceShort(buffer);
+}
+
+fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var write_buffer: [8 * 1024]u8 = undefined;
+    var writer = stream.writer(threaded.io(), &write_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !Frame {
     var header: [2]u8 = undefined;
     try readExact(stream, &header);
 
@@ -1257,14 +1286,18 @@ fn flattenUserMessageContentAlloc(allocator: std.mem.Allocator, content: std.jso
         if (std.mem.eql(u8, content_type, "localImage")) {
             const path = getOptionalObjectString(entry, "path") orelse continue;
             if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
-            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{path});
+            const label = try std.fmt.allocPrint(allocator, "[Image: {s}]", .{path});
+            defer allocator.free(label);
+            try builder.appendSlice(allocator, label);
             continue;
         }
 
         if (std.mem.eql(u8, content_type, "image")) {
             const url = getOptionalObjectString(entry, "url") orelse continue;
             if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
-            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{url});
+            const label = try std.fmt.allocPrint(allocator, "[Image: {s}]", .{url});
+            defer allocator.free(label);
+            try builder.appendSlice(allocator, label);
         }
     }
 
@@ -1282,11 +1315,13 @@ fn buildImportedFileChangeSummaryAlloc(allocator: std.mem.Allocator, changes: st
         const additions = countDiffLines(change, '+');
         const deletions = countDiffLines(change, '-');
         if (body.items.len > 0) try body.append(allocator, '\n');
-        try std.fmt.format(body.writer(allocator), "{s}  +{d} / -{d}", .{
+        const line = try std.fmt.allocPrint(allocator, "{s}  +{d} / -{d}", .{
             path,
             additions,
             deletions,
         });
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
     }
 
     return body.toOwnedSlice(allocator);
@@ -1629,7 +1664,9 @@ fn appendChangedFileLine(lines: *std.ArrayList(u8), path: []const u8, value: std
     if (lines.items.len > 0) {
         lines.append(std.heap.page_allocator, '\n') catch return;
     }
-    std.fmt.format(lines.writer(std.heap.page_allocator), "{s}  +{d} / -{d}", .{ path, additions, deletions }) catch return;
+    const line = std.fmt.allocPrint(std.heap.page_allocator, "{s}  +{d} / -{d}", .{ path, additions, deletions }) catch return;
+    defer std.heap.page_allocator.free(line);
+    lines.appendSlice(std.heap.page_allocator, line) catch return;
 }
 
 fn extractPathFromValue(value: std.json.Value) ?[]const u8 {

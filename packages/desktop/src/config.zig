@@ -92,25 +92,25 @@ pub fn readRootValue(allocator: std.mem.Allocator) !?std.json.Parsed(std.json.Va
 }
 
 pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
         const trimmed = std.mem.trim(u8, std.mem.sliceTo(xdg_config_home, 0), &std.ascii.whitespace);
         if (trimmed.len > 0) {
             return std.fs.path.join(allocator, &.{ trimmed, "verde", "verde.json" });
         }
     }
 
-    const home = std.posix.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ std.mem.sliceTo(home, 0), VERDE_CONFIG_RELATIVE_PATH });
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    return std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(1024 * 128)) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    defer file.close();
-
-    return file.readToEndAlloc(allocator, 1024 * 128);
 }
 
 fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std.json.Value) void {

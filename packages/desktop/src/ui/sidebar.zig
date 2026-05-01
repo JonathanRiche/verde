@@ -779,7 +779,7 @@ fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:
 /// Formats a relative timestamp for sidebar metadata.
 fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     if (timestamp <= 0) return "now";
-    const elapsed = @max(std.time.timestamp() - timestamp, 0);
+    const elapsed = @max(0 - timestamp, 0);
     if (elapsed < 60) return "now";
     if (elapsed < 3600) {
         const minutes = @divFloor(elapsed, 60);
