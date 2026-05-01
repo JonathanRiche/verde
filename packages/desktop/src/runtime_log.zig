@@ -88,6 +88,25 @@ pub fn stderrLogPath() ?[]const u8 {
     return stderr_log_path;
 }
 
+pub fn diagnostic(comptime format: []const u8, args: anytype) void {
+    const path = stderr_log_path orelse return;
+    const io = runtime_io orelse return;
+
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = false,
+    }) catch return;
+    defer file.close(io);
+
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.pos = file.length(io) catch return;
+    writer.interface.print("[diagnostic {d}] ", .{unixTimestampMs()}) catch return;
+    writer.interface.print(format, args) catch return;
+    writer.interface.writeByte('\n') catch return;
+    writer.interface.flush() catch return;
+}
+
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),

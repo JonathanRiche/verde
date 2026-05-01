@@ -1,6 +1,7 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
 const process_env = @import("process_env.zig");
+const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const chat_threads = @import("chat/threads.zig");
 const std = @import("std");
@@ -384,6 +385,16 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
             request.prompt.len,
         },
     );
+    runtime_log.diagnostic(
+        "sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
 
     const result = runSendWorker(page_alloc, request);
 
@@ -405,6 +416,16 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
     } else |err| {
         std.debug.print(
             "[codex-debug] sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        runtime_log.diagnostic(
+            "sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}",
             .{
                 @tagName(request.provider),
                 request.project_path,
@@ -477,6 +498,7 @@ pub fn runSendWorker(
     var client = try ai_harness.connect(allocator, provider_config);
     defer client.deinit();
     std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
+    runtime_log.diagnostic("send worker connected provider={s}", .{@tagName(request.provider)});
 
     const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
@@ -498,6 +520,16 @@ pub fn runSendWorker(
     }) catch |err| {
         std.debug.print(
             "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        runtime_log.diagnostic(
+            "client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
             .{
                 @tagName(request.provider),
                 request.project_path,
@@ -989,6 +1021,7 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
 
     send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch |err| {
         std.debug.print("[codex-debug] failed to store provisional thread id len={d}: {s}\n", .{ thread_id.len, @errorName(err) });
+        runtime_log.diagnostic("failed to store provisional thread id len={d}: {s}", .{ thread_id.len, @errorName(err) });
         return;
     };
 }
@@ -1008,6 +1041,7 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
 
     send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch |err| {
         std.debug.print("[codex-debug] failed to store active turn id len={d}: {s}\n", .{ turn_id.len, @errorName(err) });
+        runtime_log.diagnostic("failed to store active turn id len={d}: {s}", .{ turn_id.len, @errorName(err) });
         return;
     };
 }
@@ -1021,6 +1055,10 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     send_state.partial_text.appendSlice(page_alloc, delta) catch |err| {
         std.debug.print(
             "[codex-debug] failed to append stream delta delta_len={d} partial_len={d}: {s}\n",
+            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
+        );
+        runtime_log.diagnostic(
+            "failed to append stream delta delta_len={d} partial_len={d}: {s}",
             .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
         );
         return;
