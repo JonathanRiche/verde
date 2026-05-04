@@ -124,6 +124,7 @@ pub const Renderer = struct {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.appendRect(allocator, command.rect, command.color, command.clip),
                 .text => try self.appendText(allocator, command),
+                .image => {},
             }
         }
         if (self.vertices.items.len == 0) return;
