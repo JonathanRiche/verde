@@ -245,12 +245,10 @@ fn linkSdl(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
     module.linkSystemLibrary("c", .{});
     switch (os_tag) {
         .linux => {
-            module.linkSystemLibrary("SDL3", .{ .use_pkg_config = .yes });
-            module.linkSystemLibrary("SDL3_ttf", .{ .use_pkg_config = .yes });
+            linkSdlPkgConfig(module);
         },
         .macos => {
-            module.linkFramework("SDL3", .{});
-            module.linkFramework("SDL3_ttf", .{});
+            linkSdlPkgConfig(module);
             module.linkFramework("Metal", .{});
             module.linkFramework("QuartzCore", .{});
         },
@@ -259,4 +257,9 @@ fn linkSdl(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
             module.linkSystemLibrary("SDL3_ttf", .{});
         },
     }
+}
+
+fn linkSdlPkgConfig(module: *std.Build.Module) void {
+    module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+    module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
 }
