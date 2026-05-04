@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const atlas = @import("atlas.zig");
 pub const draw = @import("draw.zig");
+pub const image_loader = @import("image_loader.zig");
 pub const input_clipboard = @import("input/clipboard.zig");
 pub const input_key = @import("input/key.zig");
 pub const input_selection = @import("input/selection.zig");
@@ -42,6 +43,7 @@ pub const CodeViewConfig = code_view_component.CodeViewConfig;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;
 pub const ImageFit = image_component.ImageFit;
+pub const LoadedImage = image_loader.LoadedImage;
 pub const ListBoxCallbacks = list_box_component.ListBoxCallbacks;
 pub const ListBoxConfig = list_box_component.ListBoxConfig;
 pub const ListBoxEvent = list_box_component.ListBoxEvent;
@@ -78,6 +80,7 @@ pub const TextInputConfig = text_input_component.TextInputConfig;
 pub const TextInputEvent = text_input_component.TextInputEvent;
 pub const ClipboardCallbacks = input_clipboard;
 pub const Key = input_key;
+pub const ImageLoader = image_loader;
 pub const Layout = layout;
 pub const LayoutAlign = layout.Align;
 pub const LayoutBox = layout.Box;
@@ -180,6 +183,7 @@ pub fn textArea(comptime config: TextAreaConfig) type {
 
 test {
     _ = draw;
+    _ = image_loader;
     _ = input_clipboard;
     _ = input_key;
     _ = input_selection;

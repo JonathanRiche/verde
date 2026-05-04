@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const powder = @import("powder");
 const sdl = powder.sdl;
-const stb_image = @import("stb_image.zig");
 
 const CAL_SANS_PATH = "../desktop/src/assets/fonts/CalSans-Regular.ttf";
 const PREVIEW_IMAGE_PATH = "../desktop/src/assets/verde_logo.png";
@@ -98,13 +97,11 @@ pub fn run() !void {
     try sdl.setRenderDrawBlendMode(renderer, .blend);
     const font = try sdl.ttfOpenFont(CAL_SANS_PATH, LABEL_FONT_SIZE);
     defer sdl.ttfCloseFont(font);
-    const preview_image = try stb_image.load(PREVIEW_IMAGE_PATH);
+    const preview_image = try powder.ImageLoader.load(PREVIEW_IMAGE_PATH);
     defer preview_image.deinit();
     const preview_w: f32 = @floatFromInt(preview_image.width);
     const preview_h: f32 = @floatFromInt(preview_image.height);
-    const preview_surface = try sdl.createSurfaceFrom(preview_image.width, preview_image.height, .rgba32, preview_image.pixels, preview_image.width * 4);
-    defer sdl.destroySurface(preview_surface);
-    const preview_texture = try sdl.createTextureFromSurface(renderer, preview_surface);
+    const preview_texture = try sdl.createTextureFromImage(renderer, preview_image);
     defer sdl.destroyTexture(preview_texture);
     var texture_store: TextureStore = .{ .texture = preview_texture, .width = preview_w, .height = preview_h };
 

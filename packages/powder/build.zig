@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const powder_mod = b.createModule(.{
+    const powder_mod = b.addModule("powder", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -58,8 +58,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = "examples/layout_lab_main.zig",
         .linux_root_source_file = "examples/layout_lab.zig",
         .linux_c_source_file = "examples/linux_layout_lab_main.c",
-        .extra_c_source_file = "../../vendor/stb_image_impl.c",
-        .extra_include_path = "../../vendor",
+        .link_image_loader = true,
         .target = target,
         .optimize = optimize,
         .powder_mod = powder_mod,
@@ -106,12 +105,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const gpu_backends_step = b.step("test-gpu-backends", "Validate SDL_GPU Vulkan/Metal renderer coverage");
     const compile_shader_steps = compileGpuShaders(b);
+    const exe_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exe_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_tests_mod,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     exe_tests.step.dependOn(compile_shader_steps);
@@ -147,8 +147,7 @@ const ExampleOptions = struct {
     root_source_file: []const u8,
     linux_root_source_file: []const u8,
     linux_c_source_file: []const u8,
-    extra_c_source_file: ?[]const u8 = null,
-    extra_include_path: ?[]const u8 = null,
+    link_image_loader: bool = false,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     powder_mod: *std.Build.Module,
@@ -185,11 +184,7 @@ fn addExample(b: *std.Build, options: ExampleOptions) Example {
         }),
     });
     linkSdl(exe.root_module, options.target.result.os.tag);
-    if (options.extra_include_path) |include_path| exe.root_module.addIncludePath(b.path(include_path));
-    if (options.extra_c_source_file) |c_source| {
-        exe.root_module.addCSourceFile(.{ .file = b.path(c_source), .flags = &.{} });
-        exe.root_module.link_libc = true;
-    }
+    if (options.link_image_loader) linkBundledImageLoader(b, exe.root_module);
     return .{
         .artifact = exe,
         .step = &exe.step,
@@ -277,8 +272,6 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         "-Mpowder=src/root.zig",
         b.fmt("-femit-bin={s}", .{object_path}),
     });
-    if (options.extra_include_path) |include_path| build_obj.addArg(b.fmt("-I{s}", .{include_path}));
-    if (options.extra_c_source_file != null) build_obj.addArg("-lc");
     build_obj.step.dependOn(&mkdir.step);
 
     var link = b.addSystemCommand(&.{
@@ -287,7 +280,7 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         object_path,
         options.linux_c_source_file,
     });
-    if (options.extra_c_source_file) |c_source| link.addArg(c_source);
+    if (options.link_image_loader) link.addArg("vendor/stb_image_impl.c");
     link.addArgs(&.{
         "-lSDL3",
         "-lSDL3_ttf",
@@ -302,6 +295,18 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         .step = &link.step,
         .output_path = output_path,
     };
+}
+
+fn linkBundledImageLoader(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor"));
+    module.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{} });
+    module.link_libc = true;
+}
+
+pub fn linkImageLoader(powder_dependency: *std.Build.Dependency, module: *std.Build.Module) void {
+    module.addIncludePath(powder_dependency.path("vendor"));
+    module.addCSourceFile(.{ .file = powder_dependency.path("vendor/stb_image_impl.c"), .flags = &.{} });
+    module.link_libc = true;
 }
 
 fn optimizeArg(b: *std.Build, optimize: std.builtin.OptimizeMode) []const u8 {
