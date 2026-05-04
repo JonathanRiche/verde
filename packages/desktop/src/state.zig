@@ -681,6 +681,9 @@ pub const Project = struct {
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
+    sidebar_thread_indices: std.ArrayList(usize) = .empty,
+    sidebar_committed_thread_count: usize = 0,
+    sidebar_thread_cache_dirty: bool = true,
 
     fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8, path: []const u8, unread_count: u8) !Project {
         var terminal_dock = try terminal.Dock.init(allocator);
@@ -697,6 +700,9 @@ pub const Project = struct {
             .threads = .empty,
             .archived_threads = .empty,
             .selected_thread_index = 0,
+            .sidebar_thread_indices = .empty,
+            .sidebar_committed_thread_count = 0,
+            .sidebar_thread_cache_dirty = true,
         };
         try project.addThread(allocator);
         return project;
@@ -717,6 +723,20 @@ pub const Project = struct {
             self.selected_thread_index = self.threads.items.len - 1;
         }
         return &self.threads.items[self.selected_thread_index];
+    }
+
+    pub fn invalidateSidebarThreadCache(self: *Project) void {
+        self.sidebar_thread_cache_dirty = true;
+    }
+
+    pub fn committedThreadCountCached(self: *Project, allocator: std.mem.Allocator) usize {
+        self.ensureSidebarThreadCache(allocator);
+        return self.sidebar_committed_thread_count;
+    }
+
+    pub fn sortedCommittedThreadIndices(self: *Project, allocator: std.mem.Allocator) []const usize {
+        self.ensureSidebarThreadCache(allocator);
+        return self.sidebar_thread_indices.items;
     }
 
     fn currentDraft(self: *const Project) []const u8 {
@@ -788,6 +808,7 @@ pub const Project = struct {
             thread.deinit(allocator);
         }
         self.archived_threads.deinit(allocator);
+        self.sidebar_thread_indices.deinit(allocator);
     }
 
     fn archiveAllThreads(self: *Project, allocator: std.mem.Allocator) !void {
@@ -797,6 +818,43 @@ pub const Project = struct {
             try self.archived_threads.append(allocator, thread);
         }
         self.selected_thread_index = 0;
+        self.invalidateSidebarThreadCache();
+    }
+
+    fn ensureSidebarThreadCache(self: *Project, allocator: std.mem.Allocator) void {
+        if (!self.sidebar_thread_cache_dirty) return;
+
+        self.sidebar_thread_indices.clearRetainingCapacity();
+        self.sidebar_committed_thread_count = 0;
+
+        for (self.threads.items, 0..) |thread, index| {
+            if (!thread.committed) continue;
+            self.sidebar_committed_thread_count += 1;
+            self.sidebar_thread_indices.append(allocator, index) catch {
+                self.sidebar_thread_cache_dirty = true;
+                return;
+            };
+        }
+
+        var i: usize = 1;
+        while (i < self.sidebar_thread_indices.items.len) : (i += 1) {
+            const current = self.sidebar_thread_indices.items[i];
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                const left_index = self.sidebar_thread_indices.items[j - 1];
+                const left = self.threads.items[left_index];
+                const right = self.threads.items[current];
+                const should_move = if (left.last_activity_at != right.last_activity_at)
+                    left.last_activity_at < right.last_activity_at
+                else
+                    left_index < current;
+                if (!should_move) break;
+                self.sidebar_thread_indices.items[j] = self.sidebar_thread_indices.items[j - 1];
+            }
+            self.sidebar_thread_indices.items[j] = current;
+        }
+
+        self.sidebar_thread_cache_dirty = false;
     }
 };
 
@@ -867,6 +925,23 @@ pub const Storage = struct {
         try self.client.save(persisted.value);
     }
 };
+
+fn savePersistedStateWorker(pref_path: []u8, loaded_state: LoadedPersistedState) void {
+    var loaded = loaded_state;
+    defer loaded.deinit();
+    defer std.heap.page_allocator.free(pref_path);
+
+    var client = db_client.Client.init(std.heap.page_allocator, pref_path) catch |err| {
+        log.err("failed to initialize async native state save: {s}", .{@errorName(err)});
+        return;
+    };
+    defer client.deinit();
+
+    client.save(loaded.value) catch |err| {
+        log.err("failed to save native state: {s}", .{@errorName(err)});
+    };
+}
+
 pub const SendStatus = enum {
     idle,
     pending,
@@ -1633,6 +1708,7 @@ pub const AppState = struct {
             self.setThreadImportNotice(failedAddImportedThreadNotice(provider));
             return;
         };
+        self.projects.items[project_index].invalidateSidebarThreadCache();
         self.selected_project_index = project_index;
         self.projects.items[project_index].selected_thread_index = self.projects.items[project_index].threads.items.len - 1;
         self.requestComposerFocus();
@@ -1798,6 +1874,7 @@ pub const AppState = struct {
             self.setSidebarNotice(@errorName(err));
             return;
         };
+        project.invalidateSidebarThreadCache();
 
         if (project.threads.items.len == 0) {
             project.addThread(self.allocator) catch {
@@ -1854,6 +1931,7 @@ pub const AppState = struct {
         }
         var draft_image_copy = draft_image;
         try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null);
+        self.currentProjectMutable().invalidateSidebarThreadCache();
         try self.beginSendForThread(self.currentProject().path, thread, draft);
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
@@ -2610,6 +2688,7 @@ pub const AppState = struct {
         var previous = existing.*;
         existing.* = refreshed;
         previous.deinit(self.allocator);
+        self.projects.items[project_index].invalidateSidebarThreadCache();
     }
 
     fn buildImportedThread(
@@ -4295,10 +4374,23 @@ pub const AppState = struct {
     fn flushDirtyNow(self: *AppState) void {
         if (!self.dirty) return;
 
-        self.storage.save(self) catch |err| {
-            log.err("failed to save native state: {s}", .{@errorName(err)});
+        var persisted = self.buildPersistedState(std.heap.page_allocator) catch |err| {
+            log.err("failed to snapshot native state: {s}", .{@errorName(err)});
             return;
         };
+        errdefer persisted.deinit();
+
+        const pref_path = std.heap.page_allocator.dupe(u8, self.storage.pref_path) catch |err| {
+            log.err("failed to prepare async native state save: {s}", .{@errorName(err)});
+            return;
+        };
+        errdefer std.heap.page_allocator.free(pref_path);
+
+        const worker = std.Thread.spawn(.{}, savePersistedStateWorker, .{ pref_path, persisted }) catch |err| {
+            log.err("failed to start async native state save: {s}", .{@errorName(err)});
+            return;
+        };
+        worker.detach();
         self.dirty = false;
     }
 
@@ -4586,6 +4678,9 @@ pub const AppState = struct {
         if (next_status != .idle) {
             if (self.pending_send_count > 0) self.pending_send_count -= 1;
             thread.finishSendThread();
+            if (project_index < self.projects.items.len) {
+                self.projects.items[project_index].invalidateSidebarThreadCache();
+            }
         }
 
         switch (next_status) {
