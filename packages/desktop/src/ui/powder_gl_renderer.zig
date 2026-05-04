@@ -110,6 +110,15 @@ pub const Renderer = struct {
     }
 
     pub fn renderBatch(self: *Renderer, allocator: std.mem.Allocator, batch: *const powder.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) !void {
+        _ = self;
+        _ = allocator;
+        _ = batch;
+        _ = framebuffer_width;
+        _ = framebuffer_height;
+        return;
+    }
+
+    pub fn renderBatchFallback(self: *Renderer, allocator: std.mem.Allocator, batch: *const powder.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) !void {
         self.vertices.clearRetainingCapacity();
         for (batch.commands.items) |command| {
             switch (command.kind) {

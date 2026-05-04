@@ -3932,6 +3932,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     state.powder_composer.tick(16);
     const submitted = state.powder_composer.submitted;
     queuePowderComposerIsland(state, composer_screen_pos, width, height, input_rect_min, input_rect_max);
+    drawPowderOverlayWithZgui(&state.powder_overlay_batch);
     state.updateFileSearch();
     const pending = runtime.isSendPending(state);
     if (submitted and !pending) {
@@ -4104,6 +4105,110 @@ fn queuePowderText(state: *app_state.AppState, rect: powder.Rect, value: []const
         font_size * 1.25,
         false,
     ) catch return;
+}
+
+fn drawPowderOverlayWithZgui(batch: *const powder.RenderBatch) void {
+    const draw_list = zgui.getWindowDrawList();
+    const font = theme.terminal_font orelse zgui.getFont();
+    for (batch.commands.items) |command| {
+        switch (command.kind) {
+            .rect, .cursor, .selection, .scrollbar => drawPowderRectWithZgui(draw_list, command.rect, command.color, command.clip),
+            .text => drawPowderTextWithZgui(draw_list, font, command),
+        }
+    }
+}
+
+fn drawPowderRectWithZgui(draw_list: zgui.DrawList, rect: powder.Rect, color: powder.Color, clip: ?powder.Rect) void {
+    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0) return;
+    const clipped = if (clip) |clip_rect| clippedPowderRect(rect, clip_rect) orelse return else rect;
+    draw_list.addRectFilled(.{
+        .pmin = .{ clipped.x, clipped.y },
+        .pmax = .{ clipped.x + clipped.w, clipped.y + clipped.h },
+        .col = powderColorU32(color),
+    });
+}
+
+fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: powder.draw.Command) void {
+    if (command.text.len == 0 or command.color.a <= 0.0) return;
+
+    const glyph_w = @max(command.glyph_width, 1.0);
+    const line_h = @max(command.line_height, command.font_size);
+    const max_columns: usize = if (command.wrap)
+        @max(@as(usize, @intFromFloat(@floor(command.rect.w / glyph_w))), 1)
+    else
+        std.math.maxInt(usize);
+
+    var row: usize = 0;
+    var col: usize = 0;
+    var line_start: usize = 0;
+    var index: usize = 0;
+    while (index < command.text.len) {
+        const byte = command.text[index];
+        if (byte == '\n') {
+            drawPowderTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            row += 1;
+            col = 0;
+            index += 1;
+            line_start = index;
+            continue;
+        }
+        if (col >= max_columns) {
+            drawPowderTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            row += 1;
+            col = 0;
+            line_start = index;
+        }
+        col += 1;
+        index += powderUtf8Advance(command.text, index);
+    }
+    drawPowderTextLineWithZgui(draw_list, font, command, line_start, command.text.len, row, line_h);
+}
+
+fn drawPowderTextLineWithZgui(
+    draw_list: zgui.DrawList,
+    font: zgui.Font,
+    command: powder.draw.Command,
+    start: usize,
+    end: usize,
+    row: usize,
+    line_h: f32,
+) void {
+    if (end <= start) return;
+    var clip_rect_storage: [4]f32 = undefined;
+    const clip_rect: ?[*]const [4]f32 = if (command.clip) |clip| blk: {
+        clip_rect_storage = .{ clip.x, clip.y, clip.x + clip.w, clip.y + clip.h };
+        break :blk @as([*]const [4]f32, @ptrCast(&clip_rect_storage));
+    } else null;
+    draw_list.addTextExtendedUnformatted(
+        .{
+            command.rect.x - command.scroll.x,
+            command.rect.y + @as(f32, @floatFromInt(row)) * line_h - command.scroll.y,
+        },
+        powderColorU32(command.color),
+        command.text[start..end],
+        .{
+            .font = font,
+            .font_size = command.font_size,
+            .cpu_fine_clip_rect = clip_rect,
+        },
+    );
+}
+
+fn clippedPowderRect(rect: powder.Rect, clip: powder.Rect) ?powder.Rect {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+fn powderColorU32(value: powder.Color) u32 {
+    return zgui.colorConvertFloat4ToU32(.{ value.r, value.g, value.b, value.a });
+}
+
+fn powderUtf8Advance(text: []const u8, index: usize) usize {
+    return std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
 }
 
 fn powderColor(value: [4]f32) powder.Color {
