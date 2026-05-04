@@ -37,8 +37,6 @@ jobs:
         with:
           path: |
             .cache/zig-global
-            .zig-cache
-            packages/desktop/.zig-cache
             ~/.cargo/registry
             ~/.cargo/git
             vendor/fff/target
