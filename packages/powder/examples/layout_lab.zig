@@ -13,7 +13,12 @@ const LABEL_FONT_SIZE: f32 = 15.0;
 const Provider = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = providerLabel });
 const Model = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = modelLabel });
 const Reasoning = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = reasoningLabel });
-const Preview = powder.image(.{ .width = 48, .height = 38, .source_width = 105, .source_height = 122, .fit = .contain, .tint = powder.Color.white });
+const InlinePreview = powder.image(.{ .width = 48, .height = 38, .source_width = 105, .source_height = 122, .fit = .contain, .tint = powder.Color.white });
+const NativeImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .none, .tint = powder.Color.white });
+const ContainImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .contain, .tint = powder.Color.white });
+const CoverImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .cover, .tint = powder.Color.white });
+const StretchImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .stretch, .tint = powder.Color.white });
+const CropImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .cover, .uv = .{ .x = 0.0, .y = 0.0, .w = 0.55, .h = 0.55 }, .tint = powder.Color.white });
 const Prompt = powder.textInput(.{ .height = 38, .placeholder_text = "Resize the window, type here, and click controls" });
 const Send = powder.button(.{ .label = "Send" });
 const Stop = powder.button(.{ .label = "Stop" });
@@ -30,7 +35,12 @@ const Controls = struct {
     provider: Provider,
     model: Model,
     reasoning: Reasoning,
-    preview: Preview,
+    preview: InlinePreview,
+    image_native: NativeImage,
+    image_contain: ContainImage,
+    image_cover: CoverImage,
+    image_stretch: StretchImage,
+    image_crop: CropImage,
     prompt: Prompt,
     send: Send,
     stop: Stop,
@@ -49,9 +59,11 @@ const LayoutRects = struct {
     content: powder.Rect,
     grid_panel: powder.Rect,
     prompt_panel: powder.Rect,
+    image_panel: powder.Rect,
     wrap_panel: powder.Rect,
     grid_content: powder.Rect,
     prompt_content: powder.Rect,
+    image_content: powder.Rect,
     wrap_content: powder.Rect,
 };
 
@@ -79,7 +91,7 @@ pub fn run() !void {
     try sdl.ttfInit();
     defer sdl.ttfQuit();
 
-    const window = try sdl.Window.create("Powder Layout Lab", 920, 520, labWindowFlags());
+    const window = try sdl.Window.create("Powder Layout Lab", 920, 680, labWindowFlags());
     defer sdl.Window.destroy(window);
     const renderer = try sdl.Renderer.create(window);
     defer sdl.Renderer.destroy(renderer);
@@ -104,7 +116,12 @@ pub fn run() !void {
         .provider = Provider.initFromConfig(),
         .model = Model.initFromConfig(),
         .reasoning = Reasoning.initFromConfig(),
-        .preview = Preview.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .preview = InlinePreview.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .image_native = NativeImage.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .image_contain = ContainImage.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .image_cover = CoverImage.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .image_stretch = StretchImage.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
+        .image_crop = CropImage.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
         .prompt = try Prompt.init(allocator, ""),
         .send = Send.init(),
         .stop = Stop.init(),
@@ -172,13 +189,14 @@ fn layoutControls(allocator: std.mem.Allocator, window: *sdl.Window, controls: *
         .padding = powder.layout.Edges.all(16),
     };
     const content = shell_box.contentRect();
-    var rows: [3]powder.Rect = undefined;
+    var rows: [4]powder.Rect = undefined;
     powder.layout.flex(
         content,
         .{ .direction = .column, .gap = 18 },
         &.{
             powder.layout.FlexItem.fixed(0, 104),
             powder.layout.FlexItem.fixed(0, 70),
+            powder.layout.FlexItem.fixed(0, 190),
             powder.layout.FlexItem{ .basis_h = 52, .grow = 1, .min_h = 52 },
         },
         &rows,
@@ -186,7 +204,8 @@ fn layoutControls(allocator: std.mem.Allocator, window: *sdl.Window, controls: *
 
     const grid_box: powder.layout.Box = .{ .rect = rows[0], .padding = powder.layout.Edges.xy(14, 32) };
     const prompt_box: powder.layout.Box = .{ .rect = rows[1], .padding = powder.layout.Edges.xy(14, 24) };
-    const wrap_box: powder.layout.Box = .{ .rect = rows[2], .padding = powder.layout.Edges.xy(14, 30) };
+    const image_box: powder.layout.Box = .{ .rect = rows[2], .padding = powder.layout.Edges.xy(14, 34) };
+    const wrap_box: powder.layout.Box = .{ .rect = rows[3], .padding = powder.layout.Edges.xy(14, 30) };
 
     try powder.layout.applyGrid(
         allocator,
@@ -232,14 +251,34 @@ fn layoutControls(allocator: std.mem.Allocator, window: *sdl.Window, controls: *
         .{ &controls.chip_a, &controls.chip_b, &controls.chip_c, &controls.chip_d, &controls.chip_e, &controls.chip_f },
     );
 
+    try powder.layout.applyGrid(
+        allocator,
+        image_box.contentRect(),
+        .{
+            .columns = &.{ .{ .px = 105 }, .{ .fr = 1 }, .{ .fr = 1 }, .{ .fr = 1 }, .{ .fr = 1 } },
+            .rows = &.{.{ .fr = 1 }},
+            .gap_x = 14,
+        },
+        .{
+            powder.layout.GridItem{ .column = 0, .row = 0 },
+            powder.layout.GridItem{ .column = 1, .row = 0 },
+            powder.layout.GridItem{ .column = 2, .row = 0 },
+            powder.layout.GridItem{ .column = 3, .row = 0 },
+            powder.layout.GridItem{ .column = 4, .row = 0 },
+        },
+        .{ &controls.image_native, &controls.image_contain, &controls.image_cover, &controls.image_stretch, &controls.image_crop },
+    );
+
     return .{
         .shell = shell_box.bounds(),
         .content = content,
         .grid_panel = rows[0],
         .prompt_panel = rows[1],
-        .wrap_panel = rows[2],
+        .image_panel = rows[2],
+        .wrap_panel = rows[3],
         .grid_content = grid_box.contentRect(),
         .prompt_content = prompt_box.contentRect(),
+        .image_content = image_box.contentRect(),
         .wrap_content = wrap_box.contentRect(),
     };
 }
@@ -265,9 +304,11 @@ fn renderLabChrome(allocator: std.mem.Allocator, batch: *powder.RenderBatch, rec
     try batch.rect(allocator, rects.shell, .{ .r = 0.06, .g = 0.07, .b = 0.09, .a = 1.0 });
     try batch.rect(allocator, rects.grid_panel, .{ .r = 0.10, .g = 0.12, .b = 0.15, .a = 1.0 });
     try batch.rect(allocator, rects.prompt_panel, .{ .r = 0.08, .g = 0.11, .b = 0.12, .a = 1.0 });
+    try batch.rect(allocator, rects.image_panel, .{ .r = 0.10, .g = 0.09, .b = 0.13, .a = 1.0 });
     try batch.rect(allocator, rects.wrap_panel, .{ .r = 0.09, .g = 0.09, .b = 0.12, .a = 1.0 });
     try batch.rect(allocator, rects.grid_content, .{ .r = 0.13, .g = 0.15, .b = 0.19, .a = 0.42 });
     try batch.rect(allocator, rects.prompt_content, .{ .r = 0.11, .g = 0.16, .b = 0.15, .a = 0.40 });
+    try batch.rect(allocator, rects.image_content, .{ .r = 0.15, .g = 0.12, .b = 0.18, .a = 0.42 });
     try batch.rect(allocator, rects.wrap_content, .{ .r = 0.13, .g = 0.12, .b = 0.17, .a = 0.42 });
 }
 
@@ -276,6 +317,11 @@ fn renderControls(allocator: std.mem.Allocator, batch: *powder.RenderBatch, cont
     try controls.model.render(allocator, batch);
     try controls.reasoning.render(allocator, batch);
     try controls.preview.render(allocator, batch);
+    try controls.image_native.render(allocator, batch);
+    try controls.image_contain.render(allocator, batch);
+    try controls.image_cover.render(allocator, batch);
+    try controls.image_stretch.render(allocator, batch);
+    try controls.image_crop.render(allocator, batch);
     try controls.fast.render(allocator, batch);
     try controls.access.render(allocator, batch);
     try controls.prompt.render(allocator, batch);
@@ -294,6 +340,7 @@ fn drawOutlines(renderer: *sdl.Renderer, rects: LayoutRects) !void {
     try outline(renderer, rects.content, .{ 86, 152, 244, 255 });
     try outline(renderer, rects.grid_content, .{ 76, 175, 124, 255 });
     try outline(renderer, rects.prompt_content, .{ 76, 175, 124, 255 });
+    try outline(renderer, rects.image_content, .{ 76, 175, 124, 255 });
     try outline(renderer, rects.wrap_content, .{ 76, 175, 124, 255 });
 }
 
@@ -309,6 +356,12 @@ fn drawLabels(presenter: *powder.renderer.SdlFontRenderer, rects: LayoutRects, s
     try label(presenter, rects.shell.x + 12, rects.shell.y + 10, "Powder Layout Lab", .{ 235, 241, 248, 255 });
     try label(presenter, rects.grid_panel.x + 14, rects.grid_panel.y + 9, "Grid: 3 fractional columns + 2 fixed columns", .{ 166, 180, 198, 255 });
     try label(presenter, rects.prompt_panel.x + 14, rects.prompt_panel.y + 7, "Flex row: prompt grows, buttons stay fixed", .{ 166, 180, 198, 255 });
+    try label(presenter, rects.image_panel.x + 14, rects.image_panel.y + 9, "Images: native 105x122, contain, cover, stretch, cropped UV", .{ 166, 180, 198, 255 });
+    try imageCaption(presenter, controls.image_native.bounds(), rects.image_content, "native");
+    try imageCaption(presenter, controls.image_contain.bounds(), rects.image_content, "contain");
+    try imageCaption(presenter, controls.image_cover.bounds(), rects.image_content, "cover");
+    try imageCaption(presenter, controls.image_stretch.bounds(), rects.image_content, "stretch");
+    try imageCaption(presenter, controls.image_crop.bounds(), rects.image_content, "uv crop");
     try label(presenter, rects.wrap_panel.x + 14, rects.wrap_panel.y + 9, "Flex wrap: resize narrower to force chips onto new rows", .{ 166, 180, 198, 255 });
     try label(presenter, rects.shell.x + 16, rects.shell.y + rects.shell.h - 24, "orange=shell margin box  blue=content  green=padded content", .{ 166, 180, 198, 255 });
 
@@ -327,6 +380,10 @@ fn drawLabels(presenter: *powder.renderer.SdlFontRenderer, rects: LayoutRects, s
 
 fn label(presenter: *powder.renderer.SdlFontRenderer, x: f32, y: f32, text: []const u8, color: [4]u8) !void {
     try presenter.renderLine(x, y, text, colorFromBytes(color), LABEL_FONT_SIZE);
+}
+
+fn imageCaption(presenter: *powder.renderer.SdlFontRenderer, bounds: powder.Rect, content: powder.Rect, text: []const u8) !void {
+    try label(presenter, bounds.x + 6, content.y + content.h + 6, text, .{ 214, 226, 242, 255 });
 }
 
 fn colorFromBytes(color: [4]u8) powder.Color {
