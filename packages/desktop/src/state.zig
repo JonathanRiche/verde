@@ -1029,6 +1029,7 @@ pub const AppState = struct {
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
+    pending_send_count: usize,
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
@@ -1123,6 +1124,7 @@ pub const AppState = struct {
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
+            .pending_send_count = 0,
         };
 
         if (try storage.load(allocator)) |persisted_value| {
@@ -2052,7 +2054,6 @@ pub const AppState = struct {
     }
 
     fn beginSendForThread(self: *AppState, project_path: []const u8, thread: *ChatThread, prompt: []const u8) !void {
-        _ = self;
         const page_alloc = std.heap.page_allocator;
 
         const request = try page_alloc.create(SendWorkerRequest);
@@ -2104,7 +2105,13 @@ pub const AppState = struct {
         send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
         send_state.stop_signal_sent = false;
-        send_state.worker = try std.Thread.spawn(.{}, sendWorker, .{ send_state, request });
+        send_state.worker = std.Thread.spawn(.{}, sendWorker, .{ send_state, request }) catch |err| {
+            send_state.status = .idle;
+            send_state.started_at_ms = 0;
+            send_state.provider = null;
+            return err;
+        };
+        self.pending_send_count += 1;
     }
 
     fn beginSendDraft(self: *AppState, prompt: []const u8) !void {
@@ -3290,6 +3297,7 @@ pub const AppState = struct {
 
     pub fn pollTerminals(self: *AppState) void {
         for (self.projects.items, 0..) |*project, project_index| {
+            if (!project.terminal_dock.visible and !project.terminal_dock.hasRunningSession()) continue;
             project.terminal_dock.poll(self.allocator) catch |err| {
                 log.err("failed to poll terminal session: {s}", .{@errorName(err)});
                 if (project_index == self.selected_project_index and project.terminal_dock.visible) {
@@ -3298,6 +3306,7 @@ pub const AppState = struct {
             };
         }
         for (self.archived_projects.items) |*project| {
+            if (!project.terminal_dock.visible and !project.terminal_dock.hasRunningSession()) continue;
             project.terminal_dock.poll(self.allocator) catch |err| {
                 log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
             };
@@ -3592,6 +3601,8 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
+
         if (self.browser_launch_open_delay_frames > 0) {
             self.browser_launch_open_delay_frames -= 1;
             if (self.browser_launch_open_delay_frames == 0) {
@@ -4476,6 +4487,8 @@ pub const AppState = struct {
     }
 
     pub fn pollSend(self: *AppState) void {
+        if (self.pending_send_count == 0) return;
+
         for (self.projects.items, 0..) |*project, project_index| {
             for (project.threads.items, 0..) |*thread, thread_index| {
                 self.pollThreadSend(project_index, thread_index, thread);
@@ -4571,6 +4584,7 @@ pub const AppState = struct {
         send_state.mutex.unlock();
 
         if (next_status != .idle) {
+            if (self.pending_send_count > 0) self.pending_send_count -= 1;
             thread.finishSendThread();
         }
 
