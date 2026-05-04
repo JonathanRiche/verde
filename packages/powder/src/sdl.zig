@@ -1,6 +1,7 @@
 //! Minimal SDL3 declarations used by powder examples and component input.
 
 const std = @import("std");
+const image_loader = @import("image_loader.zig");
 
 pub const Error = error{SdlError};
 
@@ -355,6 +356,16 @@ pub fn createTextureFromSurface(renderer: *Renderer, surface: *Surface) Error!*T
 
 pub fn createSurfaceFrom(width: i32, height: i32, format: PixelFormat, pixels: [*]u8, pitch: i32) Error!*Surface {
     return SDL_CreateSurfaceFrom(width, height, @intFromEnum(format), pixels, pitch) orelse error.SdlError;
+}
+
+pub fn createSurfaceFromImage(image: image_loader.LoadedImage) Error!*Surface {
+    return createSurfaceFrom(image.width, image.height, .rgba32, image.pixels, image.pitch());
+}
+
+pub fn createTextureFromImage(renderer: *Renderer, image: image_loader.LoadedImage) Error!*Texture {
+    const surface = try createSurfaceFromImage(image);
+    defer destroySurface(surface);
+    return createTextureFromSurface(renderer, surface);
 }
 
 pub const destroyTexture = SDL_DestroyTexture;

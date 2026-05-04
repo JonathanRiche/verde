@@ -289,6 +289,33 @@ Fit modes:
 - `.cover`: preserve aspect ratio and cover the bounds
 - `.none`: draw at source size, clipped to the bounds
 
+Powder also ships a reusable image decoder backed by bundled `stb_image` files
+under `packages/powder/vendor`. It supports PNG, JPEG, BMP, and GIF as compiled
+by `vendor/stb_image_impl.c`.
+
+```zig
+const loaded = try powder.ImageLoader.load("assets/avatar.png");
+defer loaded.deinit();
+
+const texture = try powder.sdl.createTextureFromImage(renderer, loaded);
+defer powder.sdl.destroyTexture(texture);
+```
+
+If your executable uses `powder.ImageLoader`, link the bundled decoder from your
+`build.zig`:
+
+```zig
+const powder_dep = b.dependency("powder", .{ .target = target, .optimize = optimize });
+const powder_mod = powder_dep.module("powder");
+exe.root_module.addImport("powder", powder_mod);
+
+const powder_build = @import("path/to/packages/powder/build.zig");
+powder_build.linkImageLoader(powder_dep, exe.root_module);
+```
+
+The retained UI API does not depend on a specific decoder. Apps can still load
+textures through another pipeline and only hand Powder a `TextureId`.
+
 For SDL presenter examples, provide a texture lookup callback:
 
 ```zig

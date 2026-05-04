@@ -7,5 +7,6 @@
         "build.zig.zon",
         "examples",
         "src",
+        "vendor",
     },
 }
