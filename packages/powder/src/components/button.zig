@@ -439,7 +439,7 @@ test "icon button renders shell and icon" {
     try button.render(std.testing.allocator, &batch);
 
     try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
-    try std.testing.expectEqual(draw.CommandKind.glyph, batch.commands.items[5].kind);
+    try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[5].kind);
     try std.testing.expectEqual(@as(f32, 7.0), batch.commands.items[5].rect.x);
     try std.testing.expectEqual(@as(f32, 10.0), batch.commands.items[5].rect.w);
 }
