@@ -92,6 +92,10 @@ pub const Surface = extern struct {
     reserved: ?*anyopaque,
 };
 
+pub const PixelFormat = enum(u32) {
+    rgba8888 = 0x16462004,
+};
+
 pub const FRect = extern struct {
     x: f32,
     y: f32,
@@ -347,6 +351,10 @@ pub fn createTextureFromSurface(renderer: *Renderer, surface: *Surface) Error!*T
     return SDL_CreateTextureFromSurface(renderer, surface) orelse error.SdlError;
 }
 
+pub fn createSurfaceFrom(width: i32, height: i32, format: PixelFormat, pixels: [*]u8, pitch: i32) Error!*Surface {
+    return SDL_CreateSurfaceFrom(width, height, @intFromEnum(format), pixels, pitch) orelse error.SdlError;
+}
+
 pub const destroyTexture = SDL_DestroyTexture;
 pub const destroySurface = SDL_DestroySurface;
 
@@ -415,6 +423,7 @@ extern fn SDL_RenderFillRect(renderer: *Renderer, rect: *const FRect) bool;
 extern fn SDL_SetRenderClipRect(renderer: *Renderer, rect: ?*const Rect) bool;
 extern fn SDL_RenderDebugText(renderer: *Renderer, x: f32, y: f32, str: [*:0]const u8) bool;
 extern fn SDL_CreateTextureFromSurface(renderer: *Renderer, surface: *Surface) ?*Texture;
+extern fn SDL_CreateSurfaceFrom(width: c_int, height: c_int, format: u32, pixels: *anyopaque, pitch: c_int) ?*Surface;
 extern fn SDL_DestroyTexture(texture: *Texture) void;
 extern fn SDL_DestroySurface(surface: *Surface) void;
 extern fn SDL_RenderTexture(renderer: *Renderer, texture: *Texture, srcrect: ?*const FRect, dstrect: *const FRect) bool;

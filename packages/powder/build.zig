@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = "examples/layout_lab_main.zig",
         .linux_root_source_file = "examples/layout_lab.zig",
         .linux_c_source_file = "examples/linux_layout_lab_main.c",
+        .extra_c_source_file = "../../vendor/stb_image_impl.c",
+        .extra_include_path = "../../vendor",
         .target = target,
         .optimize = optimize,
         .powder_mod = powder_mod,
@@ -145,6 +147,8 @@ const ExampleOptions = struct {
     root_source_file: []const u8,
     linux_root_source_file: []const u8,
     linux_c_source_file: []const u8,
+    extra_c_source_file: ?[]const u8 = null,
+    extra_include_path: ?[]const u8 = null,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     powder_mod: *std.Build.Module,
@@ -181,6 +185,11 @@ fn addExample(b: *std.Build, options: ExampleOptions) Example {
         }),
     });
     linkSdl(exe.root_module, options.target.result.os.tag);
+    if (options.extra_include_path) |include_path| exe.root_module.addIncludePath(b.path(include_path));
+    if (options.extra_c_source_file) |c_source| {
+        exe.root_module.addCSourceFile(.{ .file = b.path(c_source), .flags = &.{} });
+        exe.root_module.link_libc = true;
+    }
     return .{
         .artifact = exe,
         .step = &exe.step,
@@ -268,15 +277,21 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         "-Mpowder=src/root.zig",
         b.fmt("-femit-bin={s}", .{object_path}),
     });
+    if (options.extra_include_path) |include_path| build_obj.addArg(b.fmt("-I{s}", .{include_path}));
+    if (options.extra_c_source_file != null) build_obj.addArg("-lc");
     build_obj.step.dependOn(&mkdir.step);
 
-    const link = b.addSystemCommand(&.{
+    var link = b.addSystemCommand(&.{
         "cc",
         "-no-pie",
         object_path,
         options.linux_c_source_file,
+    });
+    if (options.extra_c_source_file) |c_source| link.addArg(c_source);
+    link.addArgs(&.{
         "-lSDL3",
         "-lSDL3_ttf",
+        "-lm",
         "-lc",
         "-o",
         output_path,

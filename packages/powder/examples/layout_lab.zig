@@ -4,14 +4,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const powder = @import("powder");
 const sdl = powder.sdl;
+const stb_image = @import("stb_image.zig");
 
 const CAL_SANS_PATH = "../desktop/src/assets/fonts/CalSans-Regular.ttf";
+const PREVIEW_IMAGE_PATH = "../desktop/src/assets/verde_logo.png";
 const LABEL_FONT_SIZE: f32 = 15.0;
 
 const Provider = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = providerLabel });
 const Model = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = modelLabel });
 const Reasoning = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = reasoningLabel });
-const Preview = powder.image(.{ .width = 48, .height = 38, .source_width = 1, .source_height = 1, .fit = .cover, .tint = powder.Color.white });
+const Preview = powder.image(.{ .width = 48, .height = 38, .source_width = 105, .source_height = 122, .fit = .contain, .tint = powder.Color.white });
 const Prompt = powder.textInput(.{ .height = 38, .placeholder_text = "Resize the window, type here, and click controls" });
 const Send = powder.button(.{ .label = "Send" });
 const Stop = powder.button(.{ .label = "Stop" });
@@ -84,11 +86,13 @@ pub fn run() !void {
     try sdl.setRenderDrawBlendMode(renderer, .blend);
     const font = try sdl.ttfOpenFont(CAL_SANS_PATH, LABEL_FONT_SIZE);
     defer sdl.ttfCloseFont(font);
-    const preview_surface = try sdl.ttfRenderTextBlended(font, "IMG", .{ .r = 245, .g = 248, .b = 252, .a = 255 });
-    const preview_w: f32 = @floatFromInt(preview_surface.w);
-    const preview_h: f32 = @floatFromInt(preview_surface.h);
+    const preview_image = try stb_image.load(PREVIEW_IMAGE_PATH);
+    defer preview_image.deinit();
+    const preview_w: f32 = @floatFromInt(preview_image.width);
+    const preview_h: f32 = @floatFromInt(preview_image.height);
+    const preview_surface = try sdl.createSurfaceFrom(preview_image.width, preview_image.height, .rgba8888, preview_image.pixels, preview_image.width * 4);
+    defer sdl.destroySurface(preview_surface);
     const preview_texture = try sdl.createTextureFromSurface(renderer, preview_surface);
-    sdl.destroySurface(preview_surface);
     defer sdl.destroyTexture(preview_texture);
     var texture_store: TextureStore = .{ .texture = preview_texture, .width = preview_w, .height = preview_h };
 
