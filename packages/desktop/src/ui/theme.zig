@@ -109,7 +109,7 @@ fn mergeIconFont(font_bytes: []const u8, font_size: f32, ranges: []const zgui.Wc
 
 fn installTerminalFont(nerd_font_bytes: []const u8, font_size: f32) ?zgui.Font {
     for (terminalFontCandidates()) |path| {
-        std.fs.accessAbsolute(path, .{}) catch continue;
+        if (std.c.access(path.ptr, std.c.F_OK) != 0) continue;
         var config = zgui.FontConfig.init();
         config.pixel_snap_h = true;
         const font = zgui.io.addFontFromFileWithConfig(

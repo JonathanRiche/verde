@@ -1,9 +1,12 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
 const process_env = @import("process_env.zig");
+const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const chat_threads = @import("chat/threads.zig");
 const std = @import("std");
+
+const log = std.log.scoped(.native_utils);
 
 const GL_TEXTURE_2D = 0x0DE1;
 const GL_RGBA = 0x1908;
@@ -25,7 +28,7 @@ pub const PERSISTED_DIFF_MARKER = "EDITORTS_DIFF_V1\n";
 extern fn verde_macos_clipboard_copy_image(out_bytes: *?[*]u8, out_len: *usize, out_mime: *?[*:0]const u8) c_int;
 extern fn free(ptr: ?*anyopaque) void;
 
-pub const PickDirectoryError = std.process.Child.RunError || std.mem.Allocator.Error || error{
+pub const PickDirectoryError = std.process.RunError || std.mem.Allocator.Error || error{
     UnsupportedOperatingSystem,
     FolderPickerUnavailable,
     UserCancelled,
@@ -35,7 +38,7 @@ pub const PickDirectoryError = std.process.Child.RunError || std.mem.Allocator.E
 pub const OpenProjectError = std.mem.Allocator.Error || error{
     UnsupportedOperatingSystem,
     LauncherUnavailable,
-} || std.process.Child.SpawnError;
+} || std.process.SpawnError;
 
 pub const OpenFileResult = enum {
     editor,
@@ -228,11 +231,7 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
     );
     defer allocator.free(script);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "osascript", "-e", script },
-        .max_output_bytes = 16 * 1024,
-    }) catch |err| switch (err) {
+    const result = runChild(allocator, &.{ "osascript", "-e", script }, null, 16 * 1024) catch |err| switch (err) {
         error.FileNotFound => return error.FolderPickerUnavailable,
         else => return err,
     };
@@ -240,7 +239,7 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 if (std.mem.indexOf(u8, result.stderr, "User cancelled") != null or
                     std.mem.indexOf(u8, result.stderr, "(-128)") != null)
@@ -341,11 +340,7 @@ fn runDirectoryPickerCommand(
     argv: []const []const u8,
     unavailable_exit_code: ?u8,
 ) PickDirectoryError![]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 16 * 1024,
-    }) catch |err| switch (err) {
+    const result = runChild(allocator, argv, null, 16 * 1024) catch |err| switch (err) {
         error.FileNotFound => return error.FolderPickerUnavailable,
         else => return err,
     };
@@ -353,7 +348,7 @@ fn runDirectoryPickerCommand(
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code == 1) return error.UserCancelled;
             if (unavailable_exit_code) |expected| {
                 if (code == expected) return error.FolderPickerUnavailable;
@@ -380,6 +375,27 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.destroy(request);
     }
 
+    std.debug.print(
+        "[codex-debug] sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}\n",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
+    runtime_log.diagnostic(
+        "sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
+
     const result = runSendWorker(page_alloc, request);
 
     state.mutex.lock();
@@ -398,6 +414,26 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         state.error_message = null;
         state.status = .completed;
     } else |err| {
+        std.debug.print(
+            "[codex-debug] sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        runtime_log.diagnostic(
+            "sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
         if (err == error.CodexTurnInterrupted and state.stop_requested) {
             state.error_message = null;
             state.result = null;
@@ -448,10 +484,23 @@ pub fn runSendWorker(
         },
     };
 
+    log.info(
+        "send worker starting provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        .{
+            @tagName(request.provider),
+            request.project_path,
+            request.model_ref orelse "(default)",
+            request.provider_thread_id orelse "(new)",
+            request.prompt.len,
+        },
+    );
+
     var client = try ai_harness.connect(allocator, provider_config);
     defer client.deinit();
+    std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
+    runtime_log.diagnostic("send worker connected provider={s}", .{@tagName(request.provider)});
 
-    const result = try client.sendPrompt(allocator, .{
+    const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
         .thread_title = request.thread_title,
         .prompt = request.prompt,
@@ -468,7 +517,44 @@ pub fn runSendWorker(
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
         .on_approval_request = handleSendApprovalRequest,
-    });
+    }) catch |err| {
+        std.debug.print(
+            "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}\n",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        runtime_log.diagnostic(
+            "client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        log.err(
+            "send worker failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
+            .{
+                @tagName(request.provider),
+                request.project_path,
+                request.model_ref orelse "(default)",
+                request.provider_thread_id orelse "(new)",
+                @errorName(err),
+            },
+        );
+        return err;
+    };
+
+    log.info(
+        "send worker completed provider={s} provider_thread_id={s} reply_len={d}",
+        .{ @tagName(request.provider), result.thread_id, result.reply_text.len },
+    );
 
     return .{
         .provider_thread_id = result.thread_id,
@@ -497,13 +583,33 @@ fn spawnDetached(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     cwd: ?[]const u8,
-) std.process.Child.SpawnError!void {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.cwd = cwd;
-    try child.spawn();
+) std.process.SpawnError!void {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const child = try std.process.spawn(threaded.io(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+    });
+    _ = child;
+}
+
+fn runChild(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    max_output_bytes: usize,
+) !std.process.RunResult {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    return std.process.run(allocator, threaded.io(), .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
 }
 
 const PreferredEditorEnv = struct {
@@ -512,15 +618,15 @@ const PreferredEditorEnv = struct {
 };
 
 fn preferredEditorEnv() ?PreferredEditorEnv {
-    const visual = std.posix.getenv("VISUAL");
+    const visual = std.c.getenv("VISUAL");
     if (visual) |value| {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), &std.ascii.whitespace);
         if (trimmed.len > 0) return .{ .name = "VISUAL", .value = trimmed };
     }
 
-    const editor = std.posix.getenv("EDITOR");
+    const editor = std.c.getenv("EDITOR");
     if (editor) |value| {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        const trimmed = std.mem.trim(u8, std.mem.sliceTo(value, 0), &std.ascii.whitespace);
         if (trimmed.len > 0) return .{ .name = "EDITOR", .value = trimmed };
     }
     return null;
@@ -646,8 +752,8 @@ const LinuxTerminalLauncher = enum {
 };
 
 fn preferredLinuxTerminalLauncher() ?LinuxTerminalLauncher {
-    if (std.posix.getenv("TERMINAL")) |terminal| {
-        if (linuxTerminalLauncherForCommand(commandExecutableName(terminal))) |launcher| return launcher;
+    if (std.c.getenv("TERMINAL")) |terminal| {
+        if (linuxTerminalLauncherForCommand(commandExecutableName(std.mem.sliceTo(terminal, 0)))) |launcher| return launcher;
     }
 
     if (commandExists("xdg-terminal-exec")) return .xdg_terminal_exec;
@@ -824,7 +930,7 @@ fn macApplicationExists(app_name: []const u8) bool {
     defer std.heap.page_allocator.free(system_path);
     if (directoryExistsAbsolute(system_path)) return true;
 
-    const home = std.posix.getenv("HOME") orelse return false;
+    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return false, 0);
     const user_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/Applications/{s}.app", .{ home, app_name }) catch return false;
     defer std.heap.page_allocator.free(user_path);
     return directoryExistsAbsolute(user_path);
@@ -914,7 +1020,11 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
         send_state.provisional_provider_thread_id = null;
     }
 
-    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch null;
+    send_state.provisional_provider_thread_id = page_alloc.dupe(u8, thread_id) catch |err| {
+        std.debug.print("[codex-debug] failed to store provisional thread id len={d}: {s}\n", .{ thread_id.len, @errorName(err) });
+        runtime_log.diagnostic("failed to store provisional thread id len={d}: {s}", .{ thread_id.len, @errorName(err) });
+        return;
+    };
 }
 fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -930,7 +1040,11 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
         send_state.active_turn_id = null;
     }
 
-    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch null;
+    send_state.active_turn_id = page_alloc.dupe(u8, turn_id) catch |err| {
+        std.debug.print("[codex-debug] failed to store active turn id len={d}: {s}\n", .{ turn_id.len, @errorName(err) });
+        runtime_log.diagnostic("failed to store active turn id len={d}: {s}", .{ turn_id.len, @errorName(err) });
+        return;
+    };
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -939,7 +1053,17 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return;
-    send_state.partial_text.appendSlice(page_alloc, delta) catch return;
+    send_state.partial_text.appendSlice(page_alloc, delta) catch |err| {
+        std.debug.print(
+            "[codex-debug] failed to append stream delta delta_len={d} partial_len={d}: {s}\n",
+            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
+        );
+        runtime_log.diagnostic(
+            "failed to append stream delta delta_len={d} partial_len={d}: {s}",
+            .{ delta.len, send_state.partial_text.items.len, @errorName(err) },
+        );
+        return;
+    };
 }
 fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1149,12 +1273,14 @@ pub fn appendPendingDiffSummaryEvent(
 
     for (files) |file| {
         const patch = file.patch orelse "";
-        std.fmt.format(body_builder.writer(allocator), "FILE\t{s}\t{d}\t{d}\t{d}\n", .{
+        const header = std.fmt.allocPrint(allocator, "FILE\t{s}\t{d}\t{d}\t{d}\n", .{
             file.path,
             file.additions,
             file.deletions,
             patch.len,
         }) catch return;
+        defer allocator.free(header);
+        body_builder.appendSlice(allocator, header) catch return;
         body_builder.appendSlice(allocator, patch) catch return;
         body_builder.append(allocator, '\n') catch return;
     }
@@ -1281,19 +1407,14 @@ fn readMacClipboardImageFlavor(
     const command = try std.fmt.allocPrint(allocator, "get the clipboard as «class {s}»", .{class_code});
     defer allocator.free(command);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "osascript", "-e", command },
-        .cwd = ".",
-        .max_output_bytes = CLIPBOARD_IMAGE_MAX_BYTES * 4,
-    }) catch |err| switch (err) {
+    const result = runChild(allocator, &.{ "osascript", "-e", command }, ".", CLIPBOARD_IMAGE_MAX_BYTES * 4) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(result.stdout);
             return null;
         },
@@ -1359,12 +1480,13 @@ fn convertClipboardTiffToPng(
 
     const temp_dir = std.fs.path.join(allocator, &.{ "/tmp", "editorts-native-clipboard" }) catch return error.OutOfMemory;
     defer allocator.free(temp_dir);
-    std.fs.makeDirAbsolute(temp_dir) catch |err| switch (err) {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    std.Io.Dir.createDirAbsolute(threaded.io(), temp_dir, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), std.time.milliTimestamp())));
+    const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), 0)));
     const input_path = try std.fmt.allocPrint(allocator, "{s}/clipboard-{d}.tiff", .{ temp_dir, timestamp_ms });
     defer allocator.free(input_path);
     const output_path = try std.fmt.allocPrint(allocator, "{s}/clipboard-{d}.png", .{ temp_dir, timestamp_ms });
@@ -1376,12 +1498,7 @@ fn convertClipboardTiffToPng(
         try file.writeAll(capture.bytes);
     }
 
-    const convert_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "sips", "-s", "format", "png", input_path, "--out", output_path },
-        .cwd = ".",
-        .max_output_bytes = 16 * 1024,
-    }) catch |err| switch (err) {
+    const convert_result = runChild(allocator, &.{ "sips", "-s", "format", "png", input_path, "--out", output_path }, ".", 16 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -1389,7 +1506,7 @@ fn convertClipboardTiffToPng(
     defer allocator.free(convert_result.stderr);
 
     switch (convert_result.term) {
-        .Exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
@@ -1398,8 +1515,8 @@ fn convertClipboardTiffToPng(
         defer png_file.close();
         break :png_bytes try png_file.readToEndAlloc(allocator, CLIPBOARD_IMAGE_MAX_BYTES);
     };
-    std.fs.deleteFileAbsolute(input_path) catch {};
-    std.fs.deleteFileAbsolute(output_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(threaded.io(), input_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};
 
     return .{
         .bytes = png_bytes,
@@ -1408,11 +1525,12 @@ fn convertClipboardTiffToPng(
 }
 
 fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCapture {
-    const types_result = std.process.Child.run(.{
-        .allocator = allocator,
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const types_result = std.process.run(allocator, threaded.io(), .{
         .argv = &.{ "wl-paste", "--list-types" },
-        .cwd = ".",
-        .max_output_bytes = 16 * 1024,
+        .cwd = .{ .path = "." },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
     }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -1421,24 +1539,19 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
     defer allocator.free(types_result.stderr);
 
     switch (types_result.term) {
-        .Exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
     const mime = selectClipboardImageMime(types_result.stdout) orelse return null;
-    const image_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "wl-paste", "--no-newline", "--type", mime },
-        .cwd = ".",
-        .max_output_bytes = CLIPBOARD_IMAGE_MAX_BYTES,
-    }) catch |err| switch (err) {
+    const image_result = runChild(allocator, &.{ "wl-paste", "--no-newline", "--type", mime }, ".", CLIPBOARD_IMAGE_MAX_BYTES) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer allocator.free(image_result.stderr);
 
     switch (image_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(image_result.stdout);
             return null;
         },
@@ -1460,12 +1573,7 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
 }
 
 pub fn captureClipboardImageX11(allocator: std.mem.Allocator) !?ClipboardImageCapture {
-    const targets_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o" },
-        .cwd = ".",
-        .max_output_bytes = 16 * 1024,
-    }) catch |err| switch (err) {
+    const targets_result = runChild(allocator, &.{ "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o" }, ".", 16 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -1473,24 +1581,19 @@ pub fn captureClipboardImageX11(allocator: std.mem.Allocator) !?ClipboardImageCa
     defer allocator.free(targets_result.stderr);
 
     switch (targets_result.term) {
-        .Exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
     const mime = selectClipboardImageMime(targets_result.stdout) orelse return null;
-    const image_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "xclip", "-selection", "clipboard", "-t", mime, "-o" },
-        .cwd = ".",
-        .max_output_bytes = CLIPBOARD_IMAGE_MAX_BYTES,
-    }) catch |err| switch (err) {
+    const image_result = runChild(allocator, &.{ "xclip", "-selection", "clipboard", "-t", mime, "-o" }, ".", CLIPBOARD_IMAGE_MAX_BYTES) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer allocator.free(image_result.stderr);
 
     switch (image_result.term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(image_result.stdout);
             return null;
         },

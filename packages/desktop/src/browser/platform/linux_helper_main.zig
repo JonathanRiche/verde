@@ -22,8 +22,20 @@ extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, pa
 extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, width: *c_int, height: *c_int, byte_len: *usize) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
 const CommandQueue = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     items: std.ArrayList(ipc.Command) = .empty,
     closed: bool = false,
 
@@ -102,7 +114,7 @@ pub fn main() !void {
         if (queue.isDrained()) {
             std.process.exit(0);
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.atomic.spinLoopHint();
     }
 }
 
@@ -115,7 +127,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
         if (maybe_line == null) break;
-        const line = std.mem.trimRight(u8, maybe_line.?, "\r");
+        const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
         if (line.len == 0) continue;
 
         var parsed = try std.json.parseFromSlice(ipc.Command, context.allocator, line, .{ .allocate = .alloc_always });

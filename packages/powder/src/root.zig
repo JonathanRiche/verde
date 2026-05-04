@@ -15,8 +15,14 @@ pub const RenderBatch = draw.RenderBatch;
 pub const Renderer = renderer.Renderer;
 pub const FontAtlas = atlas.FontAtlas;
 pub const Text = text_component.Text;
+pub const TextCallbacks = text_component.TextCallbacks;
+pub const TextEvent = text_component.TextEvent;
 pub const TextArea = text_area_component.TextArea;
+pub const TextAreaAction = text_area_component.TextAreaAction;
+pub const TextAreaCallbacks = text_area_component.TextAreaCallbacks;
 pub const TextAreaConfig = text_area_component.TextAreaConfig;
+pub const TextAreaEvent = text_area_component.TextAreaEvent;
+pub const TextAreaKey = text_area_component.Key;
 
 /// Creates a retained text label type with comptime styling.
 pub fn text(comptime config: text_component.TextConfig) type {

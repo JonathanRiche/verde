@@ -10,6 +10,7 @@ const app_config = @import("config.zig");
 const browser_runtime = @import("browser/mod.zig");
 const chat_threads = @import("chat/threads.zig");
 const keybinds = @import("keybinds.zig");
+const profiler = @import("profiler.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
@@ -23,8 +24,13 @@ const Storage = native_state.Storage;
 
 const log = native_state.log;
 
+extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
+extern fn SDL_TextInputActive(window: *sdl.Window) bool;
+
 pub const std_options: std.Options = .{
     .enable_segfault_handler = true,
+    .logFn = runtime_log.logFn,
 };
 
 pub const panic = std.debug.FullPanic(runtime_log.panicFn);
@@ -58,10 +64,15 @@ const WindowFrame = struct {
     h: c_int,
 };
 
-pub fn main() !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    }
+    const allocator = if (builtin.mode == .Debug)
+        debug_allocator.allocator()
+    else
+        std.heap.smp_allocator;
 
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
@@ -69,7 +80,7 @@ pub fn main() !void {
 
     var storage = try Storage.init(allocator);
     defer storage.deinit();
-    runtime_log.init(storage.pref_path) catch |err| {
+    runtime_log.init(init.io, storage.pref_path) catch |err| {
         log.warn("failed to initialize runtime logging: {s}", .{@errorName(err)});
     };
     if (runtime_log.stderrLogPath()) |path| {
@@ -145,42 +156,96 @@ pub fn main() !void {
     var running = true;
     var needs_render = true;
     while (running) {
+        var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
         var had_event = false;
-        running = processEvents(window, &state, &keyboard, &had_event);
-        state.pollPicker();
-        state.pollOpencodeModelOptionsCache();
-        state.pollSend();
-        state.pollBrowser();
-        state.pollTerminals();
+        var event_wait_ns: u64 = 0;
+        running = processEvents(window, &state, &keyboard, &had_event, &frame_sample, &event_wait_ns);
+        frame_sample.waited_ns = event_wait_ns;
+        recordSpan(&frame_sample, .poll_picker, struct {
+            fn run(app_state: *AppState) void {
+                app_state.pollPicker();
+            }
+        }.run, .{&state});
+        recordSpan(&frame_sample, .poll_models, struct {
+            fn run(app_state: *AppState) void {
+                app_state.pollOpencodeModelOptionsCache();
+            }
+        }.run, .{&state});
+        recordSpan(&frame_sample, .poll_send, struct {
+            fn run(app_state: *AppState) void {
+                app_state.pollSend();
+            }
+        }.run, .{&state});
+        recordSpan(&frame_sample, .poll_browser, struct {
+            fn run(app_state: *AppState) void {
+                app_state.pollBrowser();
+            }
+        }.run, .{&state});
+        recordSpan(&frame_sample, .poll_terminals, struct {
+            fn run(app_state: *AppState) void {
+                app_state.pollTerminals();
+            }
+        }.run, .{&state});
 
         needs_render = needs_render or had_event or appNeedsContinuousFrames(&state);
         if (!needs_render) {
+            profiler.recordFrame(frame_sample);
             continue;
         }
         needs_render = false;
 
         var fb_width: c_int = 0;
         var fb_height: c_int = 0;
-        getWindowSizeInPixels(window, &fb_width, &fb_height);
+        recordSpan(&frame_sample, .render_setup, struct {
+            fn run(
+                app_window: *sdl.Window,
+                framebuffer_width: *c_int,
+                framebuffer_height: *c_int,
+                current_scale: *f32,
+            ) void {
+                getWindowSizeInPixels(app_window, framebuffer_width, framebuffer_height);
 
-        const next_ui_scale = currentWindowDisplayScale(window);
-        if (@abs(next_ui_scale - ui_scale) > 0.01) {
-            ui_scale = next_ui_scale;
-            ui_theme.applyTheme(ui_scale);
-        }
+                const next_ui_scale = currentWindowDisplayScale(app_window);
+                if (@abs(next_ui_scale - current_scale.*) > 0.01) {
+                    current_scale.* = next_ui_scale;
+                    ui_theme.applyTheme(current_scale.*);
+                }
 
-        // Begin a fresh ImGui frame for the current framebuffer size.
-        zgui.backend.newFrame(@intCast(fb_width), @intCast(fb_height));
-        // Render the root application layout for this frame.
-        ui_layout.renderRoot(&state, @floatFromInt(fb_width), @floatFromInt(fb_height));
-        state.flushIfDirty();
+                zgui.backend.newFrame(@intCast(framebuffer_width.*), @intCast(framebuffer_height.*));
+            }
+        }.run, .{ window, &fb_width, &fb_height, &ui_scale });
+
+        recordSpan(&frame_sample, .render_root, struct {
+            fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
+                ui_layout.renderRoot(app_state, @floatFromInt(framebuffer_width), @floatFromInt(framebuffer_height));
+            }
+        }.run, .{ &state, fb_width, fb_height });
+        recordSpan(&frame_sample, .flush_dirty, struct {
+            fn run(app_state: *AppState) void {
+                app_state.flushIfDirty();
+            }
+        }.run, .{&state});
 
         glClearColor(ui_theme.COLOR_BLACK[0], ui_theme.COLOR_BLACK[1], ui_theme.COLOR_BLACK[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
-        zgui.backend.draw();
+        recordSpan(&frame_sample, .draw_backend, struct {
+            fn run() void {
+                zgui.backend.draw();
+            }
+        }.run, .{});
+        const swap_start = profiler.nowNs();
         try sdl.gl.swapWindow(window);
+        frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
+        frame_sample.rendered = true;
+        profiler.recordFrame(frame_sample);
     }
+}
+
+fn recordSpan(frame_sample: *profiler.FrameSample, section: profiler.Section, comptime function: anytype, args: anytype) void {
+    const start = profiler.nowNs();
+    @call(.auto, function, args);
+    frame_sample.add(section, profiler.elapsedNs(start));
 }
 
 fn installWindowIcon(window: *sdl.Window) void {
@@ -240,12 +305,12 @@ fn initialWindowFrame() WindowFrame {
 }
 
 fn getWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) void {
-    window.getSizeInPixels(w, h) catch {
+    if (!SDL_GetWindowSizeInPixels(window, w, h)) {
         window.getSize(w, h) catch {
             if (w) |width| width.* = DEFAULT_WINDOW_WIDTH;
             if (h) |height| height.* = DEFAULT_WINDOW_HEIGHT;
         };
-    };
+    }
 }
 
 fn currentWindowDisplayScale(window: *sdl.Window) f32 {
@@ -297,30 +362,51 @@ fn normalizeMouseEventCoordinates(window: *sdl.Window, event: *sdl.Event) void {
     }
 }
 
-fn processEvents(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, had_event: *bool) bool {
+fn processEvents(
+    window: *sdl.Window,
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    had_event: *bool,
+    frame_sample: *profiler.FrameSample,
+    waited_ns: *u64,
+) bool {
     had_event.* = false;
     var event: sdl.Event = undefined;
 
     if (!sdl.pollEvent(&event)) {
-        if (!sdl.waitEventTimeout(&event, eventWaitTimeoutMs(state))) {
+        const wait_start = profiler.nowNs();
+        if (!SDL_WaitEventTimeout(&event, eventWaitTimeoutMs(state))) {
+            waited_ns.* +|= profiler.elapsedNs(wait_start);
             return true;
         }
+        waited_ns.* +|= profiler.elapsedNs(wait_start);
         had_event.* = true;
-        normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(window, state, keyboard, &event)) return false;
+        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
     } else {
         had_event.* = true;
-        normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(window, state, keyboard, &event)) return false;
+        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
         had_event.* = true;
-        normalizeMouseEventCoordinates(window, &event);
-        if (!handleEvent(window, state, keyboard, &event)) return false;
+        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
     }
 
     return true;
+}
+
+fn processOneEvent(
+    window: *sdl.Window,
+    state: *AppState,
+    keyboard: *keybinds.NativeKeyboardConfig,
+    event: *sdl.Event,
+    frame_sample: *profiler.FrameSample,
+) bool {
+    const start = profiler.nowNs();
+    normalizeMouseEventCoordinates(window, event);
+    const keep_running = handleEvent(window, state, keyboard, event);
+    frame_sample.add(.event_handling, profiler.elapsedNs(start));
+    return keep_running;
 }
 
 fn appNeedsContinuousFrames(state: *AppState) bool {
@@ -444,6 +530,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_wheel => {
+            if (state.handleComposerWheel(&event.wheel)) {
+                return true;
+            }
             if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
                 return true;
             }
@@ -454,12 +543,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
 }
 
 fn browserInputDebugEnabled() bool {
-    return std.posix.getenv("VERDE_CEF_INPUT_DEBUG") != null;
+    return std.c.getenv("VERDE_CEF_INPUT_DEBUG") != null;
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
     if (!state.isBrowserPaneFocused()) return;
-    if (sdl.textInputActive(window)) return;
+    if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
         log.info("browser-input forced SDL_StartTextInput for browser pane focus", .{});

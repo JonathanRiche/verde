@@ -1,5 +1,6 @@
 [tools]
-zig = "0.15.2"
+zig = "0.16.0"
+zls = "0.16.0"
 # zls = "0.15.2"
 
 [tasks.setup]
@@ -9,3 +10,15 @@ run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scrip
 [tasks.build]
 description = "Builds the desktop app."
 run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) scripts/release/install-macos-local.sh ;; Linux) scripts/release/install-linux-local-cef.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
+
+[tasks.dev]
+description = "Builds and runs Verde from the repo-local Zig build output."
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+
+[tasks.run]
+description = "Builds and launches Verde in development mode."
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+
+[tasks.debug]
+description = "Builds and launches Verde with the in-app diagnostics window enabled."
+run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dui-debug=true -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"

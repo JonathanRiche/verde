@@ -75,8 +75,20 @@ const RuntimePaths = struct {
     }
 };
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
 const CommandQueue = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     items: std.ArrayList(ipc.Command) = .empty,
     closed: bool = false,
 
@@ -153,7 +165,8 @@ const FrameStore = struct {
     /// Closes and removes the helper frame file.
     fn deinit(self: *FrameStore) void {
         self.file.close();
-        std.fs.deleteFileAbsolute(self.path) catch {};
+        var threaded = std.Io.Threaded.init_single_threaded;
+        std.Io.Dir.deleteFileAbsolute(threaded.io(), self.path) catch {};
         self.allocator.free(self.path);
     }
 
@@ -255,7 +268,7 @@ pub fn main() !void {
         try flushNativeEvents(allocator);
         try publishLatestFrame(allocator, &helper_state);
         if (command_queue.isDrained()) std.process.exit(0);
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.atomic.spinLoopHint();
     }
 }
 
@@ -277,7 +290,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
         const maybe_line = try reader.interface.takeDelimiter('\n');
         if (maybe_line == null) break;
 
-        const line = std.mem.trimRight(u8, maybe_line.?, "\r");
+        const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
         if (line.len == 0) continue;
 
         var parsed = try std.json.parseFromSlice(ipc.Command, context.allocator, line, .{
