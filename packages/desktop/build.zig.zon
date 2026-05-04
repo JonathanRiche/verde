@@ -12,8 +12,7 @@
             .path = "../zgui_text_select",
         },
         .zgui = .{
-            .url = "git+https://github.com/zig-gamedev/zgui#d6c4f53c2fbd54673790dc2a5208160a3586ef29",
-            .hash = "zgui-0.6.0-dev--L6sZCJKbgBZGCzVMcwD0bNGmpK6yO-UoIESHX5JiRet",
+            .path = "../zgui",
         },
         .zsdl = .{
             .url = "git+https://github.com/JonathanRiche/zsdl#100f46b336a112497436144e14877118573e0adf",
