@@ -1,6 +1,7 @@
 //! Minimal SDL3 declarations used by powder examples and component input.
 
 const std = @import("std");
+const image_loader = @import("image_loader.zig");
 
 pub const Error = error{SdlError};
 
@@ -63,6 +64,7 @@ pub const Window = opaque {
     pub const create = createWindow;
     pub const destroy = destroyWindow;
     pub const setTitle = setWindowTitle;
+    pub const size = getWindowSize;
 };
 
 pub const Renderer = opaque {
@@ -89,6 +91,12 @@ pub const Surface = extern struct {
     pixels: ?*anyopaque,
     refcount: c_int,
     reserved: ?*anyopaque,
+};
+
+pub const PixelFormat = enum(u32) {
+    rgba8888 = 0x16462004,
+    /// Byte-array RGBA format on little-endian platforms.
+    rgba32 = 0x16762004,
 };
 
 pub const FRect = extern struct {
@@ -293,6 +301,13 @@ pub fn setWindowTitle(window: *Window, title: [:0]const u8) void {
     SDL_SetWindowTitle(window, title.ptr);
 }
 
+pub fn getWindowSize(window: *Window) Error!struct { w: i32, h: i32 } {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    if (!SDL_GetWindowSize(window, &w, &h)) return error.SdlError;
+    return .{ .w = @intCast(w), .h = @intCast(h) };
+}
+
 pub fn startTextInput(window: *Window) Error!void {
     if (!SDL_StartTextInput(window)) return error.SdlError;
 }
@@ -339,12 +354,31 @@ pub fn createTextureFromSurface(renderer: *Renderer, surface: *Surface) Error!*T
     return SDL_CreateTextureFromSurface(renderer, surface) orelse error.SdlError;
 }
 
+pub fn createSurfaceFrom(width: i32, height: i32, format: PixelFormat, pixels: [*]u8, pitch: i32) Error!*Surface {
+    return SDL_CreateSurfaceFrom(width, height, @intFromEnum(format), pixels, pitch) orelse error.SdlError;
+}
+
+pub fn createSurfaceFromImage(image: image_loader.LoadedImage) Error!*Surface {
+    return createSurfaceFrom(image.width, image.height, .rgba32, image.pixels, image.pitch());
+}
+
+pub fn createTextureFromImage(renderer: *Renderer, image: image_loader.LoadedImage) Error!*Texture {
+    const surface = try createSurfaceFromImage(image);
+    defer destroySurface(surface);
+    return createTextureFromSurface(renderer, surface);
+}
+
 pub const destroyTexture = SDL_DestroyTexture;
 pub const destroySurface = SDL_DestroySurface;
 
 pub fn renderTexture(renderer: *Renderer, texture: *Texture, dst: FRect) Error!void {
+    try renderTextureRegion(renderer, texture, null, dst);
+}
+
+pub fn renderTextureRegion(renderer: *Renderer, texture: *Texture, src: ?FRect, dst: FRect) Error!void {
+    var mutable_src = src;
     var mutable_dst = dst;
-    if (!SDL_RenderTexture(renderer, texture, null, &mutable_dst)) return error.SdlError;
+    if (!SDL_RenderTexture(renderer, texture, if (mutable_src) |*r| r else null, &mutable_dst)) return error.SdlError;
 }
 
 pub fn renderPresent(renderer: *Renderer) void {
@@ -389,6 +423,7 @@ extern fn SDL_SetAppMetadata(appname: [*:0]const u8, appversion: [*:0]const u8, 
 extern fn SDL_CreateWindow(title: [*:0]const u8, w: c_int, h: c_int, flags: Window.Flags) ?*Window;
 extern fn SDL_DestroyWindow(window: *Window) void;
 extern fn SDL_SetWindowTitle(window: *Window, title: [*:0]const u8) void;
+extern fn SDL_GetWindowSize(window: *Window, w: *c_int, h: *c_int) bool;
 extern fn SDL_StartTextInput(window: *Window) bool;
 extern fn SDL_StopTextInput(window: *Window) bool;
 extern fn SDL_PollEvent(event: ?*Event) bool;
@@ -401,6 +436,7 @@ extern fn SDL_RenderFillRect(renderer: *Renderer, rect: *const FRect) bool;
 extern fn SDL_SetRenderClipRect(renderer: *Renderer, rect: ?*const Rect) bool;
 extern fn SDL_RenderDebugText(renderer: *Renderer, x: f32, y: f32, str: [*:0]const u8) bool;
 extern fn SDL_CreateTextureFromSurface(renderer: *Renderer, surface: *Surface) ?*Texture;
+extern fn SDL_CreateSurfaceFrom(width: c_int, height: c_int, format: u32, pixels: *anyopaque, pitch: c_int) ?*Surface;
 extern fn SDL_DestroyTexture(texture: *Texture) void;
 extern fn SDL_DestroySurface(surface: *Surface) void;
 extern fn SDL_RenderTexture(renderer: *Renderer, texture: *Texture, srcrect: ?*const FRect, dstrect: *const FRect) bool;

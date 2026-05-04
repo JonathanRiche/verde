@@ -6,6 +6,7 @@ const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
 const sdl = @import("../sdl.zig");
+const text_layout = @import("../text_layout.zig");
 
 pub const SelectConfig = struct {
     x: f32 = 0.0,
@@ -77,6 +78,7 @@ pub fn Select(comptime config: SelectConfig) type {
         scrollbar_drag_offset_y: f32 = 0.0,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         menu_rect: draw.Rect = .{ .x = config.x, .y = config.y + config.height, .w = config.width, .h = config.menu_height },
+        font_metrics: ?text_layout.FontMetrics = null,
         callbacks: SelectCallbacks = .{},
 
         pub fn init(item_count: usize) Component {
@@ -93,6 +95,10 @@ pub fn Select(comptime config: SelectConfig) type {
 
         pub fn setCallbacks(self: *Component, callbacks: SelectCallbacks) void {
             self.callbacks = callbacks;
+        }
+
+        pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
+            self.font_metrics = metrics_value;
         }
 
         pub fn scrollY(self: *const Component) f32 {
@@ -247,7 +253,7 @@ pub fn Select(comptime config: SelectConfig) type {
             if (self.selected_index) |index| {
                 if (self.itemLabel(index)) |label| {
                     const text_rect = self.controlTextRect(label);
-                    try batch.fixedText(allocator, text_rect, label, config.text_color, fontSize(), text_rect, .{}, config.glyph_width, text_rect.h, false);
+                    try self.renderLabel(allocator, batch, text_rect, label, config.text_color, text_rect);
                 }
             }
 
@@ -266,7 +272,7 @@ pub fn Select(comptime config: SelectConfig) type {
                 if (self.itemLabel(index)) |label| {
                     const text_rect = self.itemTextRect(label, row);
                     if (clippedRect(text_rect, self.menuContentRect())) |clipped| {
-                        try batch.fixedText(allocator, clipped, label, config.text_color, fontSize(), self.menuContentRect(), .{}, config.glyph_width, clipped.h, false);
+                        try self.renderLabel(allocator, batch, clipped, label, config.text_color, self.menuContentRect());
                     }
                 }
             }
@@ -404,20 +410,24 @@ pub fn Select(comptime config: SelectConfig) type {
 
         fn controlTextRect(self: *const Component, label: []const u8) draw.Rect {
             const control = self.controlRect();
+            const metrics_value = self.metrics();
+            const text_h = @min(control.h, metrics_value.line_height);
             return .{
                 .x = control.x + config.padding_x,
-                .y = control.y + @max((control.h - config.glyph_width * 1.4) * 0.5, 0.0),
-                .w = @min(control.w - config.padding_x * 2.0, @as(f32, @floatFromInt(label.len)) * config.glyph_width),
-                .h = @min(control.h, config.glyph_width * 1.4),
+                .y = control.y + @max((control.h - text_h) * 0.5, 0.0),
+                .w = @min(control.w - config.padding_x * 2.0, metrics_value.measureSlice(label)),
+                .h = text_h,
             };
         }
 
-        fn itemTextRect(_: *const Component, label: []const u8, row: draw.Rect) draw.Rect {
+        fn itemTextRect(self: *const Component, label: []const u8, row: draw.Rect) draw.Rect {
+            const metrics_value = self.metrics();
+            const text_h = @min(row.h, metrics_value.line_height);
             return .{
                 .x = row.x,
-                .y = row.y + @max((row.h - config.glyph_width * 1.4) * 0.5, 0.0),
-                .w = @min(row.w, @as(f32, @floatFromInt(label.len)) * config.glyph_width),
-                .h = @min(row.h, config.glyph_width * 1.4),
+                .y = row.y + @max((row.h - text_h) * 0.5, 0.0),
+                .w = @min(row.w, metrics_value.measureSlice(label)),
+                .h = text_h,
             };
         }
 
@@ -426,8 +436,25 @@ pub fn Select(comptime config: SelectConfig) type {
             return null;
         }
 
-        fn fontSize() f32 {
-            return config.glyph_width / 0.55;
+        fn renderLabel(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, label: []const u8, color: draw.Color, clip: draw.Rect) !void {
+            const metrics_value = self.metrics();
+            const runs = [_]draw.TextRun{.{
+                .text = label,
+                .byte_start = 0,
+                .byte_end = label.len,
+                .x = rect.x,
+                .y = rect.y,
+                .font_size = metrics_value.font_size,
+                .line_height = metrics_value.line_height,
+                .color = color,
+                .clip = clip,
+            }};
+            try batch.textRuns(allocator, rect, label, &runs, color, metrics_value.font_size, clip, metrics_value.line_height, metrics_value.fixedAdvance());
+        }
+
+        fn metrics(self: *const Component) text_layout.FontMetrics {
+            if (self.font_metrics) |metrics_value| return metrics_value;
+            return text_layout.FontMetrics.fixed(config.glyph_width / 0.55, config.glyph_width, config.row_height);
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {

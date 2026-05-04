@@ -246,7 +246,7 @@ test "tabs keyboard navigation works without prior focus" {
     try std.testing.expectEqual(@as(usize, 0), tabs.active_index);
 }
 
-test "tabs render one glyph per tab" {
+test "tabs render one label placeholder per tab" {
     const Strip = Tabs(.{ .x = 0, .y = 0, .width = 200, .height = 30, .tab_width = 100 });
     var tabs = Strip.init(2);
 
@@ -254,9 +254,9 @@ test "tabs render one glyph per tab" {
     defer batch.deinit(std.testing.allocator);
     try tabs.render(std.testing.allocator, &batch);
 
-    var glyphs: usize = 0;
+    var labels: usize = 0;
     for (batch.commands.items) |command| {
-        if (command.kind == .text) glyphs += 1;
+        if (command.kind == .image) labels += 1;
     }
-    try std.testing.expectEqual(@as(usize, 2), glyphs);
+    try std.testing.expectEqual(@as(usize, 2), labels);
 }
