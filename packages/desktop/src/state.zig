@@ -43,6 +43,62 @@ pub const PowderComposerTextArea = powder.textArea(.{
     .submit_on_enter = true,
 });
 
+const POWDER_CONTROL_BG = powder.Color{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 1.0 };
+const POWDER_CONTROL_BORDER = powder.Color{ .r = 0.21, .g = 0.23, .b = 0.27, .a = 1.0 };
+const POWDER_CONTROL_TEXT = powder.Color{ .r = 0.82, .g = 0.85, .b = 0.89, .a = 1.0 };
+const POWDER_MENU_BG = powder.Color{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 };
+
+const powder_select_config = powder.SelectConfig{
+    .height = 32.0,
+    .padding_x = 10.0,
+    .padding_y = 7.0,
+    .row_height = 30.0,
+    .glyph_width = 7.8,
+    .background_color = POWDER_CONTROL_BG,
+    .border_color = POWDER_CONTROL_BORDER,
+    .menu_color = POWDER_MENU_BG,
+    .text_color = POWDER_CONTROL_TEXT,
+    .selected_color = .{ .r = 0.20, .g = 0.35, .b = 0.27, .a = 0.92 },
+    .highlighted_color = .{ .r = 0.24, .g = 0.28, .b = 0.32, .a = 0.85 },
+    .scrollbar_track_color = .{ .r = 0.12, .g = 0.13, .b = 0.15, .a = 0.70 },
+    .scrollbar_thumb_color = .{ .r = 0.52, .g = 0.58, .b = 0.64, .a = 0.82 },
+    .scrollbar_width = 4.0,
+};
+
+fn powderSelectConfig(comptime label: *const fn (?*anyopaque, usize) []const u8) powder.SelectConfig {
+    var config = powder_select_config;
+    config.item_label = label;
+    return config;
+}
+
+pub const PowderProviderSelect = powder.select(powderSelectConfig(powderProviderLabel));
+pub const PowderModelSelect = powder.select(powderSelectConfig(powderModelLabel));
+pub const PowderReasoningSelect = powder.select(powderSelectConfig(powderReasoningLabel));
+pub const PowderFastSelect = powder.select(powderSelectConfig(powderFastLabel));
+pub const PowderAccessSelect = powder.select(powderSelectConfig(powderAccessLabel));
+pub const PowderSendButton = powder.button(.{
+    .label = "SEND",
+    .font_size = 11.0,
+    .background_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
+    .hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
+    .pressed_color = .{ .r = 0.18, .g = 0.34, .b = 0.23, .a = 1.0 },
+    .border_color = .{ .r = 0.33, .g = 0.58, .b = 0.40, .a = 1.0 },
+    .text_color = .{},
+    .padding_x = 7.0,
+    .padding_y = 7.0,
+});
+pub const PowderStopButton = powder.button(.{
+    .label = "STOP",
+    .font_size = 11.0,
+    .background_color = .{ .r = 0.33, .g = 0.27, .b = 0.10, .a = 1.0 },
+    .hover_color = .{ .r = 0.42, .g = 0.34, .b = 0.13, .a = 1.0 },
+    .pressed_color = .{ .r = 0.24, .g = 0.19, .b = 0.07, .a = 1.0 },
+    .border_color = .{ .r = 0.54, .g = 0.44, .b = 0.16, .a = 1.0 },
+    .text_color = .{},
+    .padding_x = 7.0,
+    .padding_y = 7.0,
+});
+
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
 
@@ -87,8 +143,8 @@ fn powderComposerGetClipboard(_: ?*anyopaque, allocator: std.mem.Allocator) ?[]u
 }
 
 fn powderMousePoint(x: f32, y: f32, ui_scale: f32) powder.draw.Vec2 {
-    const scale = @max(ui_scale, 1.0);
-    return .{ .x = x / scale, .y = y / scale };
+    _ = ui_scale;
+    return .{ .x = x, .y = y };
 }
 
 fn powderComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?powder.TextAreaKey {
@@ -119,6 +175,137 @@ fn powderComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?powder.TextAreaKey
 
 fn keymodBits(modifier_state: sdl.Keymod) u16 {
     return @as(*const u16, @ptrCast(&modifier_state)).*;
+}
+
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+
+fn appStateFromContext(context: ?*anyopaque) ?*AppState {
+    const ptr = context orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn powderProviderLabel(_: ?*anyopaque, index: usize) []const u8 {
+    if (index >= COMPOSER_PROVIDER_OPTIONS.len) return "";
+    return chat_threads.providerLabel(COMPOSER_PROVIDER_OPTIONS[index]);
+}
+
+fn powderModelLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const thread = state.currentThread();
+    const options = composerModelOptions(state, thread.provider);
+    if (index >= options.len) return "";
+    return options[index].label;
+}
+
+fn powderReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
+    if (index >= CODEX_REASONING_OPTIONS.len) return "";
+    return CODEX_REASONING_OPTIONS[index].label;
+}
+
+fn powderFastLabel(_: ?*anyopaque, index: usize) []const u8 {
+    if (index >= CODEX_FAST_MODE_OPTIONS.len) return "";
+    return CODEX_FAST_MODE_OPTIONS[index].label;
+}
+
+fn powderAccessLabel(_: ?*anyopaque, index: usize) []const u8 {
+    if (index >= CODEX_ACCESS_MODE_OPTIONS.len) return "";
+    return CODEX_ACCESS_MODE_OPTIONS[index].label;
+}
+
+fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
+    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..]);
+}
+
+fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
+    return switch (provider) {
+        .codex => DEFAULT_CODEX_MODEL,
+        .opencode => state.cachedDefaultModelRefForProvider(.opencode),
+    };
+}
+
+fn powderProviderChanged(context: ?*anyopaque, event: powder.SelectEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |maybe_index| {
+            const index = maybe_index orelse return;
+            if (index >= COMPOSER_PROVIDER_OPTIONS.len) return;
+            state.setCurrentThreadProvider(COMPOSER_PROVIDER_OPTIONS[index]);
+        },
+        else => {},
+    }
+}
+
+fn powderModelChanged(context: ?*anyopaque, event: powder.SelectEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |maybe_index| {
+            const index = maybe_index orelse return;
+            const options = composerModelOptions(state, state.currentThread().provider);
+            if (index >= options.len) return;
+            state.setCurrentThreadModelRef(options[index].value);
+        },
+        else => {},
+    }
+}
+
+fn powderReasoningChanged(context: ?*anyopaque, event: powder.SelectEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |maybe_index| {
+            const index = maybe_index orelse return;
+            if (index >= CODEX_REASONING_OPTIONS.len) return;
+            const thread = state.currentThreadMutable();
+            const next = CODEX_REASONING_OPTIONS[index].value;
+            const changed = if (next) |value|
+                thread.reasoning_effort == null or thread.reasoning_effort.? != value
+            else
+                thread.reasoning_effort != null;
+            if (!changed) return;
+            thread.reasoning_effort = next;
+            state.markDirty();
+        },
+        else => {},
+    }
+}
+
+fn powderFastChanged(context: ?*anyopaque, event: powder.SelectEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |maybe_index| {
+            const index = maybe_index orelse return;
+            if (index >= CODEX_FAST_MODE_OPTIONS.len) return;
+            const thread = state.currentThreadMutable();
+            const next = CODEX_FAST_MODE_OPTIONS[index].value;
+            if (thread.fast_mode == next) return;
+            thread.fast_mode = next;
+            state.markDirty();
+        },
+        else => {},
+    }
+}
+
+fn powderAccessChanged(context: ?*anyopaque, event: powder.SelectEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |maybe_index| {
+            const index = maybe_index orelse return;
+            if (index >= CODEX_ACCESS_MODE_OPTIONS.len) return;
+            const thread = state.currentThreadMutable();
+            const next = CODEX_ACCESS_MODE_OPTIONS[index].value;
+            if (thread.access_mode == next) return;
+            thread.access_mode = next;
+            state.markDirty();
+        },
+        else => {},
+    }
+}
+
+fn powderComposerSendButtonEvent(context: ?*anyopaque, event: powder.ButtonEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .clicked, .activated => state.activateComposerSendButton(),
+        else => {},
+    }
 }
 
 pub const ProjectEditorTarget = enum {
@@ -1116,6 +1303,13 @@ pub const AppState = struct {
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
     powder_composer: PowderComposerTextArea,
+    powder_provider_select: PowderProviderSelect,
+    powder_model_select: PowderModelSelect,
+    powder_reasoning_select: PowderReasoningSelect,
+    powder_fast_select: PowderFastSelect,
+    powder_access_select: PowderAccessSelect,
+    powder_send_button: PowderSendButton,
+    powder_stop_button: PowderStopButton,
     powder_overlay_batch: powder.RenderBatch,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
@@ -1218,6 +1412,13 @@ pub const AppState = struct {
             .composer_overlay_last_cursor_pos = 0,
             .composer_overlay_last_draft_len = 0,
             .powder_composer = try PowderComposerTextArea.init(allocator, ""),
+            .powder_provider_select = PowderProviderSelect.init(COMPOSER_PROVIDER_OPTIONS.len),
+            .powder_model_select = PowderModelSelect.init(CODEX_MODEL_OPTIONS.len),
+            .powder_reasoning_select = PowderReasoningSelect.init(CODEX_REASONING_OPTIONS.len),
+            .powder_fast_select = PowderFastSelect.init(CODEX_FAST_MODE_OPTIONS.len),
+            .powder_access_select = PowderAccessSelect.init(CODEX_ACCESS_MODE_OPTIONS.len),
+            .powder_send_button = PowderSendButton.init(),
+            .powder_stop_button = PowderStopButton.init(),
             .powder_overlay_batch = .{},
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
@@ -4222,10 +4423,49 @@ pub const AppState = struct {
         });
     }
 
-    pub fn setComposerSendButtonBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
-        self.composer_send_bounds_valid = true;
-        self.composer_send_min = input_min;
-        self.composer_send_max = input_max;
+    pub fn syncPowderComposerControls(self: *AppState) void {
+        self.powder_provider_select.setCallbacks(.{
+            .context = self,
+            .on_event = powderProviderChanged,
+        });
+        self.powder_model_select.setCallbacks(.{
+            .context = self,
+            .on_event = powderModelChanged,
+        });
+        self.powder_reasoning_select.setCallbacks(.{
+            .context = self,
+            .on_event = powderReasoningChanged,
+        });
+        self.powder_fast_select.setCallbacks(.{
+            .context = self,
+            .on_event = powderFastChanged,
+        });
+        self.powder_access_select.setCallbacks(.{
+            .context = self,
+            .on_event = powderAccessChanged,
+        });
+        self.powder_send_button.setCallbacks(.{
+            .context = self,
+            .on_event = powderComposerSendButtonEvent,
+        });
+        self.powder_stop_button.setCallbacks(.{
+            .context = self,
+            .on_event = powderComposerSendButtonEvent,
+        });
+
+        self.powder_provider_select.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
+        self.powder_reasoning_select.setItemCount(CODEX_REASONING_OPTIONS.len);
+        self.powder_fast_select.setItemCount(CODEX_FAST_MODE_OPTIONS.len);
+        self.powder_access_select.setItemCount(CODEX_ACCESS_MODE_OPTIONS.len);
+
+        const thread = self.currentThread();
+        self.powder_provider_select.selected_index = composerProviderIndex(thread.provider);
+        const model_options = composerModelOptions(self, thread.provider);
+        self.powder_model_select.setItemCount(model_options.len);
+        self.powder_model_select.selected_index = self.composerModelIndex(thread.provider, thread.model_ref);
+        self.powder_reasoning_select.selected_index = composerReasoningIndex(thread.reasoning_effort);
+        self.powder_fast_select.selected_index = composerFastModeIndex(thread.fast_mode);
+        self.powder_access_select.selected_index = composerAccessModeIndex(thread.access_mode);
     }
 
     pub fn routePowderComposerTextInput(self: *AppState, text: []const u8) bool {
@@ -4242,9 +4482,15 @@ pub const AppState = struct {
     }
 
     pub fn routePowderComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        const powder_key = powderComposerKeyFromSdl(event) orelse return false;
+        if (self.routePowderComposerControlsKey(powder_key)) {
+            self.powder_composer.focused = false;
+            self.composer_focused = false;
+            self.noteInteraction();
+            return true;
+        }
         if (!self.powder_composer.focused) return false;
-        const key = powderComposerKeyFromSdl(event) orelse return false;
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .key = key }) catch |err| {
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .key = powder_key }) catch |err| {
             log.warn("powder composer key input failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -4258,20 +4504,12 @@ pub const AppState = struct {
     pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
         const point = powderMousePoint(event.x, event.y, ui_scale);
-        if (event.down and self.composerSendButtonContains(point)) {
-            self.composer_send_pressed = true;
-            self.composer_send_hovered = true;
+        if (self.routePowderComposerControlsMouseButton(point, event.down)) {
             self.powder_composer.focused = false;
             self.composer_focused = false;
             self.terminal_focused = false;
             self.browser_pane_focused = false;
-            return true;
-        }
-        if (!event.down and self.composer_send_pressed) {
-            const should_activate = self.composerSendButtonContains(point);
-            self.composer_send_pressed = false;
-            self.composer_send_hovered = should_activate;
-            if (should_activate) self.activateComposerSendButton();
+            self.noteInteraction();
             return true;
         }
         const input: powder.text_area_component.Input = if (event.down)
@@ -4293,15 +4531,9 @@ pub const AppState = struct {
 
     pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
         const point = powderMousePoint(event.x, event.y, ui_scale);
-        const send_hovered = self.composerSendButtonContains(point);
-        const send_changed = self.composer_send_hovered != send_hovered;
-        self.composer_send_hovered = send_hovered;
-        if (self.composer_send_pressed and event.state.left == 0) {
-            self.composer_send_pressed = false;
-            return true;
-        }
+        const controls_handled = self.routePowderComposerControlsMouseMove(point, event.state.left != 0);
         if (!self.powder_composer.focused) return false;
-        if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return send_changed;
+        if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return controls_handled;
         const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = point }) catch |err| {
             log.warn("powder composer mouse drag failed: {s}", .{@errorName(err)});
             return false;
@@ -4310,10 +4542,14 @@ pub const AppState = struct {
             self.syncDraftFromPowderComposer();
             self.noteInteraction();
         }
-        return handled or send_changed;
+        return handled or controls_handled;
     }
 
     pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.routePowderComposerControlsWheel(powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) {
+            self.noteInteraction();
+            return true;
+        }
         const handled = self.powder_composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
@@ -4330,14 +4566,6 @@ pub const AppState = struct {
         self.composer_input_max = input_max;
     }
 
-    fn composerSendButtonContains(self: *const AppState, point: powder.draw.Vec2) bool {
-        if (!self.composer_send_bounds_valid) return false;
-        return point.x >= self.composer_send_min[0] and
-            point.y >= self.composer_send_min[1] and
-            point.x <= self.composer_send_max[0] and
-            point.y <= self.composer_send_max[1];
-    }
-
     fn activateComposerSendButton(self: *AppState) void {
         if (self.currentThread().isSendPendingForUi()) {
             self.abortCurrentThreadSend();
@@ -4346,6 +4574,136 @@ pub const AppState = struct {
         self.sendDraft() catch |err| {
             log.err("failed to send draft: {s}", .{@errorName(err)});
         };
+    }
+
+    fn routePowderComposerControlsKey(self: *AppState, key: powder.Key) bool {
+        if (self.powder_provider_select.focused and self.powder_provider_select.handleInput(.{ .key = key })) return true;
+        if (self.powder_model_select.focused and self.powder_model_select.handleInput(.{ .key = key })) return true;
+        if (self.powder_reasoning_select.focused and self.powder_reasoning_select.handleInput(.{ .key = key })) return true;
+        if (self.powder_fast_select.focused and self.powder_fast_select.handleInput(.{ .key = key })) return true;
+        if (self.powder_access_select.focused and self.powder_access_select.handleInput(.{ .key = key })) return true;
+        if (self.powder_send_button.focused and self.powder_send_button.handleInput(.{ .key = key })) return true;
+        if (self.powder_stop_button.focused and self.powder_stop_button.handleInput(.{ .key = key })) return true;
+        return false;
+    }
+
+    fn routePowderComposerControlsMouseButton(self: *AppState, point: powder.draw.Vec2, down: bool) bool {
+        const input = if (down) powder.select_component.Input{ .mouse_down = .{ .point = point } } else powder.select_component.Input{ .mouse_up = point };
+        if (self.powder_provider_select.handleInput(input)) return true;
+        if (self.powder_model_select.handleInput(input)) return true;
+        if (self.powder_reasoning_select.handleInput(input)) return true;
+        if (self.powder_fast_select.handleInput(input)) return true;
+        if (self.powder_access_select.handleInput(input)) return true;
+
+        const button_input = if (down) powder.button_component.Input{ .mouse_down = point } else powder.button_component.Input{ .mouse_up = point };
+        if (self.currentThread().isSendPendingForUi()) {
+            if (self.powder_stop_button.handleInput(button_input)) return true;
+            _ = self.powder_send_button.handleInput(.{ .mouse_leave = {} });
+        } else {
+            if (self.powder_send_button.handleInput(button_input)) return true;
+            _ = self.powder_stop_button.handleInput(.{ .mouse_leave = {} });
+        }
+        return false;
+    }
+
+    fn routePowderComposerControlsMouseMove(self: *AppState, point: powder.draw.Vec2, dragging: bool) bool {
+        const select_input = if (dragging) powder.select_component.Input{ .mouse_drag = point } else powder.select_component.Input{ .mouse_move = point };
+        var handled = false;
+        handled = self.powder_provider_select.handleInput(select_input) or handled;
+        handled = self.powder_model_select.handleInput(select_input) or handled;
+        handled = self.powder_reasoning_select.handleInput(select_input) or handled;
+        handled = self.powder_fast_select.handleInput(select_input) or handled;
+        handled = self.powder_access_select.handleInput(select_input) or handled;
+
+        const button_input = powder.button_component.Input{ .mouse_move = point };
+        if (self.currentThread().isSendPendingForUi()) {
+            handled = self.powder_stop_button.handleInput(button_input) or handled;
+            _ = self.powder_send_button.handleInput(.{ .mouse_leave = {} });
+        } else {
+            handled = self.powder_send_button.handleInput(button_input) or handled;
+            _ = self.powder_stop_button.handleInput(.{ .mouse_leave = {} });
+        }
+        return handled;
+    }
+
+    fn routePowderComposerControlsWheel(self: *AppState, point: powder.draw.Vec2, y: f32) bool {
+        const input = powder.select_component.Input{ .mouse_wheel = .{ .point = point, .y = y } };
+        if (self.powder_provider_select.handleInput(input)) return true;
+        if (self.powder_model_select.handleInput(input)) return true;
+        if (self.powder_reasoning_select.handleInput(input)) return true;
+        if (self.powder_fast_select.handleInput(input)) return true;
+        if (self.powder_access_select.handleInput(input)) return true;
+        return false;
+    }
+
+    fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
+        const thread = self.currentThreadMutable();
+        if (thread.provider == provider) return;
+
+        thread.provider = provider;
+        if (thread.provider_thread_id) |thread_id| self.allocator.free(thread_id);
+        thread.provider_thread_id = null;
+        if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
+        thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
+        thread.reasoning_effort = null;
+        thread.fast_mode = .off;
+        self.markDirty();
+    }
+
+    fn setCurrentThreadModelRef(self: *AppState, value: ?[:0]const u8) void {
+        const thread = self.currentThreadMutable();
+        if (thread.model_ref) |existing| {
+            if (value) |next| {
+                if (std.mem.eql(u8, existing, next)) return;
+            }
+            self.allocator.free(existing);
+            thread.model_ref = null;
+        } else if (value == null) {
+            return;
+        }
+
+        thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
+        self.markDirty();
+    }
+
+    fn composerModelIndex(self: *const AppState, provider: Provider, model_ref: ?[:0]const u8) ?usize {
+        const active = model_ref orelse composerDefaultModelRef(self, provider);
+        const options = composerModelOptions(self, provider);
+        for (options, 0..) |option, index| {
+            if (option.value) |value| {
+                if (std.mem.eql(u8, active, value)) return index;
+            }
+        }
+        return if (options.len > 0) 0 else null;
+    }
+
+    fn composerProviderIndex(provider: Provider) ?usize {
+        for (COMPOSER_PROVIDER_OPTIONS, 0..) |candidate, index| {
+            if (candidate == provider) return index;
+        }
+        return null;
+    }
+
+    fn composerReasoningIndex(value: ?ReasoningEffort) ?usize {
+        for (CODEX_REASONING_OPTIONS, 0..) |option, index| {
+            if (value == null and option.value == null) return index;
+            if (value != null and option.value != null and value.? == option.value.?) return index;
+        }
+        return null;
+    }
+
+    fn composerFastModeIndex(value: FastMode) ?usize {
+        for (CODEX_FAST_MODE_OPTIONS, 0..) |option, index| {
+            if (option.value == value) return index;
+        }
+        return null;
+    }
+
+    fn composerAccessModeIndex(value: AccessMode) ?usize {
+        for (CODEX_ACCESS_MODE_OPTIONS, 0..) |option, index| {
+            if (option.value == value) return index;
+        }
+        return null;
     }
 
     pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {

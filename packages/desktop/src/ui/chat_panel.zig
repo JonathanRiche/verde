@@ -3905,9 +3905,8 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
 
     const pad_x = theme.scaledUi(18.0);
     const pad_y = theme.scaledUi(12.0);
-    const bottom_h = theme.scaledUi(42.0);
+    const bottom_h = composerControlsHeight(width);
     const bottom_gap = theme.scaledUi(8.0);
-    const send_btn_size = theme.scaledUi(32.0);
     const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(28.0) else 0.0;
     const input_rect_min = .{
         composer_screen_pos[0] + pad_x,
@@ -3917,13 +3916,9 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         composer_screen_pos[0] + width - pad_x,
         composer_screen_pos[1] + height - pad_y - bottom_h - bottom_gap,
     };
-    const send_min = .{
-        composer_screen_pos[0] + width - pad_x - send_btn_size,
-        composer_screen_pos[1] + height - pad_y - send_btn_size,
-    };
-    const send_max = .{ send_min[0] + send_btn_size, send_min[1] + send_btn_size };
 
     state.syncPowderComposerFromDraft();
+    state.syncPowderComposerControls();
     if (state.consumeComposerFocusRequest()) {
         state.powder_composer.focused = true;
         state.composer_focused = true;
@@ -3934,10 +3929,9 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         state.terminal_focused = false;
     }
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
-    state.setComposerSendButtonBounds(send_min, send_max);
     state.powder_composer.tick(16);
     const submitted = state.powder_composer.submitted;
-    queuePowderComposerIsland(state, composer_screen_pos, width, height, input_rect_min, input_rect_max, send_min, send_max);
+    queuePowderComposerIsland(state, composer_screen_pos, width, height, input_rect_min, input_rect_max);
     state.updateFileSearch();
     const pending = runtime.isSendPending(state);
     if (submitted and !pending) {
@@ -3963,8 +3957,6 @@ fn queuePowderComposerIsland(
     height: f32,
     input_rect_min: [2]f32,
     input_rect_max: [2]f32,
-    send_min: [2]f32,
-    send_max: [2]f32,
 ) void {
     const allocator = state.allocator;
     const card_rect: powder.Rect = .{ .x = composer_screen_pos[0], .y = composer_screen_pos[1], .w = width, .h = height };
@@ -3987,50 +3979,108 @@ fn queuePowderComposerIsland(
         return;
     };
 
-    const thread = state.currentThread();
-    var label_buf: [256]u8 = undefined;
-    const model = chat_threads.selectedModelLabel(app_state.ModelOption, thread, state.opencodeModelOptionsSnapshot(), app_state.CODEX_MODEL_OPTIONS[0..]);
-    const reasoning = chat_threads.selectedReasoningLabel(app_state.ReasoningOption, thread, app_state.CODEX_REASONING_OPTIONS[0..]);
-    const fast = if (thread.fast_mode == .on) "Fast" else "Default";
-    const access = chat_threads.accessModeLabel(thread.access_mode);
-    const meta = std.fmt.bufPrint(&label_buf, "{s}  |  {s}  |  {s}  |  {s}  |  {s}", .{
-        chat_threads.providerLabel(thread.provider),
-        model,
-        reasoning,
-        fast,
-        access,
-    }) catch "";
-    const meta_rect: powder.Rect = .{
-        .x = composer_screen_pos[0] + theme.scaledUi(30.0),
-        .y = composer_screen_pos[1] + height - theme.scaledUi(33.0),
-        .w = @max(send_min[0] - composer_screen_pos[0] - theme.scaledUi(42.0), 0.0),
-        .h = theme.scaledUi(22.0),
-    };
-    queuePowderText(state, meta_rect, meta, powderColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), meta_rect);
+    queuePowderComposerControls(state, composer_screen_pos, height, input_rect_min, input_rect_max);
 
     if (runtime.isSendPending(state)) {
         if (state.pendingFollowupHint()) |hint| {
             const hint_rect: powder.Rect = .{
                 .x = input_rect_min[0],
-                .y = send_min[1] - theme.scaledUi(22.0),
+                .y = composer_screen_pos[1] + height - theme.scaledUi(64.0),
                 .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
                 .h = theme.scaledUi(18.0),
             };
             queuePowderText(state, hint_rect, hint, powderColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), hint_rect);
         }
     }
+}
 
-    const send_rect: powder.Rect = .{ .x = send_min[0], .y = send_min[1], .w = send_max[0] - send_min[0], .h = send_max[1] - send_min[1] };
-    const send_color = if (runtime.isSendPending(state))
-        powderColor(colors.rgba(80, 72, 24, 255))
-    else if (state.composer_send_pressed)
-        powderColor(theme.darken(theme.COLOR_SECONDARY_GREEN, 0.12))
-    else if (state.composer_send_hovered)
-        powderColor(theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12))
-    else
-        powderColor(theme.COLOR_SECONDARY_GREEN);
-    state.powder_overlay_batch.rect(allocator, send_rect, send_color) catch return;
-    queuePowderText(state, .{ .x = send_rect.x + theme.scaledUi(7.0), .y = send_rect.y + theme.scaledUi(8.0), .w = send_rect.w, .h = send_rect.h }, if (runtime.isSendPending(state)) "STOP" else "SEND", powderColor(theme.COLOR_WHITE), theme.scaledUi(10.0), send_rect);
+fn queuePowderComposerControls(
+    state: *app_state.AppState,
+    composer_screen_pos: [2]f32,
+    height: f32,
+    input_rect_min: [2]f32,
+    input_rect_max: [2]f32,
+) void {
+    const allocator = state.allocator;
+    const gap = theme.scaledUi(6.0);
+    const control_h = theme.scaledUi(28.0);
+    const left = input_rect_min[0];
+    const right = input_rect_max[0];
+    const send_w = theme.scaledUi(42.0);
+    const narrow = (right - left) < theme.scaledUi(520.0);
+
+    var provider_rect: powder.Rect = undefined;
+    var model_rect: powder.Rect = undefined;
+    var reasoning_rect: powder.Rect = undefined;
+    var fast_rect: powder.Rect = undefined;
+    var access_rect: powder.Rect = undefined;
+    var send_rect: powder.Rect = undefined;
+
+    if (narrow) {
+        const row1_y = composer_screen_pos[1] + height - theme.scaledUi(76.0);
+        const row2_y = composer_screen_pos[1] + height - theme.scaledUi(40.0);
+        send_rect = .{ .x = right - send_w, .y = row2_y, .w = send_w, .h = control_h };
+        provider_rect = .{ .x = left, .y = row1_y, .w = theme.scaledUi(62.0), .h = control_h };
+        model_rect = .{ .x = provider_rect.x + provider_rect.w + gap, .y = row1_y, .w = @max(right - provider_rect.x - provider_rect.w - gap, theme.scaledUi(90.0)), .h = control_h };
+        reasoning_rect = .{ .x = left, .y = row2_y, .w = theme.scaledUi(78.0), .h = control_h };
+        fast_rect = .{ .x = reasoning_rect.x + reasoning_rect.w + gap, .y = row2_y, .w = theme.scaledUi(56.0), .h = control_h };
+        access_rect = .{ .x = fast_rect.x + fast_rect.w + gap, .y = row2_y, .w = @max(send_rect.x - fast_rect.x - fast_rect.w - gap * 2.0, theme.scaledUi(64.0)), .h = control_h };
+    } else {
+        const control_y = composer_screen_pos[1] + height - theme.scaledUi(44.0);
+        send_rect = .{ .x = right - send_w, .y = control_y, .w = send_w, .h = control_h };
+        var x = left;
+        const row_available_w = @max(send_rect.x - left - gap, 0.0);
+        const provider_w = @min(theme.scaledUi(112.0), row_available_w * 0.18);
+        const model_w = @max(theme.scaledUi(120.0), row_available_w * 0.30);
+        const reasoning_w = theme.scaledUi(96.0);
+        const fast_w = theme.scaledUi(70.0);
+        const access_w = theme.scaledUi(112.0);
+
+        provider_rect = .{ .x = x, .y = control_y, .w = provider_w, .h = control_h };
+        x += provider_w + gap;
+        model_rect = .{ .x = x, .y = control_y, .w = @min(model_w, @max(send_rect.x - x - gap * 4.0 - reasoning_w - fast_w - access_w, theme.scaledUi(90.0))), .h = control_h };
+        x += model_rect.w + gap;
+        reasoning_rect = .{ .x = x, .y = control_y, .w = reasoning_w, .h = control_h };
+        x += reasoning_w + gap;
+        fast_rect = .{ .x = x, .y = control_y, .w = fast_w, .h = control_h };
+        x += fast_w + gap;
+        access_rect = .{ .x = x, .y = control_y, .w = @max(@min(access_w, send_rect.x - x - gap), theme.scaledUi(72.0)), .h = control_h };
+    }
+
+    setPowderSelectRects(&state.powder_provider_select, provider_rect, 2);
+    setPowderSelectRects(&state.powder_model_select, model_rect, @max(state.powder_model_select.item_count, 1));
+    setPowderSelectRects(&state.powder_reasoning_select, reasoning_rect, app_state.CODEX_REASONING_OPTIONS.len);
+    setPowderSelectRects(&state.powder_fast_select, fast_rect, 2);
+    setPowderSelectRects(&state.powder_access_select, access_rect, 2);
+    state.powder_send_button.setBounds(send_rect);
+    state.powder_stop_button.setBounds(send_rect);
+
+    state.powder_provider_select.render(allocator, &state.powder_overlay_batch) catch return;
+    state.powder_model_select.render(allocator, &state.powder_overlay_batch) catch return;
+    state.powder_reasoning_select.render(allocator, &state.powder_overlay_batch) catch return;
+    state.powder_fast_select.render(allocator, &state.powder_overlay_batch) catch return;
+    state.powder_access_select.render(allocator, &state.powder_overlay_batch) catch return;
+    if (runtime.isSendPending(state)) {
+        state.powder_stop_button.render(allocator, &state.powder_overlay_batch) catch return;
+    } else {
+        state.powder_send_button.render(allocator, &state.powder_overlay_batch) catch return;
+    }
+}
+
+fn composerControlsHeight(width: f32) f32 {
+    return if (width < theme.scaledUi(520.0)) theme.scaledUi(78.0) else theme.scaledUi(42.0);
+}
+
+fn setPowderSelectRects(select: anytype, rect: powder.Rect, item_count: usize) void {
+    const rows = @min(@as(usize, 6), @max(item_count, 1));
+    const menu_h = theme.scaledUi(18.0) + theme.scaledUi(30.0) * @as(f32, @floatFromInt(rows));
+    select.setBounds(rect);
+    select.setMenuBounds(.{
+        .x = rect.x,
+        .y = rect.y - menu_h - theme.scaledUi(6.0),
+        .w = rect.w,
+        .h = menu_h,
+    });
 }
 
 fn queuePowderBorder(state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
