@@ -4,6 +4,10 @@ const Self = @This();
 const std = @import("std");
 
 const draw = @import("../draw.zig");
+const clipboard = @import("../input/clipboard.zig");
+const key_input = @import("../input/key.zig");
+const scroll = @import("../scroll.zig");
+const selection_input = @import("../input/selection.zig");
 const sdl = @import("../sdl.zig");
 
 pub const TextAreaConfig = struct {
@@ -54,30 +58,7 @@ pub const MouseWheel = struct {
     y: f32,
 };
 
-pub const Key = struct {
-    code: Code,
-    shift: bool = false,
-    primary: bool = false,
-    alt: bool = false,
-
-    pub const Code = enum {
-        left,
-        right,
-        up,
-        down,
-        home,
-        end,
-        backspace,
-        delete,
-        enter,
-        page_up,
-        page_down,
-        a,
-        c,
-        v,
-        x,
-    };
-};
+pub const Key = key_input;
 
 pub const TextAreaAction = enum {
     default,
@@ -101,6 +82,14 @@ pub const TextAreaCallbacks = struct {
     validate_edit: ?*const fn (context: ?*anyopaque, current: []const u8, replacement: []const u8, start: usize, end: usize) bool = null,
     set_clipboard: ?*const fn (context: ?*anyopaque, text: []const u8) bool = null,
     get_clipboard: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+
+    fn clipboardProvider(self: TextAreaCallbacks) clipboard {
+        return .{
+            .context = self.context,
+            .set = self.set_clipboard,
+            .get = self.get_clipboard,
+        };
+    }
 };
 
 pub fn TextArea(comptime config: TextAreaConfig) type {
@@ -160,14 +149,9 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             return self.buffer.items.len == 0 and config.placeholder_text.len > 0;
         }
 
-        pub fn selection(self: *const Component) ?struct { start: usize, end: usize } {
-            const anchor = @min(self.selection_anchor orelse return null, self.buffer.items.len);
-            const focus = @min(self.selection_focus orelse return null, self.buffer.items.len);
-            if (anchor == focus) return null;
-            return if (anchor < focus)
-                .{ .start = anchor, .end = focus }
-            else
-                .{ .start = focus, .end = anchor };
+        pub fn selection(self: *const Component) ?selection_input.Range {
+            const state: selection_input = .{ .anchor = self.selection_anchor, .focus = self.selection_focus };
+            return state.normalized(self.buffer.items.len);
         }
 
         pub fn clearSelection(self: *Component) void {
@@ -180,22 +164,81 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn setScrollY(self: *Component, value: f32) void {
-            if (!config.scroll_enabled) {
-                self.scroll_y = 0.0;
-                return;
-            }
-            self.scroll_y = @min(@max(value, 0.0), self.maxScrollY());
+            self.scroll_y = scroll.clampOffsetY(value, self.scrollMetrics());
         }
 
         pub fn setCallbacks(self: *Component, callbacks: TextAreaCallbacks) void {
             self.callbacks = callbacks;
         }
 
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.bounds_rect;
+        }
+
+        pub fn textRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            return .{
+                .x = bounds_rect.x + config.padding_x,
+                .y = bounds_rect.y + config.padding_y,
+                .w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0),
+                .h = @max(bounds_rect.h - config.padding_y * 2.0, 0.0),
+            };
+        }
+
+        pub fn lineHeight(self: *const Component) f32 {
+            _ = self;
+            return Component.lineHeightValue();
+        }
+
+        pub fn glyphWidth(self: *const Component) f32 {
+            _ = self;
+            return Component.glyphWidthValue();
+        }
+
+        pub fn cursorRect(self: *const Component) draw.Rect {
+            const pos = self.cursorPosition();
+            return .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = self.lineHeight() };
+        }
+
+        pub fn contentHeight(self: *const Component) f32 {
+            const rows = self.visualCellForOffset(self.buffer.items.len).row + 1;
+            return @as(f32, @floatFromInt(rows)) * self.lineHeight();
+        }
+
+        pub fn maxScrollY(self: *const Component) f32 {
+            return scroll.maxOffsetY(self.scrollMetrics());
+        }
+
+        pub fn appendSelectionRects(self: *const Component, allocator: std.mem.Allocator, out: *std.ArrayList(draw.Rect)) !void {
+            const range = self.selection() orelse return;
+            const start_pos = self.positionForOffset(range.start);
+            const end_pos = self.positionForOffset(range.end);
+            if (start_pos.y == end_pos.y) {
+                if (clippedRect(.{ .x = start_pos.x, .y = start_pos.y, .w = @max(end_pos.x - start_pos.x, 2.0), .h = self.lineHeight() }, self.textRect())) |rect| {
+                    try out.append(allocator, rect);
+                }
+                return;
+            }
+            const text_rect = self.textRect();
+            if (clippedRect(.{ .x = start_pos.x, .y = start_pos.y, .w = text_rect.x + text_rect.w - start_pos.x, .h = self.lineHeight() }, text_rect)) |rect| {
+                try out.append(allocator, rect);
+            }
+            var y = start_pos.y + self.lineHeight();
+            while (y < end_pos.y) : (y += self.lineHeight()) {
+                if (clippedRect(.{ .x = text_rect.x, .y = y, .w = text_rect.w, .h = self.lineHeight() }, text_rect)) |rect| {
+                    try out.append(allocator, rect);
+                }
+            }
+            if (clippedRect(.{ .x = text_rect.x, .y = end_pos.y, .w = @max(end_pos.x - text_rect.x, 2.0), .h = self.lineHeight() }, text_rect)) |rect| {
+                try out.append(allocator, rect);
+            }
+        }
+
         pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
             switch (event.type) {
                 .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
                 .text_editing => return try self.handleInput(allocator, .{ .composition = std.mem.span(event.edit.text) }),
-                .key_down => return try self.handleInput(allocator, .{ .key = keyFromSdl(event.key) orelse return false }),
+                .key_down => return try self.handleInput(allocator, .{ .key = Key.fromSdl(event.key) orelse return false }),
                 .mouse_button_down => return try self.handleInput(allocator, .{ .mouse_down = .{ .point = .{ .x = event.button.x, .y = event.button.y }, .clicks = event.button.clicks } }),
                 .mouse_button_up => return try self.handleInput(allocator, .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
                 .mouse_wheel => return try self.handleInput(allocator, .{ .mouse_wheel = .{ .point = .{ .x = event.wheel.mouse_x, .y = event.wheel.mouse_y }, .y = event.wheel.y } }),
@@ -293,10 +336,21 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             if (self.selection()) |range| {
                 try self.renderSelection(allocator, batch, range.start, range.end);
             }
-            try batch.glyph(allocator, self.textRect(), .{}, if (self.placeholderVisible()) config.placeholder_color else config.text_color);
+            const text_rect = self.textRect();
+            try batch.fixedText(
+                allocator,
+                text_rect,
+                if (self.placeholderVisible()) config.placeholder_text else self.buffer.items,
+                if (self.placeholderVisible()) config.placeholder_color else config.text_color,
+                config.font_size,
+                text_rect,
+                .{ .y = if (self.placeholderVisible()) 0.0 else self.scroll_y },
+                self.glyphWidth(),
+                self.lineHeight(),
+                config.wrap,
+            );
             if (self.focused and self.cursor_visible) {
-                const pos = self.cursorPosition();
-                try self.addClippedCommand(allocator, batch, .cursor, .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = self.lineHeight() }, config.cursor_color);
+                try self.addClippedCommand(allocator, batch, .cursor, self.cursorRect(), config.cursor_color);
             }
             try self.renderScrollbar(allocator, batch);
         }
@@ -332,10 +386,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             if (key.primary and key.code == .x) return if (config.read_only) false else try self.cutSelection(allocator);
             if (key.primary and key.code == .v) return if (config.read_only) false else try self.pasteClipboard(allocator);
             switch (key.code) {
-                .left => self.moveCursor(if (key.primary or key.alt) previousWordOffset(self.buffer.items, self.cursor) else previousOffset(self.buffer.items, self.cursor), key.shift),
-                .right => self.moveCursor(if (key.primary or key.alt) nextWordOffset(self.buffer.items, self.cursor) else nextOffset(self.buffer.items, self.cursor), key.shift),
-                .home => self.moveCursor(if (key.primary) @as(usize, 0) else lineStart(self.buffer.items, self.cursor), key.shift),
-                .end => self.moveCursor(if (key.primary) self.buffer.items.len else lineEnd(self.buffer.items, self.cursor), key.shift),
+                .left => self.moveCursor(if (key.primary or key.alt) selection_input.previousWordOffset(self.buffer.items, self.cursor) else selection_input.previousOffset(self.buffer.items, self.cursor), key.shift),
+                .right => self.moveCursor(if (key.primary or key.alt) selection_input.nextWordOffset(self.buffer.items, self.cursor) else selection_input.nextOffset(self.buffer.items, self.cursor), key.shift),
+                .home => self.moveCursor(if (key.primary) @as(usize, 0) else selection_input.lineStart(self.buffer.items, self.cursor), key.shift),
+                .end => self.moveCursor(if (key.primary) self.buffer.items.len else selection_input.lineEnd(self.buffer.items, self.cursor), key.shift),
                 .up => self.moveCursor(self.verticalMove(-1), key.shift),
                 .down => self.moveCursor(self.verticalMove(1), key.shift),
                 .page_up => self.moveCursor(self.pageMove(-1), key.shift),
@@ -389,7 +443,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             self.normalizeState();
             if (self.selection()) |_| return self.replaceSelectionOrInsert(allocator, "");
             if (self.cursor == 0) return;
-            const start = previousOffset(self.buffer.items, self.cursor);
+            const start = selection_input.previousOffset(self.buffer.items, self.cursor);
             self.buffer.replaceRange(allocator, start, self.cursor - start, "") catch |err| return err;
             self.cursor = start;
             self.ensureCursorVisible();
@@ -400,7 +454,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             self.normalizeState();
             if (self.selection()) |_| return self.replaceSelectionOrInsert(allocator, "");
             if (self.cursor >= self.buffer.items.len) return;
-            const end = nextOffset(self.buffer.items, self.cursor);
+            const end = selection_input.nextOffset(self.buffer.items, self.cursor);
             self.buffer.replaceRange(allocator, self.cursor, end - self.cursor, "") catch |err| return err;
             self.ensureCursorVisible();
             self.emit(.{ .changed = self.buffer.items });
@@ -420,8 +474,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         fn copySelection(self: *Component, allocator: std.mem.Allocator) bool {
             _ = allocator;
             const range = self.selection() orelse return false;
-            const callback = self.callbacks.set_clipboard orelse return false;
-            return callback(self.callbacks.context, self.buffer.items[range.start..range.end]);
+            return self.callbacks.clipboardProvider().write(self.buffer.items[range.start..range.end]);
         }
 
         fn cutSelection(self: *Component, allocator: std.mem.Allocator) !bool {
@@ -431,8 +484,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn pasteClipboard(self: *Component, allocator: std.mem.Allocator) !bool {
-            const callback = self.callbacks.get_clipboard orelse return false;
-            const clipboard_text = callback(self.callbacks.context, allocator) orelse return false;
+            const clipboard_text = self.callbacks.clipboardProvider().read(allocator) orelse return false;
             defer allocator.free(clipboard_text);
             if (clipboard_text.len == 0) return false;
             try self.replaceSelectionOrInsert(allocator, clipboard_text);
@@ -455,12 +507,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         fn normalizeState(self: *Component) void {
             self.cursor = @min(self.cursor, self.buffer.items.len);
-            if (self.selection_anchor) |anchor| {
-                self.selection_anchor = @min(anchor, self.buffer.items.len);
-            }
-            if (self.selection_focus) |focus| {
-                self.selection_focus = @min(focus, self.buffer.items.len);
-            }
+            var state: selection_input = .{ .anchor = self.selection_anchor, .focus = self.selection_focus };
+            state.clamp(self.buffer.items.len);
+            self.selection_anchor = state.anchor;
+            self.selection_focus = state.focus;
             self.setScrollY(self.scroll_y);
         }
 
@@ -469,13 +519,9 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn dragScrollbarTo(self: *Component, y: f32) void {
-            const max_scroll = self.maxScrollY();
-            if (max_scroll <= 0.0) return;
             const track = self.scrollbarTrackRect();
             const thumb = self.scrollbarThumbRect() orelse return;
-            const travel = @max(track.h - thumb.h, 1.0);
-            const thumb_y = @min(@max(y - self.scrollbar_drag_offset_y, track.y), track.y + travel);
-            self.setScrollY(((thumb_y - track.y) / travel) * max_scroll);
+            self.setScrollY(scroll.offsetForThumbY(y, self.scrollbar_drag_offset_y, track, thumb, self.scrollMetrics()));
         }
 
         fn autoScrollForDrag(self: *Component, point: draw.Vec2) void {
@@ -488,15 +534,15 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn selectWordAt(self: *Component, offset: usize) void {
-            const range = wordRangeAt(self.buffer.items, offset);
+            const range = selection_input.wordRangeAt(self.buffer.items, offset);
             self.selection_anchor = range.start;
             self.selection_focus = range.end;
             self.cursor = range.end;
         }
 
         fn selectLineAt(self: *Component, offset: usize) void {
-            const start = lineStart(self.buffer.items, offset);
-            var end = lineEnd(self.buffer.items, offset);
+            const start = selection_input.lineStart(self.buffer.items, offset);
+            var end = selection_input.lineEnd(self.buffer.items, offset);
             if (end < self.buffer.items.len) end += 1;
             self.selection_anchor = start;
             self.selection_focus = end;
@@ -552,20 +598,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn scrollbarThumbRect(self: *const Component) ?draw.Rect {
-            const max_scroll = self.maxScrollY();
-            if (!config.scroll_enabled or max_scroll <= 0.0 or config.scrollbar_width <= 0.0) return null;
-            const track = self.scrollbarTrackRect();
-            const content_height = self.contentHeight();
-            const visible_height = self.visibleTextHeight();
-            const thumb_h = @max((visible_height / content_height) * track.h, @min(track.h, self.lineHeight()));
-            const travel = @max(track.h - thumb_h, 0.0);
-            const thumb_y = track.y + if (max_scroll > 0.0) (self.scroll_y / max_scroll) * travel else 0.0;
-            return .{
-                .x = track.x,
-                .y = thumb_y,
-                .w = track.w,
-                .h = thumb_h,
-            };
+            return scroll.thumbRect(self.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
         }
 
         fn byteOffsetForPoint(self: *const Component, point: draw.Vec2) usize {
@@ -597,7 +630,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     }
                     col += 1;
                 }
-                index = nextOffset(self.buffer.items, index);
+                index = selection_input.nextOffset(self.buffer.items, index);
             }
             return self.positionForVisualCell(row, col);
         }
@@ -634,7 +667,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     }
                     col += 1;
                 }
-                index = nextOffset(self.buffer.items, index);
+                index = selection_input.nextOffset(self.buffer.items, index);
             }
             return .{ .row = row, .col = col };
         }
@@ -649,7 +682,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     if (row == target_row) return index;
                     row += 1;
                     col = 0;
-                    index = nextOffset(self.buffer.items, index);
+                    index = selection_input.nextOffset(self.buffer.items, index);
                     continue;
                 }
                 if (self.shouldWrapColumn(col)) {
@@ -659,15 +692,16 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     if (row == target_row and col >= target_col) return index;
                 }
                 col += 1;
-                index = nextOffset(self.buffer.items, index);
+                index = selection_input.nextOffset(self.buffer.items, index);
             }
             return self.buffer.items.len;
         }
 
         fn positionForVisualCell(self: *const Component, row: usize, col: usize) draw.Vec2 {
+            const text_rect = self.textRect();
             return .{
-                .x = self.textRect().x + @as(f32, @floatFromInt(col)) * self.glyphWidth(),
-                .y = self.textRect().y + @as(f32, @floatFromInt(row)) * self.lineHeight() - self.scroll_y,
+                .x = text_rect.x + @as(f32, @floatFromInt(col)) * self.glyphWidth(),
+                .y = text_rect.y + @as(f32, @floatFromInt(row)) * self.lineHeight() - self.scroll_y,
             };
         }
 
@@ -689,14 +723,14 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             self.setScrollY(self.scroll_y);
         }
 
-        fn maxScrollY(self: *const Component) f32 {
-            if (!config.scroll_enabled) return 0.0;
-            return @max(self.contentHeight() - self.visibleTextHeight(), 0.0);
-        }
-
-        fn contentHeight(self: *const Component) f32 {
-            const rows = self.visualCellForOffset(self.buffer.items.len).row + 1;
-            return @as(f32, @floatFromInt(rows)) * self.lineHeight();
+        fn scrollMetrics(self: *const Component) scroll.Metrics {
+            return .{
+                .enabled = config.scroll_enabled,
+                .content_height = self.contentHeight(),
+                .visible_height = self.visibleTextHeight(),
+                .line_height = self.lineHeight(),
+                .scrollbar_width = config.scrollbar_width,
+            };
         }
 
         fn shouldWrapColumn(self: *const Component, col: usize) bool {
@@ -709,73 +743,18 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             return @max(@as(usize, @intFromFloat(@floor(inner_width / self.glyphWidth()))), 1);
         }
 
-        fn bounds(self: *const Component) draw.Rect {
-            return self.bounds_rect;
-        }
-
-        fn textRect(self: *const Component) draw.Rect {
-            const bounds_rect = self.bounds();
-            return .{
-                .x = bounds_rect.x + config.padding_x,
-                .y = bounds_rect.y + config.padding_y,
-                .w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0),
-                .h = @max(bounds_rect.h - config.padding_y * 2.0, 0.0),
-            };
-        }
-
         fn visibleTextHeight(self: *const Component) f32 {
             return @max(self.textRect().h, self.lineHeight());
         }
 
-        fn lineHeight(_: *const Component) f32 {
+        fn lineHeightValue() f32 {
             return config.line_height orelse config.font_size * 1.25;
         }
 
-        fn glyphWidth(_: *const Component) f32 {
+        fn glyphWidthValue() f32 {
             return config.glyph_width orelse config.font_size * 0.55;
         }
     };
-}
-
-fn keyFromSdl(event: sdl.KeyboardEvent) ?Key {
-    const mod_bits = event.mod;
-    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
-    const shift = (mod_bits & sdl.Keymod.shift) != 0;
-    const alt = (mod_bits & sdl.Keymod.alt) != 0;
-    const code: Key.Code = switch (event.key) {
-        .left => .left,
-        .right => .right,
-        .up => .up,
-        .down => .down,
-        .home => .home,
-        .end => .end,
-        .pageup => .page_up,
-        .pagedown => .page_down,
-        .backspace => .backspace,
-        .delete => .delete,
-        .@"return", .kp_enter => .enter,
-        .a => .a,
-        .c => .c,
-        .v => .v,
-        .x => .x,
-        else => return null,
-    };
-    return .{ .code = code, .shift = shift, .primary = primary, .alt = alt };
-}
-
-fn previousOffset(text: []const u8, offset: usize) usize {
-    if (offset == 0) return 0;
-    var cursor = offset - 1;
-    while (cursor > 0 and (text[cursor] & 0b1100_0000) == 0b1000_0000) {
-        cursor -= 1;
-    }
-    return cursor;
-}
-
-fn nextOffset(text: []const u8, offset: usize) usize {
-    if (offset >= text.len) return text.len;
-    const len = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
-    return @min(offset + len, text.len);
 }
 
 fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
@@ -785,64 +764,6 @@ fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
     const y1 = @min(rect.y + rect.h, clip.y + clip.h);
     if (x1 <= x0 or y1 <= y0) return null;
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
-}
-
-fn lineStart(text: []const u8, offset: usize) usize {
-    var cursor = @min(offset, text.len);
-    while (cursor > 0 and text[cursor - 1] != '\n') cursor -= 1;
-    return cursor;
-}
-
-fn lineEnd(text: []const u8, offset: usize) usize {
-    return std.mem.indexOfScalarPos(u8, text, @min(offset, text.len), '\n') orelse text.len;
-}
-
-fn isWordByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
-}
-
-fn previousWordOffset(text: []const u8, offset: usize) usize {
-    var cursor = @min(offset, text.len);
-    while (cursor > 0 and !isWordByte(text[cursor - 1])) cursor -= 1;
-    while (cursor > 0 and isWordByte(text[cursor - 1])) cursor -= 1;
-    return cursor;
-}
-
-fn nextWordOffset(text: []const u8, offset: usize) usize {
-    var cursor = @min(offset, text.len);
-    while (cursor < text.len and isWordByte(text[cursor])) cursor += 1;
-    while (cursor < text.len and !isWordByte(text[cursor])) cursor += 1;
-    return cursor;
-}
-
-fn wordRangeAt(text: []const u8, offset: usize) struct { start: usize, end: usize } {
-    if (text.len == 0) return .{ .start = 0, .end = 0 };
-    var cursor = @min(offset, text.len - 1);
-    if (!isWordByte(text[cursor]) and cursor > 0 and isWordByte(text[cursor - 1])) cursor -= 1;
-    if (!isWordByte(text[cursor])) return .{ .start = cursor, .end = @min(cursor + 1, text.len) };
-    var start = cursor;
-    while (start > 0 and isWordByte(text[start - 1])) start -= 1;
-    var end = cursor;
-    while (end < text.len and isWordByte(text[end])) end += 1;
-    return .{ .start = start, .end = end };
-}
-
-fn visualColumn(line_prefix: []const u8) usize {
-    var index: usize = 0;
-    var column: usize = 0;
-    while (index < line_prefix.len) : (column += 1) {
-        index = nextOffset(line_prefix, index);
-    }
-    return column;
-}
-
-fn offsetAtColumn(text: []const u8, start: usize, end: usize, target_column: usize) usize {
-    var offset = start;
-    var column: usize = 0;
-    while (offset < end and column < target_column) : (column += 1) {
-        offset = nextOffset(text, offset);
-    }
-    return offset;
 }
 
 test "text area edits retained buffer" {
@@ -996,6 +917,37 @@ test "text area scrolls cursor into visible bounds" {
     try std.testing.expectEqual(draw.CommandKind.cursor, cursor.kind);
     try std.testing.expect(cursor.rect.y >= 0);
     try std.testing.expect(cursor.rect.y + cursor.rect.h <= 24);
+}
+
+test "text area render emits self-contained text command" {
+    const Area = TextArea(.{ .x = 5, .y = 7, .width = 120, .height = 48, .padding_x = 3, .padding_y = 4, .font_size = 10, .glyph_width = 5, .line_height = 12, .placeholder_text = "empty" });
+    var area = try Area.init(std.testing.allocator, "");
+    defer area.deinit(std.testing.allocator);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try area.render(std.testing.allocator, &batch);
+
+    var text_command: ?draw.Command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqualStrings("empty", text_command.?.text);
+    try std.testing.expectEqual(area.textRect(), text_command.?.rect);
+    try std.testing.expectEqual(area.textRect(), text_command.?.clip.?);
+    try std.testing.expectEqual(area.glyphWidth(), text_command.?.glyph_width);
+    try std.testing.expectEqual(area.lineHeight(), text_command.?.line_height);
+
+    batch.clear();
+    area.focused = true;
+    try std.testing.expect(try area.handleInput(std.testing.allocator, .{ .text = "hello\nworld" }));
+    try area.render(std.testing.allocator, &batch);
+    text_command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expectEqualStrings(area.text(), text_command.?.text);
 }
 
 test "text area renders scrollbar only when content overflows" {

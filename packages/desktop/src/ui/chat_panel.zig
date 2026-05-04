@@ -4095,26 +4095,22 @@ fn renderPowderComposer(state: *app_state.AppState, input_rect_min: [2]f32, inpu
             .selection => drawPowderRect(draw_list, command.rect, command.color),
             .cursor => drawPowderRect(draw_list, command.rect, command.color),
             .scrollbar => drawPowderRect(draw_list, command.rect, command.color),
-            .glyph => drawPowderComposerText(draw_list, state, command.rect, command.color),
+            .text => drawPowderComposerText(draw_list, command),
         }
     }
 }
 
-fn drawPowderComposerText(draw_list: zgui.DrawList, state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
-    const text = if (state.powder_composer.placeholderVisible())
-        state.powder_composer.placeholder()
-    else
-        state.powder_composer.text();
-    if (text.len == 0) return;
+fn drawPowderComposerText(draw_list: zgui.DrawList, command: powder.draw.Command) void {
+    if (command.text.len == 0) return;
 
     draw_list.addTextExtendedUnformatted(
-        .{ rect.x, rect.y - state.powder_composer.scrollY() },
-        zgui.colorConvertFloat4ToU32(powderColor(color)),
-        text,
+        .{ command.rect.x - command.scroll.x, command.rect.y - command.scroll.y },
+        zgui.colorConvertFloat4ToU32(powderColor(command.color)),
+        command.text,
         .{
             .font = zgui.getFont(),
-            .font_size = zgui.getFontSize(),
-            .wrap_width = @max(rect.w, theme.scaledUi(40.0)),
+            .font_size = command.font_size,
+            .wrap_width = @max(command.rect.w, theme.scaledUi(40.0)),
         },
     );
 }
