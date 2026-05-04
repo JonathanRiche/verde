@@ -153,6 +153,86 @@ pub fn sdlDebugRenderer(allocator: std.mem.Allocator, sdl_renderer: *sdl.Rendere
     return .{ .allocator = allocator, .renderer = sdl_renderer };
 }
 
+pub const SdlFontRenderer = struct {
+    renderer: *sdl.Renderer,
+    font: *sdl.Font,
+    current_font_size: f32,
+
+    pub fn renderBatch(self: *SdlFontRenderer, batch: *const draw.RenderBatch) !void {
+        for (batch.commands.items) |command| {
+            switch (command.kind) {
+                .rect, .cursor, .selection, .scrollbar => try self.renderRect(command),
+                .text => try self.renderText(command),
+            }
+        }
+    }
+
+    pub fn renderLine(self: *SdlFontRenderer, x: f32, y: f32, value: []const u8, color: draw.Color, font_size: f32) !void {
+        try self.setFontSize(font_size);
+        const surface = try sdl.ttfRenderTextBlended(self.font, value, colorToSdl(color));
+        defer sdl.destroySurface(surface);
+        const texture = try sdl.createTextureFromSurface(self.renderer, surface);
+        defer sdl.destroyTexture(texture);
+        try sdl.renderTexture(self.renderer, texture, .{
+            .x = x,
+            .y = y,
+            .w = @floatFromInt(surface.w),
+            .h = @floatFromInt(surface.h),
+        });
+    }
+
+    fn renderRect(self: *SdlFontRenderer, command: draw.Command) !void {
+        const color = colorBytes(command.color);
+        if (color[3] == 0) return;
+        try sdl.setRenderDrawColor(self.renderer, color[0], color[1], color[2], color[3]);
+        try sdl.renderFillRect(self.renderer, .{
+            .x = command.rect.x,
+            .y = command.rect.y,
+            .w = command.rect.w,
+            .h = command.rect.h,
+        });
+    }
+
+    fn renderText(self: *SdlFontRenderer, command: draw.Command) !void {
+        if (command.text.len == 0 or command.color.a <= 0.0) return;
+        if (command.clip) |clip| try sdl.setRenderClipRect(self.renderer, rectToSdl(clip));
+        defer if (command.clip != null) sdl.setRenderClipRect(self.renderer, null) catch {};
+
+        const wrap_columns = if (command.wrap)
+            @max(@as(usize, @intFromFloat(@floor(command.rect.w / @max(command.glyph_width, 1.0)))), 1)
+        else
+            std.math.maxInt(usize);
+        var row: usize = 0;
+        var start: usize = 0;
+        while (start <= command.text.len) {
+            const hard_end = std.mem.indexOfScalarPos(u8, command.text, start, '\n') orelse command.text.len;
+            var line_start = start;
+            while (line_start <= hard_end) {
+                const line_end = visualLineEnd(command.text[line_start..hard_end], wrap_columns) + line_start;
+                const y = command.rect.y + @as(f32, @floatFromInt(row)) * command.line_height - command.scroll.y;
+                if (command.clip == null or rectIntersectsY(command.clip.?, y, command.line_height)) {
+                    try self.renderLine(command.rect.x - command.scroll.x, y, command.text[line_start..line_end], command.color, command.font_size);
+                }
+                row += 1;
+                if (line_end >= hard_end) break;
+                line_start = line_end;
+            }
+            if (hard_end == command.text.len) break;
+            start = hard_end + 1;
+        }
+    }
+
+    fn setFontSize(self: *SdlFontRenderer, font_size: f32) !void {
+        if (@abs(self.current_font_size - font_size) < 0.01) return;
+        try sdl.ttfSetFontSize(self.font, font_size);
+        self.current_font_size = font_size;
+    }
+};
+
+pub fn sdlFontRenderer(sdl_renderer: *sdl.Renderer, font: *sdl.Font, point_size: f32) SdlFontRenderer {
+    return .{ .renderer = sdl_renderer, .font = font, .current_font_size = point_size };
+}
+
 /// Converts retained render commands into indexed quads ready for GPU upload.
 pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, mesh: *Mesh) !void {
     mesh.clear();
@@ -212,6 +292,11 @@ fn rectToSdl(rect: draw.Rect) sdl.Rect {
 
 fn colorBytes(color: draw.Color) [4]u8 {
     return .{ colorByte(color.r), colorByte(color.g), colorByte(color.b), colorByte(color.a) };
+}
+
+fn colorToSdl(color: draw.Color) sdl.Color {
+    const bytes = colorBytes(color);
+    return .{ .r = bytes[0], .g = bytes[1], .b = bytes[2], .a = bytes[3] };
 }
 
 fn colorByte(value: f32) u8 {
