@@ -15,6 +15,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const powder_gl_renderer = @import("ui/powder_gl_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
 
@@ -138,6 +139,8 @@ pub fn main(init: std.process.Init) !void {
     // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
     zgui.backend.init(window, gl_context);
     defer zgui.backend.deinit();
+    var powder_renderer = powder_gl_renderer.Renderer.init();
+    defer powder_renderer.deinit(allocator);
 
     var ui_scale = currentWindowDisplayScale(window);
     // Apply the global ImGui style after the display scale is known.
@@ -215,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
                 zgui.backend.newFrame(@intCast(framebuffer_width.*), @intCast(framebuffer_height.*));
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
+        state.powder_overlay_batch.clear();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
@@ -230,10 +234,22 @@ pub fn main(init: std.process.Init) !void {
         glClearColor(ui_theme.COLOR_BLACK[0], ui_theme.COLOR_BLACK[1], ui_theme.COLOR_BLACK[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
         recordSpan(&frame_sample, .draw_backend, struct {
-            fn run() void {
+            fn run(
+                powder_command_renderer: *powder_gl_renderer.Renderer,
+                app_state: *AppState,
+                allocator_arg: std.mem.Allocator,
+                framebuffer_width: c_int,
+                framebuffer_height: c_int,
+            ) void {
                 zgui.backend.draw();
+                powder_command_renderer.renderBatch(
+                    allocator_arg,
+                    &app_state.powder_overlay_batch,
+                    @floatFromInt(framebuffer_width),
+                    @floatFromInt(framebuffer_height),
+                ) catch |err| log.warn("failed to render powder overlay batch: {s}", .{@errorName(err)});
             }
-        }.run, .{});
+        }.run, .{ &powder_renderer, &state, allocator, fb_width, fb_height });
         const swap_start = profiler.nowNs();
         try sdl.gl.swapWindow(window);
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));

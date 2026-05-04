@@ -2,7 +2,6 @@
 
 const std = @import("std");
 
-const powder = @import("powder");
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
@@ -75,17 +74,6 @@ const TranscriptMarkdownSelectAllFrame = struct {
             .point = last,
         };
     }
-};
-
-const ComposerInputCallbackState = struct {
-    cursor_pos: usize = 0,
-    selection_start: usize = 0,
-    selection_end: usize = 0,
-};
-
-const WrappedComposerMetrics = struct {
-    cursor_offset: [2]f32,
-    total_height: f32,
 };
 
 // Renders the transcript, composer, and any bottom-docked workspace panels.
@@ -3972,7 +3960,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
     state.powder_composer.tick(16);
     const submitted = state.powder_composer.submitted;
-    renderPowderComposer(state, input_rect_min, input_rect_max);
+    queuePowderComposer(state);
     state.updateFileSearch();
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
@@ -4073,193 +4061,11 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     //NOTE: END OF Composer
 }
 
-fn renderPowderComposer(state: *app_state.AppState, input_rect_min: [2]f32, input_rect_max: [2]f32) void {
-    var batch: powder.RenderBatch = .{};
-    defer batch.deinit(state.allocator);
-    state.powder_composer.render(state.allocator, &batch) catch |err| {
+fn queuePowderComposer(state: *app_state.AppState) void {
+    state.powder_composer.render(state.allocator, &state.powder_overlay_batch) catch |err| {
         runtime.log.warn("failed to render powder composer: {s}", .{@errorName(err)});
         return;
     };
-
-    const draw_list = zgui.getWindowDrawList();
-    draw_list.pushClipRect(.{
-        .pmin = input_rect_min,
-        .pmax = input_rect_max,
-        .intersect_with_current = true,
-    });
-    defer draw_list.popClipRect();
-
-    for (batch.commands.items) |command| {
-        switch (command.kind) {
-            .rect => drawPowderRect(draw_list, command.rect, command.color),
-            .selection => drawPowderRect(draw_list, command.rect, command.color),
-            .cursor => drawPowderRect(draw_list, command.rect, command.color),
-            .scrollbar => drawPowderRect(draw_list, command.rect, command.color),
-            .text => drawPowderComposerText(draw_list, command),
-        }
-    }
-}
-
-fn drawPowderComposerText(draw_list: zgui.DrawList, command: powder.draw.Command) void {
-    if (command.text.len == 0) return;
-
-    draw_list.addTextExtendedUnformatted(
-        .{ command.rect.x - command.scroll.x, command.rect.y - command.scroll.y },
-        zgui.colorConvertFloat4ToU32(powderColor(command.color)),
-        command.text,
-        .{
-            .font = zgui.getFont(),
-            .font_size = command.font_size,
-            .wrap_width = @max(command.rect.w, theme.scaledUi(40.0)),
-        },
-    );
-}
-
-fn drawPowderRect(draw_list: zgui.DrawList, rect: powder.Rect, color: powder.Color) void {
-    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0) return;
-    draw_list.addRectFilled(.{
-        .pmin = .{ rect.x, rect.y },
-        .pmax = .{ rect.x + rect.w, rect.y + rect.h },
-        .col = zgui.colorConvertFloat4ToU32(powderColor(color)),
-    });
-}
-
-fn powderColor(color: powder.Color) [4]f32 {
-    return .{ color.r, color.g, color.b, color.a };
-}
-
-fn composerInputFlags() zgui.InputTextFlags {
-    return .{
-        .ctrl_enter_for_new_line = true,
-        .enter_returns_true = true,
-        .callback_always = true,
-    };
-}
-
-fn composerInputCallback(data: *zgui.InputTextCallbackData) callconv(.c) i32 {
-    const raw = data.user_data orelse return 0;
-    const state: *ComposerInputCallbackState = @ptrCast(@alignCast(raw));
-    state.cursor_pos = @max(0, data.cursor_pos);
-    state.selection_start = @max(0, data.selection_start);
-    state.selection_end = @max(0, data.selection_end);
-    return 0;
-}
-
-fn renderComposerDraftOverlay(state: *app_state.AppState, buf: [:0]const u8, cursor_pos: usize, focused: bool, input_rect_min: [2]f32, input_rect_max: [2]f32) void {
-    const draft = std.mem.sliceTo(buf, 0);
-
-    const draw_list = zgui.getWindowDrawList();
-    const overlay_padding = .{ theme.scaledUi(4.0), theme.scaledUi(6.0) };
-    const visible_height = @max(input_rect_max[1] - input_rect_min[1] - overlay_padding[1] * 2.0, zgui.getFontSize());
-    const wrap_width = @max(input_rect_max[0] - input_rect_min[0] - overlay_padding[0] * 2.0, theme.scaledUi(40.0));
-    const metrics = wrappedTextMetrics(draft, @min(cursor_pos, draft.len), wrap_width);
-    const max_scroll_y = @max(metrics.total_height - visible_height, 0.0);
-    var scroll_y = @min(state.composerOverlayScrollY(), max_scroll_y);
-    if (focused and state.shouldComposerOverlayFollowCursor(cursor_pos, draft.len)) {
-        const cursor_bottom = metrics.cursor_offset[1] + zgui.getFontSize();
-        if (cursor_bottom - scroll_y > visible_height) {
-            scroll_y = cursor_bottom - visible_height;
-        } else if (metrics.cursor_offset[1] < scroll_y) {
-            scroll_y = metrics.cursor_offset[1];
-        }
-        scroll_y = @min(@max(scroll_y, 0.0), max_scroll_y);
-    }
-    state.setComposerOverlayScrollY(scroll_y);
-
-    const text_pos = .{
-        input_rect_min[0] + overlay_padding[0],
-        input_rect_min[1] + overlay_padding[1] - scroll_y,
-    };
-
-    draw_list.pushClipRect(.{
-        .pmin = input_rect_min,
-        .pmax = input_rect_max,
-        .intersect_with_current = true,
-    });
-    defer draw_list.popClipRect();
-
-    if (draft.len > 0) {
-        draw_list.addTextExtendedUnformatted(
-            text_pos,
-            zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
-            draft,
-            .{
-                .font = zgui.getFont(),
-                .font_size = zgui.getFontSize(),
-                .wrap_width = wrap_width,
-            },
-        );
-    }
-
-    if (focused) {
-        const cursor_x = text_pos[0] + metrics.cursor_offset[0];
-        const cursor_y = text_pos[1] + metrics.cursor_offset[1];
-        draw_list.addLine(.{
-            .p1 = .{ cursor_x, cursor_y },
-            .p2 = .{ cursor_x, cursor_y + zgui.getFontSize() },
-            .col = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
-            .thickness = theme.scaledUi(1.4),
-        });
-    }
-}
-
-fn wrappedTextMetrics(text: []const u8, cursor_pos: usize, wrap_width: f32) WrappedComposerMetrics {
-    const font_size = zgui.getFontSize();
-    const cursor_at = @min(cursor_pos, text.len);
-    var index: usize = 0;
-    var line_width: f32 = 0.0;
-    var line_y: f32 = 0.0;
-    var total_height = font_size;
-    var cursor_offset: ?[2]f32 = if (cursor_at == 0) .{ 0.0, 0.0 } else null;
-    var last_break_width: ?f32 = null;
-
-    while (index < text.len) {
-        const next = nextUtf8ByteOffset(text, index, text.len);
-        if (text[index] == '\n') {
-            if (cursor_offset == null and cursor_at <= next) {
-                cursor_offset = .{ line_width, line_y };
-            }
-            line_width = 0.0;
-            line_y += font_size;
-            total_height += font_size;
-            index = next;
-            last_break_width = null;
-            continue;
-        }
-
-        const glyph_width = zgui.calcTextSize(text[index..next], .{})[0];
-        line_width += glyph_width;
-        if (std.ascii.isWhitespace(text[index])) {
-            last_break_width = line_width;
-        }
-
-        if (line_width > wrap_width and index > 0) {
-            if (last_break_width) |break_width| {
-                line_width = @max(line_width - break_width, 0.0);
-            } else {
-                line_width = glyph_width;
-            }
-            line_y += font_size;
-            total_height += font_size;
-            last_break_width = null;
-        }
-
-        if (cursor_offset == null and cursor_at <= next) {
-            cursor_offset = .{ line_width, line_y };
-        }
-        index = next;
-    }
-
-    return .{
-        .cursor_offset = cursor_offset orelse .{ line_width, line_y },
-        .total_height = total_height,
-    };
-}
-
-fn nextUtf8ByteOffset(text: []const u8, index: usize, end: usize) usize {
-    if (index >= end) return end;
-    const len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-    return @min(index + len, end);
 }
 
 fn renderComposerFileSearchResults(
