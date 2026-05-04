@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     const gpu_backends_step = b.step("test-gpu-backends", "Validate SDL_GPU Vulkan/Metal renderer coverage");
+    const compile_shader_steps = compileGpuShaders(b);
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
@@ -91,6 +92,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    exe_tests.step.dependOn(compile_shader_steps);
     test_step.dependOn(&run_exe_tests.step);
     gpu_backends_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
@@ -164,6 +166,30 @@ fn wireExampleRun(b: *std.Build, example: Example, run_step: *std.Build.Step, ex
         run_step.dependOn(&run_example.step);
         examples_step.dependOn(example.step);
     }
+}
+
+fn compileGpuShaders(b: *std.Build) *std.Build.Step {
+    const step = b.step("compile-gpu-shaders", "Compile Powder Vulkan SPIR-V shader assets");
+    const shaders = [_]struct {
+        stage: []const u8,
+        input: []const u8,
+        output: []const u8,
+    }{
+        .{ .stage = "vertex", .input = "src/shaders/ui.vert.glsl", .output = "src/shaders/ui.vert.spv" },
+        .{ .stage = "fragment", .input = "src/shaders/ui.solid.frag.glsl", .output = "src/shaders/ui.solid.frag.spv" },
+        .{ .stage = "fragment", .input = "src/shaders/ui.text.frag.glsl", .output = "src/shaders/ui.text.frag.spv" },
+    };
+    for (shaders) |shader| {
+        const compile = b.addSystemCommand(&.{
+            "glslc",
+            b.fmt("-fshader-stage={s}", .{shader.stage}),
+            shader.input,
+            "-o",
+            shader.output,
+        });
+        step.dependOn(&compile.step);
+    }
+    return step;
 }
 
 fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {

@@ -75,6 +75,8 @@ pub fn Select(comptime config: SelectConfig) type {
         scroll_y: f32 = 0.0,
         dragging_scrollbar: bool = false,
         scrollbar_drag_offset_y: f32 = 0.0,
+        rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
+        menu_rect: draw.Rect = .{ .x = config.x, .y = config.y + config.height, .w = config.width, .h = config.menu_height },
         callbacks: SelectCallbacks = .{},
 
         pub fn init(item_count: usize) Component {
@@ -101,6 +103,55 @@ pub fn Select(comptime config: SelectConfig) type {
             self.scroll_y = scroll.clampOffsetY(value, self.scrollMetrics());
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            const old = self.rect;
+            self.rect = rect;
+            self.menu_rect = .{ .x = rect.x, .y = rect.y + rect.h, .w = rect.w, .h = self.menu_rect.h };
+            if (old.w != rect.w or old.h != rect.h) self.setScrollY(self.scroll_y);
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn setMenuBounds(self: *Component, rect: draw.Rect) void {
+            self.menu_rect = rect;
+            self.setScrollY(self.scroll_y);
+        }
+
+        pub fn setItemCount(self: *Component, count: usize) void {
+            self.item_count = count;
+            self.normalizeState();
+        }
+
+        pub fn controlRect(self: *const Component) draw.Rect {
+            return self.bounds();
+        }
+
+        pub fn menuRect(self: *const Component) draw.Rect {
+            return self.menu_rect;
+        }
+
+        pub fn menuContentRect(self: *const Component) draw.Rect {
+            const menu = self.menuRect();
+            return .{
+                .x = menu.x + config.padding_x,
+                .y = menu.y + config.padding_y,
+                .w = @max(menu.w - config.padding_x * 2.0, 0.0),
+                .h = @max(menu.h - config.padding_y * 2.0, config.row_height),
+            };
+        }
+
+        pub fn rowRect(self: *const Component, index: usize) draw.Rect {
+            const content = self.menuContentRect();
+            return .{
+                .x = content.x,
+                .y = content.y + @as(f32, @floatFromInt(index)) * config.row_height - self.scroll_y,
+                .w = @max(content.w - self.scrollbarGutter(), 0.0),
+                .h = config.row_height,
+            };
+        }
+
         pub fn update(self: *Component, event: *const sdl.Event) !bool {
             switch (event.type) {
                 .key_down => return self.handleInput(.{ .key = Key.fromSdl(event.key) orelse return false }),
@@ -122,7 +173,7 @@ pub fn Select(comptime config: SelectConfig) type {
             switch (input) {
                 .key => |key| return self.handleKey(key),
                 .mouse_down => |mouse| {
-                    if (Component.controlRect().contains(mouse.point)) {
+                    if (self.controlRect().contains(mouse.point)) {
                         self.focused = true;
                         if (self.open) {
                             self.close();
@@ -151,7 +202,7 @@ pub fn Select(comptime config: SelectConfig) type {
                         return true;
                     }
 
-                    if (!Component.menuRect().contains(mouse.point)) {
+                    if (!self.menuRect().contains(mouse.point)) {
                         self.close();
                         self.focused = false;
                         return true;
@@ -159,7 +210,7 @@ pub fn Select(comptime config: SelectConfig) type {
                     return true;
                 },
                 .mouse_move => |point| {
-                    if (!self.open or !Component.menuRect().contains(point)) return false;
+                    if (!self.open or !self.menuRect().contains(point)) return false;
                     if (self.indexAtPoint(point)) |index| self.setHighlighted(index);
                     return true;
                 },
@@ -168,7 +219,7 @@ pub fn Select(comptime config: SelectConfig) type {
                         self.dragScrollbarTo(point.y);
                         return true;
                     }
-                    if (!self.open or !Component.menuRect().contains(point)) return false;
+                    if (!self.open or !self.menuRect().contains(point)) return false;
                     if (self.indexAtPoint(point)) |index| self.setHighlighted(index);
                     return true;
                 },
@@ -178,28 +229,31 @@ pub fn Select(comptime config: SelectConfig) type {
                     return was_dragging;
                 },
                 .mouse_wheel => |wheel| {
-                    if (!self.open or !Component.menuRect().contains(wheel.point)) return false;
+                    if (!self.open or !self.menuRect().contains(wheel.point)) return false;
                     self.scrollBy(-wheel.y * config.row_height * 3.0);
                     return true;
                 },
                 .item_count => |count| {
-                    self.item_count = count;
-                    self.normalizeState();
+                    self.setItemCount(count);
                     return true;
                 },
             }
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
-            try batch.rect(allocator, Component.controlRect(), config.background_color);
-            try batch.rect(allocator, .{ .x = config.x, .y = config.y, .w = config.width, .h = 1.0 }, config.border_color);
+            const control = self.controlRect();
+            try batch.rect(allocator, control, config.background_color);
+            try batch.rect(allocator, .{ .x = control.x, .y = control.y, .w = control.w, .h = 1.0 }, config.border_color);
             if (self.selected_index) |index| {
-                try batch.glyph(allocator, self.controlGlyphRect(index), .{}, config.text_color);
+                if (self.itemLabel(index)) |label| {
+                    const text_rect = self.controlTextRect(label);
+                    try batch.fixedText(allocator, text_rect, label, config.text_color, fontSize(), text_rect, .{}, config.glyph_width, text_rect.h, false);
+                }
             }
 
             if (!self.open) return;
 
-            try batch.rect(allocator, Component.menuRect(), config.menu_color);
+            try batch.rect(allocator, self.menuRect(), config.menu_color);
             const visible = self.visibleRange();
             var index = visible.start;
             while (index < visible.end) : (index += 1) {
@@ -209,9 +263,11 @@ pub fn Select(comptime config: SelectConfig) type {
                 } else if (self.highlighted_index == index) {
                     try batch.rect(allocator, row, config.highlighted_color);
                 }
-                const text_rect = self.itemGlyphRect(index, row);
-                if (clippedRect(text_rect, Component.menuContentRect())) |clipped| {
-                    try batch.glyph(allocator, clipped, .{}, config.text_color);
+                if (self.itemLabel(index)) |label| {
+                    const text_rect = self.itemTextRect(label, row);
+                    if (clippedRect(text_rect, self.menuContentRect())) |clipped| {
+                        try batch.fixedText(allocator, clipped, label, config.text_color, fontSize(), self.menuContentRect(), .{}, config.glyph_width, clipped.h, false);
+                    }
                 }
             }
             try self.renderScrollbar(allocator, batch);
@@ -311,7 +367,7 @@ pub fn Select(comptime config: SelectConfig) type {
         }
 
         fn dragScrollbarTo(self: *Component, y: f32) void {
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             const thumb = self.scrollbarThumbRect() orelse return;
             self.setScrollY(scroll.offsetForThumbY(y, self.scrollbar_drag_offset_y, track, thumb, self.scrollMetrics()));
         }
@@ -323,7 +379,7 @@ pub fn Select(comptime config: SelectConfig) type {
             }
             const row_top = @as(f32, @floatFromInt(index)) * config.row_height;
             const row_bottom = row_top + config.row_height;
-            const visible_height = Component.menuContentRect().h;
+            const visible_height = self.menuContentRect().h;
             if (row_top < self.scroll_y) {
                 self.scroll_y = row_top;
             } else if (row_bottom > self.scroll_y + visible_height) {
@@ -333,8 +389,8 @@ pub fn Select(comptime config: SelectConfig) type {
         }
 
         fn indexAtPoint(self: *const Component, point: draw.Vec2) ?usize {
-            if (!Component.menuContentRect().contains(point)) return null;
-            const row_offset = @max(point.y - Component.menuContentRect().y + self.scroll_y, 0.0) / config.row_height;
+            if (!self.menuContentRect().contains(point)) return null;
+            const row_offset = @max(point.y - self.menuContentRect().y + self.scroll_y, 0.0) / config.row_height;
             const index: usize = @intFromFloat(@floor(row_offset));
             if (index >= self.item_count) return null;
             return index;
@@ -342,43 +398,41 @@ pub fn Select(comptime config: SelectConfig) type {
 
         fn visibleRange(self: *const Component) struct { start: usize, end: usize } {
             const start: usize = @min(@as(usize, @intFromFloat(@floor(self.scroll_y / config.row_height))), self.item_count);
-            const visible_count = @as(usize, @intFromFloat(@ceil(Component.menuContentRect().h / config.row_height))) + 1;
+            const visible_count = @as(usize, @intFromFloat(@ceil(self.menuContentRect().h / config.row_height))) + 1;
             return .{ .start = start, .end = @min(start + visible_count, self.item_count) };
         }
 
-        fn rowRect(self: *const Component, index: usize) draw.Rect {
-            const content = Component.menuContentRect();
+        fn controlTextRect(self: *const Component, label: []const u8) draw.Rect {
+            const control = self.controlRect();
             return .{
-                .x = content.x,
-                .y = content.y + @as(f32, @floatFromInt(index)) * config.row_height - self.scroll_y,
-                .w = @max(content.w - Component.scrollbarGutter(), 0.0),
-                .h = config.row_height,
+                .x = control.x + config.padding_x,
+                .y = control.y + @max((control.h - config.glyph_width * 1.4) * 0.5, 0.0),
+                .w = @min(control.w - config.padding_x * 2.0, @as(f32, @floatFromInt(label.len)) * config.glyph_width),
+                .h = @min(control.h, config.glyph_width * 1.4),
             };
         }
 
-        fn controlGlyphRect(self: *const Component, index: usize) draw.Rect {
-            const label_len = if (config.item_label) |label| label(self.callbacks.context, index).len else digitCount(index + 1);
-            return .{
-                .x = config.x + config.padding_x,
-                .y = config.y + @max((config.height - config.glyph_width * 1.4) * 0.5, 0.0),
-                .w = @min(config.width - config.padding_x * 2.0, @as(f32, @floatFromInt(label_len)) * config.glyph_width),
-                .h = @min(config.height, config.glyph_width * 1.4),
-            };
-        }
-
-        fn itemGlyphRect(self: *const Component, index: usize, row: draw.Rect) draw.Rect {
-            const label_len = if (config.item_label) |label| label(self.callbacks.context, index).len else digitCount(index + 1);
+        fn itemTextRect(_: *const Component, label: []const u8, row: draw.Rect) draw.Rect {
             return .{
                 .x = row.x,
                 .y = row.y + @max((row.h - config.glyph_width * 1.4) * 0.5, 0.0),
-                .w = @min(row.w, @as(f32, @floatFromInt(label_len)) * config.glyph_width),
+                .w = @min(row.w, @as(f32, @floatFromInt(label.len)) * config.glyph_width),
                 .h = @min(row.h, config.glyph_width * 1.4),
             };
         }
 
+        fn itemLabel(self: *const Component, index: usize) ?[]const u8 {
+            if (config.item_label) |label| return label(self.callbacks.context, index);
+            return null;
+        }
+
+        fn fontSize() f32 {
+            return config.glyph_width / 0.55;
+        }
+
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             if (!config.scroll_enabled or scroll.maxOffsetY(self.scrollMetrics()) <= 0.0 or config.scrollbar_width <= 0.0) return;
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             try batch.scrollbar(allocator, track, config.scrollbar_track_color);
             if (self.scrollbarThumbRect()) |thumb| {
                 try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
@@ -386,42 +440,25 @@ pub fn Select(comptime config: SelectConfig) type {
         }
 
         fn scrollbarThumbRect(self: *const Component) ?draw.Rect {
-            return scroll.thumbRect(Component.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
+            return scroll.thumbRect(self.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
         }
 
         fn scrollMetrics(self: *const Component) scroll.Metrics {
             return .{
                 .enabled = config.scroll_enabled,
                 .content_height = @as(f32, @floatFromInt(self.item_count)) * config.row_height,
-                .visible_height = Component.menuContentRect().h,
+                .visible_height = self.menuContentRect().h,
                 .line_height = config.row_height,
                 .scrollbar_width = config.scrollbar_width,
             };
         }
 
-        fn controlRect() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
-        fn menuRect() draw.Rect {
-            return .{ .x = config.x, .y = config.y + config.height, .w = config.width, .h = config.menu_height };
-        }
-
-        fn menuContentRect() draw.Rect {
-            return .{
-                .x = config.x + config.padding_x,
-                .y = config.y + config.height + config.padding_y,
-                .w = @max(config.width - config.padding_x * 2.0, 0.0),
-                .h = @max(config.menu_height - config.padding_y * 2.0, config.row_height),
-            };
-        }
-
-        fn scrollbarGutter() f32 {
+        fn scrollbarGutter(_: *const Component) f32 {
             return if (config.scroll_enabled) @max(config.scrollbar_width, 0.0) else 0.0;
         }
 
-        fn scrollbarTrackRect() draw.Rect {
-            const content = Component.menuContentRect();
+        fn scrollbarTrackRect(self: *const Component) draw.Rect {
+            const content = self.menuContentRect();
             const track_w = @min(config.scrollbar_width, content.w);
             return .{ .x = content.x + content.w - track_w, .y = content.y, .w = track_w, .h = content.h };
         }
@@ -432,13 +469,6 @@ pub fn Select(comptime config: SelectConfig) type {
             }
         }
     };
-}
-
-fn digitCount(value: usize) usize {
-    var remaining = value;
-    var count: usize = 1;
-    while (remaining >= 10) : (remaining /= 10) count += 1;
-    return count;
 }
 
 fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
@@ -467,6 +497,15 @@ fn probeSelectEvent(context: ?*anyopaque, event: SelectEvent) void {
         .highlighted => probe.highlighted += 1,
         .open_changed => probe.open_changes += 1,
     }
+}
+
+fn testItemLabel(_: ?*anyopaque, index: usize) []const u8 {
+    return switch (index) {
+        0 => "Alpha",
+        1 => "Bravo",
+        2 => "Charlie",
+        else => "Delta",
+    };
 }
 
 test "select opens and chooses an item with mouse" {
@@ -512,4 +551,32 @@ test "select renders menu scrollbar when open and overflowing" {
         if (command.kind == .scrollbar) scrollbar_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
+}
+
+test "select supports runtime bounds menu bounds item count and text labels" {
+    const Dropdown = Select(.{ .item_label = testItemLabel, .padding_x = 4, .padding_y = 2, .row_height = 20, .glyph_width = 8 });
+    var select = Dropdown.initFromConfig();
+    select.setBounds(.{ .x = 40, .y = 30, .w = 120, .h = 28 });
+    select.setMenuBounds(.{ .x = 44, .y = 62, .w = 140, .h = 70 });
+    select.setItemCount(3);
+
+    try std.testing.expect(select.handleInput(.{ .mouse_down = .{ .point = .{ .x = 50, .y = 40 } } }));
+    try std.testing.expect(select.open);
+    try std.testing.expectEqual(@as(f32, 44), select.menuRect().x);
+    try std.testing.expectEqual(@as(f32, 48), select.rowRect(0).x);
+
+    try std.testing.expect(select.handleInput(.{ .mouse_down = .{ .point = .{ .x = 52, .y = 88 } } }));
+    try std.testing.expectEqual(@as(?usize, 1), select.selected_index);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try select.render(std.testing.allocator, &batch);
+    var found_label = false;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, "Bravo")) {
+            found_label = true;
+            try std.testing.expectEqual(@as(f32, 44), command.clip.?.x);
+        }
+    }
+    try std.testing.expect(found_label);
 }

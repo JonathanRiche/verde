@@ -84,6 +84,7 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         pressed: bool = false,
         focused: bool = false,
         disabled: bool = config.disabled,
+        rect: draw.Rect = defaultCheckboxBounds(config),
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -109,6 +110,30 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
             self.emit(.{ .changed = checked });
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.rect = rect;
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn boxRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            const size = @min(config.size, @min(bounds_rect.w, bounds_rect.h));
+            return .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = size, .h = size };
+        }
+
+        pub fn labelRect(self: *const Component) draw.Rect {
+            const box = self.boxRect();
+            return .{
+                .x = box.x + box.w + config.label_gap,
+                .y = self.bounds().y,
+                .w = @max(self.bounds().w - box.w - config.label_gap, 0.0),
+                .h = self.bounds().h,
+            };
+        }
+
         pub fn toggle(self: *Component) bool {
             if (self.disabled) return false;
             self.setChecked(!self.checked);
@@ -122,13 +147,13 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         pub fn handleInput(self: *Component, input: Input) bool {
             switch (input) {
                 .mouse_move => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const changed = self.hovered != inside;
                     self.hovered = inside;
                     return inside or changed or self.pressed;
                 },
                 .mouse_down => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     self.setFocused(inside);
                     if (!inside or self.disabled) {
                         self.pressed = false;
@@ -139,7 +164,7 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
                     return true;
                 },
                 .mouse_up => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const was_pressed = self.pressed;
                     self.hovered = inside;
                     self.pressed = false;
@@ -170,15 +195,16 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
             try renderCheckboxBox(
                 allocator,
                 batch,
-                Component.boxRect(),
+                self.boxRect(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
             if (self.checked) {
-                try batch.rect(allocator, Component.checkRect(), if (self.disabled) config.disabled_label_color else config.checked_color);
+                try batch.rect(allocator, self.checkRect(), if (self.disabled) config.disabled_label_color else config.checked_color);
             }
             if (config.label.len > 0) {
-                try batch.glyph(allocator, Component.labelRect(), .{}, if (self.disabled) config.disabled_label_color else config.label_color);
+                const label_rect = self.labelRect();
+                try batch.text(allocator, label_rect, config.label, if (self.disabled) config.disabled_label_color else config.label_color, config.font_size, label_rect);
             }
         }
 
@@ -209,27 +235,10 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
             return config.background_color;
         }
 
-        fn bounds() draw.Rect {
-            const label_w = if (config.label.len > 0) config.label_gap + approximateWidth(config.label.len, config.font_size) else 0.0;
-            return .{ .x = config.x, .y = config.y, .w = config.size + label_w, .h = config.size };
-        }
-
-        fn boxRect() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.size, .h = config.size };
-        }
-
-        fn checkRect() draw.Rect {
-            const inset = @max(config.size * 0.28, 2.0);
-            return .{ .x = config.x + inset, .y = config.y + inset, .w = @max(config.size - inset * 2.0, 1.0), .h = @max(config.size - inset * 2.0, 1.0) };
-        }
-
-        fn labelRect() draw.Rect {
-            return .{
-                .x = config.x + config.size + config.label_gap,
-                .y = config.y,
-                .w = approximateWidth(config.label.len, config.font_size),
-                .h = config.size,
-            };
+        fn checkRect(self: *const Component) draw.Rect {
+            const box = self.boxRect();
+            const inset = @max(box.w * 0.28, 2.0);
+            return .{ .x = box.x + inset, .y = box.y + inset, .w = @max(box.w - inset * 2.0, 1.0), .h = @max(box.h - inset * 2.0, 1.0) };
         }
     };
 }
@@ -243,6 +252,7 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         pressed: bool = false,
         focused: bool = false,
         disabled: bool = config.disabled,
+        rect: draw.Rect = defaultToggleBounds(config),
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -268,6 +278,29 @@ pub fn Toggle(comptime config: ToggleConfig) type {
             self.emit(.{ .changed = checked });
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.rect = rect;
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn trackRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            return .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = @min(config.width, bounds_rect.w), .h = @min(config.height, bounds_rect.h) };
+        }
+
+        pub fn labelRect(self: *const Component) draw.Rect {
+            const track = self.trackRect();
+            return .{
+                .x = track.x + track.w + config.label_gap,
+                .y = self.bounds().y,
+                .w = @max(self.bounds().w - track.w - config.label_gap, 0.0),
+                .h = self.bounds().h,
+            };
+        }
+
         pub fn toggle(self: *Component) bool {
             if (self.disabled) return false;
             self.setChecked(!self.checked);
@@ -281,13 +314,13 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         pub fn handleInput(self: *Component, input: Input) bool {
             switch (input) {
                 .mouse_move => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const changed = self.hovered != inside;
                     self.hovered = inside;
                     return inside or changed or self.pressed;
                 },
                 .mouse_down => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     self.setFocused(inside);
                     if (!inside or self.disabled) {
                         self.pressed = false;
@@ -298,7 +331,7 @@ pub fn Toggle(comptime config: ToggleConfig) type {
                     return true;
                 },
                 .mouse_up => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const was_pressed = self.pressed;
                     self.hovered = inside;
                     self.pressed = false;
@@ -329,13 +362,14 @@ pub fn Toggle(comptime config: ToggleConfig) type {
             try renderCheckboxBox(
                 allocator,
                 batch,
-                Component.trackRect(),
+                self.trackRect(),
                 self.trackColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
             try batch.rect(allocator, self.thumbRect(), config.thumb_color);
             if (config.label.len > 0) {
-                try batch.glyph(allocator, Component.labelRect(), .{}, if (self.disabled) config.disabled_label_color else config.label_color);
+                const label_rect = self.labelRect();
+                try batch.text(allocator, label_rect, config.label, if (self.disabled) config.disabled_label_color else config.label_color, config.font_size, label_rect);
             }
         }
 
@@ -367,32 +401,15 @@ pub fn Toggle(comptime config: ToggleConfig) type {
             return config.track_color;
         }
 
-        fn bounds() draw.Rect {
-            const label_w = if (config.label.len > 0) config.label_gap + approximateWidth(config.label.len, config.font_size) else 0.0;
-            return .{ .x = config.x, .y = config.y, .w = config.width + label_w, .h = config.height };
-        }
-
-        fn trackRect() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
         fn thumbRect(self: *const Component) draw.Rect {
-            const inset = @max(config.height * 0.18, 2.0);
-            const size = @max(config.height - inset * 2.0, 1.0);
+            const track = self.trackRect();
+            const inset = @max(track.h * 0.18, 2.0);
+            const size = @max(track.h - inset * 2.0, 1.0);
             return .{
-                .x = config.x + if (self.checked) @max(config.width - size - inset, inset) else inset,
-                .y = config.y + inset,
+                .x = track.x + if (self.checked) @max(track.w - size - inset, inset) else inset,
+                .y = track.y + inset,
                 .w = size,
                 .h = size,
-            };
-        }
-
-        fn labelRect() draw.Rect {
-            return .{
-                .x = config.x + config.width + config.label_gap,
-                .y = config.y,
-                .w = approximateWidth(config.label.len, config.font_size),
-                .h = config.height,
             };
         }
     };
@@ -436,6 +453,16 @@ fn rectOutline(allocator: std.mem.Allocator, batch: *draw.RenderBatch, r: draw.R
 
 fn approximateWidth(len: usize, font_size: f32) f32 {
     return @as(f32, @floatFromInt(len)) * font_size * 0.55;
+}
+
+fn defaultCheckboxBounds(comptime config: CheckboxConfig) draw.Rect {
+    const label_w = if (config.label.len > 0) config.label_gap + approximateWidth(config.label.len, config.font_size) else 0.0;
+    return .{ .x = config.x, .y = config.y, .w = config.size + label_w, .h = config.size };
+}
+
+fn defaultToggleBounds(comptime config: ToggleConfig) draw.Rect {
+    const label_w = if (config.label.len > 0) config.label_gap + approximateWidth(config.label.len, config.font_size) else 0.0;
+    return .{ .x = config.x, .y = config.y, .w = config.width + label_w, .h = config.height };
 }
 
 const CheckboxProbe = struct {
@@ -517,4 +544,28 @@ test "toggle moves thumb when checked and supports space activation" {
 
     try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
     try std.testing.expect(batch.commands.items[5].rect.x > 20.0);
+}
+
+test "checkbox and toggle support runtime bounds" {
+    const Field = Checkbox(.{ .label = "Ready" });
+    var checkbox = Field.init(false);
+    checkbox.setBounds(.{ .x = 90, .y = 20, .w = 120, .h = 22 });
+    try std.testing.expect(!checkbox.handleInput(.{ .mouse_down = .{ .x = 4, .y = 4 } }));
+    try std.testing.expect(checkbox.handleInput(.{ .mouse_down = .{ .x = 94, .y = 24 } }));
+    try std.testing.expect(checkbox.handleInput(.{ .mouse_up = .{ .x = 94, .y = 24 } }));
+    try std.testing.expect(checkbox.checked);
+
+    var checkbox_batch: draw.RenderBatch = .{};
+    defer checkbox_batch.deinit(std.testing.allocator);
+    try checkbox.render(std.testing.allocator, &checkbox_batch);
+    try std.testing.expectEqual(draw.CommandKind.text, checkbox_batch.commands.items[6].kind);
+    try std.testing.expectEqualStrings("Ready", checkbox_batch.commands.items[6].text);
+
+    const Switch = Toggle(.{ .label = "Fast" });
+    var toggle = Switch.init(false);
+    toggle.setBounds(.{ .x = 220, .y = 20, .w = 110, .h = 24 });
+    try std.testing.expect(toggle.handleInput(.{ .mouse_down = .{ .x = 224, .y = 24 } }));
+    try std.testing.expect(toggle.handleInput(.{ .mouse_up = .{ .x = 224, .y = 24 } }));
+    try std.testing.expect(toggle.checked);
+    try std.testing.expectEqual(@as(f32, 220), toggle.trackRect().x);
 }
