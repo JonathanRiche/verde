@@ -351,8 +351,13 @@ pub const destroyTexture = SDL_DestroyTexture;
 pub const destroySurface = SDL_DestroySurface;
 
 pub fn renderTexture(renderer: *Renderer, texture: *Texture, dst: FRect) Error!void {
+    try renderTextureRegion(renderer, texture, null, dst);
+}
+
+pub fn renderTextureRegion(renderer: *Renderer, texture: *Texture, src: ?FRect, dst: FRect) Error!void {
+    var mutable_src = src;
     var mutable_dst = dst;
-    if (!SDL_RenderTexture(renderer, texture, null, &mutable_dst)) return error.SdlError;
+    if (!SDL_RenderTexture(renderer, texture, if (mutable_src) |*r| r else null, &mutable_dst)) return error.SdlError;
 }
 
 pub fn renderPresent(renderer: *Renderer) void {

@@ -315,7 +315,7 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
-            try batch.glyph(allocator, self.iconRect(), config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color);
+            try batch.image(allocator, self.iconRect(), .invalid, config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color, self.bounds());
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -451,7 +451,7 @@ test "icon button renders shell and icon" {
     try button.render(std.testing.allocator, &batch);
 
     try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
-    try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[5].kind);
+    try std.testing.expectEqual(draw.CommandKind.image, batch.commands.items[5].kind);
     try std.testing.expectEqual(@as(f32, 7.0), batch.commands.items[5].rect.x);
     try std.testing.expectEqual(@as(f32, 10.0), batch.commands.items[5].rect.w);
 }

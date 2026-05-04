@@ -14,6 +14,7 @@ pub const sdl = @import("sdl.zig");
 pub const button_component = @import("components/button.zig");
 pub const checkbox_component = @import("components/checkbox.zig");
 pub const code_view_component = @import("components/code_view.zig");
+pub const image_component = @import("components/image.zig");
 pub const list_box_component = @import("components/list_box.zig");
 pub const menu_component = @import("components/menu.zig");
 pub const modal_component = @import("components/modal.zig");
@@ -28,6 +29,7 @@ pub const text_input_component = @import("components/text_input.zig");
 pub const Color = draw.Color;
 pub const Rect = draw.Rect;
 pub const RenderBatch = draw.RenderBatch;
+pub const TextureId = draw.TextureId;
 pub const Renderer = renderer.Renderer;
 pub const FontAtlas = atlas.FontAtlas;
 pub const ButtonCallbacks = button_component.ButtonCallbacks;
@@ -38,6 +40,8 @@ pub const CheckboxConfig = checkbox_component.CheckboxConfig;
 pub const CheckboxEvent = checkbox_component.CheckboxEvent;
 pub const CodeViewConfig = code_view_component.CodeViewConfig;
 pub const IconButtonConfig = button_component.IconButtonConfig;
+pub const ImageConfig = image_component.ImageConfig;
+pub const ImageFit = image_component.ImageFit;
 pub const ListBoxCallbacks = list_box_component.ListBoxCallbacks;
 pub const ListBoxConfig = list_box_component.ListBoxConfig;
 pub const ListBoxEvent = list_box_component.ListBoxEvent;
@@ -107,6 +111,11 @@ pub fn button(comptime config: ButtonConfig) type {
 /// Creates a retained icon button with comptime styling.
 pub fn iconButton(comptime config: IconButtonConfig) type {
     return button_component.IconButton(config);
+}
+
+/// Creates a retained image component with comptime styling.
+pub fn image(comptime config: ImageConfig) type {
+    return image_component.Image(config);
 }
 
 /// Creates a retained checkbox with comptime styling.
@@ -179,6 +188,7 @@ test {
     _ = button_component;
     _ = checkbox_component;
     _ = code_view_component;
+    _ = image_component;
     _ = list_box_component;
     _ = menu_component;
     _ = modal_component;

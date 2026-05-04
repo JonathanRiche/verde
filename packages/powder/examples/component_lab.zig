@@ -431,7 +431,7 @@ fn selectLabel(index: ?usize) []const u8 {
 }
 
 fn commandColor(command: powder.draw.Command) [4]u8 {
-    if (command.kind == .text) return .{ 0, 0, 0, 0 };
+    if (command.kind == .text or command.kind == .image) return .{ 0, 0, 0, 0 };
     return .{
         floatChannel(command.color.r),
         floatChannel(command.color.g),

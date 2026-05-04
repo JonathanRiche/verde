@@ -6,6 +6,7 @@ const powder = @import("powder");
 const Label = powder.text(.{ .x = 12, .y = 10, .width = 180, .height = 24, .selectable = true });
 const Input = powder.textInput(.{ .x = 12, .y = 42, .width = 220, .height = 32, .placeholder_text = "Filter" });
 const PrimaryButton = powder.button(.{ .x = 12, .y = 84, .width = 96, .height = 32, .label = "Apply" });
+const Logo = powder.image(.{ .x = 128, .y = 84, .width = 64, .height = 32, .source_width = 64, .source_height = 32, .fit = .contain });
 const Check = powder.checkbox(.{ .x = 12, .y = 126, .label = "Enabled" });
 const Switch = powder.toggle(.{ .x = 12, .y = 158, .label = "Live" });
 const Items = powder.listBox(.{ .x = 260, .y = 10, .width = 180, .height = 96, .item_count = 8 });
@@ -27,6 +28,7 @@ pub fn main() !void {
     var input = try Input.init(allocator, "powder");
     defer input.deinit(allocator);
     var button = PrimaryButton.init();
+    var logo = Logo.init(powder.TextureId.init(99));
     var checkbox = Check.init(false);
     var toggle = Switch.init(false);
     var list = Items.initFromConfig();
@@ -88,6 +90,7 @@ pub fn main() !void {
     try label.render(allocator, &batch);
     try input.render(allocator, &batch);
     try button.render(allocator, &batch);
+    try logo.render(allocator, &batch);
     try checkbox.render(allocator, &batch);
     try toggle.render(allocator, &batch);
     try list.render(allocator, &batch);
