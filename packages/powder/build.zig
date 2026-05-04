@@ -38,28 +38,26 @@ pub fn build(b: *std.Build) void {
     const text_area_lab = addExample(b, .{
         .name = "powder-text-area-lab",
         .root_source_file = "examples/text_area_lab_main.zig",
+        .linux_root_source_file = "examples/text_area_lab.zig",
+        .linux_c_source_file = "examples/linux_main.c",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
+    const component_lab = addExample(b, .{
+        .name = "powder-component-lab",
+        .root_source_file = "examples/component_lab_main.zig",
+        .linux_root_source_file = "examples/component_lab.zig",
+        .linux_c_source_file = "examples/linux_component_lab_main.c",
         .target = target,
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
+    const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
     const examples_step = b.step("examples", "Build powder examples");
-    if (text_area_lab.artifact) |artifact| {
-        const run_text_area_lab = b.addRunArtifact(artifact);
-        if (b.args) |args| {
-            run_text_area_lab.addArgs(args);
-        }
-        run_text_area_lab_step.dependOn(&run_text_area_lab.step);
-        examples_step.dependOn(&artifact.step);
-    } else {
-        const run_text_area_lab = b.addSystemCommand(&.{text_area_lab.output_path});
-        if (b.args) |args| {
-            run_text_area_lab.addArgs(args);
-        }
-        run_text_area_lab.step.dependOn(text_area_lab.step);
-        run_text_area_lab_step.dependOn(&run_text_area_lab.step);
-        examples_step.dependOn(text_area_lab.step);
-    }
+    wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
+    wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
 
     const component_catalog_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -91,6 +89,8 @@ pub fn build(b: *std.Build) void {
 const ExampleOptions = struct {
     name: []const u8,
     root_source_file: []const u8,
+    linux_root_source_file: []const u8,
+    linux_c_source_file: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     powder_mod: *std.Build.Module,
@@ -126,6 +126,25 @@ fn addExample(b: *std.Build, options: ExampleOptions) Example {
     };
 }
 
+fn wireExampleRun(b: *std.Build, example: Example, run_step: *std.Build.Step, examples_step: *std.Build.Step) void {
+    if (example.artifact) |artifact| {
+        const run_example = b.addRunArtifact(artifact);
+        if (b.args) |args| {
+            run_example.addArgs(args);
+        }
+        run_step.dependOn(&run_example.step);
+        examples_step.dependOn(&artifact.step);
+    } else {
+        const run_example = b.addSystemCommand(&.{example.output_path});
+        if (b.args) |args| {
+            run_example.addArgs(args);
+        }
+        run_example.step.dependOn(example.step);
+        run_step.dependOn(&run_example.step);
+        examples_step.dependOn(example.step);
+    }
+}
+
 fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
     const out_dir = "zig-out/bin";
     const object_path = b.fmt("{s}/{s}.o", .{ out_dir, options.name });
@@ -140,7 +159,7 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         "--dep",
         "powder",
         "-fno-entry",
-        "-Mroot=examples/text_area_lab.zig",
+        b.fmt("-Mroot={s}", .{options.linux_root_source_file}),
         "-Mpowder=src/root.zig",
         b.fmt("-femit-bin={s}", .{object_path}),
     });
@@ -150,7 +169,7 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         "cc",
         "-no-pie",
         object_path,
-        "examples/linux_main.c",
+        options.linux_c_source_file,
         "-lSDL3",
         "-lSDL3_ttf",
         "-lc",
