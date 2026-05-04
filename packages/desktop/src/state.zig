@@ -1106,6 +1106,7 @@ pub const AppState = struct {
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
     powder_composer: PowderComposerTextArea,
+    powder_overlay_batch: powder.RenderBatch,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1202,6 +1203,7 @@ pub const AppState = struct {
             .composer_overlay_last_cursor_pos = 0,
             .composer_overlay_last_draft_len = 0,
             .powder_composer = try PowderComposerTextArea.init(allocator, ""),
+            .powder_overlay_batch = .{},
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -4634,6 +4636,7 @@ pub const AppState = struct {
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
         self.powder_composer.deinit(self.allocator);
+        self.powder_overlay_batch.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
