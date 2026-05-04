@@ -1,4 +1,5 @@
 const std = @import("std");
+const powder = @import("powder");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const zgui_text_select = @import("zgui_text_select");
@@ -23,6 +24,24 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+
+pub const PowderComposerTextArea = powder.textArea(.{
+    .padding_x = 4.0,
+    .padding_y = 6.0,
+    .background_color = .{ .a = 0.0 },
+    .border_color = .{ .a = 0.0 },
+    .text_color = .{},
+    .cursor_color = .{},
+    .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
+    .scrollbar_track_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.18 },
+    .scrollbar_thumb_color = .{ .r = 0.86, .g = 0.91, .b = 0.82, .a = 0.72 },
+    .scrollbar_width = 5.0,
+    .placeholder_text = "Ask anything, or use / to show available commands",
+    .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
+    .max_bytes = 8192 - 1,
+    .font_size = 16.0,
+    .submit_on_enter = true,
+});
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -49,6 +68,54 @@ const Condition = struct {
 
     fn broadcast(_: *Condition) void {}
 };
+
+fn powderComposerKey(_: ?*anyopaque, key: powder.TextAreaKey) powder.TextAreaAction {
+    if (key.code == .enter and key.shift) return .insert_newline;
+    if (key.code == .enter) return .submit;
+    return .default;
+}
+
+fn powderComposerSetClipboard(_: ?*anyopaque, text: []const u8) bool {
+    const z_text = std.heap.page_allocator.dupeZ(u8, text) catch return false;
+    defer std.heap.page_allocator.free(z_text);
+    powder.sdl.setClipboardText(z_text) catch return false;
+    return true;
+}
+
+fn powderComposerGetClipboard(_: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    return powder.sdl.getClipboardText(allocator) catch null;
+}
+
+fn powderComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?powder.TextAreaKey {
+    const mod_bits = keymodBits(event.mod);
+    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const shift = (mod_bits & sdl.Keymod.shift) != 0;
+    const alt = (mod_bits & sdl.Keymod.alt) != 0;
+    const code: powder.TextAreaKey.Code = switch (event.key) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+        .home => .home,
+        .end => .end,
+        .pageup => .page_up,
+        .pagedown => .page_down,
+        .backspace => .backspace,
+        .delete => .delete,
+        .@"return", .kp_enter => .enter,
+        .a => .a,
+        .c => .c,
+        .v => .v,
+        .x => .x,
+        else => return null,
+    };
+    return .{ .code = code, .shift = shift, .primary = primary, .alt = alt };
+}
+
+fn keymodBits(modifier_state: sdl.Keymod) u16 {
+    return @as(*const u16, @ptrCast(&modifier_state)).*;
+}
+
 pub const ProjectEditorTarget = enum {
     configured,
     cursor,
@@ -1038,6 +1105,7 @@ pub const AppState = struct {
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
+    powder_composer: PowderComposerTextArea,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1133,6 +1201,7 @@ pub const AppState = struct {
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
             .composer_overlay_last_draft_len = 0,
+            .powder_composer = try PowderComposerTextArea.init(allocator, ""),
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1201,6 +1270,11 @@ pub const AppState = struct {
             .last_interaction_at_ms = 0,
             .pending_send_count = 0,
         };
+        state.powder_composer.setCallbacks(.{
+            .on_key = powderComposerKey,
+            .set_clipboard = powderComposerSetClipboard,
+            .get_clipboard = powderComposerGetClipboard,
+        });
 
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
@@ -3826,7 +3900,8 @@ pub const AppState = struct {
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(allocator);
 
-        const header = try std.fmt.allocPrint(allocator,
+        const header = try std.fmt.allocPrint(
+            allocator,
             "Browser inspector selection\nMode: {s}\n",
             .{selection.mode},
         );
@@ -3834,7 +3909,8 @@ pub const AppState = struct {
         try buffer.appendSlice(allocator, header);
 
         if (selection.rect) |rect| {
-            const region = try std.fmt.allocPrint(allocator,
+            const region = try std.fmt.allocPrint(
+                allocator,
                 "Region: {d:.0} x {d:.0} at ({d:.0}, {d:.0})\n",
                 .{ rect.width, rect.height, rect.x, rect.y },
             );
@@ -3846,7 +3922,8 @@ pub const AppState = struct {
             try appendInspectorElementSummary(&buffer, allocator, element, null);
         } else if (selection.elements) |elements| {
             const count = @min(elements.len, 6);
-            const selected_label = try std.fmt.allocPrint(allocator,
+            const selected_label = try std.fmt.allocPrint(
+                allocator,
                 "Selected elements ({d} shown):\n",
                 .{count},
             );
@@ -3856,7 +3933,8 @@ pub const AppState = struct {
                 try appendInspectorElementSummary(&buffer, allocator, element, index + 1);
             }
             if (elements.len > count) {
-                const more_label = try std.fmt.allocPrint(allocator,
+                const more_label = try std.fmt.allocPrint(
+                    allocator,
                     "... and {d} more element{s}\n",
                     .{ elements.len - count, if (elements.len - count == 1) "" else "s" },
                 );
@@ -3865,7 +3943,8 @@ pub const AppState = struct {
             }
         }
 
-        const prompt_label = try std.fmt.allocPrint(allocator,
+        const prompt_label = try std.fmt.allocPrint(
+            allocator,
             "Requested change:\n{s}",
             .{prompt},
         );
@@ -4102,6 +4181,102 @@ pub const AppState = struct {
         return self.currentProjectMutable().draftBuffer();
     }
 
+    pub fn syncPowderComposerFromDraft(self: *AppState) void {
+        const draft = self.currentDraft();
+        if (std.mem.eql(u8, self.powder_composer.text(), draft)) return;
+        self.powder_composer.setText(self.allocator, draft) catch |err| {
+            log.warn("failed to sync powder composer draft: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn syncDraftFromPowderComposer(self: *AppState) void {
+        const text = self.powder_composer.text();
+        if (std.mem.eql(u8, self.currentDraft(), text)) return;
+        self.setDraft(text);
+    }
+
+    pub fn setPowderComposerBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
+        self.setComposerInputBounds(input_min, input_max);
+        self.powder_composer.setBounds(.{
+            .x = input_min[0],
+            .y = input_min[1],
+            .w = @max(input_max[0] - input_min[0], 0.0),
+            .h = @max(input_max[1] - input_min[1], 0.0),
+        });
+    }
+
+    pub fn routePowderComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (!self.powder_composer.focused) return false;
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+            log.warn("powder composer text input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPowderComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePowderComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (!self.powder_composer.focused) return false;
+        const key = powderComposerKeyFromSdl(event) orelse return false;
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .key = key }) catch |err| {
+            log.warn("powder composer key input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPowderComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent) bool {
+        if (event.button != 1) return false;
+        const point: powder.draw.Vec2 = .{ .x = event.x, .y = event.y };
+        const input: powder.text_area_component.Input = if (event.down)
+            .{ .mouse_down = .{ .point = point, .clicks = event.clicks } }
+        else
+            .{ .mouse_up = point };
+        const was_focused = self.powder_composer.focused;
+        const handled = self.powder_composer.handleInput(self.allocator, input) catch |err| {
+            log.warn("powder composer mouse input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.composer_focused = self.powder_composer.focused;
+        if (self.composer_focused) {
+            self.terminal_focused = false;
+            self.browser_pane_focused = false;
+        }
+        return handled or was_focused != self.powder_composer.focused;
+    }
+
+    pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent) bool {
+        if (!self.powder_composer.focused) return false;
+        if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return false;
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = .{ .x = event.x, .y = event.y } }) catch |err| {
+            log.warn("powder composer mouse drag failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPowderComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
+        const handled = self.powder_composer.handleInput(self.allocator, .{
+            .mouse_wheel = .{ .point = .{ .x = event.mouse_x, .y = event.mouse_y }, .y = event.y },
+        }) catch |err| {
+            log.warn("powder composer wheel failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
     pub fn setComposerInputBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
         self.composer_input_bounds_valid = true;
         self.composer_input_min = input_min;
@@ -4152,6 +4327,9 @@ pub const AppState = struct {
         self.composer_overlay_follow_cursor = true;
         self.composer_overlay_last_cursor_pos = 0;
         self.composer_overlay_last_draft_len = 0;
+        self.powder_composer.setText(self.allocator, self.currentDraft()) catch |err| {
+            log.warn("failed to reset powder composer draft: {s}", .{@errorName(err)});
+        };
     }
 
     pub fn updateFileSearch(self: *AppState) void {
@@ -4455,6 +4633,7 @@ pub const AppState = struct {
         self.pollSend();
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
+        self.powder_composer.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);

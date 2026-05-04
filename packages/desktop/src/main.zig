@@ -460,6 +460,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleComposerFocusShortcut(state, &event.key)) {
                 return true;
             }
+            if (state.routePowderComposerKeyDown(&event.key)) {
+                return true;
+            }
             if (event.key.repeat) {
                 if (keyboard.transcriptScrollActionForEvent(&event.key)) |repeat_action| {
                     handleKeyboardAction(state, keyboard, repeat_action);
@@ -502,8 +505,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (terminal_text_handled) {
                 return true;
             }
+            if (state.routePowderComposerTextInput(text_input)) {
+                return true;
+            }
         },
         .mouse_motion => {
+            if (state.routePowderComposerMouseMotion(&event.motion)) {
+                return true;
+            }
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
@@ -528,8 +537,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handled) {
                 return true;
             }
+            if (state.routePowderComposerMouseButton(&event.button)) {
+                return true;
+            }
         },
         .mouse_wheel => {
+            if (state.routePowderComposerWheel(&event.wheel)) {
+                return true;
+            }
             if (state.handleComposerWheel(&event.wheel)) {
                 return true;
             }

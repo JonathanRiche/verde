@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const powder = @import("powder");
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
@@ -3950,51 +3951,29 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(82.0) else 0.0;
     const content_width = @max(zgui.getContentRegionAvail()[0], theme.scaledUi(120.0));
     const input_h: f32 = @max(height - theme.scaledUi(86.0) - attachment_height, theme.scaledUi(48.0));
-    zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 0.0 });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(4.0), theme.scaledUi(6.0) } });
-    const transparent = colors.rgba(0, 0, 0, 0);
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
-    zgui.pushStyleColor4f(.{ .idx = .text, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .input_text_cursor, .c = transparent });
-
-    const cursor_before = zgui.getCursorScreenPos();
-    const buf = state.draftBuffer();
+    state.syncPowderComposerFromDraft();
     if (state.consumeComposerFocusRequest()) {
-        zgui.setKeyboardFocusHere(0);
+        state.powder_composer.focused = true;
+        state.composer_focused = true;
+        state.terminal_focused = false;
     }
-    var input_callback_state: ComposerInputCallbackState = .{};
     zgui.pushIntId(@intCast(state.composer_input_nonce));
     defer zgui.popId();
-    const submitted = zgui.inputTextMultiline("##chat-draft", .{
-        .buf = buf,
-        .w = content_width,
-        .h = input_h,
-        .flags = composerInputFlags(),
-        .callback = composerInputCallback,
-        .user_data = &input_callback_state,
-    });
-    state.composer_focused = zgui.isItemFocused();
+    const clicked_input = zgui.invisibleButton("##chat-draft-powder", .{ .w = content_width, .h = input_h });
+    if (clicked_input) {
+        state.powder_composer.focused = true;
+    }
+    state.composer_focused = state.powder_composer.focused;
     if (state.composer_focused) {
         state.terminal_focused = false;
     }
     const input_rect_min = zgui.getItemRectMin();
     const input_rect_max = zgui.getItemRectMax();
-    state.setComposerInputBounds(input_rect_min, input_rect_max);
-    if (buf[0] != 0 or state.composer_focused) {
-        renderComposerDraftOverlay(state, buf, input_callback_state.cursor_pos, state.composer_focused, input_rect_min, input_rect_max);
-    }
-    zgui.popStyleColor(.{ .count = 6 });
-    zgui.popStyleVar(.{ .count = 2 });
+    state.setPowderComposerBounds(input_rect_min, input_rect_max);
+    state.powder_composer.tick(16);
+    const submitted = state.powder_composer.submitted;
+    renderPowderComposer(state, input_rect_min, input_rect_max);
     state.updateFileSearch();
-
-    if (buf[0] == 0) {
-        const hint_pos = .{ cursor_before[0] + theme.scaledUi(4.0), cursor_before[1] + theme.scaledUi(6.0) };
-        const draw_list = zgui.getWindowDrawList();
-        draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(colors.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
-    }
 
     zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
     // Keep this disabled until image file picking has a dedicated UX.
@@ -4074,6 +4053,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         if (clicked and pending) {
             state.abortCurrentThreadSend();
         } else if ((clicked or submitted) and !pending) {
+            state.powder_composer.submitted = false;
             if (submitted and state.acceptPrimaryFileSearchResult()) {
                 //NOTE: END OF Composer
                 return;
@@ -4082,6 +4062,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
                 runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
             };
         } else if (submitted and pending) {
+            state.powder_composer.submitted = false;
             state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
         }
     }
@@ -4090,6 +4071,65 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         renderComposerFileSearchResults(state, composer_screen_pos, width, input_rect_min, input_rect_max);
     }
     //NOTE: END OF Composer
+}
+
+fn renderPowderComposer(state: *app_state.AppState, input_rect_min: [2]f32, input_rect_max: [2]f32) void {
+    var batch: powder.RenderBatch = .{};
+    defer batch.deinit(state.allocator);
+    state.powder_composer.render(state.allocator, &batch) catch |err| {
+        runtime.log.warn("failed to render powder composer: {s}", .{@errorName(err)});
+        return;
+    };
+
+    const draw_list = zgui.getWindowDrawList();
+    draw_list.pushClipRect(.{
+        .pmin = input_rect_min,
+        .pmax = input_rect_max,
+        .intersect_with_current = true,
+    });
+    defer draw_list.popClipRect();
+
+    for (batch.commands.items) |command| {
+        switch (command.kind) {
+            .rect => drawPowderRect(draw_list, command.rect, command.color),
+            .selection => drawPowderRect(draw_list, command.rect, command.color),
+            .cursor => drawPowderRect(draw_list, command.rect, command.color),
+            .scrollbar => drawPowderRect(draw_list, command.rect, command.color),
+            .glyph => drawPowderComposerText(draw_list, state, command.rect, command.color),
+        }
+    }
+}
+
+fn drawPowderComposerText(draw_list: zgui.DrawList, state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
+    const text = if (state.powder_composer.placeholderVisible())
+        state.powder_composer.placeholder()
+    else
+        state.powder_composer.text();
+    if (text.len == 0) return;
+
+    draw_list.addTextExtendedUnformatted(
+        .{ rect.x, rect.y - state.powder_composer.scrollY() },
+        zgui.colorConvertFloat4ToU32(powderColor(color)),
+        text,
+        .{
+            .font = zgui.getFont(),
+            .font_size = zgui.getFontSize(),
+            .wrap_width = @max(rect.w, theme.scaledUi(40.0)),
+        },
+    );
+}
+
+fn drawPowderRect(draw_list: zgui.DrawList, rect: powder.Rect, color: powder.Color) void {
+    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0) return;
+    draw_list.addRectFilled(.{
+        .pmin = .{ rect.x, rect.y },
+        .pmax = .{ rect.x + rect.w, rect.y + rect.h },
+        .col = zgui.colorConvertFloat4ToU32(powderColor(color)),
+    });
+}
+
+fn powderColor(color: powder.Color) [4]f32 {
+    return .{ color.r, color.g, color.b, color.a };
 }
 
 fn composerInputFlags() zgui.InputTextFlags {
