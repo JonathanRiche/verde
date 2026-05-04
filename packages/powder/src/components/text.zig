@@ -139,12 +139,12 @@ pub fn Text(comptime config: TextConfig) type {
                 const end_x = config.x + @as(f32, @floatFromInt(self.visualColumnForOffset(range.end))) * Component.glyphWidth();
                 try batch.selection(allocator, .{ .x = start_x, .y = config.y, .w = @max(end_x - start_x, 2.0), .h = config.height }, config.selection_color);
             }
-            try batch.glyph(allocator, .{
+            try batch.text(allocator, .{
                 .x = config.x,
                 .y = config.y,
                 .w = @min(config.width, approximateWidth(self.buffer.items.len, config.font_size)),
                 .h = config.height,
-            }, .{}, config.color);
+            }, self.buffer.items, config.color, config.font_size, .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height });
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}

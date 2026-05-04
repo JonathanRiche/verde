@@ -256,7 +256,7 @@ test "tabs render one glyph per tab" {
 
     var glyphs: usize = 0;
     for (batch.commands.items) |command| {
-        if (command.kind == .glyph) glyphs += 1;
+        if (command.kind == .text) glyphs += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), glyphs);
 }

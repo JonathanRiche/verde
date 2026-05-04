@@ -41,7 +41,7 @@ pub const Vertex = extern struct {
 
 pub const CommandKind = enum {
     rect,
-    glyph,
+    text,
     cursor,
     selection,
     scrollbar,
@@ -52,6 +52,14 @@ pub const Command = struct {
     rect: Rect,
     uv: Rect = .{},
     color: Color,
+    /// Frame-lifetime text slice. Callers must keep it alive until the batch is consumed.
+    text: []const u8 = "",
+    font_size: f32 = 16.0,
+    clip: ?Rect = null,
+    scroll: Vec2 = .{},
+    glyph_width: f32 = 8.8,
+    line_height: f32 = 20.0,
+    wrap: bool = false,
 };
 
 pub const RenderBatch = struct {
@@ -70,7 +78,51 @@ pub const RenderBatch = struct {
     }
 
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .glyph, .rect = r, .uv = uv, .color = color });
+        try self.commands.append(allocator, .{ .kind = .text, .rect = r, .uv = uv, .color = color });
+    }
+
+    /// Appends a text command. The `value` slice is frame-lifetime and must remain
+    /// valid until the batch is consumed by a renderer.
+    pub fn text(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, value: []const u8, color: Color, font_size: f32, clip: ?Rect) !void {
+        try self.commands.append(allocator, .{
+            .kind = .text,
+            .rect = r,
+            .color = color,
+            .text = value,
+            .font_size = font_size,
+            .clip = clip,
+            .glyph_width = font_size * 0.55,
+            .line_height = font_size * 1.25,
+        });
+    }
+
+    /// Appends fixed-cell wrapped text. TextArea uses this so rendering, hit
+    /// testing, cursor placement, selection, and scrolling share one layout model.
+    pub fn fixedText(
+        self: *RenderBatch,
+        allocator: std.mem.Allocator,
+        r: Rect,
+        value: []const u8,
+        color: Color,
+        font_size: f32,
+        clip: ?Rect,
+        scroll_value: Vec2,
+        glyph_width: f32,
+        line_height: f32,
+        wrap: bool,
+    ) !void {
+        try self.commands.append(allocator, .{
+            .kind = .text,
+            .rect = r,
+            .color = color,
+            .text = value,
+            .font_size = font_size,
+            .clip = clip,
+            .scroll = scroll_value,
+            .glyph_width = glyph_width,
+            .line_height = line_height,
+            .wrap = wrap,
+        });
     }
 
     pub fn cursor(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
