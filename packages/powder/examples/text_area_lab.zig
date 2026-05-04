@@ -4,6 +4,8 @@ const std = @import("std");
 const powder = @import("powder");
 const sdl = powder.sdl;
 
+const CAL_SANS_PATH = "../desktop/src/assets/fonts/CalSans-Regular.ttf";
+
 const Title = powder.text(.{
     .x = 24,
     .y = 20,
@@ -45,12 +47,16 @@ pub fn run() !void {
 
     try sdl.init(.{ .video = true, .events = true });
     defer sdl.quit();
+    try sdl.ttfInit();
+    defer sdl.ttfQuit();
 
     const window = try sdl.Window.create("Powder Text Area Lab", 800, 360, .{ .resizable = true, .vulkan = true });
     defer sdl.Window.destroy(window);
     const renderer = try sdl.Renderer.create(window);
     defer sdl.Renderer.destroy(renderer);
     try sdl.setRenderDrawBlendMode(renderer, .blend);
+    const font = try sdl.ttfOpenFont(CAL_SANS_PATH, 16.0);
+    defer sdl.ttfCloseFont(font);
 
     sdl.startTextInput(window) catch {};
     defer sdl.stopTextInput(window) catch {};
@@ -102,7 +108,7 @@ pub fn run() !void {
         try composer.render(allocator, &batch);
         try sdl.setRenderDrawColor(renderer, 14, 16, 20, 255);
         try sdl.renderClear(renderer);
-        var presenter = powder.renderer.sdlDebugRenderer(allocator, renderer);
+        var presenter = powder.renderer.sdlFontRenderer(renderer, font, 16.0);
         try presenter.renderBatch(&batch);
         sdl.renderPresent(renderer);
         updateWindowTitle(window, composer, batch.commands.items.len, frame_index);
