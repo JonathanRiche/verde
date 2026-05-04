@@ -5,6 +5,7 @@ const std = @import("std");
 const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
 const sdl = @import("../sdl.zig");
+const text_layout = @import("../text_layout.zig");
 
 pub const ButtonConfig = struct {
     x: f32 = 0.0,
@@ -81,6 +82,7 @@ pub fn Button(comptime config: ButtonConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
+        font_metrics: ?text_layout.FontMetrics = null,
         callbacks: ButtonCallbacks = .{},
 
         pub fn init() Component {
@@ -96,6 +98,10 @@ pub fn Button(comptime config: ButtonConfig) type {
             if (disabled) self.pressed = false;
         }
 
+        pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
+            self.font_metrics = metrics_value;
+        }
+
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
         }
@@ -107,8 +113,9 @@ pub fn Button(comptime config: ButtonConfig) type {
         pub fn labelRect(self: *const Component) draw.Rect {
             const bounds_rect = self.bounds();
             const available_w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0);
-            const text_w = @min(approximateWidth(config.label.len, config.font_size), available_w);
-            const text_h = @max(bounds_rect.h - config.padding_y * 2.0, 1.0);
+            const metrics_value = self.metrics();
+            const text_w = @min(metrics_value.measureSlice(config.label), available_w);
+            const text_h = @max(@min(metrics_value.line_height, bounds_rect.h - config.padding_y * 2.0), 1.0);
             return .{
                 .x = bounds_rect.x + config.padding_x,
                 .y = bounds_rect.y + (bounds_rect.h - text_h) * 0.5,
@@ -178,7 +185,21 @@ pub fn Button(comptime config: ButtonConfig) type {
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
             if (config.label.len > 0) {
-                try batch.text(allocator, self.labelRect(), config.label, if (self.disabled) config.disabled_text_color else config.text_color, config.font_size, self.bounds());
+                const rect = self.labelRect();
+                const color = if (self.disabled) config.disabled_text_color else config.text_color;
+                const metrics_value = self.metrics();
+                const runs = [_]draw.TextRun{.{
+                    .text = config.label,
+                    .byte_start = 0,
+                    .byte_end = config.label.len,
+                    .x = rect.x,
+                    .y = rect.y,
+                    .font_size = metrics_value.font_size,
+                    .line_height = metrics_value.line_height,
+                    .color = color,
+                    .clip = self.bounds(),
+                }};
+                try batch.textRuns(allocator, rect, config.label, &runs, color, metrics_value.font_size, self.bounds(), metrics_value.line_height, metrics_value.fixedAdvance());
             }
         }
 
@@ -208,6 +229,11 @@ pub fn Button(comptime config: ButtonConfig) type {
             if (self.pressed) return config.pressed_color;
             if (self.hovered) return config.hover_color;
             return config.background_color;
+        }
+
+        fn metrics(self: *const Component) text_layout.FontMetrics {
+            if (self.font_metrics) |metrics_value| return metrics_value;
+            return text_layout.FontMetrics.fallback(config.font_size);
         }
     };
 }
@@ -382,10 +408,6 @@ fn rectOutline(allocator: std.mem.Allocator, batch: *draw.RenderBatch, r: draw.R
     try batch.rect(allocator, .{ .x = r.x, .y = r.y + r.h - 1.0, .w = r.w, .h = 1.0 }, color);
     try batch.rect(allocator, .{ .x = r.x, .y = r.y, .w = 1.0, .h = r.h }, color);
     try batch.rect(allocator, .{ .x = r.x + r.w - 1.0, .y = r.y, .w = 1.0, .h = r.h }, color);
-}
-
-fn approximateWidth(len: usize, font_size: f32) f32 {
-    return @as(f32, @floatFromInt(len)) * font_size * 0.55;
 }
 
 const ButtonProbe = struct {

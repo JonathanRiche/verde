@@ -7,6 +7,7 @@ const clipboard = @import("../input/clipboard.zig");
 const Key = @import("../input/key.zig");
 const selection_input = @import("../input/selection.zig");
 const sdl = @import("../sdl.zig");
+const text_layout = @import("../text_layout.zig");
 
 pub const TextInputConfig = struct {
     x: f32 = 0.0,
@@ -81,6 +82,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         cursor_elapsed_ms: u32 = 0,
         dragging_selection: bool = false,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
+        font_metrics: ?text_layout.FontMetrics = null,
         callbacks: TextInputCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -118,6 +120,11 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             self.callbacks = callbacks;
         }
 
+        pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
+            self.font_metrics = metrics_value;
+            self.ensureCursorVisible();
+        }
+
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
             self.ensureCursorVisible();
@@ -133,12 +140,12 @@ pub fn TextInput(comptime config: TextInputConfig) type {
                 .x = bounds_rect.x + config.padding_x,
                 .y = bounds_rect.y + config.padding_y,
                 .w = @max(bounds_rect.w - config.padding_x * 2.0, self.glyphWidth()),
-                .h = @max(bounds_rect.h - config.padding_y * 2.0, config.font_size),
+                .h = @max(bounds_rect.h - config.padding_y * 2.0, self.metrics().line_height),
             };
         }
 
-        pub fn glyphWidth(_: *const Component) f32 {
-            return config.glyph_width orelse config.font_size * 0.55;
+        pub fn glyphWidth(self: *const Component) f32 {
+            return self.metrics().fixedAdvance();
         }
 
         pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
@@ -220,7 +227,19 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             const value = if (self.placeholderVisible()) config.placeholder_text else self.buffer.items;
             const color = if (self.placeholderVisible()) config.placeholder_color else config.text_color;
-            try batch.fixedText(allocator, text_rect, value, color, config.font_size, text_rect, .{ .x = self.scroll_x, .y = 0.0 }, self.glyphWidth(), text_rect.h, false);
+            const metrics_value = self.metrics();
+            const runs = [_]draw.TextRun{.{
+                .text = value,
+                .byte_start = 0,
+                .byte_end = value.len,
+                .x = text_rect.x - if (self.placeholderVisible()) 0.0 else self.scroll_x,
+                .y = text_rect.y,
+                .font_size = metrics_value.font_size,
+                .line_height = metrics_value.line_height,
+                .color = color,
+                .clip = text_rect,
+            }};
+            try batch.textRuns(allocator, text_rect, value, &runs, color, metrics_value.font_size, text_rect, metrics_value.line_height, metrics_value.fixedAdvance());
             if (self.focused and self.cursor_visible) {
                 const x = self.cursorX();
                 if (x >= text_rect.x and x <= text_rect.x + text_rect.w) {
@@ -358,13 +377,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn byteOffsetForPoint(self: *const Component, point: draw.Vec2) usize {
-            const col_float = @max(point.x - self.textRect().x + self.scroll_x, 0.0) / self.glyphWidth();
-            var offset: usize = 0;
-            var col: usize = 0;
-            while (offset < self.buffer.items.len and col < @as(usize, @intFromFloat(@floor(col_float)))) : (col += 1) {
-                offset = selection_input.nextOffset(self.buffer.items, offset);
-            }
-            return offset;
+            return text_layout.offsetForPoint(self.layoutOptions(self.buffer.items), point);
         }
 
         fn renderSelection(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, range: selection_input.Range) !void {
@@ -382,20 +395,12 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn xForOffset(self: *const Component, offset: usize) f32 {
-            return self.textRect().x + @as(f32, @floatFromInt(self.visualColumnForOffset(offset))) * self.glyphWidth() - self.scroll_x;
-        }
-
-        fn visualColumnForOffset(self: *const Component, offset: usize) usize {
-            var index: usize = 0;
-            var column: usize = 0;
-            while (index < @min(offset, self.buffer.items.len)) : (column += 1) {
-                index = selection_input.nextOffset(self.buffer.items, index);
-            }
-            return column;
+            return text_layout.positionForOffset(self.layoutOptions(self.buffer.items), offset).x;
         }
 
         fn ensureCursorVisible(self: *Component) void {
-            const cursor_left = @as(f32, @floatFromInt(self.visualColumnForOffset(self.cursor))) * self.glyphWidth();
+            const cell = text_layout.visualCellForOffset(self.buffer.items, self.cursor, self.metrics(), 1.0e20, false);
+            const cursor_left = cell.x;
             const visible_w = self.textRect().w;
             if (cursor_left < self.scroll_x) {
                 self.scroll_x = cursor_left;
@@ -406,15 +411,28 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn ensureScrollBounds(self: *Component) void {
-            self.scroll_x = @min(@max(self.scroll_x, 0.0), @max(self.approximateWidth(self.buffer.items.len) - self.textRect().w, 0.0));
+            self.scroll_x = @min(@max(self.scroll_x, 0.0), @max(self.metrics().measureSlice(self.buffer.items) - self.textRect().w, 0.0));
         }
 
         fn emit(self: *Component, event: TextInputEvent) void {
             if (self.callbacks.on_event) |callback| callback(self.callbacks.context, event);
         }
 
-        fn approximateWidth(self: *const Component, len: usize) f32 {
-            return @as(f32, @floatFromInt(len)) * self.glyphWidth();
+        fn metrics(self: *const Component) text_layout.FontMetrics {
+            if (self.font_metrics) |metrics_value| return metrics_value;
+            return text_layout.FontMetrics.fixed(config.font_size, config.glyph_width orelse config.font_size * 0.55, config.font_size * 1.25);
+        }
+
+        fn layoutOptions(self: *const Component, value: []const u8) text_layout.Options {
+            return .{
+                .rect = self.textRect(),
+                .text = value,
+                .color = config.text_color,
+                .metrics = self.metrics(),
+                .wrap = false,
+                .scroll = .{ .x = self.scroll_x },
+                .clip = self.textRect(),
+            };
         }
     };
 }
