@@ -1106,6 +1106,11 @@ pub const AppState = struct {
     composer_input_bounds_valid: bool,
     composer_input_min: [2]f32,
     composer_input_max: [2]f32,
+    composer_send_bounds_valid: bool,
+    composer_send_min: [2]f32,
+    composer_send_max: [2]f32,
+    composer_send_pressed: bool,
+    composer_send_hovered: bool,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
@@ -1203,6 +1208,11 @@ pub const AppState = struct {
             .composer_input_bounds_valid = false,
             .composer_input_min = .{ 0.0, 0.0 },
             .composer_input_max = .{ 0.0, 0.0 },
+            .composer_send_bounds_valid = false,
+            .composer_send_min = .{ 0.0, 0.0 },
+            .composer_send_max = .{ 0.0, 0.0 },
+            .composer_send_pressed = false,
+            .composer_send_hovered = false,
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
@@ -4212,6 +4222,12 @@ pub const AppState = struct {
         });
     }
 
+    pub fn setComposerSendButtonBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
+        self.composer_send_bounds_valid = true;
+        self.composer_send_min = input_min;
+        self.composer_send_max = input_max;
+    }
+
     pub fn routePowderComposerTextInput(self: *AppState, text: []const u8) bool {
         if (!self.powder_composer.focused) return false;
         const handled = self.powder_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
@@ -4242,6 +4258,22 @@ pub const AppState = struct {
     pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
         const point = powderMousePoint(event.x, event.y, ui_scale);
+        if (event.down and self.composerSendButtonContains(point)) {
+            self.composer_send_pressed = true;
+            self.composer_send_hovered = true;
+            self.powder_composer.focused = false;
+            self.composer_focused = false;
+            self.terminal_focused = false;
+            self.browser_pane_focused = false;
+            return true;
+        }
+        if (!event.down and self.composer_send_pressed) {
+            const should_activate = self.composerSendButtonContains(point);
+            self.composer_send_pressed = false;
+            self.composer_send_hovered = should_activate;
+            if (should_activate) self.activateComposerSendButton();
+            return true;
+        }
         const input: powder.text_area_component.Input = if (event.down)
             .{ .mouse_down = .{ .point = point, .clicks = event.clicks } }
         else
@@ -4260,9 +4292,17 @@ pub const AppState = struct {
     }
 
     pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+        const point = powderMousePoint(event.x, event.y, ui_scale);
+        const send_hovered = self.composerSendButtonContains(point);
+        const send_changed = self.composer_send_hovered != send_hovered;
+        self.composer_send_hovered = send_hovered;
+        if (self.composer_send_pressed and event.state.left == 0) {
+            self.composer_send_pressed = false;
+            return true;
+        }
         if (!self.powder_composer.focused) return false;
-        if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return false;
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = powderMousePoint(event.x, event.y, ui_scale) }) catch |err| {
+        if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return send_changed;
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = point }) catch |err| {
             log.warn("powder composer mouse drag failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -4270,7 +4310,7 @@ pub const AppState = struct {
             self.syncDraftFromPowderComposer();
             self.noteInteraction();
         }
-        return handled;
+        return handled or send_changed;
     }
 
     pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
@@ -4288,6 +4328,24 @@ pub const AppState = struct {
         self.composer_input_bounds_valid = true;
         self.composer_input_min = input_min;
         self.composer_input_max = input_max;
+    }
+
+    fn composerSendButtonContains(self: *const AppState, point: powder.draw.Vec2) bool {
+        if (!self.composer_send_bounds_valid) return false;
+        return point.x >= self.composer_send_min[0] and
+            point.y >= self.composer_send_min[1] and
+            point.x <= self.composer_send_max[0] and
+            point.y <= self.composer_send_max[1];
+    }
+
+    fn activateComposerSendButton(self: *AppState) void {
+        if (self.currentThread().isSendPendingForUi()) {
+            self.abortCurrentThreadSend();
+            return;
+        }
+        self.sendDraft() catch |err| {
+            log.err("failed to send draft: {s}", .{@errorName(err)});
+        };
     }
 
     pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {

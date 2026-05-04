@@ -2,17 +2,18 @@
 
 const std = @import("std");
 
+const powder = @import("powder");
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
-const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
+const chat_threads = @import("../chat/threads.zig");
 
 const HEADER_OPEN_MENU_ID: [:0]const u8 = "ChatHeaderOpenMenu";
 const TRANSCRIPT_VIRTUALIZE_MESSAGE_THRESHOLD: usize = 24;
@@ -3899,173 +3900,164 @@ fn renderPendingDiffPatchFallback(patch: []const u8) void {
 
 /// Renders the composer card, input, pickers, and send button.
 fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
-    const composer_bg = colors.GREEN_600;
-    const composer_rounding = theme.scaledUi(18.0);
-    state.composer_focused = false;
-    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = composer_rounding });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(12.0) } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = composer_bg });
-    // zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
-
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     const composer_screen_pos = zgui.getCursorScreenPos();
-    //NOTE: Begin of Composer
-    _ = zgui.beginChild("Composer", .{
-        .w = width,
-        .h = height,
-        .child_flags = .{ .border = true },
-    });
-    defer {
-        zgui.endChild();
-        zgui.popStyleColor(.{ .count = 2 });
-        zgui.popStyleVar(.{ .count = 2 });
+    zgui.dummy(.{ .w = width, .h = height });
 
-        const border_color = colors.DARK_BLUE;
-        const draw_list = zgui.getWindowDrawList();
-        draw_list.addRect(.{
-            .pmin = composer_screen_pos,
-            .pmax = .{ composer_screen_pos[0] + width, composer_screen_pos[1] + height },
-            .col = zgui.colorConvertFloat4ToU32(border_color),
-            .rounding = composer_rounding,
-            .thickness = 1.5,
-        });
-    }
+    const pad_x = theme.scaledUi(18.0);
+    const pad_y = theme.scaledUi(12.0);
+    const bottom_h = theme.scaledUi(42.0);
+    const bottom_gap = theme.scaledUi(8.0);
+    const send_btn_size = theme.scaledUi(32.0);
+    const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(28.0) else 0.0;
+    const input_rect_min = .{
+        composer_screen_pos[0] + pad_x,
+        composer_screen_pos[1] + pad_y + attachment_height,
+    };
+    const input_rect_max = .{
+        composer_screen_pos[0] + width - pad_x,
+        composer_screen_pos[1] + height - pad_y - bottom_h - bottom_gap,
+    };
+    const send_min = .{
+        composer_screen_pos[0] + width - pad_x - send_btn_size,
+        composer_screen_pos[1] + height - pad_y - send_btn_size,
+    };
+    const send_max = .{ send_min[0] + send_btn_size, send_min[1] + send_btn_size };
 
-    if (state.currentThread().draft_image) |image| {
-        renderComposerAttachmentPreview(state, image);
-        zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
-    }
-
-    const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(82.0) else 0.0;
-    const content_width = @max(zgui.getContentRegionAvail()[0], theme.scaledUi(120.0));
-    const input_h: f32 = @max(height - theme.scaledUi(86.0) - attachment_height, theme.scaledUi(48.0));
     state.syncPowderComposerFromDraft();
     if (state.consumeComposerFocusRequest()) {
         state.powder_composer.focused = true;
         state.composer_focused = true;
         state.terminal_focused = false;
     }
-    zgui.pushIntId(@intCast(state.composer_input_nonce));
-    defer zgui.popId();
-    const clicked_input = zgui.invisibleButton("##chat-draft-powder", .{ .w = content_width, .h = input_h });
-    if (clicked_input) {
-        state.powder_composer.focused = true;
-    }
     state.composer_focused = state.powder_composer.focused;
     if (state.composer_focused) {
         state.terminal_focused = false;
     }
-    const input_rect_min = zgui.getItemRectMin();
-    const input_rect_max = zgui.getItemRectMax();
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
+    state.setComposerSendButtonBounds(send_min, send_max);
     state.powder_composer.tick(16);
     const submitted = state.powder_composer.submitted;
-    queuePowderComposer(state);
+    queuePowderComposerIsland(state, composer_screen_pos, width, height, input_rect_min, input_rect_max, send_min, send_max);
     state.updateFileSearch();
-
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
-    // Keep this disabled until image file picking has a dedicated UX.
-    // const paste_image_button_width = theme.scaledUi(96.0);
-    // if (zgui.button("Paste image", .{ .w = paste_image_button_width, .h = theme.scaledUi(28.0) })) {
-    //     state.attachClipboardImageToCurrentDraft();
-    // }
-    // zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
-    composer_pickers.render(state);
     const pending = runtime.isSendPending(state);
-    if (pending) {
-        if (state.pendingFollowupHint()) |hint| {
-            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{hint});
-            zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
-            zgui.textColored(theme.COLOR_TEXT_MUTED, "to hold a follow-up while this thread is running", .{});
-        }
-    }
-
-    const send_btn_size = theme.scaledUi(32.0);
-    zgui.sameLine(.{ .spacing = 0.0 });
-    const avail = zgui.getContentRegionAvail();
-    if (avail[0] > send_btn_size + theme.scaledUi(4.0)) {
-        zgui.sameLine(.{ .spacing = avail[0] - send_btn_size - theme.scaledUi(4.0) });
-    }
-
-    {
-        const btn_pos = zgui.getCursorScreenPos();
-        const clicked = zgui.invisibleButton("##send-btn", .{ .w = send_btn_size, .h = send_btn_size });
-        const hovered = zgui.isItemHovered(.{});
-        const draw_list = zgui.getWindowDrawList();
-        const cx = btn_pos[0] + send_btn_size * 0.5;
-        const cy = btn_pos[1] + send_btn_size * 0.5;
-        const r = send_btn_size * 0.5;
-
-        const circle_color = if (pending)
-            colors.rgba(80, 72, 24, 255)
-        else if (hovered)
-            theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12)
-        else
-            theme.COLOR_SECONDARY_GREEN;
-        draw_list.addCircleFilled(.{
-            .p = .{ cx, cy },
-            .r = r,
-            .col = zgui.colorConvertFloat4ToU32(circle_color),
-        });
-
-        if (pending) {
-            const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
-            const stop_half = theme.scaledUi(5.5);
-            draw_list.addRectFilled(.{
-                .pmin = .{ cx - stop_half, cy - stop_half },
-                .pmax = .{ cx + stop_half, cy + stop_half },
-                .col = white,
-                .rounding = theme.scaledUi(2.0),
-            });
-        } else {
-            const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
-            const arrow_half_w = theme.scaledUi(5.5);
-            const arrow_top = cy - theme.scaledUi(7.0);
-            const arrow_mid = cy - theme.scaledUi(1.0);
-            const arrow_bottom = cy + theme.scaledUi(7.0);
-
-            draw_list.addTriangleFilled(.{
-                .p1 = .{ cx, arrow_top },
-                .p2 = .{ cx - arrow_half_w, arrow_mid },
-                .p3 = .{ cx + arrow_half_w, arrow_mid },
-                .col = white,
-            });
-            draw_list.addLine(.{
-                .p1 = .{ cx, arrow_mid },
-                .p2 = .{ cx, arrow_bottom },
-                .col = white,
-                .thickness = theme.scaledUi(2.4),
-            });
-        }
-
-        if (clicked and pending) {
-            state.abortCurrentThreadSend();
-        } else if ((clicked or submitted) and !pending) {
-            state.powder_composer.submitted = false;
-            if (submitted and state.acceptPrimaryFileSearchResult()) {
-                //NOTE: END OF Composer
-                return;
-            }
-            state.sendDraft() catch |err| {
-                runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
-            };
-        } else if (submitted and pending) {
-            state.powder_composer.submitted = false;
-            state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
-        }
+    if (submitted and !pending) {
+        state.powder_composer.submitted = false;
+        if (state.acceptPrimaryFileSearchResult()) return;
+        state.sendDraft() catch |err| {
+            runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
+        };
+    } else if (submitted and pending) {
+        state.powder_composer.submitted = false;
+        state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
     }
 
     if (state.hasActiveFileSearch()) {
         renderComposerFileSearchResults(state, composer_screen_pos, width, input_rect_min, input_rect_max);
     }
-    //NOTE: END OF Composer
 }
 
-fn queuePowderComposer(state: *app_state.AppState) void {
-    state.powder_composer.render(state.allocator, &state.powder_overlay_batch) catch |err| {
+fn queuePowderComposerIsland(
+    state: *app_state.AppState,
+    composer_screen_pos: [2]f32,
+    width: f32,
+    height: f32,
+    input_rect_min: [2]f32,
+    input_rect_max: [2]f32,
+    send_min: [2]f32,
+    send_max: [2]f32,
+) void {
+    const allocator = state.allocator;
+    const card_rect: powder.Rect = .{ .x = composer_screen_pos[0], .y = composer_screen_pos[1], .w = width, .h = height };
+    const border = powderColor(colors.DARK_BLUE);
+    state.powder_overlay_batch.rect(allocator, card_rect, powderColor(colors.GREEN_600)) catch return;
+    queuePowderBorder(state, card_rect, border);
+
+    if (state.currentThread().draft_image != null) {
+        const attachment_rect: powder.Rect = .{
+            .x = input_rect_min[0],
+            .y = composer_screen_pos[1] + theme.scaledUi(8.0),
+            .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
+            .h = theme.scaledUi(20.0),
+        };
+        queuePowderText(state, attachment_rect, "Image attached", powderColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), null);
+    }
+
+    state.powder_composer.render(allocator, &state.powder_overlay_batch) catch |err| {
         runtime.log.warn("failed to render powder composer: {s}", .{@errorName(err)});
         return;
     };
+
+    const thread = state.currentThread();
+    var label_buf: [256]u8 = undefined;
+    const model = chat_threads.selectedModelLabel(app_state.ModelOption, thread, state.opencodeModelOptionsSnapshot(), app_state.CODEX_MODEL_OPTIONS[0..]);
+    const reasoning = chat_threads.selectedReasoningLabel(app_state.ReasoningOption, thread, app_state.CODEX_REASONING_OPTIONS[0..]);
+    const fast = if (thread.fast_mode == .on) "Fast" else "Default";
+    const access = chat_threads.accessModeLabel(thread.access_mode);
+    const meta = std.fmt.bufPrint(&label_buf, "{s}  |  {s}  |  {s}  |  {s}  |  {s}", .{
+        chat_threads.providerLabel(thread.provider),
+        model,
+        reasoning,
+        fast,
+        access,
+    }) catch "";
+    const meta_rect: powder.Rect = .{
+        .x = composer_screen_pos[0] + theme.scaledUi(30.0),
+        .y = composer_screen_pos[1] + height - theme.scaledUi(33.0),
+        .w = @max(send_min[0] - composer_screen_pos[0] - theme.scaledUi(42.0), 0.0),
+        .h = theme.scaledUi(22.0),
+    };
+    queuePowderText(state, meta_rect, meta, powderColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), meta_rect);
+
+    if (runtime.isSendPending(state)) {
+        if (state.pendingFollowupHint()) |hint| {
+            const hint_rect: powder.Rect = .{
+                .x = input_rect_min[0],
+                .y = send_min[1] - theme.scaledUi(22.0),
+                .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
+                .h = theme.scaledUi(18.0),
+            };
+            queuePowderText(state, hint_rect, hint, powderColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), hint_rect);
+        }
+    }
+
+    const send_rect: powder.Rect = .{ .x = send_min[0], .y = send_min[1], .w = send_max[0] - send_min[0], .h = send_max[1] - send_min[1] };
+    const send_color = if (runtime.isSendPending(state))
+        powderColor(colors.rgba(80, 72, 24, 255))
+    else if (state.composer_send_pressed)
+        powderColor(theme.darken(theme.COLOR_SECONDARY_GREEN, 0.12))
+    else if (state.composer_send_hovered)
+        powderColor(theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12))
+    else
+        powderColor(theme.COLOR_SECONDARY_GREEN);
+    state.powder_overlay_batch.rect(allocator, send_rect, send_color) catch return;
+    queuePowderText(state, .{ .x = send_rect.x + theme.scaledUi(7.0), .y = send_rect.y + theme.scaledUi(8.0), .w = send_rect.w, .h = send_rect.h }, if (runtime.isSendPending(state)) "STOP" else "SEND", powderColor(theme.COLOR_WHITE), theme.scaledUi(10.0), send_rect);
+}
+
+fn queuePowderBorder(state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
+    const thickness = theme.scaledUi(1.5);
+    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = thickness }, color) catch return;
+    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y + rect.h - thickness, .w = rect.w, .h = thickness }, color) catch return;
+    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
+    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x + rect.w - thickness, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
+}
+
+fn queuePowderText(state: *app_state.AppState, rect: powder.Rect, value: []const u8, color: powder.Color, font_size: f32, clip: ?powder.Rect) void {
+    state.powder_overlay_batch.fixedText(
+        state.allocator,
+        rect,
+        value,
+        color,
+        font_size,
+        clip,
+        .{},
+        font_size * 0.55,
+        font_size * 1.25,
+        false,
+    ) catch return;
+}
+
+fn powderColor(value: [4]f32) powder.Color {
+    return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }
 
 fn renderComposerFileSearchResults(
