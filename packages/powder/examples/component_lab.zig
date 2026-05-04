@@ -15,24 +15,24 @@ const Header = powder.text(.{
 });
 const Search = powder.textInput(.{
     .x = 24,
-    .y = 64,
+    .y = 76,
     .width = 280,
     .height = 34,
     .glyph_width = 8,
     .placeholder_text = "Type here",
 });
-const ApplyButton = powder.button(.{ .x = 320, .y = 64, .width = 104, .height = 34, .label = "Apply" });
-const ToolButton = powder.iconButton(.{ .x = 436, .y = 64, .width = 34, .height = 34, .icon_inset = 9 });
-const ReadyCheck = powder.checkbox(.{ .x = 24, .y = 116, .size = 20, .label = "Ready" });
-const LiveToggle = powder.toggle(.{ .x = 148, .y = 115, .width = 42, .height = 22, .label = "Live" });
-const Items = powder.listBox(.{ .x = 24, .y = 164, .width = 220, .height = 146, .padding_x = 8, .padding_y = 6, .row_height = 24, .item_count = 12 });
-const Choice = powder.select(.{ .x = 270, .y = 164, .width = 220, .height = 32, .menu_height = 148, .padding_x = 8, .padding_y = 6, .row_height = 28, .item_count = 8 });
-const Strip = powder.tabs(.{ .x = 24, .y = 334, .width = 360, .height = 34, .tab_width = 120, .tab_count = 3 });
-const Panel = powder.scrollArea(.{ .x = 520, .y = 64, .width = 160, .height = 128, .content_height = 320, .background_color = .{ .r = 0.07, .g = 0.08, .b = 0.10, .a = 1.0 }, .scrollbar_width = 6 });
-const Popup = powder.menu(.{ .x = 708, .y = 64, .width = 160, .row_height = 28, .item_count = 5 });
+const ApplyButton = powder.button(.{ .x = 320, .y = 76, .width = 104, .height = 34, .label = "Apply" });
+const ToolButton = powder.iconButton(.{ .x = 436, .y = 76, .width = 34, .height = 34, .icon_inset = 9 });
+const ReadyCheck = powder.checkbox(.{ .x = 24, .y = 130, .size = 20, .label = "Ready" });
+const LiveToggle = powder.toggle(.{ .x = 160, .y = 129, .width = 42, .height = 22, .label = "Live" });
+const Items = powder.listBox(.{ .x = 24, .y = 198, .width = 220, .height = 132, .padding_x = 8, .padding_y = 6, .row_height = 24, .item_count = 12 });
+const Choice = powder.select(.{ .x = 300, .y = 198, .width = 200, .height = 32, .menu_height = 120, .padding_x = 8, .padding_y = 6, .row_height = 28, .item_count = 8 });
+const Strip = powder.tabs(.{ .x = 24, .y = 366, .width = 360, .height = 34, .tab_width = 120, .tab_count = 3 });
+const Panel = powder.scrollArea(.{ .x = 560, .y = 76, .width = 160, .height = 128, .content_height = 320, .background_color = .{ .r = 0.07, .g = 0.08, .b = 0.10, .a = 1.0 }, .scrollbar_width = 6 });
+const Popup = powder.menu(.{ .x = 740, .y = 96, .width = 160, .row_height = 28, .item_count = 5 });
 const Dialog = powder.modal(.{ .x = 260, .y = 150, .width = 340, .height = 180 });
-const Grid = powder.table(.{ .x = 520, .y = 220, .width = 360, .height = 150, .header_height = 26, .row_height = 24, .column_width = 120, .row_count = 14, .column_count = 3 });
-const Source = powder.codeView(.{ .x = 24, .y = 404, .width = 856, .height = 160, .glyph_width = 8, .line_height = 18 });
+const Grid = powder.table(.{ .x = 560, .y = 254, .width = 330, .height = 132, .header_height = 26, .row_height = 24, .column_width = 110, .row_count = 14, .column_count = 3 });
+const Source = powder.codeView(.{ .x = 24, .y = 430, .width = 856, .height = 132, .glyph_width = 8, .line_height = 18 });
 
 const State = struct {
     apply_clicks: usize = 0,
@@ -82,6 +82,8 @@ pub fn run() !void {
     var toggle = LiveToggle.init(false);
     var list = Items.initFromConfig();
     var select = Choice.initFromConfig();
+    select.open = true;
+    select.highlighted_index = 0;
     var tabs = Strip.initFromConfig();
     var panel = Panel.init();
     var popup = Popup.initFromConfig();
@@ -200,10 +202,10 @@ fn routeEvent(
                 _ = popup.handleInput(.open);
                 return;
             }
-            if (point.x >= 708 and point.x <= 868 and point.y >= 32 and point.y <= 54) {
+            if (point.x >= 740 and point.x <= 900 and point.y >= 68 and point.y <= 88) {
                 _ = popup.handleInput(.open);
             }
-            if (point.x >= 708 and point.x <= 868 and point.y >= 382 and point.y <= 410) {
+            if (point.x >= 740 and point.x <= 900 and point.y >= 404 and point.y <= 426) {
                 _ = dialog.handleInput(.open);
             }
             _ = try header.update(event);
@@ -272,21 +274,32 @@ fn drawDebugOverlay(
 ) !void {
     try debugText(allocator, renderer, 24, 22, header.text(), .{ 214, 226, 242, 255 });
     try debugText(allocator, renderer, 24, 42, "Selectable header: drag over title, Ctrl+C", .{ 122, 137, 156, 255 });
-    try debugText(allocator, renderer, 32, 75, if (search.text().len == 0) "Type here" else search.text(), .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 342, 76, "Apply", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 447, 76, "*", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 54, 119, "Ready", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 202, 119, "Live", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 24, 60, "TextInput", .{ 122, 137, 156, 255 });
+    try debugText(allocator, renderer, 320, 60, "Button / IconButton", .{ 122, 137, 156, 255 });
+    try debugText(allocator, renderer, 32, 87, if (search.text().len == 0) "Type here" else search.text(), .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 342, 88, "Apply", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 447, 88, "*", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 24, 116, "Checkbox / Toggle", .{ 122, 137, 156, 255 });
+    try debugText(allocator, renderer, 54, 133, "Ready", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 214, 133, "Live", .{ 236, 241, 248, 255 });
 
+    try debugText(allocator, renderer, 24, 178, "ListBox", .{ 122, 137, 156, 255 });
+    try debugText(allocator, renderer, 300, 178, "Select / Dropdown", .{ 122, 137, 156, 255 });
     try drawListLabels(allocator, renderer, list);
-    try debugText(allocator, renderer, 278, 173, selectLabel(select.selected_index), .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 308, 207, selectLabel(select.selected_index), .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 472, 207, "v", .{ 170, 184, 204, 255 });
     if (select.open) try drawSelectLabels(allocator, renderer, select);
+    try debugText(allocator, renderer, 24, 346, "Tabs", .{ 122, 137, 156, 255 });
     try drawTabLabels(allocator, renderer, tabs);
+    try debugText(allocator, renderer, 560, 56, "ScrollArea", .{ 122, 137, 156, 255 });
     try drawPanelContent(allocator, renderer, panel);
-    try debugText(allocator, renderer, 708, 38, "Open menu", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 740, 56, "Menu", .{ 122, 137, 156, 255 });
+    try debugText(allocator, renderer, 740, 74, "Open menu", .{ 236, 241, 248, 255 });
     if (popup.open) try drawMenuLabels(allocator, renderer);
-    try debugText(allocator, renderer, 708, 388, "Open modal", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 560, 234, "Table", .{ 122, 137, 156, 255 });
     try drawTableText(allocator, renderer, table);
+    try debugText(allocator, renderer, 740, 404, "Open modal", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 24, 410, "CodeView / DiffView", .{ 122, 137, 156, 255 });
     try drawCodeText(allocator, renderer, source);
 
     var status_buf: [256]u8 = undefined;
@@ -314,8 +327,8 @@ fn drawDebugOverlay(
 fn drawListLabels(allocator: std.mem.Allocator, renderer: *sdl.Renderer, list: Items) !void {
     var index: usize = 0;
     while (index < 12) : (index += 1) {
-        const y = 173 + @as(f32, @floatFromInt(index)) * 24.0 - list.scrollY();
-        if (y < 164 or y > 300) continue;
+        const y = 207 + @as(f32, @floatFromInt(index)) * 24.0 - list.scrollY();
+        if (y < 198 or y > 320) continue;
         var buf: [32]u8 = undefined;
         try debugText(allocator, renderer, 34, y, try std.fmt.bufPrint(&buf, "List item {d}", .{index + 1}), .{ 236, 241, 248, 255 });
     }
@@ -324,59 +337,59 @@ fn drawListLabels(allocator: std.mem.Allocator, renderer: *sdl.Renderer, list: I
 fn drawSelectLabels(allocator: std.mem.Allocator, renderer: *sdl.Renderer, select: Choice) !void {
     var index: usize = 0;
     while (index < 8) : (index += 1) {
-        const y = 204 + @as(f32, @floatFromInt(index)) * 28.0 - select.scrollY();
-        if (y < 196 or y > 342) continue;
-        try debugText(allocator, renderer, 278, y, selectLabel(index), .{ 236, 241, 248, 255 });
+        const y = 238 + @as(f32, @floatFromInt(index)) * 28.0 - select.scrollY();
+        if (y < 230 or y > 342) continue;
+        try debugText(allocator, renderer, 308, y, selectLabel(index), .{ 236, 241, 248, 255 });
     }
 }
 
 fn drawTabLabels(allocator: std.mem.Allocator, renderer: *sdl.Renderer, tabs: Strip) !void {
     _ = tabs;
-    try debugText(allocator, renderer, 52, 344, "Inspect", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 172, 344, "Review", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 292, 344, "Ship", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 52, 376, "Inspect", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 172, 376, "Review", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 292, 376, "Ship", .{ 236, 241, 248, 255 });
 }
 
 fn drawPanelContent(allocator: std.mem.Allocator, renderer: *sdl.Renderer, panel: Panel) !void {
     var row: usize = 0;
     while (row < 14) : (row += 1) {
-        const y = 74 + @as(f32, @floatFromInt(row)) * 22.0 - panel.scrollY();
-        if (y < 64 or y > 184) continue;
+        const y = 86 + @as(f32, @floatFromInt(row)) * 22.0 - panel.scrollY();
+        if (y < 76 or y > 196) continue;
         var buf: [32]u8 = undefined;
-        try debugText(allocator, renderer, 532, y, try std.fmt.bufPrint(&buf, "Scroll row {d}", .{row + 1}), .{ 210, 220, 232, 255 });
+        try debugText(allocator, renderer, 572, y, try std.fmt.bufPrint(&buf, "Scroll row {d}", .{row + 1}), .{ 210, 220, 232, 255 });
     }
 }
 
 fn drawMenuLabels(allocator: std.mem.Allocator, renderer: *sdl.Renderer) !void {
-    try debugText(allocator, renderer, 716, 72, "New thread", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 716, 100, "Copy", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 716, 128, "Archive", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 716, 156, "Settings", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 716, 184, "Close", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 748, 104, "New thread", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 748, 132, "Copy", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 748, 160, "Archive", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 748, 188, "Settings", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 748, 216, "Close", .{ 236, 241, 248, 255 });
 }
 
 fn drawTableText(allocator: std.mem.Allocator, renderer: *sdl.Renderer, table: Grid) !void {
-    try debugText(allocator, renderer, 528, 228, "Name", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 648, 228, "State", .{ 236, 241, 248, 255 });
-    try debugText(allocator, renderer, 768, 228, "Age", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 568, 262, "Name", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 678, 262, "State", .{ 236, 241, 248, 255 });
+    try debugText(allocator, renderer, 788, 262, "Age", .{ 236, 241, 248, 255 });
     var row: usize = 0;
     while (row < 14) : (row += 1) {
-        const y = 252 + @as(f32, @floatFromInt(row)) * 24.0 - table.scroll_y;
-        if (y < 246 or y > 360) continue;
+        const y = 286 + @as(f32, @floatFromInt(row)) * 24.0 - table.scroll_y;
+        if (y < 280 or y > 376) continue;
         var buf: [64]u8 = undefined;
-        try debugText(allocator, renderer, 528, y, try std.fmt.bufPrint(&buf, "Task {d}", .{row + 1}), .{ 236, 241, 248, 255 });
-        try debugText(allocator, renderer, 648, y, if (row % 2 == 0) "open" else "done", .{ 236, 241, 248, 255 });
-        try debugText(allocator, renderer, 768, y, try std.fmt.bufPrint(&buf, "{d}m", .{(row + 1) * 3}), .{ 236, 241, 248, 255 });
+        try debugText(allocator, renderer, 568, y, try std.fmt.bufPrint(&buf, "Task {d}", .{row + 1}), .{ 236, 241, 248, 255 });
+        try debugText(allocator, renderer, 678, y, if (row % 2 == 0) "open" else "done", .{ 236, 241, 248, 255 });
+        try debugText(allocator, renderer, 788, y, try std.fmt.bufPrint(&buf, "{d}m", .{(row + 1) * 3}), .{ 236, 241, 248, 255 });
     }
 }
 
 fn drawCodeText(allocator: std.mem.Allocator, renderer: *sdl.Renderer, source: Source) !void {
-    var y: f32 = 412 - source.scroll_y;
+    var y: f32 = 438 - source.scroll_y;
     var start: usize = 0;
     var line: usize = 1;
     while (start <= source.text().len) : (line += 1) {
         const end = std.mem.indexOfScalarPos(u8, source.text(), start, '\n') orelse source.text().len;
-        if (y >= 404 and y <= 550) {
+        if (y >= 430 and y <= 552) {
             var line_buf: [12]u8 = undefined;
             try debugText(allocator, renderer, 34, y, try std.fmt.bufPrint(&line_buf, "{d}", .{line}), .{ 122, 137, 156, 255 });
             try debugText(allocator, renderer, 82, y, source.text()[start..end], .{ 236, 241, 248, 255 });
