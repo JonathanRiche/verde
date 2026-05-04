@@ -8,6 +8,7 @@ const sdl = @import("sdl.zig");
 
 pub const c = @cImport({
     @cInclude("SDL3/SDL_gpu.h");
+    @cInclude("SDL3_ttf/SDL_ttf.h");
 });
 
 pub const ShaderFormat = struct {
@@ -44,21 +45,45 @@ pub const ShaderPackage = struct {
     }
 };
 
+pub const PipelineShaderPackages = struct {
+    solid: ShaderPackage,
+    text: ShaderPackage,
+};
+
 pub const RendererConfig = struct {
     debug_mode: bool = false,
     shader_formats: u32 = ShaderFormat.portable,
     shader_package: ?ShaderPackage = null,
+    shader_packages: ?PipelineShaderPackages = null,
+    font: ?*sdl.Font = null,
+};
+
+const PipelineKind = enum { solid, text };
+
+const ViewportUniform = extern struct {
+    viewport_size: [2]f32,
+    padding: [2]f32 = .{ 0, 0 },
 };
 
 pub const Renderer = struct {
     device: ?*c.SDL_GPUDevice = null,
     pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    text_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    sampler: ?*c.SDL_GPUSampler = null,
+    text_engine: ?*c.TTF_TextEngine = null,
+    font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
+    text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
+    text_index_buffer: ?*c.SDL_GPUBuffer = null,
     vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
     index_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    text_vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    text_index_transfer: ?*c.SDL_GPUTransferBuffer = null,
     vertex_capacity: usize = 0,
     index_capacity: usize = 0,
+    text_vertex_capacity: usize = 0,
+    text_index_capacity: usize = 0,
     command_counts: CommandCounts = .{},
     unsupported_text_commands: usize = 0,
 
@@ -68,8 +93,13 @@ pub const Renderer = struct {
         const device = c.SDL_CreateGPUDevice(config.shader_formats, config.debug_mode, null) orelse return error.SdlGpuCreateDeviceFailed;
         var renderer: Renderer = .{ .device = device };
         errdefer renderer.deinit();
-        if (config.shader_package) |package| {
-            try renderer.createPipeline(package);
+        if (config.shader_packages) |packages| {
+            try renderer.createPipelines(packages);
+        } else if (config.shader_package) |package| {
+            try renderer.createPipeline(package, .solid);
+        }
+        if (config.font) |font| {
+            try renderer.configureGpuText(font);
         }
         return renderer;
     }
@@ -77,10 +107,17 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         if (self.device) |device| {
             if (self.pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
+            if (self.text_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
+            if (self.sampler) |sampler| c.SDL_ReleaseGPUSampler(device, sampler);
+            if (self.text_engine) |engine| c.TTF_DestroyGPUTextEngine(engine);
             if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (self.text_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (self.text_index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            if (self.text_vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            if (self.text_index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             c.SDL_DestroyGPUDevice(device);
         }
         self.* = undefined;
@@ -100,7 +137,7 @@ pub const Renderer = struct {
     /// the renderer has been initialized with shaders and resources.
     pub fn renderBatch(self: *Renderer, pass: *c.SDL_GPURenderPass, batch: *const draw.RenderBatch) void {
         self.command_counts = CommandCounts.fromBatch(batch);
-        self.unsupported_text_commands = self.command_counts.text;
+        self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
         if (self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null or self.command_counts.drawableIndexCount() == 0) return;
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.index_buffer.?, .offset = 0 };
@@ -118,11 +155,12 @@ pub const Renderer = struct {
         try buildMesh(allocator, batch, &mesh);
 
         self.command_counts = CommandCounts.fromBatch(batch);
-        self.unsupported_text_commands = self.command_counts.text;
-        if (mesh.vertices.items.len == 0 or mesh.indices.items.len == 0) return;
-        try self.ensureBuffers(mesh.vertices.items.len, mesh.indices.items.len);
-        try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, std.mem.sliceAsBytes(mesh.vertices.items));
-        try self.uploadBuffer(command_buffer, self.index_transfer.?, self.index_buffer.?, std.mem.sliceAsBytes(mesh.indices.items));
+        self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
+        if (mesh.vertices.items.len > 0 and mesh.indices.items.len > 0) {
+            try self.ensureBuffers(.solid, mesh.vertices.items.len, mesh.indices.items.len);
+            try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, std.mem.sliceAsBytes(mesh.vertices.items));
+            try self.uploadBuffer(command_buffer, self.index_transfer.?, self.index_buffer.?, std.mem.sliceAsBytes(mesh.indices.items));
+        }
     }
 
     pub fn renderWindow(self: *Renderer, allocator: std.mem.Allocator, window: *sdl.Window, batch: *const draw.RenderBatch, clear_color: draw.Color) !void {
@@ -132,6 +170,8 @@ pub const Renderer = struct {
 
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
         try self.prepareBatch(allocator, command_buffer, batch);
+        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch);
+        defer text_frame.deinit(allocator);
 
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
         var width: u32 = 0;
@@ -154,17 +194,49 @@ pub const Renderer = struct {
                 .padding2 = 0,
             };
             const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
+            c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
             self.renderBatch(pass, batch);
+            self.renderTextFrame(pass, &text_frame, @floatFromInt(height));
             c.SDL_EndGPURenderPass(pass);
         }
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
     }
 
-    pub fn supportsGpuText(_: *const Renderer) bool {
-        return false;
+    pub fn supportsGpuText(self: *const Renderer) bool {
+        return self.text_pipeline != null and self.text_engine != null and self.font != null and self.sampler != null;
     }
 
-    fn createPipeline(self: *Renderer, package: ShaderPackage) !void {
+    pub fn configureGpuText(self: *Renderer, font: *sdl.Font) !void {
+        const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
+        self.font = @ptrCast(font);
+        self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
+        c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
+        self.sampler = c.SDL_CreateGPUSampler(device, &.{
+            .min_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mag_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .mip_lod_bias = 0,
+            .max_anisotropy = 0,
+            .compare_op = c.SDL_GPU_COMPAREOP_INVALID,
+            .min_lod = 0,
+            .max_lod = 0,
+            .enable_anisotropy = false,
+            .enable_compare = false,
+            .padding1 = 0,
+            .padding2 = 0,
+            .props = 0,
+        }) orelse return error.SdlGpuSamplerFailed;
+    }
+
+    fn createPipelines(self: *Renderer, packages: PipelineShaderPackages) !void {
+        try self.createPipeline(packages.solid, .solid);
+        try self.createPipeline(packages.text, .text);
+    }
+
+    fn createPipeline(self: *Renderer, package: ShaderPackage, kind: PipelineKind) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         const accepted_formats = c.SDL_GetGPUShaderFormats(device);
         try package.validate(accepted_formats);
@@ -189,7 +261,7 @@ pub const Renderer = struct {
             .entrypoint = package.fragment.entrypoint.ptr,
             .format = package.fragment.format,
             .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT,
-            .num_samplers = 1,
+            .num_samplers = if (kind == .text) 1 else 0,
             .num_storage_textures = 0,
             .num_storage_buffers = 0,
             .num_uniform_buffers = 0,
@@ -212,7 +284,7 @@ pub const Renderer = struct {
             .format = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
             .blend_state = alphaBlendState(),
         }};
-        self.pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &.{
+        const pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &.{
             .vertex_shader = vertex_shader,
             .fragment_shader = fragment_shader,
             .vertex_input_state = .{
@@ -254,25 +326,53 @@ pub const Renderer = struct {
             },
             .props = 0,
         }) orelse return error.SdlGpuPipelineFailed;
+        switch (kind) {
+            .solid => self.pipeline = pipeline,
+            .text => self.text_pipeline = pipeline,
+        }
     }
 
-    fn ensureBuffers(self: *Renderer, vertex_count: usize, index_count: usize) !void {
+    fn ensureBuffers(self: *Renderer, kind: PipelineKind, vertex_count: usize, index_count: usize) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
-        if (vertex_count > self.vertex_capacity) {
-            if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
-            if (self.vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
-            self.vertex_capacity = growCapacity(vertex_count);
-            const byte_size: u32 = @intCast(self.vertex_capacity * @sizeOf(draw.Vertex));
-            self.vertex_buffer = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
-            self.vertex_transfer = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
+        const vertex_buffer = switch (kind) {
+            .solid => &self.vertex_buffer,
+            .text => &self.text_vertex_buffer,
+        };
+        const index_buffer = switch (kind) {
+            .solid => &self.index_buffer,
+            .text => &self.text_index_buffer,
+        };
+        const vertex_transfer = switch (kind) {
+            .solid => &self.vertex_transfer,
+            .text => &self.text_vertex_transfer,
+        };
+        const index_transfer = switch (kind) {
+            .solid => &self.index_transfer,
+            .text => &self.text_index_transfer,
+        };
+        const vertex_capacity = switch (kind) {
+            .solid => &self.vertex_capacity,
+            .text => &self.text_vertex_capacity,
+        };
+        const index_capacity = switch (kind) {
+            .solid => &self.index_capacity,
+            .text => &self.text_index_capacity,
+        };
+        if (vertex_count > vertex_capacity.*) {
+            if (vertex_buffer.*) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (vertex_transfer.*) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            vertex_capacity.* = growCapacity(vertex_count);
+            const byte_size: u32 = @intCast(vertex_capacity.* * @sizeOf(draw.Vertex));
+            vertex_buffer.* = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
+            vertex_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
         }
-        if (index_count > self.index_capacity) {
-            if (self.index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
-            if (self.index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
-            self.index_capacity = growCapacity(index_count);
-            const byte_size: u32 = @intCast(self.index_capacity * @sizeOf(u32));
-            self.index_buffer = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_INDEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
-            self.index_transfer = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
+        if (index_count > index_capacity.*) {
+            if (index_buffer.*) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (index_transfer.*) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            index_capacity.* = growCapacity(index_count);
+            const byte_size: u32 = @intCast(index_capacity.* * @sizeOf(u32));
+            index_buffer.* = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_INDEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
+            index_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
         }
     }
 
@@ -285,6 +385,84 @@ pub const Renderer = struct {
         const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
         c.SDL_UploadToGPUBuffer(copy_pass, &.{ .transfer_buffer = transfer, .offset = 0 }, &.{ .buffer = buffer, .offset = 0, .size = @intCast(bytes.len) }, true);
         c.SDL_EndGPUCopyPass(copy_pass);
+    }
+
+    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch) !TextFrame {
+        var frame: TextFrame = .{};
+        errdefer frame.deinit(allocator);
+        if (!self.supportsGpuText()) return frame;
+        for (batch.commands.items) |command| {
+            if (command.kind != .text or command.text.len == 0 or command.color.a <= 0.0) continue;
+            try self.appendTextCommand(allocator, &frame, command);
+        }
+        if (frame.vertices.items.len > 0 and frame.indices.items.len > 0) {
+            try self.ensureBuffers(.text, frame.vertices.items.len, frame.indices.items.len);
+            try self.uploadBuffer(command_buffer, self.text_vertex_transfer.?, self.text_vertex_buffer.?, std.mem.sliceAsBytes(frame.vertices.items));
+            try self.uploadBuffer(command_buffer, self.text_index_transfer.?, self.text_index_buffer.?, std.mem.sliceAsBytes(frame.indices.items));
+        }
+        return frame;
+    }
+
+    fn appendTextCommand(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, command: draw.Command) !void {
+        const text = c.TTF_CreateText(self.text_engine.?, self.font.?, command.text.ptr, command.text.len) orelse return error.SdlTtfCreateTextFailed;
+        defer c.TTF_DestroyText(text);
+        const color = colorBytes(command.color);
+        if (!c.TTF_SetTextColor(text, color[0], color[1], color[2], color[3])) return error.SdlTtfTextFailed;
+        if (command.wrap and command.rect.w > 0) {
+            if (!c.TTF_SetTextWrapWidth(text, @intFromFloat(@ceil(command.rect.w)))) return error.SdlTtfTextFailed;
+        }
+        if (!c.TTF_UpdateText(text)) return error.SdlTtfTextFailed;
+        const sequence_head = c.TTF_GetGPUTextDrawData(text) orelse return;
+
+        var sequence: ?*c.TTF_GPUAtlasDrawSequence = sequence_head;
+        while (sequence) |seq| : (sequence = seq.next) {
+            if (seq.num_vertices <= 0 or seq.num_indices <= 0) continue;
+            const base_vertex: u32 = @intCast(frame.vertices.items.len);
+            const first_index: u32 = @intCast(frame.indices.items.len);
+            try frame.vertices.ensureUnusedCapacity(allocator, @intCast(seq.num_vertices));
+            try frame.indices.ensureUnusedCapacity(allocator, @intCast(seq.num_indices));
+
+            const xy = @as([*]const c.SDL_FPoint, @ptrCast(seq.xy))[0..@intCast(seq.num_vertices)];
+            const uv = @as([*]const c.SDL_FPoint, @ptrCast(seq.uv))[0..@intCast(seq.num_vertices)];
+            for (xy, uv) |point, texcoord| {
+                frame.vertices.appendAssumeCapacity(.{
+                    .pos = .{
+                        .x = command.rect.x - command.scroll.x + point.x,
+                        .y = command.rect.y - command.scroll.y - point.y,
+                    },
+                    .uv = .{ .x = texcoord.x, .y = texcoord.y },
+                    .color = command.color,
+                });
+            }
+            const raw_indices = @as([*]const c_int, @ptrCast(seq.indices))[0..@intCast(seq.num_indices)];
+            for (raw_indices) |index| frame.indices.appendAssumeCapacity(base_vertex + @as(u32, @intCast(index)));
+            try frame.draws.append(allocator, .{
+                .atlas_texture = seq.atlas_texture,
+                .first_index = first_index,
+                .index_count = @intCast(seq.num_indices),
+                .clip = command.clip,
+            });
+        }
+    }
+
+    fn renderTextFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const TextFrame, target_height: f32) void {
+        if (frame.draws.items.len == 0 or self.text_vertex_buffer == null or self.text_index_buffer == null) return;
+        var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.text_vertex_buffer.?, .offset = 0 };
+        var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.text_index_buffer.?, .offset = 0 };
+        c.SDL_BindGPUGraphicsPipeline(pass, self.text_pipeline.?);
+        c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
+        c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        for (frame.draws.items) |draw_call| {
+            if (draw_call.clip) |clip| {
+                var scissor = toSdlRect(clip, target_height);
+                c.SDL_SetGPUScissor(pass, &scissor);
+            }
+            var texture_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = draw_call.atlas_texture, .sampler = self.sampler.? };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &texture_binding, 1);
+            c.SDL_DrawGPUIndexedPrimitives(pass, draw_call.index_count, 1, draw_call.first_index, 0, 0);
+        }
+        var full_scissor: c.SDL_Rect = .{ .x = 0, .y = 0, .w = 65535, .h = 65535 };
+        c.SDL_SetGPUScissor(pass, &full_scissor);
     }
 };
 
@@ -326,6 +504,25 @@ pub const Mesh = struct {
     pub fn clear(self: *Mesh) void {
         self.vertices.clearRetainingCapacity();
         self.indices.clearRetainingCapacity();
+    }
+};
+
+const TextDraw = struct {
+    atlas_texture: *c.SDL_GPUTexture,
+    first_index: u32,
+    index_count: u32,
+    clip: ?draw.Rect,
+};
+
+const TextFrame = struct {
+    vertices: std.ArrayList(draw.Vertex) = .empty,
+    indices: std.ArrayList(u32) = .empty,
+    draws: std.ArrayList(TextDraw) = .empty,
+
+    fn deinit(self: *TextFrame, allocator: std.mem.Allocator) void {
+        self.vertices.deinit(allocator);
+        self.indices.deinit(allocator);
+        self.draws.deinit(allocator);
     }
 };
 
@@ -533,6 +730,15 @@ fn rectToSdl(rect: draw.Rect) sdl.Rect {
     };
 }
 
+fn toSdlRect(rect: draw.Rect, target_height: f32) c.SDL_Rect {
+    return .{
+        .x = @intFromFloat(@floor(rect.x)),
+        .y = @intFromFloat(@floor(target_height - rect.y - rect.h)),
+        .w = @intFromFloat(@ceil(rect.w)),
+        .h = @intFromFloat(@ceil(rect.h)),
+    };
+}
+
 fn colorBytes(color: draw.Color) [4]u8 {
     return .{ colorByte(color.r), colorByte(color.g), colorByte(color.b), colorByte(color.a) };
 }
@@ -571,6 +777,45 @@ fn alphaBlendState() c.SDL_GPUColorTargetBlendState {
 pub const ShaderSource = struct {
     pub const vertex_hlsl = @embedFile("shaders/ui.vert.hlsl");
     pub const fragment_hlsl = @embedFile("shaders/ui.frag.hlsl");
+    pub const vertex_spirv = @embedFile("shaders/ui.vert.spv");
+    pub const solid_fragment_spirv = @embedFile("shaders/ui.solid.frag.spv");
+    pub const text_fragment_spirv = @embedFile("shaders/ui.text.frag.spv");
+    pub const vertex_msl = @embedFile("shaders/ui.vert.msl");
+    pub const solid_fragment_msl = @embedFile("shaders/ui.solid.frag.msl");
+    pub const text_fragment_msl = @embedFile("shaders/ui.text.frag.msl");
+
+    pub fn vulkanPackages() PipelineShaderPackages {
+        return .{
+            .solid = .{
+                .vertex = .{ .format = ShaderFormat.spirv, .code = vertex_spirv },
+                .fragment = .{ .format = ShaderFormat.spirv, .code = solid_fragment_spirv },
+            },
+            .text = .{
+                .vertex = .{ .format = ShaderFormat.spirv, .code = vertex_spirv },
+                .fragment = .{ .format = ShaderFormat.spirv, .code = text_fragment_spirv },
+            },
+        };
+    }
+
+    pub fn metalPackages() PipelineShaderPackages {
+        return .{
+            .solid = .{
+                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
+                .fragment = .{ .format = ShaderFormat.msl, .code = solid_fragment_msl },
+            },
+            .text = .{
+                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
+                .fragment = .{ .format = ShaderFormat.msl, .code = text_fragment_msl },
+            },
+        };
+    }
+
+    pub fn packagesForTarget(os_tag: std.Target.Os.Tag) PipelineShaderPackages {
+        return switch (os_tag) {
+            .macos, .ios, .tvos, .watchos => metalPackages(),
+            else => vulkanPackages(),
+        };
+    }
 };
 
 test "renderer builds indexed quads from commands" {
@@ -633,4 +878,18 @@ test "shader package rejects missing and unsupported formats" {
 test "gpu text support is explicit until atlas path is configured" {
     const renderer: Renderer = .{};
     try std.testing.expect(!renderer.supportsGpuText());
+}
+
+test "embedded Vulkan and Metal shader packages validate" {
+    const vulkan = ShaderSource.vulkanPackages();
+    try vulkan.solid.validate(ShaderFormat.vulkan);
+    try vulkan.text.validate(ShaderFormat.vulkan);
+    try std.testing.expect(ShaderSource.vertex_spirv.len > 4);
+    try std.testing.expect(ShaderSource.text_fragment_spirv.len > 4);
+
+    const metal = ShaderSource.metalPackages();
+    try metal.solid.validate(ShaderFormat.metal);
+    try metal.text.validate(ShaderFormat.metal);
+    try std.testing.expect(std.mem.indexOf(u8, ShaderSource.vertex_msl, "vertex") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ShaderSource.text_fragment_msl, "texture2d") != null);
 }
