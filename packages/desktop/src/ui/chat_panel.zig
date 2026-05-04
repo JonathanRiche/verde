@@ -4003,7 +4003,7 @@ fn queuePowderComposerControls(
 ) void {
     const allocator = state.allocator;
     const gap = theme.scaledUi(6.0);
-    const control_h = theme.scaledUi(28.0);
+    const control_h = theme.scaledUi(34.0);
     const left = input_rect_min[0];
     const right = input_rect_max[0];
     const send_w = theme.scaledUi(42.0);
@@ -4017,8 +4017,8 @@ fn queuePowderComposerControls(
     var send_rect: powder.Rect = undefined;
 
     if (narrow) {
-        const row1_y = composer_screen_pos[1] + height - theme.scaledUi(76.0);
-        const row2_y = composer_screen_pos[1] + height - theme.scaledUi(40.0);
+        const row1_y = composer_screen_pos[1] + height - theme.scaledUi(86.0);
+        const row2_y = composer_screen_pos[1] + height - theme.scaledUi(44.0);
         send_rect = .{ .x = right - send_w, .y = row2_y, .w = send_w, .h = control_h };
         provider_rect = .{ .x = left, .y = row1_y, .w = theme.scaledUi(62.0), .h = control_h };
         model_rect = .{ .x = provider_rect.x + provider_rect.w + gap, .y = row1_y, .w = @max(right - provider_rect.x - provider_rect.w - gap, theme.scaledUi(90.0)), .h = control_h };
@@ -4068,12 +4068,12 @@ fn queuePowderComposerControls(
 }
 
 fn composerControlsHeight(width: f32) f32 {
-    return if (width < theme.scaledUi(520.0)) theme.scaledUi(78.0) else theme.scaledUi(42.0);
+    return if (width < theme.scaledUi(520.0)) theme.scaledUi(88.0) else theme.scaledUi(48.0);
 }
 
 fn setPowderSelectRects(select: anytype, rect: powder.Rect, item_count: usize) void {
     const rows = @min(@as(usize, 6), @max(item_count, 1));
-    const menu_h = theme.scaledUi(18.0) + theme.scaledUi(30.0) * @as(f32, @floatFromInt(rows));
+    const menu_h = theme.scaledUi(18.0) + theme.scaledUi(34.0) * @as(f32, @floatFromInt(rows));
     select.setBounds(rect);
     select.setMenuBounds(.{
         .x = rect.x,

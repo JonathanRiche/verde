@@ -189,8 +189,8 @@ pub const Renderer = struct {
                 try self.appendRect(allocator, .{
                     .x = x + cell_w * (1.0 + @as(f32, @floatFromInt(col))),
                     .y = y + cell_h * (1.0 + @as(f32, @floatFromInt(row))),
-                    .w = @max(cell_w * 0.82, 1.0),
-                    .h = @max(cell_h * 0.82, 1.0),
+                    .w = @max(cell_w * 1.12, 1.6),
+                    .h = @max(cell_h * 1.06, 1.6),
                 }, color, clip);
             }
         }
