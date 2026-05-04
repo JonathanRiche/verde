@@ -86,6 +86,11 @@ fn powderComposerGetClipboard(_: ?*anyopaque, allocator: std.mem.Allocator) ?[]u
     return powder.sdl.getClipboardText(allocator) catch null;
 }
 
+fn powderMousePoint(x: f32, y: f32, ui_scale: f32) powder.draw.Vec2 {
+    const scale = @max(ui_scale, 1.0);
+    return .{ .x = x / scale, .y = y / scale };
+}
+
 fn powderComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?powder.TextAreaKey {
     const mod_bits = keymodBits(event.mod);
     const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
@@ -4234,9 +4239,9 @@ pub const AppState = struct {
         return handled;
     }
 
-    pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent) bool {
+    pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
-        const point: powder.draw.Vec2 = .{ .x = event.x, .y = event.y };
+        const point = powderMousePoint(event.x, event.y, ui_scale);
         const input: powder.text_area_component.Input = if (event.down)
             .{ .mouse_down = .{ .point = point, .clicks = event.clicks } }
         else
@@ -4254,10 +4259,10 @@ pub const AppState = struct {
         return handled or was_focused != self.powder_composer.focused;
     }
 
-    pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent) bool {
+    pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
         if (!self.powder_composer.focused) return false;
         if (!self.powder_composer.dragging_scrollbar and event.state.left == 0) return false;
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = .{ .x = event.x, .y = event.y } }) catch |err| {
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_drag = powderMousePoint(event.x, event.y, ui_scale) }) catch |err| {
             log.warn("powder composer mouse drag failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -4268,9 +4273,9 @@ pub const AppState = struct {
         return handled;
     }
 
-    pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
+    pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
         const handled = self.powder_composer.handleInput(self.allocator, .{
-            .mouse_wheel = .{ .point = .{ .x = event.mouse_x, .y = event.mouse_y }, .y = event.y },
+            .mouse_wheel = .{ .point = powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
             log.warn("powder composer wheel failed: {s}", .{@errorName(err)});
             return false;

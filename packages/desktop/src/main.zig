@@ -163,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
         syncWindowTextInput(window, &state);
         var had_event = false;
         var event_wait_ns: u64 = 0;
-        running = processEvents(window, &state, &keyboard, &had_event, &frame_sample, &event_wait_ns);
+        running = processEvents(window, &state, &keyboard, ui_scale, &had_event, &frame_sample, &event_wait_ns);
         frame_sample.waited_ns = event_wait_ns;
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
@@ -385,6 +385,7 @@ fn processEvents(
     window: *sdl.Window,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
     had_event: *bool,
     frame_sample: *profiler.FrameSample,
     waited_ns: *u64,
@@ -400,15 +401,15 @@ fn processEvents(
         }
         waited_ns.* +|= profiler.elapsedNs(wait_start);
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     } else {
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
 
     return true;
@@ -418,12 +419,13 @@ fn processOneEvent(
     window: *sdl.Window,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
     event: *sdl.Event,
     frame_sample: *profiler.FrameSample,
 ) bool {
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
-    const keep_running = handleEvent(window, state, keyboard, event);
+    const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
 }
@@ -442,7 +444,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
         IDLE_WAIT_TIMEOUT_MS;
 }
 
-fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event: *sdl.Event) bool {
+fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     _ = zgui.backend.processEvent(event);
     switch (event.type) {
         .quit => return false,
@@ -529,7 +531,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_motion => {
-            if (state.routePowderComposerMouseMotion(&event.motion)) {
+            if (state.routePowderComposerMouseMotion(&event.motion, ui_scale)) {
                 return true;
             }
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
@@ -552,16 +554,17 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (!handled and event.button.down) {
                 state.unfocusBrowserPane();
             }
-            syncWindowTextInput(window, state);
             if (handled) {
                 return true;
             }
-            if (state.routePowderComposerMouseButton(&event.button)) {
+            if (state.routePowderComposerMouseButton(&event.button, ui_scale)) {
+                syncWindowTextInput(window, state);
                 return true;
             }
+            syncWindowTextInput(window, state);
         },
         .mouse_wheel => {
-            if (state.routePowderComposerWheel(&event.wheel)) {
+            if (state.routePowderComposerWheel(&event.wheel, ui_scale)) {
                 return true;
             }
             if (state.handleComposerWheel(&event.wheel)) {
@@ -581,7 +584,7 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused()) return;
+    if (!state.isBrowserPaneFocused() and !state.powder_composer.focused) return;
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
