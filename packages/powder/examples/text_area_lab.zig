@@ -1,6 +1,7 @@
 //! SDL event-loop lab for the retained Text and TextArea components.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const powder = @import("powder");
 const sdl = powder.sdl;
 
@@ -50,7 +51,7 @@ pub fn run() !void {
     try sdl.ttfInit();
     defer sdl.ttfQuit();
 
-    const window = try sdl.Window.create("Powder Text Area Lab", 800, 360, .{ .resizable = true, .vulkan = true });
+    const window = try sdl.Window.create("Powder Text Area Lab", 800, 360, labWindowFlags());
     defer sdl.Window.destroy(window);
     const renderer = try sdl.Renderer.create(window);
     defer sdl.Renderer.destroy(renderer);
@@ -115,6 +116,15 @@ pub fn run() !void {
 
         sdl.delay(16);
     }
+}
+
+fn labWindowFlags() sdl.Window.Flags {
+    var flags: sdl.Window.Flags = .{ .resizable = true };
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => flags.metal = true,
+        else => flags.vulkan = true,
+    }
+    return flags;
 }
 
 fn handleComposerEvent(_: ?*anyopaque, event: powder.TextAreaEvent) void {

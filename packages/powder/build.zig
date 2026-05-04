@@ -53,6 +53,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const layout_lab = addExample(b, .{
+        .name = "powder-layout-lab",
+        .root_source_file = "examples/layout_lab_main.zig",
+        .linux_root_source_file = "examples/layout_lab.zig",
+        .linux_c_source_file = "examples/linux_layout_lab_main.c",
+        .link_image_loader = true,
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const font_loading_check = addExample(b, .{
         .name = "powder-font-loading-check",
         .root_source_file = "examples/font_loading_check_main.zig",
@@ -62,11 +72,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const layout_review = addCliExample(b, .{
+        .name = "powder-layout-review",
+        .root_source_file = "examples/layout_review.zig",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
+    const run_layout_lab_step = b.step("run-layout-lab", "Run the runtime layout visual lab");
+    const run_layout_review_step = b.step("run-layout-review", "Run the runtime layout review example");
     const examples_step = b.step("examples", "Build powder examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
+    wireExampleRun(b, layout_lab, run_layout_lab_step, examples_step);
+    wireExampleRun(b, layout_review, run_layout_review_step, examples_step);
     examples_step.dependOn(font_loading_check.step);
 
     const component_catalog_tests = b.addTest(.{
@@ -84,18 +105,30 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const gpu_backends_step = b.step("test-gpu-backends", "Validate SDL_GPU Vulkan/Metal renderer coverage");
     const compile_shader_steps = compileGpuShaders(b);
+    const exe_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const exe_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = exe_tests_mod,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     exe_tests.step.dependOn(compile_shader_steps);
     test_step.dependOn(&run_exe_tests.step);
     gpu_backends_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
+    const layout_review_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/layout_review.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = powder_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(layout_review_tests).step);
     const run_font_loading_check = if (font_loading_check.artifact) |artifact|
         b.addRunArtifact(artifact)
     else blk: {
@@ -114,6 +147,15 @@ const ExampleOptions = struct {
     root_source_file: []const u8,
     linux_root_source_file: []const u8,
     linux_c_source_file: []const u8,
+    link_image_loader: bool = false,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    powder_mod: *std.Build.Module,
+};
+
+const CliExampleOptions = struct {
+    name: []const u8,
+    root_source_file: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     powder_mod: *std.Build.Module,
@@ -142,6 +184,26 @@ fn addExample(b: *std.Build, options: ExampleOptions) Example {
         }),
     });
     linkSdl(exe.root_module, options.target.result.os.tag);
+    if (options.link_image_loader) linkBundledImageLoader(b, exe.root_module);
+    return .{
+        .artifact = exe,
+        .step = &exe.step,
+        .output_path = b.fmt("zig-out/bin/{s}", .{options.name}),
+    };
+}
+
+fn addCliExample(b: *std.Build, options: CliExampleOptions) Example {
+    const exe = b.addExecutable(.{
+        .name = options.name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(options.root_source_file),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = options.powder_mod },
+            },
+        }),
+    });
     return .{
         .artifact = exe,
         .step = &exe.step,
@@ -212,13 +274,17 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
     });
     build_obj.step.dependOn(&mkdir.step);
 
-    const link = b.addSystemCommand(&.{
+    var link = b.addSystemCommand(&.{
         "cc",
         "-no-pie",
         object_path,
         options.linux_c_source_file,
+    });
+    if (options.link_image_loader) link.addArg("vendor/stb_image_impl.c");
+    link.addArgs(&.{
         "-lSDL3",
         "-lSDL3_ttf",
+        "-lm",
         "-lc",
         "-o",
         output_path,
@@ -229,6 +295,18 @@ fn addLinuxExample(b: *std.Build, options: ExampleOptions) Example {
         .step = &link.step,
         .output_path = output_path,
     };
+}
+
+fn linkBundledImageLoader(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("vendor"));
+    module.addCSourceFile(.{ .file = b.path("vendor/stb_image_impl.c"), .flags = &.{} });
+    module.link_libc = true;
+}
+
+pub fn linkImageLoader(powder_dependency: *std.Build.Dependency, module: *std.Build.Module) void {
+    module.addIncludePath(powder_dependency.path("vendor"));
+    module.addCSourceFile(.{ .file = powder_dependency.path("vendor/stb_image_impl.c"), .flags = &.{} });
+    module.link_libc = true;
 }
 
 fn optimizeArg(b: *std.Build, optimize: std.builtin.OptimizeMode) []const u8 {
@@ -245,12 +323,10 @@ fn linkSdl(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
     module.linkSystemLibrary("c", .{});
     switch (os_tag) {
         .linux => {
-            module.linkSystemLibrary("SDL3", .{ .use_pkg_config = .yes });
-            module.linkSystemLibrary("SDL3_ttf", .{ .use_pkg_config = .yes });
+            linkSdlPkgConfig(module);
         },
         .macos => {
-            module.linkFramework("SDL3", .{});
-            module.linkFramework("SDL3_ttf", .{});
+            linkSdlPkgConfig(module);
             module.linkFramework("Metal", .{});
             module.linkFramework("QuartzCore", .{});
         },
@@ -259,4 +335,9 @@ fn linkSdl(module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
             module.linkSystemLibrary("SDL3_ttf", .{});
         },
     }
+}
+
+fn linkSdlPkgConfig(module: *std.Build.Module) void {
+    module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+    module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
 }

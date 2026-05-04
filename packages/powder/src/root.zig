@@ -4,15 +4,18 @@ const std = @import("std");
 
 pub const atlas = @import("atlas.zig");
 pub const draw = @import("draw.zig");
+pub const image_loader = @import("image_loader.zig");
 pub const input_clipboard = @import("input/clipboard.zig");
 pub const input_key = @import("input/key.zig");
 pub const input_selection = @import("input/selection.zig");
+pub const layout = @import("layout.zig");
 pub const renderer = @import("renderer.zig");
 pub const scroll = @import("scroll.zig");
 pub const sdl = @import("sdl.zig");
 pub const button_component = @import("components/button.zig");
 pub const checkbox_component = @import("components/checkbox.zig");
 pub const code_view_component = @import("components/code_view.zig");
+pub const image_component = @import("components/image.zig");
 pub const list_box_component = @import("components/list_box.zig");
 pub const menu_component = @import("components/menu.zig");
 pub const modal_component = @import("components/modal.zig");
@@ -23,10 +26,13 @@ pub const tabs_component = @import("components/tabs.zig");
 pub const text_component = @import("components/text.zig");
 pub const text_area_component = @import("components/text_area.zig");
 pub const text_input_component = @import("components/text_input.zig");
+pub const text_layout = @import("text_layout.zig");
 
 pub const Color = draw.Color;
 pub const Rect = draw.Rect;
 pub const RenderBatch = draw.RenderBatch;
+pub const TextureId = draw.TextureId;
+pub const TextRun = draw.TextRun;
 pub const Renderer = renderer.Renderer;
 pub const FontAtlas = atlas.FontAtlas;
 pub const ButtonCallbacks = button_component.ButtonCallbacks;
@@ -37,6 +43,9 @@ pub const CheckboxConfig = checkbox_component.CheckboxConfig;
 pub const CheckboxEvent = checkbox_component.CheckboxEvent;
 pub const CodeViewConfig = code_view_component.CodeViewConfig;
 pub const IconButtonConfig = button_component.IconButtonConfig;
+pub const ImageConfig = image_component.ImageConfig;
+pub const ImageFit = image_component.ImageFit;
+pub const LoadedImage = image_loader.LoadedImage;
 pub const ListBoxCallbacks = list_box_component.ListBoxCallbacks;
 pub const ListBoxConfig = list_box_component.ListBoxConfig;
 pub const ListBoxEvent = list_box_component.ListBoxEvent;
@@ -73,6 +82,22 @@ pub const TextInputConfig = text_input_component.TextInputConfig;
 pub const TextInputEvent = text_input_component.TextInputEvent;
 pub const ClipboardCallbacks = input_clipboard;
 pub const Key = input_key;
+pub const ImageLoader = image_loader;
+pub const Layout = layout;
+pub const LayoutAlign = layout.Align;
+pub const LayoutBox = layout.Box;
+pub const LayoutEdges = layout.Edges;
+pub const LayoutFlexConfig = layout.FlexConfig;
+pub const LayoutFlexDirection = layout.FlexDirection;
+pub const LayoutFlexItem = layout.FlexItem;
+pub const LayoutGridConfig = layout.GridConfig;
+pub const LayoutGridItem = layout.GridItem;
+pub const LayoutJustify = layout.Justify;
+pub const LayoutTrack = layout.Track;
+pub const FontAdvance = text_layout.Advance;
+pub const FontAdvanceFn = text_layout.AdvanceFn;
+pub const FontMetrics = text_layout.FontMetrics;
+pub const TextLayout = text_layout;
 pub const ScrollState = scroll;
 pub const SelectionRange = input_selection.Range;
 pub const SelectionState = input_selection;
@@ -95,6 +120,11 @@ pub fn button(comptime config: ButtonConfig) type {
 /// Creates a retained icon button with comptime styling.
 pub fn iconButton(comptime config: IconButtonConfig) type {
     return button_component.IconButton(config);
+}
+
+/// Creates a retained image component with comptime styling.
+pub fn image(comptime config: ImageConfig) type {
+    return image_component.Image(config);
 }
 
 /// Creates a retained checkbox with comptime styling.
@@ -159,13 +189,16 @@ pub fn textArea(comptime config: TextAreaConfig) type {
 
 test {
     _ = draw;
+    _ = image_loader;
     _ = input_clipboard;
     _ = input_key;
     _ = input_selection;
+    _ = layout;
     _ = scroll;
     _ = button_component;
     _ = checkbox_component;
     _ = code_view_component;
+    _ = image_component;
     _ = list_box_component;
     _ = menu_component;
     _ = modal_component;
