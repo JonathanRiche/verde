@@ -4114,6 +4114,7 @@ fn drawPowderOverlayWithZgui(batch: *const powder.RenderBatch) void {
         switch (command.kind) {
             .rect, .cursor, .selection, .scrollbar => drawPowderRectWithZgui(draw_list, command.rect, command.color, command.clip),
             .text => drawPowderTextWithZgui(draw_list, font, command),
+            .image => {},
         }
     }
 }
@@ -4130,6 +4131,12 @@ fn drawPowderRectWithZgui(draw_list: zgui.DrawList, rect: powder.Rect, color: po
 
 fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: powder.draw.Command) void {
     if (command.text.len == 0 or command.color.a <= 0.0) return;
+    if (command.text_runs.len > 0) {
+        for (command.text_runs) |run| {
+            drawPowderTextRunWithZgui(draw_list, font, run);
+        }
+        return;
+    }
 
     const glyph_w = @max(command.glyph_width, 1.0);
     const line_h = @max(command.line_height, command.font_size);
@@ -4162,6 +4169,25 @@ fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: po
         index += powderUtf8Advance(command.text, index);
     }
     drawPowderTextLineWithZgui(draw_list, font, command, line_start, command.text.len, row, line_h);
+}
+
+fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: powder.TextRun) void {
+    if (run.text.len == 0 or run.color.a <= 0.0) return;
+    var clip_rect_storage: [4]f32 = undefined;
+    const clip_rect: ?[*]const [4]f32 = if (run.clip) |clip| blk: {
+        clip_rect_storage = .{ clip.x, clip.y, clip.x + clip.w, clip.y + clip.h };
+        break :blk @as([*]const [4]f32, @ptrCast(&clip_rect_storage));
+    } else null;
+    draw_list.addTextExtendedUnformatted(
+        .{ run.x, run.y },
+        powderColorU32(run.color),
+        run.text,
+        .{
+            .font = font,
+            .font_size = run.font_size,
+            .cpu_fine_clip_rect = clip_rect,
+        },
+    );
 }
 
 fn drawPowderTextLineWithZgui(
