@@ -59,9 +59,6 @@ pub fn run() !void {
     const font = try sdl.ttfOpenFont(CAL_SANS_PATH, 16.0);
     defer sdl.ttfCloseFont(font);
 
-    sdl.startTextInput(window) catch {};
-    defer sdl.stopTextInput(window) catch {};
-
     var title = try Title.init(allocator, "Powder TextArea");
     defer title.deinit(allocator);
 
@@ -70,6 +67,8 @@ pub fn run() !void {
         \\Enter marks the component as submitted.
     );
     defer composer.deinit(allocator);
+    var text_input_enabled = false;
+    defer stopTextInput(window, &text_input_enabled);
     composer.setCallbacks(.{
         .on_event = handleComposerEvent,
         .on_key = handleComposerKey,
@@ -100,9 +99,11 @@ pub fn run() !void {
                 },
                 else => {
                     _ = try composer.update(allocator, &event);
+                    syncTextInput(window, &text_input_enabled, composer.focused);
                 },
             }
         }
+        syncTextInput(window, &text_input_enabled, composer.focused);
 
         batch.clear();
         try title.render(allocator, &batch);
@@ -116,6 +117,28 @@ pub fn run() !void {
 
         sdl.delay(16);
     }
+}
+
+fn syncTextInput(window: *sdl.Window, enabled: *bool, focused: bool) void {
+    if (focused) {
+        if (enabled.* and sdl.textInputActive(window)) return;
+        sdl.startTextInput(window) catch {
+            std.debug.print("powder text_area_lab SDL_StartTextInput failed: {s}\n", .{sdl.getError()});
+            enabled.* = false;
+            return;
+        };
+        enabled.* = true;
+    } else {
+        stopTextInput(window, enabled);
+    }
+}
+
+fn stopTextInput(window: *sdl.Window, enabled: *bool) void {
+    if (!enabled.* and !sdl.textInputActive(window)) return;
+    sdl.stopTextInput(window) catch {
+        std.debug.print("powder text_area_lab SDL_StopTextInput failed: {s}\n", .{sdl.getError()});
+    };
+    enabled.* = false;
 }
 
 fn labWindowFlags() sdl.Window.Flags {
