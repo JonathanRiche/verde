@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"app-runtime" = .none,
         .@"emit-lib-vt" = true,
+        .@"emit-xcframework" = false,
     });
     const zqlite = b.dependency("zqlite", .{
         .target = target,
