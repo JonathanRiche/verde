@@ -65,9 +65,14 @@ const WindowFrame = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer {
+        if (builtin.mode == .Debug) _ = debug_allocator.deinit();
+    }
+    const allocator = if (builtin.mode == .Debug)
+        debug_allocator.allocator()
+    else
+        std.heap.smp_allocator;
 
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
