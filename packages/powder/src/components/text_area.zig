@@ -114,6 +114,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         focused: bool = false,
         submitted: bool = false,
         scroll_y: f32 = 0.0,
+        bounds_rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         cursor_visible: bool = true,
         cursor_elapsed_ms: u32 = 0,
         dragging_scrollbar: bool = false,
@@ -134,6 +135,20 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         pub fn text(self: *const Component) []const u8 {
             return self.buffer.items;
+        }
+
+        pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, value);
+            self.cursor = @min(self.cursor, self.buffer.items.len);
+            self.clearSelection();
+            self.ensureCursorVisible();
+        }
+
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.bounds_rect = rect;
+            self.setScrollY(self.scroll_y);
+            self.ensureCursorVisible();
         }
 
         pub fn placeholder(self: *const Component) []const u8 {
@@ -209,7 +224,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                 .mouse_down => |mouse| {
                     const point = mouse.point;
                     const was_focused = self.focused;
-                    self.focused = Component.bounds().contains(point);
+                    self.focused = self.bounds().contains(point);
                     if (self.focused != was_focused) self.emit(.{ .focus_changed = self.focused });
                     if (!self.focused) return false;
 
@@ -251,8 +266,8 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     return was_dragging;
                 },
                 .mouse_wheel => |wheel| {
-                    if (!Component.bounds().contains(wheel.point)) return false;
-                    self.scrollBy(-wheel.y * Component.lineHeight() * 3.0);
+                    if (!self.bounds().contains(wheel.point)) return false;
+                    self.scrollBy(-wheel.y * self.lineHeight() * 3.0);
                     return true;
                 },
             }
@@ -272,15 +287,16 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
-            try batch.rect(allocator, Component.bounds(), config.background_color);
-            try batch.rect(allocator, .{ .x = config.x, .y = config.y, .w = config.width, .h = 1.0 }, config.border_color);
+            const bounds_rect = self.bounds();
+            try batch.rect(allocator, bounds_rect, config.background_color);
+            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
             if (self.selection()) |range| {
                 try self.renderSelection(allocator, batch, range.start, range.end);
             }
-            try batch.glyph(allocator, Component.textRect(), .{}, if (self.placeholderVisible()) config.placeholder_color else config.text_color);
+            try batch.glyph(allocator, self.textRect(), .{}, if (self.placeholderVisible()) config.placeholder_color else config.text_color);
             if (self.focused and self.cursor_visible) {
                 const pos = self.cursorPosition();
-                try self.addClippedCommand(allocator, batch, .cursor, .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = lineHeight() }, config.cursor_color);
+                try self.addClippedCommand(allocator, batch, .cursor, .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = self.lineHeight() }, config.cursor_color);
             }
             try self.renderScrollbar(allocator, batch);
         }
@@ -455,7 +471,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         fn dragScrollbarTo(self: *Component, y: f32) void {
             const max_scroll = self.maxScrollY();
             if (max_scroll <= 0.0) return;
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             const thumb = self.scrollbarThumbRect() orelse return;
             const travel = @max(track.h - thumb.h, 1.0);
             const thumb_y = @min(@max(y - self.scrollbar_drag_offset_y, track.y), track.y + travel);
@@ -463,11 +479,11 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn autoScrollForDrag(self: *Component, point: draw.Vec2) void {
-            const text_rect = Component.textRect();
+            const text_rect = self.textRect();
             if (point.y < text_rect.y) {
-                self.scrollBy(-Component.lineHeight());
+                self.scrollBy(-self.lineHeight());
             } else if (point.y > text_rect.y + text_rect.h) {
-                self.scrollBy(Component.lineHeight());
+                self.scrollBy(self.lineHeight());
             }
         }
 
@@ -491,20 +507,21 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             const start_pos = self.positionForOffset(start);
             const end_pos = self.positionForOffset(end);
             if (start_pos.y == end_pos.y) {
-                try self.addClippedCommand(allocator, batch, .selection, .{ .x = start_pos.x, .y = start_pos.y, .w = @max(end_pos.x - start_pos.x, 2.0), .h = lineHeight() }, config.selection_color);
+                try self.addClippedCommand(allocator, batch, .selection, .{ .x = start_pos.x, .y = start_pos.y, .w = @max(end_pos.x - start_pos.x, 2.0), .h = self.lineHeight() }, config.selection_color);
                 return;
             }
-            try self.addClippedCommand(allocator, batch, .selection, .{ .x = start_pos.x, .y = start_pos.y, .w = config.x + config.width - config.padding_x - start_pos.x, .h = lineHeight() }, config.selection_color);
-            var y = start_pos.y + lineHeight();
-            while (y < end_pos.y) : (y += lineHeight()) {
-                try self.addClippedCommand(allocator, batch, .selection, .{ .x = config.x + config.padding_x, .y = y, .w = config.width - config.padding_x * 2.0, .h = lineHeight() }, config.selection_color);
+            const text_rect = self.textRect();
+            try self.addClippedCommand(allocator, batch, .selection, .{ .x = start_pos.x, .y = start_pos.y, .w = text_rect.x + text_rect.w - start_pos.x, .h = self.lineHeight() }, config.selection_color);
+            var y = start_pos.y + self.lineHeight();
+            while (y < end_pos.y) : (y += self.lineHeight()) {
+                try self.addClippedCommand(allocator, batch, .selection, .{ .x = text_rect.x, .y = y, .w = text_rect.w, .h = self.lineHeight() }, config.selection_color);
             }
-            try self.addClippedCommand(allocator, batch, .selection, .{ .x = config.x + config.padding_x, .y = end_pos.y, .w = @max(end_pos.x - (config.x + config.padding_x), 2.0), .h = lineHeight() }, config.selection_color);
+            try self.addClippedCommand(allocator, batch, .selection, .{ .x = text_rect.x, .y = end_pos.y, .w = @max(end_pos.x - text_rect.x, 2.0), .h = self.lineHeight() }, config.selection_color);
         }
 
         fn addClippedCommand(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, kind: draw.CommandKind, rect: draw.Rect, color: draw.Color) !void {
             _ = self;
-            const clipped = clippedRect(rect, Component.textRect()) orelse return;
+            const clipped = clippedRect(rect, self.textRect()) orelse return;
             switch (kind) {
                 .cursor => try batch.cursor(allocator, clipped, color),
                 .selection => try batch.selection(allocator, clipped, color),
@@ -517,15 +534,15 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             const max_scroll = self.maxScrollY();
             if (!config.scroll_enabled or max_scroll <= 0.0 or config.scrollbar_width <= 0.0) return;
 
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             try batch.scrollbar(allocator, track, config.scrollbar_track_color);
 
             const thumb = self.scrollbarThumbRect() orelse return;
             try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
         }
 
-        fn scrollbarTrackRect() draw.Rect {
-            const text_rect = Component.textRect();
+        fn scrollbarTrackRect(self: *const Component) draw.Rect {
+            const text_rect = self.textRect();
             const track_w = @min(config.scrollbar_width, text_rect.w);
             return .{
                 .x = text_rect.x + text_rect.w - track_w,
@@ -538,10 +555,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         fn scrollbarThumbRect(self: *const Component) ?draw.Rect {
             const max_scroll = self.maxScrollY();
             if (!config.scroll_enabled or max_scroll <= 0.0 or config.scrollbar_width <= 0.0) return null;
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             const content_height = self.contentHeight();
-            const visible_height = Component.visibleTextHeight();
-            const thumb_h = @max((visible_height / content_height) * track.h, @min(track.h, Component.lineHeight()));
+            const visible_height = self.visibleTextHeight();
+            const thumb_h = @max((visible_height / content_height) * track.h, @min(track.h, self.lineHeight()));
             const travel = @max(track.h - thumb_h, 0.0);
             const thumb_y = track.y + if (max_scroll > 0.0) (self.scroll_y / max_scroll) * travel else 0.0;
             return .{
@@ -553,8 +570,9 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn byteOffsetForPoint(self: *const Component, point: draw.Vec2) usize {
-            const col_float = @max(point.x - config.x - config.padding_x, 0.0) / Component.glyphWidth();
-            const row_float = @max(point.y - config.y - config.padding_y + self.scroll_y, 0.0) / Component.lineHeight();
+            const text_rect = self.textRect();
+            const col_float = @max(point.x - text_rect.x, 0.0) / self.glyphWidth();
+            const row_float = @max(point.y - text_rect.y + self.scroll_y, 0.0) / self.lineHeight();
             return self.offsetAtVisualCell(
                 @intFromFloat(@max(row_float, 0.0)),
                 @intFromFloat(@max(col_float, 0.0)),
@@ -574,7 +592,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     row += 1;
                     col = 0;
                 } else {
-                    if (Component.shouldWrapColumn(col)) {
+                    if (self.shouldWrapColumn(col)) {
                         row += 1;
                         col = 0;
                     }
@@ -596,7 +614,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn pageMove(self: *const Component, delta: i32) usize {
-            const rows = @max(@as(usize, @intFromFloat(@floor(Component.visibleTextHeight() / Component.lineHeight()))), 1);
+            const rows = @max(@as(usize, @intFromFloat(@floor(self.visibleTextHeight() / self.lineHeight()))), 1);
             const cell = self.visualCellForOffset(self.cursor);
             if (delta < 0) return self.offsetAtVisualCell(if (cell.row > rows) cell.row - rows else 0, cell.col);
             return self.offsetAtVisualCell(cell.row + rows, cell.col);
@@ -611,7 +629,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     row += 1;
                     col = 0;
                 } else {
-                    if (Component.shouldWrapColumn(col)) {
+                    if (self.shouldWrapColumn(col)) {
                         row += 1;
                         col = 0;
                     }
@@ -635,7 +653,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     index = nextOffset(self.buffer.items, index);
                     continue;
                 }
-                if (Component.shouldWrapColumn(col)) {
+                if (self.shouldWrapColumn(col)) {
                     row += 1;
                     col = 0;
                     if (row > target_row) return index;
@@ -649,8 +667,8 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         fn positionForVisualCell(self: *const Component, row: usize, col: usize) draw.Vec2 {
             return .{
-                .x = config.x + config.padding_x + @as(f32, @floatFromInt(col)) * Component.glyphWidth(),
-                .y = config.y + config.padding_y + @as(f32, @floatFromInt(row)) * Component.lineHeight() - self.scroll_y,
+                .x = self.textRect().x + @as(f32, @floatFromInt(col)) * self.glyphWidth(),
+                .y = self.textRect().y + @as(f32, @floatFromInt(row)) * self.lineHeight() - self.scroll_y,
             };
         }
 
@@ -660,9 +678,9 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                 return;
             }
             const cell = self.visualCellForOffset(self.cursor);
-            const cursor_top = @as(f32, @floatFromInt(cell.row)) * Component.lineHeight();
-            const cursor_bottom = cursor_top + Component.lineHeight();
-            const visible_height = Component.visibleTextHeight();
+            const cursor_top = @as(f32, @floatFromInt(cell.row)) * self.lineHeight();
+            const cursor_bottom = cursor_top + self.lineHeight();
+            const visible_height = self.visibleTextHeight();
 
             if (cursor_top < self.scroll_y) {
                 self.scroll_y = cursor_top;
@@ -674,41 +692,47 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         fn maxScrollY(self: *const Component) f32 {
             if (!config.scroll_enabled) return 0.0;
-            return @max(self.contentHeight() - Component.visibleTextHeight(), 0.0);
+            return @max(self.contentHeight() - self.visibleTextHeight(), 0.0);
         }
 
         fn contentHeight(self: *const Component) f32 {
             const rows = self.visualCellForOffset(self.buffer.items.len).row + 1;
-            return @as(f32, @floatFromInt(rows)) * Component.lineHeight();
+            return @as(f32, @floatFromInt(rows)) * self.lineHeight();
         }
 
-        fn shouldWrapColumn(col: usize) bool {
-            return config.wrap and col >= Component.wrapColumnLimit();
+        fn shouldWrapColumn(self: *const Component, col: usize) bool {
+            return config.wrap and col >= self.wrapColumnLimit();
         }
 
-        fn wrapColumnLimit() usize {
+        fn wrapColumnLimit(self: *const Component) usize {
             if (!config.wrap) return std.math.maxInt(usize);
-            const inner_width = @max(config.width - config.padding_x * 2.0, Component.glyphWidth());
-            return @max(@as(usize, @intFromFloat(@floor(inner_width / Component.glyphWidth()))), 1);
+            const inner_width = @max(self.textRect().w, self.glyphWidth());
+            return @max(@as(usize, @intFromFloat(@floor(inner_width / self.glyphWidth()))), 1);
         }
 
-        fn bounds() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
+        fn bounds(self: *const Component) draw.Rect {
+            return self.bounds_rect;
         }
 
-        fn textRect() draw.Rect {
-            return .{ .x = config.x + config.padding_x, .y = config.y + config.padding_y, .w = config.width - config.padding_x * 2.0, .h = config.height - config.padding_y * 2.0 };
+        fn textRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            return .{
+                .x = bounds_rect.x + config.padding_x,
+                .y = bounds_rect.y + config.padding_y,
+                .w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0),
+                .h = @max(bounds_rect.h - config.padding_y * 2.0, 0.0),
+            };
         }
 
-        fn visibleTextHeight() f32 {
-            return @max(config.height - config.padding_y * 2.0, Component.lineHeight());
+        fn visibleTextHeight(self: *const Component) f32 {
+            return @max(self.textRect().h, self.lineHeight());
         }
 
-        fn lineHeight() f32 {
+        fn lineHeight(_: *const Component) f32 {
             return config.line_height orelse config.font_size * 1.25;
         }
 
-        fn glyphWidth() f32 {
+        fn glyphWidth(_: *const Component) f32 {
             return config.glyph_width orelse config.font_size * 0.55;
         }
     };

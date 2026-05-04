@@ -8,6 +8,9 @@
         .zig_markdown = .{
             .path = "../zig_markdown",
         },
+        .powder = .{
+            .path = "../powder",
+        },
         .zgui_text_select = .{
             .path = "../zgui_text_select",
         },
