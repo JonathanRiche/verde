@@ -520,7 +520,6 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn addClippedCommand(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, kind: draw.CommandKind, rect: draw.Rect, color: draw.Color) !void {
-            _ = self;
             const clipped = clippedRect(rect, self.textRect()) orelse return;
             switch (kind) {
                 .cursor => try batch.cursor(allocator, clipped, color),
