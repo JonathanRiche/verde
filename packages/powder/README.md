@@ -231,9 +231,10 @@ outlines show the shell, content, and padded content rects. Resize the window to
 verify that the retained controls move, stretch, and wrap while hit testing and
 rendering stay aligned.
 
-The layout lab also includes a small texture-backed image command in the prompt
-row. It uses `TextureId` plus the SDL texture resolver to prove that image
-commands can render through the SDL presenter path.
+The layout lab also loads `packages/desktop/src/assets/verde_logo.png` and
+renders it as a texture-backed Powder image component. It uses `TextureId` plus
+the SDL texture resolver to prove that image commands can render through the SDL
+presenter path.
 
 Run the layout review example from `packages/powder`:
 
