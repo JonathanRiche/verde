@@ -283,7 +283,6 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                     thread_list_invalidated = true;
                     break;
                 }
-                state.prewarmThreadTranscriptMarkdown(index, thread_index, 1);
             }
 
             if (thread_list_invalidated) {
