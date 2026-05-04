@@ -1,6 +1,7 @@
 //! SDL visual lab for retained Powder components beyond TextArea.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const powder = @import("powder");
 const sdl = powder.sdl;
 
@@ -61,7 +62,7 @@ pub fn run() !void {
     try sdl.ttfInit();
     defer sdl.ttfQuit();
 
-    const window = try sdl.Window.create("Powder Component Lab", 920, 600, .{ .resizable = true, .vulkan = true });
+    const window = try sdl.Window.create("Powder Component Lab", 920, 600, labWindowFlags());
     defer sdl.Window.destroy(window);
     const renderer = try sdl.Renderer.create(window);
     defer sdl.Renderer.destroy(renderer);
@@ -149,6 +150,15 @@ pub fn run() !void {
         updateWindowTitle(window, state, search, checkbox, toggle, list, select, tabs, batch.commands.items.len, frame_index);
         sdl.delay(16);
     }
+}
+
+fn labWindowFlags() sdl.Window.Flags {
+    var flags: sdl.Window.Flags = .{ .resizable = true };
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => flags.metal = true,
+        else => flags.vulkan = true,
+    }
+    return flags;
 }
 
 fn routeEvent(
