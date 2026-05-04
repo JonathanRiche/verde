@@ -69,6 +69,52 @@ If shader source changes, regenerate the Vulkan SPIR-V assets:
 zig build compile-gpu-shaders
 ```
 
+## Runtime Layout
+
+Powder components are retained, but controls that expose `setBounds()` can be
+laid out every frame. Use `powder.layout` for container-style layout instead of
+hand-writing every rect.
+
+Flex rows and columns support padding, per-item margins, gaps, grow, alignment,
+justification, and optional wrapping:
+
+```zig
+powder.layout.applyFlex(
+    panel_rect,
+    .{ .direction = .row, .gap = 8, .padding = powder.layout.Edges.all(12) },
+    .{
+        powder.layout.FlexItem{ .basis_w = 180, .basis_h = 32, .grow = 1 },
+        powder.layout.FlexItem.fixed(72, 32),
+    },
+    .{ &input, &send_button },
+);
+```
+
+Grid layout supports fixed pixel tracks, fractional tracks, gaps, spans,
+padding, and per-item margins:
+
+```zig
+try powder.layout.applyGrid(
+    allocator,
+    panel_rect,
+    .{
+        .columns = &.{ .{ .fr = 1 }, .{ .fr = 1 } },
+        .rows = &.{ .{ .px = 32 }, .{ .px = 32 } },
+        .gap_x = 8,
+        .gap_y = 8,
+    },
+    .{
+        powder.layout.GridItem{ .column = 0, .row = 0 },
+        powder.layout.GridItem{ .column = 1, .row = 0 },
+    },
+    .{ &provider_select, &model_select },
+);
+```
+
+For lower-level control, call `powder.layout.flex()` or `powder.layout.grid()`
+to fill an array of `draw.Rect`s, then route those rects into any system that
+understands runtime bounds.
+
 ## Troubleshooting
 
 If macOS reports `unable to find framework 'SDL3'`, update to a build that uses

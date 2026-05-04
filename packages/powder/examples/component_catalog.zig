@@ -39,6 +39,33 @@ pub fn main() !void {
     var source = try Source.init(allocator, "const ok = true;\n+added\n-removed");
     defer source.deinit(allocator);
 
+    powder.layout.applyFlex(
+        .{ .x = 12, .y = 42, .w = 220, .h = 32 },
+        .{ .direction = .row, .gap = 8, .align_items = .stretch },
+        .{
+            powder.layout.FlexItem{ .basis_w = 80, .basis_h = 32, .grow = 1 },
+            powder.layout.FlexItem.fixed(80, 32),
+        },
+        .{ &input, &button },
+    );
+
+    try powder.layout.applyGrid(
+        allocator,
+        .{ .x = 260, .y = 10, .w = 320, .h = 146 },
+        .{
+            .columns = &.{ .{ .fr = 1 }, .{ .fr = 1 } },
+            .rows = &.{ .{ .px = 96 }, .{ .px = 30 } },
+            .gap_x = 16,
+            .gap_y = 18,
+        },
+        .{
+            powder.layout.GridItem{ .column = 0, .row = 0, .column_span = 2 },
+            powder.layout.GridItem{ .column = 0, .row = 1 },
+            powder.layout.GridItem{ .column = 1, .row = 1 },
+        },
+        .{ &select, &checkbox, &toggle },
+    );
+
     _ = label.handleInput(.{ .mouse_down = .{ .x = 12, .y = 16 } });
     _ = label.handleInput(.{ .mouse_drag = .{ .x = 44, .y = 16 } });
     _ = try input.handleInput(allocator, .{ .key = .{ .code = .end } });
