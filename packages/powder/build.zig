@@ -62,11 +62,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const layout_review = addCliExample(b, .{
+        .name = "powder-layout-review",
+        .root_source_file = "examples/layout_review.zig",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
+    const run_layout_review_step = b.step("run-layout-review", "Run the runtime layout review example");
     const examples_step = b.step("examples", "Build powder examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
+    wireExampleRun(b, layout_review, run_layout_review_step, examples_step);
     examples_step.dependOn(font_loading_check.step);
 
     const component_catalog_tests = b.addTest(.{
@@ -96,6 +105,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     gpu_backends_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
+    const layout_review_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/layout_review.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = powder_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(layout_review_tests).step);
     const run_font_loading_check = if (font_loading_check.artifact) |artifact|
         b.addRunArtifact(artifact)
     else blk: {
@@ -114,6 +134,14 @@ const ExampleOptions = struct {
     root_source_file: []const u8,
     linux_root_source_file: []const u8,
     linux_c_source_file: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    powder_mod: *std.Build.Module,
+};
+
+const CliExampleOptions = struct {
+    name: []const u8,
+    root_source_file: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     powder_mod: *std.Build.Module,
@@ -142,6 +170,25 @@ fn addExample(b: *std.Build, options: ExampleOptions) Example {
         }),
     });
     linkSdl(exe.root_module, options.target.result.os.tag);
+    return .{
+        .artifact = exe,
+        .step = &exe.step,
+        .output_path = b.fmt("zig-out/bin/{s}", .{options.name}),
+    };
+}
+
+fn addCliExample(b: *std.Build, options: CliExampleOptions) Example {
+    const exe = b.addExecutable(.{
+        .name = options.name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(options.root_source_file),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = options.powder_mod },
+            },
+        }),
+    });
     return .{
         .artifact = exe,
         .step = &exe.step,
