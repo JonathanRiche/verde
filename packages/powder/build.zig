@@ -53,11 +53,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const font_loading_check = addExample(b, .{
+        .name = "powder-font-loading-check",
+        .root_source_file = "examples/font_loading_check_main.zig",
+        .linux_root_source_file = "examples/font_loading_check.zig",
+        .linux_c_source_file = "examples/linux_font_loading_check_main.c",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
     const examples_step = b.step("examples", "Build powder examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
+    examples_step.dependOn(font_loading_check.step);
 
     const component_catalog_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -81,6 +91,14 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
+    const run_font_loading_check = if (font_loading_check.artifact) |artifact|
+        b.addRunArtifact(artifact)
+    else blk: {
+        const run_check = b.addSystemCommand(&.{font_loading_check.output_path});
+        run_check.step.dependOn(font_loading_check.step);
+        break :blk run_check;
+    };
+    test_step.dependOn(&run_font_loading_check.step);
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
