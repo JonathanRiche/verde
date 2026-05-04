@@ -70,6 +70,9 @@ pub fn run() !void {
     const font = try sdl.ttfOpenFont(CAL_SANS_PATH, LABEL_FONT_SIZE);
     defer sdl.ttfCloseFont(font);
 
+    sdl.startTextInput(window) catch {};
+    defer sdl.stopTextInput(window) catch {};
+
     var state: State = .{};
     var header = try Header.init(allocator, "Powder Component Lab");
     defer header.deinit(allocator);
@@ -77,8 +80,6 @@ pub fn run() !void {
 
     var search = try Search.init(allocator, "powder");
     defer search.deinit(allocator);
-    var text_input_enabled = false;
-    defer stopTextInput(window, &text_input_enabled);
     search.setCallbacks(.{ .set_clipboard = setClipboard, .get_clipboard = getClipboard });
 
     var apply = ApplyButton.init();
@@ -122,13 +123,9 @@ pub fn run() !void {
         while (sdl.pollEvent(&event)) {
             switch (event.type) {
                 .quit, .window_close_requested => running = false,
-                else => {
-                    try routeEvent(allocator, &event, &header, &search, &apply, &tool, &checkbox, &toggle, &list, &select, &tabs, &panel, &popup, &dialog, &table, &source);
-                    syncTextInput(window, &text_input_enabled, search.focused);
-                },
+                else => try routeEvent(allocator, &event, &header, &search, &apply, &tool, &checkbox, &toggle, &list, &select, &tabs, &panel, &popup, &dialog, &table, &source),
             }
         }
-        syncTextInput(window, &text_input_enabled, search.focused);
 
         batch.clear();
         try header.render(allocator, &batch);
@@ -153,28 +150,6 @@ pub fn run() !void {
         updateWindowTitle(window, state, search, checkbox, toggle, list, select, tabs, batch.commands.items.len, frame_index);
         sdl.delay(16);
     }
-}
-
-fn syncTextInput(window: *sdl.Window, enabled: *bool, focused: bool) void {
-    if (focused) {
-        if (enabled.* and sdl.textInputActive(window)) return;
-        sdl.startTextInput(window) catch {
-            std.debug.print("powder component_lab SDL_StartTextInput failed: {s}\n", .{sdl.getError()});
-            enabled.* = false;
-            return;
-        };
-        enabled.* = true;
-    } else {
-        stopTextInput(window, enabled);
-    }
-}
-
-fn stopTextInput(window: *sdl.Window, enabled: *bool) void {
-    if (!enabled.* and !sdl.textInputActive(window)) return;
-    sdl.stopTextInput(window) catch {
-        std.debug.print("powder component_lab SDL_StopTextInput failed: {s}\n", .{sdl.getError()});
-    };
-    enabled.* = false;
 }
 
 fn labWindowFlags() sdl.Window.Flags {
