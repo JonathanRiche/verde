@@ -94,6 +94,8 @@ pub const Surface = extern struct {
 
 pub const PixelFormat = enum(u32) {
     rgba8888 = 0x16462004,
+    /// Byte-array RGBA format on little-endian platforms.
+    rgba32 = 0x16762004,
 };
 
 pub const FRect = extern struct {

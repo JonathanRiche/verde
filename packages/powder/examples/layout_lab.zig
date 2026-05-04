@@ -102,7 +102,7 @@ pub fn run() !void {
     defer preview_image.deinit();
     const preview_w: f32 = @floatFromInt(preview_image.width);
     const preview_h: f32 = @floatFromInt(preview_image.height);
-    const preview_surface = try sdl.createSurfaceFrom(preview_image.width, preview_image.height, .rgba8888, preview_image.pixels, preview_image.width * 4);
+    const preview_surface = try sdl.createSurfaceFrom(preview_image.width, preview_image.height, .rgba32, preview_image.pixels, preview_image.width * 4);
     defer sdl.destroySurface(preview_surface);
     const preview_texture = try sdl.createTextureFromSurface(renderer, preview_surface);
     defer sdl.destroyTexture(preview_texture);
