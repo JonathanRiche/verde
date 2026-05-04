@@ -70,6 +70,27 @@ pub const Renderer = opaque {
     pub const destroy = destroyRenderer;
 };
 
+pub const Texture = opaque {};
+pub const Font = opaque {};
+
+pub const Color = extern struct {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+};
+
+pub const Surface = extern struct {
+    flags: u32,
+    format: u32,
+    w: c_int,
+    h: c_int,
+    pitch: c_int,
+    pixels: ?*anyopaque,
+    refcount: c_int,
+    reserved: ?*anyopaque,
+};
+
 pub const FRect = extern struct {
     x: f32,
     y: f32,
@@ -314,8 +335,41 @@ pub fn renderDebugText(renderer: *Renderer, x: f32, y: f32, text: [:0]const u8) 
     if (!SDL_RenderDebugText(renderer, x, y, text.ptr)) return error.SdlError;
 }
 
+pub fn createTextureFromSurface(renderer: *Renderer, surface: *Surface) Error!*Texture {
+    return SDL_CreateTextureFromSurface(renderer, surface) orelse error.SdlError;
+}
+
+pub const destroyTexture = SDL_DestroyTexture;
+pub const destroySurface = SDL_DestroySurface;
+
+pub fn renderTexture(renderer: *Renderer, texture: *Texture, dst: FRect) Error!void {
+    var mutable_dst = dst;
+    if (!SDL_RenderTexture(renderer, texture, null, &mutable_dst)) return error.SdlError;
+}
+
 pub fn renderPresent(renderer: *Renderer) void {
     _ = SDL_RenderPresent(renderer);
+}
+
+pub fn ttfInit() Error!void {
+    if (!TTF_Init()) return error.SdlError;
+}
+
+pub const ttfQuit = TTF_Quit;
+
+pub fn ttfOpenFont(path: [:0]const u8, point_size: f32) Error!*Font {
+    return TTF_OpenFont(path.ptr, point_size) orelse error.SdlError;
+}
+
+pub const ttfCloseFont = TTF_CloseFont;
+
+pub fn ttfSetFontSize(font: *Font, point_size: f32) Error!void {
+    if (!TTF_SetFontSize(font, point_size)) return error.SdlError;
+}
+
+pub fn ttfRenderTextBlended(font: *Font, text: []const u8, color: Color) Error!*Surface {
+    const value = if (text.len == 0) " " else text;
+    return TTF_RenderText_Blended(font, value.ptr, value.len, color) orelse error.SdlError;
 }
 
 pub fn setClipboardText(text: [:0]const u8) Error!void {
@@ -346,7 +400,17 @@ extern fn SDL_RenderClear(renderer: *Renderer) bool;
 extern fn SDL_RenderFillRect(renderer: *Renderer, rect: *const FRect) bool;
 extern fn SDL_SetRenderClipRect(renderer: *Renderer, rect: ?*const Rect) bool;
 extern fn SDL_RenderDebugText(renderer: *Renderer, x: f32, y: f32, str: [*:0]const u8) bool;
+extern fn SDL_CreateTextureFromSurface(renderer: *Renderer, surface: *Surface) ?*Texture;
+extern fn SDL_DestroyTexture(texture: *Texture) void;
+extern fn SDL_DestroySurface(surface: *Surface) void;
+extern fn SDL_RenderTexture(renderer: *Renderer, texture: *Texture, srcrect: ?*const FRect, dstrect: *const FRect) bool;
 extern fn SDL_RenderPresent(renderer: *Renderer) bool;
+extern fn TTF_Init() bool;
+extern fn TTF_Quit() void;
+extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
+extern fn TTF_CloseFont(font: *Font) void;
+extern fn TTF_SetFontSize(font: *Font, ptsize: f32) bool;
+extern fn TTF_RenderText_Blended(font: *Font, text: [*]const u8, length: usize, fg: Color) ?*Surface;
 extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
 extern fn SDL_GetClipboardText() ?[*:0]u8;
 extern fn SDL_free(mem: ?*anyopaque) void;

@@ -30,6 +30,7 @@ pub const FontAtlas = struct {
 
     pub fn init(allocator: std.mem.Allocator, path: [:0]const u8, point_size: f32) !FontAtlas {
         if (!c.TTF_Init()) return error.SdlTtfInitFailed;
+        errdefer c.TTF_Quit();
         const font = c.TTF_OpenFont(path.ptr, point_size) orelse return error.SdlTtfOpenFontFailed;
         return .{
             .allocator = allocator,
