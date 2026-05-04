@@ -232,9 +232,10 @@ verify that the retained controls move, stretch, and wrap while hit testing and
 rendering stay aligned.
 
 The layout lab also loads `packages/desktop/src/assets/verde_logo.png` and
-renders it as a texture-backed Powder image component. It uses `TextureId` plus
-the SDL texture resolver to prove that image commands can render through the SDL
-presenter path.
+renders it as texture-backed Powder image components. The image row shows native
+size, contain, cover, stretch, and cropped-UV rendering so you can inspect
+quality and fit behavior. It uses `TextureId` plus the SDL texture resolver to
+prove that image commands can render through the SDL presenter path.
 
 Run the layout review example from `packages/powder`:
 
