@@ -80,6 +80,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         cursor_visible: bool = true,
         cursor_elapsed_ms: u32 = 0,
         dragging_selection: bool = false,
+        rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         callbacks: TextInputCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -117,6 +118,29 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             self.callbacks = callbacks;
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.rect = rect;
+            self.ensureCursorVisible();
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn textRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            return .{
+                .x = bounds_rect.x + config.padding_x,
+                .y = bounds_rect.y + config.padding_y,
+                .w = @max(bounds_rect.w - config.padding_x * 2.0, self.glyphWidth()),
+                .h = @max(bounds_rect.h - config.padding_y * 2.0, config.font_size),
+            };
+        }
+
+        pub fn glyphWidth(_: *const Component) f32 {
+            return config.glyph_width orelse config.font_size * 0.55;
+        }
+
         pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
             switch (event.type) {
                 .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
@@ -148,7 +172,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
                 },
                 .mouse_down => |point| {
                     const was_focused = self.focused;
-                    self.focused = Component.bounds().contains(point);
+                    self.focused = self.bounds().contains(point);
                     if (self.focused != was_focused) self.emit(.{ .focus_changed = self.focused });
                     if (!self.focused) return false;
                     self.cursor = self.byteOffsetForPoint(point);
@@ -189,20 +213,18 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
-            try batch.rect(allocator, Component.bounds(), config.background_color);
-            try batch.rect(allocator, .{ .x = config.x, .y = config.y, .w = config.width, .h = 1.0 }, config.border_color);
+            const bounds_rect = self.bounds();
+            const text_rect = self.textRect();
+            try batch.rect(allocator, bounds_rect, config.background_color);
+            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
-            const glyph_w = if (self.placeholderVisible()) approximateWidth(config.placeholder_text.len) else approximateWidth(self.buffer.items.len);
-            try batch.glyph(allocator, .{
-                .x = config.x + config.padding_x - self.scroll_x,
-                .y = config.y + config.padding_y,
-                .w = @min(glyph_w, Component.textRect().w),
-                .h = Component.textRect().h,
-            }, .{}, if (self.placeholderVisible()) config.placeholder_color else config.text_color);
+            const value = if (self.placeholderVisible()) config.placeholder_text else self.buffer.items;
+            const color = if (self.placeholderVisible()) config.placeholder_color else config.text_color;
+            try batch.fixedText(allocator, text_rect, value, color, config.font_size, text_rect, .{ .x = self.scroll_x, .y = 0.0 }, self.glyphWidth(), text_rect.h, false);
             if (self.focused and self.cursor_visible) {
                 const x = self.cursorX();
-                if (x >= Component.textRect().x and x <= Component.textRect().x + Component.textRect().w) {
-                    try batch.cursor(allocator, .{ .x = x, .y = Component.textRect().y, .w = 1.5, .h = Component.textRect().h }, config.cursor_color);
+                if (x >= text_rect.x and x <= text_rect.x + text_rect.w) {
+                    try batch.cursor(allocator, .{ .x = x, .y = text_rect.y, .w = 1.5, .h = text_rect.h }, config.cursor_color);
                 }
             }
         }
@@ -336,7 +358,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn byteOffsetForPoint(self: *const Component, point: draw.Vec2) usize {
-            const col_float = @max(point.x - config.x - config.padding_x + self.scroll_x, 0.0) / Component.glyphWidth();
+            const col_float = @max(point.x - self.textRect().x + self.scroll_x, 0.0) / self.glyphWidth();
             var offset: usize = 0;
             var col: usize = 0;
             while (offset < self.buffer.items.len and col < @as(usize, @intFromFloat(@floor(col_float)))) : (col += 1) {
@@ -348,10 +370,11 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         fn renderSelection(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, range: selection_input.Range) !void {
             const start_x = self.xForOffset(range.start);
             const end_x = self.xForOffset(range.end);
-            const x0 = @max(start_x, Component.textRect().x);
-            const x1 = @min(end_x, Component.textRect().x + Component.textRect().w);
+            const text_rect = self.textRect();
+            const x0 = @max(start_x, text_rect.x);
+            const x1 = @min(end_x, text_rect.x + text_rect.w);
             if (x1 <= x0) return;
-            try batch.selection(allocator, .{ .x = x0, .y = Component.textRect().y, .w = @max(x1 - x0, 2.0), .h = Component.textRect().h }, config.selection_color);
+            try batch.selection(allocator, .{ .x = x0, .y = text_rect.y, .w = @max(x1 - x0, 2.0), .h = text_rect.h }, config.selection_color);
         }
 
         fn cursorX(self: *const Component) f32 {
@@ -359,7 +382,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn xForOffset(self: *const Component, offset: usize) f32 {
-            return config.x + config.padding_x + @as(f32, @floatFromInt(self.visualColumnForOffset(offset))) * Component.glyphWidth() - self.scroll_x;
+            return self.textRect().x + @as(f32, @floatFromInt(self.visualColumnForOffset(offset))) * self.glyphWidth() - self.scroll_x;
         }
 
         fn visualColumnForOffset(self: *const Component, offset: usize) usize {
@@ -372,38 +395,26 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         fn ensureCursorVisible(self: *Component) void {
-            const cursor_left = @as(f32, @floatFromInt(self.visualColumnForOffset(self.cursor))) * Component.glyphWidth();
-            const visible_w = Component.textRect().w;
+            const cursor_left = @as(f32, @floatFromInt(self.visualColumnForOffset(self.cursor))) * self.glyphWidth();
+            const visible_w = self.textRect().w;
             if (cursor_left < self.scroll_x) {
                 self.scroll_x = cursor_left;
-            } else if (cursor_left + Component.glyphWidth() > self.scroll_x + visible_w) {
-                self.scroll_x = cursor_left + Component.glyphWidth() - visible_w;
+            } else if (cursor_left + self.glyphWidth() > self.scroll_x + visible_w) {
+                self.scroll_x = cursor_left + self.glyphWidth() - visible_w;
             }
             self.ensureScrollBounds();
         }
 
         fn ensureScrollBounds(self: *Component) void {
-            self.scroll_x = @min(@max(self.scroll_x, 0.0), @max(approximateWidth(self.buffer.items.len) - Component.textRect().w, 0.0));
+            self.scroll_x = @min(@max(self.scroll_x, 0.0), @max(self.approximateWidth(self.buffer.items.len) - self.textRect().w, 0.0));
         }
 
         fn emit(self: *Component, event: TextInputEvent) void {
             if (self.callbacks.on_event) |callback| callback(self.callbacks.context, event);
         }
 
-        fn bounds() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
-        fn textRect() draw.Rect {
-            return .{ .x = config.x + config.padding_x, .y = config.y + config.padding_y, .w = @max(config.width - config.padding_x * 2.0, Component.glyphWidth()), .h = @max(config.height - config.padding_y * 2.0, config.font_size) };
-        }
-
-        fn glyphWidth() f32 {
-            return config.glyph_width orelse config.font_size * 0.55;
-        }
-
-        fn approximateWidth(len: usize) f32 {
-            return @as(f32, @floatFromInt(len)) * Component.glyphWidth();
+        fn approximateWidth(self: *const Component, len: usize) f32 {
+            return @as(f32, @floatFromInt(len)) * self.glyphWidth();
         }
     };
 }
@@ -481,4 +492,29 @@ test "text input submits on enter" {
     try std.testing.expect(try input.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
     try std.testing.expect(input.submitted);
     try std.testing.expectEqual(@as(usize, 1), probe.submitted);
+}
+
+test "text input supports runtime bounds for focus cursor and text rendering" {
+    const InputBox = TextInput(.{ .glyph_width = 8, .placeholder_text = "Name" });
+    var input = try InputBox.init(std.testing.allocator, "abc");
+    defer input.deinit(std.testing.allocator);
+    input.setBounds(.{ .x = 80, .y = 40, .w = 160, .h = 36 });
+
+    try std.testing.expect(!try input.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = 10, .y = 10 } }));
+    try std.testing.expect(try input.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = 92, .y = 48 } }));
+    try std.testing.expect(input.focused);
+    try std.testing.expectEqual(@as(f32, 88), input.textRect().x);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try input.render(std.testing.allocator, &batch);
+    var found_text = false;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text and std.mem.eql(u8, command.text, "abc")) {
+            found_text = true;
+            try std.testing.expectEqual(input.textRect().x, command.rect.x);
+            try std.testing.expectEqual(input.textRect().x, command.clip.?.x);
+        }
+    }
+    try std.testing.expect(found_text);
 }

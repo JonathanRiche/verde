@@ -80,6 +80,7 @@ pub fn Button(comptime config: ButtonConfig) type {
         pressed: bool = false,
         focused: bool = false,
         disabled: bool = config.disabled,
+        rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         callbacks: ButtonCallbacks = .{},
 
         pub fn init() Component {
@@ -95,6 +96,27 @@ pub fn Button(comptime config: ButtonConfig) type {
             if (disabled) self.pressed = false;
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.rect = rect;
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn labelRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            const available_w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0);
+            const text_w = @min(approximateWidth(config.label.len, config.font_size), available_w);
+            const text_h = @max(bounds_rect.h - config.padding_y * 2.0, 1.0);
+            return .{
+                .x = bounds_rect.x + config.padding_x,
+                .y = bounds_rect.y + (bounds_rect.h - text_h) * 0.5,
+                .w = text_w,
+                .h = text_h,
+            };
+        }
+
         pub fn update(self: *Component, event: *const sdl.Event) !bool {
             return self.handleInput(inputFromSdl(event) orelse return false);
         }
@@ -102,13 +124,13 @@ pub fn Button(comptime config: ButtonConfig) type {
         pub fn handleInput(self: *Component, input: Input) bool {
             switch (input) {
                 .mouse_move => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const changed = self.hovered != inside;
                     self.hovered = inside;
                     return inside or changed or self.pressed;
                 },
                 .mouse_down => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     self.setFocused(inside);
                     if (!inside or self.disabled) {
                         self.pressed = false;
@@ -119,7 +141,7 @@ pub fn Button(comptime config: ButtonConfig) type {
                     return true;
                 },
                 .mouse_up => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const was_pressed = self.pressed;
                     self.hovered = inside;
                     self.pressed = false;
@@ -151,12 +173,12 @@ pub fn Button(comptime config: ButtonConfig) type {
             try renderButtonShell(
                 allocator,
                 batch,
-                Component.bounds(),
+                self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
             if (config.label.len > 0) {
-                try batch.glyph(allocator, Component.labelRect(), .{}, if (self.disabled) config.disabled_text_color else config.text_color);
+                try batch.text(allocator, self.labelRect(), config.label, if (self.disabled) config.disabled_text_color else config.text_color, config.font_size, self.bounds());
             }
         }
 
@@ -186,22 +208,6 @@ pub fn Button(comptime config: ButtonConfig) type {
             if (self.pressed) return config.pressed_color;
             if (self.hovered) return config.hover_color;
             return config.background_color;
-        }
-
-        fn bounds() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
-        fn labelRect() draw.Rect {
-            const available_w = @max(config.width - config.padding_x * 2.0, 0.0);
-            const text_w = @min(approximateWidth(config.label.len, config.font_size), available_w);
-            const text_h = @max(config.height - config.padding_y * 2.0, 1.0);
-            return .{
-                .x = config.x + config.padding_x,
-                .y = config.y + (config.height - text_h) * 0.5,
-                .w = text_w,
-                .h = text_h,
-            };
         }
     };
 }
@@ -214,6 +220,7 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
         pressed: bool = false,
         focused: bool = false,
         disabled: bool = config.disabled,
+        rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         callbacks: ButtonCallbacks = .{},
 
         pub fn init() Component {
@@ -229,6 +236,25 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
             if (disabled) self.pressed = false;
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.rect = rect;
+        }
+
+        pub fn bounds(self: *const Component) draw.Rect {
+            return self.rect;
+        }
+
+        pub fn iconRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            const inset = @min(config.icon_inset, @min(bounds_rect.w, bounds_rect.h) * 0.5);
+            return .{
+                .x = bounds_rect.x + inset,
+                .y = bounds_rect.y + inset,
+                .w = @max(bounds_rect.w - inset * 2.0, 0.0),
+                .h = @max(bounds_rect.h - inset * 2.0, 0.0),
+            };
+        }
+
         pub fn update(self: *Component, event: *const sdl.Event) !bool {
             return self.handleInput(inputFromSdl(event) orelse return false);
         }
@@ -236,13 +262,13 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
         pub fn handleInput(self: *Component, input: Input) bool {
             switch (input) {
                 .mouse_move => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const changed = self.hovered != inside;
                     self.hovered = inside;
                     return inside or changed or self.pressed;
                 },
                 .mouse_down => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     self.setFocused(inside);
                     if (!inside or self.disabled) {
                         self.pressed = false;
@@ -253,7 +279,7 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
                     return true;
                 },
                 .mouse_up => |point| {
-                    const inside = Component.bounds().contains(point);
+                    const inside = self.bounds().contains(point);
                     const was_pressed = self.pressed;
                     self.hovered = inside;
                     self.pressed = false;
@@ -285,11 +311,11 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
             try renderButtonShell(
                 allocator,
                 batch,
-                Component.bounds(),
+                self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
             );
-            try batch.glyph(allocator, Component.iconRect(), config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color);
+            try batch.glyph(allocator, self.iconRect(), config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color);
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -318,20 +344,6 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
             if (self.pressed) return config.pressed_color;
             if (self.hovered) return config.hover_color;
             return config.background_color;
-        }
-
-        fn bounds() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
-        fn iconRect() draw.Rect {
-            const inset = @min(config.icon_inset, @min(config.width, config.height) * 0.5);
-            return .{
-                .x = config.x + inset,
-                .y = config.y + inset,
-                .w = @max(config.width - inset * 2.0, 0.0),
-                .h = @max(config.height - inset * 2.0, 0.0),
-            };
         }
     };
 }
@@ -442,4 +454,38 @@ test "icon button renders shell and icon" {
     try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[5].kind);
     try std.testing.expectEqual(@as(f32, 7.0), batch.commands.items[5].rect.x);
     try std.testing.expectEqual(@as(f32, 10.0), batch.commands.items[5].rect.w);
+}
+
+test "button supports runtime bounds for hit testing and text rendering" {
+    const Action = Button(.{ .label = "Send" });
+    var button = Action.init();
+    button.setBounds(.{ .x = 120, .y = 48, .w = 88, .h = 30 });
+    var probe: ButtonProbe = .{};
+    button.setCallbacks(.{ .context = &probe, .on_event = probeButtonEvent });
+
+    try std.testing.expect(!button.handleInput(.{ .mouse_down = .{ .x = 4, .y = 4 } }));
+    try std.testing.expect(button.handleInput(.{ .mouse_down = .{ .x = 126, .y = 52 } }));
+    try std.testing.expect(button.handleInput(.{ .mouse_up = .{ .x = 126, .y = 52 } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.clicked);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try button.render(std.testing.allocator, &batch);
+    try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[5].kind);
+    try std.testing.expectEqualStrings("Send", batch.commands.items[5].text);
+    try std.testing.expectEqual(@as(f32, 130), batch.commands.items[5].rect.x);
+}
+
+test "icon button supports runtime bounds for hit testing and icon geometry" {
+    const Action = IconButton(.{ .icon_inset = 4 });
+    var button = Action.init();
+    button.setBounds(.{ .x = 50, .y = 70, .w = 28, .h = 28 });
+    var probe: ButtonProbe = .{};
+    button.setCallbacks(.{ .context = &probe, .on_event = probeButtonEvent });
+
+    try std.testing.expect(button.handleInput(.{ .mouse_down = .{ .x = 52, .y = 72 } }));
+    try std.testing.expect(button.handleInput(.{ .mouse_up = .{ .x = 52, .y = 72 } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.clicked);
+    try std.testing.expectEqual(@as(f32, 54), button.iconRect().x);
+    try std.testing.expectEqual(@as(f32, 20), button.iconRect().w);
 }
