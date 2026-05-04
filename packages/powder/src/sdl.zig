@@ -63,6 +63,7 @@ pub const Window = opaque {
     pub const create = createWindow;
     pub const destroy = destroyWindow;
     pub const setTitle = setWindowTitle;
+    pub const size = getWindowSize;
 };
 
 pub const Renderer = opaque {
@@ -293,6 +294,13 @@ pub fn setWindowTitle(window: *Window, title: [:0]const u8) void {
     SDL_SetWindowTitle(window, title.ptr);
 }
 
+pub fn getWindowSize(window: *Window) Error!struct { w: i32, h: i32 } {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    if (!SDL_GetWindowSize(window, &w, &h)) return error.SdlError;
+    return .{ .w = @intCast(w), .h = @intCast(h) };
+}
+
 pub fn startTextInput(window: *Window) Error!void {
     if (!SDL_StartTextInput(window)) return error.SdlError;
 }
@@ -389,6 +397,7 @@ extern fn SDL_SetAppMetadata(appname: [*:0]const u8, appversion: [*:0]const u8, 
 extern fn SDL_CreateWindow(title: [*:0]const u8, w: c_int, h: c_int, flags: Window.Flags) ?*Window;
 extern fn SDL_DestroyWindow(window: *Window) void;
 extern fn SDL_SetWindowTitle(window: *Window, title: [*:0]const u8) void;
+extern fn SDL_GetWindowSize(window: *Window, w: *c_int, h: *c_int) bool;
 extern fn SDL_StartTextInput(window: *Window) bool;
 extern fn SDL_StopTextInput(window: *Window) bool;
 extern fn SDL_PollEvent(event: ?*Event) bool;

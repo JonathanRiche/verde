@@ -11,6 +11,10 @@ const Fast = powder.toggle(.{ .label = "Fast" });
 const Send = powder.button(.{ .label = "Send" });
 
 pub fn main() !void {
+    try run(true);
+}
+
+fn run(print_report: bool) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -77,15 +81,17 @@ pub fn main() !void {
     try prompt.render(allocator, &batch);
     try send.render(allocator, &batch);
 
-    std.debug.print("Powder layout review\n", .{});
-    printRect("shell.content", shell.contentRect());
-    printRect("provider", provider.bounds());
-    printRect("model", model.bounds());
-    printRect("reasoning", reasoning.bounds());
-    printRect("fast", fast.bounds());
-    printRect("prompt", prompt.bounds());
-    printRect("send", send.bounds());
-    std.debug.print("commands={d}\n", .{batch.commands.items.len});
+    if (print_report) {
+        std.debug.print("Powder layout review\n", .{});
+        printRect("shell.content", shell.contentRect());
+        printRect("provider", provider.bounds());
+        printRect("model", model.bounds());
+        printRect("reasoning", reasoning.bounds());
+        printRect("fast", fast.bounds());
+        printRect("prompt", prompt.bounds());
+        printRect("send", send.bounds());
+        std.debug.print("commands={d}\n", .{batch.commands.items.len});
+    }
 
     if (batch.commands.items.len == 0) return error.EmptyLayoutReview;
 }
@@ -119,5 +125,5 @@ fn reasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
 }
 
 test "layout review runs" {
-    try main();
+    try run(false);
 }
