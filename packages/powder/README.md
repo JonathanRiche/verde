@@ -61,6 +61,7 @@ Run the visual labs:
 ```bash
 zig build run-text-area-lab
 zig build run-component-lab
+zig build run-layout-review
 ```
 
 If shader source changes, regenerate the Vulkan SPIR-V assets:
@@ -75,8 +76,62 @@ Powder components are retained, but controls that expose `setBounds()` can be
 laid out every frame. Use `powder.layout` for container-style layout instead of
 hand-writing every rect.
 
-Flex rows and columns support padding, per-item margins, gaps, grow, alignment,
-justification, and optional wrapping:
+The layout package is CPU-only. It does not render anything by itself. It
+computes `draw.Rect` values, then either returns those rects to you or applies
+them to retained components through `setBounds()`. A typical frame looks like:
+
+```zig
+powder.layout.applyFlex(container, config, items, .{ &input, &button });
+try input.update(allocator, &event);
+try button.update(&event);
+try input.render(allocator, &batch);
+try button.render(allocator, &batch);
+```
+
+Components that currently support direct `applyFlex()` / `applyGrid()` usage are
+the controls with runtime bounds: `Button`, `IconButton`, `Select`, `TextInput`,
+`Checkbox`, and `Toggle`. For other components, call `powder.layout.flex()` or
+`powder.layout.grid()` into a rect array and wire the rects manually once that
+component exposes runtime bounds.
+
+### Boxes, Padding, And Margins
+
+Use `powder.layout.Box` when a panel/container needs margin and padding. Margin
+shrinks the outer rect; padding shrinks the content rect inside the margin.
+
+```zig
+const shell: powder.layout.Box = .{
+    .rect = window_rect,
+    .margin = powder.layout.Edges.all(12),
+    .padding = powder.layout.Edges.xy(16, 10),
+};
+
+const content = shell.contentRect();
+```
+
+`Edges` helpers:
+
+```zig
+powder.layout.Edges.all(8)      // top/right/bottom/left = 8
+powder.layout.Edges.xy(12, 6)   // left/right = 12, top/bottom = 6
+powder.layout.Edges.axis(12, 6) // same as xy()
+```
+
+### Flex Layout
+
+Flex rows and columns support:
+
+- `direction`: `.row` or `.column`
+- `wrap`: start a new line/column when children overflow
+- `gap`, `row_gap`, `column_gap`
+- container `padding`
+- item `margin`
+- item `grow`
+- item `min_w`, `min_h`, `max_w`, `max_h`
+- `align_items`: `.start`, `.center`, `.end`, `.stretch`
+- `justify_content`: `.start`, `.center`, `.end`, `.space_between`
+
+Use `applyFlex()` when every child is a component with `setBounds()`:
 
 ```zig
 powder.layout.applyFlex(
@@ -90,8 +145,38 @@ powder.layout.applyFlex(
 );
 ```
 
-Grid layout supports fixed pixel tracks, fractional tracks, gaps, spans,
-padding, and per-item margins:
+Use `flex()` when you want the rects back:
+
+```zig
+var rects: [3]powder.Rect = undefined;
+powder.layout.flex(
+    panel_rect,
+    .{ .direction = .row, .wrap = true, .gap = 8 },
+    &.{
+        powder.layout.FlexItem.fixed(120, 32),
+        powder.layout.FlexItem.fixed(120, 32),
+        powder.layout.FlexItem.fixed(120, 32),
+    },
+    &rects,
+);
+```
+
+`FlexItem.fixed(w, h)` creates a fixed-size item. `FlexItem.fill(h, grow)` is a
+convenience for row layouts where width should grow and height is fixed.
+
+### Grid Layout
+
+Grid layout supports:
+
+- fixed pixel tracks: `.{ .px = 120 }`
+- fractional tracks: `.{ .fr = 1 }`
+- `gap_x`, `gap_y`
+- container `padding`
+- item `margin`
+- `column`, `row`
+- `column_span`, `row_span`
+
+Use `applyGrid()` when every child has `setBounds()`:
 
 ```zig
 try powder.layout.applyGrid(
@@ -111,9 +196,38 @@ try powder.layout.applyGrid(
 );
 ```
 
-For lower-level control, call `powder.layout.flex()` or `powder.layout.grid()`
-to fill an array of `draw.Rect`s, then route those rects into any system that
-understands runtime bounds.
+Use `grid()` when you want rects back:
+
+```zig
+const columns = [_]powder.layout.Track{ .{ .px = 96 }, .{ .fr = 1 }, .{ .fr = 1 } };
+const rows = [_]powder.layout.Track{ .{ .px = 32 }, .{ .px = 32 } };
+const cells = [_]powder.layout.GridItem{
+    .{ .column = 0, .row = 0 },
+    .{ .column = 1, .row = 0, .column_span = 2 },
+};
+var rects: [cells.len]powder.Rect = undefined;
+
+try powder.layout.grid(
+    allocator,
+    panel_rect,
+    .{ .columns = &columns, .rows = &rows, .gap_x = 8, .gap_y = 8 },
+    &cells,
+    &rects,
+);
+```
+
+### Review Example
+
+Run the layout review example from `packages/powder`:
+
+```bash
+zig build run-layout-review
+```
+
+It builds a Verde-style prompt area with provider/model/reasoning selects, a
+fast toggle, a prompt input, and a send button. The example prints each computed
+rect and renders the retained controls into a `RenderBatch`, so it catches both
+layout and component integration regressions without opening a window.
 
 ## Troubleshooting
 
