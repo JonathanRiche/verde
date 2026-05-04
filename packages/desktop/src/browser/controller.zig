@@ -156,6 +156,11 @@ pub const Controller = struct {
         };
     }
 
+    /// Reports whether a browser backend has been created.
+    pub fn hasBackend(self: *const Controller) bool {
+        return self.backend != null;
+    }
+
     /// Returns the current lifetime policy for the underlying browser runtime.
     pub fn runtimeMode(self: *const Controller) browser_types.RuntimeMode {
         const backend = if (self.backend) |*backend| backend else return .keep_warm;
