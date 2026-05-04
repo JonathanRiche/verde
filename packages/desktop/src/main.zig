@@ -240,16 +240,19 @@ pub fn main(init: std.process.Init) !void {
                 allocator_arg: std.mem.Allocator,
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
+                display_scale: f32,
             ) void {
                 zgui.backend.draw();
+                const overlay_width = @as(f32, @floatFromInt(framebuffer_width)) / @max(display_scale, 1.0);
+                const overlay_height = @as(f32, @floatFromInt(framebuffer_height)) / @max(display_scale, 1.0);
                 powder_command_renderer.renderBatch(
                     allocator_arg,
                     &app_state.powder_overlay_batch,
-                    @floatFromInt(framebuffer_width),
-                    @floatFromInt(framebuffer_height),
+                    overlay_width,
+                    overlay_height,
                 ) catch |err| log.warn("failed to render powder overlay batch: {s}", .{@errorName(err)});
             }
-        }.run, .{ &powder_renderer, &state, allocator, fb_width, fb_height });
+        }.run, .{ &powder_renderer, &state, allocator, fb_width, fb_height, ui_scale });
         const swap_start = profiler.nowNs();
         try sdl.gl.swapWindow(window);
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
