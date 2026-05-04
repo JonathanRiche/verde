@@ -36,7 +36,6 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            .cache/zig-global
             ~/.cargo/registry
             ~/.cargo/git
             vendor/fff/target
