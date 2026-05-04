@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) void {
         ),
     });
 
+    const ghostty_vt = ghosttyVtModule(ghostty);
+
     const exe = b.addExecutable(.{
         .name = "verde",
         .root_module = b.createModule(.{
@@ -96,7 +98,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
-                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "ghostty-vt", .module = ghostty_vt },
                 .{ .name = "zgui_text_select", .module = zgui_text_select.module("zgui_text_select") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
@@ -308,7 +310,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
-                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "ghostty-vt", .module = ghostty_vt },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
@@ -367,6 +369,28 @@ fn configureLinuxCefBinary(
         .file = b.path("src/browser/cef/c/native_linux.cc"),
         .flags = &.{"-std=c++17"},
     });
+}
+
+fn ghosttyVtModule(dep: *std.Build.Dependency) *std.Build.Module {
+    if (dep.builder.modules.get("ghostty-vt")) |module| return module;
+
+    var it = dep.builder.modules.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, name, "ghostty-vt-") and
+            !std.mem.startsWith(u8, name, "ghostty-vt-c-"))
+        {
+            std.log.info("using Ghostty VT module '{s}'", .{name});
+            return entry.value_ptr.*;
+        }
+    }
+
+    std.log.err("Ghostty did not export a VT module. Available Ghostty modules:", .{});
+    it = dep.builder.modules.iterator();
+    while (it.next()) |entry| {
+        std.log.err("  {s}", .{entry.key_ptr.*});
+    }
+    @panic("unable to find Ghostty VT module");
 }
 
 fn installLinuxCefRuntime(b: *std.Build, sdk_path: []const u8) void {
