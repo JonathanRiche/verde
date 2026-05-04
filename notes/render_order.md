@@ -29,3 +29,15 @@
   - Sidebar sorting and committed counts every render.
   - Synchronous `flushDirtyNow()` / `flushIfDirty()` saves on the UI thread.
   - Full root render after every event, including dropdown interaction events.
+
+## Responsiveness TODO
+
+- [x] Skip provider-send polling when no sends are active.
+- [x] Skip terminal polling for hidden docks with no running session.
+- [x] Skip browser polling when no backend exists.
+- [x] Cache sidebar committed-thread counts and sorted thread rows.
+- [x] Move SQLite state writes off the UI thread.
+- [ ] Move state snapshot creation off the UI thread or make it incremental.
+- [ ] Make provider completion persistence coalesce instead of saving immediately.
+- [ ] Add frame-profiler labels around composer picker controls.
+- [ ] Cache remaining sidebar/project derived labels that are recalculated during render.
