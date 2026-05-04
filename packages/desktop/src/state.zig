@@ -26,8 +26,8 @@ pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
 pub const PowderComposerTextArea = powder.textArea(.{
-    .padding_x = 4.0,
-    .padding_y = 6.0,
+    .padding_x = 8.0,
+    .padding_y = 8.0,
     .background_color = .{ .a = 0.0 },
     .border_color = .{ .a = 0.0 },
     .text_color = .{},
@@ -39,7 +39,7 @@ pub const PowderComposerTextArea = powder.textArea(.{
     .placeholder_text = "Ask anything, or use / to show available commands",
     .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
     .max_bytes = 8192 - 1,
-    .font_size = 16.0,
+    .font_size = 20.0,
     .submit_on_enter = true,
 });
 
@@ -49,11 +49,11 @@ const POWDER_CONTROL_TEXT = powder.Color{ .r = 0.82, .g = 0.85, .b = 0.89, .a = 
 const POWDER_MENU_BG = powder.Color{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 };
 
 const powder_select_config = powder.SelectConfig{
-    .height = 32.0,
+    .height = 34.0,
     .padding_x = 10.0,
-    .padding_y = 7.0,
-    .row_height = 30.0,
-    .glyph_width = 7.8,
+    .padding_y = 8.0,
+    .row_height = 34.0,
+    .glyph_width = 9.6,
     .background_color = POWDER_CONTROL_BG,
     .border_color = POWDER_CONTROL_BORDER,
     .menu_color = POWDER_MENU_BG,
@@ -78,25 +78,25 @@ pub const PowderFastSelect = powder.select(powderSelectConfig(powderFastLabel));
 pub const PowderAccessSelect = powder.select(powderSelectConfig(powderAccessLabel));
 pub const PowderSendButton = powder.button(.{
     .label = "SEND",
-    .font_size = 11.0,
+    .font_size = 14.0,
     .background_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .pressed_color = .{ .r = 0.18, .g = 0.34, .b = 0.23, .a = 1.0 },
     .border_color = .{ .r = 0.33, .g = 0.58, .b = 0.40, .a = 1.0 },
     .text_color = .{},
     .padding_x = 7.0,
-    .padding_y = 7.0,
+    .padding_y = 8.0,
 });
 pub const PowderStopButton = powder.button(.{
     .label = "STOP",
-    .font_size = 11.0,
+    .font_size = 14.0,
     .background_color = .{ .r = 0.33, .g = 0.27, .b = 0.10, .a = 1.0 },
     .hover_color = .{ .r = 0.42, .g = 0.34, .b = 0.13, .a = 1.0 },
     .pressed_color = .{ .r = 0.24, .g = 0.19, .b = 0.07, .a = 1.0 },
     .border_color = .{ .r = 0.54, .g = 0.44, .b = 0.16, .a = 1.0 },
     .text_color = .{},
     .padding_x = 7.0,
-    .padding_y = 7.0,
+    .padding_y = 8.0,
 });
 
 const Mutex = struct {
