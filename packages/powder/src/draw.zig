@@ -44,6 +44,7 @@ pub const CommandKind = enum {
     glyph,
     cursor,
     selection,
+    scrollbar,
 };
 
 pub const Command = struct {
@@ -70,6 +71,18 @@ pub const RenderBatch = struct {
 
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
         try self.commands.append(allocator, .{ .kind = .glyph, .rect = r, .uv = uv, .color = color });
+    }
+
+    pub fn cursor(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
+        try self.commands.append(allocator, .{ .kind = .cursor, .rect = r, .color = color });
+    }
+
+    pub fn selection(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
+        try self.commands.append(allocator, .{ .kind = .selection, .rect = r, .color = color });
+    }
+
+    pub fn scrollbar(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
+        try self.commands.append(allocator, .{ .kind = .scrollbar, .rect = r, .color = color });
     }
 };
 

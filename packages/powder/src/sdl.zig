@@ -77,6 +77,22 @@ pub const FRect = extern struct {
     h: f32,
 };
 
+pub const Rect = extern struct {
+    x: c_int,
+    y: c_int,
+    w: c_int,
+    h: c_int,
+};
+
+pub const BlendMode = enum(u32) {
+    none = 0x00000000,
+    blend = 0x00000001,
+    add = 0x00000002,
+    mod = 0x00000004,
+    mul = 0x00000008,
+    invalid = 0x7fffffff,
+};
+
 pub const EventType = enum(u32) {
     quit = 0x100,
     window_shown = 0x202,
@@ -108,6 +124,7 @@ pub const Keymod = struct {
     pub const none: u16 = 0x0000;
     pub const shift: u16 = 0x0001 | 0x0002;
     pub const ctrl: u16 = 0x0040 | 0x0080;
+    pub const alt: u16 = 0x0100 | 0x0200;
     pub const gui: u16 = 0x0400 | 0x0800;
 };
 
@@ -119,6 +136,9 @@ pub const Keycode = enum(u32) {
     space = 32,
     delete = 127,
     a = 'a',
+    c = 'c',
+    v = 'v',
+    x = 'x',
     insert = 0x40000049,
     home = 0x4000004a,
     pageup = 0x4000004b,
@@ -160,6 +180,16 @@ pub const TextInputEvent = extern struct {
     text: [*:0]const u8,
 };
 
+pub const TextEditingEvent = extern struct {
+    type: EventType,
+    reserved: u32,
+    timestamp: u64,
+    window_id: WindowId,
+    text: [*:0]const u8,
+    start: c_int,
+    length: c_int,
+};
+
 pub const MouseButtonFlags = packed struct(u32) {
     left: bool = false,
     middle: bool = false,
@@ -196,13 +226,28 @@ pub const MouseButtonEvent = extern struct {
     y: f32,
 };
 
+pub const MouseWheelEvent = extern struct {
+    type: EventType,
+    reserved: u32,
+    timestamp: u64,
+    window_id: WindowId,
+    which: MouseId,
+    x: f32,
+    y: f32,
+    direction: u32,
+    mouse_x: f32,
+    mouse_y: f32,
+};
+
 pub const Event = extern union {
     type: EventType,
     common: CommonEvent,
     key: KeyboardEvent,
+    edit: TextEditingEvent,
     text: TextInputEvent,
     motion: MouseMotionEvent,
     button: MouseButtonEvent,
+    wheel: MouseWheelEvent,
     _: [128]u8,
 };
 
@@ -247,6 +292,10 @@ pub fn setRenderDrawColor(renderer: *Renderer, r: u8, g: u8, b: u8, a: u8) Error
     if (!SDL_SetRenderDrawColor(renderer, r, g, b, a)) return error.SdlError;
 }
 
+pub fn setRenderDrawBlendMode(renderer: *Renderer, blend_mode: BlendMode) Error!void {
+    if (!SDL_SetRenderDrawBlendMode(renderer, blend_mode)) return error.SdlError;
+}
+
 pub fn renderClear(renderer: *Renderer) Error!void {
     if (!SDL_RenderClear(renderer)) return error.SdlError;
 }
@@ -256,12 +305,27 @@ pub fn renderFillRect(renderer: *Renderer, rect: FRect) Error!void {
     if (!SDL_RenderFillRect(renderer, &mutable_rect)) return error.SdlError;
 }
 
+pub fn setRenderClipRect(renderer: *Renderer, rect: ?Rect) Error!void {
+    var mutable_rect = rect;
+    if (!SDL_SetRenderClipRect(renderer, if (mutable_rect) |*r| r else null)) return error.SdlError;
+}
+
 pub fn renderDebugText(renderer: *Renderer, x: f32, y: f32, text: [:0]const u8) Error!void {
     if (!SDL_RenderDebugText(renderer, x, y, text.ptr)) return error.SdlError;
 }
 
 pub fn renderPresent(renderer: *Renderer) void {
     _ = SDL_RenderPresent(renderer);
+}
+
+pub fn setClipboardText(text: [:0]const u8) Error!void {
+    if (!SDL_SetClipboardText(text.ptr)) return error.SdlError;
+}
+
+pub fn getClipboardText(allocator: std.mem.Allocator) Error![]u8 {
+    const raw = SDL_GetClipboardText() orelse return error.SdlError;
+    defer SDL_free(raw);
+    return allocator.dupe(u8, std.mem.span(raw)) catch error.SdlError;
 }
 
 extern fn SDL_Init(flags: InitFlags) bool;
@@ -277,10 +341,15 @@ extern fn SDL_PollEvent(event: ?*Event) bool;
 extern fn SDL_CreateRenderer(window: *Window, name: ?[*:0]const u8) ?*Renderer;
 extern fn SDL_DestroyRenderer(renderer: *Renderer) void;
 extern fn SDL_SetRenderDrawColor(renderer: *Renderer, r: u8, g: u8, b: u8, a: u8) bool;
+extern fn SDL_SetRenderDrawBlendMode(renderer: *Renderer, blend_mode: BlendMode) bool;
 extern fn SDL_RenderClear(renderer: *Renderer) bool;
 extern fn SDL_RenderFillRect(renderer: *Renderer, rect: *const FRect) bool;
+extern fn SDL_SetRenderClipRect(renderer: *Renderer, rect: ?*const Rect) bool;
 extern fn SDL_RenderDebugText(renderer: *Renderer, x: f32, y: f32, str: [*:0]const u8) bool;
 extern fn SDL_RenderPresent(renderer: *Renderer) bool;
+extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
+extern fn SDL_GetClipboardText() ?[*:0]u8;
+extern fn SDL_free(mem: ?*anyopaque) void;
 
 test "event union stays SDL sized" {
     try std.testing.expect(@sizeOf(Event) >= 128);

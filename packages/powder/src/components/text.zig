@@ -15,11 +15,21 @@ pub const TextConfig = struct {
     font_size: f32 = 16.0,
 };
 
+pub const TextEvent = union(enum) {
+    changed: []const u8,
+};
+
+pub const TextCallbacks = struct {
+    context: ?*anyopaque = null,
+    on_event: ?*const fn (context: ?*anyopaque, event: TextEvent) void = null,
+};
+
 pub fn Text(comptime config: TextConfig) type {
     return struct {
         const Component = @This();
 
         buffer: std.ArrayList(u8) = .empty,
+        callbacks: TextCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, value: []const u8) !Component {
             var self: Component = .{};
@@ -35,6 +45,7 @@ pub fn Text(comptime config: TextConfig) type {
         pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             self.buffer.clearRetainingCapacity();
             try self.buffer.appendSlice(allocator, value);
+            self.emit(.{ .changed = self.buffer.items });
         }
 
         pub fn text(self: *const Component) []const u8 {
@@ -43,6 +54,10 @@ pub fn Text(comptime config: TextConfig) type {
 
         pub fn update(_: *Component, _: *const sdl.Event) !bool {
             return false;
+        }
+
+        pub fn setCallbacks(self: *Component, callbacks: TextCallbacks) void {
+            self.callbacks = callbacks;
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
@@ -59,5 +74,35 @@ pub fn Text(comptime config: TextConfig) type {
         fn approximateWidth(len: usize, font_size: f32) f32 {
             return @as(f32, @floatFromInt(len)) * font_size * 0.55;
         }
+
+        fn emit(self: *Component, event: TextEvent) void {
+            if (self.callbacks.on_event) |callback| {
+                callback(self.callbacks.context, event);
+            }
+        }
     };
+}
+
+const TextProbe = struct {
+    changed: usize = 0,
+};
+
+fn probeTextEvent(context: ?*anyopaque, event: TextEvent) void {
+    const probe: *TextProbe = @ptrCast(@alignCast(context orelse return));
+    switch (event) {
+        .changed => probe.changed += 1,
+    }
+}
+
+test "text component emits change callbacks" {
+    const Label = Text(.{});
+    var label = try Label.init(std.testing.allocator, "before");
+    defer label.deinit(std.testing.allocator);
+
+    var probe: TextProbe = .{};
+    label.setCallbacks(.{ .context = &probe, .on_event = probeTextEvent });
+    try label.setText(std.testing.allocator, "after");
+
+    try std.testing.expectEqualStrings("after", label.text());
+    try std.testing.expectEqual(@as(usize, 1), probe.changed);
 }
