@@ -61,6 +61,7 @@ Run the visual labs:
 ```bash
 zig build run-text-area-lab
 zig build run-component-lab
+zig build run-layout-lab
 zig build run-layout-review
 ```
 
@@ -217,6 +218,18 @@ try powder.layout.grid(
 ```
 
 ### Review Example
+
+Run the visual layout lab from `packages/powder`:
+
+```bash
+zig build run-layout-lab
+```
+
+It opens an SDL window with a resizable shell, padded content regions, a grid
+row, a growing flex prompt row, and a wrapping flex row. Orange, blue, and green
+outlines show the shell, content, and padded content rects. Resize the window to
+verify that the retained controls move, stretch, and wrap while hit testing and
+rendering stay aligned.
 
 Run the layout review example from `packages/powder`:
 
