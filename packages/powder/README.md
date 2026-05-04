@@ -248,6 +248,53 @@ fast toggle, a prompt input, and a send button. The example prints each computed
 rect and renders the retained controls into a `RenderBatch`, so it catches both
 layout and component integration regressions without opening a window.
 
+## Text Metrics And Layout
+
+Powder owns text layout for retained controls. Components do not ask the host to
+recompute wrapping, cursor placement, selection rectangles, or scroll offsets.
+Instead, the host can provide font metrics and Powder emits laid-out text runs in
+the render batch.
+
+Use fixed metrics for monospace/debug renderers:
+
+```zig
+const metrics = powder.FontMetrics.fixed(14, 8, 18);
+
+var prompt = try powder.textInput(.{}).init(allocator, "");
+prompt.setFontMetrics(metrics);
+```
+
+Use a callback when your font atlas has proportional advances:
+
+```zig
+fn advance(context: ?*anyopaque, text: []const u8, offset: usize, font_size: f32) powder.FontAdvance {
+    const atlas: *Atlas = @ptrCast(@alignCast(context.?));
+    const len = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
+    return .{ .byte_len = len, .width = atlas.advance(text[offset .. offset + len], font_size) };
+}
+
+const metrics: powder.FontMetrics = .{
+    .font_size = 14,
+    .line_height = 18,
+    .ascent = 13,
+    .descent = 5,
+    .baseline = 14,
+    .context = &atlas,
+    .advance = advance,
+};
+```
+
+`TextArea`, `TextInput`, `Button`, and `Select` expose `setFontMetrics()`.
+Without explicit metrics, they use the existing fixed fallback derived from
+their component config.
+
+Text commands may carry `command.text_runs`. When this slice is non-empty, a
+renderer should draw each run at `run.x/run.y` using `run.text`,
+`run.font_size`, `run.color`, `run.line_height`, and `run.clip`. That output is
+authoritative: it is the same layout Powder used for hit testing, wrapping,
+cursor movement, selection, and scrolling. Hosts should not re-wrap those
+commands.
+
 ## Images And Textures
 
 Powder image rendering is command-based, like text and rectangles. Components

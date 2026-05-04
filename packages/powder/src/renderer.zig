@@ -408,12 +408,24 @@ pub const Renderer = struct {
     }
 
     fn appendTextCommand(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, command: draw.Command) !void {
-        const text = c.TTF_CreateText(self.text_engine.?, self.font.?, command.text.ptr, command.text.len) orelse return error.SdlTtfCreateTextFailed;
+        if (command.text_runs.len > 0) {
+            for (command.text_runs) |run| {
+                if (run.text.len == 0 or run.color.a <= 0.0) continue;
+                try self.appendTextSlice(allocator, frame, run.text, run.x, run.y, run.color, run.font_size, run.clip, null);
+            }
+            return;
+        }
+        try self.appendTextSlice(allocator, frame, command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.color, command.font_size, command.clip, if (command.wrap) command.rect.w else null);
+    }
+
+    fn appendTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32) !void {
+        if (!c.TTF_SetFontSize(self.font.?, font_size)) return error.SdlTtfTextFailed;
+        const text = c.TTF_CreateText(self.text_engine.?, self.font.?, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
         defer c.TTF_DestroyText(text);
-        const color = colorBytes(command.color);
+        const color = colorBytes(color_value);
         if (!c.TTF_SetTextColor(text, color[0], color[1], color[2], color[3])) return error.SdlTtfTextFailed;
-        if (command.wrap and command.rect.w > 0) {
-            if (!c.TTF_SetTextWrapWidth(text, @intFromFloat(@ceil(command.rect.w)))) return error.SdlTtfTextFailed;
+        if (wrap_width) |width| {
+            if (width > 0 and !c.TTF_SetTextWrapWidth(text, @intFromFloat(@ceil(width)))) return error.SdlTtfTextFailed;
         }
         if (!c.TTF_UpdateText(text)) return error.SdlTtfTextFailed;
         const sequence_head = c.TTF_GetGPUTextDrawData(text) orelse return;
@@ -431,11 +443,11 @@ pub const Renderer = struct {
             for (xy, uv) |point, texcoord| {
                 frame.vertices.appendAssumeCapacity(.{
                     .pos = .{
-                        .x = command.rect.x - command.scroll.x + point.x,
-                        .y = command.rect.y - command.scroll.y - point.y,
+                        .x = x + point.x,
+                        .y = y - point.y,
                     },
                     .uv = .{ .x = texcoord.x, .y = texcoord.y },
-                    .color = command.color,
+                    .color = color_value,
                 });
             }
             const raw_indices = @as([*]const c_int, @ptrCast(seq.indices))[0..@intCast(seq.num_indices)];
@@ -444,7 +456,7 @@ pub const Renderer = struct {
                 .atlas_texture = seq.atlas_texture,
                 .first_index = first_index,
                 .index_count = @intCast(seq.num_indices),
-                .clip = command.clip,
+                .clip = clip,
             });
         }
     }
@@ -565,6 +577,16 @@ pub const SdlDebugRenderer = struct {
         if (command.clip) |clip| try sdl.setRenderClipRect(self.renderer, rectToSdl(clip));
         defer if (command.clip != null) sdl.setRenderClipRect(self.renderer, null) catch {};
 
+        if (command.text_runs.len > 0) {
+            for (command.text_runs) |run| {
+                if (run.text.len == 0) continue;
+                if (run.clip == null or rectIntersectsY(run.clip.?, run.y, run.line_height)) {
+                    try self.renderDebugLine(run.x, run.y, run.text);
+                }
+            }
+            return;
+        }
+
         const wrap_columns = if (command.wrap)
             @max(@as(usize, @intFromFloat(@floor(command.rect.w / @max(command.glyph_width, 1.0)))), 1)
         else
@@ -652,6 +674,16 @@ pub const SdlFontRenderer = struct {
         if (command.text.len == 0 or command.color.a <= 0.0) return;
         if (command.clip) |clip| try sdl.setRenderClipRect(self.renderer, rectToSdl(clip));
         defer if (command.clip != null) sdl.setRenderClipRect(self.renderer, null) catch {};
+
+        if (command.text_runs.len > 0) {
+            for (command.text_runs) |run| {
+                if (run.text.len == 0) continue;
+                if (run.clip == null or rectIntersectsY(run.clip.?, run.y, run.line_height)) {
+                    try self.renderLine(run.x, run.y, run.text, run.color, run.font_size);
+                }
+            }
+            return;
+        }
 
         const wrap_columns = if (command.wrap)
             @max(@as(usize, @intFromFloat(@floor(command.rect.w / @max(command.glyph_width, 1.0)))), 1)
