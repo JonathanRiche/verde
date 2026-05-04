@@ -33,6 +33,20 @@ pub const Rect = extern struct {
     }
 };
 
+pub const TextureId = extern struct {
+    value: u32 = 0,
+
+    pub const invalid: TextureId = .{};
+
+    pub fn init(value: u32) TextureId {
+        return .{ .value = value };
+    }
+
+    pub fn valid(self: TextureId) bool {
+        return self.value != 0;
+    }
+};
+
 pub const Vertex = extern struct {
     pos: Vec2,
     uv: Vec2,
@@ -42,6 +56,7 @@ pub const Vertex = extern struct {
 pub const CommandKind = enum {
     rect,
     text,
+    image,
     cursor,
     selection,
     scrollbar,
@@ -52,6 +67,7 @@ pub const Command = struct {
     rect: Rect,
     uv: Rect = .{},
     color: Color,
+    texture: TextureId = .invalid,
     /// Frame-lifetime text slice. Callers must keep it alive until the batch is consumed.
     text: []const u8 = "",
     font_size: f32 = 16.0,
@@ -78,7 +94,18 @@ pub const RenderBatch = struct {
     }
 
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .text, .rect = r, .uv = uv, .color = color });
+        try self.image(allocator, r, .invalid, uv, color, null);
+    }
+
+    pub fn image(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, texture: TextureId, uv: Rect, tint: Color, clip: ?Rect) !void {
+        try self.commands.append(allocator, .{
+            .kind = .image,
+            .rect = r,
+            .uv = uv,
+            .color = tint,
+            .texture = texture,
+            .clip = clip,
+        });
     }
 
     /// Appends a text command. The `value` slice is frame-lifetime and must remain
@@ -142,4 +169,16 @@ test "rect contains points inside bounds" {
     const rect_value: Rect = .{ .x = 10, .y = 20, .w = 30, .h = 40 };
     try std.testing.expect(rect_value.contains(.{ .x = 10, .y = 20 }));
     try std.testing.expect(!rect_value.contains(.{ .x = 40, .y = 20 }));
+}
+
+test "image command carries texture and uv" {
+    var batch: RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try batch.image(std.testing.allocator, .{ .w = 24, .h = 16 }, TextureId.init(7), .{ .x = 0.25, .y = 0.5, .w = 0.5, .h = 0.25 }, Color.white, .{ .w = 10, .h = 10 });
+
+    try std.testing.expectEqual(CommandKind.image, batch.commands.items[0].kind);
+    try std.testing.expectEqual(@as(u32, 7), batch.commands.items[0].texture.value);
+    try std.testing.expectEqual(@as(f32, 0.25), batch.commands.items[0].uv.x);
+    try std.testing.expect(batch.commands.items[0].clip != null);
 }

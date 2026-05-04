@@ -231,6 +231,10 @@ outlines show the shell, content, and padded content rects. Resize the window to
 verify that the retained controls move, stretch, and wrap while hit testing and
 rendering stay aligned.
 
+The layout lab also includes a small texture-backed image command in the prompt
+row. It uses `TextureId` plus the SDL texture resolver to prove that image
+commands can render through the SDL presenter path.
+
 Run the layout review example from `packages/powder`:
 
 ```bash
@@ -241,6 +245,71 @@ It builds a Verde-style prompt area with provider/model/reasoning selects, a
 fast toggle, a prompt input, and a send button. The example prints each computed
 rect and renders the retained controls into a `RenderBatch`, so it catches both
 layout and component integration regressions without opening a window.
+
+## Images And Textures
+
+Powder image rendering is command-based, like text and rectangles. Components
+emit a stable `TextureId`; the renderer resolves that ID to a backend texture.
+This keeps Powder components portable across SDL debug rendering, Vulkan, and
+Metal without storing backend pointers in retained component state.
+
+Create image commands directly when you already have a rect:
+
+```zig
+try batch.image(
+    allocator,
+    image_rect,
+    powder.TextureId.init(1),
+    .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+    powder.Color.white,
+    image_rect,
+);
+```
+
+Use the retained image component when you want runtime bounds and fit behavior:
+
+```zig
+const Avatar = powder.image(.{
+    .source_width = 256,
+    .source_height = 256,
+    .fit = .cover,
+});
+
+var avatar = Avatar.init(powder.TextureId.init(1));
+avatar.setBounds(.{ .x = 12, .y = 12, .w = 40, .h = 40 });
+try avatar.render(allocator, &batch);
+```
+
+Fit modes:
+
+- `.stretch`: fill the bounds exactly
+- `.contain`: preserve aspect ratio inside the bounds
+- `.cover`: preserve aspect ratio and cover the bounds
+- `.none`: draw at source size, clipped to the bounds
+
+For SDL presenter examples, provide a texture lookup callback:
+
+```zig
+fn lookupTexture(context: ?*anyopaque, id: powder.TextureId) ?powder.renderer.SdlTexture {
+    const store: *TextureStore = @ptrCast(@alignCast(context orelse return null));
+    if (id.value != store.id.value) return null;
+    return .{ .texture = store.texture, .width = store.width, .height = store.height };
+}
+
+var presenter = powder.renderer.sdlFontRendererWithTextures(
+    renderer,
+    font,
+    16,
+    &texture_store,
+    lookupTexture,
+);
+try presenter.renderBatch(&batch);
+```
+
+The SDL presenter can render arbitrary `SDL_Texture`s this way. The SDL_GPU path
+already tracks image commands separately and currently reports them as
+unsupported until a GPU texture registry is wired in; the public command model is
+ready for Vulkan/Metal texture binding without changing components.
 
 ## Troubleshooting
 

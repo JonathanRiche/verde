@@ -86,6 +86,7 @@ pub const Renderer = struct {
     text_index_capacity: usize = 0,
     command_counts: CommandCounts = .{},
     unsupported_text_commands: usize = 0,
+    unsupported_image_commands: usize = 0,
 
     /// Creates the SDL_GPU device. Pass SPIR-V shaders for Vulkan and MSL or
     /// metallib shaders for Metal to create a drawable pipeline.
@@ -138,6 +139,7 @@ pub const Renderer = struct {
     pub fn renderBatch(self: *Renderer, pass: *c.SDL_GPURenderPass, batch: *const draw.RenderBatch) void {
         self.command_counts = CommandCounts.fromBatch(batch);
         self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
+        self.unsupported_image_commands = self.command_counts.images;
         if (self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null or self.command_counts.drawableIndexCount() == 0) return;
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.index_buffer.?, .offset = 0 };
@@ -156,6 +158,7 @@ pub const Renderer = struct {
 
         self.command_counts = CommandCounts.fromBatch(batch);
         self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
+        self.unsupported_image_commands = self.command_counts.images;
         if (mesh.vertices.items.len > 0 and mesh.indices.items.len > 0) {
             try self.ensureBuffers(.solid, mesh.vertices.items.len, mesh.indices.items.len);
             try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, std.mem.sliceAsBytes(mesh.vertices.items));
@@ -167,6 +170,7 @@ pub const Renderer = struct {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.pipeline == null) return error.MissingGpuPipeline;
         if (CommandCounts.fromBatch(batch).text > 0 and !self.supportsGpuText()) return error.GpuTextAtlasNotConfigured;
+        if (CommandCounts.fromBatch(batch).images > 0) return error.GpuImageTexturesNotConfigured;
 
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
         try self.prepareBatch(allocator, command_buffer, batch);
@@ -469,6 +473,7 @@ pub const Renderer = struct {
 pub const CommandCounts = struct {
     rects: usize = 0,
     text: usize = 0,
+    images: usize = 0,
     cursors: usize = 0,
     selections: usize = 0,
     scrollbars: usize = 0,
@@ -479,6 +484,7 @@ pub const CommandCounts = struct {
             switch (command.kind) {
                 .rect => counts.rects += 1,
                 .text => counts.text += 1,
+                .image => counts.images += 1,
                 .cursor => counts.cursors += 1,
                 .selection => counts.selections += 1,
                 .scrollbar => counts.scrollbars += 1,
@@ -535,6 +541,7 @@ pub const SdlDebugRenderer = struct {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.renderRect(command),
                 .text => try self.renderText(command),
+                .image => try self.renderImage(command),
             }
         }
     }
@@ -582,6 +589,11 @@ pub const SdlDebugRenderer = struct {
         }
     }
 
+    fn renderImage(self: *SdlDebugRenderer, command: draw.Command) !void {
+        try self.renderRect(.{ .kind = .rect, .rect = command.rect, .color = command.color });
+        try self.renderDebugLine(command.rect.x + 4, command.rect.y + 4, if (command.texture.valid()) "image" else "image?");
+    }
+
     fn renderDebugLine(self: *SdlDebugRenderer, x: f32, y: f32, value: []const u8) !void {
         const z_text = try self.allocator.dupeZ(u8, if (value.len == 0) " " else value);
         defer self.allocator.free(z_text);
@@ -597,12 +609,15 @@ pub const SdlFontRenderer = struct {
     renderer: *sdl.Renderer,
     font: *sdl.Font,
     current_font_size: f32,
+    texture_context: ?*anyopaque = null,
+    texture_lookup: ?*const fn (context: ?*anyopaque, id: draw.TextureId) ?SdlTexture = null,
 
     pub fn renderBatch(self: *SdlFontRenderer, batch: *const draw.RenderBatch) !void {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.renderRect(command),
                 .text => try self.renderText(command),
+                .image => try self.renderImage(command),
             }
         }
     }
@@ -662,6 +677,41 @@ pub const SdlFontRenderer = struct {
         }
     }
 
+    fn renderImage(self: *SdlFontRenderer, command: draw.Command) !void {
+        if (command.color.a <= 0.0) return;
+        if (command.clip) |clip| try sdl.setRenderClipRect(self.renderer, rectToSdl(clip));
+        defer if (command.clip != null) sdl.setRenderClipRect(self.renderer, null) catch {};
+
+        if (command.texture.valid()) {
+            if (self.texture_lookup) |lookup| {
+                if (lookup(self.texture_context, command.texture)) |texture| {
+                    const src = texture.sourceRect(command.uv);
+                    try sdl.renderTextureRegion(self.renderer, texture.texture, src, .{
+                        .x = command.rect.x,
+                        .y = command.rect.y,
+                        .w = command.rect.w,
+                        .h = command.rect.h,
+                    });
+                    return;
+                }
+            }
+        }
+        try self.renderImageFallback(command);
+    }
+
+    fn renderImageFallback(self: *SdlFontRenderer, command: draw.Command) !void {
+        const color = colorBytes(.{ .r = command.color.r * 0.35, .g = command.color.g * 0.35, .b = command.color.b * 0.35, .a = command.color.a });
+        if (color[3] == 0) return;
+        try sdl.setRenderDrawColor(self.renderer, color[0], color[1], color[2], color[3]);
+        try sdl.renderFillRect(self.renderer, .{
+            .x = command.rect.x,
+            .y = command.rect.y,
+            .w = command.rect.w,
+            .h = command.rect.h,
+        });
+        try self.renderLine(command.rect.x + 4, command.rect.y + 4, if (command.texture.valid()) "image" else "missing image", draw.Color.white, @min(self.current_font_size, 12.0));
+    }
+
     fn setFontSize(self: *SdlFontRenderer, font_size: f32) !void {
         if (@abs(self.current_font_size - font_size) < 0.01) return;
         try sdl.ttfSetFontSize(self.font, font_size);
@@ -669,8 +719,40 @@ pub const SdlFontRenderer = struct {
     }
 };
 
+pub const SdlTexture = struct {
+    texture: *sdl.Texture,
+    width: f32,
+    height: f32,
+
+    pub fn sourceRect(self: SdlTexture, uv: draw.Rect) sdl.FRect {
+        const u = if (uv.w == 0.0 and uv.h == 0.0) draw.Rect{ .w = 1.0, .h = 1.0 } else uv;
+        return .{
+            .x = u.x * self.width,
+            .y = u.y * self.height,
+            .w = u.w * self.width,
+            .h = u.h * self.height,
+        };
+    }
+};
+
 pub fn sdlFontRenderer(sdl_renderer: *sdl.Renderer, font: *sdl.Font, point_size: f32) SdlFontRenderer {
     return .{ .renderer = sdl_renderer, .font = font, .current_font_size = point_size };
+}
+
+pub fn sdlFontRendererWithTextures(
+    sdl_renderer: *sdl.Renderer,
+    font: *sdl.Font,
+    point_size: f32,
+    texture_context: ?*anyopaque,
+    texture_lookup: *const fn (context: ?*anyopaque, id: draw.TextureId) ?SdlTexture,
+) SdlFontRenderer {
+    return .{
+        .renderer = sdl_renderer,
+        .font = font,
+        .current_font_size = point_size,
+        .texture_context = texture_context,
+        .texture_lookup = texture_lookup,
+    };
 }
 
 /// Converts retained render commands into indexed quads ready for GPU upload.
@@ -684,7 +766,7 @@ pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, m
 }
 
 fn appendCommand(mesh: *Mesh, command: draw.Command) void {
-    if (command.kind == .text) return;
+    if (command.kind == .text or command.kind == .image) return;
     const base: u32 = @intCast(mesh.vertices.items.len);
     const x0 = command.rect.x;
     const y0 = command.rect.y;
@@ -838,6 +920,7 @@ test "gpu renderer renderBatch consumes command kinds" {
     defer batch.deinit(std.testing.allocator);
     try batch.rect(std.testing.allocator, .{ .w = 1, .h = 1 }, draw.Color.white);
     try batch.text(std.testing.allocator, .{ .w = 20, .h = 20 }, "hello", draw.Color.white, 16, null);
+    try batch.image(std.testing.allocator, .{ .w = 16, .h = 16 }, draw.TextureId.init(2), .{ .w = 1, .h = 1 }, draw.Color.white, null);
     try batch.cursor(std.testing.allocator, .{ .w = 1, .h = 20 }, draw.Color.white);
     try batch.selection(std.testing.allocator, .{ .w = 10, .h = 20 }, draw.Color.white);
     try batch.scrollbar(std.testing.allocator, .{ .w = 4, .h = 20 }, draw.Color.white);
@@ -846,10 +929,12 @@ test "gpu renderer renderBatch consumes command kinds" {
     renderer.renderBatch(undefined, &batch);
     try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.rects);
     try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.text);
+    try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.images);
     try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.cursors);
     try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.selections);
     try std.testing.expectEqual(@as(usize, 1), renderer.command_counts.scrollbars);
     try std.testing.expectEqual(@as(usize, 1), renderer.unsupported_text_commands);
+    try std.testing.expectEqual(@as(usize, 1), renderer.unsupported_image_commands);
     try std.testing.expectEqual(@as(usize, 24), renderer.command_counts.drawableIndexCount());
 }
 

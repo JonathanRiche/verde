@@ -11,6 +11,7 @@ const LABEL_FONT_SIZE: f32 = 15.0;
 const Provider = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = providerLabel });
 const Model = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = modelLabel });
 const Reasoning = powder.select(.{ .height = 32, .menu_height = 108, .item_count = 4, .item_label = reasoningLabel });
+const Preview = powder.image(.{ .width = 48, .height = 38, .source_width = 1, .source_height = 1, .fit = .cover, .tint = powder.Color.white });
 const Prompt = powder.textInput(.{ .height = 38, .placeholder_text = "Resize the window, type here, and click controls" });
 const Send = powder.button(.{ .label = "Send" });
 const Stop = powder.button(.{ .label = "Stop" });
@@ -27,6 +28,7 @@ const Controls = struct {
     provider: Provider,
     model: Model,
     reasoning: Reasoning,
+    preview: Preview,
     prompt: Prompt,
     send: Send,
     stop: Stop,
@@ -82,6 +84,13 @@ pub fn run() !void {
     try sdl.setRenderDrawBlendMode(renderer, .blend);
     const font = try sdl.ttfOpenFont(CAL_SANS_PATH, LABEL_FONT_SIZE);
     defer sdl.ttfCloseFont(font);
+    const preview_surface = try sdl.ttfRenderTextBlended(font, "IMG", .{ .r = 245, .g = 248, .b = 252, .a = 255 });
+    const preview_w: f32 = @floatFromInt(preview_surface.w);
+    const preview_h: f32 = @floatFromInt(preview_surface.h);
+    const preview_texture = try sdl.createTextureFromSurface(renderer, preview_surface);
+    sdl.destroySurface(preview_surface);
+    defer sdl.destroyTexture(preview_texture);
+    var texture_store: TextureStore = .{ .texture = preview_texture, .width = preview_w, .height = preview_h };
 
     sdl.startTextInput(window) catch {};
     defer sdl.stopTextInput(window) catch {};
@@ -91,6 +100,7 @@ pub fn run() !void {
         .provider = Provider.initFromConfig(),
         .model = Model.initFromConfig(),
         .reasoning = Reasoning.initFromConfig(),
+        .preview = Preview.initWithSize(powder.TextureId.init(1), preview_w, preview_h),
         .prompt = try Prompt.init(allocator, ""),
         .send = Send.init(),
         .stop = Stop.init(),
@@ -139,7 +149,7 @@ pub fn run() !void {
 
         try sdl.setRenderDrawColor(renderer, 12, 14, 18, 255);
         try sdl.renderClear(renderer);
-        var presenter = powder.renderer.sdlFontRenderer(renderer, font, LABEL_FONT_SIZE);
+        var presenter = powder.renderer.sdlFontRendererWithTextures(renderer, font, LABEL_FONT_SIZE, &texture_store, lookupTexture);
         try presenter.renderBatch(&batch);
         try drawOutlines(renderer, layout_rects);
         try drawLabels(&presenter, layout_rects, state, controls, frame_index);
@@ -197,10 +207,11 @@ fn layoutControls(allocator: std.mem.Allocator, window: *sdl.Window, controls: *
         .{ .direction = .row, .gap = 10 },
         .{
             powder.layout.FlexItem{ .basis_w = 280, .basis_h = 38, .grow = 1, .min_w = 160 },
+            powder.layout.FlexItem.fixed(48, 38),
             powder.layout.FlexItem.fixed(86, 38),
             powder.layout.FlexItem.fixed(86, 38),
         },
-        .{ &controls.prompt, &controls.send, &controls.stop },
+        .{ &controls.prompt, &controls.preview, &controls.send, &controls.stop },
     );
 
     powder.layout.applyFlex(
@@ -260,6 +271,7 @@ fn renderControls(allocator: std.mem.Allocator, batch: *powder.RenderBatch, cont
     try controls.provider.render(allocator, batch);
     try controls.model.render(allocator, batch);
     try controls.reasoning.render(allocator, batch);
+    try controls.preview.render(allocator, batch);
     try controls.fast.render(allocator, batch);
     try controls.access.render(allocator, batch);
     try controls.prompt.render(allocator, batch);
@@ -320,6 +332,18 @@ fn colorFromBytes(color: [4]u8) powder.Color {
         .b = @as(f32, @floatFromInt(color[2])) / 255.0,
         .a = @as(f32, @floatFromInt(color[3])) / 255.0,
     };
+}
+
+const TextureStore = struct {
+    texture: *sdl.Texture,
+    width: f32,
+    height: f32,
+};
+
+fn lookupTexture(context: ?*anyopaque, id: powder.TextureId) ?powder.renderer.SdlTexture {
+    if (id.value != 1) return null;
+    const store: *TextureStore = @ptrCast(@alignCast(context orelse return null));
+    return .{ .texture = store.texture, .width = store.width, .height = store.height };
 }
 
 fn handleSend(context: ?*anyopaque, event: powder.ButtonEvent) void {
