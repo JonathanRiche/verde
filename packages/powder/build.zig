@@ -61,6 +61,18 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(text_area_lab.step);
     }
 
+    const component_catalog_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/component_catalog.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = powder_mod },
+            },
+        }),
+    });
+    examples_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
+
     const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -70,6 +82,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
