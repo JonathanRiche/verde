@@ -9,6 +9,9 @@ const GL_STREAM_DRAW: c_uint = 0x88E0;
 const GL_VERTEX_SHADER: c_uint = 0x8B31;
 const GL_FRAGMENT_SHADER: c_uint = 0x8B30;
 const GL_BLEND: c_uint = 0x0BE2;
+const GL_CULL_FACE: c_uint = 0x0B44;
+const GL_DEPTH_TEST: c_uint = 0x0B71;
+const GL_SCISSOR_TEST: c_uint = 0x0C11;
 const GL_SRC_ALPHA: c_uint = 0x0302;
 const GL_ONE_MINUS_SRC_ALPHA: c_uint = 0x0303;
 
@@ -31,6 +34,7 @@ extern fn glBindBuffer(target: c_uint, buffer: c_uint) void;
 extern fn glBufferData(target: c_uint, size: isize, data: ?*const anyopaque, usage: c_uint) void;
 extern fn glDeleteBuffers(n: c_int, buffers: [*]const c_uint) void;
 extern fn glEnable(cap: c_uint) void;
+extern fn glDisable(cap: c_uint) void;
 extern fn glBlendFunc(sfactor: c_uint, dfactor: c_uint) void;
 extern fn glEnableVertexAttribArray(index: c_uint) void;
 extern fn glVertexAttribPointer(index: c_uint, size: c_int, type: c_uint, normalized: u8, stride: c_int, pointer: ?*const anyopaque) void;
@@ -115,6 +119,9 @@ pub const Renderer = struct {
         }
         if (self.vertices.items.len == 0) return;
 
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(self.program);
