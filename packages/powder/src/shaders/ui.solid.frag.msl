@@ -1,0 +1,12 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct FSInput {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+};
+
+fragment float4 main(FSInput input [[stage_in]]) {
+    return input.color;
+}
