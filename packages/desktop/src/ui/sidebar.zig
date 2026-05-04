@@ -261,19 +261,16 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         const sub_indent = theme.scaledUi(20.0);
         if (!is_collapsed) zgui.indent(.{ .indent_w = sub_indent });
         if (!is_collapsed) {
-            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{d} saved chats", .{state.projects.items[index].committedThreadCount()});
+            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{d} saved chats", .{state.projects.items[index].committedThreadCountCached(state.allocator)});
         }
         if (!is_collapsed) {
-            var sorted_indices = collectCommittedThreadIndicesSorted(state.allocator, &state.projects.items[index]) catch blk: {
-                break :blk std.ArrayList(usize).empty;
-            };
-            defer sorted_indices.deinit(state.allocator);
+            const sorted_indices = state.projects.items[index].sortedCommittedThreadIndices(state.allocator);
 
-            const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.items.len <= runtime.SIDEBAR_VISIBLE_THREAD_LIMIT;
-            const visible_count = if (show_all_threads) sorted_indices.items.len else @min(sorted_indices.items.len, runtime.SIDEBAR_VISIBLE_THREAD_LIMIT);
+            const show_all_threads = state.projects.items[index].thread_list_expanded or sorted_indices.len <= runtime.SIDEBAR_VISIBLE_THREAD_LIMIT;
+            const visible_count = if (show_all_threads) sorted_indices.len else @min(sorted_indices.len, runtime.SIDEBAR_VISIBLE_THREAD_LIMIT);
             var thread_list_invalidated = false;
 
-            for (sorted_indices.items[0..visible_count]) |thread_index| {
+            for (sorted_indices[0..visible_count]) |thread_index| {
                 if (thread_index >= state.projects.items[index].threads.items.len) {
                     thread_list_invalidated = true;
                     break;
@@ -283,7 +280,6 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                     thread_list_invalidated = true;
                     break;
                 }
-                state.prewarmThreadTranscriptMarkdown(index, thread_index, 1);
             }
 
             if (thread_list_invalidated) {
@@ -291,7 +287,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                 return;
             }
 
-            if (sorted_indices.items.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
+            if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
                 if (zgui.button(if (state.projects.items[index].thread_list_expanded) "Show less" else "Show more", .{
                     .w = @max(rail_width - sub_indent, theme.scaledUi(110.0)),
@@ -302,9 +298,9 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                 }
                 zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(4.0) });
             }
-            if (sorted_indices.items.len == 0 and is_selected and !state.projects.items[index].currentThread().committed) {
+            if (sorted_indices.len == 0 and is_selected and !state.projects.items[index].currentThread().committed) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "New chat will appear here after the first prompt.", .{});
-            } else if (sorted_indices.items.len == 0) {
+            } else if (sorted_indices.len == 0) {
                 zgui.textColored(theme.COLOR_TEXT_SUBTLE, "No saved threads yet", .{});
             }
         }
@@ -430,7 +426,7 @@ fn renderCompactProjectButton(state: *runtime.AppState, index: usize, button_siz
         zgui.textColored(theme.COLOR_WHITE, "{s}", .{project.label});
         zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{project.path});
         zgui.separator();
-        const saved_label = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCount()}) catch "saved chats";
+        const saved_label = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCountCached(state.allocator)}) catch "saved chats";
         zgui.textColored(theme.COLOR_TEXT_MUTED, "{s}", .{saved_label});
         if (project.unread_count > 0) {
             zgui.textColored(theme.COLOR_YELLOW, "{d} pending", .{project.unread_count});
@@ -779,7 +775,7 @@ fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:
 /// Formats a relative timestamp for sidebar metadata.
 fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     if (timestamp <= 0) return "now";
-    const elapsed = @max(std.time.timestamp() - timestamp, 0);
+    const elapsed = @max(0 - timestamp, 0);
     if (elapsed < 60) return "now";
     if (elapsed < 3600) {
         const minutes = @divFloor(elapsed, 60);
@@ -895,35 +891,4 @@ fn drawChatBubbleIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4
         .p3 = .{ tail_x, tail_top + theme.scaledUi(3.0) },
         .col = col,
     });
-}
-
-/// Collects committed threads and sorts them by recent activity.
-fn collectCommittedThreadIndicesSorted(allocator: std.mem.Allocator, project: anytype) !std.ArrayList(usize) {
-    var indices: std.ArrayList(usize) = .empty;
-    errdefer indices.deinit(allocator);
-
-    for (project.threads.items, 0..) |thread, index| {
-        if (!thread.committed) continue;
-        try indices.append(allocator, index);
-    }
-
-    var i: usize = 1;
-    while (i < indices.items.len) : (i += 1) {
-        const current = indices.items[i];
-        var j = i;
-        while (j > 0) : (j -= 1) {
-            const left_index = indices.items[j - 1];
-            const left = project.threads.items[left_index];
-            const right = project.threads.items[current];
-            const should_move = if (left.last_activity_at != right.last_activity_at)
-                left.last_activity_at < right.last_activity_at
-            else
-                left_index < current;
-            if (!should_move) break;
-            indices.items[j] = indices.items[j - 1];
-        }
-        indices.items[j] = current;
-    }
-
-    return indices;
 }

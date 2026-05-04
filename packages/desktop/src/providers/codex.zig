@@ -3,6 +3,7 @@
 const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const log = std.log.scoped(.native_codex);
 
@@ -13,6 +14,26 @@ const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
 const MAX_CONNECT_WAIT_ATTEMPTS = 30;
+
+fn sleepMs(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
+}
+
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
 
 pub const Transport = enum(u8) {
     websocket,
@@ -28,7 +49,7 @@ pub const Config = struct {
 };
 
 const SharedServerState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     child: ?std.process.Child = null,
     owns_child: bool = false,
 };
@@ -38,18 +59,31 @@ var shared_server_state: SharedServerState = .{};
 pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    stream: ?std.net.Stream = null,
+    stream: ?std.Io.net.Stream = null,
     initialized: bool = false,
     next_request_id: u64 = 1,
     loaded_threads: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
+        runtime_log.diagnostic(
+            "codex.Client.init begin transport={s} url={s} cwd={s} launch_on_connect={}",
+            .{
+                @tagName(config.transport),
+                config.websocket_url orelse "(null)",
+                config.cwd orelse "(inherit)",
+                config.launch_on_connect,
+            },
+        );
         var client: Client = .{
             .allocator = allocator,
             .config = config,
             .loaded_threads = std.StringHashMap(void).init(allocator),
         };
-        try client.ensureConnected();
+        client.ensureConnected() catch |err| {
+            runtime_log.diagnostic("codex.Client.init ensureConnected failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        runtime_log.diagnostic("codex.Client.init connected initialized={}", .{client.initialized});
         return client;
     }
 
@@ -196,22 +230,41 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
+        std.debug.print(
+            "[codex-debug] codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}\n",
+            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
+        );
+        runtime_log.diagnostic(
+            "codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}",
+            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
+        );
         try self.ensureConnected();
 
-        const thread_id = if (request.thread_id) |existing|
-            try allocator.dupe(u8, existing)
-        else
-            try self.startThread(allocator, request);
+        const thread_id = if (request.thread_id) |existing| blk: {
+            std.debug.print("[codex-debug] codex.sendPrompt using existing thread_id={s}\n", .{existing});
+            runtime_log.diagnostic("codex.sendPrompt using existing thread_id={s}", .{existing});
+            break :blk try allocator.dupe(u8, existing);
+        } else blk: {
+            std.debug.print("[codex-debug] codex.sendPrompt starting new thread\n", .{});
+            runtime_log.diagnostic("codex.sendPrompt starting new thread", .{});
+            break :blk try self.startThread(allocator, request);
+        };
         errdefer allocator.free(thread_id);
 
         if (request.on_thread_id) |on_thread_id| {
             on_thread_id(request.stream_context, thread_id);
         }
 
+        std.debug.print("[codex-debug] codex.sendPrompt ensuring thread loaded thread_id={s}\n", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id={s}", .{thread_id});
         try self.ensureThreadLoaded(thread_id);
 
+        std.debug.print("[codex-debug] codex.sendPrompt starting turn thread_id={s}\n", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt starting turn thread_id={s}", .{thread_id});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
+        std.debug.print("[codex-debug] codex.sendPrompt completed thread_id={s} reply_len={d}\n", .{ thread_id, reply.len });
+        runtime_log.diagnostic("codex.sendPrompt completed thread_id={s} reply_len={d}", .{ thread_id, reply.len });
 
         return .{
             .thread_id = thread_id,
@@ -254,21 +307,31 @@ pub const Client = struct {
 
     fn ensureConnected(self: *Client) !void {
         if (self.stream == null) {
+            runtime_log.diagnostic("codex.ensureConnected stream=null transport={s}", .{@tagName(self.config.transport)});
             switch (self.config.transport) {
-                .websocket => try self.connectWebSocket(),
+                .websocket => self.connectWebSocket() catch |err| {
+                    runtime_log.diagnostic("codex.ensureConnected connectWebSocket failed: {s}", .{@errorName(err)});
+                    return err;
+                },
                 .stdio_jsonl => return error.TransportNotImplemented,
             }
         }
 
         if (!self.initialized) {
-            try self.initializeProtocol();
+            runtime_log.diagnostic("codex.ensureConnected initializing protocol", .{});
+            self.initializeProtocol() catch |err| {
+                runtime_log.diagnostic("codex.ensureConnected initializeProtocol failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            runtime_log.diagnostic("codex.ensureConnected protocol initialized", .{});
         }
     }
 
     fn closeStream(self: *Client) void {
         if (self.stream) |stream| {
             self.writeCloseFrame(stream) catch {};
-            stream.close();
+            var threaded = std.Io.Threaded.init_single_threaded;
+            stream.close(threaded.io());
             self.stream = null;
         }
 
@@ -277,19 +340,26 @@ pub const Client = struct {
 
     fn connectWebSocket(self: *Client) !void {
         const raw_url = self.config.websocket_url orelse return error.MissingWebSocketUrl;
-        const uri = try std.Uri.parse(raw_url);
-        const host = try uri.getHostAlloc(self.allocator);
-        defer if (uri.host != null and host.ptr != switch (uri.host.?) {
-            .raw => |raw| raw.ptr,
-            .percent_encoded => |encoded| encoded.ptr,
-        }) self.allocator.free(host);
+        runtime_log.diagnostic("codex.connectWebSocket begin raw_url={s}", .{raw_url});
+        const uri = std.Uri.parse(raw_url) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host_name = uri.getHost(&host_buffer) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket getHost failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        const host = host_name.bytes;
 
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "ws")) {
             return error.UnsupportedWebSocketScheme;
         }
 
         const port = uri.port orelse 80;
+        runtime_log.diagnostic("codex.connectWebSocket target host={s} port={d}", .{ host, port });
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected existing server", .{});
             self.stream = stream;
             return;
         }
@@ -300,8 +370,13 @@ pub const Client = struct {
 
         shared_server_state.mutex.lock();
         defer shared_server_state.mutex.unlock();
+        runtime_log.diagnostic("codex.connectWebSocket acquired shared server lock owns_child={} has_child={}", .{
+            shared_server_state.owns_child,
+            shared_server_state.child != null,
+        });
 
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected after lock", .{});
             self.stream = stream;
             return;
         }
@@ -318,9 +393,13 @@ pub const Client = struct {
             }
         }
 
-        try self.spawnWebSocketServer(raw_url);
+        self.spawnWebSocketServer(raw_url) catch |err| {
+            runtime_log.diagnostic("codex.connectWebSocket spawnWebSocketServer failed: {s}", .{@errorName(err)});
+            return err;
+        };
 
         if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+            runtime_log.diagnostic("codex.connectWebSocket connected after spawn", .{});
             self.stream = stream;
             return;
         }
@@ -337,11 +416,19 @@ pub const Client = struct {
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (shared_server_state.child != null) return;
 
-        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        runtime_log.diagnostic("codex.spawnWebSocketServer begin url={s}", .{url});
+        var env_map = process_env.buildAugmentedEnvMap(self.allocator) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer buildAugmentedEnvMap failed: {s}", .{@errorName(err)});
+            return err;
+        };
         defer env_map.deinit();
 
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
+        const executable = process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer resolve executable failed executable={s}: {s}", .{ self.config.executable, @errorName(err) });
+            return err;
+        };
         defer self.allocator.free(executable);
+        runtime_log.diagnostic("codex.spawnWebSocketServer executable={s}", .{executable});
 
         var argv = [_][]const u8{
             executable,
@@ -350,17 +437,22 @@ pub const Client = struct {
             url,
         };
 
-        var child = std.process.Child.init(argv[0..], self.allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        child.cwd = self.config.cwd;
-        child.env_map = &env_map;
-        try child.spawn();
-        child.env_map = null;
-        child.argv = &.{};
+        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_spawn.deinit();
+        const child = std.process.spawn(threaded_spawn.io(), .{
+            .argv = argv[0..],
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+        }) catch |err| {
+            runtime_log.diagnostic("codex.spawnWebSocketServer process.spawn failed: {s}", .{@errorName(err)});
+            return err;
+        };
 
-        log.info("Codex app-server started pid={d} listen={s}", .{ child.id, url });
+        log.info("Codex app-server started pid={d} listen={s}", .{ child.id orelse -1, url });
+        runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.id orelse -1});
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
     }
@@ -370,9 +462,12 @@ pub const Client = struct {
         uri: std.Uri,
         host: []const u8,
         port: u16,
-    ) !?std.net.Stream {
-        const stream = std.net.tcpConnectToHost(self.allocator, host, port) catch return null;
-        errdefer stream.close();
+    ) !?std.Io.net.Stream {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const address = std.Io.net.IpAddress.parse(host, port) catch
+            std.Io.net.IpAddress.resolve(threaded.io(), host, port) catch return null;
+        const stream = address.connect(threaded.io(), .{ .mode = .stream }) catch return null;
+        errdefer stream.close(threaded.io());
 
         try self.performWebSocketHandshake(stream, uri, host, port);
         return stream;
@@ -384,26 +479,27 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         attempts: usize,
-    ) !?std.net.Stream {
+    ) !?std.Io.net.Stream {
         var attempt: usize = 0;
         while (attempt < attempts) : (attempt += 1) {
             if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
                 return stream;
             }
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            sleepMs(100);
         }
         return null;
     }
 
     fn performWebSocketHandshake(
         self: *Client,
-        stream: std.net.Stream,
+        stream: std.Io.net.Stream,
         uri: std.Uri,
         host: []const u8,
         port: u16,
     ) !void {
         var nonce: [16]u8 = undefined;
-        std.crypto.random.bytes(&nonce);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        try std.Io.randomSecure(threaded.io(), &nonce);
 
         const key = try encodeBase64Alloc(self.allocator, &nonce);
         defer self.allocator.free(key);
@@ -427,7 +523,7 @@ pub const Client = struct {
         );
         defer self.allocator.free(request);
 
-        try stream.writeAll(request);
+        try streamWriteAll(stream, request);
 
         const status_line = try readHttpLineAlloc(self.allocator, stream);
         defer self.allocator.free(status_line);
@@ -544,8 +640,11 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
+        log.info("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
         try self.writeTextMessage(payload);
-        return try self.awaitResultPayloadAlloc(id);
+        const result = try self.awaitResultPayloadAlloc(id);
+        log.info("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
+        return result;
     }
 
     fn ensureThreadLoaded(self: *Client, thread_id: []const u8) !void {
@@ -706,6 +805,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
+        log.info("Codex RPC turn/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -762,8 +862,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    const backoff_ms: u64 = @min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500);
-                    std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+                    sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
                     continue;
                 },
                 else => return err,
@@ -781,8 +880,7 @@ pub const Client = struct {
             } else |err| switch (err) {
                 error.ServerOverloaded => {
                     if (attempt + 1 >= MAX_RPC_RETRIES) return err;
-                    const backoff_ms: u64 = @min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500);
-                    std.Thread.sleep(backoff_ms * @as(u64, std.time.ns_per_ms));
+                    sleepMs(@min(@as(u64, 100) * (@as(u64, 1) << @intCast(attempt)), 1500));
                     continue;
                 },
                 else => return err,
@@ -793,7 +891,9 @@ pub const Client = struct {
     fn awaitResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
-            errdefer self.allocator.free(message);
+            defer self.allocator.free(message);
+            std.debug.print("[codex-debug] Codex RPC await id={d} message_len={d}\n", .{ id, message.len });
+            runtime_log.diagnostic("Codex RPC await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -806,6 +906,7 @@ pub const Client = struct {
             if (response_id != id) continue;
 
             if (getObjectField(root, "error")) |rpc_error| {
+                log.warn("Codex RPC response id={d} returned error: {s}", .{ id, message });
                 if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                     if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                 }
@@ -813,14 +914,16 @@ pub const Client = struct {
             }
 
             const result = getObjectField(root, "result") orelse return error.MissingRpcResult;
-            return try stringifyAlloc(self.allocator, result);
+            const payload = try stringifyAlloc(self.allocator, result);
+            log.info("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
+            return payload;
         }
     }
 
     fn awaitTurnSteerResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
-            errdefer self.allocator.free(message);
+            defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
             defer parsed.deinit();
@@ -896,7 +999,7 @@ pub const Client = struct {
         try writeClientFrame(self.allocator, stream, payload, .text);
     }
 
-    fn writeCloseFrame(self: *Client, stream: std.net.Stream) !void {
+    fn writeCloseFrame(self: *Client, stream: std.Io.net.Stream) !void {
         try writeClientFrame(self.allocator, stream, "", .connection_close);
     }
 
@@ -940,9 +1043,10 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            log.info("stopping owned Codex app-server pid={d}", .{child.id});
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            log.info("stopping owned Codex app-server pid={d}", .{child.id orelse -1});
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
+            _ = child.wait(threaded.io()) catch {};
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1014,13 +1118,13 @@ fn buildRequestTargetAlloc(allocator: std.mem.Allocator, uri: std.Uri) ![]u8 {
     return target.toOwnedSlice(allocator);
 }
 
-fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
+fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) ![]u8 {
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
 
     while (true) {
         var byte: [1]u8 = undefined;
-        const read = try stream.read(&byte);
+        const read = try streamRead(stream, &byte);
         if (read == 0) return error.EndOfStream;
 
         if (byte[0] == '\n') break;
@@ -1033,10 +1137,10 @@ fn readHttpLineAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8
     return line.toOwnedSlice(allocator);
 }
 
-fn readExact(stream: std.net.Stream, buffer: []u8) !void {
+fn readExact(stream: std.Io.net.Stream, buffer: []u8) !void {
     var index: usize = 0;
     while (index < buffer.len) {
-        const amt = try stream.read(buffer[index..]);
+        const amt = try streamRead(stream, buffer[index..]);
         if (amt == 0) return error.EndOfStream;
         index += amt;
     }
@@ -1044,7 +1148,7 @@ fn readExact(stream: std.net.Stream, buffer: []u8) !void {
 
 fn writeClientFrame(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     payload: []const u8,
     opcode: FrameOpcode,
 ) !void {
@@ -1074,7 +1178,8 @@ fn writeClientFrame(
     }
 
     var mask: [4]u8 = undefined;
-    std.crypto.random.bytes(&mask);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    try std.Io.randomSecure(threaded.io(), &mask);
     @memcpy(header[index .. index + 4], &mask);
     index += 4;
 
@@ -1084,11 +1189,44 @@ fn writeClientFrame(
         masked[i] = byte ^ mask[i % mask.len];
     }
 
-    try stream.writeAll(header[0..index]);
-    try stream.writeAll(masked);
+    try streamWriteAll(stream, header[0..index]);
+    try streamWriteAll(stream, masked);
 }
 
-fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) !Frame {
+fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
+    if (buffer.len == 0) return 0;
+
+    while (true) {
+        const result = std.c.recv(stream.socket.handle, buffer.ptr, buffer.len, 0);
+        if (result >= 0) return @intCast(result);
+
+        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            else => error.InputOutput,
+        };
+    }
+}
+
+fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const result = std.c.send(stream.socket.handle, bytes[index..].ptr, bytes.len - index, 0);
+        if (result > 0) {
+            index += @intCast(result);
+            continue;
+        }
+        if (result == 0) return error.EndOfStream;
+
+        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .AGAIN => error.WouldBlock,
+            else => error.InputOutput,
+        };
+    }
+}
+
+fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !Frame {
     var header: [2]u8 = undefined;
     try readExact(stream, &header);
 
@@ -1111,14 +1249,35 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.net.Stream) !F
         else => len_marker,
     };
 
-    if (payload_len > MAX_WS_MESSAGE_BYTES) return error.WebSocketMessageTooLarge;
+    if (payload_len > MAX_WS_MESSAGE_BYTES) {
+        std.debug.print(
+            "[codex-debug] websocket frame too large opcode={s} masked={} payload_len={d}\n",
+            .{ @tagName(opcode), masked, payload_len },
+        );
+        runtime_log.diagnostic(
+            "websocket frame too large opcode={s} masked={} payload_len={d}",
+            .{ @tagName(opcode), masked, payload_len },
+        );
+        return error.WebSocketMessageTooLarge;
+    }
+    log.debug("Codex websocket frame opcode={s} masked={} payload_len={d}", .{ @tagName(opcode), masked, payload_len });
 
     var mask: [4]u8 = undefined;
     if (masked) {
         try readExact(stream, &mask);
     }
 
-    const payload = try allocator.alloc(u8, payload_len);
+    const payload = allocator.alloc(u8, payload_len) catch |err| {
+        std.debug.print(
+            "[codex-debug] websocket payload alloc failed opcode={s} payload_len={d}: {s}\n",
+            .{ @tagName(opcode), payload_len, @errorName(err) },
+        );
+        runtime_log.diagnostic(
+            "websocket payload alloc failed opcode={s} payload_len={d}: {s}",
+            .{ @tagName(opcode), payload_len, @errorName(err) },
+        );
+        return err;
+    };
     errdefer allocator.free(payload);
     try readExact(stream, payload);
 
@@ -1257,14 +1416,18 @@ fn flattenUserMessageContentAlloc(allocator: std.mem.Allocator, content: std.jso
         if (std.mem.eql(u8, content_type, "localImage")) {
             const path = getOptionalObjectString(entry, "path") orelse continue;
             if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
-            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{path});
+            const label = try std.fmt.allocPrint(allocator, "[Image: {s}]", .{path});
+            defer allocator.free(label);
+            try builder.appendSlice(allocator, label);
             continue;
         }
 
         if (std.mem.eql(u8, content_type, "image")) {
             const url = getOptionalObjectString(entry, "url") orelse continue;
             if (builder.items.len > 0) try builder.appendSlice(allocator, "\n\n");
-            try std.fmt.format(builder.writer(allocator), "[Image: {s}]", .{url});
+            const label = try std.fmt.allocPrint(allocator, "[Image: {s}]", .{url});
+            defer allocator.free(label);
+            try builder.appendSlice(allocator, label);
         }
     }
 
@@ -1282,11 +1445,13 @@ fn buildImportedFileChangeSummaryAlloc(allocator: std.mem.Allocator, changes: st
         const additions = countDiffLines(change, '+');
         const deletions = countDiffLines(change, '-');
         if (body.items.len > 0) try body.append(allocator, '\n');
-        try std.fmt.format(body.writer(allocator), "{s}  +{d} / -{d}", .{
+        const line = try std.fmt.allocPrint(allocator, "{s}  +{d} / -{d}", .{
             path,
             additions,
             deletions,
         });
+        defer allocator.free(line);
+        try body.appendSlice(allocator, line);
     }
 
     return body.toOwnedSlice(allocator);
@@ -1629,7 +1794,9 @@ fn appendChangedFileLine(lines: *std.ArrayList(u8), path: []const u8, value: std
     if (lines.items.len > 0) {
         lines.append(std.heap.page_allocator, '\n') catch return;
     }
-    std.fmt.format(lines.writer(std.heap.page_allocator), "{s}  +{d} / -{d}", .{ path, additions, deletions }) catch return;
+    const line = std.fmt.allocPrint(std.heap.page_allocator, "{s}  +{d} / -{d}", .{ path, additions, deletions }) catch return;
+    defer std.heap.page_allocator.free(line);
+    lines.appendSlice(std.heap.page_allocator, line) catch return;
 }
 
 fn extractPathFromValue(value: std.json.Value) ?[]const u8 {

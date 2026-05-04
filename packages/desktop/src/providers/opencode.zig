@@ -15,6 +15,28 @@ const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 12_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
+const Condition = struct {
+    fn wait(_: *Condition, mutex: *Mutex) void {
+        mutex.unlock();
+        std.atomic.spinLoopHint();
+        mutex.lock();
+    }
+
+    fn broadcast(_: *Condition) void {}
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     executable: []const u8 = "opencode",
@@ -26,7 +48,7 @@ pub const Config = struct {
 };
 
 const SharedServerState = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     child: ?std.process.Child = null,
     owns_child: bool = false,
 };
@@ -273,7 +295,7 @@ pub const Client = struct {
             if (self.checkHealth()) {
                 return true;
             }
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.atomic.spinLoopHint();
         }
         return false;
     }
@@ -287,10 +309,6 @@ pub const Client = struct {
         }
 
         const host = try uri.getHostAlloc(self.allocator);
-        defer if (uri.host != null and host.ptr != switch (uri.host.?) {
-            .raw => |raw| raw.ptr,
-            .percent_encoded => |encoded| encoded.ptr,
-        }) self.allocator.free(host);
 
         const port = uri.port orelse 4096;
         const port_text = try std.fmt.allocPrint(self.allocator, "{d}", .{port});
@@ -306,20 +324,21 @@ pub const Client = struct {
             executable,
             "serve",
             "--hostname",
-            host,
+            host.bytes,
             "--port",
             port_text,
         };
 
-        var child = std.process.Child.init(argv[0..], self.allocator);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
-        child.cwd = self.config.working_directory;
-        child.env_map = &env_map;
-        try child.spawn();
-        child.env_map = null;
-        child.argv = &.{};
+        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_spawn.deinit();
+        const child = try std.process.spawn(threaded_spawn.io(), .{
+            .argv = argv[0..],
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .cwd = if (self.config.working_directory) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+        });
 
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
@@ -472,7 +491,7 @@ pub const Client = struct {
                 return error.OpencodeEmptyReply;
             }
 
-            std.Thread.sleep(POLL_INTERVAL_MS * std.time.ns_per_ms);
+            std.atomic.spinLoopHint();
         } else {
             return error.OpencodeRequestTimedOut;
         }
@@ -819,7 +838,8 @@ pub const Client = struct {
             header_count += 1;
         }
 
-        var http_client: std.http.Client = .{ .allocator = self.allocator };
+        var threaded = std.Io.Threaded.init_single_threaded;
+        var http_client: std.http.Client = .{ .allocator = self.allocator, .io = threaded.io() };
         defer http_client.deinit();
 
         const result = try http_client.fetch(.{
@@ -850,8 +870,9 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
+            _ = child.wait(threaded.io()) catch {};
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -927,8 +948,8 @@ const EventStreamContext = struct {
     request: provider_types.SendPromptRequest,
     child: ?std.process.Child = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
-    mutex: std.Thread.Mutex = .{},
-    condition: std.Thread.Condition = .{},
+    mutex: Mutex = .{},
+    condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
     stop_requested: bool = false,
     session_idle: bool = false,
@@ -1403,28 +1424,30 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
     try argv.append(context.allocator, url);
 
-    var child = std.process.Child.init(argv.items, context.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    child.env_map = &env_map;
-    try child.spawn();
-    child.env_map = null;
-    child.argv = &.{};
+    var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded_spawn.deinit();
+    const child = try std.process.spawn(threaded_spawn.io(), .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .environ_map = &env_map,
+    });
 
     context.mutex.lock();
     context.child = child;
     context.mutex.unlock();
     defer cleanupEventStreamChild(context);
 
-    log.info("OpenCode event stream started for session {s} pid={d}", .{ context.session_id, child.id });
+    log.info("OpenCode event stream started for session {s} pid={d}", .{ context.session_id, child.id orelse -1 });
 
     opened = true;
     signalEventStreamOpenState(context, .ready);
 
     const stdout = context.child.?.stdout.?;
     var read_buffer: [64 * 1024]u8 = undefined;
-    var file_reader = stdout.reader(&read_buffer);
+    var threaded_read = std.Io.Threaded.init_single_threaded;
+    var file_reader = stdout.reader(threaded_read.io(), &read_buffer);
 
     var event_name: std.ArrayList(u8) = .empty;
     defer event_name.deinit(context.allocator);
@@ -1437,7 +1460,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
         if (maybe_line == null) break;
 
         const raw_line = maybe_line.?;
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
 
         if (line.len == 0) {
             if (event_data.items.len > 0 and try processEventStreamMessage(context, event_name.items, event_data.items)) {
@@ -1453,7 +1476,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
         if (std.mem.startsWith(u8, line, "event:")) {
             event_name.clearRetainingCapacity();
-            try event_name.appendSlice(context.allocator, std.mem.trimLeft(u8, line["event:".len..], " "));
+            try event_name.appendSlice(context.allocator, std.mem.trimStart(u8, line["event:".len..], " "));
             continue;
         }
 
@@ -1461,7 +1484,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
             if (event_data.items.len > 0) {
                 try event_data.append(context.allocator, '\n');
             }
-            try event_data.appendSlice(context.allocator, std.mem.trimLeft(u8, line["data:".len..], " "));
+            try event_data.appendSlice(context.allocator, std.mem.trimStart(u8, line["data:".len..], " "));
         }
     }
 
@@ -1483,7 +1506,8 @@ fn signalEventStreamStop(handle: EventStreamHandle) void {
     handle.context.mutex.lock();
     handle.context.stop_requested = true;
     if (handle.context.child) |*child| {
-        _ = child.kill() catch {};
+        var threaded = std.Io.Threaded.init_single_threaded;
+        child.kill(threaded.io());
     }
     handle.context.mutex.unlock();
     handle.worker.join();
@@ -1504,7 +1528,10 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     context.mutex.unlock();
 
     if (maybe_child) |*owned_child| {
-        _ = owned_child.wait() catch {};
+        if (owned_child.id != null) {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            _ = owned_child.wait(threaded.io()) catch {};
+        }
     }
 
     log.info("OpenCode event stream exited for session {s}", .{context.session_id});
@@ -1670,7 +1697,9 @@ fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u
     defer text.deinit(allocator);
 
     const permission_name = getOptionalObjectString(value, "permission") orelse "permission";
-    try text.writer(allocator).print("Permission: {s}", .{permission_name});
+    const permission_label = try std.fmt.allocPrint(allocator, "Permission: {s}", .{permission_name});
+    defer allocator.free(permission_label);
+    try text.appendSlice(allocator, permission_label);
 
     const patterns_value = getObjectField(value, "patterns");
     if (patterns_value) |patterns| {
@@ -1678,7 +1707,9 @@ fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u
             try text.appendSlice(allocator, "\nPatterns:");
             for (patterns.array.items) |pattern| {
                 if (pattern != .string) continue;
-                try text.writer(allocator).print("\n- {s}", .{pattern.string});
+                const label = try std.fmt.allocPrint(allocator, "\n- {s}", .{pattern.string});
+                defer allocator.free(label);
+                try text.appendSlice(allocator, label);
             }
         }
     }
@@ -1688,8 +1719,16 @@ fn buildPermissionBody(allocator: std.mem.Allocator, value: std.json.Value) ![]u
         const message_id = getOptionalObjectString(tool, "messageID");
         if (call_id != null or message_id != null) {
             try text.appendSlice(allocator, "\nTool:");
-            if (call_id) |id| try text.writer(allocator).print("\n- call: {s}", .{id});
-            if (message_id) |id| try text.writer(allocator).print("\n- message: {s}", .{id});
+            if (call_id) |id| {
+                const label = try std.fmt.allocPrint(allocator, "\n- call: {s}", .{id});
+                defer allocator.free(label);
+                try text.appendSlice(allocator, label);
+            }
+            if (message_id) |id| {
+                const label = try std.fmt.allocPrint(allocator, "\n- message: {s}", .{id});
+                defer allocator.free(label);
+                try text.appendSlice(allocator, label);
+            }
         }
     }
 

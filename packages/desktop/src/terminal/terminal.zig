@@ -1041,7 +1041,7 @@ const UnixSession = struct {
         const child = try spawnShell(cwd, cols, rows);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
-            std.posix.close(child.master_fd);
+            _ = std.c.close(child.master_fd);
         }
 
         self.* = .{
@@ -1070,7 +1070,7 @@ const UnixSession = struct {
         if (self.running) {
             std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
         }
-        std.posix.close(self.master_fd);
+        _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
         self.stream.deinit();
         self.render_state.deinit(allocator);
@@ -1129,8 +1129,9 @@ const UnixSession = struct {
             const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{self.child_pid}) catch "";
             if (proc_path.len > 0) {
                 var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-                if (std.posix.readlink(proc_path, &cwd_buf)) |cwd| {
-                    const label = pathLabel(cwd);
+                var threaded = std.Io.Threaded.init_single_threaded;
+                if (std.Io.Dir.cwd().readLink(threaded.io(), proc_path, &cwd_buf)) |cwd_len| {
+                    const label = pathLabel(cwd_buf[0..cwd_len]);
                     if (label.len > 0) {
                         const clipped = label[0..@min(label.len, buffer.len)];
                         return std.fmt.bufPrint(buffer, "{s}", .{clipped}) catch "Shell";
@@ -1201,7 +1202,7 @@ const UnixSession = struct {
         while (true) {
             const read_len = std.posix.read(self.master_fd, &buffer) catch |err| switch (err) {
                 error.WouldBlock => break,
-                error.InputOutput, error.BrokenPipe => {
+                error.InputOutput => {
                     self.running = false;
                     break;
                 },
@@ -1298,11 +1299,12 @@ const UnixSession = struct {
     fn captureExitStatus(self: *UnixSession) bool {
         if (self.exit_status != null) return false;
 
-        const wait_result = std.posix.waitpid(self.child_pid, std.c.W.NOHANG);
-        if (wait_result.pid == 0) return false;
+        var status: c_int = 0;
+        const wait_result = std.c.waitpid(self.child_pid, &status, std.c.W.NOHANG);
+        if (wait_result == 0) return false;
 
         self.running = false;
-        self.exit_status = wait_result.status;
+        self.exit_status = @intCast(status);
         return true;
     }
 
@@ -1345,35 +1347,38 @@ const UnixSession = struct {
     }
 
     fn childExec(cwd: []const u8) noreturn {
-        std.posix.chdir(cwd) catch {
+        if (std.c.chdir(@ptrCast(cwd.ptr)) != 0) {
             std.c._exit(127);
-        };
+        }
 
-        if (std.posix.getenv("TERM") == null) {
+        if (std.c.getenv("TERM") == null) {
             _ = setenv("TERM", "xterm-256color", 1);
         }
 
-        const shell = std.posix.getenv("SHELL") orelse "/bin/bash";
+        const shell = std.c.getenv("SHELL") orelse "/bin/bash";
         const argv = [_:null]?[*:0]const u8{
-            shell.ptr,
+            shell,
             "-i",
             null,
         };
-        std.posix.execvpeZ(shell.ptr, &argv, std.c.environ) catch {};
+        _ = std.c.execve(shell, &argv, std.c.environ);
         std.c._exit(127);
     }
 };
 
 fn setNonBlocking(fd: std.posix.fd_t) !void {
-    const current = try std.posix.fcntl(fd, std.c.F.GETFL, 0);
+    const current = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    if (current < 0) return error.FcntlFailed;
     const nonblock = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = try std.posix.fcntl(fd, std.c.F.SETFL, current | nonblock);
+    if (std.c.fcntl(fd, std.c.F.SETFL, current | @as(c_int, @intCast(nonblock))) < 0) return error.FcntlFailed;
 }
 
 fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
     var remaining = bytes;
     while (remaining.len > 0) {
-        const written = try std.posix.write(fd, remaining);
+        const written_raw = std.c.write(fd, remaining.ptr, remaining.len);
+        if (written_raw < 0) return error.WriteFailed;
+        const written: usize = @intCast(written_raw);
         if (written == 0) return error.WriteFailed;
         remaining = remaining[written..];
     }
@@ -1737,7 +1742,7 @@ fn sanitizeCellCount(value: u16, min_value: u16) u16 {
 }
 
 fn pathLabel(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, path, std.fs.path.sep_str);
+    const trimmed = std.mem.trimEnd(u8, path, std.fs.path.sep_str);
     if (trimmed.len == 0) return std.fs.path.sep_str;
     const base = std.fs.path.basename(trimmed);
     return if (base.len > 0) base else trimmed;

@@ -13,15 +13,27 @@ const FRAME_FD_BASE: std.posix.fd_t = 102;
 const FRAME_SLOT_COUNT: usize = 3;
 const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
     queue: *SharedQueue,
     frame: *SharedFrame,
-    event_file: std.fs.File,
+    event_file: std.Io.File,
 };
 
 const SharedQueue = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     events: browser_queue.EventQueue = .{},
 
     /// Releases any queued browser events received from the helper.
@@ -45,7 +57,7 @@ const SharedQueue = struct {
 };
 
 const SharedFrame = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .{},
     slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
     slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
     staging: std.ArrayList(u8) = .empty,
@@ -107,7 +119,7 @@ pub const Controller = struct {
     allocator: std.mem.Allocator,
     child_pid: ?std.posix.pid_t = null,
     child_process_group: ?std.posix.pid_t = null,
-    command_file: ?std.fs.File = null,
+    command_file: ?std.Io.File = null,
     queue: *SharedQueue,
     frame: *SharedFrame,
     reader_thread: ?std.Thread = null,
@@ -288,23 +300,25 @@ pub const Controller = struct {
         const helper_path = try browserHelperPath(self.allocator, helper_name);
         defer self.allocator.free(helper_path);
 
-        const command_pipe = try std.posix.pipe();
+        var command_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&command_pipe) != 0) return error.Unexpected;
         errdefer {
-            std.posix.close(command_pipe[0]);
-            std.posix.close(command_pipe[1]);
+            _ = std.c.close(command_pipe[0]);
+            _ = std.c.close(command_pipe[1]);
         }
-        const event_pipe = try std.posix.pipe();
+        var event_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&event_pipe) != 0) return error.Unexpected;
         errdefer {
-            std.posix.close(event_pipe[0]);
-            std.posix.close(event_pipe[1]);
+            _ = std.c.close(event_pipe[0]);
+            _ = std.c.close(event_pipe[1]);
         }
         const frame_fds = try createFrameSlots(self.frame, self.allocator);
         errdefer {
-            for (frame_fds) |frame_fd| std.posix.close(frame_fd);
+            for (frame_fds) |frame_fd| _ = std.c.close(frame_fd);
             self.frame.deinit(self.allocator);
         }
 
-        var env_map = try std.process.getEnvMap(self.allocator);
+        var env_map = try std.process.Environ.createMap(currentEnviron(), self.allocator);
         defer env_map.deinit();
         // Keep helper IPC away from Chromium's low-numbered descriptor handoff slots.
         try env_map.put("VERDE_CEF_CMD_FD", "100");
@@ -321,24 +335,26 @@ pub const Controller = struct {
         const helper_dir_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_dir}, 0);
         const argv = try arena.allocSentinel(?[*:0]u8, 1, null);
         argv[0] = helper_path_z.ptr;
-        const envp = try std.process.createEnvironFromMap(arena, &env_map, .{});
+        const env_block = try env_map.createPosixBlock(arena, .{});
+        const envp = env_block.slice;
 
-        const child_pid = try std.posix.fork();
+        const child_pid = std.c.fork();
+        if (child_pid < 0) return error.Unexpected;
         if (child_pid == 0) {
             execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp.ptr, command_pipe, event_pipe, frame_fds);
         }
 
-        std.posix.close(command_pipe[0]);
-        std.posix.close(event_pipe[1]);
-        for (frame_fds) |frame_fd| std.posix.close(frame_fd);
+        _ = std.c.close(command_pipe[0]);
+        _ = std.c.close(event_pipe[1]);
+        for (frame_fds) |frame_fd| _ = std.c.close(frame_fd);
 
-        const command_file: std.fs.File = .{ .handle = command_pipe[1] };
-        const event_file: std.fs.File = .{ .handle = event_pipe[0] };
+        const command_file: std.Io.File = .{ .handle = command_pipe[1], .flags = .{ .nonblocking = false } };
+        const event_file: std.Io.File = .{ .handle = event_pipe[0], .flags = .{ .nonblocking = false } };
 
         self.child_pid = child_pid;
         self.child_process_group = child_pid;
         self.command_file = command_file;
-        std.posix.setpgid(child_pid, child_pid) catch {};
+        _ = std.c.setpgid(child_pid, child_pid);
 
         const context = try self.allocator.create(ReaderContext);
         context.* = .{
@@ -360,7 +376,9 @@ pub const Controller = struct {
         defer self.allocator.free(encoded);
 
         var write_buffer: [8 * 1024]u8 = undefined;
-        var writer = command_file.writer(&write_buffer);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var writer = command_file.writer(threaded.io(), &write_buffer);
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
         try writer.interface.flush();
@@ -369,7 +387,7 @@ pub const Controller = struct {
     // Closes the command FIFO writer so the helper can observe EOF during teardown.
     fn closeCommandFile(self: *Controller) void {
         const command_file = self.command_file orelse return;
-        command_file.close();
+        _ = std.c.close(command_file.handle);
         self.command_file = null;
     }
 
@@ -390,16 +408,22 @@ pub const Controller = struct {
         }
         var grace_checks: u8 = 0;
         while (grace_checks < 8 and processGroupAlive(child_process_group)) : (grace_checks += 1) {
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+            sleepMillis(25);
         }
         self.child_pid = null;
         self.child_process_group = null;
     }
 };
 
+fn currentEnviron() std.process.Environ {
+    if (@import("builtin").os.tag == .windows) return .{ .block = .global };
+    return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
 /// Resolves the installed CEF helper path beside the app executable.
 fn browserHelperPath(allocator: std.mem.Allocator, helper_name: []const u8) ![]u8 {
-    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const exe_dir = try std.process.executableDirPathAlloc(threaded.io(), allocator);
     defer allocator.free(exe_dir);
     return try std.fs.path.join(allocator, &.{ exe_dir, helper_name });
 }
@@ -416,16 +440,18 @@ fn encodeMouseButton(button: browser_input.MouseButton) u8 {
 /// Reads helper JSON-line events from stdout and stores them in shared state.
 fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
-    defer context.event_file.close();
+    defer _ = std.c.close(context.event_file.handle);
 
     var read_buffer: [64 * 1024]u8 = undefined;
-    var reader = context.event_file.reader(&read_buffer);
+    var threaded: std.Io.Threaded = .init(context.allocator, .{});
+    defer threaded.deinit();
+    var reader = context.event_file.readerStreaming(threaded.io(), &read_buffer);
 
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
         if (maybe_line == null) return;
 
-        const line = std.mem.trimRight(u8, maybe_line.?, "\r");
+        const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
         if (line.len == 0) continue;
 
         var parsed = try std.json.parseFromSlice(ipc.Event, context.allocator, line, .{
@@ -453,26 +479,27 @@ fn execHelperChild(
     event_pipe: [2]std.posix.fd_t,
     frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t,
 ) noreturn {
-    std.posix.setpgid(0, 0) catch {};
-    std.posix.dup2(command_pipe[0], COMMAND_FD) catch std.posix.exit(126);
-    std.posix.dup2(event_pipe[1], EVENT_FD) catch std.posix.exit(126);
+    _ = std.c.setpgid(0, 0);
+    if (std.c.dup2(command_pipe[0], COMMAND_FD) < 0) std.c._exit(126);
+    if (std.c.dup2(event_pipe[1], EVENT_FD) < 0) std.c._exit(126);
     inline for (frame_fds, 0..) |frame_fd, index| {
-        std.posix.dup2(frame_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) catch std.posix.exit(126);
+        if (std.c.dup2(frame_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) < 0) std.c._exit(126);
     }
 
-    std.posix.close(command_pipe[0]);
-    std.posix.close(command_pipe[1]);
-    std.posix.close(event_pipe[0]);
-    std.posix.close(event_pipe[1]);
-    for (frame_fds) |frame_fd| std.posix.close(frame_fd);
+    _ = std.c.close(command_pipe[0]);
+    _ = std.c.close(command_pipe[1]);
+    _ = std.c.close(event_pipe[0]);
+    _ = std.c.close(event_pipe[1]);
+    for (frame_fds) |frame_fd| _ = std.c.close(frame_fd);
     closeInheritedFileDescriptors();
 
     var empty_signal_mask = std.posix.sigemptyset();
     std.posix.sigprocmask(std.c.SIG.SETMASK, &empty_signal_mask, null);
     restoreDefaultSignal(std.posix.SIG.PIPE);
-    std.posix.chdirZ(helper_dir_z) catch std.posix.exit(126);
+    if (std.c.chdir(helper_dir_z) != 0) std.c._exit(126);
 
-    std.posix.execveZ(helper_path_z, argv, envp) catch std.posix.exit(127);
+    _ = std.c.execve(helper_path_z, argv, envp);
+    std.c._exit(127);
 }
 
 // Closes unrelated desktop-app descriptors so the helper host starts in a shell-like fd state.
@@ -489,7 +516,7 @@ fn closeInheritedFileDescriptors() void {
 
 // Checks whether any Chromium subprocesses are still alive in the helper process group.
 fn processGroupAlive(process_group: std.posix.pid_t) bool {
-    std.posix.kill(-process_group, 0) catch |err| {
+    std.posix.kill(-process_group, @enumFromInt(0)) catch |err| {
         return switch (err) {
             error.ProcessNotFound => false,
             else => true,
@@ -502,15 +529,24 @@ fn processGroupAlive(process_group: std.posix.pid_t) bool {
 fn waitForChildExit(child_pid: std.posix.pid_t, timeout_ms: u16) bool {
     var waited_ms: u16 = 0;
     while (waited_ms <= timeout_ms) : (waited_ms += 25) {
-        const result = std.posix.waitpid(child_pid, std.c.W.NOHANG);
-        if (result.pid == child_pid) return true;
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        var status: c_int = 0;
+        const result = std.c.waitpid(child_pid, &status, std.c.W.NOHANG);
+        if (result == child_pid) return true;
+        sleepMillis(25);
     }
     return false;
 }
 
+fn sleepMillis(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
+}
+
 // Restores the default action for signals that the desktop app may have globally ignored.
-fn restoreDefaultSignal(signal_number: u8) void {
+fn restoreDefaultSignal(signal_number: std.posix.SIG) void {
     const action: std.posix.Sigaction = if (@hasField(std.posix.Sigaction, "restorer"))
         .{
             .flags = 0,
@@ -538,27 +574,28 @@ fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_S
             "/tmp/verde-cef-frame-{d}-{d}-{d}.rgba",
             .{
                 @as(i32, @intCast(std.c.getpid())),
-                std.time.milliTimestamp(),
+                0,
                 index,
             },
         );
         defer allocator.free(frame_path);
 
-        var frame_file = try std.fs.createFileAbsolute(frame_path, .{
+        var threaded = std.Io.Threaded.init_single_threaded;
+        var frame_file = try std.Io.Dir.createFileAbsolute(threaded.io(), frame_path, .{
             .read = true,
             .truncate = true,
             .exclusive = true,
         });
-        std.fs.deleteFileAbsolute(frame_path) catch {};
+        std.Io.Dir.deleteFileAbsolute(threaded.io(), frame_path) catch {};
         frame_fds[index] = frame_file.handle;
         frame_file.handle = -1;
-        errdefer std.posix.close(frame_fds[index]);
+        errdefer _ = std.c.close(frame_fds[index]);
 
-        try std.posix.ftruncate(frame_fds[index], FRAME_BYTES_MAX);
+        if (std.c.ftruncate64(frame_fds[index], FRAME_BYTES_MAX) != 0) return error.Unexpected;
         frame.slots[index] = try std.posix.mmap(
             null,
             FRAME_BYTES_MAX,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             frame_fds[index],
             0,

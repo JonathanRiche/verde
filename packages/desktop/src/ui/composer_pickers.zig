@@ -210,12 +210,14 @@ pub fn render(state: *AppState) void {
             var row_buf = std.mem.zeroes([96:0]u8);
             const row_label = comboRowLabel(&row_buf, option.label, is_selected);
             if (zgui.selectable(row_label, .{ .selected = is_selected, .h = 28.0 })) {
-                thread.reasoning_effort = option.value;
-                if (thread.provider_thread_id) |thread_id| {
-                    state.allocator.free(thread_id);
+                const changed = if (option.value) |value|
+                    thread.reasoning_effort == null or thread.reasoning_effort.? != value
+                else
+                    thread.reasoning_effort != null;
+                if (changed) {
+                    thread.reasoning_effort = option.value;
+                    state.markDirty();
                 }
-                thread.provider_thread_id = null;
-                state.markDirty();
             }
         }
     }
@@ -281,10 +283,6 @@ pub fn render(state: *AppState) void {
         const new_mode: AccessMode = if (thread.access_mode == .full_access) .supervised else .full_access;
         if (thread.access_mode != new_mode) {
             thread.access_mode = new_mode;
-            if (thread.provider_thread_id) |thread_id| {
-                state.allocator.free(thread_id);
-            }
-            thread.provider_thread_id = null;
             state.markDirty();
         }
     }
