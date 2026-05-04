@@ -3066,7 +3066,10 @@ pub const AppState = struct {
             if (message.body.len == 0 or message_index >= thread.transcript_markdown_entries.items.len) continue;
 
             if (thread.transcript_markdown_entries.items[message_index]) |entry| {
-                if (std.mem.eql(u8, entry.owned_body, message.body)) continue;
+                if (std.mem.eql(u8, entry.owned_body, message.body)) {
+                    warmed += 1;
+                    continue;
+                }
                 entry.deinit(self.allocator);
                 thread.transcript_markdown_entries.items[message_index] = null;
             }
