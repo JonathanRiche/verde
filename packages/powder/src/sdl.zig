@@ -301,6 +301,14 @@ pub fn stopTextInput(window: *Window) Error!void {
     if (!SDL_StopTextInput(window)) return error.SdlError;
 }
 
+pub fn textInputActive(window: *Window) bool {
+    return SDL_TextInputActive(window);
+}
+
+pub fn getError() []const u8 {
+    return std.mem.span(SDL_GetError());
+}
+
 pub const pollEvent = SDL_PollEvent;
 
 pub fn createRenderer(window: *Window) Error!*Renderer {
@@ -391,6 +399,8 @@ extern fn SDL_DestroyWindow(window: *Window) void;
 extern fn SDL_SetWindowTitle(window: *Window, title: [*:0]const u8) void;
 extern fn SDL_StartTextInput(window: *Window) bool;
 extern fn SDL_StopTextInput(window: *Window) bool;
+extern fn SDL_TextInputActive(window: *Window) bool;
+extern fn SDL_GetError() [*:0]const u8;
 extern fn SDL_PollEvent(event: ?*Event) bool;
 extern fn SDL_CreateRenderer(window: *Window, name: ?[*:0]const u8) ?*Renderer;
 extern fn SDL_DestroyRenderer(renderer: *Renderer) void;
