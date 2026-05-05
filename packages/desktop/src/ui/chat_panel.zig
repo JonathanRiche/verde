@@ -3929,7 +3929,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
     queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
-    drawPowderComposerAccessIcon(state);
+    drawPowderComposerToolbarOverlay(state);
     drawPowderComposerStopButton(state);
     state.updateFileSearch();
 
@@ -4036,13 +4036,93 @@ fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command
     }
 }
 
-fn drawPowderComposerAccessIcon(state: *app_state.AppState) void {
-    const rect = state.powder_composer.accessRect();
+fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
+    const thread = state.currentThread();
+    const model_label = chat_threads.selectedModelLabel(
+        app_state.ModelOption,
+        thread,
+        state.opencodeModelOptionsSnapshot(),
+        app_state.CODEX_MODEL_OPTIONS[0..],
+    );
+    const reasoning_label = chat_threads.selectedReasoningLabel(
+        app_state.ReasoningOption,
+        thread,
+        app_state.CODEX_REASONING_OPTIONS[0..],
+    );
+    drawPowderComposerBadge(state.powder_composer.modelRect(), model_label, .none, false, true);
+    drawPowderComposerBadge(state.powder_composer.reasoningRect(), reasoning_label, .none, false, true);
+    drawPowderComposerBadge(state.powder_composer.fastRect(), if (thread.fast_mode == .on) "Fast" else "Normal", .lightning, false, false);
+    drawPowderComposerBadge(state.powder_composer.accessRect(), switch (thread.access_mode) {
+        .supervised => "Supervised",
+        .full_access => "Full access",
+    }, .lock, thread.access_mode == .supervised, false);
+}
+
+const ComposerBadgeIcon = enum {
+    none,
+    lightning,
+    lock,
+};
+
+fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool) void {
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
-    const color = [4]f32{ 0.70, 0.73, 0.80, 1.0 };
-    const x = rect.x + theme.scaledUi(18.0);
-    const center_y = rect.y + rect.h * 0.5;
-    drawLockIcon(zgui.getWindowDrawList(), x, center_y, color, state.currentThread().access_mode == .supervised);
+
+    const draw_list = zgui.getWindowDrawList();
+    const visual_h = theme.scaledUi(52.0);
+    const visual_rect: powder.Rect = .{
+        .x = rect.x - theme.scaledUi(2.0),
+        .y = rect.y + (rect.h - visual_h) * 0.5,
+        .w = rect.w + theme.scaledUi(4.0),
+        .h = visual_h,
+    };
+    const pmin: [2]f32 = .{ visual_rect.x, visual_rect.y };
+    const pmax: [2]f32 = .{ visual_rect.x + visual_rect.w, visual_rect.y + visual_rect.h };
+    draw_list.addRectFilled(.{
+        .pmin = pmin,
+        .pmax = pmax,
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.12, 0.13, 0.16, 0.92 }),
+        .rounding = visual_h * 0.5,
+    });
+
+    const text_col = zgui.colorConvertFloat4ToU32(.{ 0.90, 0.92, 0.97, 1.0 });
+    const font_size = theme.scaledUi(34.0);
+    const icon_size = theme.scaledUi(38.0);
+    const center_y = visual_rect.y + visual_rect.h * 0.5;
+    var x = visual_rect.x + theme.scaledUi(22.0);
+    const text_y = center_y - font_size * 0.5;
+
+    switch (icon) {
+        .none => {},
+        .lightning => {
+            draw_list.addTextExtendedUnformatted(
+                .{ x, center_y - icon_size * 0.5 },
+                text_col,
+                "⚡",
+                .{ .font = zgui.getFont(), .font_size = icon_size },
+            );
+            x += theme.scaledUi(34.0);
+        },
+        .lock => {
+            drawLockIcon(draw_list, x, center_y, .{ 0.70, 0.73, 0.80, 1.0 }, icon_locked);
+            x += theme.scaledUi(34.0);
+        },
+    }
+
+    draw_list.addTextExtendedUnformatted(
+        .{ x, text_y },
+        text_col,
+        label,
+        .{ .font = zgui.getFont(), .font_size = font_size },
+    );
+
+    if (chevron) {
+        draw_list.addTextExtendedUnformatted(
+            .{ visual_rect.x + visual_rect.w - theme.scaledUi(28.0), text_y },
+            text_col,
+            "›",
+            .{ .font = zgui.getFont(), .font_size = font_size },
+        );
+    }
 }
 
 fn drawPowderComposerStopButton(state: *app_state.AppState) void {
