@@ -49,13 +49,21 @@ pub const ComposerPromptConfig = struct {
     z_index: i32 = 0,
 };
 
+pub const ComposerPromptPart = enum {
+    model,
+    reasoning,
+    fast,
+    access,
+    send,
+};
+
 pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
     return struct {
         const Component = @This();
 
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         text_value: []const u8 = "",
-        send_hovered: bool = false,
+        hovered_part: ?ComposerPromptPart = null,
         z_index: i32 = config.z_index,
 
         pub fn init() Component {
@@ -75,7 +83,27 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         pub fn setSendHovered(self: *Component, hovered: bool) void {
-            self.send_hovered = hovered;
+            self.hovered_part = if (hovered) .send else null;
+        }
+
+        pub fn setHoveredPart(self: *Component, part: ?ComposerPromptPart) void {
+            self.hovered_part = part;
+        }
+
+        pub fn updateHover(self: *Component, point: draw.Vec2) bool {
+            const previous = self.hovered_part;
+            self.hovered_part = self.hitTest(point);
+            return previous != self.hovered_part;
+        }
+
+        pub fn hitTest(self: *const Component, point: draw.Vec2) ?ComposerPromptPart {
+            const geometry = self.toolbarGeometry();
+            if (geometry.send.contains(point)) return .send;
+            if (geometry.model.contains(point)) return .model;
+            if (geometry.reasoning.contains(point)) return .reasoning;
+            if (geometry.fast.contains(point)) return .fast;
+            if (geometry.access.contains(point)) return .access;
+            return null;
         }
 
         pub fn textRect(self: *const Component) draw.Rect {
@@ -99,14 +127,23 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         pub fn sendButtonRect(self: *const Component) draw.Rect {
-            const toolbar = self.toolbarRect();
-            const size = @min(toolbar.h, 36.0);
-            return .{
-                .x = toolbar.x + toolbar.w - size,
-                .y = toolbar.y + (toolbar.h - size) * 0.5,
-                .w = size,
-                .h = size,
-            };
+            return self.toolbarGeometry().send;
+        }
+
+        pub fn modelRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().model;
+        }
+
+        pub fn reasoningRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().reasoning;
+        }
+
+        pub fn fastRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().fast;
+        }
+
+        pub fn accessRect(self: *const Component) draw.Rect {
+            return self.toolbarGeometry().access;
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
@@ -140,39 +177,26 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
-            const toolbar = self.toolbarRect();
-            const send = self.sendButtonRect();
-            const control_h = @min(toolbar.h, 32.0);
-            var x = toolbar.x;
-            const y = toolbar.y + (toolbar.h - control_h) * 0.5;
-            const max_x = send.x - config.control_gap;
+            const geometry = self.toolbarGeometry();
+            try self.renderPill(allocator, batch, geometry.model, config.model_icon, config.model_label, config.chevron_icon, self.hovered_part == .model);
+            try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
 
-            const model_w = @min(140.0, @max(max_x - x, 0.0));
-            try self.renderPill(allocator, batch, .{ .x = x, .y = y, .w = model_w, .h = control_h }, config.model_icon, config.model_label, config.chevron_icon);
-            x += model_w + config.control_gap;
-            try self.renderSeparator(allocator, batch, x - config.control_gap * 0.5, toolbar);
+            try self.renderPill(allocator, batch, geometry.reasoning, "", config.reasoning_label, config.chevron_icon, self.hovered_part == .reasoning);
+            try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
 
-            const reasoning_w = @min(78.0, @max(max_x - x, 0.0));
-            try self.renderPill(allocator, batch, .{ .x = x, .y = y, .w = reasoning_w, .h = control_h }, "", config.reasoning_label, config.chevron_icon);
-            x += reasoning_w + config.control_gap;
-            try self.renderSeparator(allocator, batch, x - config.control_gap * 0.5, toolbar);
+            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, config.fast_label, "", self.hovered_part == .fast);
+            try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
 
-            const fast_w = @min(70.0, @max(max_x - x, 0.0));
-            try self.renderPill(allocator, batch, .{ .x = x, .y = y, .w = fast_w, .h = control_h }, config.fast_icon, config.fast_label, "");
-            x += fast_w + config.control_gap;
-            try self.renderSeparator(allocator, batch, x - config.control_gap * 0.5, toolbar);
+            try self.renderPill(allocator, batch, geometry.access, config.access_icon, config.access_label, "", self.hovered_part == .access);
 
-            const access_w = @min(122.0, @max(max_x - x, 0.0));
-            try self.renderPill(allocator, batch, .{ .x = x, .y = y, .w = access_w, .h = control_h }, config.access_icon, config.access_label, "");
-
-            try batch.panel(allocator, send, if (self.send_hovered) config.send_hover_color else config.send_color, null, send.h * 0.5, 0.0);
-            try self.renderCenteredIcon(allocator, batch, send, config.send_icon, draw.Color.white);
+            try batch.panel(allocator, geometry.send, if (self.hovered_part == .send) config.send_hover_color else config.send_color, null, geometry.send.h * 0.5, 0.0);
+            try self.renderCenteredIcon(allocator, batch, geometry.send, config.send_icon, draw.Color.white);
         }
 
-        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8) !void {
+        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
             _ = self;
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
-            try batch.panel(allocator, rect, config.control_background_color, null, rect.h * 0.5, 0.0);
+            try batch.panel(allocator, rect, if (hovered) config.control_hover_color else config.control_background_color, null, rect.h * 0.5, 0.0);
             const text_metrics = text_layout.FontMetrics.fallback(config.toolbar_font_size);
             const icon_metrics = text_layout.FontMetrics.fallback(config.icon_font_size);
             var runs: [3]draw.TextRun = undefined;
@@ -248,6 +272,56 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_id = config.icon_font_id,
             };
         }
+
+        fn toolbarGeometry(self: *const Component) struct {
+            toolbar: draw.Rect,
+            model: draw.Rect,
+            reasoning: draw.Rect,
+            fast: draw.Rect,
+            access: draw.Rect,
+            send: draw.Rect,
+        } {
+            const toolbar = self.toolbarRect();
+            const control_h = @min(toolbar.h, 32.0);
+            const y = toolbar.y + (toolbar.h - control_h) * 0.5;
+            const send_size = @min(toolbar.h, 36.0);
+            const send: draw.Rect = .{
+                .x = toolbar.x + toolbar.w - send_size,
+                .y = toolbar.y + (toolbar.h - send_size) * 0.5,
+                .w = send_size,
+                .h = send_size,
+            };
+            const max_x = send.x - config.control_gap;
+            var x = toolbar.x;
+
+            const model_w = @min(140.0, @max(max_x - x, 0.0));
+            const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
+            x += model_w + config.control_gap;
+
+            const reasoning_w = @min(78.0, @max(max_x - x, 0.0));
+            const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
+            x += reasoning_w + config.control_gap;
+
+            const fast_w = @min(70.0, @max(max_x - x, 0.0));
+            const fast: draw.Rect = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
+            x += fast_w + config.control_gap;
+
+            const access_w = @min(122.0, @max(max_x - x, 0.0));
+            const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };
+
+            return .{
+                .toolbar = toolbar,
+                .model = model,
+                .reasoning = reasoning,
+                .fast = fast,
+                .access = access,
+                .send = send,
+            };
+        }
+
+        fn separatorX(left: draw.Rect, right: draw.Rect) f32 {
+            return (left.x + left.w + right.x) * 0.5;
+        }
     };
 }
 
@@ -271,4 +345,15 @@ test "composer prompt emits styled font-role commands" {
     }
     try std.testing.expect(icon_runs >= 4);
     try std.testing.expect(rounded_send);
+}
+
+test "composer prompt hit tests toolbar controls" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .model), prompt.hitTest(.{ .x = prompt.modelRect().x + 2, .y = prompt.modelRect().y + 2 }));
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .reasoning), prompt.hitTest(.{ .x = prompt.reasoningRect().x + 2, .y = prompt.reasoningRect().y + 2 }));
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .fast), prompt.hitTest(.{ .x = prompt.fastRect().x + 2, .y = prompt.fastRect().y + 2 }));
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .access), prompt.hitTest(.{ .x = prompt.accessRect().x + 2, .y = prompt.accessRect().y + 2 }));
+    try std.testing.expectEqual(@as(?ComposerPromptPart, .send), prompt.hitTest(.{ .x = prompt.sendButtonRect().x + 2, .y = prompt.sendButtonRect().y + 2 }));
 }

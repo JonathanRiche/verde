@@ -48,6 +48,7 @@ pub const CheckboxConfig = checkbox_component.CheckboxConfig;
 pub const CheckboxEvent = checkbox_component.CheckboxEvent;
 pub const CodeViewConfig = code_view_component.CodeViewConfig;
 pub const ComposerPromptConfig = composer_prompt_component.ComposerPromptConfig;
+pub const ComposerPromptPart = composer_prompt_component.ComposerPromptPart;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;
 pub const ImageFit = image_component.ImageFit;
