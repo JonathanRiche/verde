@@ -15,6 +15,7 @@ pub const sdl = @import("sdl.zig");
 pub const button_component = @import("components/button.zig");
 pub const checkbox_component = @import("components/checkbox.zig");
 pub const code_view_component = @import("components/code_view.zig");
+pub const composer_prompt_component = @import("components/composer_prompt.zig");
 pub const image_component = @import("components/image.zig");
 pub const list_box_component = @import("components/list_box.zig");
 pub const menu_component = @import("components/menu.zig");
@@ -26,6 +27,7 @@ pub const tabs_component = @import("components/tabs.zig");
 pub const text_component = @import("components/text.zig");
 pub const text_area_component = @import("components/text_area.zig");
 pub const text_input_component = @import("components/text_input.zig");
+pub const toolbar_component = @import("components/toolbar.zig");
 pub const text_layout = @import("text_layout.zig");
 pub const virtual_list_component = @import("components/virtual_list.zig");
 
@@ -34,6 +36,7 @@ pub const Rect = draw.Rect;
 pub const RenderBatch = draw.RenderBatch;
 pub const TextureId = draw.TextureId;
 pub const TextRun = draw.TextRun;
+pub const FontRole = draw.FontRole;
 pub const Renderer = renderer.Renderer;
 pub const FontAtlas = atlas.FontAtlas;
 pub const ButtonCallbacks = button_component.ButtonCallbacks;
@@ -44,6 +47,7 @@ pub const CheckboxCallbacks = checkbox_component.CheckboxCallbacks;
 pub const CheckboxConfig = checkbox_component.CheckboxConfig;
 pub const CheckboxEvent = checkbox_component.CheckboxEvent;
 pub const CodeViewConfig = code_view_component.CodeViewConfig;
+pub const ComposerPromptConfig = composer_prompt_component.ComposerPromptConfig;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;
 pub const ImageFit = image_component.ImageFit;
@@ -63,6 +67,7 @@ pub const ScrollAreaEvent = scroll_area_component.ScrollAreaEvent;
 pub const SelectCallbacks = select_component.SelectCallbacks;
 pub const SelectConfig = select_component.SelectConfig;
 pub const SelectEvent = select_component.SelectEvent;
+pub const SelectVariant = select_component.SelectVariant;
 pub const TabsCallbacks = tabs_component.TabsCallbacks;
 pub const TabsConfig = tabs_component.TabsConfig;
 pub const TabsEvent = tabs_component.TabsEvent;
@@ -83,6 +88,8 @@ pub const TextInputAction = text_input_component.TextInputAction;
 pub const TextInputCallbacks = text_input_component.TextInputCallbacks;
 pub const TextInputConfig = text_input_component.TextInputConfig;
 pub const TextInputEvent = text_input_component.TextInputEvent;
+pub const ToolbarConfig = toolbar_component.ToolbarConfig;
+pub const ToolbarItem = toolbar_component.ToolbarItem;
 pub const VirtualListCallbacks = virtual_list_component.VirtualListCallbacks;
 pub const VirtualListConfig = virtual_list_component.VirtualListConfig;
 pub const VirtualListEvent = virtual_list_component.VirtualListEvent;
@@ -118,6 +125,11 @@ pub fn codeView(comptime config: CodeViewConfig) type {
 /// Creates a retained diff viewer with comptime styling.
 pub fn diffView(comptime config: CodeViewConfig) type {
     return code_view_component.DiffView(config);
+}
+
+/// Creates a renderer-neutral command prompt/composer visual model.
+pub fn composerPrompt(comptime config: ComposerPromptConfig) type {
+    return composer_prompt_component.ComposerPrompt(config);
 }
 
 /// Creates a retained button with comptime styling.
@@ -185,6 +197,11 @@ pub fn text(comptime config: text_component.TextConfig) type {
     return text_component.Text(config);
 }
 
+/// Creates a retained horizontal toolbar layout helper.
+pub fn toolbar(comptime config: ToolbarConfig) type {
+    return toolbar_component.Toolbar(config);
+}
+
 /// Creates a retained virtualized scroll list with runtime bounds.
 pub fn virtualList(comptime config: VirtualListConfig) type {
     return virtual_list_component.VirtualList(config);
@@ -211,6 +228,7 @@ test {
     _ = button_component;
     _ = checkbox_component;
     _ = code_view_component;
+    _ = composer_prompt_component;
     _ = image_component;
     _ = list_box_component;
     _ = menu_component;
@@ -222,5 +240,6 @@ test {
     _ = text_component;
     _ = text_area_component;
     _ = text_input_component;
+    _ = toolbar_component;
     _ = virtual_list_component;
 }

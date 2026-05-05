@@ -63,6 +63,7 @@ zig build run-text-area-lab
 zig build run-component-lab
 zig build run-layout-lab
 zig build run-layout-review
+zig build run-composer-prompt-review
 ```
 
 If shader source changes, regenerate the Vulkan SPIR-V assets:
@@ -290,10 +291,112 @@ their component config.
 
 Text commands may carry `command.text_runs`. When this slice is non-empty, a
 renderer should draw each run at `run.x/run.y` using `run.text`,
-`run.font_size`, `run.color`, `run.line_height`, and `run.clip`. That output is
-authoritative: it is the same layout Powder used for hit testing, wrapping,
-cursor movement, selection, and scrolling. Hosts should not re-wrap those
-commands.
+`run.font_size`, `run.color`, `run.line_height`, `run.clip`, and optional
+`run.font_role` / `run.font_id`. That output is authoritative: it is the same
+layout Powder used for hit testing, wrapping, cursor movement, selection, and
+scrolling. Hosts should not re-wrap those commands.
+
+Font roles are renderer-neutral:
+
+```zig
+pub const FontRole = enum { ui, ui_bold, icon, mono };
+```
+
+Component configs expose role fields where text is emitted, such as
+`font_role`, `icon_font_role`, `font_id`, and `icon_font_id`. Host renderers map
+those roles or ids to their own font atlas. The SDL examples currently fall
+back to their configured font when a role-specific font is not provided, but the
+role data remains in the batch for app renderers.
+
+## Icons And Compact Controls
+
+Buttons and selects can emit icon text as first-class `TextRun`s. Icons are not
+host-side special cases; they are text spans with `font_role = .icon` or a
+custom `icon_font_id`.
+
+```zig
+const Send = powder.button(.{
+    .icon_text = "^",
+    .circular = true,
+    .font_size = 18,
+    .icon_font_role = .icon,
+    .background_color = .{ .r = 0.32, .g = 0.54, .b = 0.39, .a = 1 },
+});
+```
+
+Buttons also support `leading_icon`, `trailing_icon`, `icon_gap`, and centered
+or start/end content alignment. `IconButton` can render either a texture-backed
+image command or centered icon text.
+
+Use `SelectVariant.compact` for inline toolbar selects:
+
+```zig
+const Model = powder.select(.{
+    .variant = .compact,
+    .left_icon = "O",
+    .chevron_icon = ">",
+    .item_label = modelLabel,
+    .compact_background_color = .{ .a = 0 },
+    .compact_border_width = 0,
+});
+```
+
+Compact selects emit a low/no-alpha background by default, optional hover/open
+background, left icon, label text, right chevron, z-indexed dropdown menu, and
+font roles for each run.
+
+## Toolbar And Composer Prompt
+
+`powder.toolbar()` is a retained horizontal layout helper for inline command
+bars. It computes child rects, supports fixed and flexible item widths,
+right-aligned actions, vertical centering, and separator commands.
+
+```zig
+const Bar = powder.toolbar(.{ .gap = 8 });
+var bar = Bar.init();
+bar.setBounds(toolbar_rect);
+
+const items = [_]powder.ToolbarItem{
+    powder.ToolbarItem.fixed(132, 32),
+    powder.ToolbarItem.flexible(120, 32, 1),
+    .{ .width = 36, .height = 36, .right_aligned = true },
+};
+var rects: [items.len]powder.Rect = undefined;
+bar.layout(&items, &rects);
+try bar.renderSeparators(allocator, &batch, &items, &rects);
+```
+
+For Verde-style command prompts, `powder.composerPrompt()` owns the renderer
+neutral visual model for the rounded shell, multiline placeholder/text region,
+bottom inline controls, separators, icon roles, chevrons, and circular send
+button:
+
+```zig
+const Composer = powder.composerPrompt(.{
+    .model_icon = "O",
+    .model_label = "GPT-5.5",
+    .reasoning_label = "Low",
+    .fast_icon = "~",
+    .fast_label = "Fast",
+    .access_icon = "L",
+    .access_label = "Full access",
+    .send_icon = "^",
+});
+
+var composer = Composer.init();
+composer.setBounds(prompt_rect);
+try composer.render(allocator, &batch);
+```
+
+Run the batch-level review:
+
+```bash
+zig build run-composer-prompt-review
+```
+
+It validates that the composer emits rounded panel commands, text/icon runs with
+font roles, separators, and a circular send button without host renderer
+heuristics.
 
 ## Z-Index
 
