@@ -4069,10 +4069,20 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
 
     const draw_list = zgui.getWindowDrawList();
     const visual_h = theme.scaledUi(40.0);
+    const font_size = theme.scaledUi(26.0);
+    const icon_size = theme.scaledUi(30.0);
+    const pad_x = theme.scaledUi(16.0);
+    const icon_advance = switch (icon) {
+        .none => 0.0,
+        .lightning => theme.scaledUi(28.0),
+        .lock => theme.scaledUi(30.0),
+    };
+    const chevron_width = if (chevron) theme.scaledUi(24.0) else 0.0;
+    const content_width = pad_x * 2.0 + icon_advance + scaledOverlayTextWidth(label, font_size) + chevron_width;
     const visual_rect: powder.Rect = .{
         .x = rect.x,
         .y = rect.y + (rect.h - visual_h) * 0.5,
-        .w = rect.w,
+        .w = @max(rect.w, content_width),
         .h = visual_h,
     };
     const pmin: [2]f32 = .{ visual_rect.x, visual_rect.y };
@@ -4085,10 +4095,8 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
     });
 
     const text_col = zgui.colorConvertFloat4ToU32(.{ 0.90, 0.92, 0.97, 1.0 });
-    const font_size = theme.scaledUi(26.0);
-    const icon_size = theme.scaledUi(30.0);
     const center_y = visual_rect.y + visual_rect.h * 0.5;
-    var x = visual_rect.x + theme.scaledUi(16.0);
+    var x = visual_rect.x + pad_x;
     const text_y = center_y - font_size * 0.5;
 
     switch (icon) {
@@ -4123,6 +4131,11 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
             .{ .font = zgui.getFont(), .font_size = font_size },
         );
     }
+}
+
+fn scaledOverlayTextWidth(label: []const u8, font_size: f32) f32 {
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    return zgui.calcTextSize(label, .{})[0] * (font_size / base_font_size);
 }
 
 fn drawPowderComposerStopButton(state: *app_state.AppState) void {
