@@ -77,15 +77,15 @@ pub const PowderReasoningSelect = powder.select(powderSelectConfig(powderReasoni
 pub const PowderFastSelect = powder.select(powderSelectConfig(powderFastLabel));
 pub const PowderAccessSelect = powder.select(powderSelectConfig(powderAccessLabel));
 pub const PowderSendButton = powder.button(.{
-    .label = "SEND",
-    .font_size = 14.0,
+    .label = "↑",
+    .font_size = 22.0,
     .background_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .pressed_color = .{ .r = 0.18, .g = 0.34, .b = 0.23, .a = 1.0 },
     .border_color = .{ .r = 0.33, .g = 0.58, .b = 0.40, .a = 1.0 },
     .text_color = .{},
-    .padding_x = 7.0,
-    .padding_y = 8.0,
+    .padding_x = 10.0,
+    .padding_y = 3.0,
 });
 pub const PowderStopButton = powder.button(.{
     .label = "STOP",
