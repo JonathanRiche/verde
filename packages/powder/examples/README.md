@@ -9,6 +9,7 @@ Run examples from `packages/powder`.
 zig build run-text-area-lab
 zig build run-component-lab
 zig build run-layout-lab
+zig build run-composer-prompt-lab
 zig build run-layout-review
 zig build run-composer-prompt-review
 ```
@@ -37,6 +38,10 @@ The composer prompt review example is a CLI example for the higher-level
 `powder.composerPrompt()` visual model. It validates rounded panel commands,
 font-role text/icon runs, toolbar separators, compact control presentation, and
 the circular send button without opening a window.
+
+The composer prompt lab opens an SDL window for that same composite. Resize the
+window, type prompt text, and hover/click the circular send button to inspect the
+actual rendered UI.
 
 Rendering is command-based. Components emit `powder.RenderBatch` commands, and
 the labs use Powder's SDL presenter for local inspection.

@@ -63,6 +63,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const composer_prompt_lab = addExample(b, .{
+        .name = "powder-composer-prompt-lab",
+        .root_source_file = "examples/composer_prompt_lab_main.zig",
+        .linux_root_source_file = "examples/composer_prompt_lab.zig",
+        .linux_c_source_file = "examples/linux_composer_prompt_lab_main.c",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const font_loading_check = addExample(b, .{
         .name = "powder-font-loading-check",
         .root_source_file = "examples/font_loading_check_main.zig",
@@ -89,12 +98,14 @@ pub fn build(b: *std.Build) void {
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
     const run_layout_lab_step = b.step("run-layout-lab", "Run the runtime layout visual lab");
+    const run_composer_prompt_lab_step = b.step("run-composer-prompt-lab", "Run the composer prompt visual lab");
     const run_layout_review_step = b.step("run-layout-review", "Run the runtime layout review example");
     const run_composer_prompt_review_step = b.step("run-composer-prompt-review", "Run the composer prompt review example");
     const examples_step = b.step("examples", "Build powder examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
     wireExampleRun(b, layout_lab, run_layout_lab_step, examples_step);
+    wireExampleRun(b, composer_prompt_lab, run_composer_prompt_lab_step, examples_step);
     wireExampleRun(b, layout_review, run_layout_review_step, examples_step);
     wireExampleRun(b, composer_prompt_review, run_composer_prompt_review_step, examples_step);
     examples_step.dependOn(font_loading_check.step);

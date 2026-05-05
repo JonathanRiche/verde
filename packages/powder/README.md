@@ -62,6 +62,7 @@ Run the visual labs:
 zig build run-text-area-lab
 zig build run-component-lab
 zig build run-layout-lab
+zig build run-composer-prompt-lab
 zig build run-layout-review
 zig build run-composer-prompt-review
 ```
@@ -387,6 +388,15 @@ var composer = Composer.init();
 composer.setBounds(prompt_rect);
 try composer.render(allocator, &batch);
 ```
+
+Run the visual composer lab:
+
+```bash
+zig build run-composer-prompt-lab
+```
+
+It opens an SDL window where you can resize the composer, type prompt text,
+hover/click the circular send button, and inspect live command/text/icon counts.
 
 Run the batch-level review:
 
