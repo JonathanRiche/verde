@@ -4384,6 +4384,10 @@ pub const AppState = struct {
     pub fn routePowderComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         const powder_key = powderComposerKeyFromSdl(event) orelse return false;
         if (!self.powder_composer.focused) return false;
+        if (self.handlePowderComposerNavigationKey(powder_key)) {
+            self.noteInteraction();
+            return true;
+        }
         const handled = self.powder_composer.handleInput(self.allocator, .{ .key = powder_key }) catch |err| {
             log.warn("powder composer key input failed: {s}", .{@errorName(err)});
             return false;
@@ -4398,6 +4402,9 @@ pub const AppState = struct {
     pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
         const point = powderMousePoint(event.x, event.y, ui_scale);
+        if (event.down and event.clicks >= 2 and self.powder_composer.textRect().contains(point)) {
+            return self.routePowderComposerMultiClick(point, event.clicks);
+        }
         const input: powder.ComposerPromptInput = if (event.down)
             .{ .mouse_down = point }
         else
@@ -4441,6 +4448,79 @@ pub const AppState = struct {
         };
         if (handled) self.noteInteraction();
         return handled;
+    }
+
+    fn handlePowderComposerNavigationKey(self: *AppState, key: powder.Key) bool {
+        if (key.primary and key.code == .a) {
+            self.powder_composer.selection_anchor = 0;
+            self.powder_composer.selection_focus = self.powder_composer.text().len;
+            self.powder_composer.cursor = self.powder_composer.text().len;
+            self.ensurePowderComposerCursorVisible();
+            return true;
+        }
+
+        if (key.code != .up and key.code != .down) return false;
+        const text = self.powder_composer.text();
+        const metrics = powderZguiFontMetrics(POWDER_COMPOSER_FONT_SIZE);
+        const text_rect = self.powder_composer.textRect();
+        const cell = powder.TextLayout.visualCellForOffset(text, self.powder_composer.cursor, metrics, text_rect.w, true);
+        const target_row = switch (key.code) {
+            .up => if (cell.row == 0) 0 else cell.row - 1,
+            .down => cell.row + 1,
+            else => unreachable,
+        };
+        const next = powder.TextLayout.offsetAtVisualCell(text, target_row, cell.x, metrics, text_rect.w, true);
+        self.movePowderComposerCursor(next, key.shift);
+        return true;
+    }
+
+    fn routePowderComposerMultiClick(self: *AppState, point: powder.draw.Vec2, clicks: u8) bool {
+        _ = self.powder_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
+            log.warn("powder composer mouse input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        const text = self.powder_composer.text();
+        const offset = self.powder_composer.cursor;
+        const range = if (clicks >= 3) blk: {
+            const start = powder.input_selection.lineStart(text, offset);
+            var end = powder.input_selection.lineEnd(text, offset);
+            if (end < text.len) end += 1;
+            break :blk powder.input_selection.Range{ .start = start, .end = end };
+        } else powder.input_selection.wordRangeAt(text, offset);
+        self.powder_composer.selection_anchor = range.start;
+        self.powder_composer.selection_focus = range.end;
+        self.powder_composer.cursor = range.end;
+        self.powder_composer.dragging_selection = false;
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+        self.ensurePowderComposerCursorVisible();
+        self.noteInteraction();
+        return true;
+    }
+
+    fn movePowderComposerCursor(self: *AppState, next: usize, extend_selection: bool) void {
+        const old = self.powder_composer.cursor;
+        self.powder_composer.cursor = @min(next, self.powder_composer.text().len);
+        if (extend_selection) {
+            if (self.powder_composer.selection_anchor == null) self.powder_composer.selection_anchor = old;
+            self.powder_composer.selection_focus = self.powder_composer.cursor;
+        } else {
+            self.powder_composer.selection_anchor = null;
+            self.powder_composer.selection_focus = null;
+        }
+        self.ensurePowderComposerCursorVisible();
+    }
+
+    fn ensurePowderComposerCursorVisible(self: *AppState) void {
+        const text_rect = self.powder_composer.textRect();
+        const cursor = self.powder_composer.cursorRect();
+        const bottom = text_rect.y + text_rect.h;
+        if (cursor.y < text_rect.y) {
+            self.powder_composer.setScrollY(self.powder_composer.scrollY() - (text_rect.y - cursor.y));
+        } else if (cursor.y + cursor.h > bottom) {
+            self.powder_composer.setScrollY(self.powder_composer.scrollY() + cursor.y + cursor.h - bottom);
+        }
     }
 
     pub fn setComposerInputBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
