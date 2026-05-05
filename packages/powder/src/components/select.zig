@@ -21,6 +21,9 @@ pub const SelectConfig = struct {
     background_color: draw.Color = .{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.22, .g = 0.25, .b = 0.30, .a = 1.0 },
     menu_color: draw.Color = .{ .r = 0.06, .g = 0.07, .b = 0.09, .a = 1.0 },
+    corner_radius: f32 = 5.0,
+    menu_corner_radius: f32 = 6.0,
+    border_width: f32 = 1.0,
     text_color: draw.Color = draw.Color.white,
     selected_color: draw.Color = .{ .r = 0.16, .g = 0.36, .b = 0.58, .a = 0.88 },
     highlighted_color: draw.Color = .{ .r = 0.32, .g = 0.36, .b = 0.42, .a = 0.62 },
@@ -28,6 +31,8 @@ pub const SelectConfig = struct {
     scrollbar_thumb_color: draw.Color = .{ .r = 0.62, .g = 0.70, .b = 0.82, .a = 0.78 },
     scrollbar_width: f32 = 4.0,
     scroll_enabled: bool = true,
+    z_index: i32 = 0,
+    menu_z_offset: i32 = 1000,
     item_count: ?usize = null,
     item_label: ?*const fn (context: ?*anyopaque, index: usize) []const u8 = null,
 };
@@ -79,6 +84,8 @@ pub fn Select(comptime config: SelectConfig) type {
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         menu_rect: draw.Rect = .{ .x = config.x, .y = config.y + config.height, .w = config.width, .h = config.menu_height },
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
+        menu_z_offset: i32 = config.menu_z_offset,
         callbacks: SelectCallbacks = .{},
 
         pub fn init(item_count: usize) Component {
@@ -99,6 +106,14 @@ pub fn Select(comptime config: SelectConfig) type {
 
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
+        }
+
+        pub fn setMenuZOffset(self: *Component, offset: i32) void {
+            self.menu_z_offset = offset;
         }
 
         pub fn scrollY(self: *const Component) f32 {
@@ -247,9 +262,11 @@ pub fn Select(comptime config: SelectConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             const control = self.controlRect();
-            try batch.rect(allocator, control, config.background_color);
-            try batch.rect(allocator, .{ .x = control.x, .y = control.y, .w = control.w, .h = 1.0 }, config.border_color);
+            try batch.panel(allocator, control, config.background_color, config.border_color, config.corner_radius, config.border_width);
             if (self.selected_index) |index| {
                 if (self.itemLabel(index)) |label| {
                     const text_rect = self.controlTextRect(label);
@@ -259,7 +276,8 @@ pub fn Select(comptime config: SelectConfig) type {
 
             if (!self.open) return;
 
-            try batch.rect(allocator, self.menuRect(), config.menu_color);
+            _ = batch.setZIndex(self.z_index + self.menu_z_offset);
+            try batch.panel(allocator, self.menuRect(), config.menu_color, config.border_color, config.menu_corner_radius, config.border_width);
             const visible = self.visibleRange();
             var index = visible.start;
             while (index < visible.end) : (index += 1) {
@@ -578,6 +596,23 @@ test "select renders menu scrollbar when open and overflowing" {
         if (command.kind == .scrollbar) scrollbar_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
+}
+
+test "select menu renders above later normal z commands" {
+    const Dropdown = Select(.{ .x = 0, .y = 0, .width = 100, .height = 30, .menu_height = 50, .padding_x = 0, .padding_y = 0, .row_height = 20 });
+    var select = Dropdown.init(2);
+    _ = select.handleInput(.{ .key = .{ .code = .enter } });
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try select.render(std.testing.allocator, &batch);
+    try batch.rect(std.testing.allocator, .{ .x = 999, .w = 10, .h = 10 }, draw.Color.white);
+
+    try std.testing.expect(batch.commands.items[batch.commands.items.len - 1].z_index > 0);
+    try std.testing.expect(batch.commands.items[batch.commands.items.len - 1].rect.x != 999);
+    for (batch.commands.items) |command| {
+        if (command.rect.x == 999) try std.testing.expectEqual(@as(i32, 0), command.z_index);
+    }
 }
 
 test "select supports runtime bounds menu bounds item count and text labels" {

@@ -559,15 +559,7 @@ pub const SdlDebugRenderer = struct {
     }
 
     fn renderRect(self: *SdlDebugRenderer, command: draw.Command) !void {
-        const color = colorBytes(command.color);
-        if (color[3] == 0) return;
-        try sdl.setRenderDrawColor(self.renderer, color[0], color[1], color[2], color[3]);
-        try sdl.renderFillRect(self.renderer, .{
-            .x = command.rect.x,
-            .y = command.rect.y,
-            .w = command.rect.w,
-            .h = command.rect.h,
-        });
+        try renderStyledRect(self.renderer, command);
     }
 
     fn renderText(self: *SdlDebugRenderer, command: draw.Command) !void {
@@ -659,15 +651,7 @@ pub const SdlFontRenderer = struct {
     }
 
     fn renderRect(self: *SdlFontRenderer, command: draw.Command) !void {
-        const color = colorBytes(command.color);
-        if (color[3] == 0) return;
-        try sdl.setRenderDrawColor(self.renderer, color[0], color[1], color[2], color[3]);
-        try sdl.renderFillRect(self.renderer, .{
-            .x = command.rect.x,
-            .y = command.rect.y,
-            .w = command.rect.w,
-            .h = command.rect.h,
-        });
+        try renderStyledRect(self.renderer, command);
     }
 
     fn renderText(self: *SdlFontRenderer, command: draw.Command) !void {
@@ -790,8 +774,8 @@ pub fn sdlFontRendererWithTextures(
 /// Converts retained render commands into indexed quads ready for GPU upload.
 pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, mesh: *Mesh) !void {
     mesh.clear();
-    try mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 4);
-    try mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 6);
+    try mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 20);
+    try mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 30);
     for (batch.commands.items) |command| {
         appendCommand(mesh, command);
     }
@@ -799,20 +783,43 @@ pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, m
 
 fn appendCommand(mesh: *Mesh, command: draw.Command) void {
     if (command.kind == .text or command.kind == .image) return;
+    if (command.border_color) |border| {
+        if (command.border_width > 0.0 and border.a > 0.0) {
+            appendBorderQuads(mesh, command.rect, border, command.border_width);
+        }
+    }
+    if (command.color.a <= 0.0) return;
+    const rect = if (command.border_color != null and command.border_width > 0.0)
+        insetRect(command.rect, command.border_width)
+    else
+        command.rect;
+    appendQuad(mesh, rect, command.uv, command.color);
+}
+
+fn appendQuad(mesh: *Mesh, rect: draw.Rect, uv: draw.Rect, color: draw.Color) void {
+    if (rect.w <= 0.0 or rect.h <= 0.0 or color.a <= 0.0) return;
     const base: u32 = @intCast(mesh.vertices.items.len);
-    const x0 = command.rect.x;
-    const y0 = command.rect.y;
-    const x1 = command.rect.x + command.rect.w;
-    const y1 = command.rect.y + command.rect.h;
-    const uv_x0 = command.uv.x;
-    const uv_y0 = command.uv.y;
-    const uv_x1 = command.uv.x + command.uv.w;
-    const uv_y1 = command.uv.y + command.uv.h;
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y0 }, .uv = .{ .x = uv_x0, .y = uv_y0 }, .color = command.color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y0 }, .uv = .{ .x = uv_x1, .y = uv_y0 }, .color = command.color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y1 }, .uv = .{ .x = uv_x1, .y = uv_y1 }, .color = command.color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y1 }, .uv = .{ .x = uv_x0, .y = uv_y1 }, .color = command.color });
+    const x0 = rect.x;
+    const y0 = rect.y;
+    const x1 = rect.x + rect.w;
+    const y1 = rect.y + rect.h;
+    const uv_x0 = uv.x;
+    const uv_y0 = uv.y;
+    const uv_x1 = uv.x + uv.w;
+    const uv_y1 = uv.y + uv.h;
+    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y0 }, .uv = .{ .x = uv_x0, .y = uv_y0 }, .color = color });
+    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y0 }, .uv = .{ .x = uv_x1, .y = uv_y0 }, .color = color });
+    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y1 }, .uv = .{ .x = uv_x1, .y = uv_y1 }, .color = color });
+    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y1 }, .uv = .{ .x = uv_x0, .y = uv_y1 }, .color = color });
     mesh.indices.appendSliceAssumeCapacity(&.{ base, base + 1, base + 2, base, base + 2, base + 3 });
+}
+
+fn appendBorderQuads(mesh: *Mesh, rect: draw.Rect, color: draw.Color, width: f32) void {
+    const w = @min(@max(width, 0.0), @min(rect.w, rect.h));
+    appendQuad(mesh, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = w }, .{}, color);
+    appendQuad(mesh, .{ .x = rect.x, .y = rect.y + rect.h - w, .w = rect.w, .h = w }, .{}, color);
+    appendQuad(mesh, .{ .x = rect.x, .y = rect.y, .w = w, .h = rect.h }, .{}, color);
+    appendQuad(mesh, .{ .x = rect.x + rect.w - w, .y = rect.y, .w = w, .h = rect.h }, .{}, color);
 }
 
 fn visualLineEnd(text: []const u8, max_columns: usize) usize {
@@ -833,6 +840,115 @@ fn nextOffset(text: []const u8, offset: usize) usize {
 
 fn rectIntersectsY(rect: draw.Rect, y: f32, h: f32) bool {
     return y + h >= rect.y and y <= rect.y + rect.h;
+}
+
+fn renderStyledRect(renderer: *sdl.Renderer, command: draw.Command) !void {
+    const radius = clampedRadius(command.rect, command.radius);
+    if (command.border_color) |border| {
+        if (command.border_width > 0.0 and border.a > 0.0) {
+            try renderRoundedBorder(renderer, command.rect, border, radius, command.border_width);
+        }
+    }
+    if (command.color.a <= 0.0) return;
+    const fill_rect = if (command.border_color != null and command.border_width > 0.0)
+        insetRect(command.rect, command.border_width)
+    else
+        command.rect;
+    if (fill_rect.w <= 0.0 or fill_rect.h <= 0.0) return;
+    try renderRoundedFill(renderer, fill_rect, command.color, @max(radius - command.border_width, 0.0));
+}
+
+fn renderRoundedFill(renderer: *sdl.Renderer, rect: draw.Rect, color: draw.Color, radius: f32) !void {
+    const bytes = colorBytes(color);
+    if (bytes[3] == 0 or rect.w <= 0.0 or rect.h <= 0.0) return;
+    try sdl.setRenderDrawColor(renderer, bytes[0], bytes[1], bytes[2], bytes[3]);
+    const r = clampedRadius(rect, radius);
+    if (r <= 0.0) {
+        try sdl.renderFillRect(renderer, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h });
+        return;
+    }
+
+    const y_start: i32 = @intFromFloat(@floor(rect.y));
+    const y_end: i32 = @intFromFloat(@ceil(rect.y + rect.h));
+    var y = y_start;
+    while (y < y_end) : (y += 1) {
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const inset = roundedInsetForY(rect, r, fy);
+        try sdl.renderFillRect(renderer, .{
+            .x = rect.x + inset,
+            .y = @floatFromInt(y),
+            .w = @max(rect.w - inset * 2.0, 0.0),
+            .h = 1.0,
+        });
+    }
+}
+
+fn renderRoundedBorder(renderer: *sdl.Renderer, rect: draw.Rect, color: draw.Color, radius: f32, width: f32) !void {
+    const bytes = colorBytes(color);
+    if (bytes[3] == 0 or rect.w <= 0.0 or rect.h <= 0.0 or width <= 0.0) return;
+    try sdl.setRenderDrawColor(renderer, bytes[0], bytes[1], bytes[2], bytes[3]);
+    const r = clampedRadius(rect, radius);
+    const inner = insetRect(rect, width);
+    if (r <= 0.0 or inner.w <= 0.0 or inner.h <= 0.0) {
+        try sdl.renderFillRect(renderer, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @min(width, rect.h) });
+        try sdl.renderFillRect(renderer, .{ .x = rect.x, .y = rect.y + rect.h - @min(width, rect.h), .w = rect.w, .h = @min(width, rect.h) });
+        try sdl.renderFillRect(renderer, .{ .x = rect.x, .y = rect.y, .w = @min(width, rect.w), .h = rect.h });
+        try sdl.renderFillRect(renderer, .{ .x = rect.x + rect.w - @min(width, rect.w), .y = rect.y, .w = @min(width, rect.w), .h = rect.h });
+        return;
+    }
+
+    const inner_r = clampedRadius(inner, @max(r - width, 0.0));
+    const y_start: i32 = @intFromFloat(@floor(rect.y));
+    const y_end: i32 = @intFromFloat(@ceil(rect.y + rect.h));
+    var y = y_start;
+    while (y < y_end) : (y += 1) {
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const outer_inset = roundedInsetForY(rect, r, fy);
+        const outer_x0 = rect.x + outer_inset;
+        const outer_x1 = rect.x + rect.w - outer_inset;
+        if (fy < inner.y or fy >= inner.y + inner.h) {
+            try sdl.renderFillRect(renderer, .{ .x = outer_x0, .y = @floatFromInt(y), .w = @max(outer_x1 - outer_x0, 0.0), .h = 1.0 });
+            continue;
+        }
+        const inner_inset = roundedInsetForY(inner, inner_r, fy);
+        const inner_x0 = inner.x + inner_inset;
+        const inner_x1 = inner.x + inner.w - inner_inset;
+        if (inner_x0 > outer_x0) {
+            try sdl.renderFillRect(renderer, .{ .x = outer_x0, .y = @floatFromInt(y), .w = inner_x0 - outer_x0, .h = 1.0 });
+        }
+        if (outer_x1 > inner_x1) {
+            try sdl.renderFillRect(renderer, .{ .x = inner_x1, .y = @floatFromInt(y), .w = outer_x1 - inner_x1, .h = 1.0 });
+        }
+    }
+}
+
+fn roundedInsetForY(rect: draw.Rect, radius: f32, y: f32) f32 {
+    const r = clampedRadius(rect, radius);
+    if (r <= 0.0) return 0.0;
+    const top_center = rect.y + r;
+    const bottom_center = rect.y + rect.h - r;
+    const dy = if (y < top_center)
+        top_center - y
+    else if (y > bottom_center)
+        y - bottom_center
+    else
+        0.0;
+    if (dy <= 0.0) return 0.0;
+    return @max(r - @sqrt(@max(r * r - dy * dy, 0.0)), 0.0);
+}
+
+fn clampedRadius(rect: draw.Rect, radius: f32) f32 {
+    return @min(@max(radius, 0.0), @min(@max(rect.w, 0.0), @max(rect.h, 0.0)) * 0.5);
+}
+
+fn insetRect(rect: draw.Rect, inset: f32) draw.Rect {
+    const amount = @max(inset, 0.0);
+    return .{
+        .x = rect.x + amount,
+        .y = rect.y + amount,
+        .w = @max(rect.w - amount * 2.0, 0.0),
+        .h = @max(rect.h - amount * 2.0, 0.0),
+    };
 }
 
 fn rectToSdl(rect: draw.Rect) sdl.Rect {

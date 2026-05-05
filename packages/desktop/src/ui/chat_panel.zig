@@ -3902,7 +3902,6 @@ fn renderPendingDiffPatchFallback(patch: []const u8) void {
 fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     const composer_screen_pos = zgui.getCursorScreenPos();
     zgui.dummy(.{ .w = width, .h = height });
-    drawPowderComposerShell(composer_screen_pos, width, height);
 
     const pad_x = theme.scaledUi(18.0);
     const pad_y = theme.scaledUi(12.0);
@@ -3961,7 +3960,15 @@ fn queuePowderComposerIsland(
     input_rect_max: [2]f32,
 ) void {
     const allocator = state.allocator;
-    _ = width;
+    const card_rect: powder.Rect = .{ .x = composer_screen_pos[0], .y = composer_screen_pos[1], .w = width, .h = height };
+    state.powder_overlay_batch.panel(
+        allocator,
+        card_rect,
+        powderColor(colors.rgba(30, 39, 42, 245)),
+        powderColor(colors.DARK_BLUE),
+        theme.scaledUi(10.0),
+        theme.scaledUi(1.5),
+    ) catch return;
 
     if (state.currentThread().draft_image != null) {
         const attachment_rect: powder.Rect = .{
@@ -3991,25 +3998,6 @@ fn queuePowderComposerIsland(
             queuePowderText(state, hint_rect, hint, powderColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), hint_rect);
         }
     }
-}
-
-fn drawPowderComposerShell(pos: [2]f32, width: f32, height: f32) void {
-    const draw_list = zgui.getWindowDrawList();
-    const rounding = theme.scaledUi(10.0);
-    const border = zgui.colorConvertFloat4ToU32(colors.DARK_BLUE);
-    draw_list.addRectFilled(.{
-        .pmin = .{ pos[0], pos[1] },
-        .pmax = .{ pos[0] + width, pos[1] + height },
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(30, 39, 42, 245)),
-        .rounding = rounding,
-    });
-    draw_list.addRect(.{
-        .pmin = .{ pos[0], pos[1] },
-        .pmax = .{ pos[0] + width, pos[1] + height },
-        .col = border,
-        .rounding = rounding,
-        .thickness = theme.scaledUi(1.5),
-    });
 }
 
 fn queuePowderComposerControls(
@@ -4129,33 +4117,37 @@ fn drawPowderOverlayWithZgui(batch: *const powder.RenderBatch) void {
     const font = zgui.getFont();
     for (batch.commands.items) |command| {
         switch (command.kind) {
-            .rect, .cursor, .selection, .scrollbar => drawPowderRectWithZgui(draw_list, command.rect, command.color, command.clip),
+            .rect, .cursor, .selection, .scrollbar => drawPowderRectWithZgui(draw_list, command),
             .text => drawPowderTextWithZgui(draw_list, font, command),
             .image => {},
         }
     }
 }
 
-fn drawPowderRectWithZgui(draw_list: zgui.DrawList, rect: powder.Rect, color: powder.Color, clip: ?powder.Rect) void {
-    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0) return;
-    const clipped = if (clip) |clip_rect| clippedPowderRect(rect, clip_rect) orelse return else rect;
-    const rounding = powderRectRounding(clipped);
-    draw_list.addRectFilled(.{
-        .pmin = .{ clipped.x, clipped.y },
-        .pmax = .{ clipped.x + clipped.w, clipped.y + clipped.h },
-        .col = powderColorU32(color),
-        .rounding = rounding,
-    });
-}
-
-fn powderRectRounding(rect: powder.Rect) f32 {
-    if (rect.h >= theme.scaledUi(30.0) and rect.w >= theme.scaledUi(30.0)) {
-        return @min(rect.h * 0.5, theme.scaledUi(10.0));
+fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command) void {
+    if (command.rect.w <= 0.0 or command.rect.h <= 0.0) return;
+    const clipped = if (command.clip) |clip_rect| clippedPowderRect(command.rect, clip_rect) orelse return else command.rect;
+    const pmin: [2]f32 = .{ clipped.x, clipped.y };
+    const pmax: [2]f32 = .{ clipped.x + clipped.w, clipped.y + clipped.h };
+    if (command.color.a > 0.0) {
+        draw_list.addRectFilled(.{
+            .pmin = pmin,
+            .pmax = pmax,
+            .col = powderColorU32(command.color),
+            .rounding = command.radius,
+        });
     }
-    if (rect.h >= theme.scaledUi(14.0) and rect.w >= theme.scaledUi(14.0)) {
-        return theme.scaledUi(4.0);
+    if (command.border_color) |border_color| {
+        if (border_color.a > 0.0 and command.border_width > 0.0) {
+            draw_list.addRect(.{
+                .pmin = pmin,
+                .pmax = pmax,
+                .col = powderColorU32(border_color),
+                .rounding = command.radius,
+                .thickness = command.border_width,
+            });
+        }
     }
-    return 0.0;
 }
 
 fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: powder.draw.Command) void {

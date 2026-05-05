@@ -57,6 +57,9 @@ const powder_select_config = powder.SelectConfig{
     .background_color = POWDER_CONTROL_BG,
     .border_color = POWDER_CONTROL_BORDER,
     .menu_color = POWDER_MENU_BG,
+    .corner_radius = 8.0,
+    .menu_corner_radius = 8.0,
+    .border_width = 1.0,
     .text_color = POWDER_CONTROL_TEXT,
     .selected_color = .{ .r = 0.20, .g = 0.35, .b = 0.27, .a = 0.92 },
     .highlighted_color = .{ .r = 0.24, .g = 0.28, .b = 0.32, .a = 0.85 },
@@ -77,8 +80,11 @@ pub const PowderReasoningSelect = powder.select(powderSelectConfig(powderReasoni
 pub const PowderFastSelect = powder.select(powderSelectConfig(powderFastLabel));
 pub const PowderAccessSelect = powder.select(powderSelectConfig(powderAccessLabel));
 pub const PowderSendButton = powder.button(.{
-    .label = "↑",
+    .icon_text = "↑",
     .font_size = 22.0,
+    .icon_font_size = 22.0,
+    .corner_radius = 17.0,
+    .border_width = 0.0,
     .background_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .pressed_color = .{ .r = 0.18, .g = 0.34, .b = 0.23, .a = 1.0 },
@@ -90,6 +96,8 @@ pub const PowderSendButton = powder.button(.{
 pub const PowderStopButton = powder.button(.{
     .label = "STOP",
     .font_size = 14.0,
+    .corner_radius = 8.0,
+    .border_width = 1.0,
     .background_color = .{ .r = 0.33, .g = 0.27, .b = 0.10, .a = 1.0 },
     .hover_color = .{ .r = 0.42, .g = 0.34, .b = 0.13, .a = 1.0 },
     .pressed_color = .{ .r = 0.24, .g = 0.19, .b = 0.07, .a = 1.0 },

@@ -19,11 +19,14 @@ pub const CheckboxConfig = struct {
     checked_color: draw.Color = .{ .r = 0.32, .g = 0.58, .b = 0.88, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.31, .g = 0.35, .b = 0.40, .a = 1.0 },
     focus_color: draw.Color = .{ .r = 0.32, .g = 0.58, .b = 0.88, .a = 1.0 },
+    corner_radius: f32 = 3.0,
+    border_width: f32 = 1.0,
     label_color: draw.Color = draw.Color.white,
     disabled_color: draw.Color = .{ .r = 0.11, .g = 0.12, .b = 0.14, .a = 0.70 },
     disabled_label_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
     checked: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const ToggleConfig = struct {
@@ -41,11 +44,14 @@ pub const ToggleConfig = struct {
     thumb_color: draw.Color = draw.Color.white,
     border_color: draw.Color = .{ .r = 0.31, .g = 0.35, .b = 0.40, .a = 1.0 },
     focus_color: draw.Color = .{ .r = 0.32, .g = 0.58, .b = 0.88, .a = 1.0 },
+    corner_radius: f32 = 999.0,
+    border_width: f32 = 1.0,
     label_color: draw.Color = draw.Color.white,
     disabled_color: draw.Color = .{ .r = 0.11, .g = 0.12, .b = 0.14, .a = 0.70 },
     disabled_label_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
     checked: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const ActivationKey = enum {
@@ -85,6 +91,7 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = defaultCheckboxBounds(config),
+        z_index: i32 = config.z_index,
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -112,6 +119,10 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -192,12 +203,17 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderCheckboxBox(
                 allocator,
                 batch,
                 self.boxRect(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
+                config.corner_radius,
+                config.border_width,
             );
             if (self.checked) {
                 try batch.rect(allocator, self.checkRect(), if (self.disabled) config.disabled_label_color else config.checked_color);
@@ -253,6 +269,7 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = defaultToggleBounds(config),
+        z_index: i32 = config.z_index,
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -280,6 +297,10 @@ pub fn Toggle(comptime config: ToggleConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -359,14 +380,19 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderCheckboxBox(
                 allocator,
                 batch,
                 self.trackRect(),
                 self.trackColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
+                config.corner_radius,
+                config.border_width,
             );
-            try batch.rect(allocator, self.thumbRect(), config.thumb_color);
+            try batch.roundedRect(allocator, self.thumbRect(), config.thumb_color, 999.0);
             if (config.label.len > 0) {
                 const label_rect = self.labelRect();
                 try batch.text(allocator, label_rect, config.label, if (self.disabled) config.disabled_label_color else config.label_color, config.font_size, label_rect);
@@ -438,9 +464,8 @@ fn inputFromSdl(event: *const sdl.Event) ?Input {
     }
 }
 
-fn renderCheckboxBox(allocator: std.mem.Allocator, batch: *draw.RenderBatch, bounds: draw.Rect, background: draw.Color, border: draw.Color) !void {
-    try batch.rect(allocator, bounds, background);
-    try rectOutline(allocator, batch, bounds, border);
+fn renderCheckboxBox(allocator: std.mem.Allocator, batch: *draw.RenderBatch, bounds: draw.Rect, background: draw.Color, border: draw.Color, radius: f32, border_width: f32) !void {
+    try batch.panel(allocator, bounds, background, border, radius, border_width);
 }
 
 fn rectOutline(allocator: std.mem.Allocator, batch: *draw.RenderBatch, r: draw.Rect, color: draw.Color) !void {
@@ -526,9 +551,9 @@ test "checked checkbox renders mark" {
 
     try checkbox.render(std.testing.allocator, &batch);
 
-    try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
-    try std.testing.expectEqual(draw.CommandKind.rect, batch.commands.items[5].kind);
-    try std.testing.expect(batch.commands.items[5].rect.w < 20.0);
+    try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
+    try std.testing.expectEqual(draw.CommandKind.rect, batch.commands.items[1].kind);
+    try std.testing.expect(batch.commands.items[1].rect.w < 20.0);
 }
 
 test "toggle moves thumb when checked and supports space activation" {
@@ -542,8 +567,8 @@ test "toggle moves thumb when checked and supports space activation" {
     try std.testing.expect(toggle.checked);
     try toggle.render(std.testing.allocator, &batch);
 
-    try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
-    try std.testing.expect(batch.commands.items[5].rect.x > 20.0);
+    try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
+    try std.testing.expect(batch.commands.items[1].rect.x > 20.0);
 }
 
 test "checkbox and toggle support runtime bounds" {
@@ -558,8 +583,12 @@ test "checkbox and toggle support runtime bounds" {
     var checkbox_batch: draw.RenderBatch = .{};
     defer checkbox_batch.deinit(std.testing.allocator);
     try checkbox.render(std.testing.allocator, &checkbox_batch);
-    try std.testing.expectEqual(draw.CommandKind.text, checkbox_batch.commands.items[6].kind);
-    try std.testing.expectEqualStrings("Ready", checkbox_batch.commands.items[6].text);
+    var text_command: ?draw.Command = null;
+    for (checkbox_batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqualStrings("Ready", text_command.?.text);
 
     const Switch = Toggle(.{ .label = "Fast" });
     var toggle = Switch.init(false);

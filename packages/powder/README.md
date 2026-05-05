@@ -295,6 +295,59 @@ authoritative: it is the same layout Powder used for hit testing, wrapping,
 cursor movement, selection, and scrolling. Hosts should not re-wrap those
 commands.
 
+## Z-Index
+
+Render commands carry `z_index`. Higher z-index commands draw later, and equal
+z-index commands keep insertion order.
+
+```zig
+var batch: powder.RenderBatch = .{};
+
+try batch.rect(allocator, background_rect, background_color);
+const previous_z = batch.setZIndex(100);
+try batch.rect(allocator, floating_rect, floating_color);
+batch.restoreZIndex(previous_z);
+```
+
+Runtime-positioned controls expose `setZIndex()` where overlapping is common:
+`Button`, `IconButton`, `Select`, `TextInput`, `TextArea`, `Checkbox`, `Toggle`,
+and `Image`. `Select` also has `setMenuZOffset()` and defaults its dropdown menu
+to an overlay z above its control, so a menu can overlap later layout sections
+without being hidden.
+
+## Shape And Borders
+
+Powder render commands carry renderer-neutral shape style. Hosts should consume
+these fields directly instead of guessing from rect size:
+
+- `radius`
+- `border_width`
+- `border_color`
+
+Use batch helpers when emitting custom surfaces:
+
+```zig
+try batch.roundedRect(allocator, rect, background, 10);
+try batch.rectBorder(allocator, rect, border, 10, 1);
+try batch.panel(allocator, rect, background, border, 10, 1);
+```
+
+Core controls expose matching config fields and emit styled commands themselves:
+`corner_radius`, `border_width`, and for `Select` also `menu_corner_radius`.
+Buttons also support centered icon text for send-style actions:
+
+```zig
+const Send = powder.button(.{
+    .icon_text = ">",
+    .font_size = 18,
+    .corner_radius = 999,
+});
+```
+
+The SDL presenters draw rounded fills and borders from those command fields.
+The GPU mesh path preserves the same command data and draws rectangular
+fallback borders until a rounded GPU path is wired in.
+
 ## Images And Textures
 
 Powder image rendering is command-based, like text and rectangles. Components

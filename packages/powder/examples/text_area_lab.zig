@@ -26,6 +26,8 @@ const Composer = powder.textArea(.{
     .font_size = 17,
     .glyph_width = COMPOSER_DEBUG_CHAR_WIDTH,
     .line_height = COMPOSER_LINE_HEIGHT,
+    .corner_radius = 12,
+    .border_width = 1.5,
     .placeholder_text = "Ask Powder to compose something...",
     .submit_on_enter = true,
 });

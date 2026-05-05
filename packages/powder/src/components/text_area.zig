@@ -20,6 +20,8 @@ pub const TextAreaConfig = struct {
     padding_y: f32 = 8.0,
     background_color: draw.Color = .{ .r = 0.07, .g = 0.08, .b = 0.09, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.18, .g = 0.21, .b = 0.24, .a = 1.0 },
+    corner_radius: f32 = 6.0,
+    border_width: f32 = 1.0,
     text_color: draw.Color = draw.Color.white,
     cursor_color: draw.Color = draw.Color.white,
     selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
@@ -37,6 +39,7 @@ pub const TextAreaConfig = struct {
     wrap: bool = true,
     scroll_enabled: bool = true,
     submit_on_enter: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const Input = union(enum) {
@@ -110,6 +113,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         scrollbar_drag_offset_y: f32 = 0.0,
         bounds_rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
         callbacks: TextAreaCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -178,6 +182,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             self.bounds_rect = rect;
             self.setScrollY(self.scroll_y);
             self.ensureCursorVisible();
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -317,8 +325,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const bounds_rect = self.bounds();
             const text_rect = self.textRect();
-            try batch.rect(allocator, bounds_rect, config.background_color);
-            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
+            try batch.panel(allocator, bounds_rect, config.background_color, config.border_color, config.corner_radius, config.border_width);
             if (self.selection()) |range| {
                 try self.renderSelection(allocator, batch, range.start, range.end);
             }
