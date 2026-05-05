@@ -20,6 +20,18 @@ const Composer = powder.composerPrompt(.{
     .send_icon = "^",
 });
 
+const LabState = struct {
+    text_changes: usize = 0,
+    submits: usize = 0,
+    model_clicks: usize = 0,
+    model_changes: usize = 0,
+    reasoning_clicks: usize = 0,
+    reasoning_changes: usize = 0,
+    fast_changes: usize = 0,
+    access_changes: usize = 0,
+    send_clicks: usize = 0,
+};
+
 pub export fn powder_composer_prompt_lab_main() c_int {
     run() catch |err| {
         std.debug.print("powder composer_prompt_lab failed: {s}\n", .{@errorName(err)});
@@ -50,13 +62,15 @@ pub fn run() !void {
     defer sdl.stopTextInput(window) catch {};
 
     var composer = Composer.init();
-    var prompt_text: std.ArrayList(u8) = .empty;
-    defer prompt_text.deinit(allocator);
+    defer composer.deinit(allocator);
+    var state: LabState = .{};
+    composer.setCallbacks(.{ .context = &state, .on_event = handleComposerEvent });
+    composer.setModelOptions(null, 3, modelOptionLabel);
+    composer.setReasoningOptions(null, 3, reasoningOptionLabel);
     var batch: powder.RenderBatch = .{};
     defer batch.deinit(allocator);
 
     var running = true;
-    var clicks: ClickCounts = .{};
     var frame_index: usize = 0;
 
     std.debug.print("powder composer_prompt_lab started; close the window or press Ctrl+C to exit.\n", .{});
@@ -69,29 +83,14 @@ pub fn run() !void {
         while (sdl.pollEvent(&event)) {
             switch (event.type) {
                 .quit, .window_close_requested => running = false,
-                .text_input => {
-                    try prompt_text.appendSlice(allocator, std.mem.span(event.text.text));
-                    composer.setText(prompt_text.items);
-                },
                 .key_down => {
-                    if (event.key.key == .backspace and prompt_text.items.len > 0) {
-                        _ = prompt_text.pop();
-                        composer.setText(prompt_text.items);
-                    } else if (event.key.key == .escape) {
+                    if (event.key.key == .escape) {
                         running = false;
-                    }
-                },
-                .mouse_motion => _ = composer.updateHover(.{ .x = event.motion.x, .y = event.motion.y }),
-                .mouse_button_down => {
-                    const point: powder.draw.Vec2 = .{ .x = event.button.x, .y = event.button.y };
-                    if (composer.hitTest(point)) |part| {
-                        clicks.add(part);
-                        composer.setHoveredPart(part);
                     } else {
-                        composer.setHoveredPart(null);
+                        _ = try composer.update(allocator, &event);
                     }
                 },
-                else => {},
+                else => _ = try composer.update(allocator, &event),
             }
         }
 
@@ -104,9 +103,9 @@ pub fn run() !void {
         try sdl.renderClear(renderer);
         var presenter = powder.renderer.sdlFontRenderer(renderer, font, LABEL_FONT_SIZE);
         try presenter.renderBatch(&batch);
-        try drawFrameLabels(&presenter, composer_rect, prompt_text.items.len, clicks, counts, frame_index);
+        try drawFrameLabels(&presenter, composer_rect, composer.text().len, state, counts, frame_index);
         sdl.renderPresent(renderer);
-        updateWindowTitle(window, prompt_text.items.len, clicks, counts, frame_index);
+        updateWindowTitle(window, composer.text().len, state, counts, frame_index);
         sdl.delay(16);
     }
 }
@@ -141,24 +140,6 @@ const Counts = struct {
     separators: usize = 0,
 };
 
-const ClickCounts = struct {
-    model: usize = 0,
-    reasoning: usize = 0,
-    fast: usize = 0,
-    access: usize = 0,
-    send: usize = 0,
-
-    fn add(self: *ClickCounts, part: powder.ComposerPromptPart) void {
-        switch (part) {
-            .model => self.model += 1,
-            .reasoning => self.reasoning += 1,
-            .fast => self.fast += 1,
-            .access => self.access += 1,
-            .send => self.send += 1,
-        }
-    }
-};
-
 fn countBatch(batch: powder.RenderBatch) Counts {
     var counts: Counts = .{ .commands = batch.commands.items.len };
     for (batch.commands.items) |command| {
@@ -173,18 +154,18 @@ fn countBatch(batch: powder.RenderBatch) Counts {
     return counts;
 }
 
-fn drawFrameLabels(presenter: *powder.renderer.SdlFontRenderer, composer_rect: powder.Rect, prompt_bytes: usize, clicks: ClickCounts, counts: Counts, frame_index: usize) !void {
+fn drawFrameLabels(presenter: *powder.renderer.SdlFontRenderer, composer_rect: powder.Rect, prompt_bytes: usize, state: LabState, counts: Counts, frame_index: usize) !void {
     try label(presenter, composer_rect.x, 42, "Powder Composer Prompt Lab", .{ 235, 241, 248, 255 });
     try label(presenter, composer_rect.x, 66, "Type prompt text. Hover/click toolbar controls and send. Resize the window.", .{ 166, 180, 198, 255 });
 
     var status_buf: [256]u8 = undefined;
     const status = try std.fmt.bufPrint(&status_buf, "prompt={d} model={d} reasoning={d} fast={d} access={d} send={d} commands={d} text={d} icons={d} separators={d} frame={d}", .{
         prompt_bytes,
-        clicks.model,
-        clicks.reasoning,
-        clicks.fast,
-        clicks.access,
-        clicks.send,
+        state.model_changes + state.model_clicks,
+        state.reasoning_changes + state.reasoning_clicks,
+        state.fast_changes,
+        state.access_changes,
+        state.send_clicks,
         counts.commands,
         counts.text_commands,
         counts.icon_runs,
@@ -207,15 +188,47 @@ fn colorFromBytes(color: [4]u8) powder.Color {
     };
 }
 
-fn updateWindowTitle(window: *sdl.Window, prompt_bytes: usize, clicks: ClickCounts, counts: Counts, frame_index: usize) void {
+fn updateWindowTitle(window: *sdl.Window, prompt_bytes: usize, state: LabState, counts: Counts, frame_index: usize) void {
     var title_buffer: [256:0]u8 = undefined;
     @memset(&title_buffer, 0);
     const title = std.fmt.bufPrintZ(
         &title_buffer,
         "Powder Composer Prompt Lab | prompt={d} model={d} reasoning={d} fast={d} access={d} send={d} commands={d} frame={d}",
-        .{ prompt_bytes, clicks.model, clicks.reasoning, clicks.fast, clicks.access, clicks.send, counts.commands, frame_index },
+        .{ prompt_bytes, state.model_changes + state.model_clicks, state.reasoning_changes + state.reasoning_clicks, state.fast_changes, state.access_changes, state.send_clicks, counts.commands, frame_index },
     ) catch return;
     sdl.Window.setTitle(window, title);
+}
+
+fn handleComposerEvent(context: ?*anyopaque, event: powder.ComposerPromptEvent) void {
+    const state: *LabState = @ptrCast(@alignCast(context orelse return));
+    switch (event) {
+        .text_changed => state.text_changes += 1,
+        .submitted => state.submits += 1,
+        .model_clicked => state.model_clicks += 1,
+        .model_changed => state.model_changes += 1,
+        .reasoning_clicked => state.reasoning_clicks += 1,
+        .reasoning_changed => state.reasoning_changes += 1,
+        .fast_changed => state.fast_changes += 1,
+        .access_changed => state.access_changes += 1,
+        .send_clicked => state.send_clicks += 1,
+        .focus_changed => {},
+    }
+}
+
+fn modelOptionLabel(_: ?*anyopaque, index: usize) []const u8 {
+    return switch (index) {
+        0 => "GPT-5.5",
+        1 => "GPT-5.4",
+        else => "Local draft",
+    };
+}
+
+fn reasoningOptionLabel(_: ?*anyopaque, index: usize) []const u8 {
+    return switch (index) {
+        0 => "Low",
+        1 => "Medium",
+        else => "High",
+    };
 }
 
 fn labWindowFlags() sdl.Window.Flags {
