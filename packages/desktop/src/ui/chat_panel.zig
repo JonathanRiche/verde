@@ -4068,11 +4068,11 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
 
     const draw_list = zgui.getWindowDrawList();
-    const visual_h = theme.scaledUi(52.0);
+    const visual_h = theme.scaledUi(40.0);
     const visual_rect: powder.Rect = .{
-        .x = rect.x - theme.scaledUi(2.0),
+        .x = rect.x,
         .y = rect.y + (rect.h - visual_h) * 0.5,
-        .w = rect.w + theme.scaledUi(4.0),
+        .w = rect.w,
         .h = visual_h,
     };
     const pmin: [2]f32 = .{ visual_rect.x, visual_rect.y };
@@ -4085,10 +4085,10 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
     });
 
     const text_col = zgui.colorConvertFloat4ToU32(.{ 0.90, 0.92, 0.97, 1.0 });
-    const font_size = theme.scaledUi(34.0);
-    const icon_size = theme.scaledUi(38.0);
+    const font_size = theme.scaledUi(26.0);
+    const icon_size = theme.scaledUi(30.0);
     const center_y = visual_rect.y + visual_rect.h * 0.5;
-    var x = visual_rect.x + theme.scaledUi(22.0);
+    var x = visual_rect.x + theme.scaledUi(16.0);
     const text_y = center_y - font_size * 0.5;
 
     switch (icon) {
@@ -4100,11 +4100,11 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
                 "⚡",
                 .{ .font = zgui.getFont(), .font_size = icon_size },
             );
-            x += theme.scaledUi(34.0);
+            x += theme.scaledUi(28.0);
         },
         .lock => {
             drawLockIcon(draw_list, x, center_y, .{ 0.70, 0.73, 0.80, 1.0 }, icon_locked);
-            x += theme.scaledUi(34.0);
+            x += theme.scaledUi(30.0);
         },
     }
 
@@ -4117,7 +4117,7 @@ fn drawPowderComposerBadge(rect: powder.Rect, label: []const u8, icon: ComposerB
 
     if (chevron) {
         draw_list.addTextExtendedUnformatted(
-            .{ visual_rect.x + visual_rect.w - theme.scaledUi(28.0), text_y },
+            .{ visual_rect.x + visual_rect.w - theme.scaledUi(22.0), text_y },
             text_col,
             "›",
             .{ .font = zgui.getFont(), .font_size = font_size },
@@ -4152,9 +4152,9 @@ fn drawPowderComposerStopButton(state: *app_state.AppState) void {
 
 fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
     const col = zgui.colorConvertFloat4ToU32(color);
-    const t = theme.scaledUi(2.6);
-    const bw = theme.scaledUi(18.0);
-    const bh = theme.scaledUi(12.0);
+    const t = theme.scaledUi(2.0);
+    const bw = theme.scaledUi(14.0);
+    const bh = theme.scaledUi(9.0);
     const body_top = center_y - theme.scaledUi(0.5);
 
     draw_list.addRectFilled(.{
@@ -4164,9 +4164,9 @@ fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, 
         .rounding = theme.scaledUi(1.5),
     });
 
-    const sw = theme.scaledUi(10.0);
-    const sh = theme.scaledUi(9.0);
-    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(4.0);
+    const sw = theme.scaledUi(8.0);
+    const sh = theme.scaledUi(7.0);
+    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(3.0);
     const sl = x + shackle_offset;
     const sr = sl + sw;
     const stop = body_top - sh;
