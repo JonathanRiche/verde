@@ -21,12 +21,20 @@ pub const ButtonConfig = struct {
     padding_x: f32 = 10.0,
     padding_y: f32 = 6.0,
     label: []const u8 = "",
+    leading_icon: []const u8 = "",
+    trailing_icon: []const u8 = "",
     icon_text: []const u8 = "",
     content_align: ButtonContentAlign = .center,
     font_size: f32 = 14.0,
     icon_font_size: ?f32 = null,
+    icon_gap: f32 = 6.0,
+    font_role: ?draw.FontRole = .ui,
+    icon_font_role: ?draw.FontRole = .icon,
+    font_id: ?u32 = null,
+    icon_font_id: ?u32 = null,
     corner_radius: f32 = 4.0,
     border_width: f32 = 1.0,
+    circular: bool = false,
     background_color: draw.Color = .{ .r = 0.15, .g = 0.18, .b = 0.21, .a = 1.0 },
     hover_color: draw.Color = .{ .r = 0.20, .g = 0.24, .b = 0.28, .a = 1.0 },
     pressed_color: draw.Color = .{ .r = 0.11, .g = 0.14, .b = 0.17, .a = 1.0 },
@@ -34,7 +42,9 @@ pub const ButtonConfig = struct {
     border_color: draw.Color = .{ .r = 0.30, .g = 0.34, .b = 0.39, .a = 1.0 },
     focus_color: draw.Color = .{ .r = 0.32, .g = 0.58, .b = 0.88, .a = 1.0 },
     text_color: draw.Color = draw.Color.white,
+    icon_color: draw.Color = draw.Color.white,
     disabled_text_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
+    disabled_icon_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
     z_index: i32 = 0,
 };
@@ -46,8 +56,13 @@ pub const IconButtonConfig = struct {
     height: f32 = 32.0,
     icon_inset: f32 = 8.0,
     icon_uv: draw.Rect = .{},
+    icon_text: []const u8 = "",
+    font_size: f32 = 16.0,
+    icon_font_role: ?draw.FontRole = .icon,
+    icon_font_id: ?u32 = null,
     corner_radius: f32 = 4.0,
     border_width: f32 = 1.0,
+    circular: bool = false,
     background_color: draw.Color = .{ .r = 0.15, .g = 0.18, .b = 0.21, .a = 1.0 },
     hover_color: draw.Color = .{ .r = 0.20, .g = 0.24, .b = 0.28, .a = 1.0 },
     pressed_color: draw.Color = .{ .r = 0.11, .g = 0.14, .b = 0.17, .a = 1.0 },
@@ -132,11 +147,9 @@ pub fn Button(comptime config: ButtonConfig) type {
 
         pub fn labelRect(self: *const Component) draw.Rect {
             const bounds_rect = self.bounds();
-            const available_w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0);
-            const metrics_value = self.metrics();
-            const text_value = self.displayText();
-            const text_w = @min(metrics_value.measureSlice(text_value), available_w);
-            const text_h = @max(@min(metrics_value.line_height, bounds_rect.h - config.padding_y * 2.0), 1.0);
+            const group = self.contentMetrics();
+            const text_w = @min(group.width, @max(bounds_rect.w - config.padding_x * 2.0, 0.0));
+            const text_h = @max(@min(group.height, bounds_rect.h - config.padding_y * 2.0), 1.0);
             const x = switch (config.content_align) {
                 .start => bounds_rect.x + config.padding_x,
                 .center => bounds_rect.x + (bounds_rect.w - text_w) * 0.5,
@@ -212,27 +225,10 @@ pub fn Button(comptime config: ButtonConfig) type {
                 self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
-                config.corner_radius,
+                self.cornerRadius(),
                 config.border_width,
             );
-            const text_value = self.displayText();
-            if (text_value.len > 0) {
-                const rect = self.labelRect();
-                const color = if (self.disabled) config.disabled_text_color else config.text_color;
-                const metrics_value = self.metrics();
-                const runs = [_]draw.TextRun{.{
-                    .text = text_value,
-                    .byte_start = 0,
-                    .byte_end = text_value.len,
-                    .x = rect.x,
-                    .y = rect.y,
-                    .font_size = metrics_value.font_size,
-                    .line_height = metrics_value.line_height,
-                    .color = color,
-                    .clip = self.bounds(),
-                }};
-                try batch.textRuns(allocator, rect, text_value, &runs, color, metrics_value.font_size, self.bounds(), metrics_value.line_height, metrics_value.fixedAdvance());
-            }
+            try self.renderContent(allocator, batch);
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -265,12 +261,84 @@ pub fn Button(comptime config: ButtonConfig) type {
 
         fn metrics(self: *const Component) text_layout.FontMetrics {
             if (self.font_metrics) |metrics_value| return metrics_value;
-            const font_size = if (config.icon_text.len > 0) (config.icon_font_size orelse config.font_size) else config.font_size;
-            return text_layout.FontMetrics.fallback(font_size);
+            return text_layout.FontMetrics.fallback(config.font_size);
         }
 
         fn displayText(_: *const Component) []const u8 {
             return if (config.icon_text.len > 0) config.icon_text else config.label;
+        }
+
+        fn cornerRadius(self: *const Component) f32 {
+            return if (config.circular) @min(self.bounds().w, self.bounds().h) * 0.5 else config.corner_radius;
+        }
+
+        fn contentMetrics(self: *const Component) struct { width: f32, height: f32 } {
+            var width: f32 = 0.0;
+            var height: f32 = 0.0;
+            var count: usize = 0;
+            self.visitContentRuns(&width, &height, &count, null);
+            if (count > 1) width += config.icon_gap * @as(f32, @floatFromInt(count - 1));
+            return .{ .width = width, .height = height };
+        }
+
+        fn renderContent(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            if (self.contentMetrics().width <= 0.0) return;
+            var runs: [3]draw.TextRun = undefined;
+            var count: usize = 0;
+            var unused_width: f32 = 0.0;
+            var unused_height: f32 = 0.0;
+            self.visitContentRuns(&unused_width, &unused_height, &count, &runs);
+            const rect = self.labelRect();
+            var x = rect.x;
+            for (runs[0..count], 0..) |*run, index| {
+                run.x = x;
+                run.y = self.bounds().y + @max((self.bounds().h - run.line_height) * 0.5, 0.0);
+                x += self.measureRun(run.text, run.font_size);
+                if (index + 1 < count) x += config.icon_gap;
+            }
+            try batch.textRuns(allocator, rect, self.displayText(), runs[0..count], if (self.disabled) config.disabled_text_color else config.text_color, config.font_size, self.bounds(), @max(rect.h, 1.0), self.metrics().fixedAdvance());
+        }
+
+        fn visitContentRuns(self: *const Component, width: *f32, height: *f32, count: *usize, out: ?*[3]draw.TextRun) void {
+            if (config.icon_text.len > 0) {
+                self.addContentRun(config.icon_text, true, width, height, count, out);
+                return;
+            }
+            self.addContentRun(config.leading_icon, true, width, height, count, out);
+            self.addContentRun(config.label, false, width, height, count, out);
+            self.addContentRun(config.trailing_icon, true, width, height, count, out);
+        }
+
+        fn addContentRun(self: *const Component, value: []const u8, icon: bool, width: *f32, height: *f32, count: *usize, out: ?*[3]draw.TextRun) void {
+            if (value.len == 0) return;
+            const font_size = if (icon) (config.icon_font_size orelse config.font_size) else config.font_size;
+            const line_height = if (self.font_metrics) |metrics_value| metrics_value.line_height else font_size * 1.25;
+            const color = if (self.disabled)
+                if (icon) config.disabled_icon_color else config.disabled_text_color
+            else if (icon) config.icon_color else config.text_color;
+            if (out) |runs| {
+                runs[count.*] = .{
+                    .text = value,
+                    .byte_start = 0,
+                    .byte_end = value.len,
+                    .font_size = font_size,
+                    .line_height = line_height,
+                    .color = color,
+                    .clip = self.bounds(),
+                    .font_role = if (icon) config.icon_font_role else config.font_role,
+                    .font_id = if (icon) config.icon_font_id else config.font_id,
+                };
+            }
+            count.* += 1;
+            width.* += self.measureRun(value, font_size);
+            height.* = @max(height.*, line_height);
+        }
+
+        fn measureRun(self: *const Component, value: []const u8, font_size: f32) f32 {
+            if (self.font_metrics) |metrics_value| {
+                if (font_size == metrics_value.font_size) return metrics_value.measureSlice(value);
+            }
+            return text_layout.FontMetrics.fallback(font_size).measureSlice(value);
         }
     };
 }
@@ -385,10 +453,29 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
                 self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
-                config.corner_radius,
+                self.cornerRadius(),
                 config.border_width,
             );
-            try batch.image(allocator, self.iconRect(), .invalid, config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color, self.bounds());
+            if (config.icon_text.len > 0) {
+                const rect = self.iconTextRect();
+                const color = if (self.disabled) config.disabled_icon_color else config.icon_color;
+                const runs = [_]draw.TextRun{.{
+                    .text = config.icon_text,
+                    .byte_start = 0,
+                    .byte_end = config.icon_text.len,
+                    .x = rect.x,
+                    .y = rect.y,
+                    .font_size = config.font_size,
+                    .line_height = config.font_size * 1.25,
+                    .color = color,
+                    .clip = self.bounds(),
+                    .font_role = config.icon_font_role,
+                    .font_id = config.icon_font_id,
+                }};
+                try batch.textRuns(allocator, rect, config.icon_text, &runs, color, config.font_size, self.bounds(), config.font_size * 1.25, config.font_size * 0.55);
+            } else {
+                try batch.image(allocator, self.iconRect(), .invalid, config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color, self.bounds());
+            }
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -417,6 +504,22 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
             if (self.pressed) return config.pressed_color;
             if (self.hovered) return config.hover_color;
             return config.background_color;
+        }
+
+        fn cornerRadius(self: *const Component) f32 {
+            return if (config.circular) @min(self.bounds().w, self.bounds().h) * 0.5 else config.corner_radius;
+        }
+
+        fn iconTextRect(self: *const Component) draw.Rect {
+            const bounds_rect = self.bounds();
+            const width = text_layout.FontMetrics.fallback(config.font_size).measureSlice(config.icon_text);
+            const height = config.font_size * 1.25;
+            return .{
+                .x = bounds_rect.x + (bounds_rect.w - width) * 0.5,
+                .y = bounds_rect.y + (bounds_rect.h - height) * 0.5,
+                .w = width,
+                .h = height,
+            };
         }
     };
 }
@@ -546,6 +649,25 @@ test "button supports runtime bounds for hit testing and text rendering" {
     try std.testing.expect(text_command != null);
     try std.testing.expectEqualStrings("Send", text_command.?.text);
     try std.testing.expect(text_command.?.rect.x > 120);
+}
+
+test "button emits icon and label text runs with roles" {
+    const Action = Button(.{ .label = "Send", .leading_icon = ">", .trailing_icon = "v", .font_size = 14 });
+    var button = Action.init();
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try button.render(std.testing.allocator, &batch);
+
+    var text_command: ?draw.Command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqual(@as(usize, 3), text_command.?.text_runs.len);
+    try std.testing.expectEqual(@as(?draw.FontRole, .icon), text_command.?.text_runs[0].font_role);
+    try std.testing.expectEqual(@as(?draw.FontRole, .ui), text_command.?.text_runs[1].font_role);
+    try std.testing.expectEqual(@as(?draw.FontRole, .icon), text_command.?.text_runs[2].font_role);
 }
 
 test "icon button supports runtime bounds for hit testing and icon geometry" {

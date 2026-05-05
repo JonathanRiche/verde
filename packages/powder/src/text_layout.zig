@@ -70,6 +70,8 @@ pub const Options = struct {
     text: []const u8,
     color: draw.Color,
     metrics: FontMetrics,
+    font_role: ?draw.FontRole = null,
+    font_id: ?u32 = null,
     wrap: bool = true,
     scroll: draw.Vec2 = .{},
     clip: ?draw.Rect = null,
@@ -95,6 +97,8 @@ pub fn appendRuns(allocator: std.mem.Allocator, options: Options, out: *std.Arra
             .line_height = options.metrics.line_height,
             .color = options.color,
             .clip = options.clip,
+            .font_role = options.font_role,
+            .font_id = options.font_id,
         });
     }
 }

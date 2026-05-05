@@ -8,6 +8,11 @@ const scroll = @import("../scroll.zig");
 const sdl = @import("../sdl.zig");
 const text_layout = @import("../text_layout.zig");
 
+pub const SelectVariant = enum {
+    regular,
+    compact,
+};
+
 pub const SelectConfig = struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
@@ -18,13 +23,29 @@ pub const SelectConfig = struct {
     padding_y: f32 = 6.0,
     row_height: f32 = 28.0,
     glyph_width: f32 = 8.0,
+    variant: SelectVariant = .regular,
+    auto_width: bool = false,
+    left_icon: []const u8 = "",
+    chevron_icon: []const u8 = "v",
+    icon_gap: f32 = 6.0,
+    icon_font_size: ?f32 = null,
+    font_role: ?draw.FontRole = .ui,
+    icon_font_role: ?draw.FontRole = .icon,
+    font_id: ?u32 = null,
+    icon_font_id: ?u32 = null,
     background_color: draw.Color = .{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 },
+    compact_background_color: draw.Color = .{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 0.0 },
+    hover_color: draw.Color = .{ .r = 0.20, .g = 0.23, .b = 0.26, .a = 0.55 },
+    active_color: draw.Color = .{ .r = 0.18, .g = 0.22, .b = 0.26, .a = 0.70 },
     border_color: draw.Color = .{ .r = 0.22, .g = 0.25, .b = 0.30, .a = 1.0 },
+    compact_border_color: ?draw.Color = null,
     menu_color: draw.Color = .{ .r = 0.06, .g = 0.07, .b = 0.09, .a = 1.0 },
     corner_radius: f32 = 5.0,
     menu_corner_radius: f32 = 6.0,
     border_width: f32 = 1.0,
+    compact_border_width: f32 = 0.0,
     text_color: draw.Color = draw.Color.white,
+    icon_color: draw.Color = draw.Color.white,
     selected_color: draw.Color = .{ .r = 0.16, .g = 0.36, .b = 0.58, .a = 0.88 },
     highlighted_color: draw.Color = .{ .r = 0.32, .g = 0.36, .b = 0.42, .a = 0.62 },
     scrollbar_track_color: draw.Color = .{ .r = 0.18, .g = 0.20, .b = 0.23, .a = 0.42 },
@@ -77,6 +98,7 @@ pub fn Select(comptime config: SelectConfig) type {
         selected_index: ?usize = null,
         highlighted_index: ?usize = null,
         open: bool = false,
+        hovered: bool = false,
         focused: bool = false,
         scroll_y: f32 = 0.0,
         dragging_scrollbar: bool = false,
@@ -146,6 +168,13 @@ pub fn Select(comptime config: SelectConfig) type {
         }
 
         pub fn controlRect(self: *const Component) draw.Rect {
+            if (config.auto_width) {
+                var control = self.bounds();
+                if (self.selected_index) |index| {
+                    if (self.itemLabel(index)) |label| control.w = @min(control.w, self.preferredWidth(label));
+                }
+                return control;
+            }
             return self.bounds();
         }
 
@@ -194,6 +223,7 @@ pub fn Select(comptime config: SelectConfig) type {
             switch (input) {
                 .key => |key| return self.handleKey(key),
                 .mouse_down => |mouse| {
+                    self.hovered = self.controlRect().contains(mouse.point);
                     if (self.controlRect().contains(mouse.point)) {
                         self.focused = true;
                         if (self.open) {
@@ -231,7 +261,9 @@ pub fn Select(comptime config: SelectConfig) type {
                     return true;
                 },
                 .mouse_move => |point| {
-                    if (!self.open or !self.menuRect().contains(point)) return false;
+                    const was_hovered = self.hovered;
+                    self.hovered = self.controlRect().contains(point);
+                    if (!self.open or !self.menuRect().contains(point)) return self.hovered or was_hovered != self.hovered;
                     if (self.indexAtPoint(point)) |index| self.setHighlighted(index);
                     return true;
                 },
@@ -266,11 +298,10 @@ pub fn Select(comptime config: SelectConfig) type {
             defer batch.restoreZIndex(previous_z);
 
             const control = self.controlRect();
-            try batch.panel(allocator, control, config.background_color, config.border_color, config.corner_radius, config.border_width);
+            try batch.panel(allocator, control, self.controlBackgroundColor(), self.controlBorderColor(), config.corner_radius, self.controlBorderWidth());
             if (self.selected_index) |index| {
                 if (self.itemLabel(index)) |label| {
-                    const text_rect = self.controlTextRect(label);
-                    try self.renderLabel(allocator, batch, text_rect, label, config.text_color, text_rect);
+                    try self.renderControlLabel(allocator, batch, label);
                 }
             }
 
@@ -438,6 +469,14 @@ pub fn Select(comptime config: SelectConfig) type {
             };
         }
 
+        pub fn preferredWidth(self: *const Component, label: []const u8) f32 {
+            const metrics_value = self.metrics();
+            var width = config.padding_x * 2.0 + metrics_value.measureSlice(label);
+            if (config.left_icon.len > 0) width += self.iconMetrics().measureSlice(config.left_icon) + config.icon_gap;
+            if (config.chevron_icon.len > 0) width += self.iconMetrics().measureSlice(config.chevron_icon) + config.icon_gap;
+            return width;
+        }
+
         fn itemTextRect(self: *const Component, label: []const u8, row: draw.Rect) draw.Rect {
             const metrics_value = self.metrics();
             const text_h = @min(row.h, metrics_value.line_height);
@@ -466,13 +505,103 @@ pub fn Select(comptime config: SelectConfig) type {
                 .line_height = metrics_value.line_height,
                 .color = color,
                 .clip = clip,
+                .font_role = config.font_role,
+                .font_id = config.font_id,
             }};
             try batch.textRuns(allocator, rect, label, &runs, color, metrics_value.font_size, clip, metrics_value.line_height, metrics_value.fixedAdvance());
+        }
+
+        fn renderControlLabel(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, label: []const u8) !void {
+            const control = self.controlRect();
+            const metrics_value = self.metrics();
+            const icon_metrics = self.iconMetrics();
+            var runs: [3]draw.TextRun = undefined;
+            var count: usize = 0;
+            var x = control.x + config.padding_x;
+            if (config.left_icon.len > 0) {
+                runs[count] = .{
+                    .text = config.left_icon,
+                    .byte_start = 0,
+                    .byte_end = config.left_icon.len,
+                    .x = x,
+                    .y = control.y + @max((control.h - icon_metrics.line_height) * 0.5, 0.0),
+                    .font_size = icon_metrics.font_size,
+                    .line_height = icon_metrics.line_height,
+                    .color = config.icon_color,
+                    .clip = control,
+                    .font_role = config.icon_font_role,
+                    .font_id = config.icon_font_id,
+                };
+                x += icon_metrics.measureSlice(config.left_icon) + config.icon_gap;
+                count += 1;
+            }
+            runs[count] = .{
+                .text = label,
+                .byte_start = 0,
+                .byte_end = label.len,
+                .x = x,
+                .y = control.y + @max((control.h - metrics_value.line_height) * 0.5, 0.0),
+                .font_size = metrics_value.font_size,
+                .line_height = metrics_value.line_height,
+                .color = config.text_color,
+                .clip = control,
+                .font_role = config.font_role,
+                .font_id = config.font_id,
+            };
+            x += metrics_value.measureSlice(label) + config.icon_gap;
+            count += 1;
+            if (config.chevron_icon.len > 0) {
+                const chevron_w = icon_metrics.measureSlice(config.chevron_icon);
+                const chevron_x = @max(x, control.x + control.w - config.padding_x - chevron_w);
+                runs[count] = .{
+                    .text = config.chevron_icon,
+                    .byte_start = 0,
+                    .byte_end = config.chevron_icon.len,
+                    .x = chevron_x,
+                    .y = control.y + @max((control.h - icon_metrics.line_height) * 0.5, 0.0),
+                    .font_size = icon_metrics.font_size,
+                    .line_height = icon_metrics.line_height,
+                    .color = config.icon_color,
+                    .clip = control,
+                    .font_role = config.icon_font_role,
+                    .font_id = config.icon_font_id,
+                };
+                count += 1;
+            }
+            try batch.textRuns(allocator, control, label, runs[0..count], config.text_color, metrics_value.font_size, control, metrics_value.line_height, metrics_value.fixedAdvance());
         }
 
         fn metrics(self: *const Component) text_layout.FontMetrics {
             if (self.font_metrics) |metrics_value| return metrics_value;
             return text_layout.FontMetrics.fixed(config.glyph_width / 0.55, config.glyph_width, config.row_height);
+        }
+
+        fn iconMetrics(_: *const Component) text_layout.FontMetrics {
+            const font_size = config.icon_font_size orelse config.glyph_width / 0.55;
+            return text_layout.FontMetrics.fallback(font_size);
+        }
+
+        fn controlBackgroundColor(self: *const Component) draw.Color {
+            if (self.open or self.focused) return config.active_color;
+            if (self.hovered) return config.hover_color;
+            return switch (config.variant) {
+                .regular => config.background_color,
+                .compact => config.compact_background_color,
+            };
+        }
+
+        fn controlBorderColor(_: *const Component) ?draw.Color {
+            return switch (config.variant) {
+                .regular => config.border_color,
+                .compact => config.compact_border_color,
+            };
+        }
+
+        fn controlBorderWidth(_: *const Component) f32 {
+            return switch (config.variant) {
+                .regular => config.border_width,
+                .compact => config.compact_border_width,
+            };
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
@@ -637,8 +766,30 @@ test "select supports runtime bounds menu bounds item count and text labels" {
     for (batch.commands.items) |command| {
         if (command.kind == .text and std.mem.eql(u8, command.text, "Bravo")) {
             found_label = true;
-            try std.testing.expectEqual(@as(f32, 44), command.clip.?.x);
+            try std.testing.expectEqual(@as(f32, 40), command.clip.?.x);
+            try std.testing.expect(command.text_runs.len >= 2);
         }
     }
     try std.testing.expect(found_label);
+}
+
+test "compact select emits icon label and chevron roles" {
+    const Dropdown = Select(.{ .variant = .compact, .left_icon = "O", .chevron_icon = ">", .item_label = testItemLabel, .item_count = 2 });
+    var select = Dropdown.initFromConfig();
+    select.selected_index = 0;
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try select.render(std.testing.allocator, &batch);
+
+    var text_command: ?draw.Command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqual(@as(usize, 3), text_command.?.text_runs.len);
+    try std.testing.expectEqual(@as(?draw.FontRole, .icon), text_command.?.text_runs[0].font_role);
+    try std.testing.expectEqual(@as(?draw.FontRole, .ui), text_command.?.text_runs[1].font_role);
+    try std.testing.expectEqual(@as(?draw.FontRole, .icon), text_command.?.text_runs[2].font_role);
+    try std.testing.expectEqual(@as(f32, 0.0), batch.commands.items[0].border_width);
 }
