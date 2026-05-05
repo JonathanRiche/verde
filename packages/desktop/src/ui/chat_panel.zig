@@ -3929,6 +3929,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
     queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
+    drawPowderComposerAccessIcon(state);
     state.updateFileSearch();
 
     if (state.hasActiveFileSearch()) {
@@ -4031,6 +4032,46 @@ fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command
                 .thickness = command.border_width,
             });
         }
+    }
+}
+
+fn drawPowderComposerAccessIcon(state: *app_state.AppState) void {
+    const rect = state.powder_composer.accessRect();
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const color = [4]f32{ 0.70, 0.73, 0.80, 1.0 };
+    const x = rect.x + theme.scaledUi(12.0);
+    const center_y = rect.y + rect.h * 0.5;
+    drawLockIcon(zgui.getWindowDrawList(), x, center_y, color, state.currentThread().access_mode == .supervised);
+}
+
+fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = theme.scaledUi(1.6);
+    const bw = theme.scaledUi(10.0);
+    const bh = theme.scaledUi(7.0);
+    const body_top = center_y - theme.scaledUi(0.5);
+
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, body_top },
+        .pmax = .{ x + bw, body_top + bh },
+        .col = col,
+        .rounding = theme.scaledUi(1.5),
+    });
+
+    const sw = theme.scaledUi(6.0);
+    const sh = theme.scaledUi(5.0);
+    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(2.5);
+    const sl = x + shackle_offset;
+    const sr = sl + sw;
+    const stop = body_top - sh;
+    const top_y = stop + theme.scaledUi(2.0);
+
+    draw_list.addLine(.{ .p1 = .{ sl, body_top }, .p2 = .{ sl, top_y }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ sl, top_y }, .p2 = .{ sr, top_y }, .col = col, .thickness = t });
+    if (locked) {
+        draw_list.addLine(.{ .p1 = .{ sr, top_y }, .p2 = .{ sr, body_top }, .col = col, .thickness = t });
+    } else {
+        draw_list.addLine(.{ .p1 = .{ sr, top_y }, .p2 = .{ sr, stop + theme.scaledUi(0.5) }, .col = col, .thickness = t });
     }
 }
 
