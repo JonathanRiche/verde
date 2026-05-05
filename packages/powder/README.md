@@ -348,6 +348,57 @@ The SDL presenters draw rounded fills and borders from those command fields.
 The GPU mesh path preserves the same command data and draws rectangular
 fallback borders until a rounded GPU path is wired in.
 
+## Rich Text
+
+`powder.text()` can render styled inline spans without host-side text splitting.
+Set spans on the retained Text instance and Powder emits laid-out `TextRun`s
+with per-run color and optional font size.
+
+```zig
+const Message = powder.text(.{ .width = 520, .height = 24, .glyph_width = 8 });
+var message = try Message.init(allocator, "Done for WIT-27.");
+try message.setSpans(allocator, &.{
+    .{ .start = 9, .end = 15, .color = .{ .r = 0.90, .g = 0.70, .b = 0.25, .a = 1.0 } },
+});
+try message.render(allocator, &batch);
+```
+
+This is intended for message text with inline code/status/link styling. Hosts
+draw the emitted runs directly; they do not need to infer which ranges should be
+highlighted.
+
+## Virtual Lists
+
+Use `powder.virtualList()` for large or variable-height scrollable lists such as
+chat history, saved chats, or project rows. The component owns scroll state,
+visible range calculation, row hit testing, selection/highlight state, scrollbar
+commands, and clipped text labels.
+
+```zig
+fn rowLabel(_: ?*anyopaque, index: usize) []const u8 {
+    return if (index == 0) "now" else "earlier";
+}
+
+fn rowHeight(_: ?*anyopaque, index: usize) f32 {
+    return if (index == 0) 64 else 36;
+}
+
+const Chats = powder.virtualList(.{
+    .item_count = 200,
+    .item_label = rowLabel,
+    .row_height_fn = rowHeight,
+    .corner_radius = 8,
+});
+
+var chats = Chats.initFromConfig();
+chats.setBounds(sidebar_rect);
+try chats.update(&event);
+try chats.render(allocator, &batch);
+```
+
+For custom row contents, use `visibleRange()` and `rowRect(index)` to render
+additional retained controls or app-owned commands into the returned row rects.
+
 ## Images And Textures
 
 Powder image rendering is command-based, like text and rectangles. Components

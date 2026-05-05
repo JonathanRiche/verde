@@ -17,6 +17,9 @@ composer through `powder.RenderBatch` plus Powder's SDL presenter, so the
 example does not manually lay out TextArea text or infer panel shape.
 
 The component lab opens a separate SDL3 window for the retained controls added after `TextArea`: text input, selectable text, button, icon button, checkbox, toggle, listbox, select, tabs, scroll area, menu, modal, table, and code view.
+The package also includes unit coverage for rich inline text spans and
+virtualized scroll lists; use the README snippets as the minimal integration
+examples for those APIs.
 
 The layout lab opens an SDL3 window for `powder.layout`. Resize it to inspect
 grid tracks, flex growth, flex wrapping, margins, padding, and runtime
