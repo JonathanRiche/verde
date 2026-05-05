@@ -19,6 +19,8 @@ pub const TextConfig = struct {
     font_size: f32 = 16.0,
     glyph_width: ?f32 = null,
     line_height: ?f32 = null,
+    font_role: ?draw.FontRole = .ui,
+    font_id: ?u32 = null,
     selectable: bool = false,
 };
 
@@ -27,6 +29,8 @@ pub const RichSpan = struct {
     end: usize,
     color: draw.Color,
     font_size: ?f32 = null,
+    font_role: ?draw.FontRole = null,
+    font_id: ?u32 = null,
 };
 
 pub const TextEvent = union(enum) {
@@ -244,6 +248,8 @@ pub fn Text(comptime config: TextConfig) type {
                     .line_height = Component.lineHeight(),
                     .color = config.color,
                     .clip = clip,
+                    .font_role = config.font_role,
+                    .font_id = config.font_id,
                 });
                 return;
             }
@@ -254,19 +260,19 @@ pub fn Text(comptime config: TextConfig) type {
                 const start = @min(span.start, self.buffer.items.len);
                 const end = @min(@max(span.end, start), self.buffer.items.len);
                 if (cursor < start) {
-                    x += try self.appendRun(allocator, out, cursor, start, x, config.color, config.font_size, clip);
+                    x += try self.appendRun(allocator, out, cursor, start, x, config.color, config.font_size, config.font_role, config.font_id, clip);
                 }
                 if (start < end) {
-                    x += try self.appendRun(allocator, out, start, end, x, span.color, span.font_size orelse config.font_size, clip);
+                    x += try self.appendRun(allocator, out, start, end, x, span.color, span.font_size orelse config.font_size, span.font_role orelse config.font_role, span.font_id orelse config.font_id, clip);
                 }
                 cursor = @max(cursor, end);
             }
             if (cursor < self.buffer.items.len) {
-                _ = try self.appendRun(allocator, out, cursor, self.buffer.items.len, x, config.color, config.font_size, clip);
+                _ = try self.appendRun(allocator, out, cursor, self.buffer.items.len, x, config.color, config.font_size, config.font_role, config.font_id, clip);
             }
         }
 
-        fn appendRun(self: *const Component, allocator: std.mem.Allocator, out: *std.ArrayList(draw.TextRun), start: usize, end: usize, x: f32, color: draw.Color, font_size: f32, clip: draw.Rect) !f32 {
+        fn appendRun(self: *const Component, allocator: std.mem.Allocator, out: *std.ArrayList(draw.TextRun), start: usize, end: usize, x: f32, color: draw.Color, font_size: f32, font_role: ?draw.FontRole, font_id: ?u32, clip: draw.Rect) !f32 {
             const metrics_value = text_layout.FontMetrics.fixed(font_size, config.glyph_width orelse font_size * 0.55, Component.lineHeight());
             try out.append(allocator, .{
                 .text = self.buffer.items[start..end],
@@ -278,6 +284,8 @@ pub fn Text(comptime config: TextConfig) type {
                 .line_height = Component.lineHeight(),
                 .color = color,
                 .clip = clip,
+                .font_role = font_role,
+                .font_id = font_id,
             });
             return metrics_value.measureSlice(self.buffer.items[start..end]);
         }

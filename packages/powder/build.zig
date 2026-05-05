@@ -79,15 +79,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .powder_mod = powder_mod,
     });
+    const composer_prompt_review = addCliExample(b, .{
+        .name = "powder-composer-prompt-review",
+        .root_source_file = "examples/composer_prompt_review.zig",
+        .target = target,
+        .optimize = optimize,
+        .powder_mod = powder_mod,
+    });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
     const run_layout_lab_step = b.step("run-layout-lab", "Run the runtime layout visual lab");
     const run_layout_review_step = b.step("run-layout-review", "Run the runtime layout review example");
+    const run_composer_prompt_review_step = b.step("run-composer-prompt-review", "Run the composer prompt review example");
     const examples_step = b.step("examples", "Build powder examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
     wireExampleRun(b, layout_lab, run_layout_lab_step, examples_step);
     wireExampleRun(b, layout_review, run_layout_review_step, examples_step);
+    wireExampleRun(b, composer_prompt_review, run_composer_prompt_review_step, examples_step);
     examples_step.dependOn(font_loading_check.step);
 
     const component_catalog_tests = b.addTest(.{
@@ -129,6 +138,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(layout_review_tests).step);
+    const composer_prompt_review_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/composer_prompt_review.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "powder", .module = powder_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(composer_prompt_review_tests).step);
     const run_font_loading_check = if (font_loading_check.artifact) |artifact|
         b.addRunArtifact(artifact)
     else blk: {

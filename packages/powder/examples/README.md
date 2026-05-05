@@ -10,6 +10,7 @@ zig build run-text-area-lab
 zig build run-component-lab
 zig build run-layout-lab
 zig build run-layout-review
+zig build run-composer-prompt-review
 ```
 
 The text area lab focuses on multiline editing. It renders a rounded multiline
@@ -31,6 +32,11 @@ It also shows rounded selects and an explicit icon-text circular send button.
 The layout review example is a CLI example for `powder.layout`. It computes a
 Verde-style command prompt layout, applies the rects to retained controls, emits
 a render batch, and prints the final bounds for review.
+
+The composer prompt review example is a CLI example for the higher-level
+`powder.composerPrompt()` visual model. It validates rounded panel commands,
+font-role text/icon runs, toolbar separators, compact control presentation, and
+the circular send button without opening a window.
 
 Rendering is command-based. Components emit `powder.RenderBatch` commands, and
 the labs use Powder's SDL presenter for local inspection.

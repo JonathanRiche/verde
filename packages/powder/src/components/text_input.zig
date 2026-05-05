@@ -30,6 +30,8 @@ pub const TextInputConfig = struct {
     cursor_blink_ms: u32 = 530,
     font_size: f32 = 16.0,
     glyph_width: ?f32 = null,
+    font_role: ?draw.FontRole = .ui,
+    font_id: ?u32 = null,
     submit_on_enter: bool = true,
     z_index: i32 = 0,
 };
@@ -248,6 +250,8 @@ pub fn TextInput(comptime config: TextInputConfig) type {
                 .line_height = metrics_value.line_height,
                 .color = color,
                 .clip = text_rect,
+                .font_role = config.font_role,
+                .font_id = config.font_id,
             }};
             try batch.textRuns(allocator, text_rect, value, &runs, color, metrics_value.font_size, text_rect, metrics_value.line_height, metrics_value.fixedAdvance());
             if (self.focused and self.cursor_visible) {

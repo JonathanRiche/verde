@@ -62,6 +62,13 @@ pub const CommandKind = enum {
     scrollbar,
 };
 
+pub const FontRole = enum {
+    ui,
+    ui_bold,
+    icon,
+    mono,
+};
+
 pub const TextRun = struct {
     /// Slice into the command text. Frame-lifetime with the owning command text.
     text: []const u8 = "",
@@ -73,6 +80,10 @@ pub const TextRun = struct {
     line_height: f32 = 20.0,
     color: Color = Color.white,
     clip: ?Rect = null,
+    /// Renderer-neutral font role. Host renderers map this to their own font atlas.
+    font_role: ?FontRole = null,
+    /// Optional host-defined font id for apps that prefer numeric atlas handles.
+    font_id: ?u32 = null,
 };
 
 pub const Command = struct {
@@ -89,6 +100,8 @@ pub const Command = struct {
     text_run_start: usize = 0,
     text_run_count: usize = 0,
     font_size: f32 = 16.0,
+    font_role: ?FontRole = null,
+    font_id: ?u32 = null,
     clip: ?Rect = null,
     scroll: Vec2 = .{},
     glyph_width: f32 = 8.8,
@@ -181,6 +194,21 @@ pub const RenderBatch = struct {
             .color = color,
             .text = value,
             .font_size = font_size,
+            .clip = clip,
+            .glyph_width = font_size * 0.55,
+            .line_height = font_size * 1.25,
+        });
+    }
+
+    pub fn roleText(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, value: []const u8, color: Color, font_size: f32, font_role: ?FontRole, font_id: ?u32, clip: ?Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .text,
+            .rect = r,
+            .color = color,
+            .text = value,
+            .font_size = font_size,
+            .font_role = font_role,
+            .font_id = font_id,
             .clip = clip,
             .glyph_width = font_size * 0.55,
             .line_height = font_size * 1.25,
