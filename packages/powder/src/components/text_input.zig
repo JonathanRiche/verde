@@ -18,6 +18,8 @@ pub const TextInputConfig = struct {
     padding_y: f32 = 6.0,
     background_color: draw.Color = .{ .r = 0.07, .g = 0.08, .b = 0.09, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.18, .g = 0.21, .b = 0.24, .a = 1.0 },
+    corner_radius: f32 = 5.0,
+    border_width: f32 = 1.0,
     text_color: draw.Color = draw.Color.white,
     cursor_color: draw.Color = draw.Color.white,
     selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
@@ -231,8 +233,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
 
             const bounds_rect = self.bounds();
             const text_rect = self.textRect();
-            try batch.rect(allocator, bounds_rect, config.background_color);
-            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
+            try batch.panel(allocator, bounds_rect, config.background_color, config.border_color, config.corner_radius, config.border_width);
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             const value = if (self.placeholderVisible()) config.placeholder_text else self.buffer.items;
             const color = if (self.placeholderVisible()) config.placeholder_color else config.text_color;

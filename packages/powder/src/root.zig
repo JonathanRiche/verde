@@ -37,6 +37,7 @@ pub const Renderer = renderer.Renderer;
 pub const FontAtlas = atlas.FontAtlas;
 pub const ButtonCallbacks = button_component.ButtonCallbacks;
 pub const ButtonConfig = button_component.ButtonConfig;
+pub const ButtonContentAlign = button_component.ButtonContentAlign;
 pub const ButtonEvent = button_component.ButtonEvent;
 pub const CheckboxCallbacks = checkbox_component.CheckboxCallbacks;
 pub const CheckboxConfig = checkbox_component.CheckboxConfig;

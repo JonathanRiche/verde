@@ -7,6 +7,12 @@ const key_input = @import("../input/key.zig");
 const sdl = @import("../sdl.zig");
 const text_layout = @import("../text_layout.zig");
 
+pub const ButtonContentAlign = enum {
+    start,
+    center,
+    end,
+};
+
 pub const ButtonConfig = struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
@@ -15,7 +21,12 @@ pub const ButtonConfig = struct {
     padding_x: f32 = 10.0,
     padding_y: f32 = 6.0,
     label: []const u8 = "",
+    icon_text: []const u8 = "",
+    content_align: ButtonContentAlign = .center,
     font_size: f32 = 14.0,
+    icon_font_size: ?f32 = null,
+    corner_radius: f32 = 4.0,
+    border_width: f32 = 1.0,
     background_color: draw.Color = .{ .r = 0.15, .g = 0.18, .b = 0.21, .a = 1.0 },
     hover_color: draw.Color = .{ .r = 0.20, .g = 0.24, .b = 0.28, .a = 1.0 },
     pressed_color: draw.Color = .{ .r = 0.11, .g = 0.14, .b = 0.17, .a = 1.0 },
@@ -35,6 +46,8 @@ pub const IconButtonConfig = struct {
     height: f32 = 32.0,
     icon_inset: f32 = 8.0,
     icon_uv: draw.Rect = .{},
+    corner_radius: f32 = 4.0,
+    border_width: f32 = 1.0,
     background_color: draw.Color = .{ .r = 0.15, .g = 0.18, .b = 0.21, .a = 1.0 },
     hover_color: draw.Color = .{ .r = 0.20, .g = 0.24, .b = 0.28, .a = 1.0 },
     pressed_color: draw.Color = .{ .r = 0.11, .g = 0.14, .b = 0.17, .a = 1.0 },
@@ -121,10 +134,16 @@ pub fn Button(comptime config: ButtonConfig) type {
             const bounds_rect = self.bounds();
             const available_w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0);
             const metrics_value = self.metrics();
-            const text_w = @min(metrics_value.measureSlice(config.label), available_w);
+            const text_value = self.displayText();
+            const text_w = @min(metrics_value.measureSlice(text_value), available_w);
             const text_h = @max(@min(metrics_value.line_height, bounds_rect.h - config.padding_y * 2.0), 1.0);
+            const x = switch (config.content_align) {
+                .start => bounds_rect.x + config.padding_x,
+                .center => bounds_rect.x + (bounds_rect.w - text_w) * 0.5,
+                .end => bounds_rect.x + bounds_rect.w - config.padding_x - text_w,
+            };
             return .{
-                .x = bounds_rect.x + config.padding_x,
+                .x = x,
                 .y = bounds_rect.y + (bounds_rect.h - text_h) * 0.5,
                 .w = text_w,
                 .h = text_h,
@@ -193,15 +212,18 @@ pub fn Button(comptime config: ButtonConfig) type {
                 self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
+                config.corner_radius,
+                config.border_width,
             );
-            if (config.label.len > 0) {
+            const text_value = self.displayText();
+            if (text_value.len > 0) {
                 const rect = self.labelRect();
                 const color = if (self.disabled) config.disabled_text_color else config.text_color;
                 const metrics_value = self.metrics();
                 const runs = [_]draw.TextRun{.{
-                    .text = config.label,
+                    .text = text_value,
                     .byte_start = 0,
-                    .byte_end = config.label.len,
+                    .byte_end = text_value.len,
                     .x = rect.x,
                     .y = rect.y,
                     .font_size = metrics_value.font_size,
@@ -209,7 +231,7 @@ pub fn Button(comptime config: ButtonConfig) type {
                     .color = color,
                     .clip = self.bounds(),
                 }};
-                try batch.textRuns(allocator, rect, config.label, &runs, color, metrics_value.font_size, self.bounds(), metrics_value.line_height, metrics_value.fixedAdvance());
+                try batch.textRuns(allocator, rect, text_value, &runs, color, metrics_value.font_size, self.bounds(), metrics_value.line_height, metrics_value.fixedAdvance());
             }
         }
 
@@ -243,7 +265,12 @@ pub fn Button(comptime config: ButtonConfig) type {
 
         fn metrics(self: *const Component) text_layout.FontMetrics {
             if (self.font_metrics) |metrics_value| return metrics_value;
-            return text_layout.FontMetrics.fallback(config.font_size);
+            const font_size = if (config.icon_text.len > 0) (config.icon_font_size orelse config.font_size) else config.font_size;
+            return text_layout.FontMetrics.fallback(font_size);
+        }
+
+        fn displayText(_: *const Component) []const u8 {
+            return if (config.icon_text.len > 0) config.icon_text else config.label;
         }
     };
 }
@@ -358,6 +385,8 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
                 self.bounds(),
                 self.backgroundColor(),
                 if (self.focused and !self.disabled) config.focus_color else config.border_color,
+                config.corner_radius,
+                config.border_width,
             );
             try batch.image(allocator, self.iconRect(), .invalid, config.icon_uv, if (self.disabled) config.disabled_icon_color else config.icon_color, self.bounds());
         }
@@ -415,9 +444,8 @@ fn inputFromSdl(event: *const sdl.Event) ?Input {
     }
 }
 
-fn renderButtonShell(allocator: std.mem.Allocator, batch: *draw.RenderBatch, bounds: draw.Rect, background: draw.Color, border: draw.Color) !void {
-    try batch.rect(allocator, bounds, background);
-    try rectOutline(allocator, batch, bounds, border);
+fn renderButtonShell(allocator: std.mem.Allocator, batch: *draw.RenderBatch, bounds: draw.Rect, background: draw.Color, border: draw.Color, radius: f32, border_width: f32) !void {
+    try batch.panel(allocator, bounds, background, border, radius, border_width);
 }
 
 fn rectOutline(allocator: std.mem.Allocator, batch: *draw.RenderBatch, r: draw.Rect, color: draw.Color) !void {
@@ -490,10 +518,10 @@ test "icon button renders shell and icon" {
 
     try button.render(std.testing.allocator, &batch);
 
-    try std.testing.expectEqual(@as(usize, 6), batch.commands.items.len);
-    try std.testing.expectEqual(draw.CommandKind.image, batch.commands.items[5].kind);
-    try std.testing.expectEqual(@as(f32, 7.0), batch.commands.items[5].rect.x);
-    try std.testing.expectEqual(@as(f32, 10.0), batch.commands.items[5].rect.w);
+    try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
+    try std.testing.expectEqual(draw.CommandKind.image, batch.commands.items[1].kind);
+    try std.testing.expectEqual(@as(f32, 7.0), batch.commands.items[1].rect.x);
+    try std.testing.expectEqual(@as(f32, 10.0), batch.commands.items[1].rect.w);
 }
 
 test "button supports runtime bounds for hit testing and text rendering" {
@@ -511,9 +539,13 @@ test "button supports runtime bounds for hit testing and text rendering" {
     var batch: draw.RenderBatch = .{};
     defer batch.deinit(std.testing.allocator);
     try button.render(std.testing.allocator, &batch);
-    try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[5].kind);
-    try std.testing.expectEqualStrings("Send", batch.commands.items[5].text);
-    try std.testing.expectEqual(@as(f32, 130), batch.commands.items[5].rect.x);
+    var text_command: ?draw.Command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqualStrings("Send", text_command.?.text);
+    try std.testing.expect(text_command.?.rect.x > 120);
 }
 
 test "icon button supports runtime bounds for hit testing and icon geometry" {
