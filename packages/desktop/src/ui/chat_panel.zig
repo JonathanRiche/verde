@@ -4119,7 +4119,6 @@ fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: po
 
 fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: powder.TextRun) void {
     if (run.text.len == 0 or run.color.a <= 0.0) return;
-    const font_size = powderFontSizeForZgui(run.font_size);
     var clip_rect_storage: [4]f32 = undefined;
     const clip_rect: ?[*]const [4]f32 = if (run.clip) |clip| blk: {
         clip_rect_storage = .{ clip.x, clip.y, clip.x + clip.w, clip.y + clip.h };
@@ -4131,7 +4130,7 @@ fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: pow
         run.text,
         .{
             .font = font,
-            .font_size = font_size,
+            .font_size = run.font_size,
             .cpu_fine_clip_rect = clip_rect,
         },
     );
@@ -4161,14 +4160,10 @@ fn drawPowderTextLineWithZgui(
         command.text[start..end],
         .{
             .font = font,
-            .font_size = powderFontSizeForZgui(command.font_size),
+            .font_size = command.font_size,
             .cpu_fine_clip_rect = clip_rect,
         },
     );
-}
-
-fn powderFontSizeForZgui(font_size: f32) f32 {
-    return theme.scaledUi(font_size * 1.45);
 }
 
 fn clippedPowderRect(rect: powder.Rect, clip: powder.Rect) ?powder.Rect {
