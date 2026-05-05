@@ -367,10 +367,11 @@ bar.layout(&items, &rects);
 try bar.renderSeparators(allocator, &batch, &items, &rects);
 ```
 
-For Verde-style command prompts, `powder.composerPrompt()` owns the renderer
-neutral visual model for the rounded shell, multiline placeholder/text region,
-bottom inline controls, separators, icon roles, chevrons, and circular send
-button:
+For Verde-style command prompts, `powder.composerPrompt()` owns the retained
+composer behavior and visual model: rounded shell, multiline text buffer,
+placeholder, compact model/reasoning menus, fast/access toggles, toolbar
+separators, hover/focus states, icon roles, and send/stop/pending/disabled send
+button state.
 
 ```zig
 const Composer = powder.composerPrompt(.{
@@ -385,9 +386,36 @@ const Composer = powder.composerPrompt(.{
 });
 
 var composer = Composer.init();
+defer composer.deinit(allocator);
 composer.setBounds(prompt_rect);
+
+composer.setCallbacks(.{ .context = app, .on_event = handleComposerEvent });
+composer.setModelOptions(app, model_count, modelLabel);
+composer.setReasoningOptions(app, reasoning_count, reasoningLabel);
+try composer.setText(allocator, draft_text);
+try composer.setPlaceholder(allocator, "Ask anything, or use / to show commands");
+composer.setSendState(.send);
+
+try composer.update(allocator, &event);
 try composer.render(allocator, &batch);
 ```
+
+The common runtime API:
+
+- `setBounds(rect)` / `bounds()`
+- `setText(allocator, value)` / `text()`
+- `setPlaceholder(allocator, value)`
+- `setModelLabel()`, `setReasoningLabel()`, `setFastLabel()`,
+  `setAccessLabel()`
+- `setSendState(.send | .stop | .disabled | .pending)`
+- `setModelOptions()` / `setReasoningOptions()` / `setOptions()`
+- `handleInput(allocator, input)` or SDL `update(allocator, event)`
+- `render(allocator, batch)`
+
+Composer events include text changes, submit, model/reasoning click and change,
+fast/access changes, send clicks, and focus changes. The host feeds events,
+listens to callbacks, and draws the batch; it does not position a separate
+TextArea, Selects, toggles, or Button to recreate the prompt.
 
 Run the visual composer lab:
 
@@ -395,8 +423,9 @@ Run the visual composer lab:
 zig build run-composer-prompt-lab
 ```
 
-It opens an SDL window where you can resize the composer, type prompt text,
-hover/click the circular send button, and inspect live command/text/icon counts.
+It opens an SDL window where you can resize the composer, type multiline prompt
+text, open model/reasoning menus, toggle fast/access, hover/click send, and
+inspect live command/text/icon counts.
 
 Run the batch-level review:
 
