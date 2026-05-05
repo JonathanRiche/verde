@@ -27,6 +27,7 @@ pub const text_component = @import("components/text.zig");
 pub const text_area_component = @import("components/text_area.zig");
 pub const text_input_component = @import("components/text_input.zig");
 pub const text_layout = @import("text_layout.zig");
+pub const virtual_list_component = @import("components/virtual_list.zig");
 
 pub const Color = draw.Color;
 pub const Rect = draw.Rect;
@@ -71,6 +72,7 @@ pub const TableEvent = table_component.TableEvent;
 pub const Text = text_component.Text;
 pub const TextCallbacks = text_component.TextCallbacks;
 pub const TextEvent = text_component.TextEvent;
+pub const RichTextSpan = text_component.RichSpan;
 pub const TextArea = text_area_component.TextArea;
 pub const TextAreaAction = text_area_component.TextAreaAction;
 pub const TextAreaCallbacks = text_area_component.TextAreaCallbacks;
@@ -81,6 +83,11 @@ pub const TextInputAction = text_input_component.TextInputAction;
 pub const TextInputCallbacks = text_input_component.TextInputCallbacks;
 pub const TextInputConfig = text_input_component.TextInputConfig;
 pub const TextInputEvent = text_input_component.TextInputEvent;
+pub const VirtualListCallbacks = virtual_list_component.VirtualListCallbacks;
+pub const VirtualListConfig = virtual_list_component.VirtualListConfig;
+pub const VirtualListEvent = virtual_list_component.VirtualListEvent;
+pub const VirtualListItemLabelFn = virtual_list_component.ItemLabelFn;
+pub const VirtualListRowHeightFn = virtual_list_component.RowHeightFn;
 pub const ClipboardCallbacks = input_clipboard;
 pub const Key = input_key;
 pub const ImageLoader = image_loader;
@@ -178,6 +185,11 @@ pub fn text(comptime config: text_component.TextConfig) type {
     return text_component.Text(config);
 }
 
+/// Creates a retained virtualized scroll list with runtime bounds.
+pub fn virtualList(comptime config: VirtualListConfig) type {
+    return virtual_list_component.VirtualList(config);
+}
+
 /// Creates a retained single-line text input with comptime styling.
 pub fn textInput(comptime config: TextInputConfig) type {
     return text_input_component.TextInput(config);
@@ -210,4 +222,5 @@ test {
     _ = text_component;
     _ = text_area_component;
     _ = text_input_component;
+    _ = virtual_list_component;
 }
