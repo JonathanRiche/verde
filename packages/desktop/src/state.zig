@@ -34,10 +34,18 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
     .padding_y = 20.0,
     .toolbar_height = 48.0,
     .toolbar_gap = 14.0,
-    .control_gap = 16.0,
+    .control_gap = 14.0,
     .pill_padding_x = 16.0,
     .pill_icon_gap = 10.0,
     .pill_chevron_gap = 10.0,
+    .model_min_width = 138.0,
+    .model_max_width = 220.0,
+    .reasoning_min_width = 92.0,
+    .reasoning_max_width = 150.0,
+    .fast_min_width = 116.0,
+    .fast_max_width = 132.0,
+    .access_min_width = 172.0,
+    .access_max_width = 192.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -1226,6 +1234,11 @@ pub const AppState = struct {
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
+    composer_toolbar_overlay_valid: bool,
+    composer_toolbar_model_rect: powder.Rect,
+    composer_toolbar_reasoning_rect: powder.Rect,
+    composer_toolbar_fast_rect: powder.Rect,
+    composer_toolbar_access_rect: powder.Rect,
     powder_composer: PowderComposerPrompt,
     powder_overlay_batch: powder.RenderBatch,
     terminal_focused: bool,
@@ -1328,6 +1341,11 @@ pub const AppState = struct {
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
             .composer_overlay_last_draft_len = 0,
+            .composer_toolbar_overlay_valid = false,
+            .composer_toolbar_model_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_reasoning_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .powder_composer = PowderComposerPrompt.init(),
             .powder_overlay_batch = .{},
             .terminal_focused = false,
@@ -4408,6 +4426,7 @@ pub const AppState = struct {
         if (event.down and event.clicks >= 2 and self.powder_composer.textRect().contains(point)) {
             return self.routePowderComposerMultiClick(point, event.clicks);
         }
+        if (event.down and self.routePowderComposerToolbarOverlayClick(point)) return true;
         const input: powder.ComposerPromptInput = if (event.down)
             .{ .mouse_down = point }
         else
@@ -4422,6 +4441,37 @@ pub const AppState = struct {
             self.terminal_focused = false;
             self.browser_pane_focused = false;
         }
+        return handled or was_focused != self.powder_composer.focused;
+    }
+
+    fn routePowderComposerToolbarOverlayClick(self: *AppState, point: powder.draw.Vec2) bool {
+        if (!self.composer_toolbar_overlay_valid) return false;
+        const target = if (self.composer_toolbar_model_rect.contains(point))
+            self.powder_composer.modelRect()
+        else if (self.composer_toolbar_reasoning_rect.contains(point))
+            self.powder_composer.reasoningRect()
+        else if (self.composer_toolbar_fast_rect.contains(point))
+            self.powder_composer.fastRect()
+        else if (self.composer_toolbar_access_rect.contains(point))
+            self.powder_composer.accessRect()
+        else
+            return false;
+
+        const target_point: powder.draw.Vec2 = .{
+            .x = target.x + target.w * 0.5,
+            .y = target.y + target.h * 0.5,
+        };
+        const was_focused = self.powder_composer.focused;
+        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_down = target_point }) catch |err| {
+            log.warn("powder composer toolbar overlay click failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.composer_focused = self.powder_composer.focused;
+        if (self.composer_focused) {
+            self.terminal_focused = false;
+            self.browser_pane_focused = false;
+        }
+        if (handled) self.noteInteraction();
         return handled or was_focused != self.powder_composer.focused;
     }
 
