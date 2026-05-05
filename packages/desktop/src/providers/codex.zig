@@ -5,8 +5,6 @@ const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
 
-const log = std.log.scoped(.native_codex);
-
 const OVERLOAD_ERROR_CODE = -32001;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
@@ -230,10 +228,6 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        std.debug.print(
-            "[codex-debug] codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}\n",
-            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
-        );
         runtime_log.diagnostic(
             "codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}",
             .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
@@ -241,11 +235,9 @@ pub const Client = struct {
         try self.ensureConnected();
 
         const thread_id = if (request.thread_id) |existing| blk: {
-            std.debug.print("[codex-debug] codex.sendPrompt using existing thread_id={s}\n", .{existing});
             runtime_log.diagnostic("codex.sendPrompt using existing thread_id={s}", .{existing});
             break :blk try allocator.dupe(u8, existing);
         } else blk: {
-            std.debug.print("[codex-debug] codex.sendPrompt starting new thread\n", .{});
             runtime_log.diagnostic("codex.sendPrompt starting new thread", .{});
             break :blk try self.startThread(allocator, request);
         };
@@ -255,15 +247,12 @@ pub const Client = struct {
             on_thread_id(request.stream_context, thread_id);
         }
 
-        std.debug.print("[codex-debug] codex.sendPrompt ensuring thread loaded thread_id={s}\n", .{thread_id});
         runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id={s}", .{thread_id});
         try self.ensureThreadLoaded(thread_id);
 
-        std.debug.print("[codex-debug] codex.sendPrompt starting turn thread_id={s}\n", .{thread_id});
         runtime_log.diagnostic("codex.sendPrompt starting turn thread_id={s}", .{thread_id});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
-        std.debug.print("[codex-debug] codex.sendPrompt completed thread_id={s} reply_len={d}\n", .{ thread_id, reply.len });
         runtime_log.diagnostic("codex.sendPrompt completed thread_id={s} reply_len={d}", .{ thread_id, reply.len });
 
         return .{
@@ -451,7 +440,6 @@ pub const Client = struct {
             return err;
         };
 
-        log.info("Codex app-server started pid={d} listen={s}", .{ child.id orelse -1, url });
         runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.id orelse -1});
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
@@ -640,10 +628,10 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        log.info("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
+        runtime_log.diagnostic("Codex RPC thread/start id={d} payload_len={d}", .{ id, payload.len });
         try self.writeTextMessage(payload);
         const result = try self.awaitResultPayloadAlloc(id);
-        log.info("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
+        runtime_log.diagnostic("Codex RPC thread/start id={d} result_len={d}", .{ id, result.len });
         return result;
     }
 
@@ -805,7 +793,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        log.info("Codex RPC turn/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
+        runtime_log.diagnostic("Codex RPC turn/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -892,7 +880,6 @@ pub const Client = struct {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
             defer self.allocator.free(message);
-            std.debug.print("[codex-debug] Codex RPC await id={d} message_len={d}\n", .{ id, message.len });
             runtime_log.diagnostic("Codex RPC await id={d} message_len={d}", .{ id, message.len });
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
@@ -906,7 +893,7 @@ pub const Client = struct {
             if (response_id != id) continue;
 
             if (getObjectField(root, "error")) |rpc_error| {
-                log.warn("Codex RPC response id={d} returned error: {s}", .{ id, message });
+                runtime_log.diagnostic("Codex RPC response id={d} returned error: {s}", .{ id, message });
                 if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                     if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                 }
@@ -915,7 +902,7 @@ pub const Client = struct {
 
             const result = getObjectField(root, "result") orelse return error.MissingRpcResult;
             const payload = try stringifyAlloc(self.allocator, result);
-            log.info("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
+            runtime_log.diagnostic("Codex RPC response id={d} message_len={d} result_len={d}", .{ id, message.len, payload.len });
             return payload;
         }
     }
@@ -1043,10 +1030,9 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            log.info("stopping owned Codex app-server pid={d}", .{child.id orelse -1});
+            runtime_log.diagnostic("codex.stopOwnedServer stopping pid={d}", .{child.id orelse -1});
             var threaded = std.Io.Threaded.init_single_threaded;
             child.kill(threaded.io());
-            _ = child.wait(threaded.io()) catch {};
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1250,17 +1236,12 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
     };
 
     if (payload_len > MAX_WS_MESSAGE_BYTES) {
-        std.debug.print(
-            "[codex-debug] websocket frame too large opcode={s} masked={} payload_len={d}\n",
-            .{ @tagName(opcode), masked, payload_len },
-        );
         runtime_log.diagnostic(
             "websocket frame too large opcode={s} masked={} payload_len={d}",
             .{ @tagName(opcode), masked, payload_len },
         );
         return error.WebSocketMessageTooLarge;
     }
-    log.debug("Codex websocket frame opcode={s} masked={} payload_len={d}", .{ @tagName(opcode), masked, payload_len });
 
     var mask: [4]u8 = undefined;
     if (masked) {
@@ -1268,10 +1249,6 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
     }
 
     const payload = allocator.alloc(u8, payload_len) catch |err| {
-        std.debug.print(
-            "[codex-debug] websocket payload alloc failed opcode={s} payload_len={d}: {s}\n",
-            .{ @tagName(opcode), payload_len, @errorName(err) },
-        );
         runtime_log.diagnostic(
             "websocket payload alloc failed opcode={s} payload_len={d}: {s}",
             .{ @tagName(opcode), payload_len, @errorName(err) },
