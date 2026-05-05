@@ -286,7 +286,8 @@ const metrics: powder.FontMetrics = .{
 };
 ```
 
-`TextArea`, `TextInput`, `Button`, and `Select` expose `setFontMetrics()`.
+`TextArea`, `TextInput`, `Button`, `Select`, and `ComposerPrompt` expose
+`setFontMetrics()`.
 Without explicit metrics, they use the existing fixed fallback derived from
 their component config.
 
@@ -409,6 +410,8 @@ The common runtime API:
   `setAccessLabel()`
 - `setSendState(.send | .stop | .disabled | .pending)`
 - `setModelOptions()` / `setReasoningOptions()` / `setOptions()`
+- `setFontMetrics()` for prompt text layout and hit testing
+- `setToolbarFontMetrics()` / `setIconFontMetrics()` for measured toolbar pills
 - `handleInput(allocator, input)` or SDL `update(allocator, event)`
 - `render(allocator, batch)`
 
@@ -416,6 +419,11 @@ Composer events include text changes, submit, model/reasoning click and change,
 fast/access changes, send clicks, and focus changes. The host feeds events,
 listens to callbacks, and draws the batch; it does not position a separate
 TextArea, Selects, toggles, or Button to recreate the prompt.
+
+The composer uses the same `FontMetrics` instance for wrapping prompt text,
+click hit testing, cursor geometry, and emitted text run positions. Toolbar pill
+rects are measured from icon, label, chevron, configured padding, and configured
+gaps; fixed min/max widths are constraints rather than hardcoded layout.
 
 Run the visual composer lab:
 
