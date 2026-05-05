@@ -872,7 +872,6 @@ fn stopOwnedServerLocked() void {
         if (shared_server_state.owns_child) {
             var threaded = std.Io.Threaded.init_single_threaded;
             child.kill(threaded.io());
-            _ = child.wait(threaded.io()) catch {};
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
