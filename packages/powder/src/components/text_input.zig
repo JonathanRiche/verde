@@ -29,6 +29,7 @@ pub const TextInputConfig = struct {
     font_size: f32 = 16.0,
     glyph_width: ?f32 = null,
     submit_on_enter: bool = true,
+    z_index: i32 = 0,
 };
 
 pub const Input = union(enum) {
@@ -83,6 +84,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         dragging_selection: bool = false,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
         callbacks: TextInputCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -123,6 +125,10 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
             self.ensureCursorVisible();
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
@@ -220,6 +226,9 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             const bounds_rect = self.bounds();
             const text_rect = self.textRect();
             try batch.rect(allocator, bounds_rect, config.background_color);

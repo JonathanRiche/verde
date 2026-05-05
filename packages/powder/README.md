@@ -295,6 +295,26 @@ authoritative: it is the same layout Powder used for hit testing, wrapping,
 cursor movement, selection, and scrolling. Hosts should not re-wrap those
 commands.
 
+## Z-Index
+
+Render commands carry `z_index`. Higher z-index commands draw later, and equal
+z-index commands keep insertion order.
+
+```zig
+var batch: powder.RenderBatch = .{};
+
+try batch.rect(allocator, background_rect, background_color);
+const previous_z = batch.setZIndex(100);
+try batch.rect(allocator, floating_rect, floating_color);
+batch.restoreZIndex(previous_z);
+```
+
+Runtime-positioned controls expose `setZIndex()` where overlapping is common:
+`Button`, `IconButton`, `Select`, `TextInput`, `TextArea`, `Checkbox`, `Toggle`,
+and `Image`. `Select` also has `setMenuZOffset()` and defaults its dropdown menu
+to an overlay z above its control, so a menu can overlap later layout sections
+without being hidden.
+
 ## Images And Textures
 
 Powder image rendering is command-based, like text and rectangles. Components

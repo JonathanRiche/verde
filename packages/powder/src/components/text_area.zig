@@ -37,6 +37,7 @@ pub const TextAreaConfig = struct {
     wrap: bool = true,
     scroll_enabled: bool = true,
     submit_on_enter: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const Input = union(enum) {
@@ -109,6 +110,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         dragging_scrollbar: bool = false,
         scrollbar_drag_offset_y: f32 = 0.0,
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
         callbacks: TextAreaCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -161,6 +163,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
             self.setScrollY(self.scroll_y);
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -295,6 +301,9 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try batch.rect(allocator, Component.boundsRect(), config.background_color);
             try batch.rect(allocator, .{ .x = config.x, .y = config.y, .w = config.width, .h = 1.0 }, config.border_color);
             if (self.selection()) |range| {

@@ -25,6 +25,7 @@ pub const ButtonConfig = struct {
     text_color: draw.Color = draw.Color.white,
     disabled_text_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const IconButtonConfig = struct {
@@ -43,6 +44,7 @@ pub const IconButtonConfig = struct {
     icon_color: draw.Color = draw.Color.white,
     disabled_icon_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const ActivationKey = enum {
@@ -83,6 +85,7 @@ pub fn Button(comptime config: ButtonConfig) type {
         disabled: bool = config.disabled,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
         callbacks: ButtonCallbacks = .{},
 
         pub fn init() Component {
@@ -100,6 +103,10 @@ pub fn Button(comptime config: ButtonConfig) type {
 
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
@@ -177,6 +184,9 @@ pub fn Button(comptime config: ButtonConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderButtonShell(
                 allocator,
                 batch,
@@ -247,6 +257,7 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
+        z_index: i32 = config.z_index,
         callbacks: ButtonCallbacks = .{},
 
         pub fn init() Component {
@@ -264,6 +275,10 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -334,6 +349,9 @@ pub fn IconButton(comptime config: IconButtonConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderButtonShell(
                 allocator,
                 batch,
