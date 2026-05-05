@@ -33,6 +33,9 @@ pub const ComposerPromptConfig = struct {
     font_size: f32 = 16.0,
     toolbar_font_size: f32 = 14.0,
     icon_font_size: f32 = 16.0,
+    fixed_advance: ?f32 = null,
+    toolbar_fixed_advance: ?f32 = null,
+    icon_fixed_advance: ?f32 = null,
     font_role: ?draw.FontRole = .ui,
     bold_font_role: ?draw.FontRole = .ui_bold,
     icon_font_role: ?draw.FontRole = .icon,
@@ -57,6 +60,17 @@ pub const ComposerPromptConfig = struct {
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
     menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
     row_height: f32 = 28.0,
+    pill_padding_x: f32 = 10.0,
+    pill_icon_gap: f32 = 7.0,
+    pill_chevron_gap: f32 = 8.0,
+    model_min_width: f32 = 0.0,
+    model_max_width: f32 = 180.0,
+    reasoning_min_width: f32 = 0.0,
+    reasoning_max_width: f32 = 150.0,
+    fast_min_width: f32 = 0.0,
+    fast_max_width: f32 = 120.0,
+    access_min_width: f32 = 0.0,
+    access_max_width: f32 = 170.0,
     z_index: i32 = 0,
 };
 
@@ -150,6 +164,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
+        font_metrics: ?text_layout.FontMetrics = null,
+        toolbar_font_metrics: ?text_layout.FontMetrics = null,
+        icon_font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: ComposerPromptCallbacks = .{},
 
@@ -177,6 +194,18 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn setCallbacks(self: *Component, callbacks: ComposerPromptCallbacks) void {
             self.callbacks = callbacks;
+        }
+
+        pub fn setFontMetrics(self: *Component, metrics: text_layout.FontMetrics) void {
+            self.font_metrics = metrics;
+        }
+
+        pub fn setToolbarFontMetrics(self: *Component, metrics: text_layout.FontMetrics) void {
+            self.toolbar_font_metrics = metrics;
+        }
+
+        pub fn setIconFontMetrics(self: *Component, metrics: text_layout.FontMetrics) void {
+            self.icon_font_metrics = metrics;
         }
 
         pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
@@ -351,19 +380,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const placeholder = self.placeholderText();
             const value = if (self.buffer.items.len == 0) placeholder else self.buffer.items;
             const color = if (self.buffer.items.len == 0) config.placeholder_color else config.text_color;
-            const metrics = text_layout.FontMetrics.fallback(config.font_size);
+            const metrics = self.textMetrics();
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
-            try text_layout.appendRuns(allocator, .{
-                .rect = rect,
-                .text = value,
-                .color = color,
-                .metrics = metrics,
-                .font_role = config.font_role,
-                .font_id = config.font_id,
-                .wrap = true,
-                .clip = rect,
-            }, &runs);
+            try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             if (self.focused and self.buffer.items.len > 0) {
                 const cursor = self.cursorRect();
@@ -393,17 +413,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
-            _ = self;
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
             try batch.panel(allocator, rect, if (hovered) config.control_hover_color else config.control_background_color, null, rect.h * 0.5, 0.0);
-            const text_metrics = text_layout.FontMetrics.fallback(config.toolbar_font_size);
-            const icon_metrics = text_layout.FontMetrics.fallback(config.icon_font_size);
+            const text_metrics = self.toolbarMetrics();
+            const icon_metrics = self.iconMetrics();
             var runs: [3]draw.TextRun = undefined;
             var count: usize = 0;
-            var x = rect.x + 10.0;
+            var x = rect.x + config.pill_padding_x;
             if (left_icon.len > 0) {
                 runs[count] = iconRun(left_icon, x, rect, icon_metrics, config.icon_color);
-                x += icon_metrics.measureSlice(left_icon) + 7.0;
+                x += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
                 count += 1;
             }
             runs[count] = .{
@@ -422,14 +441,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             count += 1;
             if (right_icon.len > 0) {
                 const icon_w = icon_metrics.measureSlice(right_icon);
-                runs[count] = iconRun(right_icon, rect.x + rect.w - 10.0 - icon_w, rect, icon_metrics, config.icon_color);
+                runs[count] = iconRun(right_icon, rect.x + rect.w - config.pill_padding_x - icon_w, rect, icon_metrics, config.icon_color);
                 count += 1;
             }
             try batch.textRuns(allocator, rect, label, runs[0..count], config.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
         }
 
-        fn renderCenteredIcon(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
-            const metrics = text_layout.FontMetrics.fallback(config.icon_font_size);
+        fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
+            const metrics = self.iconMetrics();
             const width = metrics.measureSlice(icon);
             const runs = [_]draw.TextRun{.{
                 .text = icon,
@@ -480,7 +499,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const previous_z = batch.setZIndex(self.z_index + 1000);
             defer batch.restoreZIndex(previous_z);
             try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, 10.0, 1.0);
-            const metrics = text_layout.FontMetrics.fallback(config.toolbar_font_size);
+            const metrics = self.toolbarMetrics();
             var index: usize = 0;
             while (index < options.count) : (index += 1) {
                 const row = self.menuRowRect(target, index);
@@ -491,9 +510,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 }
                 const label = options.labelFor(index) orelse continue;
                 const text_rect: draw.Rect = .{
-                    .x = row.x + 10.0,
+                    .x = row.x + config.pill_padding_x,
                     .y = row.y + @max((row.h - metrics.line_height) * 0.5, 0.0),
-                    .w = @max(row.w - 20.0, 0.0),
+                    .w = @max(row.w - config.pill_padding_x * 2.0, 0.0),
                     .h = metrics.line_height,
                 };
                 const runs = [_]draw.TextRun{.{
@@ -588,7 +607,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             if (self.textRect().contains(point)) {
                 self.setFocused(true);
-                self.cursor = self.buffer.items.len;
+                self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, config.text_color), point);
                 return true;
             }
             if (self.hitTest(point)) |part| {
@@ -671,17 +690,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.emit(.{ .focus_changed = focused });
         }
 
-        fn cursorRect(self: *const Component) draw.Rect {
-            const rect = self.textRect();
-            const metrics = text_layout.FontMetrics.fallback(config.font_size);
-            const pos = text_layout.positionForOffset(.{
-                .rect = rect,
-                .text = self.buffer.items,
-                .color = config.text_color,
-                .metrics = metrics,
-                .wrap = true,
-                .clip = rect,
-            }, self.cursor);
+        pub fn cursorRect(self: *const Component) draw.Rect {
+            const metrics = self.textMetrics();
+            const pos = text_layout.positionForOffset(self.textLayoutOptions(self.buffer.items, config.text_color), self.cursor);
             return .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = metrics.line_height };
         }
 
@@ -692,7 +703,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
             const options = self.optionsFor(target);
             const height = @min(@as(f32, @floatFromInt(options.count)) * config.row_height, config.row_height * 6.0);
-            return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, 150.0), .h = height };
+            return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, self.menuContentWidth(target)), .h = height };
         }
 
         fn menuRowRect(self: *const Component, target: ComposerPromptOptionTarget, index: usize) draw.Rect {
@@ -755,6 +766,56 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (self.callbacks.on_event) |callback| callback(self.callbacks.context, event);
         }
 
+        fn textMetrics(self: *const Component) text_layout.FontMetrics {
+            if (self.font_metrics) |metrics| return metrics;
+            return text_layout.FontMetrics.fixed(config.font_size, config.fixed_advance orelse config.font_size * 0.55, config.font_size * 1.25);
+        }
+
+        fn toolbarMetrics(self: *const Component) text_layout.FontMetrics {
+            if (self.toolbar_font_metrics) |metrics| return metrics;
+            return text_layout.FontMetrics.fixed(config.toolbar_font_size, config.toolbar_fixed_advance orelse config.toolbar_font_size * 0.55, config.toolbar_font_size * 1.25);
+        }
+
+        fn iconMetrics(self: *const Component) text_layout.FontMetrics {
+            if (self.icon_font_metrics) |metrics| return metrics;
+            return text_layout.FontMetrics.fixed(config.icon_font_size, config.icon_fixed_advance orelse config.icon_font_size * 0.55, config.icon_font_size * 1.25);
+        }
+
+        fn textLayoutOptions(self: *const Component, value: []const u8, color: draw.Color) text_layout.Options {
+            return .{
+                .rect = self.textRect(),
+                .text = value,
+                .color = color,
+                .metrics = self.textMetrics(),
+                .font_role = config.font_role,
+                .font_id = config.font_id,
+                .wrap = true,
+                .clip = self.textRect(),
+            };
+        }
+
+        fn pillWidth(self: *const Component, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
+            const text_metrics = self.toolbarMetrics();
+            const icon_metrics = self.iconMetrics();
+            var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label);
+            if (left_icon.len > 0) width += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
+            if (right_icon.len > 0) width += icon_metrics.measureSlice(right_icon) + config.pill_chevron_gap;
+            return @min(@max(width, min_width), max_width);
+        }
+
+        fn menuContentWidth(self: *const Component, target: ComposerPromptOptionTarget) f32 {
+            const options = self.optionsFor(target);
+            const metrics = self.toolbarMetrics();
+            var width: f32 = 150.0;
+            var index: usize = 0;
+            while (index < options.count) : (index += 1) {
+                if (options.labelFor(index)) |label| {
+                    width = @max(width, metrics.measureSlice(label) + config.pill_padding_x * 2.0);
+                }
+            }
+            return width;
+        }
+
         fn toolbarGeometry(self: *const Component) struct {
             toolbar: draw.Rect,
             model: draw.Rect,
@@ -776,19 +837,19 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const max_x = send.x - config.control_gap;
             var x = toolbar.x;
 
-            const model_w = @min(140.0, @max(max_x - x, 0.0));
+            const model_w = @min(self.pillWidth(config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width), @max(max_x - x, 0.0));
             const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
             x += model_w + config.control_gap;
 
-            const reasoning_w = @min(78.0, @max(max_x - x, 0.0));
+            const reasoning_w = @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0));
             const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
             x += reasoning_w + config.control_gap;
 
-            const fast_w = @min(70.0, @max(max_x - x, 0.0));
+            const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
             const fast: draw.Rect = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
             x += fast_w + config.control_gap;
 
-            const access_w = @min(122.0, @max(max_x - x, 0.0));
+            const access_w = @min(self.pillWidth(config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width), @max(max_x - x, 0.0));
             const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };
 
             return .{
@@ -910,4 +971,49 @@ test "composer prompt owns text options toggles and send input" {
     try std.testing.expectEqual(@as(usize, 1), probe.model_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.fast_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
+}
+
+fn proportionalAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, _: f32) text_layout.Advance {
+    return .{
+        .byte_len = 1,
+        .width = switch (text[byte_offset]) {
+            'W' => 20,
+            'i' => 2,
+            else => 10,
+        },
+    };
+}
+
+test "composer prompt uses injected metrics for cursor and hit testing" {
+    const Prompt = ComposerPrompt(.{ .x = 0, .y = 0, .width = 260, .height = 150 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    prompt.setFontMetrics(.{
+        .font_size = 10,
+        .line_height = 18,
+        .advance = proportionalAdvance,
+    });
+    try prompt.setText(std.testing.allocator, "Wi");
+
+    try std.testing.expectEqual(@as(f32, prompt.textRect().x + 22), prompt.cursorRect().x);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 20.4, .y = prompt.textRect().y + 2 } }));
+    try std.testing.expectEqual(@as(usize, 1), prompt.cursor);
+    try std.testing.expectEqual(@as(f32, prompt.textRect().x + 20), prompt.cursorRect().x);
+}
+
+test "composer prompt sizes toolbar pills from measured content" {
+    const Prompt = ComposerPrompt(.{
+        .width = 520,
+        .height = 150,
+        .pill_padding_x = 12,
+        .pill_icon_gap = 4,
+        .pill_chevron_gap = 3,
+        .toolbar_fixed_advance = 5,
+        .icon_fixed_advance = 6,
+        .model_max_width = 240,
+    });
+    var prompt = Prompt.init();
+    const model = prompt.modelRect();
+    const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + 3 + 6;
+    try std.testing.expectEqual(expected, model.w);
 }
