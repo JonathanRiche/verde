@@ -25,6 +25,10 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
+const POWDER_COMPOSER_FONT_SIZE: f32 = 32.0;
+const POWDER_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 20.0;
+const POWDER_COMPOSER_ICON_FONT_SIZE: f32 = 24.0;
+
 pub const PowderComposerPrompt = powder.composerPrompt(.{
     .padding_x = 24.0,
     .padding_y = 20.0,
@@ -44,9 +48,9 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
     .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
-    .font_size = 32.0,
-    .toolbar_font_size = 20.0,
-    .icon_font_size = 24.0,
+    .font_size = POWDER_COMPOSER_FONT_SIZE,
+    .toolbar_font_size = POWDER_COMPOSER_TOOLBAR_FONT_SIZE,
+    .icon_font_size = POWDER_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
     .model_icon = "",
     .fast_icon = "⚡",
@@ -55,6 +59,26 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
     .send_icon = "↑",
     .stop_icon = "■",
 });
+
+fn powderZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) powder.FontAdvance {
+    if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
+    const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
+    const end = @min(byte_offset + byte_len, text.len);
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    const width = zgui.calcTextSize(text[byte_offset..end], .{})[0] * (font_size / base_font_size);
+    return .{ .byte_len = end - byte_offset, .width = width };
+}
+
+fn powderZguiFontMetrics(font_size: f32) powder.FontMetrics {
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    const line_height = @max(zgui.getTextLineHeight() * (font_size / base_font_size), font_size);
+    return .{
+        .font_size = font_size,
+        .line_height = line_height,
+        .context = null,
+        .advance = powderZguiFontAdvance,
+    };
+}
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -4307,6 +4331,9 @@ pub const AppState = struct {
 
     pub fn syncPowderComposerControls(self: *AppState) void {
         self.powder_composer.setCallbacks(.{ .context = self, .on_event = powderComposerPromptEvent });
+        self.powder_composer.setFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_FONT_SIZE));
+        self.powder_composer.setToolbarFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_TOOLBAR_FONT_SIZE));
+        self.powder_composer.setIconFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
         const model_options = composerModelOptions(self, thread.provider);
         self.powder_composer.setModelOptions(self, model_options.len, powderModelLabel);
