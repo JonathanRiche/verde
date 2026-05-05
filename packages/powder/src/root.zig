@@ -16,6 +16,7 @@ pub const button_component = @import("components/button.zig");
 pub const checkbox_component = @import("components/checkbox.zig");
 pub const code_view_component = @import("components/code_view.zig");
 pub const composer_prompt_component = @import("components/composer_prompt.zig");
+pub const cascade_menu_component = @import("components/cascade_menu.zig");
 pub const image_component = @import("components/image.zig");
 pub const list_box_component = @import("components/list_box.zig");
 pub const menu_component = @import("components/menu.zig");
@@ -55,6 +56,12 @@ pub const ComposerPromptOptionLabelFn = composer_prompt_component.ComposerPrompt
 pub const ComposerPromptOptionTarget = composer_prompt_component.ComposerPromptOptionTarget;
 pub const ComposerPromptPart = composer_prompt_component.ComposerPromptPart;
 pub const ComposerPromptSendState = composer_prompt_component.ComposerPromptSendState;
+pub const CascadeMenuCallbacks = cascade_menu_component.CascadeMenuCallbacks;
+pub const CascadeMenuConfig = cascade_menu_component.CascadeMenuConfig;
+pub const CascadeMenuEvent = cascade_menu_component.CascadeMenuEvent;
+pub const CascadeMenuInput = cascade_menu_component.Input;
+pub const CascadeMenuItemLabelFn = cascade_menu_component.ItemLabelFn;
+pub const CascadeMenuChildCountFn = cascade_menu_component.ChildCountFn;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;
 pub const ImageFit = image_component.ImageFit;
@@ -137,6 +144,11 @@ pub fn diffView(comptime config: CodeViewConfig) type {
 /// Creates a renderer-neutral command prompt/composer visual model.
 pub fn composerPrompt(comptime config: ComposerPromptConfig) type {
     return composer_prompt_component.ComposerPrompt(config);
+}
+
+/// Creates a retained nested popup menu with child submenus.
+pub fn cascadeMenu(comptime config: CascadeMenuConfig) type {
+    return cascade_menu_component.CascadeMenu(config);
 }
 
 /// Creates a retained button with comptime styling.
@@ -236,6 +248,7 @@ test {
     _ = checkbox_component;
     _ = code_view_component;
     _ = composer_prompt_component;
+    _ = cascade_menu_component;
     _ = image_component;
     _ = list_box_component;
     _ = menu_component;
