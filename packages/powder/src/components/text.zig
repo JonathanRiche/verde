@@ -7,6 +7,7 @@ const draw = @import("../draw.zig");
 const clipboard = @import("../input/clipboard.zig");
 const selection_input = @import("../input/selection.zig");
 const sdl = @import("../sdl.zig");
+const text_layout = @import("../text_layout.zig");
 
 pub const TextConfig = struct {
     x: f32 = 0.0,
@@ -17,7 +18,15 @@ pub const TextConfig = struct {
     selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
     font_size: f32 = 16.0,
     glyph_width: ?f32 = null,
+    line_height: ?f32 = null,
     selectable: bool = false,
+};
+
+pub const RichSpan = struct {
+    start: usize,
+    end: usize,
+    color: draw.Color,
+    font_size: ?f32 = null,
 };
 
 pub const TextEvent = union(enum) {
@@ -50,6 +59,7 @@ pub fn Text(comptime config: TextConfig) type {
         const Component = @This();
 
         buffer: std.ArrayList(u8) = .empty,
+        spans: std.ArrayList(RichSpan) = .empty,
         selection_anchor: ?usize = null,
         selection_focus: ?usize = null,
         dragging_selection: bool = false,
@@ -63,12 +73,30 @@ pub fn Text(comptime config: TextConfig) type {
 
         pub fn deinit(self: *Component, allocator: std.mem.Allocator) void {
             self.buffer.deinit(allocator);
+            self.spans.deinit(allocator);
             self.* = undefined;
         }
 
         pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             self.buffer.clearRetainingCapacity();
             try self.buffer.appendSlice(allocator, value);
+            self.spans.clearRetainingCapacity();
+            self.emit(.{ .changed = self.buffer.items });
+        }
+
+        pub fn setRichText(self: *Component, allocator: std.mem.Allocator, value: []const u8, spans: []const RichSpan) !void {
+            self.buffer.clearRetainingCapacity();
+            self.spans.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, value);
+            try self.spans.appendSlice(allocator, spans);
+            self.clampSpans();
+            self.emit(.{ .changed = self.buffer.items });
+        }
+
+        pub fn setSpans(self: *Component, allocator: std.mem.Allocator, spans: []const RichSpan) !void {
+            self.spans.clearRetainingCapacity();
+            try self.spans.appendSlice(allocator, spans);
+            self.clampSpans();
             self.emit(.{ .changed = self.buffer.items });
         }
 
@@ -139,12 +167,15 @@ pub fn Text(comptime config: TextConfig) type {
                 const end_x = config.x + @as(f32, @floatFromInt(self.visualColumnForOffset(range.end))) * Component.glyphWidth();
                 try batch.selection(allocator, .{ .x = start_x, .y = config.y, .w = @max(end_x - start_x, 2.0), .h = config.height }, config.selection_color);
             }
-            try batch.text(allocator, .{
+            var runs: std.ArrayList(draw.TextRun) = .empty;
+            defer runs.deinit(allocator);
+            try self.appendTextRuns(allocator, &runs);
+            try batch.textRuns(allocator, .{
                 .x = config.x,
                 .y = config.y,
-                .w = @min(config.width, approximateWidth(self.buffer.items.len, config.font_size)),
+                .w = @min(config.width, self.metrics().measureSlice(self.buffer.items)),
                 .h = config.height,
-            }, self.buffer.items, config.color, config.font_size, .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height });
+            }, self.buffer.items, runs.items, config.color, config.font_size, Component.bounds(), self.metrics().line_height, Component.glyphWidth());
         }
 
         pub fn renderPass(_: *const Component, _: *draw.GpuRenderPass) void {}
@@ -182,6 +213,14 @@ pub fn Text(comptime config: TextConfig) type {
             return config.glyph_width orelse config.font_size * 0.55;
         }
 
+        fn lineHeight() f32 {
+            return config.line_height orelse config.height;
+        }
+
+        fn metrics(_: *const Component) text_layout.FontMetrics {
+            return text_layout.FontMetrics.fixed(config.font_size, Component.glyphWidth(), Component.lineHeight());
+        }
+
         fn bounds() draw.Rect {
             return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
         }
@@ -189,6 +228,64 @@ pub fn Text(comptime config: TextConfig) type {
         fn emit(self: *Component, event: TextEvent) void {
             if (self.callbacks.on_event) |callback| {
                 callback(self.callbacks.context, event);
+            }
+        }
+
+        fn appendTextRuns(self: *const Component, allocator: std.mem.Allocator, out: *std.ArrayList(draw.TextRun)) !void {
+            const clip = Component.bounds();
+            if (self.spans.items.len == 0) {
+                try out.append(allocator, .{
+                    .text = self.buffer.items,
+                    .byte_start = 0,
+                    .byte_end = self.buffer.items.len,
+                    .x = config.x,
+                    .y = config.y,
+                    .font_size = config.font_size,
+                    .line_height = Component.lineHeight(),
+                    .color = config.color,
+                    .clip = clip,
+                });
+                return;
+            }
+
+            var cursor: usize = 0;
+            var x = config.x;
+            for (self.spans.items) |span| {
+                const start = @min(span.start, self.buffer.items.len);
+                const end = @min(@max(span.end, start), self.buffer.items.len);
+                if (cursor < start) {
+                    x += try self.appendRun(allocator, out, cursor, start, x, config.color, config.font_size, clip);
+                }
+                if (start < end) {
+                    x += try self.appendRun(allocator, out, start, end, x, span.color, span.font_size orelse config.font_size, clip);
+                }
+                cursor = @max(cursor, end);
+            }
+            if (cursor < self.buffer.items.len) {
+                _ = try self.appendRun(allocator, out, cursor, self.buffer.items.len, x, config.color, config.font_size, clip);
+            }
+        }
+
+        fn appendRun(self: *const Component, allocator: std.mem.Allocator, out: *std.ArrayList(draw.TextRun), start: usize, end: usize, x: f32, color: draw.Color, font_size: f32, clip: draw.Rect) !f32 {
+            const metrics_value = text_layout.FontMetrics.fixed(font_size, config.glyph_width orelse font_size * 0.55, Component.lineHeight());
+            try out.append(allocator, .{
+                .text = self.buffer.items[start..end],
+                .byte_start = start,
+                .byte_end = end,
+                .x = x,
+                .y = config.y,
+                .font_size = font_size,
+                .line_height = Component.lineHeight(),
+                .color = color,
+                .clip = clip,
+            });
+            return metrics_value.measureSlice(self.buffer.items[start..end]);
+        }
+
+        fn clampSpans(self: *Component) void {
+            for (self.spans.items) |*span| {
+                span.start = @min(span.start, self.buffer.items.len);
+                span.end = @min(@max(span.end, span.start), self.buffer.items.len);
             }
         }
     };
@@ -234,6 +331,33 @@ test "selectable text can drag selection and copy" {
     try std.testing.expectEqualStrings("hel", label.text()[label.selection().?.start..label.selection().?.end]);
     try std.testing.expect(label.handleInput(.copy_selection));
     try std.testing.expectEqualStrings("hel", copied.items);
+}
+
+test "text component emits rich text runs" {
+    const Label = Text(.{ .x = 10, .y = 20, .width = 220, .height = 24, .glyph_width = 8 });
+    var label = try Label.init(std.testing.allocator, "plain code link");
+    defer label.deinit(std.testing.allocator);
+
+    try label.setSpans(std.testing.allocator, &.{
+        .{ .start = 6, .end = 10, .color = .{ .r = 0.9, .g = 0.7, .b = 0.2, .a = 1.0 } },
+        .{ .start = 11, .end = 15, .color = .{ .r = 0.4, .g = 0.7, .b = 1.0, .a = 1.0 }, .font_size = 18 },
+    });
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try label.render(std.testing.allocator, &batch);
+
+    var text_command: ?draw.Command = null;
+    for (batch.commands.items) |command| {
+        if (command.kind == .text) text_command = command;
+    }
+    try std.testing.expect(text_command != null);
+    try std.testing.expectEqual(@as(usize, 4), text_command.?.text_runs.len);
+    try std.testing.expectEqualStrings("plain ", text_command.?.text_runs[0].text);
+    try std.testing.expectEqualStrings("code", text_command.?.text_runs[1].text);
+    try std.testing.expectEqualStrings(" ", text_command.?.text_runs[2].text);
+    try std.testing.expectEqualStrings("link", text_command.?.text_runs[3].text);
+    try std.testing.expectEqual(@as(f32, 18), text_command.?.text_runs[3].font_size);
 }
 
 fn setProbeClipboard(context: ?*anyopaque, text: []const u8) bool {
