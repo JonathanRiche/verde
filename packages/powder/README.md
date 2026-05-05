@@ -315,6 +315,39 @@ and `Image`. `Select` also has `setMenuZOffset()` and defaults its dropdown menu
 to an overlay z above its control, so a menu can overlap later layout sections
 without being hidden.
 
+## Shape And Borders
+
+Powder render commands carry renderer-neutral shape style. Hosts should consume
+these fields directly instead of guessing from rect size:
+
+- `radius`
+- `border_width`
+- `border_color`
+
+Use batch helpers when emitting custom surfaces:
+
+```zig
+try batch.roundedRect(allocator, rect, background, 10);
+try batch.rectBorder(allocator, rect, border, 10, 1);
+try batch.panel(allocator, rect, background, border, 10, 1);
+```
+
+Core controls expose matching config fields and emit styled commands themselves:
+`corner_radius`, `border_width`, and for `Select` also `menu_corner_radius`.
+Buttons also support centered icon text for send-style actions:
+
+```zig
+const Send = powder.button(.{
+    .icon_text = ">",
+    .font_size = 18,
+    .corner_radius = 999,
+});
+```
+
+The SDL presenters draw rounded fills and borders from those command fields.
+The GPU mesh path preserves the same command data and draws rectangular
+fallback borders until a rounded GPU path is wired in.
+
 ## Images And Textures
 
 Powder image rendering is command-based, like text and rectangles. Components

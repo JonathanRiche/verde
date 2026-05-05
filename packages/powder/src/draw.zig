@@ -94,6 +94,9 @@ pub const Command = struct {
     glyph_width: f32 = 8.8,
     line_height: f32 = 20.0,
     wrap: bool = false,
+    radius: f32 = 0.0,
+    border_width: f32 = 0.0,
+    border_color: ?Color = null,
     /// Higher z-index commands draw later. Equal z-index preserves insertion order.
     z_index: i32 = 0,
 };
@@ -126,6 +129,32 @@ pub const RenderBatch = struct {
 
     pub fn rect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color });
+    }
+
+    pub fn roundedRect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32) !void {
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius });
+    }
+
+    pub fn rectBorder(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, width: f32) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .rect,
+            .rect = r,
+            .color = Color.transparent,
+            .radius = radius,
+            .border_width = width,
+            .border_color = color,
+        });
+    }
+
+    pub fn panel(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, background: Color, border: ?Color, radius: f32, border_width: f32) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .rect,
+            .rect = r,
+            .color = background,
+            .radius = radius,
+            .border_width = border_width,
+            .border_color = border,
+        });
     }
 
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
@@ -286,4 +315,16 @@ test "commands are stably sorted by z-index" {
     try std.testing.expectEqual(@as(f32, 1), batch.commands.items[1].rect.x);
     try std.testing.expectEqual(@as(f32, 5), batch.commands.items[2].rect.x);
     try std.testing.expectEqual(@as(f32, 10), batch.commands.items[3].rect.x);
+}
+
+test "panel command carries renderer-neutral shape style" {
+    var batch: RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    try batch.panel(std.testing.allocator, .{ .w = 20, .h = 10 }, Color.black, Color.white, 6, 2);
+
+    try std.testing.expectEqual(CommandKind.rect, batch.commands.items[0].kind);
+    try std.testing.expectEqual(@as(f32, 6), batch.commands.items[0].radius);
+    try std.testing.expectEqual(@as(f32, 2), batch.commands.items[0].border_width);
+    try std.testing.expect(batch.commands.items[0].border_color != null);
 }

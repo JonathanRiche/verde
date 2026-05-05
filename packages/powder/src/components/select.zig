@@ -21,6 +21,9 @@ pub const SelectConfig = struct {
     background_color: draw.Color = .{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.22, .g = 0.25, .b = 0.30, .a = 1.0 },
     menu_color: draw.Color = .{ .r = 0.06, .g = 0.07, .b = 0.09, .a = 1.0 },
+    corner_radius: f32 = 5.0,
+    menu_corner_radius: f32 = 6.0,
+    border_width: f32 = 1.0,
     text_color: draw.Color = draw.Color.white,
     selected_color: draw.Color = .{ .r = 0.16, .g = 0.36, .b = 0.58, .a = 0.88 },
     highlighted_color: draw.Color = .{ .r = 0.32, .g = 0.36, .b = 0.42, .a = 0.62 },
@@ -263,8 +266,7 @@ pub fn Select(comptime config: SelectConfig) type {
             defer batch.restoreZIndex(previous_z);
 
             const control = self.controlRect();
-            try batch.rect(allocator, control, config.background_color);
-            try batch.rect(allocator, .{ .x = control.x, .y = control.y, .w = control.w, .h = 1.0 }, config.border_color);
+            try batch.panel(allocator, control, config.background_color, config.border_color, config.corner_radius, config.border_width);
             if (self.selected_index) |index| {
                 if (self.itemLabel(index)) |label| {
                     const text_rect = self.controlTextRect(label);
@@ -275,7 +277,7 @@ pub fn Select(comptime config: SelectConfig) type {
             if (!self.open) return;
 
             _ = batch.setZIndex(self.z_index + self.menu_z_offset);
-            try batch.rect(allocator, self.menuRect(), config.menu_color);
+            try batch.panel(allocator, self.menuRect(), config.menu_color, config.border_color, config.menu_corner_radius, config.border_width);
             const visible = self.visibleRange();
             var index = visible.start;
             while (index < visible.end) : (index += 1) {
