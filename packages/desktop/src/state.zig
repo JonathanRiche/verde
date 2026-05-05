@@ -26,15 +26,18 @@ pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
 const POWDER_COMPOSER_FONT_SIZE: f32 = 32.0;
-const POWDER_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 20.0;
-const POWDER_COMPOSER_ICON_FONT_SIZE: f32 = 24.0;
+const POWDER_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 24.0;
+const POWDER_COMPOSER_ICON_FONT_SIZE: f32 = 28.0;
 
 pub const PowderComposerPrompt = powder.composerPrompt(.{
     .padding_x = 24.0,
     .padding_y = 20.0,
-    .toolbar_height = 40.0,
-    .toolbar_gap = 12.0,
-    .control_gap = 12.0,
+    .toolbar_height = 48.0,
+    .toolbar_gap = 14.0,
+    .control_gap = 14.0,
+    .pill_padding_x = 16.0,
+    .pill_icon_gap = 9.0,
+    .pill_chevron_gap = 10.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },

@@ -4040,7 +4040,7 @@ fn drawPowderComposerAccessIcon(state: *app_state.AppState) void {
     const rect = state.powder_composer.accessRect();
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
     const color = [4]f32{ 0.70, 0.73, 0.80, 1.0 };
-    const x = rect.x + theme.scaledUi(12.0);
+    const x = rect.x + theme.scaledUi(14.0);
     const center_y = rect.y + rect.h * 0.5;
     drawLockIcon(zgui.getWindowDrawList(), x, center_y, color, state.currentThread().access_mode == .supervised);
 }
@@ -4072,9 +4072,9 @@ fn drawPowderComposerStopButton(state: *app_state.AppState) void {
 
 fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
     const col = zgui.colorConvertFloat4ToU32(color);
-    const t = theme.scaledUi(1.6);
-    const bw = theme.scaledUi(10.0);
-    const bh = theme.scaledUi(7.0);
+    const t = theme.scaledUi(2.0);
+    const bw = theme.scaledUi(14.0);
+    const bh = theme.scaledUi(9.0);
     const body_top = center_y - theme.scaledUi(0.5);
 
     draw_list.addRectFilled(.{
@@ -4084,9 +4084,9 @@ fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, 
         .rounding = theme.scaledUi(1.5),
     });
 
-    const sw = theme.scaledUi(6.0);
-    const sh = theme.scaledUi(5.0);
-    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(2.5);
+    const sw = theme.scaledUi(8.0);
+    const sh = theme.scaledUi(7.0);
+    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(3.0);
     const sl = x + shackle_offset;
     const sr = sl + sw;
     const stop = body_top - sh;
