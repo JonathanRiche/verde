@@ -4417,7 +4417,11 @@ pub const AppState = struct {
 
     pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
         const point = powderMousePoint(event.x, event.y, ui_scale);
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_move = point }) catch |err| {
+        const input: powder.ComposerPromptInput = if (event.state.left != 0)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point };
+        const handled = self.powder_composer.handleInput(self.allocator, input) catch |err| {
             log.warn("powder composer mouse motion failed: {s}", .{@errorName(err)});
             return false;
         };
