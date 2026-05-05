@@ -108,6 +108,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         cursor_elapsed_ms: u32 = 0,
         dragging_scrollbar: bool = false,
         scrollbar_drag_offset_y: f32 = 0.0,
+        bounds_rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
         callbacks: TextAreaCallbacks = .{},
 
@@ -125,6 +126,16 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
 
         pub fn text(self: *const Component) []const u8 {
             return self.buffer.items;
+        }
+
+        pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, value);
+            self.cursor = self.buffer.items.len;
+            self.clearSelection();
+            self.submitted = false;
+            self.normalizeState();
+            self.ensureCursorVisible();
         }
 
         pub fn placeholder(self: *const Component) []const u8 {
@@ -163,14 +174,23 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             self.setScrollY(self.scroll_y);
         }
 
+        pub fn setBounds(self: *Component, rect: draw.Rect) void {
+            self.bounds_rect = rect;
+            self.setScrollY(self.scroll_y);
+            self.ensureCursorVisible();
+        }
+
         pub fn bounds(self: *const Component) draw.Rect {
-            _ = self;
-            return Component.boundsRect();
+            return self.bounds_rect;
         }
 
         pub fn textRect(self: *const Component) draw.Rect {
-            _ = self;
-            return Component.textRectValue();
+            return .{
+                .x = self.bounds_rect.x + config.padding_x,
+                .y = self.bounds_rect.y + config.padding_y,
+                .w = self.bounds_rect.w - config.padding_x * 2.0,
+                .h = self.bounds_rect.h - config.padding_y * 2.0,
+            };
         }
 
         pub fn lineHeight(self: *const Component) f32 {
@@ -187,7 +207,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn contentHeight(self: *const Component) f32 {
-            return text_layout.contentHeight(self.buffer.items, self.metrics(), Component.textRectValue().w, config.wrap);
+            return text_layout.contentHeight(self.buffer.items, self.metrics(), self.textRect().w, config.wrap);
         }
 
         pub fn maxScrollY(self: *const Component) f32 {
@@ -232,7 +252,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                 .mouse_down => |mouse| {
                     const point = mouse.point;
                     const was_focused = self.focused;
-                    self.focused = Component.boundsRect().contains(point);
+                    self.focused = self.bounds().contains(point);
                     if (self.focused != was_focused) self.emit(.{ .focus_changed = self.focused });
                     if (!self.focused) return false;
 
@@ -274,7 +294,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
                     return was_dragging;
                 },
                 .mouse_wheel => |wheel| {
-                    if (!Component.boundsRect().contains(wheel.point)) return false;
+                    if (!self.bounds().contains(wheel.point)) return false;
                     self.scrollBy(-wheel.y * self.lineHeight() * 3.0);
                     return true;
                 },
@@ -295,8 +315,10 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
-            try batch.rect(allocator, Component.boundsRect(), config.background_color);
-            try batch.rect(allocator, .{ .x = config.x, .y = config.y, .w = config.width, .h = 1.0 }, config.border_color);
+            const bounds_rect = self.bounds();
+            const text_rect = self.textRect();
+            try batch.rect(allocator, bounds_rect, config.background_color);
+            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
             if (self.selection()) |range| {
                 try self.renderSelection(allocator, batch, range.start, range.end);
             }
@@ -308,12 +330,12 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             try text_layout.appendRuns(allocator, self.layoutOptions(value, color, scroll_y), &runs);
             try batch.textRuns(
                 allocator,
-                Component.textRectValue(),
+                text_rect,
                 value,
                 runs.items,
                 color,
                 config.font_size,
-                Component.textRectValue(),
+                text_rect,
                 self.lineHeight(),
                 self.glyphWidth(),
             );
@@ -487,13 +509,13 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn dragScrollbarTo(self: *Component, y: f32) void {
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             const thumb = self.scrollbarThumbRect() orelse return;
             self.setScrollY(scroll.offsetForThumbY(y, self.scrollbar_drag_offset_y, track, thumb, self.scrollMetrics()));
         }
 
         fn autoScrollForDrag(self: *Component, point: draw.Vec2) void {
-            const text_rect = Component.textRectValue();
+            const text_rect = self.textRect();
             if (point.y < text_rect.y) {
                 self.scrollBy(-self.lineHeight());
             } else if (point.y > text_rect.y + text_rect.h) {
@@ -525,8 +547,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn addClippedCommand(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, kind: draw.CommandKind, rect: draw.Rect, color: draw.Color) !void {
-            _ = self;
-            const clipped = clippedRect(rect, Component.textRectValue()) orelse return;
+            const clipped = clippedRect(rect, self.textRect()) orelse return;
             switch (kind) {
                 .cursor => try batch.cursor(allocator, clipped, color),
                 .selection => try batch.selection(allocator, clipped, color),
@@ -546,8 +567,8 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
         }
 
-        fn scrollbarTrackRect() draw.Rect {
-            const text_rect = Component.textRectValue();
+        fn scrollbarTrackRect(self: *const Component) draw.Rect {
+            const text_rect = self.textRect();
             const track_w = @min(config.scrollbar_width, text_rect.w);
             return .{
                 .x = text_rect.x + text_rect.w - track_w,
@@ -558,7 +579,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn scrollbarThumbRect(self: *const Component) ?draw.Rect {
-            return scroll.thumbRect(Component.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
+            return scroll.thumbRect(self.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
         }
 
         fn byteOffsetForPoint(self: *const Component, point: draw.Vec2) usize {
@@ -591,11 +612,11 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn visualCellForOffset(self: *const Component, offset: usize) text_layout.VisualCell {
-            return text_layout.visualCellForOffset(self.buffer.items, offset, self.metrics(), Component.textRectValue().w, config.wrap);
+            return text_layout.visualCellForOffset(self.buffer.items, offset, self.metrics(), self.textRect().w, config.wrap);
         }
 
         fn offsetAtVisualCell(self: *const Component, target_row: usize, target_x: f32) usize {
-            return text_layout.offsetAtVisualCell(self.buffer.items, target_row, target_x, self.metrics(), Component.textRectValue().w, config.wrap);
+            return text_layout.offsetAtVisualCell(self.buffer.items, target_row, target_x, self.metrics(), self.textRect().w, config.wrap);
         }
 
         fn ensureCursorVisible(self: *Component) void {
@@ -626,18 +647,6 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             };
         }
 
-        fn boundsRect() draw.Rect {
-            return .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height };
-        }
-
-        fn textRectValue() draw.Rect {
-            return .{ .x = config.x + config.padding_x, .y = config.y + config.padding_y, .w = config.width - config.padding_x * 2.0, .h = config.height - config.padding_y * 2.0 };
-        }
-
-        fn visibleTextHeightValue() f32 {
-            return @max(config.height - config.padding_y * 2.0, Component.lineHeightValue());
-        }
-
         fn lineHeightValue() f32 {
             return config.line_height orelse config.font_size * 1.25;
         }
@@ -652,19 +661,20 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
         }
 
         fn layoutOptions(self: *const Component, value: []const u8, color: draw.Color, scroll_y: f32) text_layout.Options {
+            const text_rect = self.textRect();
             return .{
-                .rect = Component.textRectValue(),
+                .rect = text_rect,
                 .text = value,
                 .color = color,
                 .metrics = self.metrics(),
                 .wrap = config.wrap,
                 .scroll = .{ .y = scroll_y },
-                .clip = Component.textRectValue(),
+                .clip = text_rect,
             };
         }
 
         fn visibleTextHeight(self: *const Component) f32 {
-            return @max(config.height - config.padding_y * 2.0, self.lineHeight());
+            return @max(self.textRect().h, self.lineHeight());
         }
     };
 }
