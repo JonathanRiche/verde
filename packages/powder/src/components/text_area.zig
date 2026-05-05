@@ -560,7 +560,7 @@ pub fn TextArea(comptime config: TextAreaConfig) type {
             const max_scroll = self.maxScrollY();
             if (!config.scroll_enabled or max_scroll <= 0.0 or config.scrollbar_width <= 0.0) return;
 
-            const track = Component.scrollbarTrackRect();
+            const track = self.scrollbarTrackRect();
             try batch.scrollbar(allocator, track, config.scrollbar_track_color);
 
             const thumb = self.scrollbarThumbRect() orelse return;
