@@ -347,6 +347,35 @@ Compact selects emit a low/no-alpha background by default, optional hover/open
 background, left icon, label text, right chevron, z-indexed dropdown menu, and
 font roles for each run.
 
+## Cascade Menus
+
+`powder.select()` is intentionally a flat dropdown. For menus that need child
+submenus, use `powder.cascadeMenu()`.
+
+```zig
+const Menu = powder.cascadeMenu(.{
+    .item_count = 3,
+    .item_label = itemLabel,
+    .child_count = childCount,
+});
+
+var menu = Menu.initFromConfig();
+menu.setBounds(.{ .x = x, .y = y, .w = 220, .h = 236 });
+_ = menu.handleInput(.open);
+try menu.render(allocator, &batch);
+```
+
+`item_label(context, path, index)` receives the parent path for the current
+menu level. `child_count(context, path, index)` returns how many children that
+row owns. For example, the root row at index `0` is called with `path = &.{}`;
+its first child row is called with `path = &.{0}`.
+
+Cascade menus are retained components with runtime `setBounds()`, mouse hover,
+click, wheel scrolling, keyboard navigation, close-on-outside-click, z-indexed
+child panels, and renderer-neutral labels/chevrons emitted as `TextRun`s. Use
+`CascadeMenuCallbacks.on_event` to receive `selected`, `highlighted`, and
+`open_changed` events.
+
 ## Toolbar And Composer Prompt
 
 `powder.toolbar()` is a retained horizontal layout helper for inline command
