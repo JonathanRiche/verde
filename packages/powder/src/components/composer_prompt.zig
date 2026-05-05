@@ -3,6 +3,8 @@
 const std = @import("std");
 
 const draw = @import("../draw.zig");
+const key_input = @import("../input/key.zig");
+const sdl = @import("../sdl.zig");
 const text_layout = @import("../text_layout.zig");
 
 pub const ComposerPromptConfig = struct {
@@ -46,6 +48,15 @@ pub const ComposerPromptConfig = struct {
     access_label: []const u8 = "Full access",
     chevron_icon: []const u8 = ">",
     send_icon: []const u8 = "^",
+    stop_icon: []const u8 = "x",
+    pending_icon: []const u8 = ".",
+    cursor_color: draw.Color = draw.Color.white,
+    selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
+    menu_background_color: draw.Color = .{ .r = 0.07, .g = 0.09, .b = 0.10, .a = 0.98 },
+    menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
+    menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
+    row_height: f32 = 28.0,
     z_index: i32 = 0,
 };
 
@@ -57,17 +68,103 @@ pub const ComposerPromptPart = enum {
     send,
 };
 
+pub const ComposerPromptSendState = enum {
+    send,
+    stop,
+    disabled,
+    pending,
+};
+
+pub const ComposerPromptOptionTarget = enum {
+    model,
+    reasoning,
+};
+
+pub const ComposerPromptOptionLabelFn = *const fn (context: ?*anyopaque, index: usize) []const u8;
+
+pub const ComposerPromptInput = union(enum) {
+    text: []const u8,
+    key: key_input,
+    mouse_move: draw.Vec2,
+    mouse_down: draw.Vec2,
+    mouse_up: draw.Vec2,
+    mouse_wheel: MouseWheel,
+    focus: bool,
+};
+
+pub const MouseWheel = struct {
+    point: draw.Vec2,
+    y: f32,
+};
+
+pub const ComposerPromptEvent = union(enum) {
+    text_changed: []const u8,
+    submitted: []const u8,
+    model_clicked,
+    model_changed: usize,
+    reasoning_clicked,
+    reasoning_changed: usize,
+    fast_changed: bool,
+    access_changed: bool,
+    send_clicked,
+    focus_changed: bool,
+};
+
+pub const ComposerPromptCallbacks = struct {
+    context: ?*anyopaque = null,
+    on_event: ?*const fn (context: ?*anyopaque, event: ComposerPromptEvent) void = null,
+};
+
+const Options = struct {
+    context: ?*anyopaque = null,
+    count: usize = 0,
+    label: ?ComposerPromptOptionLabelFn = null,
+
+    fn labelFor(self: Options, index: usize) ?[]const u8 {
+        if (index >= self.count) return null;
+        if (self.label) |callback| return callback(self.context, index);
+        return null;
+    }
+};
+
 pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
     return struct {
         const Component = @This();
 
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
-        text_value: []const u8 = "",
+        buffer: std.ArrayList(u8) = .empty,
+        cursor: usize = 0,
+        placeholder_buffer: std.ArrayList(u8) = .empty,
+        model_label_buffer: std.ArrayList(u8) = .empty,
+        reasoning_label_buffer: std.ArrayList(u8) = .empty,
+        fast_label_buffer: std.ArrayList(u8) = .empty,
+        access_label_buffer: std.ArrayList(u8) = .empty,
+        model_options: Options = .{},
+        reasoning_options: Options = .{},
+        model_index: ?usize = null,
+        reasoning_index: ?usize = null,
+        active_menu: ?ComposerPromptOptionTarget = null,
+        hovered_menu_index: ?usize = null,
         hovered_part: ?ComposerPromptPart = null,
+        focused: bool = false,
+        fast_enabled: bool = false,
+        access_enabled: bool = false,
+        send_state: ComposerPromptSendState = .send,
         z_index: i32 = config.z_index,
+        callbacks: ComposerPromptCallbacks = .{},
 
         pub fn init() Component {
             return .{};
+        }
+
+        pub fn deinit(self: *Component, allocator: std.mem.Allocator) void {
+            self.buffer.deinit(allocator);
+            self.placeholder_buffer.deinit(allocator);
+            self.model_label_buffer.deinit(allocator);
+            self.reasoning_label_buffer.deinit(allocator);
+            self.fast_label_buffer.deinit(allocator);
+            self.access_label_buffer.deinit(allocator);
+            self.* = undefined;
         }
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
@@ -78,8 +175,101 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return self.rect;
         }
 
-        pub fn setText(self: *Component, value: []const u8) void {
-            self.text_value = value;
+        pub fn setCallbacks(self: *Component, callbacks: ComposerPromptCallbacks) void {
+            self.callbacks = callbacks;
+        }
+
+        pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, value);
+            self.cursor = self.buffer.items.len;
+            self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        pub fn text(self: *const Component) []const u8 {
+            return self.buffer.items;
+        }
+
+        pub fn setPlaceholder(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.placeholder_buffer, value);
+        }
+
+        pub fn setModelLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.model_label_buffer, value);
+        }
+
+        pub fn setReasoningLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.reasoning_label_buffer, value);
+        }
+
+        pub fn setFastLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.fast_label_buffer, value);
+        }
+
+        pub fn setAccessLabel(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            try setOwnedString(allocator, &self.access_label_buffer, value);
+        }
+
+        pub fn setSendState(self: *Component, state: ComposerPromptSendState) void {
+            self.send_state = state;
+        }
+
+        pub fn setModelOptions(self: *Component, context: ?*anyopaque, count: usize, label: ?ComposerPromptOptionLabelFn) void {
+            self.model_options = .{ .context = context, .count = count, .label = label };
+            if (self.model_index) |index| {
+                if (index >= count) self.model_index = null;
+            }
+        }
+
+        pub fn setReasoningOptions(self: *Component, context: ?*anyopaque, count: usize, label: ?ComposerPromptOptionLabelFn) void {
+            self.reasoning_options = .{ .context = context, .count = count, .label = label };
+            if (self.reasoning_index) |index| {
+                if (index >= count) self.reasoning_index = null;
+            }
+        }
+
+        pub fn setOptions(self: *Component, target: ComposerPromptOptionTarget, context: ?*anyopaque, count: usize, label: ?ComposerPromptOptionLabelFn) void {
+            switch (target) {
+                .model => self.setModelOptions(context, count, label),
+                .reasoning => self.setReasoningOptions(context, count, label),
+            }
+        }
+
+        pub fn handleInput(self: *Component, allocator: std.mem.Allocator, input: ComposerPromptInput) !bool {
+            switch (input) {
+                .text => |value| {
+                    if (!self.focused) return false;
+                    try self.insertText(allocator, value);
+                    return true;
+                },
+                .key => |key| return try self.handleKey(allocator, key),
+                .mouse_move => |point| {
+                    const changed = self.updateHover(point);
+                    const previous_index = self.hovered_menu_index;
+                    self.hovered_menu_index = self.menuIndexAtPoint(point);
+                    return changed or previous_index != self.hovered_menu_index;
+                },
+                .mouse_down => |point| return try self.handleMouseDown(allocator, point),
+                .mouse_up => return false,
+                .mouse_wheel => return false,
+                .focus => |focused| {
+                    const changed = self.focused != focused;
+                    self.setFocused(focused);
+                    return changed;
+                },
+            }
+        }
+
+        pub fn update(self: *Component, allocator: std.mem.Allocator, event: *const sdl.Event) !bool {
+            switch (event.type) {
+                .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
+                .key_down => return try self.handleInput(allocator, .{ .key = key_input.fromSdl(event.key) orelse return false }),
+                .mouse_motion => return try self.handleInput(allocator, .{ .mouse_move = .{ .x = event.motion.x, .y = event.motion.y } }),
+                .mouse_button_down => return try self.handleInput(allocator, .{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
+                .mouse_button_up => return try self.handleInput(allocator, .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
+                .mouse_wheel => return try self.handleInput(allocator, .{ .mouse_wheel = .{ .point = .{ .x = event.wheel.mouse_x, .y = event.wheel.mouse_y }, .y = event.wheel.y } }),
+                else => return false,
+            }
         }
 
         pub fn setSendHovered(self: *Component, hovered: bool) void {
@@ -153,44 +343,53 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try batch.panel(allocator, self.bounds(), config.background_color, config.border_color, config.corner_radius, config.border_width);
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
+            try self.renderMenu(allocator, batch);
         }
 
         fn renderPromptText(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const rect = self.textRect();
-            const value = if (self.text_value.len == 0) config.placeholder else self.text_value;
-            const color = if (self.text_value.len == 0) config.placeholder_color else config.text_color;
+            const placeholder = self.placeholderText();
+            const value = if (self.buffer.items.len == 0) placeholder else self.buffer.items;
+            const color = if (self.buffer.items.len == 0) config.placeholder_color else config.text_color;
             const metrics = text_layout.FontMetrics.fallback(config.font_size);
-            const runs = [_]draw.TextRun{.{
+            var runs: std.ArrayList(draw.TextRun) = .empty;
+            defer runs.deinit(allocator);
+            try text_layout.appendRuns(allocator, .{
+                .rect = rect,
                 .text = value,
-                .byte_start = 0,
-                .byte_end = value.len,
-                .x = rect.x,
-                .y = rect.y,
-                .font_size = metrics.font_size,
-                .line_height = metrics.line_height,
                 .color = color,
-                .clip = rect,
+                .metrics = metrics,
                 .font_role = config.font_role,
                 .font_id = config.font_id,
-            }};
-            try batch.textRuns(allocator, rect, value, &runs, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+                .wrap = true,
+                .clip = rect,
+            }, &runs);
+            try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+            if (self.focused and self.buffer.items.len > 0) {
+                const cursor = self.cursorRect();
+                if (rectContainsY(rect, cursor.y, cursor.h)) try batch.cursor(allocator, cursor, config.cursor_color);
+            }
         }
 
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const geometry = self.toolbarGeometry();
-            try self.renderPill(allocator, batch, geometry.model, config.model_icon, config.model_label, config.chevron_icon, self.hovered_part == .model);
+            try self.renderPill(allocator, batch, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
             try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
 
-            try self.renderPill(allocator, batch, geometry.reasoning, "", config.reasoning_label, config.chevron_icon, self.hovered_part == .reasoning);
+            try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
             try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
 
-            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, config.fast_label, "", self.hovered_part == .fast);
+            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
             try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
 
-            try self.renderPill(allocator, batch, geometry.access, config.access_icon, config.access_label, "", self.hovered_part == .access);
+            try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
-            try batch.panel(allocator, geometry.send, if (self.hovered_part == .send) config.send_hover_color else config.send_color, null, geometry.send.h * 0.5, 0.0);
-            try self.renderCenteredIcon(allocator, batch, geometry.send, config.send_icon, draw.Color.white);
+            const send_disabled = self.send_state == .disabled or self.send_state == .pending;
+            const send_color: draw.Color = if (send_disabled)
+                draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 }
+            else if (self.hovered_part == .send) config.send_hover_color else config.send_color;
+            try batch.panel(allocator, geometry.send, send_color, null, geometry.send.h * 0.5, 0.0);
+            try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
         }
 
         fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
@@ -273,6 +472,289 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
         }
 
+        fn renderMenu(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const target = self.active_menu orelse return;
+            const options = self.optionsFor(target);
+            if (options.count == 0) return;
+            const rect = self.menuRect(target);
+            const previous_z = batch.setZIndex(self.z_index + 1000);
+            defer batch.restoreZIndex(previous_z);
+            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, 10.0, 1.0);
+            const metrics = text_layout.FontMetrics.fallback(config.toolbar_font_size);
+            var index: usize = 0;
+            while (index < options.count) : (index += 1) {
+                const row = self.menuRowRect(target, index);
+                if (self.selectedIndex(target) == index) {
+                    try batch.selection(allocator, row, config.menu_selected_color);
+                } else if (self.hovered_menu_index == index) {
+                    try batch.rect(allocator, row, config.menu_hover_color);
+                }
+                const label = options.labelFor(index) orelse continue;
+                const text_rect: draw.Rect = .{
+                    .x = row.x + 10.0,
+                    .y = row.y + @max((row.h - metrics.line_height) * 0.5, 0.0),
+                    .w = @max(row.w - 20.0, 0.0),
+                    .h = metrics.line_height,
+                };
+                const runs = [_]draw.TextRun{.{
+                    .text = label,
+                    .byte_start = 0,
+                    .byte_end = label.len,
+                    .x = text_rect.x,
+                    .y = text_rect.y,
+                    .font_size = metrics.font_size,
+                    .line_height = metrics.line_height,
+                    .color = config.text_color,
+                    .clip = rect,
+                    .font_role = config.font_role,
+                    .font_id = config.font_id,
+                }};
+                try batch.textRuns(allocator, text_rect, label, &runs, config.text_color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+            }
+        }
+
+        fn handleKey(self: *Component, allocator: std.mem.Allocator, key: key_input) !bool {
+            if (self.active_menu) |target| {
+                if (key.code == .escape) {
+                    self.active_menu = null;
+                    self.hovered_menu_index = null;
+                    return true;
+                }
+                if (key.code == .enter) {
+                    if (self.hovered_menu_index) |index| {
+                        try self.selectOption(allocator, target, index);
+                        return true;
+                    }
+                }
+            }
+            if (!self.focused and key.code != .escape) return false;
+            switch (key.code) {
+                .escape => {
+                    self.active_menu = null;
+                    self.setFocused(false);
+                    return true;
+                },
+                .backspace => {
+                    if (self.cursor == 0) return true;
+                    self.cursor -= 1;
+                    _ = self.buffer.orderedRemove(self.cursor);
+                    self.emit(.{ .text_changed = self.buffer.items });
+                    return true;
+                },
+                .delete => {
+                    if (self.cursor >= self.buffer.items.len) return true;
+                    _ = self.buffer.orderedRemove(self.cursor);
+                    self.emit(.{ .text_changed = self.buffer.items });
+                    return true;
+                },
+                .left => {
+                    if (self.cursor > 0) self.cursor -= 1;
+                    return true;
+                },
+                .right => {
+                    if (self.cursor < self.buffer.items.len) self.cursor += 1;
+                    return true;
+                },
+                .home => {
+                    self.cursor = 0;
+                    return true;
+                },
+                .end => {
+                    self.cursor = self.buffer.items.len;
+                    return true;
+                },
+                .enter => {
+                    if (key.primary) {
+                        self.submit();
+                    } else {
+                        try self.insertText(allocator, "\n");
+                    }
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        fn handleMouseDown(self: *Component, allocator: std.mem.Allocator, point: draw.Vec2) !bool {
+            if (self.active_menu) |target| {
+                if (self.menuIndexAtPoint(point)) |index| {
+                    try self.selectOption(allocator, target, index);
+                    return true;
+                }
+                if (!self.menuRect(target).contains(point)) {
+                    self.active_menu = null;
+                    self.hovered_menu_index = null;
+                }
+            }
+            if (self.textRect().contains(point)) {
+                self.setFocused(true);
+                self.cursor = self.buffer.items.len;
+                return true;
+            }
+            if (self.hitTest(point)) |part| {
+                self.setFocused(false);
+                self.hovered_part = part;
+                switch (part) {
+                    .model => {
+                        self.toggleMenu(.model);
+                        self.emit(.model_clicked);
+                    },
+                    .reasoning => {
+                        self.toggleMenu(.reasoning);
+                        self.emit(.reasoning_clicked);
+                    },
+                    .fast => {
+                        self.fast_enabled = !self.fast_enabled;
+                        self.emit(.{ .fast_changed = self.fast_enabled });
+                    },
+                    .access => {
+                        self.access_enabled = !self.access_enabled;
+                        self.emit(.{ .access_changed = self.access_enabled });
+                    },
+                    .send => {
+                        if (self.send_state != .disabled and self.send_state != .pending) {
+                            self.emit(.send_clicked);
+                            if (self.send_state == .send) self.submit();
+                        }
+                    },
+                }
+                return true;
+            }
+            self.setFocused(false);
+            self.hovered_part = null;
+            return false;
+        }
+
+        fn insertText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            if (value.len == 0) return;
+            try self.buffer.insertSlice(allocator, self.cursor, value);
+            self.cursor += value.len;
+            self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn submit(self: *Component) void {
+            self.emit(.{ .submitted = self.buffer.items });
+        }
+
+        fn toggleMenu(self: *Component, target: ComposerPromptOptionTarget) void {
+            if (self.active_menu == target) {
+                self.active_menu = null;
+                self.hovered_menu_index = null;
+            } else {
+                self.active_menu = target;
+                self.hovered_menu_index = self.selectedIndex(target) orelse 0;
+            }
+        }
+
+        fn selectOption(self: *Component, allocator: std.mem.Allocator, target: ComposerPromptOptionTarget, index: usize) !void {
+            const options = self.optionsFor(target);
+            if (index >= options.count) return;
+            switch (target) {
+                .model => {
+                    self.model_index = index;
+                    if (options.labelFor(index)) |label| try self.setModelLabel(allocator, label);
+                    self.emit(.{ .model_changed = index });
+                },
+                .reasoning => {
+                    self.reasoning_index = index;
+                    if (options.labelFor(index)) |label| try self.setReasoningLabel(allocator, label);
+                    self.emit(.{ .reasoning_changed = index });
+                },
+            }
+            self.active_menu = null;
+            self.hovered_menu_index = null;
+        }
+
+        fn setFocused(self: *Component, focused: bool) void {
+            if (self.focused == focused) return;
+            self.focused = focused;
+            self.emit(.{ .focus_changed = focused });
+        }
+
+        fn cursorRect(self: *const Component) draw.Rect {
+            const rect = self.textRect();
+            const metrics = text_layout.FontMetrics.fallback(config.font_size);
+            const pos = text_layout.positionForOffset(.{
+                .rect = rect,
+                .text = self.buffer.items,
+                .color = config.text_color,
+                .metrics = metrics,
+                .wrap = true,
+                .clip = rect,
+            }, self.cursor);
+            return .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = metrics.line_height };
+        }
+
+        fn menuRect(self: *const Component, target: ComposerPromptOptionTarget) draw.Rect {
+            const control = switch (target) {
+                .model => self.modelRect(),
+                .reasoning => self.reasoningRect(),
+            };
+            const options = self.optionsFor(target);
+            const height = @min(@as(f32, @floatFromInt(options.count)) * config.row_height, config.row_height * 6.0);
+            return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, 150.0), .h = height };
+        }
+
+        fn menuRowRect(self: *const Component, target: ComposerPromptOptionTarget, index: usize) draw.Rect {
+            const menu = self.menuRect(target);
+            return .{ .x = menu.x, .y = menu.y + @as(f32, @floatFromInt(index)) * config.row_height, .w = menu.w, .h = config.row_height };
+        }
+
+        fn menuIndexAtPoint(self: *const Component, point: draw.Vec2) ?usize {
+            const target = self.active_menu orelse return null;
+            const menu = self.menuRect(target);
+            if (!menu.contains(point)) return null;
+            const index: usize = @intFromFloat(@floor((point.y - menu.y) / config.row_height));
+            if (index >= self.optionsFor(target).count) return null;
+            return index;
+        }
+
+        fn selectedIndex(self: *const Component, target: ComposerPromptOptionTarget) ?usize {
+            return switch (target) {
+                .model => self.model_index,
+                .reasoning => self.reasoning_index,
+            };
+        }
+
+        fn optionsFor(self: *const Component, target: ComposerPromptOptionTarget) Options {
+            return switch (target) {
+                .model => self.model_options,
+                .reasoning => self.reasoning_options,
+            };
+        }
+
+        fn placeholderText(self: *const Component) []const u8 {
+            return if (self.placeholder_buffer.items.len > 0) self.placeholder_buffer.items else config.placeholder;
+        }
+
+        fn modelLabel(self: *const Component) []const u8 {
+            return if (self.model_label_buffer.items.len > 0) self.model_label_buffer.items else config.model_label;
+        }
+
+        fn reasoningLabel(self: *const Component) []const u8 {
+            return if (self.reasoning_label_buffer.items.len > 0) self.reasoning_label_buffer.items else config.reasoning_label;
+        }
+
+        fn fastLabel(self: *const Component) []const u8 {
+            return if (self.fast_label_buffer.items.len > 0) self.fast_label_buffer.items else config.fast_label;
+        }
+
+        fn accessLabel(self: *const Component) []const u8 {
+            return if (self.access_label_buffer.items.len > 0) self.access_label_buffer.items else config.access_label;
+        }
+
+        fn sendIcon(self: *const Component) []const u8 {
+            return switch (self.send_state) {
+                .send, .disabled => config.send_icon,
+                .stop => config.stop_icon,
+                .pending => config.pending_icon,
+            };
+        }
+
+        fn emit(self: *Component, event: ComposerPromptEvent) void {
+            if (self.callbacks.on_event) |callback| callback(self.callbacks.context, event);
+        }
+
         fn toolbarGeometry(self: *const Component) struct {
             toolbar: draw.Rect,
             model: draw.Rect,
@@ -325,6 +807,15 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
     };
 }
 
+fn setOwnedString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: []const u8) !void {
+    out.clearRetainingCapacity();
+    try out.appendSlice(allocator, value);
+}
+
+fn rectContainsY(rect: draw.Rect, y: f32, h: f32) bool {
+    return y + h > rect.y and y < rect.y + rect.h;
+}
+
 test "composer prompt emits styled font-role commands" {
     const Prompt = ComposerPrompt(.{});
     var prompt = Prompt.init();
@@ -356,4 +847,67 @@ test "composer prompt hit tests toolbar controls" {
     try std.testing.expectEqual(@as(?ComposerPromptPart, .fast), prompt.hitTest(.{ .x = prompt.fastRect().x + 2, .y = prompt.fastRect().y + 2 }));
     try std.testing.expectEqual(@as(?ComposerPromptPart, .access), prompt.hitTest(.{ .x = prompt.accessRect().x + 2, .y = prompt.accessRect().y + 2 }));
     try std.testing.expectEqual(@as(?ComposerPromptPart, .send), prompt.hitTest(.{ .x = prompt.sendButtonRect().x + 2, .y = prompt.sendButtonRect().y + 2 }));
+}
+
+const ComposerProbe = struct {
+    text_changed: usize = 0,
+    submitted: usize = 0,
+    model_changed: usize = 0,
+    fast_changed: usize = 0,
+    access_changed: usize = 0,
+    send_clicked: usize = 0,
+};
+
+fn probeComposerEvent(context: ?*anyopaque, event: ComposerPromptEvent) void {
+    const probe: *ComposerProbe = @ptrCast(@alignCast(context orelse return));
+    switch (event) {
+        .text_changed => probe.text_changed += 1,
+        .submitted => probe.submitted += 1,
+        .model_changed => probe.model_changed += 1,
+        .fast_changed => probe.fast_changed += 1,
+        .access_changed => probe.access_changed += 1,
+        .send_clicked => probe.send_clicked += 1,
+        else => {},
+    }
+}
+
+fn testModelOption(_: ?*anyopaque, index: usize) []const u8 {
+    return switch (index) {
+        0 => "Default",
+        1 => "Deep",
+        else => "Fast",
+    };
+}
+
+test "composer prompt owns text options toggles and send input" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    var probe: ComposerProbe = .{};
+    prompt.setCallbacks(.{ .context = &probe, .on_event = probeComposerEvent });
+    prompt.setModelOptions(null, 3, testModelOption);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 2, .y = prompt.textRect().y + 2 } }));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .text = "hello" }));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
+    try std.testing.expectEqualStrings("hello\n", prompt.text());
+    try std.testing.expectEqual(@as(usize, 2), probe.text_changed);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.modelRect().x + 2, .y = prompt.modelRect().y + 2 } }));
+    try std.testing.expect(prompt.active_menu == .model);
+    const row = prompt.menuRowRect(.model, 1);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = row.x + 2, .y = row.y + 2 } }));
+    try std.testing.expectEqual(@as(?usize, 1), prompt.model_index);
+    try std.testing.expectEqualStrings("Deep", prompt.modelLabel());
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.fastRect().x + 2, .y = prompt.fastRect().y + 2 } }));
+    try std.testing.expect(prompt.fast_enabled);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.accessRect().x + 2, .y = prompt.accessRect().y + 2 } }));
+    try std.testing.expect(prompt.access_enabled);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.sendButtonRect().x + 2, .y = prompt.sendButtonRect().y + 2 } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.send_clicked);
+    try std.testing.expectEqual(@as(usize, 1), probe.submitted);
+    try std.testing.expectEqual(@as(usize, 1), probe.model_changed);
+    try std.testing.expectEqual(@as(usize, 1), probe.fast_changed);
+    try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
 }
