@@ -405,6 +405,7 @@ The common runtime API:
 
 - `setBounds(rect)` / `bounds()`
 - `setText(allocator, value)` / `text()`
+- `selection()`, `scrollY()`, `contentHeight()`, `maxScrollY()`
 - `setPlaceholder(allocator, value)`
 - `setModelLabel()`, `setReasoningLabel()`, `setFastLabel()`,
   `setAccessLabel()`
@@ -421,9 +422,13 @@ listens to callbacks, and draws the batch; it does not position a separate
 TextArea, Selects, toggles, or Button to recreate the prompt.
 
 The composer uses the same `FontMetrics` instance for wrapping prompt text,
-click hit testing, cursor geometry, and emitted text run positions. Toolbar pill
-rects are measured from icon, label, chevron, configured padding, and configured
-gaps; fixed min/max widths are constraints rather than hardcoded layout.
+click hit testing, cursor geometry, selection rectangles, scrolling, and
+emitted text run positions. The prompt text viewport owns `scroll_y`, mouse
+wheel scrolling, auto-scroll into view, clipped cursor/text, scrollbar commands,
+drag selection, shift-arrow selection, and replace-selection editing. Toolbar
+pill rects are measured from icon, label, chevron, configured padding, and
+configured gaps; fixed min/max widths are constraints rather than hardcoded
+layout.
 
 Run the visual composer lab:
 

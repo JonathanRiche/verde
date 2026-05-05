@@ -4,6 +4,8 @@ const std = @import("std");
 
 const draw = @import("../draw.zig");
 const key_input = @import("../input/key.zig");
+const scroll = @import("../scroll.zig");
+const selection_input = @import("../input/selection.zig");
 const sdl = @import("../sdl.zig");
 const text_layout = @import("../text_layout.zig");
 
@@ -55,6 +57,10 @@ pub const ComposerPromptConfig = struct {
     pending_icon: []const u8 = ".",
     cursor_color: draw.Color = draw.Color.white,
     selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
+    scrollbar_track_color: draw.Color = .{ .r = 0.18, .g = 0.20, .b = 0.23, .a = 0.42 },
+    scrollbar_thumb_color: draw.Color = .{ .r = 0.62, .g = 0.70, .b = 0.82, .a = 0.78 },
+    scrollbar_width: f32 = 4.0,
+    scroll_enabled: bool = true,
     menu_background_color: draw.Color = .{ .r = 0.07, .g = 0.09, .b = 0.10, .a = 0.98 },
     menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
@@ -101,6 +107,7 @@ pub const ComposerPromptInput = union(enum) {
     key: key_input,
     mouse_move: draw.Vec2,
     mouse_down: draw.Vec2,
+    mouse_drag: draw.Vec2,
     mouse_up: draw.Vec2,
     mouse_wheel: MouseWheel,
     focus: bool,
@@ -148,6 +155,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         buffer: std.ArrayList(u8) = .empty,
         cursor: usize = 0,
+        selection_anchor: ?usize = null,
+        selection_focus: ?usize = null,
+        scroll_y: f32 = 0.0,
+        dragging_selection: bool = false,
         placeholder_buffer: std.ArrayList(u8) = .empty,
         model_label_buffer: std.ArrayList(u8) = .empty,
         reasoning_label_buffer: std.ArrayList(u8) = .empty,
@@ -186,6 +197,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+            self.setScrollY(self.scroll_y);
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -198,6 +210,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn setFontMetrics(self: *Component, metrics: text_layout.FontMetrics) void {
             self.font_metrics = metrics;
+            self.setScrollY(self.scroll_y);
         }
 
         pub fn setToolbarFontMetrics(self: *Component, metrics: text_layout.FontMetrics) void {
@@ -212,11 +225,35 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.buffer.clearRetainingCapacity();
             try self.buffer.appendSlice(allocator, value);
             self.cursor = self.buffer.items.len;
+            self.selection_anchor = null;
+            self.selection_focus = null;
+            self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
         }
 
         pub fn text(self: *const Component) []const u8 {
             return self.buffer.items;
+        }
+
+        pub fn selection(self: *const Component) ?selection_input.Range {
+            const state: selection_input = .{ .anchor = self.selection_anchor, .focus = self.selection_focus };
+            return state.normalized(self.buffer.items.len);
+        }
+
+        pub fn scrollY(self: *const Component) f32 {
+            return self.scroll_y;
+        }
+
+        pub fn setScrollY(self: *Component, value: f32) void {
+            self.scroll_y = scroll.clampOffsetY(value, self.scrollMetrics());
+        }
+
+        pub fn contentHeight(self: *const Component) f32 {
+            return text_layout.contentHeight(self.buffer.items, self.textMetrics(), self.textRect().w, true);
+        }
+
+        pub fn maxScrollY(self: *const Component) f32 {
+            return scroll.maxOffsetY(self.scrollMetrics());
         }
 
         pub fn setPlaceholder(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
@@ -279,8 +316,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     return changed or previous_index != self.hovered_menu_index;
                 },
                 .mouse_down => |point| return try self.handleMouseDown(allocator, point),
-                .mouse_up => return false,
-                .mouse_wheel => return false,
+                .mouse_drag => |point| return self.handleMouseDrag(point),
+                .mouse_up => {
+                    const was_dragging = self.dragging_selection;
+                    self.dragging_selection = false;
+                    return was_dragging;
+                },
+                .mouse_wheel => |wheel| {
+                    if (!self.textRect().contains(wheel.point)) return false;
+                    self.scrollBy(-wheel.y * self.textMetrics().line_height * 3.0);
+                    return true;
+                },
                 .focus => |focused| {
                     const changed = self.focused != focused;
                     self.setFocused(focused);
@@ -293,7 +339,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             switch (event.type) {
                 .text_input => return try self.handleInput(allocator, .{ .text = std.mem.span(event.text.text) }),
                 .key_down => return try self.handleInput(allocator, .{ .key = key_input.fromSdl(event.key) orelse return false }),
-                .mouse_motion => return try self.handleInput(allocator, .{ .mouse_move = .{ .x = event.motion.x, .y = event.motion.y } }),
+                .mouse_motion => {
+                    const point: draw.Vec2 = .{ .x = event.motion.x, .y = event.motion.y };
+                    if (self.dragging_selection or event.motion.state.left) return try self.handleInput(allocator, .{ .mouse_drag = point });
+                    return try self.handleInput(allocator, .{ .mouse_move = point });
+                },
                 .mouse_button_down => return try self.handleInput(allocator, .{ .mouse_down = .{ .x = event.button.x, .y = event.button.y } }),
                 .mouse_button_up => return try self.handleInput(allocator, .{ .mouse_up = .{ .x = event.button.x, .y = event.button.y } }),
                 .mouse_wheel => return try self.handleInput(allocator, .{ .mouse_wheel = .{ .point = .{ .x = event.wheel.mouse_x, .y = event.wheel.mouse_y }, .y = event.wheel.y } }),
@@ -373,6 +423,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
             try self.renderMenu(allocator, batch);
+            try self.renderScrollbar(allocator, batch);
         }
 
         fn renderPromptText(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
@@ -384,10 +435,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
             try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             if (self.focused and self.buffer.items.len > 0) {
                 const cursor = self.cursorRect();
-                if (rectContainsY(rect, cursor.y, cursor.h)) try batch.cursor(allocator, cursor, config.cursor_color);
+                if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
             }
         }
 
@@ -554,32 +606,38 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     return true;
                 },
                 .backspace => {
+                    if (self.selection()) |_| {
+                        try self.replaceSelection(allocator, "");
+                        return true;
+                    }
                     if (self.cursor == 0) return true;
-                    self.cursor -= 1;
-                    _ = self.buffer.orderedRemove(self.cursor);
-                    self.emit(.{ .text_changed = self.buffer.items });
+                    const start = selection_input.previousOffset(self.buffer.items, self.cursor);
+                    try self.replaceRange(allocator, start, self.cursor, "");
                     return true;
                 },
                 .delete => {
+                    if (self.selection()) |_| {
+                        try self.replaceSelection(allocator, "");
+                        return true;
+                    }
                     if (self.cursor >= self.buffer.items.len) return true;
-                    _ = self.buffer.orderedRemove(self.cursor);
-                    self.emit(.{ .text_changed = self.buffer.items });
+                    try self.replaceRange(allocator, self.cursor, selection_input.nextOffset(self.buffer.items, self.cursor), "");
                     return true;
                 },
                 .left => {
-                    if (self.cursor > 0) self.cursor -= 1;
+                    self.moveCursor(selection_input.previousOffset(self.buffer.items, self.cursor), key.shift);
                     return true;
                 },
                 .right => {
-                    if (self.cursor < self.buffer.items.len) self.cursor += 1;
+                    self.moveCursor(selection_input.nextOffset(self.buffer.items, self.cursor), key.shift);
                     return true;
                 },
                 .home => {
-                    self.cursor = 0;
+                    self.moveCursor(selection_input.lineStart(self.buffer.items, self.cursor), key.shift);
                     return true;
                 },
                 .end => {
-                    self.cursor = self.buffer.items.len;
+                    self.moveCursor(selection_input.lineEnd(self.buffer.items, self.cursor), key.shift);
                     return true;
                 },
                 .enter => {
@@ -608,6 +666,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (self.textRect().contains(point)) {
                 self.setFocused(true);
                 self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, config.text_color), point);
+                self.selection_anchor = self.cursor;
+                self.selection_focus = self.cursor;
+                self.dragging_selection = true;
                 return true;
             }
             if (self.hitTest(point)) |part| {
@@ -644,11 +705,60 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return false;
         }
 
+        fn handleMouseDrag(self: *Component, point: draw.Vec2) bool {
+            if (!self.dragging_selection) return false;
+            if (self.selection_anchor == null) self.selection_anchor = self.cursor;
+            self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, config.text_color), point);
+            self.selection_focus = self.cursor;
+            self.autoScrollForDrag(point);
+            self.ensureCursorVisible();
+            return true;
+        }
+
         fn insertText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             if (value.len == 0) return;
-            try self.buffer.insertSlice(allocator, self.cursor, value);
-            self.cursor += value.len;
+            if (self.selection()) |_| return self.replaceSelection(allocator, value);
+            try self.replaceRange(allocator, self.cursor, self.cursor, value);
+        }
+
+        fn replaceSelection(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            const range = self.selection() orelse return self.replaceRange(allocator, self.cursor, self.cursor, value);
+            try self.replaceRange(allocator, range.start, range.end, value);
+        }
+
+        fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
+            const safe_start = @min(start, self.buffer.items.len);
+            const safe_end = @min(@max(end, safe_start), self.buffer.items.len);
+            self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            self.cursor = safe_start + value.len;
+            self.selection_anchor = null;
+            self.selection_focus = null;
+            self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn moveCursor(self: *Component, next: usize, extend_selection: bool) void {
+            const old = self.cursor;
+            self.cursor = @min(next, self.buffer.items.len);
+            if (extend_selection) {
+                if (self.selection_anchor == null) self.selection_anchor = old;
+                self.selection_focus = self.cursor;
+            } else {
+                self.selection_anchor = null;
+                self.selection_focus = null;
+            }
+            self.ensureCursorVisible();
+        }
+
+        fn autoScrollForDrag(self: *Component, point: draw.Vec2) void {
+            const text_rect = self.textRect();
+            if (point.y < text_rect.y) {
+                self.scrollBy(-self.textMetrics().line_height);
+            } else if (point.y > text_rect.y + text_rect.h) {
+                self.scrollBy(self.textMetrics().line_height);
+            }
         }
 
         fn submit(self: *Component) void {
@@ -790,8 +900,69 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_role = config.font_role,
                 .font_id = config.font_id,
                 .wrap = true,
+                .scroll = .{ .y = self.scroll_y },
                 .clip = self.textRect(),
             };
+        }
+
+        fn renderSelection(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, range: selection_input.Range) !void {
+            var rects: std.ArrayList(draw.Rect) = .empty;
+            defer rects.deinit(allocator);
+            try text_layout.appendSelectionRects(allocator, self.textLayoutOptions(self.buffer.items, config.text_color), range, &rects);
+            for (rects.items) |rect| try batch.selection(allocator, rect, config.selection_color);
+        }
+
+        fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            if (!config.scroll_enabled or config.scrollbar_width <= 0.0 or self.maxScrollY() <= 0.0) return;
+            const track = self.scrollbarTrackRect();
+            try batch.scrollbar(allocator, track, config.scrollbar_track_color);
+            if (self.scrollbarThumbRect()) |thumb| try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
+        }
+
+        fn scrollbarTrackRect(self: *const Component) draw.Rect {
+            const text_rect = self.textRect();
+            const track_w = @min(config.scrollbar_width, text_rect.w);
+            return .{
+                .x = text_rect.x + text_rect.w - track_w,
+                .y = text_rect.y,
+                .w = track_w,
+                .h = text_rect.h,
+            };
+        }
+
+        fn scrollbarThumbRect(self: *const Component) ?draw.Rect {
+            return scroll.thumbRect(self.scrollbarTrackRect(), self.scrollMetrics(), self.scroll_y);
+        }
+
+        fn scrollMetrics(self: *const Component) scroll.Metrics {
+            return .{
+                .enabled = config.scroll_enabled,
+                .content_height = self.contentHeight(),
+                .visible_height = self.textRect().h,
+                .line_height = self.textMetrics().line_height,
+                .scrollbar_width = config.scrollbar_width,
+            };
+        }
+
+        fn scrollBy(self: *Component, delta_y: f32) void {
+            self.setScrollY(self.scroll_y + delta_y);
+        }
+
+        fn ensureCursorVisible(self: *Component) void {
+            if (!config.scroll_enabled) {
+                self.scroll_y = 0.0;
+                return;
+            }
+            const cell = text_layout.visualCellForOffset(self.buffer.items, self.cursor, self.textMetrics(), self.textRect().w, true);
+            const cursor_top = @as(f32, @floatFromInt(cell.row)) * self.textMetrics().line_height;
+            const cursor_bottom = cursor_top + self.textMetrics().line_height;
+            const visible_height = self.textRect().h;
+            if (cursor_top < self.scroll_y) {
+                self.scroll_y = cursor_top;
+            } else if (cursor_bottom > self.scroll_y + visible_height) {
+                self.scroll_y = cursor_bottom - visible_height;
+            }
+            self.setScrollY(self.scroll_y);
         }
 
         fn pillWidth(self: *const Component, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
@@ -875,6 +1046,15 @@ fn setOwnedString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: 
 
 fn rectContainsY(rect: draw.Rect, y: f32, h: f32) bool {
     return y + h > rect.y and y < rect.y + rect.h;
+}
+
+fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 test "composer prompt emits styled font-role commands" {
@@ -1016,4 +1196,57 @@ test "composer prompt sizes toolbar pills from measured content" {
     const model = prompt.modelRect();
     const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + 3 + 6;
     try std.testing.expectEqual(expected, model.w);
+}
+
+test "composer prompt scrolls overflowing text and renders scrollbar" {
+    const Prompt = ComposerPrompt(.{ .width = 260, .height = 122, .font_size = 10, .fixed_advance = 5, .scrollbar_width = 4 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    try prompt.setText(std.testing.allocator, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6");
+    prompt.focused = true;
+    prompt.cursor = prompt.text().len;
+    prompt.ensureCursorVisible();
+
+    try std.testing.expect(prompt.scrollY() > 0);
+    const before = prompt.scrollY();
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_wheel = .{ .point = .{ .x = prompt.textRect().x + 2, .y = prompt.textRect().y + 2 }, .y = 1 } }));
+    try std.testing.expect(prompt.scrollY() < before);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try prompt.render(std.testing.allocator, &batch);
+    var scrollbar_count: usize = 0;
+    for (batch.commands.items) |command| {
+        if (command.kind == .scrollbar) scrollbar_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), scrollbar_count);
+}
+
+test "composer prompt selects and replaces text" {
+    const Prompt = ComposerPrompt(.{ .width = 320, .height = 150, .font_size = 10, .fixed_advance = 10 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    try prompt.setText(std.testing.allocator, "hello world");
+    prompt.focused = true;
+    prompt.cursor = 5;
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .left, .shift = true } }));
+    try std.testing.expect(prompt.selection() != null);
+    try std.testing.expectEqualStrings("o", prompt.text()[prompt.selection().?.start..prompt.selection().?.end]);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .text = "O" }));
+    try std.testing.expectEqualStrings("hellO world", prompt.text());
+
+    const start = prompt.textRect();
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = start.x + 0, .y = start.y + 2 } }));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_drag = .{ .x = start.x + 50, .y = start.y + 2 } }));
+    try std.testing.expect(prompt.selection() != null);
+
+    var batch: draw.RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+    try prompt.render(std.testing.allocator, &batch);
+    var selection_count: usize = 0;
+    for (batch.commands.items) |command| {
+        if (command.kind == .selection) selection_count += 1;
+    }
+    try std.testing.expect(selection_count > 0);
 }
