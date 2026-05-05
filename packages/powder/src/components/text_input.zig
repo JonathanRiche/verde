@@ -18,6 +18,8 @@ pub const TextInputConfig = struct {
     padding_y: f32 = 6.0,
     background_color: draw.Color = .{ .r = 0.07, .g = 0.08, .b = 0.09, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.18, .g = 0.21, .b = 0.24, .a = 1.0 },
+    corner_radius: f32 = 5.0,
+    border_width: f32 = 1.0,
     text_color: draw.Color = draw.Color.white,
     cursor_color: draw.Color = draw.Color.white,
     selection_color: draw.Color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
@@ -29,6 +31,7 @@ pub const TextInputConfig = struct {
     font_size: f32 = 16.0,
     glyph_width: ?f32 = null,
     submit_on_enter: bool = true,
+    z_index: i32 = 0,
 };
 
 pub const Input = union(enum) {
@@ -83,6 +86,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         dragging_selection: bool = false,
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
+        z_index: i32 = config.z_index,
         callbacks: TextInputCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -123,6 +127,10 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
             self.font_metrics = metrics_value;
             self.ensureCursorVisible();
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
@@ -220,10 +228,12 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             const bounds_rect = self.bounds();
             const text_rect = self.textRect();
-            try batch.rect(allocator, bounds_rect, config.background_color);
-            try batch.rect(allocator, .{ .x = bounds_rect.x, .y = bounds_rect.y, .w = bounds_rect.w, .h = 1.0 }, config.border_color);
+            try batch.panel(allocator, bounds_rect, config.background_color, config.border_color, config.corner_radius, config.border_width);
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             const value = if (self.placeholderVisible()) config.placeholder_text else self.buffer.items;
             const color = if (self.placeholderVisible()) config.placeholder_color else config.text_color;

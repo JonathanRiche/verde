@@ -19,7 +19,7 @@ const CoverImage = powder.image(.{ .source_width = 105, .source_height = 122, .f
 const StretchImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .stretch, .tint = powder.Color.white });
 const CropImage = powder.image(.{ .source_width = 105, .source_height = 122, .fit = .cover, .uv = .{ .x = 0.0, .y = 0.0, .w = 0.55, .h = 0.55 }, .tint = powder.Color.white });
 const Prompt = powder.textInput(.{ .height = 38, .placeholder_text = "Resize the window, type here, and click controls" });
-const Send = powder.button(.{ .label = "Send" });
+const Send = powder.button(.{ .icon_text = ">", .font_size = 18, .corner_radius = 999 });
 const Stop = powder.button(.{ .label = "Stop" });
 const Fast = powder.toggle(.{ .label = "Fast" });
 const Access = powder.checkbox(.{ .label = "Tools" });
