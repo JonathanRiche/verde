@@ -22,6 +22,7 @@ pub const ImageConfig = struct {
     uv: draw.Rect = .{ .w = 1.0, .h = 1.0 },
     tint: draw.Color = draw.Color.white,
     clip: bool = true,
+    z_index: i32 = 0,
 };
 
 pub fn Image(comptime config: ImageConfig) type {
@@ -33,6 +34,7 @@ pub fn Image(comptime config: ImageConfig) type {
         source_size: draw.Vec2 = .{ .x = config.source_width, .y = config.source_height },
         uv: draw.Rect = config.uv,
         tint: draw.Color = config.tint,
+        z_index: i32 = config.z_index,
 
         pub fn init(texture: draw.TextureId) Component {
             return .{ .texture = texture };
@@ -57,6 +59,10 @@ pub fn Image(comptime config: ImageConfig) type {
             self.rect = rect;
         }
 
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
+        }
+
         pub fn bounds(self: *const Component) draw.Rect {
             return self.rect;
         }
@@ -66,6 +72,9 @@ pub fn Image(comptime config: ImageConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try batch.image(
                 allocator,
                 self.imageRect(),

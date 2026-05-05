@@ -24,6 +24,7 @@ pub const CheckboxConfig = struct {
     disabled_label_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
     checked: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const ToggleConfig = struct {
@@ -46,6 +47,7 @@ pub const ToggleConfig = struct {
     disabled_label_color: draw.Color = .{ .r = 0.58, .g = 0.63, .b = 0.68, .a = 0.80 },
     disabled: bool = false,
     checked: bool = false,
+    z_index: i32 = 0,
 };
 
 pub const ActivationKey = enum {
@@ -85,6 +87,7 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = defaultCheckboxBounds(config),
+        z_index: i32 = config.z_index,
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -112,6 +115,10 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -192,6 +199,9 @@ pub fn Checkbox(comptime config: CheckboxConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderCheckboxBox(
                 allocator,
                 batch,
@@ -253,6 +263,7 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         focused: bool = false,
         disabled: bool = config.disabled,
         rect: draw.Rect = defaultToggleBounds(config),
+        z_index: i32 = config.z_index,
         callbacks: CheckboxCallbacks = .{},
 
         pub fn init(checked: bool) Component {
@@ -280,6 +291,10 @@ pub fn Toggle(comptime config: ToggleConfig) type {
 
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
+        }
+
+        pub fn setZIndex(self: *Component, z_index: i32) void {
+            self.z_index = z_index;
         }
 
         pub fn bounds(self: *const Component) draw.Rect {
@@ -359,6 +374,9 @@ pub fn Toggle(comptime config: ToggleConfig) type {
         }
 
         pub fn render(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
+            const previous_z = batch.setZIndex(self.z_index);
+            defer batch.restoreZIndex(previous_z);
+
             try renderCheckboxBox(
                 allocator,
                 batch,

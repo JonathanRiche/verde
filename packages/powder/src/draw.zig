@@ -94,11 +94,14 @@ pub const Command = struct {
     glyph_width: f32 = 8.8,
     line_height: f32 = 20.0,
     wrap: bool = false,
+    /// Higher z-index commands draw later. Equal z-index preserves insertion order.
+    z_index: i32 = 0,
 };
 
 pub const RenderBatch = struct {
     commands: std.ArrayList(Command) = .empty,
     text_runs: std.ArrayList(TextRun) = .empty,
+    current_z_index: i32 = 0,
 
     pub fn deinit(self: *RenderBatch, allocator: std.mem.Allocator) void {
         self.commands.deinit(allocator);
@@ -108,10 +111,21 @@ pub const RenderBatch = struct {
     pub fn clear(self: *RenderBatch) void {
         self.commands.clearRetainingCapacity();
         self.text_runs.clearRetainingCapacity();
+        self.current_z_index = 0;
+    }
+
+    pub fn setZIndex(self: *RenderBatch, z_index: i32) i32 {
+        const previous = self.current_z_index;
+        self.current_z_index = z_index;
+        return previous;
+    }
+
+    pub fn restoreZIndex(self: *RenderBatch, z_index: i32) void {
+        self.current_z_index = z_index;
     }
 
     pub fn rect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .rect, .rect = r, .color = color });
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color });
     }
 
     pub fn glyph(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, uv: Rect, color: Color) !void {
@@ -119,7 +133,7 @@ pub const RenderBatch = struct {
     }
 
     pub fn image(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, texture: TextureId, uv: Rect, tint: Color, clip: ?Rect) !void {
-        try self.commands.append(allocator, .{
+        try self.appendCommand(allocator, .{
             .kind = .image,
             .rect = r,
             .uv = uv,
@@ -132,7 +146,7 @@ pub const RenderBatch = struct {
     /// Appends a text command. The `value` slice is frame-lifetime and must remain
     /// valid until the batch is consumed by a renderer.
     pub fn text(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, value: []const u8, color: Color, font_size: f32, clip: ?Rect) !void {
-        try self.commands.append(allocator, .{
+        try self.appendCommand(allocator, .{
             .kind = .text,
             .rect = r,
             .color = color,
@@ -162,7 +176,7 @@ pub const RenderBatch = struct {
         const start = self.text_runs.items.len;
         try self.text_runs.appendSlice(allocator, runs);
         const stored = self.text_runs.items[start .. start + runs.len];
-        try self.commands.append(allocator, .{
+        try self.appendCommand(allocator, .{
             .kind = .text,
             .rect = r,
             .color = color,
@@ -193,7 +207,7 @@ pub const RenderBatch = struct {
         line_height: f32,
         wrap: bool,
     ) !void {
-        try self.commands.append(allocator, .{
+        try self.appendCommand(allocator, .{
             .kind = .text,
             .rect = r,
             .color = color,
@@ -208,15 +222,26 @@ pub const RenderBatch = struct {
     }
 
     pub fn cursor(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .cursor, .rect = r, .color = color });
+        try self.appendCommand(allocator, .{ .kind = .cursor, .rect = r, .color = color });
     }
 
     pub fn selection(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .selection, .rect = r, .color = color });
+        try self.appendCommand(allocator, .{ .kind = .selection, .rect = r, .color = color });
     }
 
     pub fn scrollbar(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
-        try self.commands.append(allocator, .{ .kind = .scrollbar, .rect = r, .color = color });
+        try self.appendCommand(allocator, .{ .kind = .scrollbar, .rect = r, .color = color });
+    }
+
+    fn appendCommand(self: *RenderBatch, allocator: std.mem.Allocator, command: Command) !void {
+        var next = command;
+        next.z_index = self.current_z_index;
+        try self.commands.append(allocator, next);
+        var index = self.commands.items.len - 1;
+        while (index > 0 and self.commands.items[index - 1].z_index > next.z_index) : (index -= 1) {
+            self.commands.items[index] = self.commands.items[index - 1];
+        }
+        self.commands.items[index] = next;
     }
 
     fn refreshTextRunSlices(self: *RenderBatch) void {
@@ -243,4 +268,22 @@ test "image command carries texture and uv" {
     try std.testing.expectEqual(@as(u32, 7), batch.commands.items[0].texture.value);
     try std.testing.expectEqual(@as(f32, 0.25), batch.commands.items[0].uv.x);
     try std.testing.expect(batch.commands.items[0].clip != null);
+}
+
+test "commands are stably sorted by z-index" {
+    var batch: RenderBatch = .{};
+    defer batch.deinit(std.testing.allocator);
+
+    _ = batch.setZIndex(10);
+    try batch.rect(std.testing.allocator, .{ .x = 10 }, Color.white);
+    _ = batch.setZIndex(0);
+    try batch.rect(std.testing.allocator, .{ .x = 0 }, Color.white);
+    try batch.rect(std.testing.allocator, .{ .x = 1 }, Color.white);
+    _ = batch.setZIndex(5);
+    try batch.rect(std.testing.allocator, .{ .x = 5 }, Color.white);
+
+    try std.testing.expectEqual(@as(f32, 0), batch.commands.items[0].rect.x);
+    try std.testing.expectEqual(@as(f32, 1), batch.commands.items[1].rect.x);
+    try std.testing.expectEqual(@as(f32, 5), batch.commands.items[2].rect.x);
+    try std.testing.expectEqual(@as(f32, 10), batch.commands.items[3].rect.x);
 }
