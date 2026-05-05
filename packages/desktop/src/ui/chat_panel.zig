@@ -3930,6 +3930,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
     drawPowderComposerAccessIcon(state);
+    drawPowderComposerStopOverlay(state);
     state.updateFileSearch();
 
     if (state.hasActiveFileSearch()) {
@@ -4042,6 +4043,31 @@ fn drawPowderComposerAccessIcon(state: *app_state.AppState) void {
     const x = rect.x + theme.scaledUi(12.0);
     const center_y = rect.y + rect.h * 0.5;
     drawLockIcon(zgui.getWindowDrawList(), x, center_y, color, state.currentThread().access_mode == .supervised);
+}
+
+fn drawPowderComposerStopOverlay(state: *app_state.AppState) void {
+    if (!state.currentThread().isSendPendingForUi()) return;
+    const rect = state.powder_composer.sendButtonRect();
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const draw_list = zgui.getWindowDrawList();
+    const pmin = [2]f32{ rect.x, rect.y };
+    const pmax = [2]f32{ rect.x + rect.w, rect.y + rect.h };
+    draw_list.addRectFilled(.{
+        .pmin = pmin,
+        .pmax = pmax,
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.64, 0.48, 0.16, 1.0 }),
+        .rounding = rect.h * 0.5,
+    });
+
+    const size = @min(rect.w, rect.h) * 0.34;
+    const cx = rect.x + rect.w * 0.5;
+    const cy = rect.y + rect.h * 0.5;
+    draw_list.addRectFilled(.{
+        .pmin = .{ cx - size * 0.5, cy - size * 0.5 },
+        .pmax = .{ cx + size * 0.5, cy + size * 0.5 },
+        .col = zgui.colorConvertFloat4ToU32(.{ 1.0, 0.96, 0.86, 1.0 }),
+        .rounding = theme.scaledUi(1.5),
+    });
 }
 
 fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
