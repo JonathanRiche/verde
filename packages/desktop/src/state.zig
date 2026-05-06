@@ -74,12 +74,13 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
 const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
 const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 34.0;
 const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 3;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 pub const PowderModelCascadeMenu = powder.cascadeMenu(.{
     .width = COMPOSER_MODEL_CASCADE_WIDTH,
     .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
-    .max_visible_rows = 5,
+    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
     .max_depth = 2,
     .padding_x = 12.0,
     .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
@@ -4492,12 +4493,12 @@ pub const AppState = struct {
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
         var max_child_rows: usize = 1;
         for (COMPOSER_PROVIDER_OPTIONS) |provider| {
-            max_child_rows = @max(max_child_rows, @min(composerModelOptions(self, provider).len, 8));
+            max_child_rows = @max(max_child_rows, @min(composerModelOptions(self, provider).len, COMPOSER_MODEL_CASCADE_VISIBLE_ROWS));
         }
         const child_visible_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(max_child_rows));
-        const child_max_row_offset = (COMPOSER_MODEL_CASCADE_PADDING_Y +
-            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len - 1))) * 0.5;
+        const child_max_row_offset = COMPOSER_MODEL_CASCADE_PADDING_Y +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len - 1));
         const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
@@ -4526,7 +4527,7 @@ pub const AppState = struct {
                 self.powder_model_cascade.active_depth = 2;
                 if (self.composerModelIndex(thread.provider, thread.model_ref)) |model_index| {
                     self.powder_model_cascade.highlighted[1] = model_index;
-                    const max_visible_rows: usize = 5;
+                    const max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS;
                     if (model_index >= max_visible_rows) {
                         const first_visible = model_index - max_visible_rows + 1;
                         self.powder_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
