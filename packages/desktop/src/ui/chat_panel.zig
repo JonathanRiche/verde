@@ -3930,6 +3930,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
     drawPowderComposerToolbarOverlay(state);
+    drawPowderModelCascadeMenu(state);
     drawPowderComposerStopButton(state);
     state.updateFileSearch();
 
@@ -4085,6 +4086,20 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     };
     state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.powder_composer.accessRect(), access_label, .lock, false);
     drawPowderComposerBadge(state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, powderRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
+}
+
+fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
+    if (!state.powder_model_cascade.isOpen()) return;
+    state.syncPowderModelCascadeMenu();
+    state.setPowderModelCascadeBoundsFromToolbar();
+
+    var batch: powder.RenderBatch = .{};
+    defer batch.deinit(state.allocator);
+    state.powder_model_cascade.render(state.allocator, &batch) catch |err| {
+        runtime.log.warn("failed to render powder model cascade menu: {s}", .{@errorName(err)});
+        return;
+    };
+    drawPowderOverlayWithZgui(&batch);
 }
 
 const ComposerBadgeIcon = enum {
