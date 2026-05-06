@@ -4065,19 +4065,19 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     const gap = theme.scaledUi(14.0);
     var x = toolbar.x;
     state.composer_toolbar_overlay_valid = true;
-    state.composer_toolbar_model_rect = composerBadgeRectAt(x, state.powder_composer.modelRect(), model_label, .none, true);
-    drawPowderComposerBadge(state.composer_toolbar_model_rect, model_label, .none, false, true, powderRectContainsPoint(state.composer_toolbar_model_rect, mouse_pos));
+    state.composer_toolbar_model_rect = composerBadgeRectAt(x, state.powder_composer.modelRect(), model_label, .provider_logo, true);
+    drawPowderComposerBadge(state, state.composer_toolbar_model_rect, model_label, .provider_logo, false, true, powderRectContainsPoint(state.composer_toolbar_model_rect, mouse_pos));
     x += state.composer_toolbar_model_rect.w + gap;
     drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     state.composer_toolbar_reasoning_rect = composerBadgeRectAt(x, state.powder_composer.reasoningRect(), reasoning_label, .none, true);
-    drawPowderComposerBadge(state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, powderRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
+    drawPowderComposerBadge(state, state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, powderRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
     x += state.composer_toolbar_reasoning_rect.w + gap;
     drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     const fast_enabled = thread.fast_mode == .on;
     const fast_label = if (fast_enabled) "Fast" else "Default";
     const fast_icon: ComposerBadgeIcon = if (fast_enabled) .lightning else .default_mode;
     state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.powder_composer.fastRect(), fast_label, fast_icon, false);
-    drawPowderComposerBadge(state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, powderRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
+    drawPowderComposerBadge(state, state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, powderRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
     x += state.composer_toolbar_fast_rect.w + gap;
     drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     const access_label = switch (thread.access_mode) {
@@ -4085,7 +4085,7 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
         .full_access => "Full access",
     };
     state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.powder_composer.accessRect(), access_label, .lock, false);
-    drawPowderComposerBadge(state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, powderRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
+    drawPowderComposerBadge(state, state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, powderRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
 }
 
 fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
@@ -4100,10 +4100,79 @@ fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
         return;
     };
     drawPowderOverlayWithZgui(&batch);
+    drawPowderModelCascadeProviderLogos(state);
+}
+
+fn drawPowderModelCascadeProviderLogos(state: *app_state.AppState) void {
+    const draw_list = zgui.getWindowDrawList();
+    const providers = [_]app_state.Provider{ .codex, .opencode };
+    for (providers, 0..) |provider, index| {
+        const row = state.powder_model_cascade.rowRect(0, index);
+        if (row.w <= 0.0 or row.h <= 0.0) continue;
+        drawProviderLogoInPowderOverlay(
+            draw_list,
+            state,
+            provider,
+            row.x + theme.scaledUi(1.0),
+            row.y + row.h * 0.5,
+            theme.scaledUi(16.0),
+        );
+    }
+}
+
+fn drawProviderLogoInPowderOverlay(draw_list: zgui.DrawList, state: *app_state.AppState, provider: app_state.Provider, x: f32, center_y: f32, target_height: f32) void {
+    const cached = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    } orelse return;
+    const uv = providerLogoUvBounds(provider);
+    const visible_w = uv.max[0] - uv.min[0];
+    const visible_h = uv.max[1] - uv.min[1];
+    if (visible_w <= 0.0 or visible_h <= 0.0) return;
+    const logo_h = target_height * providerLogoScale(provider);
+    const logo_w = logo_h * (visible_w / visible_h);
+    const logo_min: [2]f32 = .{
+        x,
+        center_y - logo_h * 0.5 + providerLogoYOffset(provider),
+    };
+    draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
+        .pmin = logo_min,
+        .pmax = .{ logo_min[0] + logo_w, logo_min[1] + logo_h },
+        .uvmin = uv.min,
+        .uvmax = uv.max,
+    });
+}
+
+fn providerLogoUvBounds(provider: app_state.Provider) struct { min: [2]f32, max: [2]f32 } {
+    return switch (provider) {
+        .codex => .{
+            .min = .{ 118.0 / 721.0, 120.0 / 721.0 },
+            .max = .{ 603.0 / 721.0, 601.0 / 721.0 },
+        },
+        .opencode => .{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ 1.0, 1.0 },
+        },
+    };
+}
+
+fn providerLogoScale(provider: app_state.Provider) f32 {
+    return switch (provider) {
+        .codex => 0.92,
+        .opencode => 0.78,
+    };
+}
+
+fn providerLogoYOffset(provider: app_state.Provider) f32 {
+    return switch (provider) {
+        .codex => theme.scaledUi(-0.5),
+        .opencode => 0.0,
+    };
 }
 
 const ComposerBadgeIcon = enum {
     none,
+    provider_logo,
     default_mode,
     lightning,
     lock,
@@ -4117,6 +4186,7 @@ fn composerBadgeRectAt(x_pos: f32, rect: powder.Rect, label: []const u8, icon: C
     const pad_x = theme.scaledUi(14.0);
     const icon_advance = switch (icon) {
         .none => 0.0,
+        .provider_logo => theme.scaledUi(26.0),
         .default_mode => theme.scaledUi(24.0),
         .lightning => theme.scaledUi(30.0),
         .lock => theme.scaledUi(26.0),
@@ -4131,7 +4201,7 @@ fn composerBadgeRectAt(x_pos: f32, rect: powder.Rect, label: []const u8, icon: C
     };
 }
 
-fn drawPowderComposerBadge(visual_rect: powder.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool, hovered: bool) void {
+fn drawPowderComposerBadge(state: *app_state.AppState, visual_rect: powder.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool, hovered: bool) void {
     if (visual_rect.w <= 0.0 or visual_rect.h <= 0.0) return;
 
     const draw_list = zgui.getWindowDrawList();
@@ -4140,6 +4210,7 @@ fn drawPowderComposerBadge(visual_rect: powder.Rect, label: []const u8, icon: Co
     const pad_x = theme.scaledUi(14.0);
     const icon_advance = switch (icon) {
         .none => 0.0,
+        .provider_logo => theme.scaledUi(26.0),
         .default_mode => theme.scaledUi(24.0),
         .lightning => theme.scaledUi(30.0),
         .lock => theme.scaledUi(26.0),
@@ -4160,6 +4231,10 @@ fn drawPowderComposerBadge(visual_rect: powder.Rect, label: []const u8, icon: Co
 
     switch (icon) {
         .none => {},
+        .provider_logo => {
+            drawProviderLogoInPowderOverlay(draw_list, state, state.currentThread().provider, x, center_y, theme.scaledUi(18.0));
+            x += icon_advance;
+        },
         .default_mode => {
             const icon_col = zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.95, 0.96, 1.0, 1.0 } else .{ 0.78, 0.82, 0.92, 1.0 });
             draw_list.addCircle(.{
