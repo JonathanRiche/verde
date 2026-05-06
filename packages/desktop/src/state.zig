@@ -4503,7 +4503,8 @@ pub const AppState = struct {
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        const y = @max(8.0, anchor.y - child_visible_height - child_max_row_offset - 8.0);
+        const prompt_top = if (self.composer_input_bounds_valid) self.composer_input_min[1] else anchor.y;
+        const y = @max(8.0, prompt_top - child_visible_height - child_max_row_offset - 8.0);
         self.powder_model_cascade.setBounds(.{
             .x = x,
             .y = y,
