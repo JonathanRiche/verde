@@ -376,6 +376,28 @@ child panels, and renderer-neutral labels/chevrons emitted as `TextRun`s. Use
 `CascadeMenuCallbacks.on_event` to receive `selected`, `highlighted`, and
 `open_changed` events.
 
+Popup placement can be controlled without renderer logic:
+
+```zig
+const Menu = powder.cascadeMenu(.{
+    .placement = .above,
+    .submenu_placement = .right,
+    .item_label = itemLabel,
+    .child_count = childCount,
+});
+
+menu.setAnchorRect(toolbar_button_rect);
+menu.setViewportRect(window_content_rect);
+menu.setForbiddenRect(composer_card_rect);
+```
+
+`setAnchorRect()` positions the root menu relative to a button or control.
+`setViewportRect()` clamps root and child panels inside the visible area.
+`setForbiddenRect()` marks a rect that popups should not overlap, such as a
+composer card below the toolbar. Child menus open from the highlighted row,
+flip horizontally when `submenu_placement = .auto`, and shift upward before
+viewport clamping when they would collide with the forbidden rect.
+
 ## Toolbar And Composer Prompt
 
 `powder.toolbar()` is a retained horizontal layout helper for inline command
