@@ -4105,19 +4105,59 @@ fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
 
 fn drawPowderModelCascadeProviderLogos(state: *app_state.AppState) void {
     const draw_list = zgui.getWindowDrawList();
+    const font = zgui.getFont();
     const providers = [_]app_state.Provider{ .codex, .opencode };
     for (providers, 0..) |provider, index| {
         const row = state.powder_model_cascade.rowRect(0, index);
         if (row.w <= 0.0 or row.h <= 0.0) continue;
+        const highlighted = state.powder_model_cascade.highlighted[0] != null and state.powder_model_cascade.highlighted[0].? == index;
+        const row_color = if (highlighted)
+            powder.Color{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 }
+        else
+            powder.Color{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 };
+        draw_list.addRectFilled(.{
+            .pmin = .{ row.x, row.y },
+            .pmax = .{ row.x + row.w, row.y + row.h },
+            .col = powderColorU32(row_color),
+            .rounding = theme.scaledUi(5.0),
+        });
+        const logo_slot_w = theme.scaledUi(25.0);
         drawProviderLogoInPowderOverlay(
             draw_list,
             state,
             provider,
-            row.x + theme.scaledUi(1.0),
+            row.x + (logo_slot_w - providerLogoWidth(provider, row.h - theme.scaledUi(10.0))) * 0.5,
             row.y + row.h * 0.5,
-            theme.scaledUi(16.0),
+            row.h - theme.scaledUi(10.0),
+        );
+        const label = chat_threads.providerLabel(provider);
+        draw_list.addTextExtendedUnformatted(
+            .{ row.x + logo_slot_w + theme.scaledUi(6.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
+            powderColorU32(.{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 }),
+            label,
+            .{
+                .font = font,
+                .font_size = theme.scaledUi(20.0),
+            },
+        );
+        draw_list.addTextExtendedUnformatted(
+            .{ row.x + row.w - theme.scaledUi(19.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
+            powderColorU32(.{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 }),
+            "›",
+            .{
+                .font = font,
+                .font_size = theme.scaledUi(20.0),
+            },
         );
     }
+}
+
+fn providerLogoWidth(provider: app_state.Provider, target_height: f32) f32 {
+    const uv = providerLogoUvBounds(provider);
+    const visible_w = uv.max[0] - uv.min[0];
+    const visible_h = uv.max[1] - uv.min[1];
+    if (visible_w <= 0.0 or visible_h <= 0.0) return 0.0;
+    return target_height * providerLogoScale(provider) * (visible_w / visible_h);
 }
 
 fn drawProviderLogoInPowderOverlay(draw_list: zgui.DrawList, state: *app_state.AppState, provider: app_state.Provider, x: f32, center_y: f32, target_height: f32) void {
