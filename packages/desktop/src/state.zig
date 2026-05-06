@@ -293,10 +293,7 @@ fn powderModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usi
     const state = appStateFromContext(context) orelse return "";
     if (path.len == 0) {
         const provider = providerForComposerCascadeIndex(index) orelse return "";
-        return switch (provider) {
-            .codex => "   Codex",
-            .opencode => "   OpenCode",
-        };
+        return chat_threads.providerLabel(provider);
     }
     if (path.len == 1) {
         const provider = providerForComposerCascadeIndex(path[0]) orelse return "";
