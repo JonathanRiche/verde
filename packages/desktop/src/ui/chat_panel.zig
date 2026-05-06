@@ -4072,9 +4072,11 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     drawPowderComposerBadge(state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, powderRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
     x += state.composer_toolbar_reasoning_rect.w + gap;
     drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
-    const fast_label = if (thread.fast_mode == .on) "Fast" else "Normal";
-    state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.powder_composer.fastRect(), fast_label, .lightning, false);
-    drawPowderComposerBadge(state.composer_toolbar_fast_rect, fast_label, .lightning, false, false, powderRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
+    const fast_enabled = thread.fast_mode == .on;
+    const fast_label = if (fast_enabled) "Fast" else "Default";
+    const fast_icon: ComposerBadgeIcon = if (fast_enabled) .lightning else .default_mode;
+    state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.powder_composer.fastRect(), fast_label, fast_icon, false);
+    drawPowderComposerBadge(state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, powderRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
     x += state.composer_toolbar_fast_rect.w + gap;
     drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     const access_label = switch (thread.access_mode) {
@@ -4087,6 +4089,7 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
 
 const ComposerBadgeIcon = enum {
     none,
+    default_mode,
     lightning,
     lock,
 };
@@ -4099,7 +4102,8 @@ fn composerBadgeRectAt(x_pos: f32, rect: powder.Rect, label: []const u8, icon: C
     const pad_x = theme.scaledUi(14.0);
     const icon_advance = switch (icon) {
         .none => 0.0,
-        .lightning => theme.scaledUi(24.0),
+        .default_mode => theme.scaledUi(24.0),
+        .lightning => theme.scaledUi(30.0),
         .lock => theme.scaledUi(26.0),
     };
     const chevron_width = if (chevron) theme.scaledUi(20.0) else 0.0;
@@ -4121,7 +4125,8 @@ fn drawPowderComposerBadge(visual_rect: powder.Rect, label: []const u8, icon: Co
     const pad_x = theme.scaledUi(14.0);
     const icon_advance = switch (icon) {
         .none => 0.0,
-        .lightning => theme.scaledUi(24.0),
+        .default_mode => theme.scaledUi(24.0),
+        .lightning => theme.scaledUi(30.0),
         .lock => theme.scaledUi(26.0),
     };
     const pmin: [2]f32 = .{ visual_rect.x, visual_rect.y };
@@ -4140,9 +4145,19 @@ fn drawPowderComposerBadge(visual_rect: powder.Rect, label: []const u8, icon: Co
 
     switch (icon) {
         .none => {},
+        .default_mode => {
+            const icon_col = zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.95, 0.96, 1.0, 1.0 } else .{ 0.78, 0.82, 0.92, 1.0 });
+            draw_list.addCircle(.{
+                .p = .{ x + theme.scaledUi(7.0), center_y },
+                .r = theme.scaledUi(5.0),
+                .col = icon_col,
+                .thickness = theme.scaledUi(1.8),
+            });
+            x += icon_advance;
+        },
         .lightning => {
             draw_list.addTextExtendedUnformatted(
-                .{ x, center_y - icon_size * 0.5 },
+                .{ x, center_y - icon_size * 0.5 + theme.scaledUi(1.0) },
                 zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.95, 0.96, 1.0, 1.0 } else .{ 0.78, 0.82, 0.92, 1.0 }),
                 "⚡",
                 .{ .font = zgui.getFont(), .font_size = icon_size },
