@@ -11,6 +11,18 @@ const text_layout = @import("../text_layout.zig");
 pub const ItemLabelFn = *const fn (context: ?*anyopaque, path: []const usize, index: usize) []const u8;
 pub const ChildCountFn = *const fn (context: ?*anyopaque, path: []const usize, index: usize) usize;
 
+pub const RootPlacement = enum {
+    below,
+    above,
+    auto,
+};
+
+pub const SubmenuPlacement = enum {
+    right,
+    left,
+    auto,
+};
+
 pub const CascadeMenuConfig = struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
@@ -41,6 +53,11 @@ pub const CascadeMenuConfig = struct {
     border_width: f32 = 1.0,
     z_index: i32 = 0,
     submenu_z_offset: i32 = 100,
+    placement: RootPlacement = .below,
+    submenu_placement: SubmenuPlacement = .right,
+    viewport_rect: ?draw.Rect = null,
+    anchor_rect: ?draw.Rect = null,
+    forbidden_rect: ?draw.Rect = null,
     scroll_enabled: bool = true,
     item_count: ?usize = null,
     item_label: ?ItemLabelFn = null,
@@ -108,6 +125,9 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
         dragging_scrollbar_depth: ?usize = null,
         scrollbar_drag_offset_y: f32 = 0.0,
         font_metrics: ?text_layout.FontMetrics = null,
+        viewport_rect: ?draw.Rect = config.viewport_rect,
+        anchor_rect: ?draw.Rect = config.anchor_rect,
+        forbidden_rect: ?draw.Rect = config.forbidden_rect,
         z_index: i32 = config.z_index,
         callbacks: CascadeMenuCallbacks = .{},
 
@@ -135,6 +155,36 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             self.z_index = z_index;
         }
 
+        pub fn setViewportRect(self: *Component, rect_value: draw.Rect) void {
+            self.viewport_rect = rect_value;
+            self.normalizeScroll();
+        }
+
+        pub fn clearViewportRect(self: *Component) void {
+            self.viewport_rect = null;
+            self.normalizeScroll();
+        }
+
+        pub fn setAnchorRect(self: *Component, rect_value: draw.Rect) void {
+            self.anchor_rect = rect_value;
+            self.normalizeScroll();
+        }
+
+        pub fn clearAnchorRect(self: *Component) void {
+            self.anchor_rect = null;
+            self.normalizeScroll();
+        }
+
+        pub fn setForbiddenRect(self: *Component, rect_value: draw.Rect) void {
+            self.forbidden_rect = rect_value;
+            self.normalizeScroll();
+        }
+
+        pub fn clearForbiddenRect(self: *Component) void {
+            self.forbidden_rect = null;
+            self.normalizeScroll();
+        }
+
         pub fn setBounds(self: *Component, rect: draw.Rect) void {
             self.rect = rect;
             self.normalizeScroll();
@@ -155,18 +205,16 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
 
         pub fn menuRect(self: *const Component, depth: usize) draw.Rect {
             const clamped_depth = @min(depth, config.max_depth - 1);
-            var rect_value = self.rect;
-            rect_value.w = if (self.rect.w > 0.0) self.rect.w else config.width;
-            rect_value.h = if (self.rect.h > 0.0) self.rect.h else self.menuHeight(self.itemCountAtDepth(0));
+            var rect_value = self.rootMenuRect();
             var current: usize = 0;
             while (current < clamped_depth) : (current += 1) {
                 const parent = rect_value;
-                rect_value.x = parent.x + parent.w + config.submenu_gap;
+                var next = self.baseSubmenuRect(parent, current);
                 if (self.highlighted[current]) |index| {
-                    const y = parent.y + config.padding_y + @as(f32, @floatFromInt(index)) * config.row_height - self.scroll_y[current];
-                    rect_value.y = y;
+                    next.y = parent.y + config.padding_y + @as(f32, @floatFromInt(index)) * config.row_height - self.scroll_y[current];
                 }
-                rect_value.h = self.menuHeight(self.itemCountAtDepth(current + 1));
+                next.h = self.menuHeight(self.itemCountAtDepth(current + 1));
+                rect_value = self.positionSubmenu(next, parent);
             }
             return rect_value;
         }
@@ -628,6 +676,95 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             return scroll.thumbRect(self.scrollbarTrackRect(depth), self.scrollMetrics(depth), self.scroll_y[depth]);
         }
 
+        fn rootMenuRect(self: *const Component) draw.Rect {
+            var rect_value = self.rect;
+            rect_value.w = if (self.rect.w > 0.0) self.rect.w else config.width;
+            rect_value.h = if (self.rect.h > 0.0) self.rect.h else self.menuHeight(self.itemCountAtDepth(0));
+            const anchor = self.anchor_rect orelse return self.clampToViewport(rect_value);
+            switch (config.placement) {
+                .below => rect_value.y = anchor.y + anchor.h + config.submenu_gap,
+                .above => rect_value.y = anchor.y - rect_value.h - config.submenu_gap,
+                .auto => rect_value.y = self.autoRootY(anchor, rect_value.h),
+            }
+            rect_value.x = anchor.x;
+            rect_value = self.avoidForbidden(rect_value, true);
+            return self.clampToViewport(rect_value);
+        }
+
+        fn autoRootY(self: *const Component, anchor: draw.Rect, height: f32) f32 {
+            if (self.viewport_rect) |viewport| {
+                const below_space = viewport.y + viewport.h - (anchor.y + anchor.h);
+                const above_space = anchor.y - viewport.y;
+                if (above_space >= height or above_space > below_space) return anchor.y - height - config.submenu_gap;
+            }
+            return anchor.y + anchor.h + config.submenu_gap;
+        }
+
+        fn baseSubmenuRect(self: *const Component, parent: draw.Rect, parent_depth: usize) draw.Rect {
+            _ = parent_depth;
+            var rect_value: draw.Rect = .{
+                .x = parent.x + parent.w + config.submenu_gap,
+                .y = parent.y,
+                .w = if (self.rect.w > 0.0) self.rect.w else config.width,
+                .h = config.row_height,
+            };
+            if (config.submenu_placement == .left) {
+                rect_value.x = parent.x - rect_value.w - config.submenu_gap;
+            }
+            return rect_value;
+        }
+
+        fn positionSubmenu(self: *const Component, rect_value: draw.Rect, parent: draw.Rect) draw.Rect {
+            var placed = rect_value;
+            placed.x = switch (config.submenu_placement) {
+                .right => parent.x + parent.w + config.submenu_gap,
+                .left => parent.x - placed.w - config.submenu_gap,
+                .auto => self.autoSubmenuX(parent, placed.w),
+            };
+            placed = self.avoidForbidden(placed, false);
+            return self.clampToViewport(placed);
+        }
+
+        fn autoSubmenuX(self: *const Component, parent: draw.Rect, width: f32) f32 {
+            const right_x = parent.x + parent.w + config.submenu_gap;
+            const left_x = parent.x - width - config.submenu_gap;
+            if (self.viewport_rect) |viewport| {
+                const right_overflow = right_x + width > viewport.x + viewport.w;
+                const left_fits = left_x >= viewport.x;
+                if (right_overflow and left_fits) return left_x;
+            }
+            return right_x;
+        }
+
+        fn avoidForbidden(self: *const Component, rect_value: draw.Rect, is_root: bool) draw.Rect {
+            var placed = rect_value;
+            const forbidden = self.forbidden_rect orelse self.anchor_rect orelse return placed;
+            if (!rectIntersects(placed, forbidden)) return placed;
+
+            const shifted_above = forbidden.y - placed.h - config.submenu_gap;
+            const shifted_below = forbidden.y + forbidden.h + config.submenu_gap;
+            if (is_root and config.placement == .below) {
+                placed.y = shifted_below;
+            } else {
+                placed.y = shifted_above;
+            }
+            return placed;
+        }
+
+        fn clampToViewport(self: *const Component, rect_value: draw.Rect) draw.Rect {
+            var clamped = rect_value;
+            const viewport = self.viewport_rect orelse return clamped;
+            if (clamped.w <= viewport.w) {
+                if (clamped.x < viewport.x) clamped.x = viewport.x;
+                if (clamped.x + clamped.w > viewport.x + viewport.w) clamped.x = viewport.x + viewport.w - clamped.w;
+            }
+            if (clamped.h <= viewport.h) {
+                if (clamped.y < viewport.y) clamped.y = viewport.y;
+                if (clamped.y + clamped.h > viewport.y + viewport.h) clamped.y = viewport.y + viewport.h - clamped.h;
+            }
+            return clamped;
+        }
+
         fn scrollbarGutter(self: *const Component, depth: usize) f32 {
             if (scroll.maxOffsetY(self.scrollMetrics(depth)) <= 0.0) return 0.0;
             return config.scrollbar_width + config.icon_gap;
@@ -672,6 +809,11 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             return config.padding_y * 2.0 + @as(f32, @floatFromInt(@max(config.max_visible_rows, 1))) * config.row_height;
         }
     };
+}
+
+fn rectIntersects(a: draw.Rect, b: draw.Rect) bool {
+    return a.x < b.x + b.w and a.x + a.w > b.x and
+        a.y < b.y + b.h and a.y + a.h > b.y;
 }
 
 test "cascade menu opens child menu and selects leaf with path" {
@@ -776,4 +918,86 @@ test "cascade menu renders text and icon runs with increasing z-index" {
     try std.testing.expectEqual(@as(usize, 2), batch.commands.items[2].text_run_count);
     try std.testing.expectEqual(draw.FontRole.icon, batch.commands.items[2].text_runs[1].font_role.?);
     try std.testing.expect(batch.commands.items[batch.commands.items.len - 1].z_index > batch.commands.items[0].z_index);
+}
+
+test "cascade menu places root above anchor and clamps to viewport" {
+    const Menu = CascadeMenu(.{
+        .width = 120,
+        .row_height = 20,
+        .max_visible_rows = 2,
+        .item_count = 2,
+        .placement = .above,
+    });
+    var menu = Menu.initFromConfig();
+    menu.setBounds(.{ .x = 0, .y = 0, .w = 120, .h = 52 });
+    menu.setAnchorRect(.{ .x = 40, .y = 140, .w = 64, .h = 32 });
+    menu.setViewportRect(.{ .x = 0, .y = 100, .w = 240, .h = 160 });
+
+    const root = menu.menuRect(0);
+    try std.testing.expectEqual(@as(f32, 40), root.x);
+    try std.testing.expectEqual(@as(f32, 100), root.y);
+    try std.testing.expectEqual(@as(f32, 52), root.h);
+}
+
+test "cascade menu shifts child above forbidden rect and hit tests final rect" {
+    const Context = struct {
+        selected_path_len: usize = 0,
+        selected_path: [3]usize = [_]usize{99} ** 3,
+        selected_index: usize = 99,
+
+        fn label(_: ?*anyopaque, path: []const usize, index: usize) []const u8 {
+            if (path.len == 0 and index == 0) return "Provider";
+            if (path.len == 1 and path[0] == 0 and index == 0) return "OpenAI";
+            return "";
+        }
+
+        fn childCount(_: ?*anyopaque, path: []const usize, index: usize) usize {
+            if (path.len == 0 and index == 0) return 2;
+            return 0;
+        }
+
+        fn onEvent(context: ?*anyopaque, event: CascadeMenuEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            switch (event) {
+                .selected => |selected| {
+                    self.selected_path_len = selected.path.len;
+                    for (selected.path, 0..) |part, i| self.selected_path[i] = part;
+                    self.selected_index = selected.index;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const Menu = CascadeMenu(.{
+        .width = 120,
+        .row_height = 20,
+        .max_visible_rows = 2,
+        .max_depth = 3,
+        .item_count = 1,
+        .item_label = Context.label,
+        .child_count = Context.childCount,
+        .placement = .above,
+        .submenu_placement = .right,
+    });
+    var context = Context{};
+    var menu = Menu.initFromConfig();
+    menu.setCallbacks(.{ .context = &context, .on_event = Context.onEvent });
+    menu.setBounds(.{ .x = 0, .y = 0, .w = 120, .h = 32 });
+    menu.setAnchorRect(.{ .x = 40, .y = 156, .w = 64, .h = 32 });
+    menu.setViewportRect(.{ .x = 0, .y = 0, .w = 420, .h = 320 });
+    menu.setForbiddenRect(.{ .x = 0, .y = 160, .w = 420, .h = 96 });
+
+    try std.testing.expect(menu.handleInput(.open));
+    try std.testing.expect(menu.handleInput(.{ .mouse_move = .{ .x = 50, .y = 130 } }));
+
+    const child = menu.menuRect(1);
+    try std.testing.expect(child.x > menu.menuRect(0).x);
+    try std.testing.expect(child.y + child.h <= 160);
+    try std.testing.expect(!rectIntersects(child, .{ .x = 0, .y = 160, .w = 420, .h = 96 }));
+
+    try std.testing.expect(menu.handleInput(.{ .mouse_down = .{ .point = .{ .x = child.x + 8, .y = child.y + 10 } } }));
+    try std.testing.expectEqual(@as(usize, 1), context.selected_path_len);
+    try std.testing.expectEqual(@as(usize, 0), context.selected_path[0]);
+    try std.testing.expectEqual(@as(usize, 0), context.selected_index);
 }
