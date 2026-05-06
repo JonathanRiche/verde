@@ -4497,29 +4497,17 @@ pub const AppState = struct {
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        const prompt_top = if (self.composer_input_bounds_valid) self.composer_input_min[1] else anchor.y;
-        const prompt_rect: powder.Rect = if (self.composer_input_bounds_valid) .{
-            .x = self.composer_input_min[0],
-            .y = self.composer_input_min[1],
-            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
-            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
-        } else .{
-            .x = anchor.x,
-            .y = prompt_top,
-            .w = total_width,
-            .h = root_height,
-        };
         self.powder_model_cascade.setAnchorRect(anchor);
-        self.powder_model_cascade.setForbiddenRect(prompt_rect);
+        self.powder_model_cascade.clearForbiddenRect();
         self.powder_model_cascade.setViewportRect(.{
             .x = min_x,
             .y = 8.0,
             .w = @max(max_x - min_x, total_width),
-            .h = @max(prompt_top - 16.0, root_height),
+            .h = @max(anchor.y - 16.0, root_height),
         });
         self.powder_model_cascade.setBounds(.{
             .x = x,
-            .y = prompt_top,
+            .y = anchor.y,
             .w = COMPOSER_MODEL_CASCADE_WIDTH,
             .h = root_height,
         });
