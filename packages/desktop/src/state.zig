@@ -4378,7 +4378,7 @@ pub const AppState = struct {
                 };
             }
         }
-        self.powder_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Normal") catch |err| {
+        self.powder_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
             log.warn("failed to sync powder composer fast label: {s}", .{@errorName(err)});
         };
         self.powder_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
