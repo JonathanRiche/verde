@@ -71,6 +71,40 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
     .stop_icon = "■",
 });
 
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 34.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+
+pub const PowderModelCascadeMenu = powder.cascadeMenu(.{
+    .width = COMPOSER_MODEL_CASCADE_WIDTH,
+    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
+    .max_visible_rows = 5,
+    .max_depth = 2,
+    .padding_x = 12.0,
+    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
+    .submenu_gap = 6.0,
+    .glyph_width = 10.8,
+    .font_size = 20.0,
+    .chevron_icon = "›",
+    .icon_gap = 10.0,
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
+    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
+    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
+    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
+    .scrollbar_width = 5.0,
+    .corner_radius = 10.0,
+    .border_width = 1.0,
+    .z_index = 200,
+    .submenu_z_offset = 10,
+    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
+    .item_label = powderModelCascadeLabel,
+    .child_count = powderModelCascadeChildCount,
+});
+
 fn powderZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) powder.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
     const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
@@ -237,6 +271,56 @@ fn powderComposerPromptEvent(context: ?*anyopaque, event: powder.ComposerPromptE
             }
         },
         .model_clicked, .reasoning_clicked => {},
+    }
+}
+
+fn providerForComposerCascadeIndex(index: usize) ?Provider {
+    if (index >= COMPOSER_PROVIDER_OPTIONS.len) return null;
+    return COMPOSER_PROVIDER_OPTIONS[index];
+}
+
+fn composerCascadeIndexForProvider(provider: Provider) ?usize {
+    for (COMPOSER_PROVIDER_OPTIONS, 0..) |candidate, index| {
+        if (candidate == provider) return index;
+    }
+    return null;
+}
+
+fn powderModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    if (path.len == 0) {
+        const provider = providerForComposerCascadeIndex(index) orelse return "";
+        return chat_threads.providerLabel(provider);
+    }
+    if (path.len == 1) {
+        const provider = providerForComposerCascadeIndex(path[0]) orelse return "";
+        const options = composerModelOptions(state, provider);
+        if (index >= options.len) return "";
+        return options[index].label;
+    }
+    return "";
+}
+
+fn powderModelCascadeChildCount(context: ?*anyopaque, path: []const usize, index: usize) usize {
+    const state = appStateFromContext(context) orelse return 0;
+    if (path.len != 0) return 0;
+    const provider = providerForComposerCascadeIndex(index) orelse return 0;
+    return composerModelOptions(state, provider).len;
+}
+
+fn powderModelCascadeEvent(context: ?*anyopaque, event: powder.CascadeMenuEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .selected => |selection| {
+            if (selection.path.len != 1) return;
+            const provider = providerForComposerCascadeIndex(selection.path[0]) orelse return;
+            const options = composerModelOptions(state, provider);
+            if (selection.index >= options.len) return;
+            state.setCurrentThreadProvider(provider);
+            state.setCurrentThreadModelRef(options[selection.index].value);
+            state.syncPowderComposerControls();
+        },
+        .highlighted, .open_changed => {},
     }
 }
 
@@ -1240,6 +1324,7 @@ pub const AppState = struct {
     composer_toolbar_fast_rect: powder.Rect,
     composer_toolbar_access_rect: powder.Rect,
     powder_composer: PowderComposerPrompt,
+    powder_model_cascade: PowderModelCascadeMenu,
     powder_overlay_batch: powder.RenderBatch,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
@@ -1347,6 +1432,7 @@ pub const AppState = struct {
             .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .powder_composer = PowderComposerPrompt.init(),
+            .powder_model_cascade = PowderModelCascadeMenu.initFromConfig(),
             .powder_overlay_batch = .{},
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
@@ -4389,6 +4475,67 @@ pub const AppState = struct {
         };
     }
 
+    pub fn syncPowderModelCascadeMenu(self: *AppState) void {
+        self.powder_model_cascade.setCallbacks(.{ .context = self, .on_event = powderModelCascadeEvent });
+        self.powder_model_cascade.setFontMetrics(powderZguiFontMetrics(20.0));
+        self.powder_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
+        if (self.currentThread().committed and self.powder_model_cascade.isOpen()) {
+            _ = self.powder_model_cascade.handleInput(.close);
+        }
+    }
+
+    pub fn setPowderModelCascadeBoundsFromToolbar(self: *AppState) void {
+        const anchor = self.composer_toolbar_model_rect;
+        if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
+
+        const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+        var max_child_rows: usize = 1;
+        for (COMPOSER_PROVIDER_OPTIONS) |provider| {
+            max_child_rows = @max(max_child_rows, @min(composerModelOptions(self, provider).len, 8));
+        }
+        const child_visible_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(max_child_rows));
+        const child_max_row_offset = (COMPOSER_MODEL_CASCADE_PADDING_Y +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len - 1))) * 0.5;
+        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
+        const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
+        const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const x = @max(min_x, @min(anchor.x, max_x - total_width));
+        const y = @max(8.0, anchor.y - child_visible_height - child_max_row_offset - 8.0);
+        self.powder_model_cascade.setBounds(.{
+            .x = x,
+            .y = y,
+            .w = COMPOSER_MODEL_CASCADE_WIDTH,
+            .h = root_height,
+        });
+    }
+
+    pub fn openPowderModelCascadeMenu(self: *AppState) void {
+        self.syncPowderModelCascadeMenu();
+        self.setPowderModelCascadeBoundsFromToolbar();
+        _ = self.powder_model_cascade.handleInput(.open);
+
+        const thread = self.currentThread();
+        if (composerCascadeIndexForProvider(thread.provider)) |provider_index| {
+            self.powder_model_cascade.highlighted[0] = provider_index;
+            self.powder_model_cascade.highlighted[1] = null;
+            self.powder_model_cascade.scroll_y[1] = 0.0;
+            const model_count = composerModelOptions(self, thread.provider).len;
+            if (model_count > 0) {
+                self.powder_model_cascade.active_depth = 2;
+                if (self.composerModelIndex(thread.provider, thread.model_ref)) |model_index| {
+                    self.powder_model_cascade.highlighted[1] = model_index;
+                    const max_visible_rows: usize = 5;
+                    if (model_index >= max_visible_rows) {
+                        const first_visible = model_index - max_visible_rows + 1;
+                        self.powder_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn routePowderComposerTextInput(self: *AppState, text: []const u8) bool {
         if (!self.powder_composer.focused) return false;
         const handled = self.powder_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
@@ -4404,6 +4551,7 @@ pub const AppState = struct {
 
     pub fn routePowderComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         const powder_key = powderComposerKeyFromSdl(event) orelse return false;
+        if (self.routePowderModelCascadeKey(powder_key)) return true;
         if (!self.powder_composer.focused) return false;
         if (self.handlePowderComposerNavigationKey(powder_key)) {
             self.noteInteraction();
@@ -4423,6 +4571,7 @@ pub const AppState = struct {
     pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
         const point = powderMousePoint(event.x, event.y, ui_scale);
+        if (self.routePowderModelCascadeMouseButton(point, event.down)) return true;
         if (event.down and event.clicks >= 2 and self.powder_composer.textRect().contains(point)) {
             return self.routePowderComposerMultiClick(point, event.clicks);
         }
@@ -4446,6 +4595,13 @@ pub const AppState = struct {
 
     fn routePowderComposerToolbarOverlayClick(self: *AppState, point: powder.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
+        if (self.composer_toolbar_model_rect.contains(point) and !self.currentThread().committed) {
+            self.openPowderModelCascadeMenu();
+            self.powder_composer.focused = false;
+            self.composer_focused = false;
+            self.noteInteraction();
+            return true;
+        }
         const target = if (self.composer_toolbar_model_rect.contains(point))
             self.powder_composer.modelRect()
         else if (self.composer_toolbar_reasoning_rect.contains(point))
@@ -4477,6 +4633,7 @@ pub const AppState = struct {
 
     pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
         const point = powderMousePoint(event.x, event.y, ui_scale);
+        if (self.routePowderModelCascadeMouseMove(point, event.state.left != 0)) return true;
         const input: powder.ComposerPromptInput = if (event.state.left != 0)
             .{ .mouse_drag = point }
         else
@@ -4493,12 +4650,47 @@ pub const AppState = struct {
     }
 
     pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.routePowderModelCascadeWheel(powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
         const handled = self.powder_composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
             log.warn("powder composer wheel failed: {s}", .{@errorName(err)});
             return false;
         };
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePowderModelCascadeKey(self: *AppState, key: powder.Key) bool {
+        if (!self.powder_model_cascade.isOpen()) return false;
+        const handled = self.powder_model_cascade.handleInput(.{ .key = key });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePowderModelCascadeMouseButton(self: *AppState, point: powder.draw.Vec2, down: bool) bool {
+        if (!self.powder_model_cascade.isOpen()) return false;
+        const handled = self.powder_model_cascade.handleInput(if (down)
+            .{ .mouse_down = .{ .point = point } }
+        else
+            .{ .mouse_up = point });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePowderModelCascadeMouseMove(self: *AppState, point: powder.draw.Vec2, dragging: bool) bool {
+        if (!self.powder_model_cascade.isOpen()) return false;
+        const handled = self.powder_model_cascade.handleInput(if (dragging)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePowderModelCascadeWheel(self: *AppState, point: powder.draw.Vec2, y: f32) bool {
+        if (!self.powder_model_cascade.isOpen()) return false;
+        const handled = self.powder_model_cascade.handleInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
         if (handled) self.noteInteraction();
         return handled;
     }
