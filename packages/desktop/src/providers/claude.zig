@@ -45,7 +45,7 @@ pub const Client = struct {
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
-        const response = try self.runBridge(.{ .command = "auth", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .command = "auth", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return .unknown;
@@ -56,7 +56,7 @@ pub const Client = struct {
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
-        const response = try self.runBridge(.{ .command = "list_threads", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .command = "list_threads", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return allocator.alloc(provider_types.ChatThreadSummary, 0);
@@ -78,7 +78,7 @@ pub const Client = struct {
     }
 
     pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-        const response = try self.runBridge(.{ .command = "list_models", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .command = "list_models", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return allocator.alloc(provider_types.ModelInfo, 0);
@@ -106,7 +106,7 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
-        const response = try self.runBridge(.{
+        var response = try self.runBridge(.{
             .command = "read_thread",
             .cwd = self.config.cwd,
             .thread_id = thread_id,
@@ -167,7 +167,7 @@ pub const Client = struct {
             .sandbox_mode = if (request.sandbox_mode) |mode| @tagName(mode) else null,
             .claude_executable = self.config.claude_executable,
         };
-        const response = try self.runBridge(bridge_request, request);
+        var response = try self.runBridge(bridge_request, request);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return error.ClaudeRequestFailed;
@@ -207,7 +207,8 @@ pub const Client = struct {
         const bridge_path = try writeBridgeFile(self.allocator);
         defer self.allocator.free(bridge_path);
 
-        var threaded = std.Io.Threaded.init_single_threaded;
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
         var child = try std.process.spawn(threaded.io(), .{
             .argv = &.{ executable, bridge_path },
             .stdin = .pipe,
@@ -342,8 +343,7 @@ const BridgeSendPromptRequest = struct {
 
 fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
-    const tmp_dir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const path = try std.fs.path.join(allocator, &.{ tmp_dir, "verde-claude-agent-sdk-bridge.mjs" });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "verde-claude-agent-sdk-bridge.mjs" });
     errdefer allocator.free(path);
 
     const file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
