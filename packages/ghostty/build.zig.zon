@@ -39,8 +39,7 @@
         },
         .uucode = .{
             // jacobsandlund/uucode
-            .url = "https://deps.files.ghostty.org/uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9.tar.gz",
-            .hash = "uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9",
+            .path = "../uucode",
         },
         .zig_wayland = .{
             // codeberg ifreund/zig-wayland
