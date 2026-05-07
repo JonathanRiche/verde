@@ -937,8 +937,9 @@ fn macApplicationExists(app_name: []const u8) bool {
 }
 
 fn directoryExistsAbsolute(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    defer dir.close();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var dir = std.Io.Dir.openDirAbsolute(threaded.io(), path, .{}) catch return false;
+    defer dir.close(threaded.io());
     return true;
 }
 
@@ -1493,9 +1494,12 @@ fn convertClipboardTiffToPng(
     defer allocator.free(output_path);
 
     {
-        var file = try std.fs.createFileAbsolute(input_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(capture.bytes);
+        var file = try std.Io.Dir.createFileAbsolute(threaded.io(), input_path, .{ .truncate = true });
+        defer file.close(threaded.io());
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = file.writer(threaded.io(), &write_buffer);
+        try writer.interface.writeAll(capture.bytes);
+        try writer.interface.flush();
     }
 
     const convert_result = runChild(allocator, &.{ "sips", "-s", "format", "png", input_path, "--out", output_path }, ".", 16 * 1024) catch |err| switch (err) {
