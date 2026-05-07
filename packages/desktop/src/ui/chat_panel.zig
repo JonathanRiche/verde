@@ -2,17 +2,18 @@
 
 const std = @import("std");
 
+const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
-const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 const app_state = @import("../state.zig");
+const chat_threads = @import("../chat/threads.zig");
 
 const HEADER_OPEN_MENU_ID: [:0]const u8 = "ChatHeaderOpenMenu";
 const TRANSCRIPT_VIRTUALIZE_MESSAGE_THRESHOLD: usize = 24;
@@ -74,17 +75,6 @@ const TranscriptMarkdownSelectAllFrame = struct {
             .point = last,
         };
     }
-};
-
-const ComposerInputCallbackState = struct {
-    cursor_pos: usize = 0,
-    selection_start: usize = 0,
-    selection_end: usize = 0,
-};
-
-const WrappedComposerMetrics = struct {
-    cursor_offset: [2]f32,
-    total_height: f32,
 };
 
 // Renders the transcript, composer, and any bottom-docked workspace panels.
@@ -3910,320 +3900,629 @@ fn renderPendingDiffPatchFallback(patch: []const u8) void {
 
 /// Renders the composer card, input, pickers, and send button.
 fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
-    const composer_bg = colors.GREEN_600;
-    const composer_rounding = theme.scaledUi(18.0);
-    state.composer_focused = false;
-    zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = composer_rounding });
-    zgui.pushStyleVar2f(.{ .idx = .window_padding, .v = .{ theme.scaledUi(18.0), theme.scaledUi(12.0) } });
-    zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = composer_bg });
-    // zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
-
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = colors.DARK_BLUE });
     const composer_screen_pos = zgui.getCursorScreenPos();
-    //NOTE: Begin of Composer
-    _ = zgui.beginChild("Composer", .{
-        .w = width,
-        .h = height,
-        .child_flags = .{ .border = true },
-    });
-    defer {
-        zgui.endChild();
-        zgui.popStyleColor(.{ .count = 2 });
-        zgui.popStyleVar(.{ .count = 2 });
+    zgui.dummy(.{ .w = width, .h = height });
 
-        const border_color = colors.DARK_BLUE;
-        const draw_list = zgui.getWindowDrawList();
-        draw_list.addRect(.{
-            .pmin = composer_screen_pos,
-            .pmax = .{ composer_screen_pos[0] + width, composer_screen_pos[1] + height },
-            .col = zgui.colorConvertFloat4ToU32(border_color),
-            .rounding = composer_rounding,
-            .thickness = 1.5,
-        });
-    }
+    const pad_x = theme.scaledUi(0.0);
+    const pad_y = theme.scaledUi(0.0);
+    const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(28.0) else 0.0;
+    const input_rect_min = .{
+        composer_screen_pos[0] + pad_x,
+        composer_screen_pos[1] + pad_y + attachment_height,
+    };
+    const input_rect_max = .{
+        composer_screen_pos[0] + width - pad_x,
+        composer_screen_pos[1] + height - pad_y,
+    };
 
-    if (state.currentThread().draft_image) |image| {
-        renderComposerAttachmentPreview(state, image);
-        zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(10.0) });
-    }
-
-    const attachment_height: f32 = if (state.currentThread().draft_image != null) theme.scaledUi(82.0) else 0.0;
-    const content_width = @max(zgui.getContentRegionAvail()[0], theme.scaledUi(120.0));
-    const input_h: f32 = @max(height - theme.scaledUi(86.0) - attachment_height, theme.scaledUi(48.0));
-    zgui.pushStyleVar1f(.{ .idx = .frame_rounding, .v = 0.0 });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = .{ theme.scaledUi(4.0), theme.scaledUi(6.0) } });
-    const transparent = colors.rgba(0, 0, 0, 0);
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .border, .c = .{ 0, 0, 0, 0 } });
-    zgui.pushStyleColor4f(.{ .idx = .text, .c = transparent });
-    zgui.pushStyleColor4f(.{ .idx = .input_text_cursor, .c = transparent });
-
-    const cursor_before = zgui.getCursorScreenPos();
-    const buf = state.draftBuffer();
+    state.syncPaletteComposerFromDraft();
+    state.syncPaletteComposerControls();
     if (state.consumeComposerFocusRequest()) {
-        zgui.setKeyboardFocusHere(0);
+        state.palette_composer.focused = true;
+        state.composer_focused = true;
+        state.terminal_focused = false;
     }
-    var input_callback_state: ComposerInputCallbackState = .{};
-    zgui.pushIntId(@intCast(state.composer_input_nonce));
-    defer zgui.popId();
-    const submitted = zgui.inputTextMultiline("##chat-draft", .{
-        .buf = buf,
-        .w = content_width,
-        .h = input_h,
-        .flags = composerInputFlags(),
-        .callback = composerInputCallback,
-        .user_data = &input_callback_state,
-    });
-    state.composer_focused = zgui.isItemFocused();
+    state.composer_focused = state.palette_composer.focused;
     if (state.composer_focused) {
         state.terminal_focused = false;
     }
-    const input_rect_min = zgui.getItemRectMin();
-    const input_rect_max = zgui.getItemRectMax();
-    state.setComposerInputBounds(input_rect_min, input_rect_max);
-    if (buf[0] != 0 or state.composer_focused) {
-        renderComposerDraftOverlay(state, buf, input_callback_state.cursor_pos, state.composer_focused, input_rect_min, input_rect_max);
-    }
-    zgui.popStyleColor(.{ .count = 6 });
-    zgui.popStyleVar(.{ .count = 2 });
+    state.setPaletteComposerBounds(input_rect_min, input_rect_max);
+    queuePaletteComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
+    drawPaletteOverlayWithZgui(&state.palette_overlay_batch);
+    drawPaletteComposerEmptyCaret(state);
+    drawPaletteComposerToolbarOverlay(state);
+    drawPaletteComposerPendingHint(state);
+    drawPaletteModelCascadeMenu(state);
+    drawPaletteComposerStopButton(state);
     state.updateFileSearch();
-
-    if (buf[0] == 0) {
-        const hint_pos = .{ cursor_before[0] + theme.scaledUi(4.0), cursor_before[1] + theme.scaledUi(6.0) };
-        const draw_list = zgui.getWindowDrawList();
-        draw_list.addText(hint_pos, zgui.colorConvertFloat4ToU32(colors.rgba(100, 102, 115, 255)), "Ask anything, or use / to show available commands", .{});
-    }
-
-    zgui.dummy(.{ .w = 0.0, .h = theme.scaledUi(2.0) });
-    // Keep this disabled until image file picking has a dedicated UX.
-    // const paste_image_button_width = theme.scaledUi(96.0);
-    // if (zgui.button("Paste image", .{ .w = paste_image_button_width, .h = theme.scaledUi(28.0) })) {
-    //     state.attachClipboardImageToCurrentDraft();
-    // }
-    // zgui.sameLine(.{ .spacing = theme.scaledUi(8.0) });
-    composer_pickers.render(state);
-    const pending = runtime.isSendPending(state);
-    if (pending) {
-        if (state.pendingFollowupHint()) |hint| {
-            zgui.textColored(theme.COLOR_TEXT_SUBTLE, "{s}", .{hint});
-            zgui.sameLine(.{ .spacing = theme.scaledUi(6.0) });
-            zgui.textColored(theme.COLOR_TEXT_MUTED, "to hold a follow-up while this thread is running", .{});
-        }
-    }
-
-    const send_btn_size = theme.scaledUi(32.0);
-    zgui.sameLine(.{ .spacing = 0.0 });
-    const avail = zgui.getContentRegionAvail();
-    if (avail[0] > send_btn_size + theme.scaledUi(4.0)) {
-        zgui.sameLine(.{ .spacing = avail[0] - send_btn_size - theme.scaledUi(4.0) });
-    }
-
-    {
-        const btn_pos = zgui.getCursorScreenPos();
-        const clicked = zgui.invisibleButton("##send-btn", .{ .w = send_btn_size, .h = send_btn_size });
-        const hovered = zgui.isItemHovered(.{});
-        const draw_list = zgui.getWindowDrawList();
-        const cx = btn_pos[0] + send_btn_size * 0.5;
-        const cy = btn_pos[1] + send_btn_size * 0.5;
-        const r = send_btn_size * 0.5;
-
-        const circle_color = if (pending)
-            colors.rgba(80, 72, 24, 255)
-        else if (hovered)
-            theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12)
-        else
-            theme.COLOR_SECONDARY_GREEN;
-        draw_list.addCircleFilled(.{
-            .p = .{ cx, cy },
-            .r = r,
-            .col = zgui.colorConvertFloat4ToU32(circle_color),
-        });
-
-        if (pending) {
-            const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
-            const stop_half = theme.scaledUi(5.5);
-            draw_list.addRectFilled(.{
-                .pmin = .{ cx - stop_half, cy - stop_half },
-                .pmax = .{ cx + stop_half, cy + stop_half },
-                .col = white,
-                .rounding = theme.scaledUi(2.0),
-            });
-        } else {
-            const white = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE);
-            const arrow_half_w = theme.scaledUi(5.5);
-            const arrow_top = cy - theme.scaledUi(7.0);
-            const arrow_mid = cy - theme.scaledUi(1.0);
-            const arrow_bottom = cy + theme.scaledUi(7.0);
-
-            draw_list.addTriangleFilled(.{
-                .p1 = .{ cx, arrow_top },
-                .p2 = .{ cx - arrow_half_w, arrow_mid },
-                .p3 = .{ cx + arrow_half_w, arrow_mid },
-                .col = white,
-            });
-            draw_list.addLine(.{
-                .p1 = .{ cx, arrow_mid },
-                .p2 = .{ cx, arrow_bottom },
-                .col = white,
-                .thickness = theme.scaledUi(2.4),
-            });
-        }
-
-        if (clicked and pending) {
-            state.abortCurrentThreadSend();
-        } else if ((clicked or submitted) and !pending) {
-            if (submitted and state.acceptPrimaryFileSearchResult()) {
-                //NOTE: END OF Composer
-                return;
-            }
-            state.sendDraft() catch |err| {
-                runtime.log.err("failed to send draft: {s}", .{@errorName(err)});
-            };
-        } else if (submitted and pending) {
-            state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
-        }
-    }
 
     if (state.hasActiveFileSearch()) {
         renderComposerFileSearchResults(state, composer_screen_pos, width, input_rect_min, input_rect_max);
     }
-    //NOTE: END OF Composer
 }
 
-fn composerInputFlags() zgui.InputTextFlags {
-    return .{
-        .ctrl_enter_for_new_line = true,
-        .enter_returns_true = true,
-        .callback_always = true,
+fn queuePaletteComposerIsland(
+    state: *app_state.AppState,
+    composer_screen_pos: [2]f32,
+    height: f32,
+    input_rect_min: [2]f32,
+    input_rect_max: [2]f32,
+) void {
+    const allocator = state.allocator;
+
+    if (state.currentThread().draft_image != null) {
+        const attachment_rect: palette.Rect = .{
+            .x = input_rect_min[0],
+            .y = composer_screen_pos[1] + theme.scaledUi(8.0),
+            .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
+            .h = theme.scaledUi(20.0),
+        };
+        queuePaletteText(state, attachment_rect, "Image attached", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), null);
+    }
+
+    state.palette_composer.render(allocator, &state.palette_overlay_batch) catch |err| {
+        runtime.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
+        return;
     };
+
+    _ = height;
 }
 
-fn composerInputCallback(data: *zgui.InputTextCallbackData) callconv(.c) i32 {
-    const raw = data.user_data orelse return 0;
-    const state: *ComposerInputCallbackState = @ptrCast(@alignCast(raw));
-    state.cursor_pos = @max(0, data.cursor_pos);
-    state.selection_start = @max(0, data.selection_start);
-    state.selection_end = @max(0, data.selection_end);
-    return 0;
+fn queuePaletteBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    const thickness = theme.scaledUi(1.5);
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = thickness }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y + rect.h - thickness, .w = rect.w, .h = thickness }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x + rect.w - thickness, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
 }
 
-fn renderComposerDraftOverlay(state: *app_state.AppState, buf: [:0]const u8, cursor_pos: usize, focused: bool, input_rect_min: [2]f32, input_rect_max: [2]f32) void {
-    const draft = std.mem.sliceTo(buf, 0);
+fn queuePaletteText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.fixedText(
+        state.allocator,
+        rect,
+        value,
+        color,
+        font_size,
+        clip,
+        .{},
+        font_size * 0.55,
+        font_size * 1.25,
+        false,
+    ) catch return;
+}
+
+fn drawPaletteOverlayWithZgui(batch: *const palette.RenderBatch) void {
+    const draw_list = zgui.getWindowDrawList();
+    const font = zgui.getFont();
+    for (batch.commands.items) |command| {
+        switch (command.kind) {
+            .rect, .cursor, .selection, .scrollbar => drawPaletteRectWithZgui(draw_list, command),
+            .text => drawPaletteTextWithZgui(draw_list, font, command),
+            .image => {},
+        }
+    }
+}
+
+fn drawPaletteComposerEmptyCaret(state: *app_state.AppState) void {
+    if (!state.palette_composer.focused) return;
+    if (state.palette_composer.text().len != 0) return;
+
+    const clipped = clippedPaletteRect(state.palette_composer.cursorRect(), state.palette_composer.textRect()) orelse return;
+    zgui.getWindowDrawList().addRectFilled(.{
+        .pmin = .{ clipped.x, clipped.y },
+        .pmax = .{ clipped.x + clipped.w, clipped.y + clipped.h },
+        .col = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
+    });
+}
+
+fn drawPaletteRectWithZgui(draw_list: zgui.DrawList, command: palette.draw.Command) void {
+    if (command.rect.w <= 0.0 or command.rect.h <= 0.0) return;
+    const clipped = if (command.clip) |clip_rect| clippedPaletteRect(command.rect, clip_rect) orelse return else command.rect;
+    const pmin: [2]f32 = .{ clipped.x, clipped.y };
+    const pmax: [2]f32 = .{ clipped.x + clipped.w, clipped.y + clipped.h };
+    if (command.color.a > 0.0) {
+        draw_list.addRectFilled(.{
+            .pmin = pmin,
+            .pmax = pmax,
+            .col = paletteColorU32(command.color),
+            .rounding = command.radius,
+        });
+    }
+    if (command.border_color) |border_color| {
+        if (border_color.a > 0.0 and command.border_width > 0.0) {
+            draw_list.addRect(.{
+                .pmin = pmin,
+                .pmax = pmax,
+                .col = paletteColorU32(border_color),
+                .rounding = command.radius,
+                .thickness = command.border_width,
+            });
+        }
+    }
+}
+
+fn drawPaletteComposerToolbarOverlay(state: *app_state.AppState) void {
+    const thread = state.currentThread();
+    const model_label = chat_threads.selectedModelLabel(
+        app_state.ModelOption,
+        thread,
+        state.opencodeModelOptionsSnapshot(),
+        app_state.CODEX_MODEL_OPTIONS[0..],
+    );
+    const reasoning_label = chat_threads.selectedReasoningLabel(
+        app_state.ReasoningOption,
+        thread,
+        app_state.CODEX_REASONING_OPTIONS[0..],
+    );
 
     const draw_list = zgui.getWindowDrawList();
-    const overlay_padding = .{ theme.scaledUi(4.0), theme.scaledUi(6.0) };
-    const visible_height = @max(input_rect_max[1] - input_rect_min[1] - overlay_padding[1] * 2.0, zgui.getFontSize());
-    const wrap_width = @max(input_rect_max[0] - input_rect_min[0] - overlay_padding[0] * 2.0, theme.scaledUi(40.0));
-    const metrics = wrappedTextMetrics(draft, @min(cursor_pos, draft.len), wrap_width);
-    const max_scroll_y = @max(metrics.total_height - visible_height, 0.0);
-    var scroll_y = @min(state.composerOverlayScrollY(), max_scroll_y);
-    if (focused and state.shouldComposerOverlayFollowCursor(cursor_pos, draft.len)) {
-        const cursor_bottom = metrics.cursor_offset[1] + zgui.getFontSize();
-        if (cursor_bottom - scroll_y > visible_height) {
-            scroll_y = cursor_bottom - visible_height;
-        } else if (metrics.cursor_offset[1] < scroll_y) {
-            scroll_y = metrics.cursor_offset[1];
-        }
-        scroll_y = @min(@max(scroll_y, 0.0), max_scroll_y);
-    }
-    state.setComposerOverlayScrollY(scroll_y);
-
-    const text_pos = .{
-        input_rect_min[0] + overlay_padding[0],
-        input_rect_min[1] + overlay_padding[1] - scroll_y,
-    };
-
-    draw_list.pushClipRect(.{
-        .pmin = input_rect_min,
-        .pmax = input_rect_max,
-        .intersect_with_current = true,
+    const toolbar = state.palette_composer.toolbarRect();
+    const send = state.palette_composer.sendButtonRect();
+    const mouse_pos = zgui.getMousePos();
+    const mask_max_x = @max(send.x - theme.scaledUi(10.0), toolbar.x);
+    draw_list.addRectFilled(.{
+        .pmin = .{ toolbar.x - theme.scaledUi(2.0), toolbar.y - theme.scaledUi(2.0) },
+        .pmax = .{ mask_max_x, toolbar.y + toolbar.h + theme.scaledUi(2.0) },
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.11, 0.15, 0.16, 1.0 }),
     });
-    defer draw_list.popClipRect();
 
-    if (draft.len > 0) {
+    const gap = theme.scaledUi(14.0);
+    var x = toolbar.x;
+    state.composer_toolbar_overlay_valid = true;
+    state.composer_toolbar_model_rect = composerBadgeRectAt(x, state.palette_composer.modelRect(), model_label, .provider_logo, true);
+    drawPaletteComposerBadge(state, state.composer_toolbar_model_rect, model_label, .provider_logo, false, true, paletteRectContainsPoint(state.composer_toolbar_model_rect, mouse_pos));
+    x += state.composer_toolbar_model_rect.w + gap;
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    state.composer_toolbar_reasoning_rect = composerBadgeRectAt(x, state.palette_composer.reasoningRect(), reasoning_label, .none, true);
+    drawPaletteComposerBadge(state, state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, paletteRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
+    x += state.composer_toolbar_reasoning_rect.w + gap;
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    const fast_enabled = thread.fast_mode == .on;
+    const fast_label = if (fast_enabled) "Fast" else "Default";
+    const fast_icon: ComposerBadgeIcon = if (fast_enabled) .lightning else .default_mode;
+    state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.palette_composer.fastRect(), fast_label, fast_icon, false);
+    drawPaletteComposerBadge(state, state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, paletteRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
+    x += state.composer_toolbar_fast_rect.w + gap;
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    const access_label = switch (thread.access_mode) {
+        .supervised => "Supervised",
+        .full_access => "Full access",
+    };
+    state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.palette_composer.accessRect(), access_label, .lock, false);
+    drawPaletteComposerBadge(state, state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, paletteRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
+}
+
+fn drawPaletteComposerPendingHint(state: *app_state.AppState) void {
+    const hint = state.pendingFollowupHint() orelse return;
+    const toolbar = state.palette_composer.toolbarRect();
+    if (toolbar.w <= 0.0 or toolbar.h <= 0.0) return;
+
+    const font_size = theme.scaledUi(14.0);
+    const text_pos: [2]f32 = .{
+        toolbar.x,
+        toolbar.y - font_size - theme.scaledUi(10.0),
+    };
+    zgui.getWindowDrawList().addTextExtendedUnformatted(
+        text_pos,
+        zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_SUBTLE),
+        hint,
+        .{ .font = zgui.getFont(), .font_size = font_size },
+    );
+}
+
+fn drawPaletteModelCascadeMenu(state: *app_state.AppState) void {
+    if (!state.palette_model_cascade.isOpen()) return;
+    state.syncPaletteModelCascadeMenu();
+    state.setPaletteModelCascadeBoundsFromToolbar();
+
+    var batch: palette.RenderBatch = .{};
+    defer batch.deinit(state.allocator);
+    state.palette_model_cascade.render(state.allocator, &batch) catch |err| {
+        runtime.log.warn("failed to render palette model cascade menu: {s}", .{@errorName(err)});
+        return;
+    };
+    drawPaletteOverlayWithZgui(&batch);
+    drawPaletteModelCascadeProviderLogos(state);
+}
+
+fn drawPaletteModelCascadeProviderLogos(state: *app_state.AppState) void {
+    const draw_list = zgui.getWindowDrawList();
+    const font = zgui.getFont();
+    const providers = [_]app_state.Provider{ .codex, .opencode };
+    for (providers, 0..) |provider, index| {
+        const row = state.palette_model_cascade.rowRect(0, index);
+        if (row.w <= 0.0 or row.h <= 0.0) continue;
+        const highlighted = state.palette_model_cascade.highlighted[0] != null and state.palette_model_cascade.highlighted[0].? == index;
+        const row_color = if (highlighted)
+            palette.Color{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 }
+        else
+            palette.Color{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 };
+        draw_list.addRectFilled(.{
+            .pmin = .{ row.x, row.y },
+            .pmax = .{ row.x + row.w, row.y + row.h },
+            .col = paletteColorU32(row_color),
+            .rounding = theme.scaledUi(5.0),
+        });
+        const logo_slot_w = theme.scaledUi(25.0);
+        drawProviderLogoInPaletteOverlay(
+            draw_list,
+            state,
+            provider,
+            row.x + (logo_slot_w - providerLogoWidth(provider, row.h - theme.scaledUi(10.0))) * 0.5,
+            row.y + row.h * 0.5,
+            row.h - theme.scaledUi(10.0),
+        );
+        const label = chat_threads.providerLabel(provider);
         draw_list.addTextExtendedUnformatted(
-            text_pos,
-            zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
-            draft,
+            .{ row.x + logo_slot_w + theme.scaledUi(6.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
+            paletteColorU32(.{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 }),
+            label,
             .{
-                .font = zgui.getFont(),
-                .font_size = zgui.getFontSize(),
-                .wrap_width = wrap_width,
+                .font = font,
+                .font_size = theme.scaledUi(20.0),
+            },
+        );
+        draw_list.addTextExtendedUnformatted(
+            .{ row.x + row.w - theme.scaledUi(19.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
+            paletteColorU32(.{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 }),
+            "›",
+            .{
+                .font = font,
+                .font_size = theme.scaledUi(20.0),
             },
         );
     }
-
-    if (focused) {
-        const cursor_x = text_pos[0] + metrics.cursor_offset[0];
-        const cursor_y = text_pos[1] + metrics.cursor_offset[1];
-        draw_list.addLine(.{
-            .p1 = .{ cursor_x, cursor_y },
-            .p2 = .{ cursor_x, cursor_y + zgui.getFontSize() },
-            .col = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
-            .thickness = theme.scaledUi(1.4),
-        });
-    }
 }
 
-fn wrappedTextMetrics(text: []const u8, cursor_pos: usize, wrap_width: f32) WrappedComposerMetrics {
-    const font_size = zgui.getFontSize();
-    const cursor_at = @min(cursor_pos, text.len);
-    var index: usize = 0;
-    var line_width: f32 = 0.0;
-    var line_y: f32 = 0.0;
-    var total_height = font_size;
-    var cursor_offset: ?[2]f32 = if (cursor_at == 0) .{ 0.0, 0.0 } else null;
-    var last_break_width: ?f32 = null;
+fn providerLogoWidth(provider: app_state.Provider, target_height: f32) f32 {
+    const uv = providerLogoUvBounds(provider);
+    const visible_w = uv.max[0] - uv.min[0];
+    const visible_h = uv.max[1] - uv.min[1];
+    if (visible_w <= 0.0 or visible_h <= 0.0) return 0.0;
+    return target_height * providerLogoScale(provider) * (visible_w / visible_h);
+}
 
-    while (index < text.len) {
-        const next = nextUtf8ByteOffset(text, index, text.len);
-        if (text[index] == '\n') {
-            if (cursor_offset == null and cursor_at <= next) {
-                cursor_offset = .{ line_width, line_y };
-            }
-            line_width = 0.0;
-            line_y += font_size;
-            total_height += font_size;
-            index = next;
-            last_break_width = null;
-            continue;
-        }
+fn drawProviderLogoInPaletteOverlay(draw_list: zgui.DrawList, state: *app_state.AppState, provider: app_state.Provider, x: f32, center_y: f32, target_height: f32) void {
+    const cached = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    } orelse return;
+    const uv = providerLogoUvBounds(provider);
+    const visible_w = uv.max[0] - uv.min[0];
+    const visible_h = uv.max[1] - uv.min[1];
+    if (visible_w <= 0.0 or visible_h <= 0.0) return;
+    const logo_h = target_height * providerLogoScale(provider);
+    const logo_w = logo_h * (visible_w / visible_h);
+    const logo_min: [2]f32 = .{
+        x,
+        center_y - logo_h * 0.5 + providerLogoYOffset(provider),
+    };
+    draw_list.addImage(runtime.textureRefFromGlId(cached.texture_id), .{
+        .pmin = logo_min,
+        .pmax = .{ logo_min[0] + logo_w, logo_min[1] + logo_h },
+        .uvmin = uv.min,
+        .uvmax = uv.max,
+    });
+}
 
-        const glyph_width = zgui.calcTextSize(text[index..next], .{})[0];
-        line_width += glyph_width;
-        if (std.ascii.isWhitespace(text[index])) {
-            last_break_width = line_width;
-        }
-
-        if (line_width > wrap_width and index > 0) {
-            if (last_break_width) |break_width| {
-                line_width = @max(line_width - break_width, 0.0);
-            } else {
-                line_width = glyph_width;
-            }
-            line_y += font_size;
-            total_height += font_size;
-            last_break_width = null;
-        }
-
-        if (cursor_offset == null and cursor_at <= next) {
-            cursor_offset = .{ line_width, line_y };
-        }
-        index = next;
-    }
-
-    return .{
-        .cursor_offset = cursor_offset orelse .{ line_width, line_y },
-        .total_height = total_height,
+fn providerLogoUvBounds(provider: app_state.Provider) struct { min: [2]f32, max: [2]f32 } {
+    return switch (provider) {
+        .codex => .{
+            .min = .{ 118.0 / 721.0, 120.0 / 721.0 },
+            .max = .{ 603.0 / 721.0, 601.0 / 721.0 },
+        },
+        .opencode => .{
+            .min = .{ 0.0, 0.0 },
+            .max = .{ 1.0, 1.0 },
+        },
     };
 }
 
-fn nextUtf8ByteOffset(text: []const u8, index: usize, end: usize) usize {
-    if (index >= end) return end;
-    const len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-    return @min(index + len, end);
+fn providerLogoScale(provider: app_state.Provider) f32 {
+    return switch (provider) {
+        .codex => 0.92,
+        .opencode => 0.78,
+    };
+}
+
+fn providerLogoYOffset(provider: app_state.Provider) f32 {
+    return switch (provider) {
+        .codex => theme.scaledUi(-0.5),
+        .opencode => 0.0,
+    };
+}
+
+const ComposerBadgeIcon = enum {
+    none,
+    provider_logo,
+    default_mode,
+    lightning,
+    lock,
+};
+
+fn composerBadgeRectAt(x_pos: f32, rect: palette.Rect, label: []const u8, icon: ComposerBadgeIcon, chevron: bool) palette.Rect {
+    if (rect.h <= 0.0) return .{ .x = x_pos, .y = rect.y, .w = 0.0, .h = 0.0 };
+
+    const visual_h = theme.scaledUi(34.0);
+    const font_size = theme.scaledUi(20.0);
+    const pad_x = theme.scaledUi(14.0);
+    const icon_advance = switch (icon) {
+        .none => 0.0,
+        .provider_logo => theme.scaledUi(26.0),
+        .default_mode => theme.scaledUi(24.0),
+        .lightning => theme.scaledUi(30.0),
+        .lock => theme.scaledUi(26.0),
+    };
+    const chevron_width = if (chevron) theme.scaledUi(20.0) else 0.0;
+    const content_width = pad_x * 2.0 + icon_advance + scaledOverlayTextWidth(label, font_size) + chevron_width;
+    return .{
+        .x = x_pos,
+        .y = rect.y + (rect.h - visual_h) * 0.5,
+        .w = content_width,
+        .h = visual_h,
+    };
+}
+
+fn drawPaletteComposerBadge(state: *app_state.AppState, visual_rect: palette.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool, hovered: bool) void {
+    if (visual_rect.w <= 0.0 or visual_rect.h <= 0.0) return;
+
+    const draw_list = zgui.getWindowDrawList();
+    const font_size = theme.scaledUi(20.0);
+    const icon_size = theme.scaledUi(24.0);
+    const pad_x = theme.scaledUi(14.0);
+    const icon_advance = switch (icon) {
+        .none => 0.0,
+        .provider_logo => theme.scaledUi(26.0),
+        .default_mode => theme.scaledUi(24.0),
+        .lightning => theme.scaledUi(30.0),
+        .lock => theme.scaledUi(26.0),
+    };
+    const pmin: [2]f32 = .{ visual_rect.x, visual_rect.y };
+    const pmax: [2]f32 = .{ visual_rect.x + visual_rect.w, visual_rect.y + visual_rect.h };
+    draw_list.addRectFilled(.{
+        .pmin = pmin,
+        .pmax = pmax,
+        .col = zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.17, 0.19, 0.23, 0.98 } else .{ 0.12, 0.13, 0.16, 0.92 }),
+        .rounding = visual_rect.h * 0.5,
+    });
+
+    const text_col = zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.98, 0.99, 1.0, 1.0 } else .{ 0.90, 0.92, 0.97, 1.0 });
+    const center_y = visual_rect.y + visual_rect.h * 0.5;
+    var x = visual_rect.x + pad_x;
+    const text_y = center_y - font_size * 0.5;
+
+    switch (icon) {
+        .none => {},
+        .provider_logo => {
+            drawProviderLogoInPaletteOverlay(draw_list, state, state.currentThread().provider, x, center_y, theme.scaledUi(18.0));
+            x += icon_advance;
+        },
+        .default_mode => {
+            const icon_col = zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.95, 0.96, 1.0, 1.0 } else .{ 0.78, 0.82, 0.92, 1.0 });
+            draw_list.addCircle(.{
+                .p = .{ x + theme.scaledUi(7.0), center_y },
+                .r = theme.scaledUi(5.0),
+                .col = icon_col,
+                .thickness = theme.scaledUi(1.8),
+            });
+            x += icon_advance;
+        },
+        .lightning => {
+            draw_list.addTextExtendedUnformatted(
+                .{ x, center_y - icon_size * 0.5 + theme.scaledUi(1.0) },
+                zgui.colorConvertFloat4ToU32(if (hovered) .{ 0.95, 0.96, 1.0, 1.0 } else .{ 0.78, 0.82, 0.92, 1.0 }),
+                "⚡",
+                .{ .font = zgui.getFont(), .font_size = icon_size },
+            );
+            x += icon_advance;
+        },
+        .lock => {
+            drawLockIcon(draw_list, x, center_y, .{ 0.70, 0.73, 0.80, 1.0 }, icon_locked);
+            x += icon_advance;
+        },
+    }
+
+    draw_list.addTextExtendedUnformatted(
+        .{ x, text_y },
+        text_col,
+        label,
+        .{ .font = zgui.getFont(), .font_size = font_size },
+    );
+
+    if (chevron) {
+        draw_list.addTextExtendedUnformatted(
+            .{ visual_rect.x + visual_rect.w - theme.scaledUi(18.0), text_y },
+            text_col,
+            "›",
+            .{ .font = zgui.getFont(), .font_size = font_size },
+        );
+    }
+}
+
+fn paletteRectContainsPoint(rect: palette.Rect, point: [2]f32) bool {
+    return point[0] >= rect.x and point[0] <= rect.x + rect.w and point[1] >= rect.y and point[1] <= rect.y + rect.h;
+}
+
+fn scaledOverlayTextWidth(label: []const u8, font_size: f32) f32 {
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    return zgui.calcTextSize(label, .{})[0] * (font_size / base_font_size);
+}
+
+fn drawPaletteComposerToolbarSeparator(draw_list: zgui.DrawList, x: f32, toolbar: palette.Rect) void {
+    draw_list.addLine(.{
+        .p1 = .{ x, toolbar.y + theme.scaledUi(9.0) },
+        .p2 = .{ x, toolbar.y + toolbar.h - theme.scaledUi(9.0) },
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.23, 0.26, 0.31, 0.95 }),
+        .thickness = theme.scaledUi(1.5),
+    });
+}
+
+fn drawPaletteComposerStopButton(state: *app_state.AppState) void {
+    if (!runtime.isSendPending(state)) return;
+
+    const rect = state.palette_composer.sendButtonRect();
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+
+    const draw_list = zgui.getWindowDrawList();
+    const center: [2]f32 = .{ rect.x + rect.w * 0.5, rect.y + rect.h * 0.5 };
+    const radius = @min(rect.w, rect.h) * 0.5;
+    draw_list.addCircleFilled(.{
+        .p = center,
+        .r = radius,
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.61, 0.50, 0.12, 1.0 }),
+    });
+
+    const size = theme.scaledUi(10.0);
+    const half = size * 0.5;
+    draw_list.addRectFilled(.{
+        .pmin = .{ center[0] - half, center[1] - half },
+        .pmax = .{ center[0] + half, center[1] + half },
+        .col = zgui.colorConvertFloat4ToU32(.{ 0.94, 0.96, 0.98, 1.0 }),
+        .rounding = theme.scaledUi(2.0),
+    });
+}
+
+fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, locked: bool) void {
+    const col = zgui.colorConvertFloat4ToU32(color);
+    const t = theme.scaledUi(2.0);
+    const bw = theme.scaledUi(14.0);
+    const bh = theme.scaledUi(9.0);
+    const body_top = center_y - theme.scaledUi(0.5);
+
+    draw_list.addRectFilled(.{
+        .pmin = .{ x, body_top },
+        .pmax = .{ x + bw, body_top + bh },
+        .col = col,
+        .rounding = theme.scaledUi(1.5),
+    });
+
+    const sw = theme.scaledUi(8.0);
+    const sh = theme.scaledUi(7.0);
+    const shackle_offset: f32 = if (locked) (bw - sw) * 0.5 else (bw - sw) * 0.5 + theme.scaledUi(3.0);
+    const sl = x + shackle_offset;
+    const sr = sl + sw;
+    const stop = body_top - sh;
+    const top_y = stop + theme.scaledUi(2.0);
+
+    draw_list.addLine(.{ .p1 = .{ sl, body_top }, .p2 = .{ sl, top_y }, .col = col, .thickness = t });
+    draw_list.addLine(.{ .p1 = .{ sl, top_y }, .p2 = .{ sr, top_y }, .col = col, .thickness = t });
+    if (locked) {
+        draw_list.addLine(.{ .p1 = .{ sr, top_y }, .p2 = .{ sr, body_top }, .col = col, .thickness = t });
+    } else {
+        draw_list.addLine(.{ .p1 = .{ sr, top_y }, .p2 = .{ sr, stop + theme.scaledUi(0.5) }, .col = col, .thickness = t });
+    }
+}
+
+fn drawPaletteTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: palette.draw.Command) void {
+    if (command.text.len == 0 or command.color.a <= 0.0) return;
+    if (command.text_runs.len > 0) {
+        for (command.text_runs) |run| {
+            drawPaletteTextRunWithZgui(draw_list, font, run);
+        }
+        return;
+    }
+
+    const glyph_w = @max(command.glyph_width, 1.0);
+    const line_h = @max(command.line_height, command.font_size);
+    const max_columns: usize = if (command.wrap)
+        @max(@as(usize, @intFromFloat(@floor(command.rect.w / glyph_w))), 1)
+    else
+        std.math.maxInt(usize);
+
+    var row: usize = 0;
+    var col: usize = 0;
+    var line_start: usize = 0;
+    var index: usize = 0;
+    while (index < command.text.len) {
+        const byte = command.text[index];
+        if (byte == '\n') {
+            drawPaletteTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            row += 1;
+            col = 0;
+            index += 1;
+            line_start = index;
+            continue;
+        }
+        if (col >= max_columns) {
+            drawPaletteTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            row += 1;
+            col = 0;
+            line_start = index;
+        }
+        col += 1;
+        index += paletteUtf8Advance(command.text, index);
+    }
+    drawPaletteTextLineWithZgui(draw_list, font, command, line_start, command.text.len, row, line_h);
+}
+
+fn drawPaletteTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: palette.TextRun) void {
+    if (run.text.len == 0 or run.color.a <= 0.0) return;
+    var clip_rect_storage: [4]f32 = undefined;
+    const clip_rect: ?[*]const [4]f32 = if (run.clip) |clip| blk: {
+        clip_rect_storage = .{ clip.x, clip.y, clip.x + clip.w, clip.y + clip.h };
+        break :blk @as([*]const [4]f32, @ptrCast(&clip_rect_storage));
+    } else null;
+    draw_list.addTextExtendedUnformatted(
+        .{ run.x, run.y },
+        paletteColorU32(run.color),
+        run.text,
+        .{
+            .font = font,
+            .font_size = run.font_size,
+            .cpu_fine_clip_rect = clip_rect,
+        },
+    );
+}
+
+fn drawPaletteTextLineWithZgui(
+    draw_list: zgui.DrawList,
+    font: zgui.Font,
+    command: palette.draw.Command,
+    start: usize,
+    end: usize,
+    row: usize,
+    line_h: f32,
+) void {
+    if (end <= start) return;
+    var clip_rect_storage: [4]f32 = undefined;
+    const clip_rect: ?[*]const [4]f32 = if (command.clip) |clip| blk: {
+        clip_rect_storage = .{ clip.x, clip.y, clip.x + clip.w, clip.y + clip.h };
+        break :blk @as([*]const [4]f32, @ptrCast(&clip_rect_storage));
+    } else null;
+    draw_list.addTextExtendedUnformatted(
+        .{
+            command.rect.x - command.scroll.x,
+            command.rect.y + @as(f32, @floatFromInt(row)) * line_h - command.scroll.y,
+        },
+        paletteColorU32(command.color),
+        command.text[start..end],
+        .{
+            .font = font,
+            .font_size = command.font_size,
+            .cpu_fine_clip_rect = clip_rect,
+        },
+    );
+}
+
+fn clippedPaletteRect(rect: palette.Rect, clip: palette.Rect) ?palette.Rect {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+fn paletteColorU32(value: palette.Color) u32 {
+    return zgui.colorConvertFloat4ToU32(.{ value.r, value.g, value.b, value.a });
+}
+
+fn paletteUtf8Advance(text: []const u8, index: usize) usize {
+    return std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+}
+
+fn paletteColor(value: [4]f32) palette.Color {
+    return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }
 
 fn renderComposerFileSearchResults(

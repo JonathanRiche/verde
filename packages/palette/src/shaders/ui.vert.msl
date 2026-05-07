@@ -1,0 +1,28 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct VSInput {
+    float2 position [[attribute(0)]];
+    float2 uv [[attribute(1)]];
+    float4 color [[attribute(2)]];
+};
+
+struct VSOutput {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+};
+
+struct PaletteUniforms {
+    float2 viewport_size;
+    float2 padding;
+};
+
+vertex VSOutput main(VSInput input [[stage_in]], constant PaletteUniforms& uniforms [[buffer(0)]]) {
+    VSOutput output;
+    float2 ndc = (input.position / uniforms.viewport_size) * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    output.position = float4(ndc, 0.0, 1.0);
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}

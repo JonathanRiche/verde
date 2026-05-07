@@ -15,6 +15,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const palette_gl_renderer = @import("ui/palette_gl_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
 
@@ -138,6 +139,8 @@ pub fn main(init: std.process.Init) !void {
     // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
     zgui.backend.init(window, gl_context);
     defer zgui.backend.deinit();
+    var palette_renderer = palette_gl_renderer.Renderer.init();
+    defer palette_renderer.deinit(allocator);
 
     var ui_scale = currentWindowDisplayScale(window);
     // Apply the global ImGui style after the display scale is known.
@@ -160,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
         syncWindowTextInput(window, &state);
         var had_event = false;
         var event_wait_ns: u64 = 0;
-        running = processEvents(window, &state, &keyboard, &had_event, &frame_sample, &event_wait_ns);
+        running = processEvents(window, &state, &keyboard, ui_scale, &had_event, &frame_sample, &event_wait_ns);
         frame_sample.waited_ns = event_wait_ns;
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
@@ -215,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
                 zgui.backend.newFrame(@intCast(framebuffer_width.*), @intCast(framebuffer_height.*));
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
+        state.palette_overlay_batch.clear();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
@@ -230,10 +234,22 @@ pub fn main(init: std.process.Init) !void {
         glClearColor(ui_theme.COLOR_BLACK[0], ui_theme.COLOR_BLACK[1], ui_theme.COLOR_BLACK[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
         recordSpan(&frame_sample, .draw_backend, struct {
-            fn run() void {
+            fn run(
+                palette_command_renderer: *palette_gl_renderer.Renderer,
+                app_state: *AppState,
+                allocator_arg: std.mem.Allocator,
+                framebuffer_width: c_int,
+                framebuffer_height: c_int,
+            ) void {
                 zgui.backend.draw();
+                palette_command_renderer.renderBatch(
+                    allocator_arg,
+                    &app_state.palette_overlay_batch,
+                    @floatFromInt(framebuffer_width),
+                    @floatFromInt(framebuffer_height),
+                ) catch |err| log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
             }
-        }.run, .{});
+        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height });
         const swap_start = profiler.nowNs();
         try sdl.gl.swapWindow(window);
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
@@ -366,6 +382,7 @@ fn processEvents(
     window: *sdl.Window,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
     had_event: *bool,
     frame_sample: *profiler.FrameSample,
     waited_ns: *u64,
@@ -381,15 +398,15 @@ fn processEvents(
         }
         waited_ns.* +|= profiler.elapsedNs(wait_start);
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     } else {
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
 
     while (sdl.pollEvent(&event)) {
         had_event.* = true;
-        if (!processOneEvent(window, state, keyboard, &event, frame_sample)) return false;
+        if (!processOneEvent(window, state, keyboard, ui_scale, &event, frame_sample)) return false;
     }
 
     return true;
@@ -399,12 +416,13 @@ fn processOneEvent(
     window: *sdl.Window,
     state: *AppState,
     keyboard: *keybinds.NativeKeyboardConfig,
+    ui_scale: f32,
     event: *sdl.Event,
     frame_sample: *profiler.FrameSample,
 ) bool {
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
-    const keep_running = handleEvent(window, state, keyboard, event);
+    const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
 }
@@ -423,7 +441,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
         IDLE_WAIT_TIMEOUT_MS;
 }
 
-fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, event: *sdl.Event) bool {
+fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     _ = zgui.backend.processEvent(event);
     switch (event.type) {
         .quit => return false,
@@ -458,6 +476,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handleComposerFocusShortcut(state, &event.key)) {
+                return true;
+            }
+            if (state.routePaletteComposerKeyDown(&event.key)) {
                 return true;
             }
             if (event.key.repeat) {
@@ -502,8 +523,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (terminal_text_handled) {
                 return true;
             }
+            if (state.routePaletteComposerTextInput(text_input)) {
+                return true;
+            }
         },
         .mouse_motion => {
+            if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
+                return true;
+            }
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
@@ -524,12 +551,19 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (!handled and event.button.down) {
                 state.unfocusBrowserPane();
             }
-            syncWindowTextInput(window, state);
             if (handled) {
                 return true;
             }
+            if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            syncWindowTextInput(window, state);
         },
         .mouse_wheel => {
+            if (state.routePaletteComposerWheel(&event.wheel, ui_scale)) {
+                return true;
+            }
             if (state.handleComposerWheel(&event.wheel)) {
                 return true;
             }
@@ -547,7 +581,7 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused()) return;
+    if (!state.isBrowserPaneFocused() and !state.palette_composer.focused) return;
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
