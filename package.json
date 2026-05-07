@@ -8,5 +8,8 @@
   },
   "devDependencies": {
     "@redwoodjs/agent-ci": "^0.6.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.132"
   }
 }
