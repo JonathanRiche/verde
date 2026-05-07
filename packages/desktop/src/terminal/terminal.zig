@@ -1038,7 +1038,7 @@ const UnixSession = struct {
         errdefer terminal.deinit(allocator);
         try terminal.setPwd(cwd);
 
-        const child = try spawnShell(cwd, cols, rows);
+        const child = try spawnShell(allocator, cwd, cols, rows);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -1324,7 +1324,10 @@ const UnixSession = struct {
         );
     }
 
-    fn spawnShell(cwd: []const u8, cols: u16, rows: u16) !SpawnResult {
+    fn spawnShell(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16) !SpawnResult {
+        const cwd_z = try allocator.dupeZ(u8, cwd);
+        defer allocator.free(cwd_z);
+
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
             .row = rows,
@@ -1336,7 +1339,7 @@ const UnixSession = struct {
         if (fork_result < 0) return error.ForkPtyFailed;
 
         if (fork_result == 0) {
-            childExec(cwd);
+            childExec(cwd_z);
         }
 
         try setNonBlocking(@intCast(master_fd));
@@ -1346,8 +1349,8 @@ const UnixSession = struct {
         };
     }
 
-    fn childExec(cwd: []const u8) noreturn {
-        if (std.c.chdir(@ptrCast(cwd.ptr)) != 0) {
+    fn childExec(cwd: [:0]const u8) noreturn {
+        if (std.c.chdir(cwd.ptr) != 0) {
             std.c._exit(127);
         }
 
