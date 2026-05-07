@@ -3931,6 +3931,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
     drawPowderComposerEmptyCaret(state);
     drawPowderComposerToolbarOverlay(state);
+    drawPowderComposerPendingHint(state);
     drawPowderModelCascadeMenu(state);
     drawPowderComposerStopButton(state);
     state.updateFileSearch();
@@ -3964,17 +3965,7 @@ fn queuePowderComposerIsland(
         return;
     };
 
-    if (runtime.isSendPending(state)) {
-        if (state.pendingFollowupHint()) |hint| {
-            const hint_rect: powder.Rect = .{
-                .x = input_rect_min[0],
-                .y = composer_screen_pos[1] + height - theme.scaledUi(64.0),
-                .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
-                .h = theme.scaledUi(18.0),
-            };
-            queuePowderText(state, hint_rect, hint, powderColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), hint_rect);
-        }
-    }
+    _ = height;
 }
 
 fn queuePowderBorder(state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
@@ -4099,6 +4090,24 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     };
     state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.powder_composer.accessRect(), access_label, .lock, false);
     drawPowderComposerBadge(state, state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, powderRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
+}
+
+fn drawPowderComposerPendingHint(state: *app_state.AppState) void {
+    const hint = state.pendingFollowupHint() orelse return;
+    const toolbar = state.powder_composer.toolbarRect();
+    if (toolbar.w <= 0.0 or toolbar.h <= 0.0) return;
+
+    const font_size = theme.scaledUi(14.0);
+    const text_pos: [2]f32 = .{
+        toolbar.x,
+        toolbar.y - font_size - theme.scaledUi(10.0),
+    };
+    zgui.getWindowDrawList().addTextExtendedUnformatted(
+        text_pos,
+        zgui.colorConvertFloat4ToU32(theme.COLOR_TEXT_SUBTLE),
+        hint,
+        .{ .font = zgui.getFont(), .font_size = font_size },
+    );
 }
 
 fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
