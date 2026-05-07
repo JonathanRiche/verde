@@ -3929,6 +3929,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     state.setPowderComposerBounds(input_rect_min, input_rect_max);
     queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
     drawPowderOverlayWithZgui(&state.powder_overlay_batch);
+    drawPowderComposerEmptyCaret(state);
     drawPowderComposerToolbarOverlay(state);
     drawPowderModelCascadeMenu(state);
     drawPowderComposerStopButton(state);
@@ -4009,6 +4010,18 @@ fn drawPowderOverlayWithZgui(batch: *const powder.RenderBatch) void {
             .image => {},
         }
     }
+}
+
+fn drawPowderComposerEmptyCaret(state: *app_state.AppState) void {
+    if (!state.powder_composer.focused) return;
+    if (state.powder_composer.text().len != 0) return;
+
+    const clipped = clippedPowderRect(state.powder_composer.cursorRect(), state.powder_composer.textRect()) orelse return;
+    zgui.getWindowDrawList().addRectFilled(.{
+        .pmin = .{ clipped.x, clipped.y },
+        .pmax = .{ clipped.x + clipped.w, clipped.y + clipped.h },
+        .col = zgui.colorConvertFloat4ToU32(theme.COLOR_WHITE),
+    });
 }
 
 fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command) void {
