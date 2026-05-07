@@ -4514,6 +4514,9 @@ pub const AppState = struct {
     }
 
     pub fn openPowderModelCascadeMenu(self: *AppState) void {
+        if (self.opencode_model_options.items.len == 0) {
+            self.refreshOpencodeModelOptionsCacheAsync();
+        }
         self.syncPowderModelCascadeMenu();
         self.setPowderModelCascadeBoundsFromToolbar();
         _ = self.powder_model_cascade.handleInput(.open);

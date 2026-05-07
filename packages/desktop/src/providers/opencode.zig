@@ -15,6 +15,14 @@ const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 12_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
 
+fn sleepMs(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
+}
+
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
 
@@ -295,7 +303,7 @@ pub const Client = struct {
             if (self.checkHealth()) {
                 return true;
             }
-            std.atomic.spinLoopHint();
+            sleepMs(100);
         }
         return false;
     }
