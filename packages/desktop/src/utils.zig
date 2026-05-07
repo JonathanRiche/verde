@@ -937,8 +937,9 @@ fn macApplicationExists(app_name: []const u8) bool {
 }
 
 fn directoryExistsAbsolute(path: []const u8) bool {
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    defer dir.close();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var dir = std.Io.Dir.openDirAbsolute(threaded.io(), path, .{}) catch return false;
+    defer dir.close(threaded.io());
     return true;
 }
 
@@ -1493,9 +1494,12 @@ fn convertClipboardTiffToPng(
     defer allocator.free(output_path);
 
     {
-        var file = try std.fs.createFileAbsolute(input_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(capture.bytes);
+        var file = try std.Io.Dir.createFileAbsolute(threaded.io(), input_path, .{ .truncate = true });
+        defer file.close(threaded.io());
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = file.writer(threaded.io(), &write_buffer);
+        try writer.interface.writeAll(capture.bytes);
+        try writer.interface.flush();
     }
 
     const convert_result = runChild(allocator, &.{ "sips", "-s", "format", "png", input_path, "--out", output_path }, ".", 16 * 1024) catch |err| switch (err) {
@@ -1511,9 +1515,13 @@ fn convertClipboardTiffToPng(
     }
 
     const png_bytes = png_bytes: {
-        const png_file = try std.fs.openFileAbsolute(output_path, .{});
-        defer png_file.close();
-        break :png_bytes try png_file.readToEndAlloc(allocator, CLIPBOARD_IMAGE_MAX_BYTES);
+        var png_file = try std.Io.Dir.openFileAbsolute(threaded.io(), output_path, .{ .mode = .read_only });
+        defer png_file.close(threaded.io());
+        const png_size = try png_file.stat(threaded.io());
+        if (png_size.size > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = png_file.reader(threaded.io(), &read_buffer);
+        break :png_bytes try reader.interface.readAlloc(allocator, @intCast(png_size.size));
     };
     std.Io.Dir.deleteFileAbsolute(threaded.io(), input_path) catch {};
     std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};
