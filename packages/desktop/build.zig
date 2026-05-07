@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const powder = b.dependency("powder", .{
+    const palette = b.dependency("palette", .{
         .target = target,
         .optimize = optimize,
     });
@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
-                .{ .name = "powder", .module = powder.module("powder") },
+                .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "zgui_text_select", .module = zgui_text_select.module("zgui_text_select") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },

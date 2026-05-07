@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-const powder = @import("powder");
+const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 const zgui = @import("zgui");
 const colors = @import("colors.zig");
@@ -3915,25 +3915,25 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
         composer_screen_pos[1] + height - pad_y,
     };
 
-    state.syncPowderComposerFromDraft();
-    state.syncPowderComposerControls();
+    state.syncPaletteComposerFromDraft();
+    state.syncPaletteComposerControls();
     if (state.consumeComposerFocusRequest()) {
-        state.powder_composer.focused = true;
+        state.palette_composer.focused = true;
         state.composer_focused = true;
         state.terminal_focused = false;
     }
-    state.composer_focused = state.powder_composer.focused;
+    state.composer_focused = state.palette_composer.focused;
     if (state.composer_focused) {
         state.terminal_focused = false;
     }
-    state.setPowderComposerBounds(input_rect_min, input_rect_max);
-    queuePowderComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
-    drawPowderOverlayWithZgui(&state.powder_overlay_batch);
-    drawPowderComposerEmptyCaret(state);
-    drawPowderComposerToolbarOverlay(state);
-    drawPowderComposerPendingHint(state);
-    drawPowderModelCascadeMenu(state);
-    drawPowderComposerStopButton(state);
+    state.setPaletteComposerBounds(input_rect_min, input_rect_max);
+    queuePaletteComposerIsland(state, composer_screen_pos, height, input_rect_min, input_rect_max);
+    drawPaletteOverlayWithZgui(&state.palette_overlay_batch);
+    drawPaletteComposerEmptyCaret(state);
+    drawPaletteComposerToolbarOverlay(state);
+    drawPaletteComposerPendingHint(state);
+    drawPaletteModelCascadeMenu(state);
+    drawPaletteComposerStopButton(state);
     state.updateFileSearch();
 
     if (state.hasActiveFileSearch()) {
@@ -3941,7 +3941,7 @@ fn renderComposer(state: *app_state.AppState, width: f32, height: f32) void {
     }
 }
 
-fn queuePowderComposerIsland(
+fn queuePaletteComposerIsland(
     state: *app_state.AppState,
     composer_screen_pos: [2]f32,
     height: f32,
@@ -3951,33 +3951,33 @@ fn queuePowderComposerIsland(
     const allocator = state.allocator;
 
     if (state.currentThread().draft_image != null) {
-        const attachment_rect: powder.Rect = .{
+        const attachment_rect: palette.Rect = .{
             .x = input_rect_min[0],
             .y = composer_screen_pos[1] + theme.scaledUi(8.0),
             .w = @max(input_rect_max[0] - input_rect_min[0], 0.0),
             .h = theme.scaledUi(20.0),
         };
-        queuePowderText(state, attachment_rect, "Image attached", powderColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), null);
+        queuePaletteText(state, attachment_rect, "Image attached", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), null);
     }
 
-    state.powder_composer.render(allocator, &state.powder_overlay_batch) catch |err| {
-        runtime.log.warn("failed to render powder composer: {s}", .{@errorName(err)});
+    state.palette_composer.render(allocator, &state.palette_overlay_batch) catch |err| {
+        runtime.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
         return;
     };
 
     _ = height;
 }
 
-fn queuePowderBorder(state: *app_state.AppState, rect: powder.Rect, color: powder.Color) void {
+fn queuePaletteBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
     const thickness = theme.scaledUi(1.5);
-    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = thickness }, color) catch return;
-    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y + rect.h - thickness, .w = rect.w, .h = thickness }, color) catch return;
-    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
-    state.powder_overlay_batch.rect(state.allocator, .{ .x = rect.x + rect.w - thickness, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = thickness }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y + rect.h - thickness, .w = rect.w, .h = thickness }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = rect.x + rect.w - thickness, .y = rect.y, .w = thickness, .h = rect.h }, color) catch return;
 }
 
-fn queuePowderText(state: *app_state.AppState, rect: powder.Rect, value: []const u8, color: powder.Color, font_size: f32, clip: ?powder.Rect) void {
-    state.powder_overlay_batch.fixedText(
+fn queuePaletteText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.fixedText(
         state.allocator,
         rect,
         value,
@@ -3991,23 +3991,23 @@ fn queuePowderText(state: *app_state.AppState, rect: powder.Rect, value: []const
     ) catch return;
 }
 
-fn drawPowderOverlayWithZgui(batch: *const powder.RenderBatch) void {
+fn drawPaletteOverlayWithZgui(batch: *const palette.RenderBatch) void {
     const draw_list = zgui.getWindowDrawList();
     const font = zgui.getFont();
     for (batch.commands.items) |command| {
         switch (command.kind) {
-            .rect, .cursor, .selection, .scrollbar => drawPowderRectWithZgui(draw_list, command),
-            .text => drawPowderTextWithZgui(draw_list, font, command),
+            .rect, .cursor, .selection, .scrollbar => drawPaletteRectWithZgui(draw_list, command),
+            .text => drawPaletteTextWithZgui(draw_list, font, command),
             .image => {},
         }
     }
 }
 
-fn drawPowderComposerEmptyCaret(state: *app_state.AppState) void {
-    if (!state.powder_composer.focused) return;
-    if (state.powder_composer.text().len != 0) return;
+fn drawPaletteComposerEmptyCaret(state: *app_state.AppState) void {
+    if (!state.palette_composer.focused) return;
+    if (state.palette_composer.text().len != 0) return;
 
-    const clipped = clippedPowderRect(state.powder_composer.cursorRect(), state.powder_composer.textRect()) orelse return;
+    const clipped = clippedPaletteRect(state.palette_composer.cursorRect(), state.palette_composer.textRect()) orelse return;
     zgui.getWindowDrawList().addRectFilled(.{
         .pmin = .{ clipped.x, clipped.y },
         .pmax = .{ clipped.x + clipped.w, clipped.y + clipped.h },
@@ -4015,16 +4015,16 @@ fn drawPowderComposerEmptyCaret(state: *app_state.AppState) void {
     });
 }
 
-fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command) void {
+fn drawPaletteRectWithZgui(draw_list: zgui.DrawList, command: palette.draw.Command) void {
     if (command.rect.w <= 0.0 or command.rect.h <= 0.0) return;
-    const clipped = if (command.clip) |clip_rect| clippedPowderRect(command.rect, clip_rect) orelse return else command.rect;
+    const clipped = if (command.clip) |clip_rect| clippedPaletteRect(command.rect, clip_rect) orelse return else command.rect;
     const pmin: [2]f32 = .{ clipped.x, clipped.y };
     const pmax: [2]f32 = .{ clipped.x + clipped.w, clipped.y + clipped.h };
     if (command.color.a > 0.0) {
         draw_list.addRectFilled(.{
             .pmin = pmin,
             .pmax = pmax,
-            .col = powderColorU32(command.color),
+            .col = paletteColorU32(command.color),
             .rounding = command.radius,
         });
     }
@@ -4033,7 +4033,7 @@ fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command
             draw_list.addRect(.{
                 .pmin = pmin,
                 .pmax = pmax,
-                .col = powderColorU32(border_color),
+                .col = paletteColorU32(border_color),
                 .rounding = command.radius,
                 .thickness = command.border_width,
             });
@@ -4041,7 +4041,7 @@ fn drawPowderRectWithZgui(draw_list: zgui.DrawList, command: powder.draw.Command
     }
 }
 
-fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
+fn drawPaletteComposerToolbarOverlay(state: *app_state.AppState) void {
     const thread = state.currentThread();
     const model_label = chat_threads.selectedModelLabel(
         app_state.ModelOption,
@@ -4056,8 +4056,8 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     );
 
     const draw_list = zgui.getWindowDrawList();
-    const toolbar = state.powder_composer.toolbarRect();
-    const send = state.powder_composer.sendButtonRect();
+    const toolbar = state.palette_composer.toolbarRect();
+    const send = state.palette_composer.sendButtonRect();
     const mouse_pos = zgui.getMousePos();
     const mask_max_x = @max(send.x - theme.scaledUi(10.0), toolbar.x);
     draw_list.addRectFilled(.{
@@ -4069,32 +4069,32 @@ fn drawPowderComposerToolbarOverlay(state: *app_state.AppState) void {
     const gap = theme.scaledUi(14.0);
     var x = toolbar.x;
     state.composer_toolbar_overlay_valid = true;
-    state.composer_toolbar_model_rect = composerBadgeRectAt(x, state.powder_composer.modelRect(), model_label, .provider_logo, true);
-    drawPowderComposerBadge(state, state.composer_toolbar_model_rect, model_label, .provider_logo, false, true, powderRectContainsPoint(state.composer_toolbar_model_rect, mouse_pos));
+    state.composer_toolbar_model_rect = composerBadgeRectAt(x, state.palette_composer.modelRect(), model_label, .provider_logo, true);
+    drawPaletteComposerBadge(state, state.composer_toolbar_model_rect, model_label, .provider_logo, false, true, paletteRectContainsPoint(state.composer_toolbar_model_rect, mouse_pos));
     x += state.composer_toolbar_model_rect.w + gap;
-    drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
-    state.composer_toolbar_reasoning_rect = composerBadgeRectAt(x, state.powder_composer.reasoningRect(), reasoning_label, .none, true);
-    drawPowderComposerBadge(state, state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, powderRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    state.composer_toolbar_reasoning_rect = composerBadgeRectAt(x, state.palette_composer.reasoningRect(), reasoning_label, .none, true);
+    drawPaletteComposerBadge(state, state.composer_toolbar_reasoning_rect, reasoning_label, .none, false, true, paletteRectContainsPoint(state.composer_toolbar_reasoning_rect, mouse_pos));
     x += state.composer_toolbar_reasoning_rect.w + gap;
-    drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     const fast_enabled = thread.fast_mode == .on;
     const fast_label = if (fast_enabled) "Fast" else "Default";
     const fast_icon: ComposerBadgeIcon = if (fast_enabled) .lightning else .default_mode;
-    state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.powder_composer.fastRect(), fast_label, fast_icon, false);
-    drawPowderComposerBadge(state, state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, powderRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
+    state.composer_toolbar_fast_rect = composerBadgeRectAt(x, state.palette_composer.fastRect(), fast_label, fast_icon, false);
+    drawPaletteComposerBadge(state, state.composer_toolbar_fast_rect, fast_label, fast_icon, false, false, paletteRectContainsPoint(state.composer_toolbar_fast_rect, mouse_pos));
     x += state.composer_toolbar_fast_rect.w + gap;
-    drawPowderComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
+    drawPaletteComposerToolbarSeparator(draw_list, x - gap * 0.5, toolbar);
     const access_label = switch (thread.access_mode) {
         .supervised => "Supervised",
         .full_access => "Full access",
     };
-    state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.powder_composer.accessRect(), access_label, .lock, false);
-    drawPowderComposerBadge(state, state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, powderRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
+    state.composer_toolbar_access_rect = composerBadgeRectAt(x, state.palette_composer.accessRect(), access_label, .lock, false);
+    drawPaletteComposerBadge(state, state.composer_toolbar_access_rect, access_label, .lock, thread.access_mode == .supervised, false, paletteRectContainsPoint(state.composer_toolbar_access_rect, mouse_pos));
 }
 
-fn drawPowderComposerPendingHint(state: *app_state.AppState) void {
+fn drawPaletteComposerPendingHint(state: *app_state.AppState) void {
     const hint = state.pendingFollowupHint() orelse return;
-    const toolbar = state.powder_composer.toolbarRect();
+    const toolbar = state.palette_composer.toolbarRect();
     if (toolbar.w <= 0.0 or toolbar.h <= 0.0) return;
 
     const font_size = theme.scaledUi(14.0);
@@ -4110,41 +4110,41 @@ fn drawPowderComposerPendingHint(state: *app_state.AppState) void {
     );
 }
 
-fn drawPowderModelCascadeMenu(state: *app_state.AppState) void {
-    if (!state.powder_model_cascade.isOpen()) return;
-    state.syncPowderModelCascadeMenu();
-    state.setPowderModelCascadeBoundsFromToolbar();
+fn drawPaletteModelCascadeMenu(state: *app_state.AppState) void {
+    if (!state.palette_model_cascade.isOpen()) return;
+    state.syncPaletteModelCascadeMenu();
+    state.setPaletteModelCascadeBoundsFromToolbar();
 
-    var batch: powder.RenderBatch = .{};
+    var batch: palette.RenderBatch = .{};
     defer batch.deinit(state.allocator);
-    state.powder_model_cascade.render(state.allocator, &batch) catch |err| {
-        runtime.log.warn("failed to render powder model cascade menu: {s}", .{@errorName(err)});
+    state.palette_model_cascade.render(state.allocator, &batch) catch |err| {
+        runtime.log.warn("failed to render palette model cascade menu: {s}", .{@errorName(err)});
         return;
     };
-    drawPowderOverlayWithZgui(&batch);
-    drawPowderModelCascadeProviderLogos(state);
+    drawPaletteOverlayWithZgui(&batch);
+    drawPaletteModelCascadeProviderLogos(state);
 }
 
-fn drawPowderModelCascadeProviderLogos(state: *app_state.AppState) void {
+fn drawPaletteModelCascadeProviderLogos(state: *app_state.AppState) void {
     const draw_list = zgui.getWindowDrawList();
     const font = zgui.getFont();
     const providers = [_]app_state.Provider{ .codex, .opencode };
     for (providers, 0..) |provider, index| {
-        const row = state.powder_model_cascade.rowRect(0, index);
+        const row = state.palette_model_cascade.rowRect(0, index);
         if (row.w <= 0.0 or row.h <= 0.0) continue;
-        const highlighted = state.powder_model_cascade.highlighted[0] != null and state.powder_model_cascade.highlighted[0].? == index;
+        const highlighted = state.palette_model_cascade.highlighted[0] != null and state.palette_model_cascade.highlighted[0].? == index;
         const row_color = if (highlighted)
-            powder.Color{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 }
+            palette.Color{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 }
         else
-            powder.Color{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 };
+            palette.Color{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 };
         draw_list.addRectFilled(.{
             .pmin = .{ row.x, row.y },
             .pmax = .{ row.x + row.w, row.y + row.h },
-            .col = powderColorU32(row_color),
+            .col = paletteColorU32(row_color),
             .rounding = theme.scaledUi(5.0),
         });
         const logo_slot_w = theme.scaledUi(25.0);
-        drawProviderLogoInPowderOverlay(
+        drawProviderLogoInPaletteOverlay(
             draw_list,
             state,
             provider,
@@ -4155,7 +4155,7 @@ fn drawPowderModelCascadeProviderLogos(state: *app_state.AppState) void {
         const label = chat_threads.providerLabel(provider);
         draw_list.addTextExtendedUnformatted(
             .{ row.x + logo_slot_w + theme.scaledUi(6.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
-            powderColorU32(.{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 }),
+            paletteColorU32(.{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 }),
             label,
             .{
                 .font = font,
@@ -4164,7 +4164,7 @@ fn drawPowderModelCascadeProviderLogos(state: *app_state.AppState) void {
         );
         draw_list.addTextExtendedUnformatted(
             .{ row.x + row.w - theme.scaledUi(19.0), row.y + @max((row.h - theme.scaledUi(20.0) * 1.25) * 0.5, 0.0) },
-            powderColorU32(.{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 }),
+            paletteColorU32(.{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 }),
             "›",
             .{
                 .font = font,
@@ -4182,7 +4182,7 @@ fn providerLogoWidth(provider: app_state.Provider, target_height: f32) f32 {
     return target_height * providerLogoScale(provider) * (visible_w / visible_h);
 }
 
-fn drawProviderLogoInPowderOverlay(draw_list: zgui.DrawList, state: *app_state.AppState, provider: app_state.Provider, x: f32, center_y: f32, target_height: f32) void {
+fn drawProviderLogoInPaletteOverlay(draw_list: zgui.DrawList, state: *app_state.AppState, provider: app_state.Provider, x: f32, center_y: f32, target_height: f32) void {
     const cached = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
@@ -4240,7 +4240,7 @@ const ComposerBadgeIcon = enum {
     lock,
 };
 
-fn composerBadgeRectAt(x_pos: f32, rect: powder.Rect, label: []const u8, icon: ComposerBadgeIcon, chevron: bool) powder.Rect {
+fn composerBadgeRectAt(x_pos: f32, rect: palette.Rect, label: []const u8, icon: ComposerBadgeIcon, chevron: bool) palette.Rect {
     if (rect.h <= 0.0) return .{ .x = x_pos, .y = rect.y, .w = 0.0, .h = 0.0 };
 
     const visual_h = theme.scaledUi(34.0);
@@ -4263,7 +4263,7 @@ fn composerBadgeRectAt(x_pos: f32, rect: powder.Rect, label: []const u8, icon: C
     };
 }
 
-fn drawPowderComposerBadge(state: *app_state.AppState, visual_rect: powder.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool, hovered: bool) void {
+fn drawPaletteComposerBadge(state: *app_state.AppState, visual_rect: palette.Rect, label: []const u8, icon: ComposerBadgeIcon, icon_locked: bool, chevron: bool, hovered: bool) void {
     if (visual_rect.w <= 0.0 or visual_rect.h <= 0.0) return;
 
     const draw_list = zgui.getWindowDrawList();
@@ -4294,7 +4294,7 @@ fn drawPowderComposerBadge(state: *app_state.AppState, visual_rect: powder.Rect,
     switch (icon) {
         .none => {},
         .provider_logo => {
-            drawProviderLogoInPowderOverlay(draw_list, state, state.currentThread().provider, x, center_y, theme.scaledUi(18.0));
+            drawProviderLogoInPaletteOverlay(draw_list, state, state.currentThread().provider, x, center_y, theme.scaledUi(18.0));
             x += icon_advance;
         },
         .default_mode => {
@@ -4339,7 +4339,7 @@ fn drawPowderComposerBadge(state: *app_state.AppState, visual_rect: powder.Rect,
     }
 }
 
-fn powderRectContainsPoint(rect: powder.Rect, point: [2]f32) bool {
+fn paletteRectContainsPoint(rect: palette.Rect, point: [2]f32) bool {
     return point[0] >= rect.x and point[0] <= rect.x + rect.w and point[1] >= rect.y and point[1] <= rect.y + rect.h;
 }
 
@@ -4348,7 +4348,7 @@ fn scaledOverlayTextWidth(label: []const u8, font_size: f32) f32 {
     return zgui.calcTextSize(label, .{})[0] * (font_size / base_font_size);
 }
 
-fn drawPowderComposerToolbarSeparator(draw_list: zgui.DrawList, x: f32, toolbar: powder.Rect) void {
+fn drawPaletteComposerToolbarSeparator(draw_list: zgui.DrawList, x: f32, toolbar: palette.Rect) void {
     draw_list.addLine(.{
         .p1 = .{ x, toolbar.y + theme.scaledUi(9.0) },
         .p2 = .{ x, toolbar.y + toolbar.h - theme.scaledUi(9.0) },
@@ -4357,10 +4357,10 @@ fn drawPowderComposerToolbarSeparator(draw_list: zgui.DrawList, x: f32, toolbar:
     });
 }
 
-fn drawPowderComposerStopButton(state: *app_state.AppState) void {
+fn drawPaletteComposerStopButton(state: *app_state.AppState) void {
     if (!runtime.isSendPending(state)) return;
 
-    const rect = state.powder_composer.sendButtonRect();
+    const rect = state.palette_composer.sendButtonRect();
     if (rect.w <= 0.0 or rect.h <= 0.0) return;
 
     const draw_list = zgui.getWindowDrawList();
@@ -4413,11 +4413,11 @@ fn drawLockIcon(draw_list: zgui.DrawList, x: f32, center_y: f32, color: [4]f32, 
     }
 }
 
-fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: powder.draw.Command) void {
+fn drawPaletteTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: palette.draw.Command) void {
     if (command.text.len == 0 or command.color.a <= 0.0) return;
     if (command.text_runs.len > 0) {
         for (command.text_runs) |run| {
-            drawPowderTextRunWithZgui(draw_list, font, run);
+            drawPaletteTextRunWithZgui(draw_list, font, run);
         }
         return;
     }
@@ -4436,7 +4436,7 @@ fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: po
     while (index < command.text.len) {
         const byte = command.text[index];
         if (byte == '\n') {
-            drawPowderTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            drawPaletteTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
             row += 1;
             col = 0;
             index += 1;
@@ -4444,18 +4444,18 @@ fn drawPowderTextWithZgui(draw_list: zgui.DrawList, font: zgui.Font, command: po
             continue;
         }
         if (col >= max_columns) {
-            drawPowderTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
+            drawPaletteTextLineWithZgui(draw_list, font, command, line_start, index, row, line_h);
             row += 1;
             col = 0;
             line_start = index;
         }
         col += 1;
-        index += powderUtf8Advance(command.text, index);
+        index += paletteUtf8Advance(command.text, index);
     }
-    drawPowderTextLineWithZgui(draw_list, font, command, line_start, command.text.len, row, line_h);
+    drawPaletteTextLineWithZgui(draw_list, font, command, line_start, command.text.len, row, line_h);
 }
 
-fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: powder.TextRun) void {
+fn drawPaletteTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: palette.TextRun) void {
     if (run.text.len == 0 or run.color.a <= 0.0) return;
     var clip_rect_storage: [4]f32 = undefined;
     const clip_rect: ?[*]const [4]f32 = if (run.clip) |clip| blk: {
@@ -4464,7 +4464,7 @@ fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: pow
     } else null;
     draw_list.addTextExtendedUnformatted(
         .{ run.x, run.y },
-        powderColorU32(run.color),
+        paletteColorU32(run.color),
         run.text,
         .{
             .font = font,
@@ -4474,10 +4474,10 @@ fn drawPowderTextRunWithZgui(draw_list: zgui.DrawList, font: zgui.Font, run: pow
     );
 }
 
-fn drawPowderTextLineWithZgui(
+fn drawPaletteTextLineWithZgui(
     draw_list: zgui.DrawList,
     font: zgui.Font,
-    command: powder.draw.Command,
+    command: palette.draw.Command,
     start: usize,
     end: usize,
     row: usize,
@@ -4494,7 +4494,7 @@ fn drawPowderTextLineWithZgui(
             command.rect.x - command.scroll.x,
             command.rect.y + @as(f32, @floatFromInt(row)) * line_h - command.scroll.y,
         },
-        powderColorU32(command.color),
+        paletteColorU32(command.color),
         command.text[start..end],
         .{
             .font = font,
@@ -4504,7 +4504,7 @@ fn drawPowderTextLineWithZgui(
     );
 }
 
-fn clippedPowderRect(rect: powder.Rect, clip: powder.Rect) ?powder.Rect {
+fn clippedPaletteRect(rect: palette.Rect, clip: palette.Rect) ?palette.Rect {
     const x0 = @max(rect.x, clip.x);
     const y0 = @max(rect.y, clip.y);
     const x1 = @min(rect.x + rect.w, clip.x + clip.w);
@@ -4513,15 +4513,15 @@ fn clippedPowderRect(rect: powder.Rect, clip: powder.Rect) ?powder.Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-fn powderColorU32(value: powder.Color) u32 {
+fn paletteColorU32(value: palette.Color) u32 {
     return zgui.colorConvertFloat4ToU32(.{ value.r, value.g, value.b, value.a });
 }
 
-fn powderUtf8Advance(text: []const u8, index: usize) usize {
+fn paletteUtf8Advance(text: []const u8, index: usize) usize {
     return std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
 }
 
-fn powderColor(value: [4]f32) powder.Color {
+fn paletteColor(value: [4]f32) palette.Color {
     return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
 }
 
