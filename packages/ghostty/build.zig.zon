@@ -25,8 +25,7 @@
         },
         .zig_objc = .{
             // mitchellh/zig-objc
-            .url = "https://deps.files.ghostty.org/zig_objc-f356ed02833f0f1b8e84d50bed9e807bf7cdc0ae.tar.gz",
-            .hash = "zig_objc-0.0.0-Ir_Sp5gTAQCvxxR7oVIrPXxXwsfKgVP7_wqoOQrZjFeK",
+            .path = "../zig_objc",
             .lazy = true,
         },
         .zig_js = .{
