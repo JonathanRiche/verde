@@ -144,7 +144,7 @@ pub const Client = struct {
         const result = try std.process.run(allocator, threaded.io(), .{
             .argv = &.{ executable, "--input-type=module", "--eval", BRIDGE_SCRIPT },
             .cwd = if (if (input.request) |request| request.cwd orelse self.config.cwd else self.config.cwd) |path| .{ .path = path } else .inherit,
-            .env_map = &env_map,
+            .environ_map = &env_map,
             .stdout_limit = .limited(MAX_BRIDGE_STDOUT_BYTES),
             .stderr_limit = .limited(MAX_BRIDGE_STDERR_BYTES),
         });
