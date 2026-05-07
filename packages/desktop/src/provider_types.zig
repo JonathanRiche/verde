@@ -3,6 +3,7 @@
 pub const Provider = enum(u8) {
     opencode,
     codex,
+    cursor,
 };
 
 pub const HarnessKind = enum(u8) {
