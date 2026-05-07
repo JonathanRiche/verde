@@ -8,5 +8,8 @@
   },
   "devDependencies": {
     "@redwoodjs/agent-ci": "^0.6.0"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.12"
   }
 }
