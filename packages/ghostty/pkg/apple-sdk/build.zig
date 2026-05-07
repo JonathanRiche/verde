@@ -60,7 +60,7 @@ pub fn addPaths(
             }) catch break :darwin;
 
             // Render the file compatible with the `--libc` Zig flag.
-            var stream: std.io.Writer.Allocating = .init(b.allocator);
+            var stream: std.Io.Writer.Allocating = .init(b.allocator);
             defer stream.deinit();
             try libc.render(&stream.writer);
 
