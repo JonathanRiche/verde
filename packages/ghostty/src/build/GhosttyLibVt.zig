@@ -174,7 +174,7 @@ pub fn initStaticAppleUniversal(
             .os_tag = p.os_tag,
             .os_version_min = Config.osVersionMin(p.os_tag),
         };
-        if (detectAppleSDK(b.resolveTargetQuery(target_query).result)) {
+        if (detectAppleSDK(b, b.resolveTargetQuery(target_query).result)) {
             const dev_zig = try zig.retarget(b, cfg, deps, b.resolveTargetQuery(target_query));
             result.put(p.device, try initStatic(b, &dev_zig));
 
@@ -438,10 +438,10 @@ pub fn xcframework(
 }
 
 /// Returns true if the Apple SDK for the given target is installed.
-fn detectAppleSDK(target: std.Target) bool {
-    _ = std.zig.LibCInstallation.findNative(.{
-        .allocator = std.heap.page_allocator,
+fn detectAppleSDK(b: *std.Build, target: std.Target) bool {
+    _ = std.zig.LibCInstallation.findNative(b.allocator, b.graph.io, .{
         .target = &target,
+        .environ_map = &b.graph.environ_map,
         .verbose = false,
     }) catch return false;
     return true;

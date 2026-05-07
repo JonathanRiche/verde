@@ -4,12 +4,36 @@ const std = @import("std");
 const builtin = @import("builtin");
 const browser_input = @import("../input.zig");
 const browser_bridge = @import("bridge.zig");
-const browser_helper = @import("linux_helper.zig");
 const browser_platform = @import("platform.zig");
 const browser_queue = @import("../queue.zig");
 const browser_session = @import("../session.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
+const browser_helper = if (builtin.os.tag == .linux) @import("linux_helper.zig") else struct {
+    pub const Controller = struct {
+        pub fn init(_: std.mem.Allocator, _: []const u8) !Controller {
+            return error.BrowserUnavailable;
+        }
+
+        pub fn deinit(_: *Controller) void {}
+        pub fn show(_: *Controller, _: u32, _: u32, _: []const u8) !void {}
+        pub fn hide(_: *Controller) !void {}
+        pub fn resize(_: *Controller, _: u32, _: u32) !void {}
+        pub fn navigate(_: *Controller, _: u32, _: u32, _: []const u8) !void {}
+        pub fn eval(_: *Controller, _: []const u8) !void {}
+        pub fn postJson(_: *Controller, _: []const u8) !void {}
+        pub fn handleMouse(_: *Controller, _: browser_input.MouseEvent) !bool {
+            return false;
+        }
+        pub fn handleKey(_: *Controller, _: browser_input.KeyEvent) !bool {
+            return false;
+        }
+        pub fn popEvent(_: *Controller) ?browser_types.Event {
+            return null;
+        }
+        pub fn uploadFrame(_: *Controller, _: *browser_texture.PaneTexture) !void {}
+    };
+};
 
 const DEFAULT_PANE_WIDTH: u32 = 1280;
 const DEFAULT_PANE_HEIGHT: u32 = 720;
@@ -224,7 +248,7 @@ pub const Backend = struct {
 
     // Reports whether this build should use the real helper runtime instead of the synthetic preview.
     fn usingNativeRuntime(self: *const Backend) bool {
-        return (builtin.os.tag == .linux or builtin.os.tag == .macos) and self.sdkConfigured() and !self.stubPreview();
+        return builtin.os.tag == .linux and self.sdkConfigured() and !self.stubPreview();
     }
 
     // Warms the runtime once so the browser cost is paid on first open instead of app launch.
