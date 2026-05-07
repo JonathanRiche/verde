@@ -1,4 +1,5 @@
 const std = @import("std");
+const palette = @import("palette");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const zgui_text_select = @import("zgui_text_select");
@@ -23,6 +24,109 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
+const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
+const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+
+pub const PaletteComposerPrompt = palette.composerPrompt(.{
+    .padding_x = 24.0,
+    .padding_y = 20.0,
+    .toolbar_height = 48.0,
+    .toolbar_gap = 14.0,
+    .control_gap = 14.0,
+    .pill_padding_x = 16.0,
+    .pill_icon_gap = 10.0,
+    .pill_chevron_gap = 10.0,
+    .model_min_width = 138.0,
+    .model_max_width = 220.0,
+    .reasoning_min_width = 92.0,
+    .reasoning_max_width = 150.0,
+    .fast_min_width = 116.0,
+    .fast_max_width = 132.0,
+    .access_min_width = 172.0,
+    .access_max_width = 192.0,
+    .corner_radius = 28.0,
+    .border_width = 1.5,
+    .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
+    .border_color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
+    .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
+    .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
+    .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
+    .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
+    .text_color = .{ .r = 0.94, .g = 0.96, .b = 0.98, .a = 1.0 },
+    .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
+    .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
+    .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
+    .font_size = PALETTE_COMPOSER_FONT_SIZE,
+    .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
+    .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
+    .placeholder = "Ask anything, or use / to show available commands",
+    .model_icon = " ",
+    .fast_icon = "⚡",
+    .access_icon = "  ",
+    .chevron_icon = "›",
+    .send_icon = "↑",
+    .stop_icon = "■",
+});
+
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 34.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+
+pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
+    .width = COMPOSER_MODEL_CASCADE_WIDTH,
+    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
+    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
+    .max_depth = 2,
+    .padding_x = 12.0,
+    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
+    .submenu_gap = 6.0,
+    .glyph_width = 10.8,
+    .font_size = 20.0,
+    .chevron_icon = "›",
+    .icon_gap = 10.0,
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
+    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
+    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
+    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
+    .scrollbar_width = 5.0,
+    .corner_radius = 10.0,
+    .border_width = 1.0,
+    .z_index = 200,
+    .submenu_z_offset = 10,
+    .placement = .above,
+    .submenu_placement = .right,
+    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
+    .item_label = paletteModelCascadeLabel,
+    .child_count = paletteModelCascadeChildCount,
+});
+
+fn paletteZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+    if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
+    const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
+    const end = @min(byte_offset + byte_len, text.len);
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    const width = zgui.calcTextSize(text[byte_offset..end], .{})[0] * (font_size / base_font_size);
+    return .{ .byte_len = end - byte_offset, .width = width };
+}
+
+fn paletteZguiFontMetrics(font_size: f32) palette.FontMetrics {
+    const base_font_size = @max(zgui.getFontSize(), 1.0);
+    const line_height = @max(zgui.getTextLineHeight() * (font_size / base_font_size), font_size);
+    return .{
+        .font_size = font_size,
+        .line_height = line_height,
+        .context = null,
+        .advance = paletteZguiFontAdvance,
+    };
+}
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -49,6 +153,180 @@ const Condition = struct {
 
     fn broadcast(_: *Condition) void {}
 };
+
+fn paletteMousePoint(x: f32, y: f32, ui_scale: f32) palette.draw.Vec2 {
+    _ = ui_scale;
+    return .{ .x = x, .y = y };
+}
+
+fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
+    const mod_bits = keymodBits(event.mod);
+    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const shift = (mod_bits & sdl.Keymod.shift) != 0;
+    const alt = (mod_bits & sdl.Keymod.alt) != 0;
+    const code: palette.Key.Code = switch (event.key) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+        .home => .home,
+        .end => .end,
+        .pageup => .page_up,
+        .pagedown => .page_down,
+        .backspace => .backspace,
+        .delete => .delete,
+        .@"return", .kp_enter => .enter,
+        .a => .a,
+        .c => .c,
+        .v => .v,
+        .x => .x,
+        else => return null,
+    };
+    return .{ .code = code, .shift = shift, .primary = primary or (code == .enter and !shift), .alt = alt };
+}
+
+fn keymodBits(modifier_state: sdl.Keymod) u16 {
+    return @as(*const u16, @ptrCast(&modifier_state)).*;
+}
+
+fn appStateFromContext(context: ?*anyopaque) ?*AppState {
+    const ptr = context orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn paletteModelLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const thread = state.currentThread();
+    const options = composerModelOptions(state, thread.provider);
+    if (index >= options.len) return "";
+    return options[index].label;
+}
+
+fn paletteReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
+    if (index >= CODEX_REASONING_OPTIONS.len) return "";
+    return CODEX_REASONING_OPTIONS[index].label;
+}
+
+fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
+    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..]);
+}
+
+fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
+    return switch (provider) {
+        .codex => DEFAULT_CODEX_MODEL,
+        .opencode => state.cachedDefaultModelRefForProvider(.opencode),
+    };
+}
+
+fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .text_changed => |text| state.setDraft(text),
+        .submitted => {
+            if (state.currentThread().isSendPendingForUi()) {
+                state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
+                return;
+            }
+            if (state.acceptPrimaryFileSearchResult()) return;
+            state.sendDraft() catch |err| {
+                log.err("failed to send draft: {s}", .{@errorName(err)});
+            };
+        },
+        .model_changed => |index| {
+            const options = composerModelOptions(state, state.currentThread().provider);
+            if (index >= options.len) return;
+            state.setCurrentThreadModelRef(options[index].value);
+        },
+        .reasoning_changed => |index| {
+            if (index >= CODEX_REASONING_OPTIONS.len) return;
+            const thread = state.currentThreadMutable();
+            const next = CODEX_REASONING_OPTIONS[index].value;
+            const changed = if (next) |value|
+                thread.reasoning_effort == null or thread.reasoning_effort.? != value
+            else
+                thread.reasoning_effort != null;
+            if (!changed) return;
+            thread.reasoning_effort = next;
+            state.markDirty();
+        },
+        .fast_changed => |enabled| {
+            const next: FastMode = if (enabled) .on else .off;
+            const thread = state.currentThreadMutable();
+            if (thread.fast_mode == next) return;
+            thread.fast_mode = next;
+            state.markDirty();
+        },
+        .access_changed => |enabled| {
+            const next: AccessMode = if (enabled) .full_access else .supervised;
+            const thread = state.currentThreadMutable();
+            if (thread.access_mode == next) return;
+            thread.access_mode = next;
+            state.markDirty();
+        },
+        .send_clicked => {
+            if (state.currentThread().isSendPendingForUi()) state.abortCurrentThreadSend();
+        },
+        .focus_changed => |focused| {
+            state.composer_focused = focused;
+            if (focused) {
+                state.terminal_focused = false;
+                state.browser_pane_focused = false;
+            }
+        },
+        .model_clicked, .reasoning_clicked => {},
+    }
+}
+
+fn providerForComposerCascadeIndex(index: usize) ?Provider {
+    if (index >= COMPOSER_PROVIDER_OPTIONS.len) return null;
+    return COMPOSER_PROVIDER_OPTIONS[index];
+}
+
+fn composerCascadeIndexForProvider(provider: Provider) ?usize {
+    for (COMPOSER_PROVIDER_OPTIONS, 0..) |candidate, index| {
+        if (candidate == provider) return index;
+    }
+    return null;
+}
+
+fn paletteModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    if (path.len == 0) {
+        const provider = providerForComposerCascadeIndex(index) orelse return "";
+        return chat_threads.providerLabel(provider);
+    }
+    if (path.len == 1) {
+        const provider = providerForComposerCascadeIndex(path[0]) orelse return "";
+        const options = composerModelOptions(state, provider);
+        if (index >= options.len) return "";
+        return options[index].label;
+    }
+    return "";
+}
+
+fn paletteModelCascadeChildCount(context: ?*anyopaque, path: []const usize, index: usize) usize {
+    const state = appStateFromContext(context) orelse return 0;
+    if (path.len != 0) return 0;
+    const provider = providerForComposerCascadeIndex(index) orelse return 0;
+    return composerModelOptions(state, provider).len;
+}
+
+fn paletteModelCascadeEvent(context: ?*anyopaque, event: palette.CascadeMenuEvent) void {
+    const state = appStateFromContext(context) orelse return;
+    switch (event) {
+        .selected => |selection| {
+            if (selection.path.len != 1) return;
+            const provider = providerForComposerCascadeIndex(selection.path[0]) orelse return;
+            const options = composerModelOptions(state, provider);
+            if (selection.index >= options.len) return;
+            state.setCurrentThreadProvider(provider);
+            state.setCurrentThreadModelRef(options[selection.index].value);
+            state.syncPaletteComposerControls();
+        },
+        .highlighted, .open_changed => {},
+    }
+}
+
 pub const ProjectEditorTarget = enum {
     configured,
     cursor,
@@ -1034,10 +1312,23 @@ pub const AppState = struct {
     composer_input_bounds_valid: bool,
     composer_input_min: [2]f32,
     composer_input_max: [2]f32,
+    composer_send_bounds_valid: bool,
+    composer_send_min: [2]f32,
+    composer_send_max: [2]f32,
+    composer_send_pressed: bool,
+    composer_send_hovered: bool,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
+    composer_toolbar_overlay_valid: bool,
+    composer_toolbar_model_rect: palette.Rect,
+    composer_toolbar_reasoning_rect: palette.Rect,
+    composer_toolbar_fast_rect: palette.Rect,
+    composer_toolbar_access_rect: palette.Rect,
+    palette_composer: PaletteComposerPrompt,
+    palette_model_cascade: PaletteModelCascadeMenu,
+    palette_overlay_batch: palette.RenderBatch,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1129,10 +1420,23 @@ pub const AppState = struct {
             .composer_input_bounds_valid = false,
             .composer_input_min = .{ 0.0, 0.0 },
             .composer_input_max = .{ 0.0, 0.0 },
+            .composer_send_bounds_valid = false,
+            .composer_send_min = .{ 0.0, 0.0 },
+            .composer_send_max = .{ 0.0, 0.0 },
+            .composer_send_pressed = false,
+            .composer_send_hovered = false,
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
             .composer_overlay_last_draft_len = 0,
+            .composer_toolbar_overlay_valid = false,
+            .composer_toolbar_model_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_reasoning_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .palette_composer = PaletteComposerPrompt.init(),
+            .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
+            .palette_overlay_batch = .{},
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1201,6 +1505,7 @@ pub const AppState = struct {
             .last_interaction_at_ms = 0,
             .pending_send_count = 0,
         };
+        state.palette_composer.setCallbacks(.{});
 
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
@@ -3826,7 +4131,8 @@ pub const AppState = struct {
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(allocator);
 
-        const header = try std.fmt.allocPrint(allocator,
+        const header = try std.fmt.allocPrint(
+            allocator,
             "Browser inspector selection\nMode: {s}\n",
             .{selection.mode},
         );
@@ -3834,7 +4140,8 @@ pub const AppState = struct {
         try buffer.appendSlice(allocator, header);
 
         if (selection.rect) |rect| {
-            const region = try std.fmt.allocPrint(allocator,
+            const region = try std.fmt.allocPrint(
+                allocator,
                 "Region: {d:.0} x {d:.0} at ({d:.0}, {d:.0})\n",
                 .{ rect.width, rect.height, rect.x, rect.y },
             );
@@ -3846,7 +4153,8 @@ pub const AppState = struct {
             try appendInspectorElementSummary(&buffer, allocator, element, null);
         } else if (selection.elements) |elements| {
             const count = @min(elements.len, 6);
-            const selected_label = try std.fmt.allocPrint(allocator,
+            const selected_label = try std.fmt.allocPrint(
+                allocator,
                 "Selected elements ({d} shown):\n",
                 .{count},
             );
@@ -3856,7 +4164,8 @@ pub const AppState = struct {
                 try appendInspectorElementSummary(&buffer, allocator, element, index + 1);
             }
             if (elements.len > count) {
-                const more_label = try std.fmt.allocPrint(allocator,
+                const more_label = try std.fmt.allocPrint(
+                    allocator,
                     "... and {d} more element{s}\n",
                     .{ elements.len - count, if (elements.len - count == 1) "" else "s" },
                 );
@@ -3865,7 +4174,8 @@ pub const AppState = struct {
             }
         }
 
-        const prompt_label = try std.fmt.allocPrint(allocator,
+        const prompt_label = try std.fmt.allocPrint(
+            allocator,
             "Requested change:\n{s}",
             .{prompt},
         );
@@ -4102,10 +4412,434 @@ pub const AppState = struct {
         return self.currentProjectMutable().draftBuffer();
     }
 
+    pub fn syncPaletteComposerFromDraft(self: *AppState) void {
+        const draft = self.currentDraft();
+        if (std.mem.eql(u8, self.palette_composer.text(), draft)) return;
+        const callbacks = self.palette_composer.callbacks;
+        self.palette_composer.setCallbacks(.{});
+        defer self.palette_composer.setCallbacks(callbacks);
+        self.palette_composer.setText(self.allocator, draft) catch |err| {
+            log.warn("failed to sync palette composer draft: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn syncDraftFromPaletteComposer(self: *AppState) void {
+        const text = self.palette_composer.text();
+        if (std.mem.eql(u8, self.currentDraft(), text)) return;
+        self.setDraft(text);
+    }
+
+    pub fn setPaletteComposerBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
+        self.setComposerInputBounds(input_min, input_max);
+        self.palette_composer.setBounds(.{
+            .x = input_min[0],
+            .y = input_min[1],
+            .w = @max(input_max[0] - input_min[0], 0.0),
+            .h = @max(input_max[1] - input_min[1], 0.0),
+        });
+    }
+
+    pub fn syncPaletteComposerControls(self: *AppState) void {
+        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent });
+        self.palette_composer.setFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setToolbarFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
+        self.palette_composer.setIconFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
+        const thread = self.currentThread();
+        const model_options = composerModelOptions(self, thread.provider);
+        self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
+        self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
+        self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
+        self.palette_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
+        self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        self.palette_composer.access_enabled = thread.access_mode == .full_access;
+        self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
+        if (self.palette_composer.model_index) |index| {
+            if (index < model_options.len) {
+                self.palette_composer.setModelLabel(self.allocator, model_options[index].label) catch |err| {
+                    log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
+                };
+            }
+        }
+        if (self.palette_composer.reasoning_index) |index| {
+            if (index < CODEX_REASONING_OPTIONS.len) {
+                self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
+                    log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
+                };
+            }
+        }
+        self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
+            log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
+        };
+        self.palette_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
+            .full_access => "Full access",
+            .supervised => "Supervised",
+        }) catch |err| {
+            log.warn("failed to sync palette composer access label: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
+        self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
+        self.palette_model_cascade.setFontMetrics(paletteZguiFontMetrics(20.0));
+        self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
+        if (self.currentThread().committed and self.palette_model_cascade.isOpen()) {
+            _ = self.palette_model_cascade.handleInput(.close);
+        }
+    }
+
+    pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
+        const anchor = self.composer_toolbar_model_rect;
+        if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
+
+        const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
+        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
+        const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
+        const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const x = @max(min_x, @min(anchor.x, max_x - total_width));
+        self.palette_model_cascade.setAnchorRect(anchor);
+        self.palette_model_cascade.clearForbiddenRect();
+        self.palette_model_cascade.setViewportRect(.{
+            .x = min_x,
+            .y = 8.0,
+            .w = @max(max_x - min_x, total_width),
+            .h = @max(anchor.y - 16.0, root_height),
+        });
+        self.palette_model_cascade.setBounds(.{
+            .x = x,
+            .y = anchor.y,
+            .w = COMPOSER_MODEL_CASCADE_WIDTH,
+            .h = root_height,
+        });
+    }
+
+    pub fn openPaletteModelCascadeMenu(self: *AppState) void {
+        if (self.opencode_model_options.items.len == 0) {
+            self.refreshOpencodeModelOptionsCacheAsync();
+        }
+        self.syncPaletteModelCascadeMenu();
+        self.setPaletteModelCascadeBoundsFromToolbar();
+        _ = self.palette_model_cascade.handleInput(.open);
+
+        const thread = self.currentThread();
+        if (composerCascadeIndexForProvider(thread.provider)) |provider_index| {
+            self.palette_model_cascade.highlighted[0] = provider_index;
+            self.palette_model_cascade.highlighted[1] = null;
+            self.palette_model_cascade.scroll_y[1] = 0.0;
+            const model_count = composerModelOptions(self, thread.provider).len;
+            if (model_count > 0) {
+                self.palette_model_cascade.active_depth = 2;
+                if (self.composerModelIndex(thread.provider, thread.model_ref)) |model_index| {
+                    self.palette_model_cascade.highlighted[1] = model_index;
+                    const max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS;
+                    if (model_index >= max_visible_rows) {
+                        const first_visible = model_index - max_visible_rows + 1;
+                        self.palette_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (!self.palette_composer.focused) return false;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+            log.warn("palette composer text input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPaletteComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (self.routePaletteModelCascadeKey(palette_key)) return true;
+        if (!self.palette_composer.focused) return false;
+        if (self.handlePaletteComposerNavigationKey(palette_key)) {
+            self.noteInteraction();
+            return true;
+        }
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .key = palette_key }) catch |err| {
+            log.warn("palette composer key input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPaletteComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+        if (event.button != 1) return false;
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelCascadeMouseButton(point, event.down)) return true;
+        if (event.down and event.clicks >= 2 and self.palette_composer.textRect().contains(point)) {
+            return self.routePaletteComposerMultiClick(point, event.clicks);
+        }
+        if (event.down and self.routePaletteComposerToolbarOverlayClick(point)) return true;
+        const input: palette.ComposerPromptInput = if (event.down)
+            .{ .mouse_down = point }
+        else
+            .{ .mouse_up = point };
+        const was_focused = self.palette_composer.focused;
+        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+            log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.composer_focused = self.palette_composer.focused;
+        if (self.composer_focused) {
+            self.terminal_focused = false;
+            self.browser_pane_focused = false;
+        }
+        return handled or was_focused != self.palette_composer.focused;
+    }
+
+    fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
+        if (!self.composer_toolbar_overlay_valid) return false;
+        if (self.composer_toolbar_model_rect.contains(point) and !self.currentThread().committed) {
+            self.openPaletteModelCascadeMenu();
+            self.palette_composer.focused = false;
+            self.composer_focused = false;
+            self.noteInteraction();
+            return true;
+        }
+        const target = if (self.composer_toolbar_model_rect.contains(point))
+            self.palette_composer.modelRect()
+        else if (self.composer_toolbar_reasoning_rect.contains(point))
+            self.palette_composer.reasoningRect()
+        else if (self.composer_toolbar_fast_rect.contains(point))
+            self.palette_composer.fastRect()
+        else if (self.composer_toolbar_access_rect.contains(point))
+            self.palette_composer.accessRect()
+        else
+            return false;
+
+        const target_point: palette.draw.Vec2 = .{
+            .x = target.x + target.w * 0.5,
+            .y = target.y + target.h * 0.5,
+        };
+        const was_focused = self.palette_composer.focused;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = target_point }) catch |err| {
+            log.warn("palette composer toolbar overlay click failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.composer_focused = self.palette_composer.focused;
+        if (self.composer_focused) {
+            self.terminal_focused = false;
+            self.browser_pane_focused = false;
+        }
+        if (handled) self.noteInteraction();
+        return handled or was_focused != self.palette_composer.focused;
+    }
+
+    pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelCascadeMouseMove(point, event.state.left != 0)) return true;
+        const input: palette.ComposerPromptInput = if (event.state.left != 0)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point };
+        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+            log.warn("palette composer mouse motion failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPaletteComposer();
+            self.noteInteraction();
+        }
+        return handled;
+    }
+
+    pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.routePaletteModelCascadeWheel(paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
+        const handled = self.palette_composer.handleInput(self.allocator, .{
+            .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
+        }) catch |err| {
+            log.warn("palette composer wheel failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePaletteModelCascadeKey(self: *AppState, key: palette.Key) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(.{ .key = key });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePaletteModelCascadeMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(if (down)
+            .{ .mouse_down = .{ .point = point } }
+        else
+            .{ .mouse_up = point });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePaletteModelCascadeMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(if (dragging)
+            .{ .mouse_drag = point }
+        else
+            .{ .mouse_move = point });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn routePaletteModelCascadeWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
+        if (handled) self.noteInteraction();
+        return handled;
+    }
+
+    fn handlePaletteComposerNavigationKey(self: *AppState, key: palette.Key) bool {
+        if (key.primary and key.code == .a) {
+            self.palette_composer.selection_anchor = 0;
+            self.palette_composer.selection_focus = self.palette_composer.text().len;
+            self.palette_composer.cursor = self.palette_composer.text().len;
+            self.ensurePaletteComposerCursorVisible();
+            return true;
+        }
+
+        if (key.code != .up and key.code != .down) return false;
+        const text = self.palette_composer.text();
+        const metrics = paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const text_rect = self.palette_composer.textRect();
+        const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
+        const target_row = switch (key.code) {
+            .up => if (cell.row == 0) 0 else cell.row - 1,
+            .down => cell.row + 1,
+            else => unreachable,
+        };
+        const next = palette.TextLayout.offsetAtVisualCell(text, target_row, cell.x, metrics, text_rect.w, true);
+        self.movePaletteComposerCursor(next, key.shift);
+        return true;
+    }
+
+    fn routePaletteComposerMultiClick(self: *AppState, point: palette.draw.Vec2, clicks: u8) bool {
+        _ = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
+            log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        const text = self.palette_composer.text();
+        const offset = self.palette_composer.cursor;
+        const range = if (clicks >= 3) blk: {
+            const start = palette.input_selection.lineStart(text, offset);
+            var end = palette.input_selection.lineEnd(text, offset);
+            if (end < text.len) end += 1;
+            break :blk palette.input_selection.Range{ .start = start, .end = end };
+        } else palette.input_selection.wordRangeAt(text, offset);
+        self.palette_composer.selection_anchor = range.start;
+        self.palette_composer.selection_focus = range.end;
+        self.palette_composer.cursor = range.end;
+        self.palette_composer.dragging_selection = false;
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+        self.ensurePaletteComposerCursorVisible();
+        self.noteInteraction();
+        return true;
+    }
+
+    fn movePaletteComposerCursor(self: *AppState, next: usize, extend_selection: bool) void {
+        const old = self.palette_composer.cursor;
+        self.palette_composer.cursor = @min(next, self.palette_composer.text().len);
+        if (extend_selection) {
+            if (self.palette_composer.selection_anchor == null) self.palette_composer.selection_anchor = old;
+            self.palette_composer.selection_focus = self.palette_composer.cursor;
+        } else {
+            self.palette_composer.selection_anchor = null;
+            self.palette_composer.selection_focus = null;
+        }
+        self.ensurePaletteComposerCursorVisible();
+    }
+
+    fn ensurePaletteComposerCursorVisible(self: *AppState) void {
+        const text_rect = self.palette_composer.textRect();
+        const cursor = self.palette_composer.cursorRect();
+        const bottom = text_rect.y + text_rect.h;
+        if (cursor.y < text_rect.y) {
+            self.palette_composer.setScrollY(self.palette_composer.scrollY() - (text_rect.y - cursor.y));
+        } else if (cursor.y + cursor.h > bottom) {
+            self.palette_composer.setScrollY(self.palette_composer.scrollY() + cursor.y + cursor.h - bottom);
+        }
+    }
+
     pub fn setComposerInputBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
         self.composer_input_bounds_valid = true;
         self.composer_input_min = input_min;
         self.composer_input_max = input_max;
+    }
+
+    fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
+        const thread = self.currentThreadMutable();
+        if (thread.provider == provider) return;
+
+        thread.provider = provider;
+        if (thread.provider_thread_id) |thread_id| self.allocator.free(thread_id);
+        thread.provider_thread_id = null;
+        if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
+        thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
+        thread.reasoning_effort = null;
+        thread.fast_mode = .off;
+        self.markDirty();
+    }
+
+    fn setCurrentThreadModelRef(self: *AppState, value: ?[:0]const u8) void {
+        const thread = self.currentThreadMutable();
+        if (thread.model_ref) |existing| {
+            if (value) |next| {
+                if (std.mem.eql(u8, existing, next)) return;
+            }
+            self.allocator.free(existing);
+            thread.model_ref = null;
+        } else if (value == null) {
+            return;
+        }
+
+        thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
+        self.markDirty();
+    }
+
+    fn composerModelIndex(self: *const AppState, provider: Provider, model_ref: ?[:0]const u8) ?usize {
+        const active = model_ref orelse composerDefaultModelRef(self, provider);
+        const options = composerModelOptions(self, provider);
+        for (options, 0..) |option, index| {
+            if (option.value) |value| {
+                if (std.mem.eql(u8, active, value)) return index;
+            }
+        }
+        return if (options.len > 0) 0 else null;
+    }
+
+    fn composerReasoningIndex(value: ?ReasoningEffort) ?usize {
+        for (CODEX_REASONING_OPTIONS, 0..) |option, index| {
+            if (value == null and option.value == null) return index;
+            if (value != null and option.value != null and value.? == option.value.?) return index;
+        }
+        return null;
+    }
+
+    fn composerFastModeIndex(value: FastMode) ?usize {
+        for (CODEX_FAST_MODE_OPTIONS, 0..) |option, index| {
+            if (option.value == value) return index;
+        }
+        return null;
+    }
+
+    fn composerAccessModeIndex(value: AccessMode) ?usize {
+        for (CODEX_ACCESS_MODE_OPTIONS, 0..) |option, index| {
+            if (option.value == value) return index;
+        }
+        return null;
     }
 
     pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
@@ -4152,6 +4886,12 @@ pub const AppState = struct {
         self.composer_overlay_follow_cursor = true;
         self.composer_overlay_last_cursor_pos = 0;
         self.composer_overlay_last_draft_len = 0;
+        const callbacks = self.palette_composer.callbacks;
+        self.palette_composer.setCallbacks(.{});
+        defer self.palette_composer.setCallbacks(callbacks);
+        self.palette_composer.setText(self.allocator, self.currentDraft()) catch |err| {
+            log.warn("failed to reset palette composer draft: {s}", .{@errorName(err)});
+        };
     }
 
     pub fn updateFileSearch(self: *AppState) void {
@@ -4455,6 +5195,8 @@ pub const AppState = struct {
         self.pollSend();
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
+        self.palette_composer.deinit(self.allocator);
+        self.palette_overlay_batch.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
