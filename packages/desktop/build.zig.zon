@@ -18,8 +18,7 @@
             .path = "../zgui",
         },
         .zsdl = .{
-            .url = "git+https://github.com/JonathanRiche/zsdl#100f46b336a112497436144e14877118573e0adf",
-            .hash = "zsdl-0.4.0-dev-rFpjEzrkXwBaY3TYCYulrMLnBldTIm27f7oH1GYpoHLi",
+            .path = "../zsdl",
         },
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig#5ac4cabe95a6d7faa7baf0da8057a8e6e8a227a1",

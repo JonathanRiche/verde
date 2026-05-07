@@ -28,8 +28,7 @@
             .lazy = true,
         },
         .zsdl = .{
-            .url = "https://github.com/zig-gamedev/zsdl/archive/537de39b5719f39dcd612df2923607f3aedaf147.tar.gz",
-            .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
+            .path = "../zsdl",
             .lazy = true,
         },
         .freetype = .{
