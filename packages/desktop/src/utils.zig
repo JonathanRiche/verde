@@ -1515,9 +1515,13 @@ fn convertClipboardTiffToPng(
     }
 
     const png_bytes = png_bytes: {
-        const png_file = try std.fs.openFileAbsolute(output_path, .{});
-        defer png_file.close();
-        break :png_bytes try png_file.readToEndAlloc(allocator, CLIPBOARD_IMAGE_MAX_BYTES);
+        var png_file = try std.Io.Dir.openFileAbsolute(threaded.io(), output_path, .{ .mode = .read_only });
+        defer png_file.close(threaded.io());
+        const png_size = try png_file.stat(threaded.io());
+        if (png_size.size > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = png_file.reader(threaded.io(), &read_buffer);
+        break :png_bytes try reader.interface.readAlloc(allocator, @intCast(png_size.size));
     };
     std.Io.Dir.deleteFileAbsolute(threaded.io(), input_path) catch {};
     std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};

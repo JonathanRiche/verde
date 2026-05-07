@@ -95,7 +95,7 @@ const TaggedPageAllocator = struct {
         const slice = std.posix.mmap(
             null,
             overalloc_len,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
             tag.make(),
             0,
