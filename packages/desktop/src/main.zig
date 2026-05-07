@@ -15,7 +15,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
-const powder_gl_renderer = @import("ui/powder_gl_renderer.zig");
+const palette_gl_renderer = @import("ui/palette_gl_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
 
@@ -139,8 +139,8 @@ pub fn main(init: std.process.Init) !void {
     // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
     zgui.backend.init(window, gl_context);
     defer zgui.backend.deinit();
-    var powder_renderer = powder_gl_renderer.Renderer.init();
-    defer powder_renderer.deinit(allocator);
+    var palette_renderer = palette_gl_renderer.Renderer.init();
+    defer palette_renderer.deinit(allocator);
 
     var ui_scale = currentWindowDisplayScale(window);
     // Apply the global ImGui style after the display scale is known.
@@ -218,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
                 zgui.backend.newFrame(@intCast(framebuffer_width.*), @intCast(framebuffer_height.*));
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
-        state.powder_overlay_batch.clear();
+        state.palette_overlay_batch.clear();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
@@ -235,21 +235,21 @@ pub fn main(init: std.process.Init) !void {
         glClear(GL_COLOR_BUFFER_BIT);
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
-                powder_command_renderer: *powder_gl_renderer.Renderer,
+                palette_command_renderer: *palette_gl_renderer.Renderer,
                 app_state: *AppState,
                 allocator_arg: std.mem.Allocator,
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
             ) void {
                 zgui.backend.draw();
-                powder_command_renderer.renderBatch(
+                palette_command_renderer.renderBatch(
                     allocator_arg,
-                    &app_state.powder_overlay_batch,
+                    &app_state.palette_overlay_batch,
                     @floatFromInt(framebuffer_width),
                     @floatFromInt(framebuffer_height),
-                ) catch |err| log.warn("failed to render powder overlay batch: {s}", .{@errorName(err)});
+                ) catch |err| log.warn("failed to render palette overlay batch: {s}", .{@errorName(err)});
             }
-        }.run, .{ &powder_renderer, &state, allocator, fb_width, fb_height });
+        }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height });
         const swap_start = profiler.nowNs();
         try sdl.gl.swapWindow(window);
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
@@ -478,7 +478,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleComposerFocusShortcut(state, &event.key)) {
                 return true;
             }
-            if (state.routePowderComposerKeyDown(&event.key)) {
+            if (state.routePaletteComposerKeyDown(&event.key)) {
                 return true;
             }
             if (event.key.repeat) {
@@ -523,12 +523,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (terminal_text_handled) {
                 return true;
             }
-            if (state.routePowderComposerTextInput(text_input)) {
+            if (state.routePaletteComposerTextInput(text_input)) {
                 return true;
             }
         },
         .mouse_motion => {
-            if (state.routePowderComposerMouseMotion(&event.motion, ui_scale)) {
+            if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
                 return true;
             }
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
@@ -554,14 +554,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handled) {
                 return true;
             }
-            if (state.routePowderComposerMouseButton(&event.button, ui_scale)) {
+            if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
             syncWindowTextInput(window, state);
         },
         .mouse_wheel => {
-            if (state.routePowderComposerWheel(&event.wheel, ui_scale)) {
+            if (state.routePaletteComposerWheel(&event.wheel, ui_scale)) {
                 return true;
             }
             if (state.handleComposerWheel(&event.wheel)) {
@@ -581,7 +581,7 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused() and !state.powder_composer.focused) return;
+    if (!state.isBrowserPaneFocused() and !state.palette_composer.focused) return;
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {

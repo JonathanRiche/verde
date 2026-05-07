@@ -1,0 +1,12 @@
+.{
+    .name = .palette,
+    .version = "0.0.0",
+    .fingerprint = 0xc7e5a77e40fbe07c,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "examples",
+        "src",
+        "vendor",
+    },
+}

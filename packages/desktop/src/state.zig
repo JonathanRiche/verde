@@ -1,5 +1,5 @@
 const std = @import("std");
-const powder = @import("powder");
+const palette = @import("palette");
 const sdl = @import("zsdl3");
 const zgui = @import("zgui");
 const zgui_text_select = @import("zgui_text_select");
@@ -25,11 +25,11 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
-const POWDER_COMPOSER_FONT_SIZE: f32 = 32.0;
-const POWDER_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
-const POWDER_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
+const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
+const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
 
-pub const PowderComposerPrompt = powder.composerPrompt(.{
+pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
     .padding_y = 20.0,
     .toolbar_height = 48.0,
@@ -59,9 +59,9 @@ pub const PowderComposerPrompt = powder.composerPrompt(.{
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
     .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
-    .font_size = POWDER_COMPOSER_FONT_SIZE,
-    .toolbar_font_size = POWDER_COMPOSER_TOOLBAR_FONT_SIZE,
-    .icon_font_size = POWDER_COMPOSER_ICON_FONT_SIZE,
+    .font_size = PALETTE_COMPOSER_FONT_SIZE,
+    .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
+    .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
     .model_icon = " ",
     .fast_icon = "⚡",
@@ -77,7 +77,7 @@ const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
-pub const PowderModelCascadeMenu = powder.cascadeMenu(.{
+pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .width = COMPOSER_MODEL_CASCADE_WIDTH,
     .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
     .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
@@ -104,11 +104,11 @@ pub const PowderModelCascadeMenu = powder.cascadeMenu(.{
     .placement = .above,
     .submenu_placement = .right,
     .item_count = COMPOSER_PROVIDER_OPTIONS.len,
-    .item_label = powderModelCascadeLabel,
-    .child_count = powderModelCascadeChildCount,
+    .item_label = paletteModelCascadeLabel,
+    .child_count = paletteModelCascadeChildCount,
 });
 
-fn powderZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) powder.FontAdvance {
+fn paletteZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
     const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
     const end = @min(byte_offset + byte_len, text.len);
@@ -117,14 +117,14 @@ fn powderZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, f
     return .{ .byte_len = end - byte_offset, .width = width };
 }
 
-fn powderZguiFontMetrics(font_size: f32) powder.FontMetrics {
+fn paletteZguiFontMetrics(font_size: f32) palette.FontMetrics {
     const base_font_size = @max(zgui.getFontSize(), 1.0);
     const line_height = @max(zgui.getTextLineHeight() * (font_size / base_font_size), font_size);
     return .{
         .font_size = font_size,
         .line_height = line_height,
         .context = null,
-        .advance = powderZguiFontAdvance,
+        .advance = paletteZguiFontAdvance,
     };
 }
 
@@ -154,17 +154,17 @@ const Condition = struct {
     fn broadcast(_: *Condition) void {}
 };
 
-fn powderMousePoint(x: f32, y: f32, ui_scale: f32) powder.draw.Vec2 {
+fn paletteMousePoint(x: f32, y: f32, ui_scale: f32) palette.draw.Vec2 {
     _ = ui_scale;
     return .{ .x = x, .y = y };
 }
 
-fn powderComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?powder.Key {
+fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
     const mod_bits = keymodBits(event.mod);
     const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (mod_bits & sdl.Keymod.shift) != 0;
     const alt = (mod_bits & sdl.Keymod.alt) != 0;
-    const code: powder.Key.Code = switch (event.key) {
+    const code: palette.Key.Code = switch (event.key) {
         .left => .left,
         .right => .right,
         .up => .up,
@@ -194,7 +194,7 @@ fn appStateFromContext(context: ?*anyopaque) ?*AppState {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn powderModelLabel(context: ?*anyopaque, index: usize) []const u8 {
+fn paletteModelLabel(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     const thread = state.currentThread();
     const options = composerModelOptions(state, thread.provider);
@@ -202,7 +202,7 @@ fn powderModelLabel(context: ?*anyopaque, index: usize) []const u8 {
     return options[index].label;
 }
 
-fn powderReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
+fn paletteReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
     if (index >= CODEX_REASONING_OPTIONS.len) return "";
     return CODEX_REASONING_OPTIONS[index].label;
 }
@@ -218,7 +218,7 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
     };
 }
 
-fn powderComposerPromptEvent(context: ?*anyopaque, event: powder.ComposerPromptEvent) void {
+fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
     const state = appStateFromContext(context) orelse return;
     switch (event) {
         .text_changed => |text| state.setDraft(text),
@@ -289,7 +289,7 @@ fn composerCascadeIndexForProvider(provider: Provider) ?usize {
     return null;
 }
 
-fn powderModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usize) []const u8 {
+fn paletteModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
     if (path.len == 0) {
         const provider = providerForComposerCascadeIndex(index) orelse return "";
@@ -304,14 +304,14 @@ fn powderModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usi
     return "";
 }
 
-fn powderModelCascadeChildCount(context: ?*anyopaque, path: []const usize, index: usize) usize {
+fn paletteModelCascadeChildCount(context: ?*anyopaque, path: []const usize, index: usize) usize {
     const state = appStateFromContext(context) orelse return 0;
     if (path.len != 0) return 0;
     const provider = providerForComposerCascadeIndex(index) orelse return 0;
     return composerModelOptions(state, provider).len;
 }
 
-fn powderModelCascadeEvent(context: ?*anyopaque, event: powder.CascadeMenuEvent) void {
+fn paletteModelCascadeEvent(context: ?*anyopaque, event: palette.CascadeMenuEvent) void {
     const state = appStateFromContext(context) orelse return;
     switch (event) {
         .selected => |selection| {
@@ -321,7 +321,7 @@ fn powderModelCascadeEvent(context: ?*anyopaque, event: powder.CascadeMenuEvent)
             if (selection.index >= options.len) return;
             state.setCurrentThreadProvider(provider);
             state.setCurrentThreadModelRef(options[selection.index].value);
-            state.syncPowderComposerControls();
+            state.syncPaletteComposerControls();
         },
         .highlighted, .open_changed => {},
     }
@@ -1322,13 +1322,13 @@ pub const AppState = struct {
     composer_overlay_last_cursor_pos: usize,
     composer_overlay_last_draft_len: usize,
     composer_toolbar_overlay_valid: bool,
-    composer_toolbar_model_rect: powder.Rect,
-    composer_toolbar_reasoning_rect: powder.Rect,
-    composer_toolbar_fast_rect: powder.Rect,
-    composer_toolbar_access_rect: powder.Rect,
-    powder_composer: PowderComposerPrompt,
-    powder_model_cascade: PowderModelCascadeMenu,
-    powder_overlay_batch: powder.RenderBatch,
+    composer_toolbar_model_rect: palette.Rect,
+    composer_toolbar_reasoning_rect: palette.Rect,
+    composer_toolbar_fast_rect: palette.Rect,
+    composer_toolbar_access_rect: palette.Rect,
+    palette_composer: PaletteComposerPrompt,
+    palette_model_cascade: PaletteModelCascadeMenu,
+    palette_overlay_batch: palette.RenderBatch,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1434,9 +1434,9 @@ pub const AppState = struct {
             .composer_toolbar_reasoning_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
-            .powder_composer = PowderComposerPrompt.init(),
-            .powder_model_cascade = PowderModelCascadeMenu.initFromConfig(),
-            .powder_overlay_batch = .{},
+            .palette_composer = PaletteComposerPrompt.init(),
+            .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
+            .palette_overlay_batch = .{},
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1505,7 +1505,7 @@ pub const AppState = struct {
             .last_interaction_at_ms = 0,
             .pending_send_count = 0,
         };
-        state.powder_composer.setCallbacks(.{});
+        state.palette_composer.setCallbacks(.{});
 
         if (try storage.load(allocator)) |persisted_value| {
             var persisted = persisted_value;
@@ -4412,26 +4412,26 @@ pub const AppState = struct {
         return self.currentProjectMutable().draftBuffer();
     }
 
-    pub fn syncPowderComposerFromDraft(self: *AppState) void {
+    pub fn syncPaletteComposerFromDraft(self: *AppState) void {
         const draft = self.currentDraft();
-        if (std.mem.eql(u8, self.powder_composer.text(), draft)) return;
-        const callbacks = self.powder_composer.callbacks;
-        self.powder_composer.setCallbacks(.{});
-        defer self.powder_composer.setCallbacks(callbacks);
-        self.powder_composer.setText(self.allocator, draft) catch |err| {
-            log.warn("failed to sync powder composer draft: {s}", .{@errorName(err)});
+        if (std.mem.eql(u8, self.palette_composer.text(), draft)) return;
+        const callbacks = self.palette_composer.callbacks;
+        self.palette_composer.setCallbacks(.{});
+        defer self.palette_composer.setCallbacks(callbacks);
+        self.palette_composer.setText(self.allocator, draft) catch |err| {
+            log.warn("failed to sync palette composer draft: {s}", .{@errorName(err)});
         };
     }
 
-    pub fn syncDraftFromPowderComposer(self: *AppState) void {
-        const text = self.powder_composer.text();
+    pub fn syncDraftFromPaletteComposer(self: *AppState) void {
+        const text = self.palette_composer.text();
         if (std.mem.eql(u8, self.currentDraft(), text)) return;
         self.setDraft(text);
     }
 
-    pub fn setPowderComposerBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
+    pub fn setPaletteComposerBounds(self: *AppState, input_min: [2]f32, input_max: [2]f32) void {
         self.setComposerInputBounds(input_min, input_max);
-        self.powder_composer.setBounds(.{
+        self.palette_composer.setBounds(.{
             .x = input_min[0],
             .y = input_min[1],
             .w = @max(input_max[0] - input_min[0], 0.0),
@@ -4439,55 +4439,55 @@ pub const AppState = struct {
         });
     }
 
-    pub fn syncPowderComposerControls(self: *AppState) void {
-        self.powder_composer.setCallbacks(.{ .context = self, .on_event = powderComposerPromptEvent });
-        self.powder_composer.setFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_FONT_SIZE));
-        self.powder_composer.setToolbarFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_TOOLBAR_FONT_SIZE));
-        self.powder_composer.setIconFontMetrics(powderZguiFontMetrics(POWDER_COMPOSER_ICON_FONT_SIZE));
+    pub fn syncPaletteComposerControls(self: *AppState) void {
+        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent });
+        self.palette_composer.setFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setToolbarFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
+        self.palette_composer.setIconFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
         const model_options = composerModelOptions(self, thread.provider);
-        self.powder_composer.setModelOptions(self, model_options.len, powderModelLabel);
-        self.powder_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, powderReasoningLabel);
-        self.powder_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
-        self.powder_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
-        self.powder_composer.fast_enabled = thread.fast_mode == .on;
-        self.powder_composer.access_enabled = thread.access_mode == .full_access;
-        self.powder_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
-        if (self.powder_composer.model_index) |index| {
+        self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
+        self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
+        self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
+        self.palette_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
+        self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        self.palette_composer.access_enabled = thread.access_mode == .full_access;
+        self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
+        if (self.palette_composer.model_index) |index| {
             if (index < model_options.len) {
-                self.powder_composer.setModelLabel(self.allocator, model_options[index].label) catch |err| {
-                    log.warn("failed to sync powder composer model label: {s}", .{@errorName(err)});
+                self.palette_composer.setModelLabel(self.allocator, model_options[index].label) catch |err| {
+                    log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
                 };
             }
         }
-        if (self.powder_composer.reasoning_index) |index| {
+        if (self.palette_composer.reasoning_index) |index| {
             if (index < CODEX_REASONING_OPTIONS.len) {
-                self.powder_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
-                    log.warn("failed to sync powder composer reasoning label: {s}", .{@errorName(err)});
+                self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
+                    log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
                 };
             }
         }
-        self.powder_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
-            log.warn("failed to sync powder composer fast label: {s}", .{@errorName(err)});
+        self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
+            log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
         };
-        self.powder_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
+        self.palette_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
             .full_access => "Full access",
             .supervised => "Supervised",
         }) catch |err| {
-            log.warn("failed to sync powder composer access label: {s}", .{@errorName(err)});
+            log.warn("failed to sync palette composer access label: {s}", .{@errorName(err)});
         };
     }
 
-    pub fn syncPowderModelCascadeMenu(self: *AppState) void {
-        self.powder_model_cascade.setCallbacks(.{ .context = self, .on_event = powderModelCascadeEvent });
-        self.powder_model_cascade.setFontMetrics(powderZguiFontMetrics(20.0));
-        self.powder_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
-        if (self.currentThread().committed and self.powder_model_cascade.isOpen()) {
-            _ = self.powder_model_cascade.handleInput(.close);
+    pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
+        self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
+        self.palette_model_cascade.setFontMetrics(paletteZguiFontMetrics(20.0));
+        self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
+        if (self.currentThread().committed and self.palette_model_cascade.isOpen()) {
+            _ = self.palette_model_cascade.handleInput(.close);
         }
     }
 
-    pub fn setPowderModelCascadeBoundsFromToolbar(self: *AppState) void {
+    pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
 
@@ -4497,15 +4497,15 @@ pub const AppState = struct {
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        self.powder_model_cascade.setAnchorRect(anchor);
-        self.powder_model_cascade.clearForbiddenRect();
-        self.powder_model_cascade.setViewportRect(.{
+        self.palette_model_cascade.setAnchorRect(anchor);
+        self.palette_model_cascade.clearForbiddenRect();
+        self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
             .y = 8.0,
             .w = @max(max_x - min_x, total_width),
             .h = @max(anchor.y - 16.0, root_height),
         });
-        self.powder_model_cascade.setBounds(.{
+        self.palette_model_cascade.setBounds(.{
             .x = x,
             .y = anchor.y,
             .w = COMPOSER_MODEL_CASCADE_WIDTH,
@@ -4513,169 +4513,169 @@ pub const AppState = struct {
         });
     }
 
-    pub fn openPowderModelCascadeMenu(self: *AppState) void {
+    pub fn openPaletteModelCascadeMenu(self: *AppState) void {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
-        self.syncPowderModelCascadeMenu();
-        self.setPowderModelCascadeBoundsFromToolbar();
-        _ = self.powder_model_cascade.handleInput(.open);
+        self.syncPaletteModelCascadeMenu();
+        self.setPaletteModelCascadeBoundsFromToolbar();
+        _ = self.palette_model_cascade.handleInput(.open);
 
         const thread = self.currentThread();
         if (composerCascadeIndexForProvider(thread.provider)) |provider_index| {
-            self.powder_model_cascade.highlighted[0] = provider_index;
-            self.powder_model_cascade.highlighted[1] = null;
-            self.powder_model_cascade.scroll_y[1] = 0.0;
+            self.palette_model_cascade.highlighted[0] = provider_index;
+            self.palette_model_cascade.highlighted[1] = null;
+            self.palette_model_cascade.scroll_y[1] = 0.0;
             const model_count = composerModelOptions(self, thread.provider).len;
             if (model_count > 0) {
-                self.powder_model_cascade.active_depth = 2;
+                self.palette_model_cascade.active_depth = 2;
                 if (self.composerModelIndex(thread.provider, thread.model_ref)) |model_index| {
-                    self.powder_model_cascade.highlighted[1] = model_index;
+                    self.palette_model_cascade.highlighted[1] = model_index;
                     const max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS;
                     if (model_index >= max_visible_rows) {
                         const first_visible = model_index - max_visible_rows + 1;
-                        self.powder_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
+                        self.palette_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
                     }
                 }
             }
         }
     }
 
-    pub fn routePowderComposerTextInput(self: *AppState, text: []const u8) bool {
-        if (!self.powder_composer.focused) return false;
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
-            log.warn("powder composer text input failed: {s}", .{@errorName(err)});
+    pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (!self.palette_composer.focused) return false;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+            log.warn("palette composer text input failed: {s}", .{@errorName(err)});
             return false;
         };
         if (handled) {
-            self.syncDraftFromPowderComposer();
+            self.syncDraftFromPaletteComposer();
             self.noteInteraction();
         }
         return handled;
     }
 
-    pub fn routePowderComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
-        const powder_key = powderComposerKeyFromSdl(event) orelse return false;
-        if (self.routePowderModelCascadeKey(powder_key)) return true;
-        if (!self.powder_composer.focused) return false;
-        if (self.handlePowderComposerNavigationKey(powder_key)) {
+    pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (self.routePaletteModelCascadeKey(palette_key)) return true;
+        if (!self.palette_composer.focused) return false;
+        if (self.handlePaletteComposerNavigationKey(palette_key)) {
             self.noteInteraction();
             return true;
         }
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .key = powder_key }) catch |err| {
-            log.warn("powder composer key input failed: {s}", .{@errorName(err)});
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .key = palette_key }) catch |err| {
+            log.warn("palette composer key input failed: {s}", .{@errorName(err)});
             return false;
         };
         if (handled) {
-            self.syncDraftFromPowderComposer();
+            self.syncDraftFromPaletteComposer();
             self.noteInteraction();
         }
         return handled;
     }
 
-    pub fn routePowderComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+    pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
         if (event.button != 1) return false;
-        const point = powderMousePoint(event.x, event.y, ui_scale);
-        if (self.routePowderModelCascadeMouseButton(point, event.down)) return true;
-        if (event.down and event.clicks >= 2 and self.powder_composer.textRect().contains(point)) {
-            return self.routePowderComposerMultiClick(point, event.clicks);
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelCascadeMouseButton(point, event.down)) return true;
+        if (event.down and event.clicks >= 2 and self.palette_composer.textRect().contains(point)) {
+            return self.routePaletteComposerMultiClick(point, event.clicks);
         }
-        if (event.down and self.routePowderComposerToolbarOverlayClick(point)) return true;
-        const input: powder.ComposerPromptInput = if (event.down)
+        if (event.down and self.routePaletteComposerToolbarOverlayClick(point)) return true;
+        const input: palette.ComposerPromptInput = if (event.down)
             .{ .mouse_down = point }
         else
             .{ .mouse_up = point };
-        const was_focused = self.powder_composer.focused;
-        const handled = self.powder_composer.handleInput(self.allocator, input) catch |err| {
-            log.warn("powder composer mouse input failed: {s}", .{@errorName(err)});
+        const was_focused = self.palette_composer.focused;
+        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+            log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
             return false;
         };
-        self.composer_focused = self.powder_composer.focused;
+        self.composer_focused = self.palette_composer.focused;
         if (self.composer_focused) {
             self.terminal_focused = false;
             self.browser_pane_focused = false;
         }
-        return handled or was_focused != self.powder_composer.focused;
+        return handled or was_focused != self.palette_composer.focused;
     }
 
-    fn routePowderComposerToolbarOverlayClick(self: *AppState, point: powder.draw.Vec2) bool {
+    fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
         if (self.composer_toolbar_model_rect.contains(point) and !self.currentThread().committed) {
-            self.openPowderModelCascadeMenu();
-            self.powder_composer.focused = false;
+            self.openPaletteModelCascadeMenu();
+            self.palette_composer.focused = false;
             self.composer_focused = false;
             self.noteInteraction();
             return true;
         }
         const target = if (self.composer_toolbar_model_rect.contains(point))
-            self.powder_composer.modelRect()
+            self.palette_composer.modelRect()
         else if (self.composer_toolbar_reasoning_rect.contains(point))
-            self.powder_composer.reasoningRect()
+            self.palette_composer.reasoningRect()
         else if (self.composer_toolbar_fast_rect.contains(point))
-            self.powder_composer.fastRect()
+            self.palette_composer.fastRect()
         else if (self.composer_toolbar_access_rect.contains(point))
-            self.powder_composer.accessRect()
+            self.palette_composer.accessRect()
         else
             return false;
 
-        const target_point: powder.draw.Vec2 = .{
+        const target_point: palette.draw.Vec2 = .{
             .x = target.x + target.w * 0.5,
             .y = target.y + target.h * 0.5,
         };
-        const was_focused = self.powder_composer.focused;
-        const handled = self.powder_composer.handleInput(self.allocator, .{ .mouse_down = target_point }) catch |err| {
-            log.warn("powder composer toolbar overlay click failed: {s}", .{@errorName(err)});
+        const was_focused = self.palette_composer.focused;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = target_point }) catch |err| {
+            log.warn("palette composer toolbar overlay click failed: {s}", .{@errorName(err)});
             return false;
         };
-        self.composer_focused = self.powder_composer.focused;
+        self.composer_focused = self.palette_composer.focused;
         if (self.composer_focused) {
             self.terminal_focused = false;
             self.browser_pane_focused = false;
         }
         if (handled) self.noteInteraction();
-        return handled or was_focused != self.powder_composer.focused;
+        return handled or was_focused != self.palette_composer.focused;
     }
 
-    pub fn routePowderComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
-        const point = powderMousePoint(event.x, event.y, ui_scale);
-        if (self.routePowderModelCascadeMouseMove(point, event.state.left != 0)) return true;
-        const input: powder.ComposerPromptInput = if (event.state.left != 0)
+    pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelCascadeMouseMove(point, event.state.left != 0)) return true;
+        const input: palette.ComposerPromptInput = if (event.state.left != 0)
             .{ .mouse_drag = point }
         else
             .{ .mouse_move = point };
-        const handled = self.powder_composer.handleInput(self.allocator, input) catch |err| {
-            log.warn("powder composer mouse motion failed: {s}", .{@errorName(err)});
+        const handled = self.palette_composer.handleInput(self.allocator, input) catch |err| {
+            log.warn("palette composer mouse motion failed: {s}", .{@errorName(err)});
             return false;
         };
         if (handled) {
-            self.syncDraftFromPowderComposer();
+            self.syncDraftFromPaletteComposer();
             self.noteInteraction();
         }
         return handled;
     }
 
-    pub fn routePowderComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
-        if (self.routePowderModelCascadeWheel(powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
-        const handled = self.powder_composer.handleInput(self.allocator, .{
-            .mouse_wheel = .{ .point = powderMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
+    pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.routePaletteModelCascadeWheel(paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
+        const handled = self.palette_composer.handleInput(self.allocator, .{
+            .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
-            log.warn("powder composer wheel failed: {s}", .{@errorName(err)});
+            log.warn("palette composer wheel failed: {s}", .{@errorName(err)});
             return false;
         };
         if (handled) self.noteInteraction();
         return handled;
     }
 
-    fn routePowderModelCascadeKey(self: *AppState, key: powder.Key) bool {
-        if (!self.powder_model_cascade.isOpen()) return false;
-        const handled = self.powder_model_cascade.handleInput(.{ .key = key });
+    fn routePaletteModelCascadeKey(self: *AppState, key: palette.Key) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(.{ .key = key });
         if (handled) self.noteInteraction();
         return handled;
     }
 
-    fn routePowderModelCascadeMouseButton(self: *AppState, point: powder.draw.Vec2, down: bool) bool {
-        if (!self.powder_model_cascade.isOpen()) return false;
-        const handled = self.powder_model_cascade.handleInput(if (down)
+    fn routePaletteModelCascadeMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(if (down)
             .{ .mouse_down = .{ .point = point } }
         else
             .{ .mouse_up = point });
@@ -4683,9 +4683,9 @@ pub const AppState = struct {
         return handled;
     }
 
-    fn routePowderModelCascadeMouseMove(self: *AppState, point: powder.draw.Vec2, dragging: bool) bool {
-        if (!self.powder_model_cascade.isOpen()) return false;
-        const handled = self.powder_model_cascade.handleInput(if (dragging)
+    fn routePaletteModelCascadeMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(if (dragging)
             .{ .mouse_drag = point }
         else
             .{ .mouse_move = point });
@@ -4693,83 +4693,83 @@ pub const AppState = struct {
         return handled;
     }
 
-    fn routePowderModelCascadeWheel(self: *AppState, point: powder.draw.Vec2, y: f32) bool {
-        if (!self.powder_model_cascade.isOpen()) return false;
-        const handled = self.powder_model_cascade.handleInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
+    fn routePaletteModelCascadeWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
+        if (!self.palette_model_cascade.isOpen()) return false;
+        const handled = self.palette_model_cascade.handleInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
         if (handled) self.noteInteraction();
         return handled;
     }
 
-    fn handlePowderComposerNavigationKey(self: *AppState, key: powder.Key) bool {
+    fn handlePaletteComposerNavigationKey(self: *AppState, key: palette.Key) bool {
         if (key.primary and key.code == .a) {
-            self.powder_composer.selection_anchor = 0;
-            self.powder_composer.selection_focus = self.powder_composer.text().len;
-            self.powder_composer.cursor = self.powder_composer.text().len;
-            self.ensurePowderComposerCursorVisible();
+            self.palette_composer.selection_anchor = 0;
+            self.palette_composer.selection_focus = self.palette_composer.text().len;
+            self.palette_composer.cursor = self.palette_composer.text().len;
+            self.ensurePaletteComposerCursorVisible();
             return true;
         }
 
         if (key.code != .up and key.code != .down) return false;
-        const text = self.powder_composer.text();
-        const metrics = powderZguiFontMetrics(POWDER_COMPOSER_FONT_SIZE);
-        const text_rect = self.powder_composer.textRect();
-        const cell = powder.TextLayout.visualCellForOffset(text, self.powder_composer.cursor, metrics, text_rect.w, true);
+        const text = self.palette_composer.text();
+        const metrics = paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const text_rect = self.palette_composer.textRect();
+        const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
             .up => if (cell.row == 0) 0 else cell.row - 1,
             .down => cell.row + 1,
             else => unreachable,
         };
-        const next = powder.TextLayout.offsetAtVisualCell(text, target_row, cell.x, metrics, text_rect.w, true);
-        self.movePowderComposerCursor(next, key.shift);
+        const next = palette.TextLayout.offsetAtVisualCell(text, target_row, cell.x, metrics, text_rect.w, true);
+        self.movePaletteComposerCursor(next, key.shift);
         return true;
     }
 
-    fn routePowderComposerMultiClick(self: *AppState, point: powder.draw.Vec2, clicks: u8) bool {
-        _ = self.powder_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
-            log.warn("powder composer mouse input failed: {s}", .{@errorName(err)});
+    fn routePaletteComposerMultiClick(self: *AppState, point: palette.draw.Vec2, clicks: u8) bool {
+        _ = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = point }) catch |err| {
+            log.warn("palette composer mouse input failed: {s}", .{@errorName(err)});
             return false;
         };
-        const text = self.powder_composer.text();
-        const offset = self.powder_composer.cursor;
+        const text = self.palette_composer.text();
+        const offset = self.palette_composer.cursor;
         const range = if (clicks >= 3) blk: {
-            const start = powder.input_selection.lineStart(text, offset);
-            var end = powder.input_selection.lineEnd(text, offset);
+            const start = palette.input_selection.lineStart(text, offset);
+            var end = palette.input_selection.lineEnd(text, offset);
             if (end < text.len) end += 1;
-            break :blk powder.input_selection.Range{ .start = start, .end = end };
-        } else powder.input_selection.wordRangeAt(text, offset);
-        self.powder_composer.selection_anchor = range.start;
-        self.powder_composer.selection_focus = range.end;
-        self.powder_composer.cursor = range.end;
-        self.powder_composer.dragging_selection = false;
+            break :blk palette.input_selection.Range{ .start = start, .end = end };
+        } else palette.input_selection.wordRangeAt(text, offset);
+        self.palette_composer.selection_anchor = range.start;
+        self.palette_composer.selection_focus = range.end;
+        self.palette_composer.cursor = range.end;
+        self.palette_composer.dragging_selection = false;
         self.composer_focused = true;
         self.terminal_focused = false;
         self.browser_pane_focused = false;
-        self.ensurePowderComposerCursorVisible();
+        self.ensurePaletteComposerCursorVisible();
         self.noteInteraction();
         return true;
     }
 
-    fn movePowderComposerCursor(self: *AppState, next: usize, extend_selection: bool) void {
-        const old = self.powder_composer.cursor;
-        self.powder_composer.cursor = @min(next, self.powder_composer.text().len);
+    fn movePaletteComposerCursor(self: *AppState, next: usize, extend_selection: bool) void {
+        const old = self.palette_composer.cursor;
+        self.palette_composer.cursor = @min(next, self.palette_composer.text().len);
         if (extend_selection) {
-            if (self.powder_composer.selection_anchor == null) self.powder_composer.selection_anchor = old;
-            self.powder_composer.selection_focus = self.powder_composer.cursor;
+            if (self.palette_composer.selection_anchor == null) self.palette_composer.selection_anchor = old;
+            self.palette_composer.selection_focus = self.palette_composer.cursor;
         } else {
-            self.powder_composer.selection_anchor = null;
-            self.powder_composer.selection_focus = null;
+            self.palette_composer.selection_anchor = null;
+            self.palette_composer.selection_focus = null;
         }
-        self.ensurePowderComposerCursorVisible();
+        self.ensurePaletteComposerCursorVisible();
     }
 
-    fn ensurePowderComposerCursorVisible(self: *AppState) void {
-        const text_rect = self.powder_composer.textRect();
-        const cursor = self.powder_composer.cursorRect();
+    fn ensurePaletteComposerCursorVisible(self: *AppState) void {
+        const text_rect = self.palette_composer.textRect();
+        const cursor = self.palette_composer.cursorRect();
         const bottom = text_rect.y + text_rect.h;
         if (cursor.y < text_rect.y) {
-            self.powder_composer.setScrollY(self.powder_composer.scrollY() - (text_rect.y - cursor.y));
+            self.palette_composer.setScrollY(self.palette_composer.scrollY() - (text_rect.y - cursor.y));
         } else if (cursor.y + cursor.h > bottom) {
-            self.powder_composer.setScrollY(self.powder_composer.scrollY() + cursor.y + cursor.h - bottom);
+            self.palette_composer.setScrollY(self.palette_composer.scrollY() + cursor.y + cursor.h - bottom);
         }
     }
 
@@ -4886,11 +4886,11 @@ pub const AppState = struct {
         self.composer_overlay_follow_cursor = true;
         self.composer_overlay_last_cursor_pos = 0;
         self.composer_overlay_last_draft_len = 0;
-        const callbacks = self.powder_composer.callbacks;
-        self.powder_composer.setCallbacks(.{});
-        defer self.powder_composer.setCallbacks(callbacks);
-        self.powder_composer.setText(self.allocator, self.currentDraft()) catch |err| {
-            log.warn("failed to reset powder composer draft: {s}", .{@errorName(err)});
+        const callbacks = self.palette_composer.callbacks;
+        self.palette_composer.setCallbacks(.{});
+        defer self.palette_composer.setCallbacks(callbacks);
+        self.palette_composer.setText(self.allocator, self.currentDraft()) catch |err| {
+            log.warn("failed to reset palette composer draft: {s}", .{@errorName(err)});
         };
     }
 
@@ -5195,8 +5195,8 @@ pub const AppState = struct {
         self.pollSend();
         self.flushDirtyNow();
         self.file_search_state.deinit(self.allocator);
-        self.powder_composer.deinit(self.allocator);
-        self.powder_overlay_batch.deinit(self.allocator);
+        self.palette_composer.deinit(self.allocator);
+        self.palette_overlay_batch.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
