@@ -53,9 +53,9 @@ pub fn addPaths(
             // Detect our SDK using the "findNative" Zig stdlib function.
             // This is really important because it forces using `xcrun` to
             // find the SDK path.
-            const libc = std.zig.LibCInstallation.findNative(.{
-                .allocator = b.allocator,
+            const libc = std.zig.LibCInstallation.findNative(b.allocator, b.graph.io, .{
                 .target = &step.rootModuleTarget(),
+                .environ_map = &b.graph.environ_map,
                 .verbose = false,
             }) catch break :darwin;
 
