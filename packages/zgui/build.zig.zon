@@ -1,0 +1,45 @@
+.{
+    .name = .zgui,
+    .fingerprint = 0xe78160e64acbef8,
+    .version = "0.6.0-dev",
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "libs",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+    .dependencies = .{
+        .system_sdk = .{
+            .url = "https://github.com/zig-gamedev/system_sdk/archive/777e76828f05d5d223df47a4c0de95ae4efde884.tar.gz",
+            .hash = "system_sdk-0.3.0-dev-alwUNqAaaALJ5VoZImZo3n6prezBnQnrpziun3ZeZwcp",
+            .lazy = true,
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
+            .lazy = true,
+        },
+        .zgpu = .{
+            .url = "https://github.com/zig-gamedev/zgpu/archive/c512b60c1f0cd438dcc6297083d0e3d91ad5e717.tar.gz",
+            .hash = "zgpu-0.12.0-dev-nqFT5OOmCABcwCeEje63Wohd7SqQ73CbPqZzmuqArpgF",
+            .lazy = true,
+        },
+        .zsdl = .{
+            .url = "https://github.com/zig-gamedev/zsdl/archive/537de39b5719f39dcd612df2923607f3aedaf147.tar.gz",
+            .hash = "zsdl-0.4.0-dev-rFpjEzgIXwBdDmlda0YnQPRVApMc1YEgbyzLWuT9GupM",
+            .lazy = true,
+        },
+        .freetype = .{
+            .url = "https://github.com/loftafi/freetype/archive/3c32c471fd01a4940c0674c064ffe396b16f3b54.tar.gz",
+            .hash = "freetype-0.0.2-PphdeW1JcwDJPUwi8dE737-jVnUMUPGMC3wNK_gVdpjS",
+            .lazy = true,
+        },
+        .zopengl = .{
+            .url = "https://github.com/zig-gamedev/zopengl/archive/db9d615c742086b39954eef064f957e92dafc7e2.tar.gz",
+            .hash = "zopengl-0.6.0-dev-5-tnz36mDgBuU9pDfag6_B-qCWOJQc5GXiXuZ6z41zQM",
+        },
+    },
+}

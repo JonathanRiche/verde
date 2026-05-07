@@ -21,8 +21,6 @@ jobs:
       matrix:
         target:
           - linux-x86_64
-          - macos-x86_64
-          - macos-arm64
 
     runs-on: ${{ matrix.target == 'linux-x86_64' && 'ubuntu-24.04' || matrix.target == 'macos-x86_64' && 'macos-15-intel' || 'macos-14' }}
     env:
@@ -36,9 +34,6 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            .cache/zig-global
-            .zig-cache
-            packages/desktop/.zig-cache
             ~/.cargo/registry
             ~/.cargo/git
             vendor/fff/target

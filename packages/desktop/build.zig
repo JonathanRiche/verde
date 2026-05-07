@@ -38,11 +38,12 @@ pub fn build(b: *std.Build) void {
         .use_wchar32 = true,
     });
     const zsdl = b.dependency("zsdl", .{});
-    const ghostty = b.lazyDependency("ghostty", .{
+    const ghostty = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
         .@"app-runtime" = .none,
         .@"emit-lib-vt" = true,
+        .@"emit-xcframework" = false,
     });
     const zqlite = b.dependency("zqlite", .{
         .target = target,
@@ -99,7 +100,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
-                .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "zgui_text_select", .module = zgui_text_select.module("zgui_text_select") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
@@ -312,7 +313,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
-                .{ .name = "ghostty-vt", .module = ghostty.?.module("ghostty-vt") },
+                .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
