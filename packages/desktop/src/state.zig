@@ -136,37 +136,6 @@ const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
-pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
-    .width = COMPOSER_MODEL_CASCADE_WIDTH,
-    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
-    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
-    .max_depth = 2,
-    .padding_x = 12.0,
-    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = 6.0,
-    .glyph_width = 10.8,
-    .font_size = 20.0,
-    .chevron_icon = ">",
-    .icon_gap = 10.0,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
-    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
-    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
-    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
-    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
-    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
-    .scrollbar_width = 5.0,
-    .corner_radius = 10.0,
-    .border_width = 1.0,
-    .z_index = 200,
-    .submenu_z_offset = 10,
-    .placement = .above,
-    .submenu_placement = .right,
-    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
-    .item_label = paletteModelCascadeLabel,
-    .child_count = paletteModelCascadeChildCount,
-});
-
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
     if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
@@ -387,6 +356,70 @@ fn paletteModelCascadeChildCount(context: ?*anyopaque, path: []const usize, inde
     const provider = providerForComposerCascadeIndex(index) orelse return 0;
     return composerModelOptions(state, provider).len;
 }
+
+fn paletteModelCascadeRenderRowLeading(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    depth: usize,
+    path: []const usize,
+    index: usize,
+    clip: palette.draw.Rect,
+    leading_rect: palette.draw.Rect,
+) void {
+    _ = path;
+    if (depth != 0) return;
+    const state = appStateFromContext(context) orelse return;
+    const provider = providerForComposerCascadeIndex(index) orelse return;
+    const tex = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    } orelse return;
+    if (!tex.valid or tex.texture_id == 0) return;
+    const sz = @min(leading_rect.w, leading_rect.h) * 0.68;
+    const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
+    const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
+    const r: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
+        .x = 0.0,
+        .y = 0.0,
+        .w = 1.0,
+        .h = 1.0,
+    }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+}
+
+pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
+    .width = COMPOSER_MODEL_CASCADE_WIDTH,
+    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
+    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
+    .max_depth = 2,
+    .padding_x = 12.0,
+    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
+    .submenu_gap = 6.0,
+    .glyph_width = 10.8,
+    .font_size = 20.0,
+    .chevron_icon = ">",
+    .icon_gap = 10.0,
+    .row_leading_width = 30.0,
+    .render_row_leading = paletteModelCascadeRenderRowLeading,
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
+    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
+    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
+    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
+    .scrollbar_width = 5.0,
+    .corner_radius = 10.0,
+    .border_width = 1.0,
+    .z_index = 200,
+    .submenu_z_offset = 10,
+    .placement = .above,
+    .submenu_placement = .right,
+    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
+    .item_label = paletteModelCascadeLabel,
+    .child_count = paletteModelCascadeChildCount,
+});
 
 fn paletteModelCascadeEvent(context: ?*anyopaque, event: palette.CascadeMenuEvent) void {
     const state = appStateFromContext(context) orelse return;
@@ -4525,6 +4558,21 @@ pub const AppState = struct {
         });
     }
 
+    /// Cleared at the start of each workspace paint; see `syncComposerToolbarOverlayHitRects`.
+    pub fn invalidateComposerToolbarOverlayHitRects(self: *AppState) void {
+        self.composer_toolbar_overlay_valid = false;
+    }
+
+    /// Hit targets for `routePaletteComposerToolbarOverlayClick` (cascade on new threads, synthetic
+    /// toolbar clicks when the overlay batch sits above the composer's own hit testing).
+    pub fn syncComposerToolbarOverlayHitRects(self: *AppState) void {
+        self.composer_toolbar_model_rect = self.palette_composer.modelRect();
+        self.composer_toolbar_reasoning_rect = self.palette_composer.reasoningRect();
+        self.composer_toolbar_fast_rect = self.palette_composer.fastRect();
+        self.composer_toolbar_access_rect = self.palette_composer.accessRect();
+        self.composer_toolbar_overlay_valid = true;
+    }
+
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
         self.palette_composer.setFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
@@ -4550,7 +4598,7 @@ pub const AppState = struct {
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
             if (index < model_options.len) {
-                self.palette_composer.setModelLabel(self.allocator, model_options[index].label) catch |err| {
+                self.palette_composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
                     log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
                 };
             }
