@@ -7,6 +7,7 @@ const app_state = @import("../state.zig");
 const browser_panel = @import("browser.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
+const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 
 const TOP_BAR_HEIGHT: f32 = 82.0;
@@ -270,7 +271,69 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.palette_composer.render(state.allocator, &state.palette_overlay_batch) catch |err| {
         app_state.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
     };
+    renderComposerDraftImage(state);
     renderComposerToolbarIcons(state);
+}
+
+fn renderComposerDraftImage(state: *app_state.AppState) void {
+    const image = state.currentThread().draft_image orelse return;
+    const text_rect = state.palette_composer.textRect();
+    if (text_rect.w <= theme.scaledUi(120.0) or text_rect.h <= theme.scaledUi(72.0)) return;
+
+    const thumb_max: f32 = @min(theme.scaledUi(86.0), @max(theme.scaledUi(52.0), text_rect.h - theme.scaledUi(18.0)));
+    const preview_w = @min(text_rect.w - theme.scaledUi(12.0), theme.scaledUi(360.0));
+    const preview_h = thumb_max + theme.scaledUi(16.0);
+    const preview = palette.Rect{
+        .x = text_rect.x + theme.scaledUi(2.0),
+        .y = text_rect.y + theme.scaledUi(2.0),
+        .w = preview_w,
+        .h = preview_h,
+    };
+
+    queueRounded(state, preview, paletteColor(colors.rgba(12, 20, 21, 235)), theme.scaledUi(10.0));
+    queueBorder(state, preview, paletteColor(colors.rgba(76, 95, 101, 220)), theme.scaledUi(10.0), theme.scaledUi(1.0));
+
+    const thumb = palette.Rect{
+        .x = preview.x + theme.scaledUi(8.0),
+        .y = preview.y + theme.scaledUi(8.0),
+        .w = thumb_max,
+        .h = thumb_max,
+    };
+    queueRounded(state, thumb, paletteColor(colors.rgba(17, 24, 26, 255)), theme.scaledUi(8.0));
+
+    if (state.ensureImageTexture(image.path)) |cached| {
+        const dims = runtime.scaledImageSize(cached.width, cached.height, thumb.w, thumb.h);
+        queueImage(state, .{
+            .x = thumb.x + (thumb.w - dims[0]) * 0.5,
+            .y = thumb.y + (thumb.h - dims[1]) * 0.5,
+            .w = dims[0],
+            .h = dims[1],
+        }, cached, thumb);
+    } else {
+        queueText(state, .{
+            .x = thumb.x + theme.scaledUi(8.0),
+            .y = thumb.y + (thumb.h - theme.scaledUi(18.0)) * 0.5,
+            .w = thumb.w - theme.scaledUi(16.0),
+            .h = theme.scaledUi(20.0),
+        }, "Image", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), thumb);
+    }
+
+    var size_buf: [32:0]u8 = undefined;
+    const size_label = runtime.formatByteSize(&size_buf, image.byte_size);
+    const label_x = thumb.x + thumb.w + theme.scaledUi(12.0);
+    const label_w = @max(preview.x + preview.w - label_x - theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queueText(state, .{
+        .x = label_x,
+        .y = preview.y + theme.scaledUi(16.0),
+        .w = label_w,
+        .h = theme.scaledUi(24.0),
+    }, image.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.0), preview);
+    queueText(state, .{
+        .x = label_x,
+        .y = preview.y + theme.scaledUi(42.0),
+        .w = label_w,
+        .h = theme.scaledUi(20.0),
+    }, size_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), preview);
 }
 
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {
