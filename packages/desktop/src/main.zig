@@ -438,12 +438,13 @@ fn processOneEvent(
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.hasAnyPendingSends() or
         state.isPickerPending() or
+        state.isBrowserVisible() or
         state.hasVisibleTerminalSessions() or
         state.transcriptMarkdownSelectionDragging();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
