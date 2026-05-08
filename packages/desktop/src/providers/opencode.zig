@@ -1229,6 +1229,47 @@ fn providerCollectionValue(root: std.json.Value) ?std.json.Value {
     return getObjectField(root, "providers");
 }
 
+fn readReasoningSupported(model_value: std.json.Value) bool {
+    if (model_value != .object) return true;
+    const cap = getObjectField(model_value, "capabilities") orelse return true;
+    if (cap != .object) return true;
+    const r = getObjectField(cap, "reasoning") orelse return true;
+    return switch (r) {
+        .bool => |b| b,
+        else => true,
+    };
+}
+
+fn collectVariantKeysSortedAlloc(allocator: std.mem.Allocator, model_value: std.json.Value) !?[][:0]const u8 {
+    if (model_value != .object) return null;
+    const variants = getObjectField(model_value, "variants") orelse return null;
+    if (variants != .object) return null;
+
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var it = variants.object.iterator();
+    while (it.next()) |entry| {
+        try names.append(allocator, entry.key_ptr.*);
+    }
+    if (names.items.len == 0) return null;
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+
+    const out = try allocator.alloc([:0]const u8, names.items.len);
+    errdefer {
+        for (out) |k| allocator.free(k);
+        allocator.free(out);
+    }
+    for (names.items, 0..) |name, i| {
+        out[i] = try allocator.dupeZ(u8, name);
+    }
+    return out;
+}
+
 fn appendProviderModels(
     allocator: std.mem.Allocator,
     provider_value: std.json.Value,
@@ -1279,11 +1320,20 @@ fn appendModelInfo(
         else => return,
     };
 
+    const reasoning_supported = readReasoningSupported(model_value);
+    const variant_keys = try collectVariantKeysSortedAlloc(allocator, model_value);
+    errdefer if (variant_keys) |keys| {
+        for (keys) |k| allocator.free(k);
+        allocator.free(keys);
+    };
+
     try models.append(allocator, .{
         .provider_id = try allocator.dupe(u8, provider_id),
         .provider_name = try allocator.dupe(u8, provider_name),
         .model_id = try allocator.dupe(u8, model_id),
         .model_name = try allocator.dupe(u8, model_name),
+        .reasoning_supported = reasoning_supported,
+        .reasoning_variant_keys = variant_keys,
     });
 }
 
@@ -2011,7 +2061,7 @@ fn buildPromptBody(
     allocator: std.mem.Allocator,
     request: provider_types.SendPromptRequest,
 ) ![]u8 {
-    const variant = reasoningVariantName(request.reasoning_effort);
+    const mapped_effort_variant = reasoningVariantName(request.reasoning_effort);
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     var stringify: std.json.Stringify = .{
@@ -2030,7 +2080,10 @@ fn buildPromptBody(
         try stringify.write(model_id);
         try stringify.endObject();
     }
-    if (variant) |variant_name| {
+    if (request.opencode_variant) |explicit| {
+        try stringify.objectField("variant");
+        try stringify.write(explicit);
+    } else if (mapped_effort_variant) |variant_name| {
         try stringify.objectField("variant");
         try stringify.write(variant_name);
     }
@@ -2173,7 +2226,7 @@ test "parseConfiguredModelsAlloc reads configured providers and models" {
         \\      "id": "openai",
         \\      "name": "OpenAI",
         \\      "models": {
-        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" }
+        \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4", "capabilities": { "reasoning": true }, "variants": { "high": {}, "low": {} } }
         \\      }
         \\    },
         \\    {
@@ -2181,7 +2234,7 @@ test "parseConfiguredModelsAlloc reads configured providers and models" {
         \\      "name": "Zen",
         \\      "models": {
         \\        "gpt-5.4": { "id": "gpt-5.4", "name": "GPT-5.4" },
-        \\        "sonnet": { "id": "sonnet", "name": "Claude Sonnet" }
+        \\        "sonnet": { "id": "sonnet", "name": "Claude Sonnet", "capabilities": { "reasoning": false } }
         \\      }
         \\    }
         \\  ]
@@ -2197,6 +2250,30 @@ test "parseConfiguredModelsAlloc reads configured providers and models" {
     try std.testing.expectEqualStrings("OpenAI", models[0].provider_name);
     try std.testing.expectEqualStrings("gpt-5.4", models[0].model_id);
     try std.testing.expectEqualStrings("GPT-5.4", models[0].model_name);
+    try std.testing.expect(models[0].reasoning_supported);
+    try std.testing.expect(models[0].reasoning_variant_keys != null);
+    try std.testing.expectEqual(@as(usize, 2), models[0].reasoning_variant_keys.?.len);
+    try std.testing.expectEqualStrings("high", models[0].reasoning_variant_keys.?[0]);
+    try std.testing.expectEqualStrings("low", models[0].reasoning_variant_keys.?[1]);
     try std.testing.expectEqualStrings("zen", models[1].provider_id);
     try std.testing.expectEqualStrings("Zen", models[1].provider_name);
+    try std.testing.expect(models[1].reasoning_variant_keys == null);
+    try std.testing.expectEqualStrings("zen", models[2].provider_id);
+    try std.testing.expectEqualStrings("sonnet", models[2].model_id);
+    try std.testing.expect(!models[2].reasoning_supported);
+    try std.testing.expect(models[2].reasoning_variant_keys == null);
+}
+
+test "buildPromptBody prefers explicit opencode variant over reasoning effort" {
+    const allocator = std.testing.allocator;
+    const body = try buildPromptBody(allocator, .{
+        .prompt = "hi",
+        .model = "openai/gpt-5.4",
+        .opencode_variant = "minimal",
+        .reasoning_effort = .high,
+    });
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"variant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "minimal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "high") == null);
 }
