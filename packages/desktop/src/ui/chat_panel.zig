@@ -395,6 +395,11 @@ fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, colum
     return theme.scaledUi(44.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
 }
 
+/// Corner radius for transcript bubbles (user / assistant / system) and shell command rows.
+fn transcriptBubbleCornerRadius() f32 {
+    return theme.scaledUi(14.0);
+}
+
 fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
         renderCommandEventRow(state, column, y, height, message.author, message.body, clip);
@@ -418,8 +423,9 @@ fn renderCommandEventRow(
     clip: palette.Rect,
 ) void {
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
-    queueRoundedClipped(state, bubble, paletteColor(colors.rgba(28, 29, 34, 255)), theme.scaledUi(10.0), clip);
-    queueBorderClipped(state, bubble, paletteColor(colors.DARK_BLUE), theme.scaledUi(10.0), 1.0, clip);
+    const rr = transcriptBubbleCornerRadius();
+    queueRoundedClipped(state, bubble, paletteColor(colors.rgba(28, 29, 34, 255)), rr, clip);
+    queueBorderClipped(state, bubble, paletteColor(colors.DARK_BLUE), rr, 1.0, clip);
 
     const pad = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
@@ -461,8 +467,9 @@ fn renderTranscriptBubbleFromParts(
         .assistant => colors.rgba(22, 30, 32, 242),
         .system => colors.rgba(57, 43, 9, 235),
     };
-    queueRoundedClipped(state, bubble, paletteColor(bg), theme.scaledUi(8.0), clip);
-    queueBorderClipped(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0, clip);
+    const rr = transcriptBubbleCornerRadius();
+    queueRoundedClipped(state, bubble, paletteColor(bg), rr, clip);
+    queueBorderClipped(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), rr, 1.0, clip);
     queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),

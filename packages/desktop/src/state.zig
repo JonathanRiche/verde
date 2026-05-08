@@ -411,7 +411,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
     .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
     .scrollbar_width = 5.0,
-    .corner_radius = 10.0,
+    .corner_radius = 14.0,
     .border_width = 1.0,
     .z_index = 200,
     .submenu_z_offset = 10,

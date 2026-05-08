@@ -1148,6 +1148,8 @@ fn renderPaletteTextBlockLayout(
             const px = ctx.start[0] + step.x;
             const py = ctx.start[1] + step.y;
             if (step.inline_style.code) {
+                const code_font = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
+                const pill_r = @max(6.0, code_font * 0.32);
                 ctx.code_backgrounds.append(ctx.palette_context.allocator, .{
                     .rect = .{
                         .x = px - 3.0,
@@ -1155,7 +1157,7 @@ fn renderPaletteTextBlockLayout(
                         .w = step.width + 6.0,
                         .h = step.line_height - 2.0,
                     },
-                    .radius = 4.0,
+                    .radius = pill_r,
                 }) catch return;
             }
 
@@ -2200,7 +2202,7 @@ fn codeBlockPaddingY(options: RenderOptions) f32 {
 }
 
 fn codeBlockRounding(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.3, 6.0);
+    return @max(defaultLineHeight(options) * 0.42, 10.0);
 }
 
 fn codeBlockHeight(block: FencedCodeView, line_height: f32, pad_y: f32) f32 {
