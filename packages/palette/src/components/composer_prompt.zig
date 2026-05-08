@@ -205,6 +205,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
         show_fast_toggle: bool = true,
+        show_reasoning_toggle: bool = true,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
@@ -215,6 +216,18 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         icon_font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: ComposerPromptCallbacks = .{},
+
+        pub fn setShowReasoningToggle(self: *Component, show: bool) void {
+            self.show_reasoning_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .reasoning) null else self.hovered_part;
+                self.active_menu = if (self.active_menu == .reasoning) null else self.active_menu;
+            }
+        }
+
+        pub fn showReasoningToggle(self: *const Component) bool {
+            return self.show_reasoning_toggle;
+        }
 
         pub fn setShowFastToggle(self: *Component, show: bool) void {
             self.show_fast_toggle = show;
@@ -419,7 +432,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const geometry = self.toolbarGeometry();
             if (geometry.send.contains(point)) return .send;
             if (geometry.model.contains(point)) return .model;
-            if (geometry.reasoning.contains(point)) return .reasoning;
+            if (self.show_reasoning_toggle and geometry.reasoning.w > 0.0 and geometry.reasoning.contains(point)) return .reasoning;
             if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
             if (geometry.access.contains(point)) return .access;
             return null;
@@ -496,15 +509,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const geometry = self.toolbarGeometry();
             try self.renderPill(allocator, batch, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+            const left_before_fast: draw.Rect = if (self.show_reasoning_toggle) geometry.reasoning else geometry.model;
+            if (self.show_reasoning_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
+                try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+            }
             if (self.show_fast_toggle) {
-                try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.fast), geometry.toolbar);
                 try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
                 try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
             } else {
-                try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.access), geometry.toolbar);
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.access), geometry.toolbar);
             }
 
             try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
@@ -1220,7 +1235,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
             x += model_w + config.control_gap;
 
-            const reasoning_w = @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0));
+            const reasoning_w = if (self.show_reasoning_toggle)
+                @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0))
+            else
+                0.0;
             const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
             x += reasoning_w;
 

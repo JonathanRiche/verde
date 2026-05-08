@@ -242,9 +242,16 @@ fn paletteModelLabel(context: ?*anyopaque, index: usize) []const u8 {
     return options[index].label;
 }
 
-fn paletteReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
-    if (index >= CODEX_REASONING_OPTIONS.len) return "";
-    return CODEX_REASONING_OPTIONS[index].label;
+fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const thread = state.currentThread();
+    if (thread.provider == .codex) {
+        if (index >= CODEX_REASONING_OPTIONS.len) return "";
+        return CODEX_REASONING_OPTIONS[index].label;
+    }
+    const rows = state.opencode_reasoning_menu.items;
+    if (index >= rows.len) return "";
+    return rows[index].label;
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
@@ -278,15 +285,32 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.setCurrentThreadModelRef(options[index].value);
         },
         .reasoning_changed => |index| {
-            if (index >= CODEX_REASONING_OPTIONS.len) return;
             const thread = state.currentThreadMutable();
-            const next = CODEX_REASONING_OPTIONS[index].value;
-            const changed = if (next) |value|
-                thread.reasoning_effort == null or thread.reasoning_effort.? != value
-            else
-                thread.reasoning_effort != null;
-            if (!changed) return;
-            thread.reasoning_effort = next;
+            if (thread.provider == .codex) {
+                if (index >= CODEX_REASONING_OPTIONS.len) return;
+                const next = CODEX_REASONING_OPTIONS[index].value;
+                const changed = if (next) |value|
+                    thread.reasoning_effort == null or thread.reasoning_effort.? != value
+                else
+                    thread.reasoning_effort != null;
+                if (!changed) return;
+                thread.reasoning_effort = next;
+                state.markDirty();
+                return;
+            }
+            const rows = state.opencode_reasoning_menu.items;
+            if (index >= rows.len) return;
+            const row = rows[index];
+            const matches = blk: {
+                if (thread.opencode_reasoning_variant == null and row.variant == null) break :blk true;
+                if (thread.opencode_reasoning_variant) |existing| {
+                    if (row.variant) |rv| break :blk std.mem.eql(u8, existing, rv);
+                }
+                break :blk false;
+            };
+            if (matches) return;
+            if (thread.opencode_reasoning_variant) |old| state.allocator.free(old);
+            thread.opencode_reasoning_variant = if (row.variant) |rv| state.allocator.dupeZ(u8, rv) catch null else null;
             state.markDirty();
         },
         .fast_changed => |enabled| {
@@ -496,6 +520,16 @@ const uploadTexture = utils.uploadTexture;
 pub const ModelOption = struct {
     label: [:0]const u8,
     value: ?[:0]const u8 = null,
+    /// From OpenCode model metadata (`capabilities.reasoning`); presets default to true.
+    reasoning_supported: bool = true,
+    /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
+    reasoning_variant_keys: ?[][:0]const u8 = null,
+};
+
+const OpencodeReasoningMenuRow = struct {
+    label: [:0]const u8,
+    /// Null selects the default (no `variant` field on the wire).
+    variant: ?[:0]const u8,
 };
 
 pub const ReasoningOption = struct {
@@ -647,6 +681,8 @@ pub const ChatThread = struct {
     provider_thread_id: ?[:0]const u8 = null,
     model_ref: ?[:0]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
+    /// OpenCode JSON `variant` when the configured model exposes variant keys.
+    opencode_reasoning_variant: ?[:0]const u8 = null,
     fast_mode: FastMode = .off,
     access_mode: AccessMode = .full_access,
     provider: Provider = .opencode,
@@ -860,6 +896,7 @@ pub const ChatThread = struct {
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
+        if (self.opencode_reasoning_variant) |variant| allocator.free(variant);
         for (self.messages.items) |message| {
             allocator.free(message.author);
             allocator.free(message.body);
@@ -1415,6 +1452,7 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
+    opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
     opencode_logo_texture: ?CachedImageTexture,
@@ -1536,6 +1574,7 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
+            .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
             .opencode_logo_texture = null,
@@ -1650,34 +1689,33 @@ pub const AppState = struct {
         };
     }
 
-    fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
-        const SortedModel = struct {
-            provider_name: []const u8,
-            provider_id: []const u8,
-            model_name: []const u8,
-            model_id: []const u8,
-        };
-
-        var sorted_models = try self.allocator.alloc(SortedModel, models.len);
-        defer self.allocator.free(sorted_models);
-
-        for (models, 0..) |model, index| {
-            sorted_models[index] = .{
-                .provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id,
-                .provider_id = model.provider_id,
-                .model_name = if (model.model_name.len > 0) model.model_name else model.model_id,
-                .model_id = model.model_id,
-            };
+    fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[][:0]const u8) !?[][:0]const u8 {
+        const keys = src orelse return null;
+        if (keys.len == 0) return null;
+        const out = try allocator.alloc([:0]const u8, keys.len);
+        errdefer {
+            for (out) |k| allocator.free(k);
+            allocator.free(out);
         }
+        for (keys, 0..) |k, i| {
+            out[i] = try allocator.dupeZ(u8, k);
+        }
+        return out;
+    }
 
-        var i: usize = 1;
-        while (i < sorted_models.len) : (i += 1) {
-            const current = sorted_models[i];
-            var j = i;
-            while (j > 0 and opencodeModelSortLessThan(current, sorted_models[j - 1])) : (j -= 1) {
-                sorted_models[j] = sorted_models[j - 1];
+    fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
+        var order = try self.allocator.alloc(usize, models.len);
+        defer self.allocator.free(order);
+        for (0..models.len) |i| order[i] = i;
+
+        var sort_i: usize = 1;
+        while (sort_i < order.len) : (sort_i += 1) {
+            const cur_idx = order[sort_i];
+            var j = sort_i;
+            while (j > 0 and opencodeModelSortLessThan(models[cur_idx], models[order[j - 1]])) : (j -= 1) {
+                order[j] = order[j - 1];
             }
-            sorted_models[j] = current;
+            order[j] = cur_idx;
         }
 
         // Preset `opencode/…` routes first when the API list omits them (common when only one vendor
@@ -1686,21 +1724,29 @@ pub const AppState = struct {
         for (OPENCODE_MODEL_OPTIONS) |preset| {
             const preset_value = preset.value orelse continue;
             const preset_model_id = opencodeModelIdSuffixFromRef(preset_value) orelse continue;
-            if (opencodeSortedModelsContainModelId(sorted_models, preset_model_id)) continue;
+            if (opencodeSortedModelsContainModelIdFromOrder(order, models, preset_model_id)) continue;
 
             const preset_label = try self.allocator.dupeZ(u8, preset.label);
             errdefer self.allocator.free(preset_label);
             const preset_value_copy = try self.allocator.dupeZ(u8, preset_value);
             errdefer self.allocator.free(preset_value_copy);
+            const preset_keys = try duplicateReasoningVariantKeys(self.allocator, preset.reasoning_variant_keys);
+            errdefer if (preset_keys) |pk| {
+                for (pk) |k| self.allocator.free(k);
+                self.allocator.free(pk);
+            };
             try self.opencode_model_options.append(self.allocator, .{
                 .label = preset_label,
                 .value = preset_value_copy,
+                .reasoning_supported = preset.reasoning_supported,
+                .reasoning_variant_keys = preset_keys,
             });
         }
 
-        for (sorted_models) |model| {
-            const model_name = model.model_name;
-            const provider_name = model.provider_name;
+        for (order) |mi| {
+            const model = models[mi];
+            const model_name = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id;
             const label_text = try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ model_name, provider_name });
             defer self.allocator.free(label_text);
             const label = try self.allocator.dupeZ(u8, label_text);
@@ -1711,9 +1757,17 @@ pub const AppState = struct {
             const value = try self.allocator.dupeZ(u8, value_text);
             errdefer self.allocator.free(value);
 
+            const keys = try duplicateReasoningVariantKeys(self.allocator, model.reasoning_variant_keys);
+            errdefer if (keys) |k| {
+                for (k) |x| self.allocator.free(x);
+                self.allocator.free(k);
+            };
+
             try self.opencode_model_options.append(self.allocator, .{
                 .label = label,
                 .value = value,
+                .reasoning_supported = model.reasoning_supported,
+                .reasoning_variant_keys = keys,
             });
         }
     }
@@ -1724,18 +1778,22 @@ pub const AppState = struct {
         return model_ref[slash + 1 ..];
     }
 
-    fn opencodeSortedModelsContainModelId(sorted_models: anytype, model_id: []const u8) bool {
-        for (sorted_models) |m| {
-            if (std.mem.eql(u8, m.model_id, model_id)) return true;
+    fn opencodeSortedModelsContainModelIdFromOrder(order: []const usize, model_list: []const ai_harness.ModelInfo, model_id: []const u8) bool {
+        for (order) |mi| {
+            if (std.mem.eql(u8, model_list[mi].model_id, model_id)) return true;
         }
         return false;
     }
 
-    fn opencodeModelSortLessThan(a: anytype, b: anytype) bool {
-        const provider_cmp = asciiCaseInsensitiveCompare(a.provider_name, b.provider_name);
+    fn opencodeModelSortLessThan(a: ai_harness.ModelInfo, b: ai_harness.ModelInfo) bool {
+        const provider_name_a = if (a.provider_name.len > 0) a.provider_name else a.provider_id;
+        const provider_name_b = if (b.provider_name.len > 0) b.provider_name else b.provider_id;
+        const provider_cmp = asciiCaseInsensitiveCompare(provider_name_a, provider_name_b);
         if (provider_cmp != .eq) return provider_cmp == .lt;
 
-        const model_cmp = asciiCaseInsensitiveCompare(a.model_name, b.model_name);
+        const model_name_a = if (a.model_name.len > 0) a.model_name else a.model_id;
+        const model_name_b = if (b.model_name.len > 0) b.model_name else b.model_id;
+        const model_cmp = asciiCaseInsensitiveCompare(model_name_a, model_name_b);
         if (model_cmp != .eq) return model_cmp == .lt;
 
         const provider_id_cmp = asciiCaseInsensitiveCompare(a.provider_id, b.provider_id);
@@ -1775,22 +1833,100 @@ pub const AppState = struct {
         if (thread.model_ref) |model_ref| {
             for (self.opencode_model_options.items) |option| {
                 if (option.value) |value| {
-                    if (std.mem.eql(u8, model_ref, value)) return;
+                    if (std.mem.eql(u8, model_ref, value)) {
+                        self.normalizeOpencodeReasoningVariant(thread);
+                        return;
+                    }
                 }
             }
             self.allocator.free(model_ref);
         }
 
         thread.model_ref = self.allocator.dupeZ(u8, fallback_model_ref) catch null;
+        self.normalizeOpencodeReasoningVariant(thread);
         self.markDirty();
+    }
+
+    fn opencodeModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
+        const ref = model_ref orelse return null;
+        for (self.opencode_model_options.items) |opt| {
+            if (opt.value) |v| {
+                if (std.mem.eql(u8, ref, v)) return opt;
+            }
+        }
+        return null;
+    }
+
+    fn refreshOpencodeReasoningMenu(self: *AppState, thread: *const ChatThread) !void {
+        self.clearOpencodeReasoningMenu();
+        errdefer self.clearOpencodeReasoningMenu();
+
+        if (thread.provider != .opencode) return;
+        const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
+        if (!opt.reasoning_supported) return;
+        const keys = opt.reasoning_variant_keys orelse return;
+        if (keys.len == 0) return;
+
+        const default_label = try self.allocator.dupeZ(u8, "Default");
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = default_label, .variant = null });
+
+        for (keys) |key| {
+            const label = try self.allocator.dupeZ(u8, key);
+            const variant_copy = try self.allocator.dupeZ(u8, key);
+            try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+        }
+    }
+
+    fn normalizeOpencodeReasoningVariant(self: *AppState, thread: *ChatThread) void {
+        if (thread.provider != .opencode) return;
+        if (thread.opencode_reasoning_variant) |cur| {
+            const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            };
+            if (!opt.reasoning_supported) {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            }
+            const keys = opt.reasoning_variant_keys orelse {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            };
+            if (keys.len == 0) {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            }
+            for (keys) |k| {
+                if (std.mem.eql(u8, cur, k)) return;
+            }
+            self.allocator.free(cur);
+            thread.opencode_reasoning_variant = null;
+        }
     }
 
     fn clearDynamicOpencodeModelOptions(self: *AppState) void {
         for (self.opencode_model_options.items) |option| {
             self.allocator.free(option.label);
             if (option.value) |value| self.allocator.free(value);
+            if (option.reasoning_variant_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
         }
         self.opencode_model_options.clearRetainingCapacity();
+        self.clearOpencodeReasoningMenu();
+    }
+
+    fn clearOpencodeReasoningMenu(self: *AppState) void {
+        for (self.opencode_reasoning_menu.items) |row| {
+            self.allocator.free(row.label);
+            if (row.variant) |v| self.allocator.free(v);
+        }
+        self.opencode_reasoning_menu.clearRetainingCapacity();
     }
 
     fn clearOpencodeModelOptions(self: *AppState) void {
@@ -2502,7 +2638,8 @@ pub const AppState = struct {
             .prompt = prompt,
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
-            .reasoning_effort = thread.reasoning_effort,
+            .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+            .reasoning_effort = if (thread.provider == .opencode and thread.opencode_reasoning_variant != null) null else thread.reasoning_effort,
             .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
             .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
             .sandbox_mode = sandboxModeForMode(thread.provider, thread.access_mode),
@@ -2587,6 +2724,13 @@ pub const AppState = struct {
             .thread_title = try page_alloc.dupe(u8, thread.title),
             .model_ref = if (thread.model_ref) |model_ref| try page_alloc.dupe(u8, model_ref) else null,
             .reasoning_effort = thread.reasoning_effort,
+            .opencode_reasoning_variant = blk: {
+                if (thread.provider != .opencode) break :blk null;
+                if (thread.opencode_reasoning_variant) |v| {
+                    break :blk try page_alloc.dupe(u8, v);
+                }
+                break :blk null;
+            },
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
         };
@@ -2599,6 +2743,7 @@ pub const AppState = struct {
             if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
+            if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
         }
 
         const send_state = thread.send_state;
@@ -2690,6 +2835,11 @@ pub const AppState = struct {
                     else
                         null;
                     thread.reasoning_effort = persisted_thread.reasoning_effort;
+                    if (thread.opencode_reasoning_variant) |v| self.allocator.free(v);
+                    thread.opencode_reasoning_variant = if (persisted_thread.reasoning_variant) |rv|
+                        try self.allocator.dupeZ(u8, rv)
+                    else
+                        null;
                     thread.fast_mode = persisted_thread.fast_mode orelse .off;
                     thread.access_mode = persisted_thread.access_mode orelse .full_access;
                     thread.provider = persisted_thread.provider;
@@ -2859,6 +3009,7 @@ pub const AppState = struct {
             .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
             .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
             .reasoning_effort = thread.reasoning_effort,
+            .reasoning_variant = try dupeOptionalSlice(allocator, if (thread.opencode_reasoning_variant) |v| v else null),
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
             .provider = thread.provider,
@@ -3226,6 +3377,11 @@ pub const AppState = struct {
             hydrated.provider = existing.provider;
             hydrated.harness = existing.harness;
             hydrated.reasoning_effort = existing.reasoning_effort;
+            if (hydrated.opencode_reasoning_variant) |v| self.allocator.free(v);
+            hydrated.opencode_reasoning_variant = if (existing.opencode_reasoning_variant) |v|
+                try self.allocator.dupeZ(u8, v)
+            else
+                null;
             hydrated.fast_mode = existing.fast_mode;
             hydrated.access_mode = existing.access_mode;
 
@@ -4628,9 +4784,19 @@ pub const AppState = struct {
         };
         const model_options = composerModelOptions(self, thread.provider);
         self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
-        self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
+        self.refreshOpencodeReasoningMenu(thread) catch |err| {
+            log.warn("failed to refresh OpenCode reasoning menu: {s}", .{@errorName(err)});
+            self.clearOpencodeReasoningMenu();
+        };
+        const show_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
+        self.palette_composer.setShowReasoningToggle(show_reasoning);
+        const reasoning_count: usize = if (thread.provider == .codex)
+            CODEX_REASONING_OPTIONS.len
+        else
+            self.opencode_reasoning_menu.items.len;
+        self.palette_composer.setReasoningOptions(self, reasoning_count, paletteReasoningLabel);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
-        self.palette_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
+        self.palette_composer.reasoning_index = composerReasoningIndexForThread(self, thread);
         if (show_fast_toggle) {
             self.palette_composer.fast_enabled = thread.fast_mode == .on;
         } else {
@@ -4646,10 +4812,19 @@ pub const AppState = struct {
             }
         }
         if (self.palette_composer.reasoning_index) |index| {
-            if (index < CODEX_REASONING_OPTIONS.len) {
-                self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
-                    log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
-                };
+            if (thread.provider == .codex) {
+                if (index < CODEX_REASONING_OPTIONS.len) {
+                    self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
+                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
+                    };
+                }
+            } else {
+                const rows = self.opencode_reasoning_menu.items;
+                if (index < rows.len) {
+                    self.palette_composer.setReasoningLabel(self.allocator, std.mem.sliceTo(rows[index].label, 0)) catch |err| {
+                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
+                    };
+                }
             }
         }
         if (show_fast_toggle) {
@@ -5021,6 +5196,10 @@ pub const AppState = struct {
         if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
         thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
         thread.reasoning_effort = null;
+        if (thread.opencode_reasoning_variant) |v| {
+            self.allocator.free(v);
+            thread.opencode_reasoning_variant = null;
+        }
         thread.fast_mode = .off;
         self.markDirty();
     }
@@ -5038,6 +5217,7 @@ pub const AppState = struct {
         }
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
+        self.normalizeOpencodeReasoningVariant(thread);
         self.markDirty();
     }
 
@@ -5058,6 +5238,24 @@ pub const AppState = struct {
             if (value != null and option.value != null and value.? == option.value.?) return index;
         }
         return null;
+    }
+
+    fn composerReasoningIndexForThread(self: *const AppState, thread: *const ChatThread) ?usize {
+        if (thread.provider == .codex) {
+            return composerReasoningIndex(thread.reasoning_effort);
+        }
+        const rows = self.opencode_reasoning_menu.items;
+        for (rows, 0..) |row, i| {
+            const matches = blk: {
+                if (thread.opencode_reasoning_variant == null and row.variant == null) break :blk true;
+                if (thread.opencode_reasoning_variant) |v| {
+                    if (row.variant) |rv| break :blk std.mem.eql(u8, v, rv);
+                }
+                break :blk false;
+            };
+            if (matches) return i;
+        }
+        return if (rows.len > 0) 0 else null;
     }
 
     fn composerFastModeIndex(value: FastMode) ?usize {
@@ -5445,6 +5643,8 @@ pub const AppState = struct {
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
+        self.clearOpencodeModelOptions();
+        self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
@@ -5556,6 +5756,7 @@ pub const AppState = struct {
                     return;
                 };
                 self.normalizeCurrentOpencodeThreadModel();
+                self.normalizeOpencodeReasoningVariant(self.currentThreadMutable());
             },
             .failed => {
                 log.warn("failed to refresh OpenCode model cache", .{});
