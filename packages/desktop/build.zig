@@ -45,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "palette", .module = palette.module("palette") },
             .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
             .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
         },
