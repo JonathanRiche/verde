@@ -12,11 +12,8 @@ const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const MESSAGE_POLL_LIMIT = 12;
 const IMPORT_MESSAGE_LIMIT = 100_000;
 const POLL_INTERVAL_MS: u64 = 150;
-const MAX_POLL_ATTEMPTS = 12_000;
+const MAX_POLL_ATTEMPTS = 24_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
-/// OpenCode SSE can emit very small `message.part.delta` chunks; batching UI callbacks
-/// keeps transcript layout from repainting on every handful of bytes.
-const OPENCODE_STREAM_UI_COALESCE_MIN_BYTES: usize = 56;
 
 fn sleepMs(ms: u64) void {
     const request: std.c.timespec = .{
@@ -447,7 +444,6 @@ pub const Client = struct {
                 eventStreamReachedIdle(context)
             else
                 false;
-            const can_complete_from_status_idle = event_stream_context == null;
             if (event_stream_context) |context| {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
@@ -484,19 +480,24 @@ pub const Client = struct {
 
             const has_output_activity =
                 std.mem.trim(u8, streamed_text, &std.ascii.whitespace).len > 0 or
-                latest_snapshot.task_summary != null or
                 latest_snapshot.hasRenderablePostBaselineContent(baseline_assistant_id);
+
+            const idle_exit_with_body = blk: {
+                if (status != .idle or !has_output_activity) break :blk false;
+                const f = latest_snapshot.finish orelse break :blk false;
+                break :blk !std.mem.eql(u8, f, "tool-calls");
+            };
 
             if (!has_pending_permissions and
                 (stream_idle or
                     latest_snapshot.isTerminalForPrompt(baseline_assistant_id) or
-                    (can_complete_from_status_idle and status == .idle and has_output_activity)))
+                    idle_exit_with_body))
             {
                 break;
             }
 
             if (!has_pending_permissions and
-                can_complete_from_status_idle and
+                event_stream_context == null and
                 status == .idle and
                 !has_output_activity and
                 attempt + 1 >= EMPTY_IDLE_GRACE_POLLS)
@@ -504,7 +505,7 @@ pub const Client = struct {
                 return error.OpencodeEmptyReply;
             }
 
-            std.atomic.spinLoopHint();
+            sleepMs(POLL_INTERVAL_MS);
         } else {
             return error.OpencodeRequestTimedOut;
         }
@@ -777,7 +778,11 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        const latest = findLatestAssistantMessage(parsed.value) orelse return .{
+        const latest_opt: ?std.json.Value = if (baseline_assistant_id != null)
+            findPrimaryAssistantAfterLastUser(parsed.value) orelse findLatestAssistantMessage(parsed.value)
+        else
+            findLatestAssistantMessage(parsed.value);
+        const latest = latest_opt orelse return .{
             .text = try allocator.dupe(u8, ""),
         };
 
@@ -960,7 +965,6 @@ const EventStreamContext = struct {
     request: provider_types.SendPromptRequest,
     child: ?std.process.Child = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
-    stream_delta_coalesce: std.ArrayListUnmanaged(u8) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -968,11 +972,9 @@ const EventStreamContext = struct {
     session_idle: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
-        flushPendingOpencodeStreamDeltas(self);
         self.allocator.free(self.session_id);
         if (self.baseline_assistant_id) |message_id| self.allocator.free(message_id);
         self.streamed_text.deinit(self.allocator);
-        self.stream_delta_coalesce.deinit(self.allocator);
     }
 };
 
@@ -1506,8 +1508,6 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     if (event_data.items.len > 0) {
         _ = try processEventStreamMessage(context, event_name.items, event_data.items);
     }
-
-    flushPendingOpencodeStreamDeltas(context);
 }
 
 fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpenState) void {
@@ -1588,7 +1588,6 @@ fn signalEventStreamIdle(context: *EventStreamContext) void {
     context.mutex.lock();
     context.session_idle = true;
     context.mutex.unlock();
-    flushPendingOpencodeStreamDeltas(context);
 }
 
 fn eventStreamReachedIdle(context: *EventStreamContext) bool {
@@ -1635,30 +1634,6 @@ fn eventTargetsSession(value: std.json.Value, session_id: []const u8) bool {
     return std.mem.eql(u8, event_session_id, session_id);
 }
 
-fn flushPendingOpencodeStreamDeltas(context: *EventStreamContext) void {
-    const on_stream_delta = context.request.on_stream_delta orelse {
-        context.mutex.lock();
-        context.stream_delta_coalesce.clearRetainingCapacity();
-        context.mutex.unlock();
-        return;
-    };
-
-    context.mutex.lock();
-    if (context.stream_delta_coalesce.items.len == 0) {
-        context.mutex.unlock();
-        return;
-    }
-    const owned = context.stream_delta_coalesce.toOwnedSlice(context.allocator) catch {
-        context.mutex.unlock();
-        return;
-    };
-    context.stream_delta_coalesce = .empty;
-    context.mutex.unlock();
-
-    on_stream_delta(context.request.stream_context, owned);
-    context.allocator.free(owned);
-}
-
 fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Value) !void {
     if (!eventTargetsSession(properties, context.session_id)) return;
 
@@ -1680,21 +1655,16 @@ fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Val
         return;
     };
 
-    context.mutex.lock();
-    errdefer context.mutex.unlock();
-    try context.streamed_text.appendSlice(context.allocator, delta);
-    try context.stream_delta_coalesce.appendSlice(context.allocator, delta);
-    const flush_now = context.stream_delta_coalesce.items.len >= OPENCODE_STREAM_UI_COALESCE_MIN_BYTES or
-        std.mem.indexOfScalar(u8, delta, '\n') != null;
-    if (flush_now) {
-        const owned = try context.stream_delta_coalesce.toOwnedSlice(context.allocator);
-        context.stream_delta_coalesce = .empty;
-        context.mutex.unlock();
-        on_stream_delta(context.request.stream_context, owned);
-        context.allocator.free(owned);
-        return;
+    {
+        context.mutex.lock();
+        defer context.mutex.unlock();
+        try context.streamed_text.appendSlice(context.allocator, delta);
     }
-    context.mutex.unlock();
+
+    const owned = try context.allocator.dupe(u8, delta);
+    errdefer context.allocator.free(owned);
+    on_stream_delta(context.request.stream_context, owned);
+    context.allocator.free(owned);
 }
 
 fn handleSessionDiff(context: *EventStreamContext, properties: std.json.Value) !void {
@@ -1711,6 +1681,37 @@ fn handleSessionDiff(context: *EventStreamContext, properties: std.json.Value) !
     on_stream_event(context.request.stream_context, .{ .diff = .{
         .files = files.items,
     } });
+}
+
+/// Subagent runs can append additional assistant messages after the root reply for the
+/// current user turn. Picking the newest-by-`time.created` assistant then points at an
+/// often-empty sub-leaf while the root message is still streaming or accumulating text.
+fn findPrimaryAssistantAfterLastUser(root: std.json.Value) ?std.json.Value {
+    if (root != .array) return null;
+
+    var last_user_index: ?usize = null;
+    for (root.array.items, 0..) |item, index| {
+        if (item != .object) continue;
+        const info = getObjectField(item, "info") orelse continue;
+        const role = getOptionalObjectString(info, "role") orelse continue;
+        if (std.mem.eql(u8, role, "user")) {
+            last_user_index = index;
+        }
+    }
+
+    const after_user = last_user_index orelse return null;
+    var i = after_user + 1;
+    while (i < root.array.items.len) : (i += 1) {
+        const item = root.array.items[i];
+        if (item != .object) continue;
+        const info = getObjectField(item, "info") orelse continue;
+        const role = getOptionalObjectString(info, "role") orelse continue;
+        if (std.mem.eql(u8, role, "assistant")) {
+            return item;
+        }
+    }
+
+    return null;
 }
 
 fn findLatestAssistantMessage(value: std.json.Value) ?std.json.Value {
@@ -2093,6 +2094,23 @@ test "extractLatestAssistantTaskSummaryAlloc skips baseline assistant message" {
     const summary = (try extractLatestAssistantTaskSummaryAlloc(allocator, parsed.value, "baseline")).?;
     defer allocator.free(summary);
     try std.testing.expectEqualStrings("Running subtask: New task", summary);
+}
+
+test "findPrimaryAssistantAfterLastUser picks root assistant for latest user turn" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"info":{"role":"user","id":"u1","time":{"created":1}},"parts":[{"type":"text","text":"hi"}]},
+        \\  {"info":{"role":"assistant","id":"root","time":{"created":2}},"parts":[{"type":"text","text":"main"}]},
+        \\  {"info":{"role":"assistant","id":"sub","time":{"created":99}},"parts":[]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const item = findPrimaryAssistantAfterLastUser(parsed.value) orelse return error.TestUnexpectedNull;
+    const info_obj = getObjectField(item, "info") orelse return error.TestUnexpectedNull;
+    const id = getOptionalObjectString(info_obj, "id") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("root", id);
 }
 
 test "appendSessionDiffFiles keeps nested patch bodies and derives counts" {
