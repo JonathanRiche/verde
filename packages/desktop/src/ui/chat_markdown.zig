@@ -1225,6 +1225,14 @@ fn renderPaletteTextBlockLayout(
     }
 
     if (text_runs.items.len > 0) {
+        // `block.text` is freed when the BodyView is deinit'd after this frame's layout
+        // pass, while the overlay batch is drawn later — same as `queuePaletteText` we must
+        // duplicate into `frame_text` so run slices stay valid until the batch is consumed.
+        const stable_body = stablePaletteText(context, block.text) catch return height;
+        for (text_runs.items) |*run| {
+            run.text = stable_body[run.byte_start..run.byte_end];
+        }
+
         const cmd_rect: palette.Rect = .{
             .x = start[0],
             .y = start[1],
@@ -1234,7 +1242,7 @@ fn renderPaletteTextBlockLayout(
         context.batch.textRuns(
             context.allocator,
             cmd_rect,
-            block.text,
+            stable_body,
             text_runs.items,
             palette.Color.white,
             options.base_font_size,
