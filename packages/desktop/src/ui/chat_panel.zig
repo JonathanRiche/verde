@@ -44,17 +44,12 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
 
     const header = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_height };
 
-    const composer_width = @max(theme.scaledUi(220.0), @min(rect.w - side_margin * 2.0, theme.scaledUi(980.0)));
     const composer_bottom = if (terminal_height > 0.0)
         rect.y + rect.h - terminal_height - terminal_gap
     else
         rect.y + rect.h - bottom_margin;
-    const composer_rect = palette.Rect{
-        .x = rect.x + (rect.w - composer_width) * 0.5,
-        .y = composer_bottom - composer_height,
-        .w = composer_width,
-        .h = composer_height,
-    };
+    const composer_y = composer_bottom - composer_height;
+
     const attachment_count = state.currentThread().draftImageCount();
     const attachment_rows = if (attachment_count == 0) 0 else (attachment_count + 1) / 2;
     const attachment_reserve = if (attachment_rows > 0)
@@ -66,11 +61,23 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_rect.y - (header.y + header.h) - attachment_reserve, theme.scaledUi(120.0)),
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve, theme.scaledUi(120.0)),
     };
 
-    if (state.isBrowserVisible() and body.w >= theme.scaledUi(900.0)) {
-        const browser_width = body.w * 0.50;
+    const split_chat_browser = state.isBrowserVisible() and body.w >= theme.scaledUi(900.0);
+    const browser_width = if (split_chat_browser) state.browserPanelWidth(body.w) else 0.0;
+    const composer_lane_w = if (split_chat_browser) body.w - browser_width else body.w;
+    const composer_lane_x = body.x;
+
+    const composer_width = @max(theme.scaledUi(220.0), @min(composer_lane_w - side_margin * 2.0, theme.scaledUi(980.0)));
+    const composer_rect = palette.Rect{
+        .x = composer_lane_x + (composer_lane_w - composer_width) * 0.5,
+        .y = composer_y,
+        .w = composer_width,
+        .h = composer_height,
+    };
+
+    if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
         renderTranscript(state, chat_rect);
         browser_panel.renderDockAt(state, .{ .x = chat_rect.x + chat_rect.w, .y = body.y, .w = browser_width, .h = body.h });
