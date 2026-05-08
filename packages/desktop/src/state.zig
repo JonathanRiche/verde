@@ -1435,6 +1435,8 @@ pub const AppState = struct {
     browser_pane_max: [2]f32,
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
+    /// Palette sidebar thread row under the cursor (hover highlight).
+    sidebar_thread_hover: ?struct { project_index: usize, thread_index: usize },
     browser_pane_focused: bool,
     browser_address_focused: bool,
     browser_address_cursor: usize,
@@ -1554,6 +1556,7 @@ pub const AppState = struct {
             .browser_pane_max = .{ 0.0, 0.0 },
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
+            .sidebar_thread_hover = null,
             .browser_pane_focused = false,
             .browser_address_focused = false,
             .browser_address_cursor = 0,
@@ -2689,7 +2692,7 @@ pub const AppState = struct {
                 var thread = try ChatThread.init(self.allocator, "New thread");
                 thread.archived = project.archived;
                 thread.committed = project.messages.len > 0;
-                thread.last_activity_at = if (thread.committed) 0 else 0;
+                thread.last_activity_at = 0;
                 thread.provider = project.provider;
                 thread.harness = project.harness;
                 thread.setDraft(project.draft);

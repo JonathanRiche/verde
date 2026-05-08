@@ -564,6 +564,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .mouse_motion => {
             browser_ui.handlePaletteMouseMotion(event.motion.x, event.motion.y);
+            sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
                 return true;
             }
