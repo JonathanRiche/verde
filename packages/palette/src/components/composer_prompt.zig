@@ -202,6 +202,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         hovered_menu_index: ?usize = null,
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
+        show_fast_toggle: bool = true,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
@@ -212,6 +213,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         icon_font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: ComposerPromptCallbacks = .{},
+
+        pub fn setShowFastToggle(self: *Component, show: bool) void {
+            self.show_fast_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .fast) null else self.hovered_part;
+            }
+        }
+
+        pub fn showFastToggle(self: *const Component) bool {
+            return self.show_fast_toggle;
+        }
 
         pub fn init() Component {
             return .{};
@@ -406,7 +418,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (geometry.send.contains(point)) return .send;
             if (geometry.model.contains(point)) return .model;
             if (geometry.reasoning.contains(point)) return .reasoning;
-            if (geometry.fast.contains(point)) return .fast;
+            if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
             if (geometry.access.contains(point)) return .access;
             return null;
         }
@@ -485,10 +497,13 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
 
             try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
+            if (self.show_fast_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
+                try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
+                try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
+            } else {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.access), geometry.toolbar);
+            }
 
             try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
@@ -1189,11 +1204,18 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
             const reasoning_w = @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0));
             const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
-            x += reasoning_w + config.control_gap;
+            x += reasoning_w;
 
-            const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
-            const fast: draw.Rect = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
-            x += fast_w + config.control_gap;
+            var fast: draw.Rect = undefined;
+            if (self.show_fast_toggle) {
+                x += config.control_gap;
+                const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
+                fast = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
+                x += fast_w + config.control_gap;
+            } else {
+                fast = .{ .x = x, .y = y, .w = 0.0, .h = control_h };
+                x += config.control_gap;
+            }
 
             const access_w = @min(self.pillWidth(config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width), @max(max_x - x, 0.0));
             const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };

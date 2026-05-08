@@ -151,6 +151,8 @@ When adding a new chat provider, wire it through the shared provider request con
 - If the provider cannot support local image/file inputs, fail explicitly with a user-facing notice instead of silently dropping attachments.
 - Validate both text-only prompts and prompts with more than one image before considering the provider complete.
 
+**Palette composer toolbar:** The Fast/Default pill maps to Codex `service_tier` / `fast_mode` only (`utils.serviceTierForMode`). Providers without that concept (for example OpenCode) must not show the control: use `palette_composer.setShowFastToggle` from `syncPaletteComposerControls` when the current provider does not support it, and ignore `fast_changed` composer events for those providers. Wire the same toggle when adding another provider that exposes a comparable speed option.
+
 ## Provider transcript UI contract (Palette)
 
 The chat workspace (`src/ui/chat_panel.zig`) renders **committed messages** and **in-flight stream state** (`send_state.partial_text`, `send_state.pending_events`). New providers must emit data in shapes the UI already understands, or extend **one** well-documented place (`shouldRenderPaletteCommandRow` and friends in `chat_panel.zig`) when introducing a genuinely new visual category.
