@@ -1036,10 +1036,11 @@ fn walkTextBlockLayout(
             .text => |text_run| {
                 const spec = inlineFontSpec(block.style, text_run.style, options);
                 const chunk_line_height = lineHeightForSpec(spec, options);
+                const face = paletteFaceForLayout(spec, options);
                 const slice = block.text[text_run.start..text_run.end];
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = layoutTextWidthForSpec(spec, chunk.text);
+                    const chunk_width = face.measureRun(chunk.text);
 
                     if (chunk.is_whitespace and state.line_start) {
                         continue;
@@ -1621,11 +1622,8 @@ fn buildSelectableCodeLines(
     block: FencedCodeView,
     options: RenderOptions,
 ) ![]SelectableCodeLine {
-    const code_spec: FontSpec = .{
-        .size = options.code_font_size,
-    };
-
     const line_height = codeLineHeight(options);
+    const code_face = paletteCodeFontFace(options);
     var lines = std.ArrayList(SelectableCodeLine).empty;
     errdefer {
         for (lines.items) |line| allocator.free(line.chunks);
@@ -1641,11 +1639,11 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = layoutTextWidthForSpec(code_spec, token.text);
+            const token_width = code_face.measureRun(token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
-                .font_spec = code_spec,
+                .font_spec = .{ .size = options.code_font_size },
                 .x = cursor_x,
                 .width = token_width,
                 .start_column = cursor_column,
@@ -1874,11 +1872,12 @@ fn renderPaletteStyledChunk(
 
 fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) void {
     var cursor_x = layout.x;
+    const code_face = paletteCodeFontFace(options);
     for (line.tokens) |token| {
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = layoutTextWidthForSpec(.{ .size = options.code_font_size }, token.text);
+        const width = code_face.measureRun(token.text);
         queuePaletteText(context, .{
             .x = cursor_x,
             .y = layout.y,
@@ -1971,23 +1970,22 @@ fn lineHeightForSpec(spec: FontSpec, options: RenderOptions) f32 {
     return (options.line_height orelse fontSizeForSpecWithOptions(spec, options) * 1.25);
 }
 
+/// Horizontal metrics for markdown layout: matches `palette.TextStack` / `text_layout` defaults
+/// (UTF-8 scalar advances) so chunk positions align with Palette-owned measurement.
+fn paletteFaceForLayout(spec: FontSpec, options: RenderOptions) palette.TextFontFace {
+    const fs = fontSizeForSpecWithOptions(spec, options);
+    var m = palette.TextMetrics.defaultUi(fs);
+    m.line_height = lineHeightForSpec(spec, options);
+    return palette.TextFontFace.init("", m);
+}
+
+fn paletteCodeFontFace(options: RenderOptions) palette.TextFontFace {
+    const fs = codeFontSize(options);
+    return palette.TextFontFace.defaultUi("", fs);
+}
+
 fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
     return @as(f32, @floatFromInt(countColumns(text))) * glyphWidthForSpec(spec, .{});
-}
-
-/// Counts glyphs the OpenGL transcript rasterizer (`palette_text_gl_draw`) actually advances for:
-/// one byte at a time, only U+0020..U+007E are drawn; all other bytes are skipped with no advance.
-/// Markdown layout must use this for horizontal metrics or wrapped runs leave huge gaps between chunks.
-fn layoutGlyphCellCount(text: []const u8) usize {
-    var n: usize = 0;
-    for (text) |b| {
-        if (b >= 32 and b <= 126) n += 1;
-    }
-    return n;
-}
-
-fn layoutTextWidthForSpec(spec: FontSpec, text: []const u8) f32 {
-    return @as(f32, @floatFromInt(layoutGlyphCellCount(text))) * glyphWidthForSpec(spec, .{});
 }
 
 fn nextChunk(text: []const u8, index: *usize) ?Chunk {
@@ -2272,9 +2270,12 @@ test "maps markdown fence tags to syntax languages" {
     try std.testing.expectEqual(zig_dif.Language.plain, codeLanguageForTag(null));
 }
 
-test "layout glyph count matches GL transcript rasterizer ASCII subset" {
-    try std.testing.expectEqual(@as(usize, 2), layoutGlyphCellCount("a\u{00A0}b")); // NBSP UTF-8 bytes not drawn by palette_text_gl
-    try std.testing.expectEqual(@as(usize, 2), layoutGlyphCellCount("a\tb")); // tab skipped like in palette_text_gl_draw
+test "markdown layout width uses palette text metrics for nbsp and tab" {
+    const options = RenderOptions{ .base_font_size = 10.0, .line_height = 12.5 };
+    const spec: FontSpec = .{};
+    const face = paletteFaceForLayout(spec, options);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.2), face.measureRun("\xc2\xa0"), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 12.8), face.measureRun("\t"), 0.001);
     try std.testing.expectEqual(@as(usize, 3), countColumns("a\u{00A0}b"));
 }
 
