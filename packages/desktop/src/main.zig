@@ -463,8 +463,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
             if (paste_shortcut) {
-                if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 if (state.attachClipboardImageToCurrentDraft()) return true;
+                if (state.pasteClipboardTextIntoPaletteComposer()) return true;
             }
             if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);

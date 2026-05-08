@@ -2869,18 +2869,22 @@ pub const AppState = struct {
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image capture failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Clipboard image paste failed.");
-            return true;
+            return false;
         };
         if (capture == null) {
+            runtime_log.diagnostic("clipboard image capture unavailable", .{});
             return false;
         }
 
         const image = capture.?;
         defer self.allocator.free(image.bytes);
+        runtime_log.diagnostic("clipboard image captured mime={s} bytes={d}", .{ image.mime, image.bytes.len });
 
         const image_path = self.writeClipboardImageToStorage(image.mime, image.bytes) catch |err| {
             log.err("failed to persist clipboard image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image persist failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to save clipboard image.");
             return true;
         };
@@ -2889,9 +2893,11 @@ pub const AppState = struct {
         const thread = self.currentThreadMutable();
         thread.setDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
             log.err("failed to attach draft image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image draft attach failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to attach clipboard image.");
             return true;
         };
+        runtime_log.diagnostic("clipboard image attached mime={s} bytes={d}", .{ image.mime, image.bytes.len });
         self.setSidebarNotice("Clipboard image attached.");
         self.markDirty();
         return true;
@@ -4401,6 +4407,9 @@ pub const AppState = struct {
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
+        self.palette_composer.setPlaceholder(self.allocator, if (thread.draft_image == null) "Ask anything, or use / to show available commands" else " ") catch |err| {
+            log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
+        };
         const model_options = composerModelOptions(self, thread.provider);
         self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
         self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
