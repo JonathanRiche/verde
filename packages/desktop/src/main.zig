@@ -600,6 +600,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (event.button.button == 1 and state.handleComposerDraftImageClearMouseButton(event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;

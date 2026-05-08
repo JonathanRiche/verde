@@ -43,12 +43,13 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         .w = composer_width,
         .h = composer_height,
     };
+    const attachment_reserve = if (state.currentThread().draft_image != null) theme.scaledUi(84.0) else 0.0;
 
     const body = palette.Rect{
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_rect.y - (header.y + header.h), theme.scaledUi(120.0)),
+        .h = @max(composer_rect.y - (header.y + header.h) - attachment_reserve, theme.scaledUi(120.0)),
     };
 
     if (state.isBrowserVisible() and body.w >= theme.scaledUi(900.0)) {
@@ -276,26 +277,35 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
 }
 
 fn renderComposerDraftImage(state: *app_state.AppState) void {
-    const image = state.currentThread().draft_image orelse return;
-    const text_rect = state.palette_composer.textRect();
-    if (text_rect.w <= theme.scaledUi(120.0) or text_rect.h <= theme.scaledUi(72.0)) return;
+    const image = state.currentThread().draft_image orelse {
+        state.setComposerDraftImageClearRect(null);
+        return;
+    };
+    const previous_z = state.palette_overlay_batch.setZIndex(10);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const thumb_max: f32 = @min(theme.scaledUi(86.0), @max(theme.scaledUi(52.0), text_rect.h - theme.scaledUi(18.0)));
-    const preview_w = @min(text_rect.w - theme.scaledUi(12.0), theme.scaledUi(360.0));
-    const preview_h = thumb_max + theme.scaledUi(16.0);
+    const composer = state.palette_composer.bounds();
+    if (composer.w <= theme.scaledUi(140.0)) {
+        state.setComposerDraftImageClearRect(null);
+        return;
+    }
+
+    const preview_h = theme.scaledUi(68.0);
+    const thumb_max: f32 = theme.scaledUi(56.0);
+    const preview_w = @min(composer.w - theme.scaledUi(48.0), theme.scaledUi(360.0));
     const preview = palette.Rect{
-        .x = text_rect.x + theme.scaledUi(2.0),
-        .y = text_rect.y + theme.scaledUi(2.0),
+        .x = composer.x + theme.scaledUi(24.0),
+        .y = composer.y - preview_h - theme.scaledUi(10.0),
         .w = preview_w,
         .h = preview_h,
     };
 
-    queueRounded(state, preview, paletteColor(colors.rgba(12, 20, 21, 235)), theme.scaledUi(10.0));
-    queueBorder(state, preview, paletteColor(colors.rgba(76, 95, 101, 220)), theme.scaledUi(10.0), theme.scaledUi(1.0));
+    queueRounded(state, preview, paletteColor(colors.rgba(7, 13, 14, 255)), theme.scaledUi(9.0));
+    queueBorder(state, preview, paletteColor(colors.rgba(76, 95, 101, 255)), theme.scaledUi(9.0), theme.scaledUi(1.0));
 
     const thumb = palette.Rect{
-        .x = preview.x + theme.scaledUi(8.0),
-        .y = preview.y + theme.scaledUi(8.0),
+        .x = preview.x + theme.scaledUi(6.0),
+        .y = preview.y + (preview.h - thumb_max) * 0.5,
         .w = thumb_max,
         .h = thumb_max,
     };
@@ -321,19 +331,36 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
     var size_buf: [32:0]u8 = undefined;
     const size_label = runtime.formatByteSize(&size_buf, image.byte_size);
     const label_x = thumb.x + thumb.w + theme.scaledUi(12.0);
-    const label_w = @max(preview.x + preview.w - label_x - theme.scaledUi(12.0), theme.scaledUi(1.0));
+    const clear_size = theme.scaledUi(22.0);
+    const clear_rect = palette.Rect{
+        .x = preview.x + preview.w - clear_size - theme.scaledUi(8.0),
+        .y = preview.y + theme.scaledUi(8.0),
+        .w = clear_size,
+        .h = clear_size,
+    };
+    state.setComposerDraftImageClearRect(clear_rect);
+    const label_w = @max(clear_rect.x - label_x - theme.scaledUi(12.0), theme.scaledUi(1.0));
     queueText(state, .{
         .x = label_x,
-        .y = preview.y + theme.scaledUi(16.0),
-        .w = label_w,
-        .h = theme.scaledUi(24.0),
-    }, image.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.0), preview);
-    queueText(state, .{
-        .x = label_x,
-        .y = preview.y + theme.scaledUi(42.0),
+        .y = preview.y + theme.scaledUi(15.0),
         .w = label_w,
         .h = theme.scaledUi(20.0),
-    }, size_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), preview);
+    }, image.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), preview);
+    queueText(state, .{
+        .x = label_x,
+        .y = preview.y + theme.scaledUi(39.0),
+        .w = label_w,
+        .h = theme.scaledUi(18.0),
+    }, size_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), preview);
+
+    queueRounded(state, clear_rect, paletteColor(colors.rgba(35, 42, 46, 255)), clear_size * 0.5);
+    queueBorder(state, clear_rect, paletteColor(colors.rgba(86, 105, 112, 255)), clear_size * 0.5, theme.scaledUi(1.0));
+    queueText(state, .{
+        .x = clear_rect.x + clear_rect.w * 0.34,
+        .y = clear_rect.y + clear_rect.h * 0.10,
+        .w = clear_rect.w * 0.5,
+        .h = clear_rect.h * 0.8,
+    }, "x", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clear_rect);
 }
 
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {

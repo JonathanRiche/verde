@@ -1252,6 +1252,8 @@ pub const AppState = struct {
     composer_send_max: [2]f32,
     composer_send_pressed: bool,
     composer_send_hovered: bool,
+    composer_draft_image_clear_valid: bool,
+    composer_draft_image_clear_rect: palette.Rect,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
@@ -1365,6 +1367,8 @@ pub const AppState = struct {
             .composer_send_max = .{ 0.0, 0.0 },
             .composer_send_pressed = false,
             .composer_send_hovered = false,
+            .composer_draft_image_clear_valid = false,
+            .composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
@@ -4749,6 +4753,26 @@ pub const AppState = struct {
         self.composer_input_bounds_valid = true;
         self.composer_input_min = input_min;
         self.composer_input_max = input_max;
+    }
+
+    pub fn setComposerDraftImageClearRect(self: *AppState, rect: ?palette.Rect) void {
+        if (rect) |value| {
+            self.composer_draft_image_clear_valid = true;
+            self.composer_draft_image_clear_rect = value;
+        } else {
+            self.composer_draft_image_clear_valid = false;
+            self.composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+        }
+    }
+
+    pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
+        if (!self.composer_draft_image_clear_valid) return false;
+        const rect = self.composer_draft_image_clear_rect;
+        if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
+        if (!down) {
+            self.clearCurrentDraftImage();
+        }
+        return true;
     }
 
     fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
