@@ -1680,6 +1680,24 @@ pub const AppState = struct {
             sorted_models[j] = current;
         }
 
+        // Preset `opencode/…` routes first when the API list omits them (common when only one vendor
+        // is configured). Skip a preset when any API row already exposes the same model id so we do
+        // not list two entries for the same model (e.g. `openai/gpt-5.4` vs `opencode/gpt-5.4`).
+        for (OPENCODE_MODEL_OPTIONS) |preset| {
+            const preset_value = preset.value orelse continue;
+            const preset_model_id = opencodeModelIdSuffixFromRef(preset_value) orelse continue;
+            if (opencodeSortedModelsContainModelId(sorted_models, preset_model_id)) continue;
+
+            const preset_label = try self.allocator.dupeZ(u8, preset.label);
+            errdefer self.allocator.free(preset_label);
+            const preset_value_copy = try self.allocator.dupeZ(u8, preset_value);
+            errdefer self.allocator.free(preset_value_copy);
+            try self.opencode_model_options.append(self.allocator, .{
+                .label = preset_label,
+                .value = preset_value_copy,
+            });
+        }
+
         for (sorted_models) |model| {
             const model_name = model.model_name;
             const provider_name = model.provider_name;
@@ -1698,32 +1716,19 @@ pub const AppState = struct {
                 .value = value,
             });
         }
+    }
 
-        // OpenCode's configured provider list can be a subset (e.g. only models the user wired
-        // through one vendor). Keep the built-in `opencode/…` presets so OpenCode threads can
-        // still target other bundled routes when those refs are valid for the harness.
-        for (OPENCODE_MODEL_OPTIONS) |preset| {
-            const preset_value = preset.value orelse continue;
-            var already = false;
-            for (self.opencode_model_options.items) |existing| {
-                if (existing.value) |v| {
-                    if (std.mem.eql(u8, v, preset_value)) {
-                        already = true;
-                        break;
-                    }
-                }
-            }
-            if (already) continue;
+    fn opencodeModelIdSuffixFromRef(model_ref: []const u8) ?[]const u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, model_ref, '/') orelse return null;
+        if (slash + 1 >= model_ref.len) return null;
+        return model_ref[slash + 1 ..];
+    }
 
-            const preset_label = try self.allocator.dupeZ(u8, preset.label);
-            errdefer self.allocator.free(preset_label);
-            const preset_value_copy = try self.allocator.dupeZ(u8, preset_value);
-            errdefer self.allocator.free(preset_value_copy);
-            try self.opencode_model_options.append(self.allocator, .{
-                .label = preset_label,
-                .value = preset_value_copy,
-            });
+    fn opencodeSortedModelsContainModelId(sorted_models: anytype, model_id: []const u8) bool {
+        for (sorted_models) |m| {
+            if (std.mem.eql(u8, m.model_id, model_id)) return true;
         }
+        return false;
     }
 
     fn opencodeModelSortLessThan(a: anytype, b: anytype) bool {

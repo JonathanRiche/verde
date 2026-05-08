@@ -351,7 +351,16 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             while (depth < self.visibleDepthCount()) : (depth += 1) {
                 _ = batch.setZIndex(self.z_index + @as(i32, @intCast(depth)) * config.submenu_z_offset);
                 const menu = self.menuRect(depth);
-                try batch.panel(allocator, menu, config.background_color, config.border_color, config.corner_radius, config.border_width);
+                const inset = @max(config.border_width, 1.0);
+                try batch.roundedRectClipped(allocator, menu, config.border_color, config.corner_radius, menu);
+                if (menu.w > inset * 2.0 and menu.h > inset * 2.0) {
+                    try batch.roundedRectClipped(allocator, .{
+                        .x = menu.x + inset,
+                        .y = menu.y + inset,
+                        .w = menu.w - inset * 2.0,
+                        .h = menu.h - inset * 2.0,
+                    }, config.background_color, @max(config.corner_radius - inset, 0.0), menu);
+                }
 
                 const range = self.visibleRange(depth);
                 var index = range.start;
