@@ -70,6 +70,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 state.show_project_creator = true;
                 state.setSidebarCollapsed(false);
                 state.setSidebarNotice("");
+                state.browseForProjectDirectory();
             },
             .new_thread => {
                 if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
@@ -232,12 +233,14 @@ fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette
 
 fn queuePaletteButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, green: bool) void {
     queuePaletteRoundedRect(state, rect, paletteColor(if (green) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
+    const font_size = theme.scaledUi(16.0);
+    const text_width = @as(f32, @floatFromInt(label.len)) * font_size * 0.55;
     queuePaletteText(state, .{
-        .x = rect.x,
-        .y = rect.y + theme.scaledUi(4.0),
-        .w = rect.w,
-        .h = rect.h,
-    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), rect);
+        .x = rect.x + (rect.w - text_width) * 0.5,
+        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
+        .w = @max(text_width, theme.scaledUi(4.0)),
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
 }
 
 fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread_index: usize, thread: anytype, rect: palette.Rect, clip: palette.Rect) void {

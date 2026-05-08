@@ -470,6 +470,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (handleFontSizeShortcut(state, &event.key)) {
+                return true;
+            }
             if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .new_thread) {
                 handleKeyboardAction(state, keyboard, action.?);
                 return true;
@@ -836,6 +839,31 @@ fn handleKeyboardAction(
             state.requestTranscriptPageScroll(1);
         },
     }
+}
+
+fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    const delta: f32 = switch (event.key) {
+        .plus, .kp_plus, .equals => 1.0,
+        .minus, .kp_minus => -1.0,
+        else => return false,
+    };
+    const current = state.app_config.font_size;
+    const next = clampf(current + delta, 11.0, 24.0);
+    if (@abs(next - current) < 0.01) return true;
+    state.app_config.font_size = next;
+    ui_theme.installFonts(
+        CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
+        NOTO_SANS_BOLD_BYTES[0..NOTO_SANS_BOLD_BYTES.len],
+        NOTO_SANS_ITALIC_BYTES[0..NOTO_SANS_ITALIC_BYTES.len],
+        NOTO_SANS_BOLD_ITALIC_BYTES[0..NOTO_SANS_BOLD_ITALIC_BYTES.len],
+        CODICON_BYTES[0..CODICON_BYTES.len],
+        NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
+        next,
+    );
+    state.markDirty();
+    return true;
 }
 
 fn canHandleTranscriptScrollAction(state: *const AppState) bool {
