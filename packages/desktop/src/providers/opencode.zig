@@ -1,6 +1,7 @@
 //! OpenCode provider harness backed by the local HTTP server.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 
@@ -62,6 +63,36 @@ const SharedServerState = struct {
 };
 
 var shared_server_state: SharedServerState = .{};
+
+/// When `VERDE_DUMP_OPENCODE_PROVIDERS` is set to a non-empty value other than `0`, writes the raw
+/// JSON body from `GET /config/providers` to disk for inspection (reasoning/thinking fields, variants, etc.).
+/// Override path with `VERDE_DUMP_OPENCODE_PROVIDERS_PATH` (absolute recommended on Unix: `/tmp/...`).
+fn maybeDumpOpencodeProvidersConfig(body: []const u8) void {
+    const flag_z = std.c.getenv("VERDE_DUMP_OPENCODE_PROVIDERS") orelse return;
+    const flag = std.mem.sliceTo(flag_z, 0);
+    if (flag.len == 0 or std.mem.eql(u8, flag, "0")) return;
+
+    const default_path: []const u8 = switch (builtin.os.tag) {
+        .windows => "verde-opencode-config-providers.json",
+        else => "/tmp/verde-opencode-config-providers.json",
+    };
+    const path = if (std.c.getenv("VERDE_DUMP_OPENCODE_PROVIDERS_PATH")) |p|
+        std.mem.sliceTo(p, 0)
+    else
+        default_path;
+
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var file = std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true }) catch |err| {
+        log.warn("VERDE_DUMP_OPENCODE_PROVIDERS: create {s}: {s}", .{ path, @errorName(err) });
+        return;
+    };
+    defer file.close(threaded.io());
+    file.writeStreamingAll(threaded.io(), body) catch |err| {
+        log.warn("VERDE_DUMP_OPENCODE_PROVIDERS: write {s}: {s}", .{ path, @errorName(err) });
+        return;
+    };
+    log.info("VERDE_DUMP_OPENCODE_PROVIDERS: wrote {d} bytes to {s}", .{ body.len, path });
+}
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -139,6 +170,8 @@ pub const Client = struct {
         defer self.allocator.free(response.body);
 
         if (response.status != .ok) return error.OpencodeRequestFailed;
+
+        maybeDumpOpencodeProvidersConfig(response.body);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
