@@ -232,13 +232,11 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
     const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
     const bg = switch (message.role) {
         .user => colors.rgba(31, 48, 46, 255),
-        .assistant => colors.rgba(10, 15, 16, 0),
+        .assistant => colors.rgba(22, 30, 32, 242),
         .system => colors.rgba(57, 43, 9, 235),
     };
-    if (message.role != .assistant) {
-        queueRounded(state, bubble, paletteColor(bg), theme.scaledUi(8.0));
-        queueBorder(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0);
-    }
+    queueRounded(state, bubble, paletteColor(bg), theme.scaledUi(8.0));
+    queueBorder(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0);
     queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),

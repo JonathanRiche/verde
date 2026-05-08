@@ -1039,7 +1039,7 @@ fn walkTextBlockLayout(
                 const slice = block.text[text_run.start..text_run.end];
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = textWidthForSpec(spec, chunk.text);
+                    const chunk_width = layoutTextWidthForSpec(spec, chunk.text);
 
                     if (chunk.is_whitespace and state.line_start) {
                         continue;
@@ -1641,7 +1641,7 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = textWidthForSpec(code_spec, token.text);
+            const token_width = layoutTextWidthForSpec(code_spec, token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
@@ -1878,7 +1878,7 @@ fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, lay
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = textWidthForSpec(.{ .size = options.code_font_size }, token.text);
+        const width = layoutTextWidthForSpec(.{ .size = options.code_font_size }, token.text);
         queuePaletteText(context, .{
             .x = cursor_x,
             .y = layout.y,
@@ -1973,6 +1973,21 @@ fn lineHeightForSpec(spec: FontSpec, options: RenderOptions) f32 {
 
 fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
     return @as(f32, @floatFromInt(countColumns(text))) * glyphWidthForSpec(spec, .{});
+}
+
+/// Counts glyphs the OpenGL transcript rasterizer (`palette_text_gl_draw`) actually advances for:
+/// one byte at a time, only U+0020..U+007E are drawn; all other bytes are skipped with no advance.
+/// Markdown layout must use this for horizontal metrics or wrapped runs leave huge gaps between chunks.
+fn layoutGlyphCellCount(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |b| {
+        if (b >= 32 and b <= 126) n += 1;
+    }
+    return n;
+}
+
+fn layoutTextWidthForSpec(spec: FontSpec, text: []const u8) f32 {
+    return @as(f32, @floatFromInt(layoutGlyphCellCount(text))) * glyphWidthForSpec(spec, .{});
 }
 
 fn nextChunk(text: []const u8, index: *usize) ?Chunk {
@@ -2255,6 +2270,12 @@ test "maps markdown fence tags to syntax languages" {
     try std.testing.expectEqual(zig_dif.Language.json, codeLanguageForTag("json"));
     try std.testing.expectEqual(zig_dif.Language.markdown, codeLanguageForTag("markdown"));
     try std.testing.expectEqual(zig_dif.Language.plain, codeLanguageForTag(null));
+}
+
+test "layout glyph count matches GL transcript rasterizer ASCII subset" {
+    try std.testing.expectEqual(@as(usize, 2), layoutGlyphCellCount("a\u{00A0}b")); // NBSP UTF-8 bytes not drawn by palette_text_gl
+    try std.testing.expectEqual(@as(usize, 2), layoutGlyphCellCount("a\tb")); // tab skipped like in palette_text_gl_draw
+    try std.testing.expectEqual(@as(usize, 3), countColumns("a\u{00A0}b"));
 }
 
 test "double click selection expands to a code word on raw lines" {
