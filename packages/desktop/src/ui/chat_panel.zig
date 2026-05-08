@@ -359,7 +359,6 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     };
     renderComposerDraftImage(state);
     renderComposerToolbarIcons(state);
-    renderComposerSendIcon(state);
 }
 
 fn renderComposerDraftImage(state: *app_state.AppState) void {
@@ -463,29 +462,6 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .w = icon_size,
         .h = icon_size,
     }, icon_color);
-}
-
-fn renderComposerSendIcon(state: *app_state.AppState) void {
-    const rect = state.palette_composer.sendButtonRect();
-    const color = paletteColor(theme.COLOR_WHITE);
-    const cx = rect.x + rect.w * 0.5;
-    const cy = rect.y + rect.h * 0.5;
-    const shaft_w = @max(rect.w * 0.10, theme.scaledUi(2.0));
-    const shaft_h = rect.h * 0.32;
-    const head_w = rect.w * 0.36;
-    queueRect(state, .{
-        .x = cx - shaft_w * 0.5,
-        .y = cy - shaft_h * 0.10,
-        .w = shaft_w,
-        .h = shaft_h,
-    }, color);
-    queueTriangle(
-        state,
-        .{ .x = cx, .y = cy - shaft_h * 0.62 },
-        .{ .x = cx - head_w * 0.5, .y = cy - shaft_h * 0.10 },
-        .{ .x = cx + head_w * 0.5, .y = cy - shaft_h * 0.10 },
-        color,
-    );
 }
 
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
