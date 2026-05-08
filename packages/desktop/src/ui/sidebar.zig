@@ -53,6 +53,36 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     }
 }
 
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
+    var new_hover: ?struct { project_index: usize, thread_index: usize } = null;
+    if (!state.isSidebarCollapsed() and rectContainsPoint(palette_sidebar_rect, x, y)) {
+        var index = palette_hit_count;
+        while (index > 0) {
+            index -= 1;
+            const hit = palette_hits[index];
+            if (hit.kind != .thread_row) continue;
+            if (!rectContainsPoint(hit.rect, x, y)) continue;
+            new_hover = .{ .project_index = hit.project_index, .thread_index = hit.thread_index };
+            break;
+        }
+    }
+
+    if (state.sidebar_thread_hover == null and new_hover == null) return;
+
+    var changed = false;
+    if (state.sidebar_thread_hover) |ho| {
+        if (new_hover) |nw| {
+            changed = ho.project_index != nw.project_index or ho.thread_index != nw.thread_index;
+        } else changed = true;
+    } else {
+        changed = new_hover != null;
+    }
+    if (!changed) return;
+
+    state.sidebar_thread_hover = new_hover;
+    state.markDirty();
+}
+
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return rectContainsPoint(palette_sidebar_rect, x, y);
     if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
@@ -183,13 +213,21 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                 y += theme.scaledUi(28.0);
             }
             if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
-                const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(28.0) };
+                const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) };
                 if (rowVisible(show_rect, rect)) {
                     queuePaletteRoundedRect(state, show_rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(8.0));
-                    queuePaletteText(state, .{ .x = show_rect.x, .y = show_rect.y + theme.scaledUi(5.0), .w = show_rect.w, .h = show_rect.h }, if (project.thread_list_expanded) "Show less" else "Show more", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), show_rect);
+                    const label = if (project.thread_list_expanded) "Show less" else "Show more";
+                    const show_pad_x = theme.scaledUi(14.0);
+                    const font_size = theme.scaledUi(14.0);
+                    queuePaletteText(state, .{
+                        .x = show_rect.x + show_pad_x,
+                        .y = show_rect.y + (show_rect.h - font_size * 1.25) * 0.5,
+                        .w = show_rect.w - show_pad_x * 2.0,
+                        .h = font_size * 1.25,
+                    }, label, paletteColor(theme.COLOR_WHITE), font_size, show_rect);
                     addPaletteHit(show_rect, .toggle_threads, project_index, 0);
                 }
-                y += theme.scaledUi(36.0);
+                y += theme.scaledUi(40.0);
             }
         }
         y += theme.scaledUi(8.0);
@@ -246,7 +284,12 @@ fn queuePaletteButton(state: *runtime.AppState, rect: palette.Rect, label: []con
 fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread_index: usize, thread: anytype, rect: palette.Rect, clip: palette.Rect) void {
     const project = &state.projects.items[project_index];
     const selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
-    if (selected) queuePaletteRoundedRect(state, rect, paletteColor(colors.DARK_BLUE), theme.scaledUi(4.0));
+    const hovered = if (state.sidebar_thread_hover) |h| h.project_index == project_index and h.thread_index == thread_index else false;
+    if (selected) {
+        queuePaletteRoundedRect(state, rect, paletteColor(colors.DARK_BLUE), theme.scaledUi(4.0));
+    } else if (hovered) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.CHAT_BLACK, 0.14)), theme.scaledUi(4.0));
+    }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
     queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(8.0), rect.y + rect.h * 0.5, clip);
@@ -446,21 +489,33 @@ fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:
     return buffer[0..bounded_max :0];
 }
 
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn unixTimestampSeconds() i64 {
+    return @divTrunc(unixTimestampMs(), std.time.ms_per_s);
+}
+
 /// Formats a relative timestamp for sidebar metadata.
 fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
-    if (timestamp <= 0) return "now";
-    const elapsed = @max(0 - timestamp, 0);
+    if (timestamp <= 0) return "—";
+    const now = unixTimestampSeconds();
+    const elapsed = @max(0, now - timestamp);
     if (elapsed < 60) return "now";
     if (elapsed < 3600) {
         const minutes = @divFloor(elapsed, 60);
-        return std.fmt.bufPrint(buffer, "{d}m ago", .{minutes}) catch "recent";
+        return std.fmt.bufPrint(buffer, "{d}m", .{minutes}) catch "…";
     }
     if (elapsed < 86_400) {
         const hours = @divFloor(elapsed, 3600);
-        return std.fmt.bufPrint(buffer, "{d}h ago", .{hours}) catch "recent";
+        return std.fmt.bufPrint(buffer, "{d}h", .{hours}) catch "…";
     }
     const days = @divFloor(elapsed, 86_400);
-    return std.fmt.bufPrint(buffer, "{d}d ago", .{days}) catch "recent";
+    return std.fmt.bufPrint(buffer, "{d}d", .{days}) catch "…";
 }
 
 fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
