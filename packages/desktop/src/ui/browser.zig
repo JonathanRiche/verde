@@ -7,7 +7,6 @@ const sdl = @import("zsdl3");
 const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
-const runtime = @import("runtime.zig");
 const theme = @import("theme.zig");
 
 const BrowserHitKind = enum {
@@ -288,13 +287,18 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
     renderPaletteToolbarButton(
         state,
         inspect_menu_rect,
-        "⌄",
+        "",
         inspector_button_color,
         inspector_hover_color,
         inspector_active_color,
         if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
         can_use_inspector and rectHovered(inspect_menu_rect),
         false,
+    );
+    drawCaretDownIcon(
+        state,
+        centeredIconRect(inspect_menu_rect),
+        paletteColor(if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE),
     );
     addPaletteHit(inspect_menu_rect, .inspect_mode_menu);
     if (!can_use_inspector) state.browser_inspector_menu_open = false;
@@ -346,6 +350,22 @@ fn centeredIconRect(rect: palette.Rect) palette.Rect {
         .w = size,
         .h = size,
     };
+}
+
+/// Small ▼ for the inspector mode split button (Unicode caret is often absent from the UI font).
+fn drawCaretDownIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    const cx = rect.x + rect.w * 0.5;
+    const tip_y = rect.y + rect.h * 0.72;
+    const wing_y = rect.y + rect.h * 0.30;
+    const left_x = rect.x + rect.w * 0.20;
+    const right_x = rect.x + rect.w * 0.80;
+    queuePaletteTriangle(
+        state,
+        .{ .x = cx, .y = tip_y },
+        .{ .x = left_x, .y = wing_y },
+        .{ .x = right_x, .y = wing_y },
+        color,
+    );
 }
 
 fn drawCursorIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
@@ -531,26 +551,16 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {
-            // Preserve the browser snapshot aspect ratio so compositor-sized frames are not stretched into the pane.
-            const image_size = runtime.scaledImageSize(
-                @intCast(pane_texture.width),
-                @intCast(pane_texture.height),
-                pane_rect.w,
-                pane_rect.h,
-            );
-            const image_pos = .{
-                pane_rect.x + (pane_rect.w - image_size[0]) * 0.5,
-                pane_rect.y + (pane_rect.h - image_size[1]) * 0.5,
-            };
+            // Fill the pane so the preview uses the full column (resizePane already matches pane_rect size).
             state.noteBrowserPaneRegion(
-                image_pos,
-                .{ image_pos[0] + image_size[0], image_pos[1] + image_size[1] },
+                .{ pane_rect.x, pane_rect.y },
+                .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
                 input_size,
                 pane_hovered,
             );
             state.palette_overlay_batch.image(
                 state.allocator,
-                .{ .x = image_pos[0], .y = image_pos[1], .w = image_size[0], .h = image_size[1] },
+                .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = pane_rect.h },
                 palette.TextureId.init(pane_texture.texture_id),
                 .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
                 paletteColor(theme.COLOR_WHITE),
