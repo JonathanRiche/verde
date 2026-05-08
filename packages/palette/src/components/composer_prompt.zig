@@ -30,6 +30,8 @@ pub const ComposerPromptConfig = struct {
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
     send_color: draw.Color = .{ .r = 0.32, .g = 0.54, .b = 0.39, .a = 1.0 },
     send_hover_color: draw.Color = .{ .r = 0.38, .g = 0.64, .b = 0.47, .a = 1.0 },
+    stop_button_color: draw.Color = .{ .r = 0.78, .g = 0.58, .b = 0.10, .a = 1.0 },
+    stop_button_hover_color: draw.Color = .{ .r = 0.90, .g = 0.68, .b = 0.14, .a = 1.0 },
     text_color: draw.Color = draw.Color.white,
     placeholder_color: draw.Color = .{ .r = 0.58, .g = 0.62, .b = 0.68, .a = 0.82 },
     icon_color: draw.Color = .{ .r = 0.78, .g = 0.82, .b = 0.88, .a = 1.0 },
@@ -491,11 +493,24 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
-            const send_color: draw.Color = if (send_disabled)
-                draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 }
-            else if (self.hovered_part == .send) config.send_hover_color else config.send_color;
-            try batch.panel(allocator, geometry.send, send_color, null, geometry.send.h * 0.5, 0.0);
-            try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            const send_panel_color: draw.Color = blk: {
+                if (send_disabled)
+                    break :blk draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 };
+                if (self.send_state == .stop) {
+                    if (self.hovered_part == .send) break :blk config.stop_button_hover_color;
+                    break :blk config.stop_button_color;
+                }
+                if (self.hovered_part == .send) break :blk config.send_hover_color;
+                break :blk config.send_color;
+            };
+            try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
+            if (self.send_state == .stop) {
+                try renderStopSquare(allocator, batch, geometry.send);
+            } else if (self.send_state == .pending) {
+                try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            } else {
+                try renderSendArrow(allocator, batch, geometry.send);
+            }
         }
 
         fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
@@ -534,6 +549,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
+            if (icon.len == 0) return;
             const metrics = self.iconMetrics();
             const width = metrics.measureSlice(icon);
             const runs = [_]draw.TextRun{.{
@@ -550,6 +566,51 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_id = config.icon_font_id,
             }};
             try batch.textRuns(allocator, rect, icon, &runs, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+        }
+
+        fn sendGlyphBounds(button: draw.Rect) draw.Rect {
+            const m = @min(button.w, button.h);
+            const inset = m * 0.125;
+            return .{
+                .x = button.x + inset,
+                .y = button.y + inset,
+                .w = @max(button.w - 2.0 * inset, 1.0),
+                .h = @max(button.h - 2.0 * inset, 1.0),
+            };
+        }
+
+        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const side = m * 0.74;
+            const cx = inner.x + inner.w * 0.5;
+            const cy = inner.y + inner.h * 0.5;
+            const cr = @max(side * 0.18, 1.5);
+            try batch.roundedRectClipped(allocator, .{
+                .x = cx - side * 0.5,
+                .y = cy - side * 0.5,
+                .w = side,
+                .h = side,
+            }, draw.Color.white, cr, button);
+        }
+
+        /// Single clipped chevron (no layered triangles — those read as a double arrow at small sizes).
+        fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const cx = @round((inner.x + inner.w * 0.5) * 2.0) * 0.5;
+            const cy = @round((inner.y + inner.h * 0.5) * 2.0) * 0.5;
+            const half = m * 0.20;
+            const rise = m * 0.12;
+            const fall = m * 0.10;
+            try batch.triangleClipped(
+                allocator,
+                .{ .x = cx, .y = cy - rise },
+                .{ .x = cx - half, .y = cy + fall },
+                .{ .x = cx + half, .y = cy + fall },
+                draw.Color.white,
+                button,
+            );
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {

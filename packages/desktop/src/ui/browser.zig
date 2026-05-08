@@ -443,9 +443,10 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
 
     if (focused) {
         const cursor = @min(state.browser_address_cursor, address.len);
-        const caret_x = text_rect.x + @as(f32, @floatFromInt(cursor)) * font_size * 0.55;
+        const prefix_w = app_state.paletteUiTextPrefixWidth(address, font_size, cursor);
+        const caret_x = text_rect.x + prefix_w;
         queuePaletteRect(state, .{
-            .x = @min(caret_x, rect.x + rect.w - pad_x),
+            .x = @min(caret_x, rect.x + rect.w - pad_x - theme.scaledUi(1.5)),
             .y = text_rect.y + theme.scaledUi(1.0),
             .w = theme.scaledUi(1.5),
             .h = text_rect.h - theme.scaledUi(2.0),
@@ -487,12 +488,31 @@ fn selectInspectorMode(state: *app_state.AppState, mode: browser_runtime.Inspect
     state.browser_inspector_menu_open = false;
 }
 
+fn addressIndexForClick(address: []const u8, font_size: f32, rel: f32) usize {
+    if (address.len == 0 or rel <= 0.0) return 0;
+    const total = app_state.paletteUiTextPrefixWidth(address, font_size, address.len);
+    if (rel >= total) return address.len;
+
+    var i: usize = 0;
+    while (i < address.len) {
+        const step = std.unicode.utf8ByteSequenceLength(address[i]) catch 1;
+        const next = @min(i + step, address.len);
+        const w_before = app_state.paletteUiTextPrefixWidth(address, font_size, i);
+        const w_after = app_state.paletteUiTextPrefixWidth(address, font_size, next);
+        if (w_after > rel) {
+            return if (rel - w_before <= w_after - rel) i else next;
+        }
+        i = next;
+    }
+    return address.len;
+}
+
 fn cursorForAddressPoint(state: *app_state.AppState, rect: palette.Rect, x: f32) usize {
     const font_size = theme.scaledUi(14.0);
     const pad_x = theme.scaledUi(10.0);
+    const address = state.browserState().addressInput();
     const rel = @max(x - rect.x - pad_x, 0.0);
-    const estimated = @as(usize, @intFromFloat(rel / @max(font_size * 0.55, 1.0)));
-    return @min(estimated, state.browserState().addressInput().len);
+    return @min(addressIndexForClick(address, font_size, rel), address.len);
 }
 
 fn insertAddressText(state: *app_state.AppState, text: []const u8) void {

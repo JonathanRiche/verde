@@ -164,6 +164,18 @@ pub const RenderBatch = struct {
         });
     }
 
+    pub fn triangleClipped(self: *RenderBatch, allocator: std.mem.Allocator, p0: Vec2, p1: Vec2, p2: Vec2, color: Color, clip: Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .triangle,
+            .rect = .{},
+            .p0 = p0,
+            .p1 = p1,
+            .p2 = p2,
+            .color = color,
+            .clip = clip,
+        });
+    }
+
     pub fn roundedRect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32) !void {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius });
     }
