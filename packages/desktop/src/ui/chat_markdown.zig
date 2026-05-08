@@ -7,6 +7,28 @@ const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
 
+extern fn palette_text_gl_measure_line_width(
+    font_data: [*]const u8,
+    font_len: i32,
+    text: [*]const u8,
+    text_len: i32,
+    font_size: f32,
+) callconv(.c) f32;
+
+/// Same CalSans bytes as `palette_gl_renderer.zig` / `palette_text_gl_draw`.
+const gl_transcript_font = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+
+fn glTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
+    if (text.len == 0) return 0.0;
+    return palette_text_gl_measure_line_width(
+        gl_transcript_font.ptr,
+        @intCast(gl_transcript_font.len),
+        text.ptr,
+        @intCast(text.len),
+        font_size,
+    );
+}
+
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
@@ -1036,11 +1058,11 @@ fn walkTextBlockLayout(
             .text => |text_run| {
                 const spec = inlineFontSpec(block.style, text_run.style, options);
                 const chunk_line_height = lineHeightForSpec(spec, options);
-                const face = paletteFaceForLayout(spec, options);
                 const slice = block.text[text_run.start..text_run.end];
+                const layout_font_size = fontSizeForSpecWithOptions(spec, options);
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = face.measureRun(chunk.text);
+                    const chunk_width = glTranscriptTextWidth(layout_font_size, chunk.text);
 
                     if (chunk.is_whitespace and state.line_start) {
                         continue;
@@ -1629,7 +1651,6 @@ fn buildSelectableCodeLines(
     options: RenderOptions,
 ) ![]SelectableCodeLine {
     const line_height = codeLineHeight(options);
-    const code_face = paletteCodeFontFace(options);
     var lines = std.ArrayList(SelectableCodeLine).empty;
     errdefer {
         for (lines.items) |line| allocator.free(line.chunks);
@@ -1645,7 +1666,7 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = code_face.measureRun(token.text);
+            const token_width = glTranscriptTextWidth(codeFontSize(options), token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
@@ -1880,12 +1901,12 @@ fn renderPaletteStyledChunk(
 
 fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) void {
     var cursor_x = layout.x;
-    const code_face = paletteCodeFontFace(options);
+    const code_fs = codeFontSize(options);
     for (line.tokens) |token| {
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = code_face.measureRun(token.text);
+        const width = glTranscriptTextWidth(code_fs, token.text);
         queuePaletteText(context, .{
             .x = cursor_x,
             .y = layout.y,
@@ -1976,20 +1997,6 @@ fn inlineFontSpec(block_style: TextStyle, inline_style: InlineStyle, options: Re
 
 fn lineHeightForSpec(spec: FontSpec, options: RenderOptions) f32 {
     return (options.line_height orelse fontSizeForSpecWithOptions(spec, options) * 1.25);
-}
-
-/// Horizontal metrics for markdown layout: matches `palette.TextStack` / `text_layout` defaults
-/// (UTF-8 scalar advances) so chunk positions align with Palette-owned measurement.
-fn paletteFaceForLayout(spec: FontSpec, options: RenderOptions) palette.TextFontFace {
-    const fs = fontSizeForSpecWithOptions(spec, options);
-    var m = palette.TextMetrics.defaultUi(fs);
-    m.line_height = lineHeightForSpec(spec, options);
-    return palette.TextFontFace.init("", m);
-}
-
-fn paletteCodeFontFace(options: RenderOptions) palette.TextFontFace {
-    const fs = codeFontSize(options);
-    return palette.TextFontFace.defaultUi("", fs);
 }
 
 fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
@@ -2274,13 +2281,9 @@ test "maps markdown fence tags to syntax languages" {
     try std.testing.expectEqual(zig_dif.Language.plain, codeLanguageForTag(null));
 }
 
-test "markdown layout width uses palette text metrics for nbsp and tab" {
-    const options = RenderOptions{ .base_font_size = 10.0, .line_height = 12.5 };
-    const spec: FontSpec = .{};
-    const face = paletteFaceForLayout(spec, options);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.2), face.measureRun("\xc2\xa0"), 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 12.8), face.measureRun("\t"), 0.001);
-    try std.testing.expectEqual(@as(usize, 3), countColumns("a\u{00A0}b"));
+test "transcript layout width tracks GL text metrics for ASCII" {
+    const w = glTranscriptTextWidth(16.0, "Hello");
+    try std.testing.expect(w > 10.0 and w < 90.0);
 }
 
 test "double click selection expands to a code word on raw lines" {

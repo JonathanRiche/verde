@@ -141,6 +141,51 @@ static PaletteTextAtlas *atlas_for_size(const unsigned char *font_data, int font
     return atlas;
 }
 
+static stbtt_fontinfo g_measure_font;
+static int g_measure_font_ready;
+
+static void ensure_measure_font(const unsigned char *font_data) {
+    if (g_measure_font_ready) return;
+    if (!stbtt_InitFont(&g_measure_font, font_data, stbtt_GetFontOffsetForIndex(font_data, 0))) return;
+    g_measure_font_ready = 1;
+}
+
+/// Horizontal width for `text` using the same ASCII subset and scale as `palette_text_gl_draw`,
+/// but via `stbtt_GetCodepointHMetrics` so chunk layout matches variable glyph advances (no GL calls).
+float palette_text_gl_measure_line_width(
+    const unsigned char *font_data,
+    int font_len,
+    const char *text,
+    int text_len,
+    float font_size
+) {
+    (void)font_len;
+    if (!font_data || !text || text_len <= 0 || font_size <= 0.0f) return 0.0f;
+    ensure_measure_font(font_data);
+    if (!g_measure_font_ready) return 0.0f;
+
+    const float bucket = roundf(font_size);
+    const float scale = stbtt_ScaleForPixelHeight(&g_measure_font, bucket);
+
+    float line_w = 0.0f;
+    float max_w = 0.0f;
+    for (int i = 0; i < text_len; i += 1) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == '\n') {
+            if (line_w > max_w) max_w = line_w;
+            line_w = 0.0f;
+            continue;
+        }
+        if (ch < 32 || ch > 126) continue;
+        int advance = 0;
+        int lsb = 0;
+        stbtt_GetCodepointHMetrics(&g_measure_font, (int)ch, &advance, &lsb);
+        line_w += (float)advance * scale;
+    }
+    if (line_w > max_w) max_w = line_w;
+    return max_w;
+}
+
 void palette_text_gl_draw(
     const unsigned char *font_data,
     int font_len,

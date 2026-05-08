@@ -280,6 +280,11 @@ pub fn build(b: *std.Build) void {
         .root_module = chat_markdown,
     });
     chat_markdown_tests.root_module.link_libc = true;
+    chat_markdown_tests.root_module.addIncludePath(b.path("../../vendor"));
+    chat_markdown_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/ui/palette_text_gl.c"),
+        .flags = &.{"-DGL_GLEXT_PROTOTYPES"},
+    });
     if (target.result.os.tag == .linux) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
             chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
