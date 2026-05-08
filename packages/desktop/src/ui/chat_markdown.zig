@@ -3,20 +3,34 @@
 const std = @import("std");
 
 const colors = @import("colors.zig");
+const palette = @import("palette");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
-const zgui = @import("zgui");
 
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
-    heading_font: ?zgui.Font = null,
+    base_font_size: f32 = 24.0,
+    line_height: ?f32 = null,
+    glyph_width: ?f32 = null,
+    heading_font: ?*anyopaque = null,
     heading_font_size: ?f32 = null,
-    bold_font: ?zgui.Font = null,
-    italic_font: ?zgui.Font = null,
-    bold_italic_font: ?zgui.Font = null,
-    code_font: ?zgui.Font = null,
+    bold_font: ?*anyopaque = null,
+    italic_font: ?*anyopaque = null,
+    bold_italic_font: ?*anyopaque = null,
+    code_font: ?*anyopaque = null,
     code_font_size: ?f32 = null,
+};
+
+pub const PaletteRenderContext = struct {
+    allocator: Allocator,
+    batch: *palette.RenderBatch,
+    frame_text: *std.ArrayList(u8),
+    cursor: palette.Rect,
+    available_width: f32,
+    mouse_pos: [2]f32 = .{ -1.0, -1.0 },
+    hovered: bool = false,
+    clip: ?palette.Rect = null,
 };
 
 pub const SelectionPoint = struct {
@@ -222,7 +236,6 @@ const FlattenContext = struct {
 };
 
 const FontSpec = struct {
-    font: ?zgui.Font = null,
     size: ?f32 = null,
 };
 
@@ -253,24 +266,27 @@ pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
 
 /// Renders a parsed markdown body as wrapped text, themed rules, and fenced code blocks.
 pub fn renderBody(view: BodyView, options: RenderOptions) void {
-    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
+    _ = view;
+    _ = options;
+}
+
+/// Renders a parsed markdown body into a Palette batch and advances `context.cursor.y`.
+pub fn renderPaletteBody(context: *PaletteRenderContext, view: BodyView, options: RenderOptions) void {
+    const available_width = @max(context.available_width, 1.0);
 
     var previous: ?BlockView = null;
     for (view.blocks) |block| {
         if (previous) |prior| {
             if (prior.kind() != .blank and block.kind() != .blank) {
-                zgui.dummy(.{
-                    .w = 0.0,
-                    .h = if (prior.isCompact() or block.isCompact()) compactBlockGap() else blockGap(),
-                });
+                advancePaletteCursor(context, if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options));
             }
         }
 
         switch (block) {
-            .blank => renderBlankBlock(),
-            .text => |text| renderTextBlock(text, available_width, options),
-            .fenced_code => |code| renderFencedCodeBlock(code, available_width, options),
-            .thematic_break => |rule| renderThematicBreakBlock(rule, available_width),
+            .blank => renderPaletteBlankBlock(context, options),
+            .text => |text| renderPaletteTextBlock(context, text, available_width, options),
+            .fenced_code => |code| renderPaletteFencedCodeBlock(context, code, available_width, options),
+            .thematic_break => |rule| renderPaletteThematicBreakBlock(context, rule, available_width, options),
         }
 
         previous = block;
@@ -364,12 +380,12 @@ pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOp
     for (view.blocks) |block| {
         if (previous) |prior| {
             if (prior.kind() != .blank and block.kind() != .blank) {
-                total += if (prior.isCompact() or block.isCompact()) compactBlockGap() else blockGap();
+                total += if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options);
             }
         }
 
         total += switch (block) {
-            .blank => blankBlockHeight(),
+            .blank => blankBlockHeight(options),
             .text => |text| measureTextBlockHeight(text, width, options),
             .fenced_code => |code| measureFencedCodeHeight(code, width, options),
             .thematic_break => |rule| measureThematicBreakHeight(rule),
@@ -388,9 +404,27 @@ pub fn renderSelectableBody(
     selection: ?SelectionRange,
     copy_selection: bool,
 ) SelectionRenderOutput {
-    const available_width = @max(zgui.getContentRegionAvail()[0], 1.0);
-    const mouse_pos = zgui.getMousePos();
-    const hovered = zgui.isWindowHovered(.{ .allow_when_blocked_by_active_item = true });
+    _ = allocator;
+    _ = view;
+    _ = options;
+    _ = selection;
+    _ = copy_selection;
+    return .{};
+}
+
+/// Selectable Palette markdown fallback. It preserves copy/select point behavior with fixed metrics,
+/// but callers must still route mouse and batch context explicitly.
+pub fn renderSelectablePaletteBody(
+    context: *PaletteRenderContext,
+    allocator: Allocator,
+    view: BodyView,
+    options: RenderOptions,
+    selection: ?SelectionRange,
+    copy_selection: bool,
+) SelectionRenderOutput {
+    const available_width = @max(context.available_width, 1.0);
+    const mouse_pos = context.mouse_pos;
+    const hovered = context.hovered;
     const ordered_selection = if (selection) |active| orderSelection(active) else null;
 
     var output: SelectionRenderOutput = .{ .hovered = hovered };
@@ -403,7 +437,7 @@ pub fn renderSelectableBody(
     for (view.blocks) |block| {
         if (previous) |prior| {
             if (prior.kind() != .blank and block.kind() != .blank) {
-                const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap() else blockGap();
+                const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options);
                 renderSelectableBlankLine(
                     allocator,
                     &output,
@@ -413,6 +447,7 @@ pub fn renderSelectableBody(
                     &copied_any_line,
                     mouse_pos,
                     hovered,
+                    context,
                     global_line_index,
                     gap_height,
                 );
@@ -431,8 +466,9 @@ pub fn renderSelectableBody(
                     &copied_any_line,
                     mouse_pos,
                     hovered,
+                    context,
                     global_line_index,
-                    blankBlockHeight(),
+                    blankBlockHeight(options),
                 );
                 global_line_index += 1;
             },
@@ -446,14 +482,15 @@ pub fn renderSelectableBody(
                     &copied_any_line,
                     mouse_pos,
                     hovered,
+                    context,
                     &global_line_index,
                     text_block,
                     available_width,
                     options,
-                ) catch renderTextBlock(text_block, available_width, options);
+                ) catch renderPaletteTextBlock(context, text_block, available_width, options);
             },
             .fenced_code => |code_block| {
-                renderSelectableCodeBlock(
+                renderSelectablePaletteCodeBlock(
                     allocator,
                     &output,
                     ordered_selection,
@@ -462,14 +499,15 @@ pub fn renderSelectableBody(
                     &copied_any_line,
                     mouse_pos,
                     hovered,
+                    context,
                     &global_line_index,
                     code_block,
                     available_width,
                     options,
-                ) catch renderFencedCodeBlock(code_block, available_width, options);
+                ) catch renderPaletteFencedCodeBlock(context, code_block, available_width, options);
             },
             .thematic_break => |rule| {
-                renderThematicBreakBlock(rule, available_width);
+                renderPaletteThematicBreakBlock(context, rule, available_width, options);
             },
         }
 
@@ -893,96 +931,52 @@ fn codeLanguageForTag(language: ?[]const u8) zig_dif.Language {
     return .plain;
 }
 
-fn renderBlankBlock() void {
-    zgui.dummy(.{ .w = 0.0, .h = blankBlockHeight() });
+fn renderPaletteBlankBlock(context: *PaletteRenderContext, options: RenderOptions) void {
+    advancePaletteCursor(context, blankBlockHeight(options));
 }
 
-fn renderTextBlock(block: TextBlockView, available_width: f32, options: RenderOptions) void {
+fn renderPaletteTextBlock(context: *PaletteRenderContext, block: TextBlockView, available_width: f32, options: RenderOptions) void {
     const indent = indentWidth(block.indent);
-    if (indent > 0.0) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
-    }
-
-    const start = zgui.getCursorScreenPos();
+    const start = .{ context.cursor.x + indent, context.cursor.y };
     const width = @max(available_width - indent, 1.0);
-    const draw_list = zgui.getWindowDrawList();
-    const height = renderTextBlockLayout(draw_list, .{ start[0], start[1] }, block, width, options);
+    const height = renderPaletteTextBlockLayout(context, .{ start[0], start[1] }, block, width, options);
 
-    zgui.dummy(.{ .w = width, .h = height });
+    advancePaletteCursor(context, height);
 }
 
-fn renderFencedCodeBlock(block: FencedCodeView, available_width: f32, options: RenderOptions) void {
+fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCodeView, available_width: f32, options: RenderOptions) void {
     const indent = indentWidth(block.indent);
-    if (indent > 0.0) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
-    }
-
-    const start = zgui.getCursorScreenPos();
-    const width = @max(available_width - indent, minimumCodeBlockWidth());
-    const pushed_font = pushFontSpec(.{
-        .font = options.code_font,
-        .size = options.code_font_size,
-    });
-    defer if (pushed_font) zgui.popFont();
-
-    const line_height = zgui.getTextLineHeightWithSpacing();
-    const pad_x = codeBlockPaddingX();
-    const pad_y = codeBlockPaddingY();
+    const start = .{ context.cursor.x + indent, context.cursor.y };
+    const width = @max(available_width - indent, minimumCodeBlockWidth(options));
+    const line_height = codeLineHeight(options);
+    const pad_x = codeBlockPaddingX(options);
+    const pad_y = codeBlockPaddingY(options);
     const height = codeBlockHeight(block, line_height, pad_y);
-    const max_pos = .{ start[0] + width, start[1] + height };
-    const draw_list = zgui.getWindowDrawList();
-
-    draw_list.addRectFilled(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(24, 24, 28, 255)),
-        .rounding = codeBlockRounding(),
-    });
-    draw_list.addRect(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(52, 54, 62, 255)),
-        .rounding = codeBlockRounding(),
-        .thickness = 1.0,
-    });
-
-    draw_list.pushClipRect(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .intersect_with_current = true,
-    });
-    defer draw_list.popClipRect();
+    const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
+    queuePaletteRoundedRect(context, rect, paletteColor(colors.rgba(24, 24, 28, 255)), codeBlockRounding(options));
+    queuePaletteBorder(context, rect, paletteColor(colors.rgba(52, 54, 62, 255)), codeBlockRounding(options), 1.0);
 
     var y = start[1] + pad_y;
     for (block.lines) |line| {
-        renderCodeLine(draw_list, line, .{
+        renderPaletteCodeLine(context, line, .{
             .x = start[0] + pad_x,
             .y = y,
-            .max_x = max_pos[0] - pad_x,
-        });
+            .max_x = start[0] + width - pad_x,
+        }, options, rect);
         y += line_height;
     }
 
-    zgui.dummy(.{ .w = width, .h = height });
+    advancePaletteCursor(context, height);
 }
 
-fn renderThematicBreakBlock(rule: ThematicBreakView, available_width: f32) void {
+fn renderPaletteThematicBreakBlock(context: *PaletteRenderContext, rule: ThematicBreakView, available_width: f32, options: RenderOptions) void {
     const indent = indentWidth(rule.indent);
-    if (indent > 0.0) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
-    }
-
-    const start = zgui.getCursorScreenPos();
+    const start = .{ context.cursor.x + indent, context.cursor.y };
     const width = @max(available_width - indent, 24.0);
-    const y = start[1] + thematicBreakHeight() * 0.5;
-    const draw_list = zgui.getWindowDrawList();
-    draw_list.addLine(.{
-        .p1 = .{ start[0], y },
-        .p2 = .{ start[0] + width, y },
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(68, 72, 82, 255)),
-        .thickness = 1.0,
-    });
-    zgui.dummy(.{ .w = width, .h = thematicBreakHeight() });
+    const height = thematicBreakHeight(options);
+    const y = start[1] + height * 0.5;
+    queuePaletteRect(context, .{ .x = start[0], .y = y, .w = width, .h = 1.0 }, paletteColor(colors.rgba(68, 72, 82, 255)));
+    advancePaletteCursor(context, height);
 }
 
 const TextBlockLayoutState = struct {
@@ -1034,14 +1028,14 @@ fn walkTextBlockLayout(
 ) f32 {
     const width = @max(available_width, 1.0);
     const block_font = textBlockFontSpecWithOptions(block.style, options);
-    var state = TextBlockLayoutState.init(lineHeightForSpec(block_font));
+    var state = TextBlockLayoutState.init(lineHeightForSpec(block_font, options));
 
     for (block.runs) |run| {
         switch (run) {
             .line_break => state.advanceLine(),
             .text => |text_run| {
                 const spec = inlineFontSpec(block.style, text_run.style, options);
-                const chunk_line_height = lineHeightForSpec(spec);
+                const chunk_line_height = lineHeightForSpec(spec, options);
                 const slice = block.text[text_run.start..text_run.end];
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
@@ -1090,20 +1084,20 @@ fn measureTextBlockLayout(
     return walkTextBlockLayout(block, available_width, options, {}, ignoreTextBlockLayoutStep);
 }
 
-fn renderTextBlockLayout(
-    draw_list: anytype,
+fn renderPaletteTextBlockLayout(
+    context: *PaletteRenderContext,
     start: [2]f32,
     block: TextBlockView,
     available_width: f32,
     options: RenderOptions,
 ) f32 {
     const RenderContext = struct {
-        draw_list: @TypeOf(draw_list),
+        palette_context: *PaletteRenderContext,
         start: [2]f32,
 
         fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
-            renderStyledChunk(
-                ctx.draw_list,
+            renderPaletteStyledChunk(
+                ctx.palette_context,
                 .{ ctx.start[0] + step.x, ctx.start[1] + step.y },
                 step.text,
                 step.block_style,
@@ -1116,7 +1110,7 @@ fn renderTextBlockLayout(
     };
 
     return walkTextBlockLayout(block, available_width, options, RenderContext{
-        .draw_list = draw_list,
+        .palette_context = context,
         .start = start,
     }, RenderContext.onStep);
 }
@@ -1430,7 +1424,7 @@ fn buildSelectableTextLines(
     if (builder.failed) |err| return err;
 
     if (builder.lines.items.len == 0) {
-        const base_line_height = lineHeightForSpec(textBlockFontSpecWithOptions(block.style, options));
+        const base_line_height = lineHeightForSpec(textBlockFontSpecWithOptions(block.style, options), options);
         try builder.lines.append(allocator, .{
             .y = 0.0,
             .height = base_line_height,
@@ -1476,7 +1470,6 @@ fn hoveredColumnForLine(line: SelectableLine, local_x: f32) usize {
 
 fn renderSelectableLine(
     allocator: Allocator,
-    draw_list: anytype,
     output: *SelectionRenderOutput,
     selection: ?OrderedSelection,
     copy_selection: bool,
@@ -1484,6 +1477,7 @@ fn renderSelectableLine(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
+    context: *PaletteRenderContext,
     start: [2]f32,
     line_index: usize,
     line: SelectableLine,
@@ -1502,7 +1496,7 @@ fn renderSelectableLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72));
+                const selection_col = paletteColor(colors.rgba(88, 166, 255, 72));
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
@@ -1511,12 +1505,7 @@ fn renderSelectableLine(
                     const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
                     const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
-                        draw_list.addRectFilled(.{
-                            .pmin = .{ x0, top },
-                            .pmax = .{ x1, bottom },
-                            .col = selection_col,
-                            .rounding = 2.0,
-                        });
+                        queuePaletteRoundedRect(context, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }, selection_col, 2.0);
                     }
                 }
             }
@@ -1538,8 +1527,8 @@ fn renderSelectableLine(
     }
 
     for (line.chunks) |chunk| {
-        renderStyledChunk(
-            draw_list,
+        renderPaletteStyledChunk(
+            context,
             .{ start[0] + chunk.x, top },
             chunk.text,
             chunk.block_style,
@@ -1560,10 +1549,11 @@ fn renderSelectableBlankLine(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
+    context: *PaletteRenderContext,
     line_index: usize,
     height: f32,
 ) void {
-    const start = zgui.getCursorScreenPos();
+    const start = .{ context.cursor.x, context.cursor.y };
     noteSelectableLineBounds(output, line_index, 0);
     if (hovered and output.hovered_point == null and mouse_pos[1] >= start[1] and mouse_pos[1] <= start[1] + height) {
         output.hovered_point = .{ .line_index = line_index, .column = 0 };
@@ -1579,7 +1569,7 @@ fn renderSelectableBlankLine(
             }
         }
     }
-    zgui.dummy(.{ .w = 0.0, .h = height });
+    advancePaletteCursor(context, height);
 }
 
 fn renderSelectableTextBlock(
@@ -1591,19 +1581,15 @@ fn renderSelectableTextBlock(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
+    context: *PaletteRenderContext,
     global_line_index: *usize,
     block: TextBlockView,
     available_width: f32,
     options: RenderOptions,
 ) !void {
     const indent = indentWidth(block.indent);
-    if (indent > 0.0) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
-    }
-
-    const start = zgui.getCursorScreenPos();
+    const start = .{ context.cursor.x + indent, context.cursor.y };
     const width = @max(available_width - indent, 1.0);
-    const draw_list = zgui.getWindowDrawList();
     const lines = try buildSelectableTextLines(allocator, block, width, options);
     defer deinitSelectableLines(allocator, lines);
 
@@ -1611,7 +1597,6 @@ fn renderSelectableTextBlock(
     for (lines, 0..) |line, index| {
         renderSelectableLine(
             allocator,
-            draw_list,
             output,
             selection,
             copy_selection,
@@ -1619,6 +1604,7 @@ fn renderSelectableTextBlock(
             copied_any_line,
             mouse_pos,
             hovered,
+            context,
             start,
             global_line_index.* + index,
             line,
@@ -1626,7 +1612,7 @@ fn renderSelectableTextBlock(
         height = @max(height, line.y + line.height);
     }
 
-    zgui.dummy(.{ .w = width, .h = height });
+    advancePaletteCursor(context, height);
     global_line_index.* += lines.len;
 }
 
@@ -1636,13 +1622,10 @@ fn buildSelectableCodeLines(
     options: RenderOptions,
 ) ![]SelectableCodeLine {
     const code_spec: FontSpec = .{
-        .font = options.code_font,
         .size = options.code_font_size,
     };
-    const pushed_font = pushFontSpec(code_spec);
-    defer if (pushed_font) zgui.popFont();
 
-    const line_height = zgui.getTextLineHeightWithSpacing();
+    const line_height = codeLineHeight(options);
     var lines = std.ArrayList(SelectableCodeLine).empty;
     errdefer {
         for (lines.items) |line| allocator.free(line.chunks);
@@ -1658,7 +1641,7 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = zgui.calcTextSize(token.text, .{})[0];
+            const token_width = textWidthForSpec(code_spec, token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
@@ -1721,7 +1704,6 @@ fn hoveredColumnForCodeLine(line: SelectableCodeLine, local_x: f32) usize {
 
 fn renderSelectableCodeLine(
     allocator: Allocator,
-    draw_list: anytype,
     output: *SelectionRenderOutput,
     selection: ?OrderedSelection,
     copy_selection: bool,
@@ -1729,9 +1711,12 @@ fn renderSelectableCodeLine(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
+    context: *PaletteRenderContext,
     start: [2]f32,
     line_index: usize,
     line: SelectableCodeLine,
+    options: RenderOptions,
+    clip: palette.Rect,
 ) void {
     noteSelectableLineBounds(output, line_index, line.total_columns);
 
@@ -1747,7 +1732,7 @@ fn renderSelectableCodeLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = zgui.colorConvertFloat4ToU32(colors.rgba(88, 166, 255, 72));
+                const selection_col = paletteColor(colors.rgba(88, 166, 255, 72));
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
@@ -1756,12 +1741,7 @@ fn renderSelectableCodeLine(
                     const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
                     const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
-                        draw_list.addRectFilled(.{
-                            .pmin = .{ x0, top },
-                            .pmax = .{ x1, bottom },
-                            .col = selection_col,
-                            .rounding = 2.0,
-                        });
+                        queuePaletteRoundedRect(context, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }, selection_col, 2.0);
                     }
                 }
             }
@@ -1783,15 +1763,16 @@ fn renderSelectableCodeLine(
     }
 
     for (line.chunks) |chunk| {
-        draw_list.addTextUnformatted(
-            .{ start[0] + chunk.x, top },
-            zgui.colorConvertFloat4ToU32(codeTokenColor(chunk.token_kind)),
-            chunk.text,
-        );
+        queuePaletteText(context, .{
+            .x = start[0] + chunk.x,
+            .y = top,
+            .w = @max(clip.x + clip.w - (start[0] + chunk.x), 1.0),
+            .h = codeLineHeight(options),
+        }, chunk.text, paletteColor(codeTokenColor(chunk.token_kind)), codeFontSize(options), clip);
     }
 }
 
-fn renderSelectableCodeBlock(
+fn renderSelectablePaletteCodeBlock(
     allocator: Allocator,
     output: *SelectionRenderOutput,
     selection: ?OrderedSelection,
@@ -1800,52 +1781,22 @@ fn renderSelectableCodeBlock(
     copied_any_line: *bool,
     mouse_pos: [2]f32,
     hovered: bool,
+    context: *PaletteRenderContext,
     global_line_index: *usize,
     block: FencedCodeView,
     available_width: f32,
     options: RenderOptions,
 ) !void {
     const indent = indentWidth(block.indent);
-    if (indent > 0.0) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + indent);
-    }
-
-    const start = zgui.getCursorScreenPos();
-    const width = @max(available_width - indent, minimumCodeBlockWidth());
-    const code_spec: FontSpec = .{
-        .font = options.code_font,
-        .size = options.code_font_size,
-    };
-    const pushed_font = pushFontSpec(code_spec);
-    defer if (pushed_font) zgui.popFont();
-
-    const line_height = zgui.getTextLineHeightWithSpacing();
-    const pad_x = codeBlockPaddingX();
-    const pad_y = codeBlockPaddingY();
+    const start = .{ context.cursor.x + indent, context.cursor.y };
+    const width = @max(available_width - indent, minimumCodeBlockWidth(options));
+    const line_height = codeLineHeight(options);
+    const pad_x = codeBlockPaddingX(options);
+    const pad_y = codeBlockPaddingY(options);
     const height = codeBlockHeight(block, line_height, pad_y);
-    const max_pos = .{ start[0] + width, start[1] + height };
-    const draw_list = zgui.getWindowDrawList();
-
-    draw_list.addRectFilled(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(24, 24, 28, 255)),
-        .rounding = codeBlockRounding(),
-    });
-    draw_list.addRect(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .col = zgui.colorConvertFloat4ToU32(colors.rgba(52, 54, 62, 255)),
-        .rounding = codeBlockRounding(),
-        .thickness = 1.0,
-    });
-
-    draw_list.pushClipRect(.{
-        .pmin = start,
-        .pmax = max_pos,
-        .intersect_with_current = true,
-    });
-    defer draw_list.popClipRect();
+    const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
+    queuePaletteRoundedRect(context, rect, paletteColor(colors.rgba(24, 24, 28, 255)), codeBlockRounding(options));
+    queuePaletteBorder(context, rect, paletteColor(colors.rgba(52, 54, 62, 255)), codeBlockRounding(options), 1.0);
 
     const lines = try buildSelectableCodeLines(allocator, block, options);
     defer deinitSelectableCodeLines(allocator, lines);
@@ -1854,7 +1805,6 @@ fn renderSelectableCodeBlock(
     for (lines, 0..) |line, index| {
         renderSelectableCodeLine(
             allocator,
-            draw_list,
             output,
             selection,
             copy_selection,
@@ -1862,18 +1812,21 @@ fn renderSelectableCodeBlock(
             copied_any_line,
             mouse_pos,
             hovered,
+            context,
             content_start,
             global_line_index.* + index,
             line,
+            options,
+            rect,
         );
     }
 
-    zgui.dummy(.{ .w = width, .h = height });
+    advancePaletteCursor(context, height);
     global_line_index.* += lines.len;
 }
 
-fn renderStyledChunk(
-    draw_list: anytype,
+fn renderPaletteStyledChunk(
+    context: *PaletteRenderContext,
     position: [2]f32,
     text: []const u8,
     block_style: TextStyle,
@@ -1882,52 +1835,56 @@ fn renderStyledChunk(
     width: f32,
     line_height: f32,
 ) void {
-    const pushed_font = pushFontSpec(font_spec);
-    defer if (pushed_font) zgui.popFont();
-
     const color = inlineTextColor(textBlockColor(block_style), inline_style);
-    const color_u32 = zgui.colorConvertFloat4ToU32(color);
 
     if (inline_style.code) {
-        draw_list.addRectFilled(.{
-            .pmin = .{ position[0] - 3.0, position[1] + 1.0 },
-            .pmax = .{ position[0] + width + 3.0, position[1] + line_height - 1.0 },
-            .col = zgui.colorConvertFloat4ToU32(colors.rgba(36, 39, 46, 255)),
-            .rounding = 4.0,
-        });
+        queuePaletteRoundedRect(context, .{
+            .x = position[0] - 3.0,
+            .y = position[1] + 1.0,
+            .w = width + 6.0,
+            .h = line_height - 2.0,
+        }, paletteColor(colors.rgba(36, 39, 46, 255)), 4.0);
     }
 
-    draw_list.addTextUnformatted(position, color_u32, text);
+    queuePaletteText(context, .{
+        .x = position[0],
+        .y = position[1],
+        .w = width,
+        .h = line_height,
+    }, text, paletteColor(color), fontSizeForSpec(font_spec), context.clip);
     if (inline_style.strong) {
-        draw_list.addTextUnformatted(.{ position[0] + 0.75, position[1] }, color_u32, text);
+        queuePaletteText(context, .{
+            .x = position[0] + 0.75,
+            .y = position[1],
+            .w = width,
+            .h = line_height,
+        }, text, paletteColor(color), fontSizeForSpec(font_spec), context.clip);
     }
 
     if (inline_style.link or inline_style.emphasis) {
-        const underline_color = if (inline_style.link)
-            zgui.colorConvertFloat4ToU32(colors.rgb(0x7A, 0xCA, 0xFF))
-        else
-            color_u32;
-        draw_list.addLine(.{
-            .p1 = .{ position[0], position[1] + line_height - 2.0 },
-            .p2 = .{ position[0] + width, position[1] + line_height - 2.0 },
-            .col = underline_color,
-            .thickness = if (inline_style.link) 1.5 else 1.0,
-        });
+        const underline_color = if (inline_style.link) paletteColor(colors.rgb(0x7A, 0xCA, 0xFF)) else paletteColor(color);
+        queuePaletteRect(context, .{
+            .x = position[0],
+            .y = position[1] + line_height - 2.0,
+            .w = width,
+            .h = if (inline_style.link) 1.5 else 1.0,
+        }, underline_color);
     }
 }
 
-fn renderCodeLine(draw_list: anytype, line: CodeLineView, layout: CodeLineLayout) void {
+fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) void {
     var cursor_x = layout.x;
     for (line.tokens) |token| {
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = zgui.calcTextSize(token.text, .{})[0];
-        draw_list.addTextUnformatted(
-            .{ cursor_x, layout.y },
-            zgui.colorConvertFloat4ToU32(codeTokenColor(token.kind)),
-            token.text,
-        );
+        const width = textWidthForSpec(.{ .size = options.code_font_size }, token.text);
+        queuePaletteText(context, .{
+            .x = cursor_x,
+            .y = layout.y,
+            .w = @min(width, @max(layout.max_x - cursor_x, 1.0)),
+            .h = codeLineHeight(options),
+        }, token.text, paletteColor(codeTokenColor(token.kind)), codeFontSize(options), clip);
         cursor_x += width;
     }
 }
@@ -1945,57 +1902,42 @@ fn measureTextBlockHeight(block: TextBlockView, available_width: f32, options: R
 
 fn measureFencedCodeHeight(block: FencedCodeView, available_width: f32, options: RenderOptions) f32 {
     _ = available_width;
-    const pushed_font = pushFontSpec(.{
-        .font = options.code_font,
-        .size = options.code_font_size,
-    });
-    defer if (pushed_font) zgui.popFont();
-    const line_height = zgui.getTextLineHeightWithSpacing();
-    return codeBlockHeight(block, line_height, codeBlockPaddingY());
+    return codeBlockHeight(block, codeLineHeight(options), codeBlockPaddingY(options));
 }
 
 fn measureThematicBreakHeight(rule: ThematicBreakView) f32 {
     _ = rule;
-    return thematicBreakHeight();
+    return thematicBreakHeight(.{});
 }
 
-fn pushFontSpec(spec: FontSpec) bool {
-    if (spec.font != null or spec.size != null) {
-        zgui.pushFont(spec.font orelse zgui.getFont(), spec.size orelse zgui.getFontSize());
-        return true;
-    }
-    return false;
-}
-
-fn textBlockFontSpec(style: TextStyle) FontSpec {
-    const base_size = zgui.getFontSize();
+fn textBlockFontSpec(style: TextStyle, options: RenderOptions) FontSpec {
+    const base_size = options.base_font_size;
     const heading_size = base_size;
 
     return switch (style) {
         .paragraph, .quote => .{},
-        .heading_1 => .{ .font = null, .size = heading_size * 1.18 },
-        .heading_2 => .{ .font = null, .size = heading_size * 1.08 },
-        .heading_3 => .{ .font = null, .size = @max(base_size * 1.20, heading_size * 0.94) },
-        .heading_4 => .{ .font = null, .size = @max(base_size * 1.12, heading_size * 0.86) },
-        .heading_5 => .{ .font = null, .size = @max(base_size * 1.06, heading_size * 0.8) },
-        .heading_6 => .{ .font = null, .size = @max(base_size * 1.02, heading_size * 0.76) },
+        .heading_1 => .{ .size = heading_size * 1.18 },
+        .heading_2 => .{ .size = heading_size * 1.08 },
+        .heading_3 => .{ .size = @max(base_size * 1.20, heading_size * 0.94) },
+        .heading_4 => .{ .size = @max(base_size * 1.12, heading_size * 0.86) },
+        .heading_5 => .{ .size = @max(base_size * 1.06, heading_size * 0.8) },
+        .heading_6 => .{ .size = @max(base_size * 1.02, heading_size * 0.76) },
     };
 }
 
 fn textBlockFontSpecWithOptions(style: TextStyle, options: RenderOptions) FontSpec {
-    const base = textBlockFontSpec(style);
+    const base = textBlockFontSpec(style, options);
     if (style == .paragraph or style == .quote) return base;
 
     return .{
-        .font = options.heading_font orelse base.font,
         .size = if (options.heading_font_size) |heading_size|
             switch (style) {
                 .heading_1 => heading_size * 1.18,
                 .heading_2 => heading_size * 1.08,
-                .heading_3 => @max(zgui.getFontSize() * 1.20, heading_size * 0.94),
-                .heading_4 => @max(zgui.getFontSize() * 1.12, heading_size * 0.86),
-                .heading_5 => @max(zgui.getFontSize() * 1.06, heading_size * 0.8),
-                .heading_6 => @max(zgui.getFontSize() * 1.02, heading_size * 0.76),
+                .heading_3 => @max(options.base_font_size * 1.20, heading_size * 0.94),
+                .heading_4 => @max(options.base_font_size * 1.12, heading_size * 0.86),
+                .heading_5 => @max(options.base_font_size * 1.06, heading_size * 0.8),
+                .heading_6 => @max(options.base_font_size * 1.02, heading_size * 0.76),
                 else => base.size,
             }
         else
@@ -2007,41 +1949,30 @@ fn inlineFontSpec(block_style: TextStyle, inline_style: InlineStyle, options: Re
     const base = textBlockFontSpecWithOptions(block_style, options);
     if (inline_style.code) {
         return .{
-            .font = options.code_font,
             .size = options.code_font_size,
         };
     }
     if (inline_style.strong and inline_style.emphasis) {
-        return .{
-            .font = options.bold_italic_font orelse options.bold_font orelse options.italic_font,
-            .size = base.size,
-        };
+        _ = options.bold_italic_font orelse options.bold_font orelse options.italic_font;
+        return .{ .size = base.size };
     }
     if (inline_style.strong) {
-        return .{
-            .font = options.bold_font,
-            .size = base.size,
-        };
+        _ = options.bold_font;
+        return .{ .size = base.size };
     }
     if (inline_style.emphasis) {
-        return .{
-            .font = options.italic_font,
-            .size = base.size,
-        };
+        _ = options.italic_font;
+        return .{ .size = base.size };
     }
     return base;
 }
 
-fn lineHeightForSpec(spec: FontSpec) f32 {
-    const pushed_font = pushFontSpec(spec);
-    defer if (pushed_font) zgui.popFont();
-    return zgui.getTextLineHeight();
+fn lineHeightForSpec(spec: FontSpec, options: RenderOptions) f32 {
+    return (options.line_height orelse fontSizeForSpecWithOptions(spec, options) * 1.25);
 }
 
 fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
-    const pushed_font = pushFontSpec(spec);
-    defer if (pushed_font) zgui.popFont();
-    return zgui.calcTextSize(text, .{})[0];
+    return @as(f32, @floatFromInt(countColumns(text))) * glyphWidthForSpec(spec, .{});
 }
 
 fn nextChunk(text: []const u8, index: *usize) ?Chunk {
@@ -2083,43 +2014,110 @@ fn textBlockColor(style: TextStyle) [4]f32 {
 }
 
 fn indentWidth(level: usize) f32 {
-    return @as(f32, @floatFromInt(level)) * @max(zgui.getTextLineHeightWithSpacing() * 1.25, 18.0);
+    return @as(f32, @floatFromInt(level)) * 30.0;
 }
 
-fn blankBlockHeight() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.65, 1.0);
+fn blankBlockHeight(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.65, 1.0);
 }
 
-fn blockGap() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.65, 1.0);
+fn blockGap(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.65, 1.0);
 }
 
-fn compactBlockGap() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.2, 2.0);
+fn compactBlockGap(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.2, 2.0);
 }
 
-fn thematicBreakHeight() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.7, 10.0);
+fn thematicBreakHeight(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.7, 10.0);
 }
 
-fn minimumCodeBlockWidth() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 10.0, 240.0);
+fn minimumCodeBlockWidth(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 10.0, 240.0);
 }
 
-fn codeBlockPaddingX() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.75, 10.0);
+fn codeBlockPaddingX(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.75, 10.0);
 }
 
-fn codeBlockPaddingY() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.5, 8.0);
+fn codeBlockPaddingY(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.5, 8.0);
 }
 
-fn codeBlockRounding() f32 {
-    return @max(zgui.getTextLineHeightWithSpacing() * 0.3, 6.0);
+fn codeBlockRounding(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.3, 6.0);
 }
 
 fn codeBlockHeight(block: FencedCodeView, line_height: f32, pad_y: f32) f32 {
     return pad_y * 2.0 + line_height * @as(f32, @floatFromInt(@max(block.lines.len, 1)));
+}
+
+fn advancePaletteCursor(context: *PaletteRenderContext, height: f32) void {
+    context.cursor.y += height;
+    context.cursor.h = @max(context.cursor.h, height);
+}
+
+fn queuePaletteRect(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color) void {
+    context.batch.rect(context.allocator, rect, color) catch {};
+}
+
+fn queuePaletteRoundedRect(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color, radius: f32) void {
+    context.batch.roundedRect(context.allocator, rect, color, radius) catch {};
+}
+
+fn queuePaletteBorder(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
+    context.batch.rectBorder(context.allocator, rect, color, radius, width) catch {};
+}
+
+fn queuePaletteText(context: *PaletteRenderContext, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    const stable = stablePaletteText(context, value) catch return;
+    context.batch.fixedText(
+        context.allocator,
+        rect,
+        stable,
+        color,
+        font_size,
+        clip,
+        .{},
+        font_size * 0.55,
+        font_size * 1.25,
+        false,
+    ) catch {};
+}
+
+fn stablePaletteText(context: *PaletteRenderContext, value: []const u8) ![]const u8 {
+    const start = context.frame_text.items.len;
+    try context.frame_text.appendSlice(context.allocator, value);
+    return context.frame_text.items[start .. start + value.len];
+}
+
+fn paletteColor(value: [4]f32) palette.Color {
+    return .{ .r = value[0], .g = value[1], .b = value[2], .a = value[3] };
+}
+
+fn defaultLineHeight(options: RenderOptions) f32 {
+    return options.line_height orelse options.base_font_size * 1.25;
+}
+
+fn codeFontSize(options: RenderOptions) f32 {
+    return options.code_font_size orelse options.base_font_size * 0.92;
+}
+
+fn codeLineHeight(options: RenderOptions) f32 {
+    return (options.code_font_size orelse options.base_font_size * 0.92) * 1.25;
+}
+
+fn fontSizeForSpec(spec: FontSpec) f32 {
+    return spec.size orelse 24.0;
+}
+
+fn fontSizeForSpecWithOptions(spec: FontSpec, options: RenderOptions) f32 {
+    return spec.size orelse options.base_font_size;
+}
+
+fn glyphWidthForSpec(spec: FontSpec, options: RenderOptions) f32 {
+    return fontSizeForSpecWithOptions(spec, options) * 0.55;
 }
 
 fn codeTokenColor(kind: zig_dif.TokenKind) [4]f32 {

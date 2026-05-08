@@ -484,6 +484,7 @@ pub const Renderer = struct {
 
 pub const CommandCounts = struct {
     rects: usize = 0,
+    triangles: usize = 0,
     text: usize = 0,
     images: usize = 0,
     cursors: usize = 0,
@@ -495,6 +496,7 @@ pub const CommandCounts = struct {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect => counts.rects += 1,
+                .triangle => counts.triangles += 1,
                 .text => counts.text += 1,
                 .image => counts.images += 1,
                 .cursor => counts.cursors += 1,
@@ -506,7 +508,7 @@ pub const CommandCounts = struct {
     }
 
     pub fn drawableIndexCount(self: CommandCounts) usize {
-        return (self.rects + self.cursors + self.selections + self.scrollbars) * 6;
+        return (self.rects + self.cursors + self.selections + self.scrollbars) * 6 + self.triangles * 3;
     }
 };
 
@@ -552,6 +554,7 @@ pub const SdlDebugRenderer = struct {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.renderRect(command),
+                .triangle => {},
                 .text => try self.renderText(command),
                 .image => try self.renderImage(command),
             }
@@ -630,6 +633,7 @@ pub const SdlFontRenderer = struct {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.renderRect(command),
+                .triangle => {},
                 .text => try self.renderText(command),
                 .image => try self.renderImage(command),
             }
@@ -783,6 +787,10 @@ pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, m
 
 fn appendCommand(mesh: *Mesh, command: draw.Command) void {
     if (command.kind == .text or command.kind == .image) return;
+    if (command.kind == .triangle) {
+        appendTriangle(mesh, command.p0, command.p1, command.p2, command.color);
+        return;
+    }
     if (command.border_color) |border| {
         if (command.border_width > 0.0 and border.a > 0.0) {
             appendBorderQuads(mesh, command.rect, border, command.border_width);
@@ -812,6 +820,15 @@ fn appendQuad(mesh: *Mesh, rect: draw.Rect, uv: draw.Rect, color: draw.Color) vo
     mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y1 }, .uv = .{ .x = uv_x1, .y = uv_y1 }, .color = color });
     mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y1 }, .uv = .{ .x = uv_x0, .y = uv_y1 }, .color = color });
     mesh.indices.appendSliceAssumeCapacity(&.{ base, base + 1, base + 2, base, base + 2, base + 3 });
+}
+
+fn appendTriangle(mesh: *Mesh, p0: draw.Vec2, p1: draw.Vec2, p2: draw.Vec2, color: draw.Color) void {
+    if (color.a <= 0.0) return;
+    const base: u32 = @intCast(mesh.vertices.items.len);
+    mesh.vertices.appendAssumeCapacity(.{ .pos = p0, .uv = .{}, .color = color });
+    mesh.vertices.appendAssumeCapacity(.{ .pos = p1, .uv = .{}, .color = color });
+    mesh.vertices.appendAssumeCapacity(.{ .pos = p2, .uv = .{}, .color = color });
+    mesh.indices.appendSliceAssumeCapacity(&.{ base, base + 1, base + 2 });
 }
 
 fn appendBorderQuads(mesh: *Mesh, rect: draw.Rect, color: draw.Color, width: f32) void {

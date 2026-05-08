@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const draw = @import("../draw.zig");
+const clipboard = @import("../input/clipboard.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
 const selection_input = @import("../input/selection.zig");
@@ -134,6 +135,11 @@ pub const ComposerPromptEvent = union(enum) {
 pub const ComposerPromptCallbacks = struct {
     context: ?*anyopaque = null,
     on_event: ?*const fn (context: ?*anyopaque, event: ComposerPromptEvent) void = null,
+    get_clipboard: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+
+    fn clipboardProvider(self: ComposerPromptCallbacks) clipboard {
+        return .{ .context = self.context, .get = self.get_clipboard };
+    }
 };
 
 const Options = struct {
@@ -648,6 +654,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     }
                     return true;
                 },
+                .v => {
+                    if (!key.primary) return false;
+                    return try self.pasteClipboard(allocator);
+                },
                 else => return false,
             }
         }
@@ -724,6 +734,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn replaceSelection(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             const range = self.selection() orelse return self.replaceRange(allocator, self.cursor, self.cursor, value);
             try self.replaceRange(allocator, range.start, range.end, value);
+        }
+
+        fn pasteClipboard(self: *Component, allocator: std.mem.Allocator) !bool {
+            const clipboard_text = self.callbacks.clipboardProvider().read(allocator) orelse return false;
+            defer allocator.free(clipboard_text);
+            if (clipboard_text.len == 0) return false;
+            try self.replaceSelection(allocator, clipboard_text);
+            return true;
         }
 
         fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
