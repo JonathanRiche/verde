@@ -12,7 +12,7 @@ const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 
-const TOP_BAR_HEIGHT: f32 = 82.0;
+const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const COMPOSER_HEIGHT: f32 = 220.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
@@ -30,7 +30,8 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         return;
     }
 
-    const header_height = theme.clampf(rect.h * 0.14, theme.scaledUi(54.0), theme.scaledUi(TOP_BAR_HEIGHT));
+    // ~30% shorter than the original (0.14 / 54 / 82) clamp: scale each bound by 0.7.
+    const header_height = theme.clampf(rect.h * 0.098, theme.scaledUi(38.0), theme.scaledUi(TOP_BAR_HEIGHT));
     const composer_height = theme.clampf(rect.h * 0.29, theme.scaledUi(128.0), theme.scaledUi(COMPOSER_HEIGHT));
     const bottom_margin = theme.clampf(rect.h * 0.018, theme.scaledUi(8.0), theme.scaledUi(14.0));
     const side_margin = theme.clampf(rect.w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
@@ -126,11 +127,13 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
     const project = state.currentProject();
     const thread = state.currentThread();
     const title = if (thread.title.len > 0) thread.title else project.label;
+    const title_line_h = theme.scaledUi(32.0);
+    const title_y = rect.y + @max((rect.h - title_line_h) * 0.5, theme.scaledUi(4.0));
     queueText(state, .{
         .x = rect.x + theme.scaledUi(32.0),
-        .y = rect.y + theme.scaledUi(22.0),
+        .y = title_y,
         .w = @max(rect.w - theme.scaledUi(64.0), 1.0),
-        .h = theme.scaledUi(32.0),
+        .h = title_line_h,
     }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), rect);
 }
 
