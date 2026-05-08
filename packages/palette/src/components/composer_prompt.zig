@@ -594,20 +594,27 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }, draw.Color.white, cr, button);
         }
 
-        /// Single clipped chevron (no layered triangles — those read as a double arrow at small sizes).
+        /// Submit arrow uses a looser inset than stop/square so the glyph reads larger ("upscaled") inside the pill.
         fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
-            const inner = sendGlyphBounds(button);
+            const m0 = @min(button.w, button.h);
+            const inset = m0 * 0.068;
+            const inner: draw.Rect = .{
+                .x = button.x + inset,
+                .y = button.y + inset,
+                .w = @max(button.w - 2.0 * inset, 1.0),
+                .h = @max(button.h - 2.0 * inset, 1.0),
+            };
             const m = @min(inner.w, inner.h);
-            const cx = @round((inner.x + inner.w * 0.5) * 2.0) * 0.5;
-            const cy = @round((inner.y + inner.h * 0.5) * 2.0) * 0.5;
-            const half = m * 0.20;
-            const rise = m * 0.12;
-            const fall = m * 0.10;
+            const cx = inner.x + inner.w * 0.5;
+            // Narrow tall chevron in the upper half of the inner box (wide short triangle reads like a tree trunk + canopy).
+            const tip_y = inner.y + m * 0.18;
+            const base_y = inner.y + m * 0.48;
+            const half = m * 0.095;
             try batch.triangleClipped(
                 allocator,
-                .{ .x = cx, .y = cy - rise },
-                .{ .x = cx - half, .y = cy + fall },
-                .{ .x = cx + half, .y = cy + fall },
+                .{ .x = cx, .y = tip_y },
+                .{ .x = cx - half, .y = base_y },
+                .{ .x = cx + half, .y = base_y },
                 draw.Color.white,
                 button,
             );
