@@ -151,6 +151,53 @@ When adding a new chat provider, wire it through the shared provider request con
 - If the provider cannot support local image/file inputs, fail explicitly with a user-facing notice instead of silently dropping attachments.
 - Validate both text-only prompts and prompts with more than one image before considering the provider complete.
 
+## Provider transcript UI contract (Palette)
+
+The chat workspace (`src/ui/chat_panel.zig`) renders **committed messages** and **in-flight stream state** (`send_state.partial_text`, `send_state.pending_events`). New providers must emit data in shapes the UI already understands, or extend **one** well-documented place (`shouldRenderPaletteCommandRow` and friends in `chat_panel.zig`) when introducing a genuinely new visual category.
+
+### Timeline events → transcript rows
+
+During a send, `utils.handleSendStreamEvent` appends `PendingTimelineEvent` rows with:
+
+- `role`: `.user`, `.assistant`, or `.system`
+- `author`: short label shown in the bubble header (or used for row-type detection)
+- `body`: full text for that row
+
+When the send completes, those events are turned into persisted `ChatMessage` rows with the same fields.
+
+### Command execution (compact `>_ … - …` row)
+
+The Palette transcript uses a **compact command row** (dark gray card, `>_` prefix) instead of the amber generic “System” bubble when **either**:
+
+1. **Codex-style authors** (preferred, explicit): `author` is exactly `Ran command` or `Command failed` (set in `providers/codex.zig`). Use `Command failed` when the run failed so the row can use failure coloring.
+
+2. **Shell-shaped body** (fallback for providers that label generic system lines as `System` or another title): trimmed `body` starts with one of the prefixes checked in `isCommandLikeShellBody` in `chat_panel.zig` (e.g. `/usr/bin/bash`, `/bin/bash`, `bash -lc`, `/usr/bin/env bash`, `/bin/sh -lc`, `/usr/bin/sh`). The displayed prefix label defaults to **`Ran command`** in that case; failure styling still requires `author == "Command failed"`.
+
+**New provider checklist for shell / tool events:**
+
+- Prefer emitting **`.system`** events with `author == "Ran command"` or `"Command failed"` and the full command string in `body`, matching Codex. That keeps semantics explicit and avoids heuristics.
+- If the upstream API only gives “system + command string”, ensure `body` begins with a conventional shell path so the heuristic matches, **or** extend `isCommandLikeShellBody` in `chat_panel.zig` with a narrow, documented prefix for your shell wrapper.
+- Do **not** put long unrelated system notices in a `body` that accidentally starts with `/usr/bin/bash` unless that is truly a command line.
+
+### Other system content
+
+- Special cases like **changed-files** cards may use dedicated authors/bodies (see legacy `chat_panel` on `master` for zgui). Palette support may still be partial; extend `renderTranscriptMessage` / height helpers in parallel when adding parity.
+
+### Assistant streaming text
+
+- Assistant reply text during a send is buffered in `send_state.partial_text` and flushed into timeline events by `flushPendingAssistantTextLocked` in `utils.zig`. Providers should drive **`on_stream_delta`** for incremental assistant text so the transcript can grow while the send is pending.
+
+### Stream event wiring
+
+- `SendPromptRequest.on_stream_event` receives `provider_types.StreamEvent`: either `.message{ .title, .body }` or `.diff{ .files }`. The `message.title` becomes the persisted **`author`** for that system row. Pick **stable, short titles**; they appear in the UI and in command-row detection.
+
+### When you add a provider
+
+1. Implement the harness contract in `provider_types.zig` / `harness.zig` and your `providers/<name>.zig`.
+2. Map streaming behavior to **`on_stream_delta`** and **`on_stream_event`** as above.
+3. Open `src/ui/chat_panel.zig` and confirm whether your system messages need updates to **`shouldRenderPaletteCommandRow`**, **`paletteCommandRowDisplayAuthor`**, or dedicated render branches (mirroring what `master` did for zgui in `chat_panel.zig` if needed).
+4. Manually verify with `mise run dev`: tail auto-scroll, command rows, and failure styling for your provider’s happy path and error path.
+
 ## Coordinate Spaces
 
 This app uses multiple size spaces. Mixing them incorrectly causes the exact failures we hit before: top-left-only rendering, giant black unused areas, or UI that changes apparent size across displays.

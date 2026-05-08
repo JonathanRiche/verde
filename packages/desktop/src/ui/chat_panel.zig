@@ -222,7 +222,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
 
     var content_y = column.y - scroll_y;
     for (thread.messages.items) |message| {
-        const item_h = transcriptMessageHeight(message.body, message.role, column.w);
+        const item_h = transcriptMessageHeight(message.body, message.role, column.w, message.author);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
             renderTranscriptMessage(state, column, content_y, item_h, message, clip);
         }
@@ -243,7 +243,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
 fn transcriptContentHeight(thread: anytype, width: f32) f32 {
     var total: f32 = theme.scaledUi(4.0);
     for (thread.messages.items) |message| {
-        total += transcriptMessageHeight(message.body, message.role, width) + theme.scaledUi(12.0);
+        total += transcriptMessageHeight(message.body, message.role, width, message.author) + theme.scaledUi(12.0);
     }
     total += transcriptPendingStreamHeight(thread, width);
     return total;
@@ -257,11 +257,11 @@ fn transcriptPendingStreamHeight(thread: *const app_state.ChatThread, column_wid
 
     var total: f32 = 0;
     for (send_state.pending_events.items) |event| {
-        total += transcriptMessageHeight(event.body, event.role, column_width) + theme.scaledUi(12.0);
+        total += transcriptMessageHeight(event.body, event.role, column_width, event.author) + theme.scaledUi(12.0);
     }
     const stream_text: []const u8 = send_state.partial_text.items;
     const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    total += transcriptMessageHeight(body_for_height, .assistant, column_width);
+    total += transcriptMessageHeight(body_for_height, .assistant, column_width, "");
     return total;
 }
 
@@ -273,14 +273,20 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 
     var y = content_y;
     for (send_state.pending_events.items) |event| {
-        const item_h = transcriptMessageHeight(event.body, event.role, column.w);
-        const role_label: []const u8 = switch (event.role) {
-            .user => "You",
-            .assistant => if (event.author.len > 0) event.author else "Assistant",
-            .system => if (event.author.len > 0) event.author else "System",
-        };
-        if (y + item_h >= column.y and y <= column.y + column.h) {
-            renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, clip);
+        const item_h = transcriptMessageHeight(event.body, event.role, column.w, event.author);
+        if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip);
+            }
+        } else {
+            const role_label: []const u8 = switch (event.role) {
+                .user => "You",
+                .assistant => if (event.author.len > 0) event.author else "Assistant",
+                .system => if (event.author.len > 0) event.author else "System",
+            };
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, clip);
+            }
         }
         y += item_h + theme.scaledUi(12.0);
     }
@@ -289,7 +295,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms);
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
-    const assistant_h = transcriptMessageHeight(body, .assistant, column.w);
+    const assistant_h = transcriptMessageHeight(body, .assistant, column.w, "");
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, clip);
     }
@@ -317,7 +323,56 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
     return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}", .{ minutes, seconds }) catch "Working - 0:00";
 }
 
-fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, column_width: f32) f32 {
+fn isCommandSystemEvent(author: []const u8) bool {
+    return std.mem.eql(u8, author, "Ran command") or std.mem.eql(u8, author, "Command failed");
+}
+
+/// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
+fn isCommandLikeShellBody(body_raw: []const u8) bool {
+    const t = std.mem.trim(u8, body_raw, "\n\r\t ");
+    if (t.len < 8) return false;
+    return std.mem.startsWith(u8, t, "/usr/bin/bash") or
+        std.mem.startsWith(u8, t, "/bin/bash") or
+        std.mem.startsWith(u8, t, "bash -lc") or
+        std.mem.startsWith(u8, t, "/usr/bin/env bash") or
+        std.mem.startsWith(u8, t, "/bin/sh -lc") or
+        std.mem.startsWith(u8, t, "/usr/bin/sh");
+}
+
+fn shouldRenderPaletteCommandRow(author: []const u8, body_raw: []const u8) bool {
+    if (isCommandSystemEvent(author)) return true;
+    return isCommandLikeShellBody(body_raw);
+}
+
+/// Label shown after `>_` in the compact command row (Codex-native titles preserved; shell-like bodies default to "Ran command").
+fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
+    if (isCommandSystemEvent(original_author)) return original_author;
+    if (isCommandLikeShellBody(body_raw)) return "Ran command";
+    return original_author;
+}
+
+fn transcriptCommandEventHeight(original_author: []const u8, body_raw: []const u8, column_width: f32) f32 {
+    const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
+    const pad_x = theme.scaledUi(14.0);
+    const pad_y = theme.scaledUi(9.0);
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const font_size = theme.scaledUi(15.0);
+    const inner_w = @max(column_width - pad_x * 2.0, theme.scaledUi(80.0));
+    const chars_per_line = @max(@as(usize, @intFromFloat(inner_w / (font_size * 0.52))), 1);
+
+    const combined = std.fmt.allocPrint(std.heap.page_allocator, ">_ {s} - {s}", .{ label, body }) catch {
+        const line_count = wrappedLineCount(body, chars_per_line);
+        return pad_y * 2.0 + @as(f32, @floatFromInt(1 + line_count)) * font_size * 1.28;
+    };
+    defer std.heap.page_allocator.free(combined);
+    const line_count = wrappedLineCount(combined, chars_per_line);
+    return pad_y * 2.0 + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
+}
+
+fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, column_width: f32, message_author: []const u8) f32 {
+    if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
+        return transcriptCommandEventHeight(message_author, body_raw, column_width);
+    }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(16.0);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
@@ -338,12 +393,49 @@ fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, colum
 }
 
 fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
+    if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip);
+        return;
+    }
     const role_label = switch (message.role) {
         .user => "You",
         .assistant => if (message.author.len > 0) message.author else "Assistant",
         .system => "System",
     };
     renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, clip);
+}
+
+fn renderCommandEventRow(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    original_author: []const u8,
+    body_raw: []const u8,
+    clip: palette.Rect,
+) void {
+    const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
+    queueRoundedClipped(state, bubble, paletteColor(colors.rgba(28, 29, 34, 255)), theme.scaledUi(10.0), clip);
+    queueBorderClipped(state, bubble, paletteColor(colors.DARK_BLUE), theme.scaledUi(10.0), 1.0, clip);
+
+    const pad = theme.scaledUi(14.0);
+    const pad_y = theme.scaledUi(9.0);
+    const inner = palette.Rect{
+        .x = bubble.x + pad,
+        .y = bubble.y + pad_y,
+        .w = @max(bubble.w - pad * 2.0, theme.scaledUi(40.0)),
+        .h = @max(bubble.h - pad_y * 2.0, theme.scaledUi(1.0)),
+    };
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
+    const combined = std.fmt.allocPrint(state.allocator, ">_ {s} - {s}", .{ label, body }) catch {
+        renderWrappedBody(state, inner, body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
+        return;
+    };
+    defer state.allocator.free(combined);
+    const failed = std.mem.eql(u8, original_author, "Command failed");
+    const color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
+    renderWrappedBody(state, inner, combined, color, theme.scaledUi(15.0), clip);
 }
 
 fn renderTranscriptBubbleFromParts(
