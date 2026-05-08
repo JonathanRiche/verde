@@ -42,7 +42,6 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         0.0;
 
     const header = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_height };
-    renderHeader(state, header);
 
     const composer_width = @max(theme.scaledUi(220.0), @min(rect.w - side_margin * 2.0, theme.scaledUi(980.0)));
     const composer_bottom = if (terminal_height > 0.0)
@@ -77,6 +76,10 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     } else {
         renderTranscript(state, body);
     }
+
+    // Paint after the transcript so the opaque header strip wins over any scrolled
+    // message geometry or GL text that would otherwise overlap the title bar.
+    renderHeader(state, header);
 
     renderComposer(state, composer_rect);
     if (terminal_height > 0.0) {
@@ -143,9 +146,9 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     transcript_rect = rect;
     const column_width = @min(rect.w - theme.scaledUi(48.0), theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
     const column = palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) };
-    // Clip to transcript body (below workspace header) so scrolled bubbles and GL text
-    // cannot paint over the title bar.
-    const clip = palette.Rect{ .x = column.x, .y = rect.y, .w = column.w, .h = rect.h };
+    // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
+    // stay below the workspace header when scrolled.
+    const clip = rect;
     const thread = state.currentThread();
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi()) {
