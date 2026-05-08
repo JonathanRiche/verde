@@ -1343,6 +1343,12 @@ fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup
         followup.* = null;
     }
 }
+
+pub const SidebarThreadHover = struct {
+    project_index: usize,
+    thread_index: usize,
+};
+
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1436,7 +1442,7 @@ pub const AppState = struct {
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
-    sidebar_thread_hover: ?struct { project_index: usize, thread_index: usize },
+    sidebar_thread_hover: ?SidebarThreadHover,
     browser_pane_focused: bool,
     browser_address_focused: bool,
     browser_address_cursor: usize,

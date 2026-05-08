@@ -54,7 +54,7 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
-    var new_hover: ?struct { project_index: usize, thread_index: usize } = null;
+    var new_hover: ?native_state.SidebarThreadHover = null;
     if (!state.isSidebarCollapsed() and rectContainsPoint(palette_sidebar_rect, x, y)) {
         var index = palette_hit_count;
         while (index > 0) {
