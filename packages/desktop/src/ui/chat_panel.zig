@@ -644,16 +644,18 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }, cached, model_rect);
     }
 
-    const fast_icon_rect = palette.Rect{
-        .x = fast_rect.x + theme.scaledUi(17.0),
-        .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
-        .w = icon_size,
-        .h = icon_size,
-    };
-    if (state.currentThread().fast_mode == .on) {
-        drawBoltIcon(state, fast_icon_rect, icon_color);
-    } else {
-        drawDefaultModeIcon(state, fast_icon_rect, icon_color);
+    if (state.currentThread().provider == .codex) {
+        const fast_icon_rect = palette.Rect{
+            .x = fast_rect.x + theme.scaledUi(17.0),
+            .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
+            .w = icon_size,
+            .h = icon_size,
+        };
+        if (state.currentThread().fast_mode == .on) {
+            drawBoltIcon(state, fast_icon_rect, icon_color);
+        } else {
+            drawDefaultModeIcon(state, fast_icon_rect, icon_color);
+        }
     }
 
     drawAccessIcon(state, .{

@@ -320,6 +320,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.markDirty();
         },
         .fast_changed => |enabled| {
+            if (state.currentThread().provider != .codex) return;
             const next: FastMode = if (enabled) .on else .off;
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
@@ -4530,6 +4531,8 @@ pub const AppState = struct {
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
+        const show_fast_toggle = thread.provider == .codex;
+        self.palette_composer.setShowFastToggle(show_fast_toggle);
         self.palette_composer.setPlaceholder(self.allocator, if (thread.draftImageCount() == 0) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
@@ -4538,7 +4541,11 @@ pub const AppState = struct {
         self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
         self.palette_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
-        self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        if (show_fast_toggle) {
+            self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        } else {
+            self.palette_composer.fast_enabled = false;
+        }
         self.palette_composer.access_enabled = thread.access_mode == .full_access;
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
@@ -4555,9 +4562,11 @@ pub const AppState = struct {
                 };
             }
         }
-        self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
-            log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
-        };
+        if (show_fast_toggle) {
+            self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
+                log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
+            };
+        }
         self.palette_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
             .full_access => "Full access",
             .supervised => "Supervised",
@@ -4706,7 +4715,7 @@ pub const AppState = struct {
             self.palette_composer.modelRect()
         else if (self.composer_toolbar_reasoning_rect.contains(point))
             self.palette_composer.reasoningRect()
-        else if (self.composer_toolbar_fast_rect.contains(point))
+        else if (self.currentThread().provider == .codex and self.composer_toolbar_fast_rect.contains(point))
             self.palette_composer.fastRect()
         else if (self.composer_toolbar_access_rect.contains(point))
             self.palette_composer.accessRect()
