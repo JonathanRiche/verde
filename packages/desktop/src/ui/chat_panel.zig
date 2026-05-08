@@ -34,14 +34,24 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     const composer_height = theme.clampf(rect.h * 0.29, theme.scaledUi(128.0), theme.scaledUi(COMPOSER_HEIGHT));
     const bottom_margin = theme.clampf(rect.h * 0.018, theme.scaledUi(8.0), theme.scaledUi(14.0));
     const side_margin = theme.clampf(rect.w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
+    const terminal_visible = state.isTerminalVisible() and !state.isBrowserVisible();
+    const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
+    const terminal_height = if (terminal_visible)
+        @min(@max((rect.h - header_height - composer_height - bottom_margin) * 0.32, theme.scaledUi(120.0)), theme.scaledUi(260.0))
+    else
+        0.0;
 
     const header = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_height };
     renderHeader(state, header);
 
     const composer_width = @max(theme.scaledUi(220.0), @min(rect.w - side_margin * 2.0, theme.scaledUi(980.0)));
+    const composer_bottom = if (terminal_height > 0.0)
+        rect.y + rect.h - terminal_height - terminal_gap
+    else
+        rect.y + rect.h - bottom_margin;
     const composer_rect = palette.Rect{
         .x = rect.x + (rect.w - composer_width) * 0.5,
-        .y = rect.y + rect.h - composer_height - bottom_margin,
+        .y = composer_bottom - composer_height,
         .w = composer_width,
         .h = composer_height,
     };
@@ -64,16 +74,19 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
         renderTranscript(state, chat_rect);
         browser_panel.renderDockAt(state, .{ .x = chat_rect.x + chat_rect.w, .y = body.y, .w = browser_width, .h = body.h });
-    } else if (state.isTerminalVisible() and body.h >= theme.scaledUi(360.0)) {
-        const terminal_height = @min(body.h * 0.32, theme.scaledUi(260.0));
-        const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w, .h = body.h - terminal_height };
-        renderTranscript(state, chat_rect);
-        terminal_panel.renderDockAt(state, .{ .x = body.x, .y = chat_rect.y + chat_rect.h, .w = body.w, .h = terminal_height });
     } else {
         renderTranscript(state, body);
     }
 
     renderComposer(state, composer_rect);
+    if (terminal_height > 0.0) {
+        terminal_panel.renderDockAt(state, .{
+            .x = rect.x,
+            .y = rect.y + rect.h - terminal_height,
+            .w = rect.w,
+            .h = terminal_height,
+        });
+    }
     composer_pickers.render(state);
 }
 
