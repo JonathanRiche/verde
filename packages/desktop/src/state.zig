@@ -96,7 +96,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .pill_icon_gap = 10.0,
     .pill_chevron_gap = 10.0,
     .model_min_width = 138.0,
-    .model_max_width = 220.0,
+    // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
+    .model_max_width = 420.0,
     .reasoning_min_width = 92.0,
     .reasoning_max_width = 150.0,
     .fast_min_width = 116.0,
@@ -130,7 +131,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .stop_icon = "x",
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 400.0;
 const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 40.0;
 const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 10.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
