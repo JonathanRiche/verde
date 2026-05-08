@@ -68,6 +68,8 @@ pub const ComposerPromptConfig = struct {
     menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
     menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
+    /// Max rows shown for model/reasoning dropdowns before clipping (scroll not wired for these menus).
+    menu_max_visible_rows: f32 = 14.0,
     row_height: f32 = 28.0,
     pill_padding_x: f32 = 10.0,
     pill_icon_gap: f32 = 7.0,
@@ -670,7 +672,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const previous_z = batch.setZIndex(self.z_index + 1000);
             defer batch.restoreZIndex(previous_z);
             const menu_corner: f32 = 14.0;
-            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, menu_corner, 1.0);
+            // Rounded shell (avoid `panel` + rectBorder sharp outer frame on top of rounded fills).
+            const inset = @max(1.0, 1.0);
+            try batch.roundedRectClipped(allocator, rect, config.menu_border_color, menu_corner, rect);
+            if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
+                try batch.roundedRectClipped(allocator, .{
+                    .x = rect.x + inset,
+                    .y = rect.y + inset,
+                    .w = rect.w - inset * 2.0,
+                    .h = rect.h - inset * 2.0,
+                }, config.menu_background_color, @max(menu_corner - inset, 0.0), rect);
+            }
             const metrics = self.toolbarMetrics();
             const row_corner = @min(9.0, @max(4.0, metrics.line_height * 0.38));
             var index: usize = 0;
@@ -1004,7 +1016,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .reasoning => self.reasoningRect(),
             };
             const options = self.optionsFor(target);
-            const height = @min(@as(f32, @floatFromInt(options.count)) * config.row_height, config.row_height * 6.0);
+            const max_rows = @max(config.menu_max_visible_rows, 1.0);
+            const height = @min(
+                @as(f32, @floatFromInt(options.count)) * config.row_height,
+                config.row_height * max_rows,
+            );
             return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, self.menuContentWidth(target)), .h = height };
         }
 
