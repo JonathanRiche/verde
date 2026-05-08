@@ -14,6 +14,9 @@ const IMPORT_MESSAGE_LIMIT = 100_000;
 const POLL_INTERVAL_MS: u64 = 150;
 const MAX_POLL_ATTEMPTS = 12_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
+/// OpenCode SSE can emit very small `message.part.delta` chunks; batching UI callbacks
+/// keeps transcript layout from repainting on every handful of bytes.
+const OPENCODE_STREAM_UI_COALESCE_MIN_BYTES: usize = 56;
 
 fn sleepMs(ms: u64) void {
     const request: std.c.timespec = .{
@@ -449,7 +452,9 @@ pub const Client = struct {
                 try self.syncStreamedTextFromEventStream(context, &streamed_text);
             }
             try self.emitTaskProgressFromSnapshot(&latest_snapshot, request, &last_task_summary);
-            try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
+            if (event_stream_context == null) {
+                try self.emitAssistantProgressFromSnapshot(&latest_snapshot, baseline_assistant_id, request, &streamed_text);
+            }
             try self.emitDiffProgress(session_id, request, baseline_diff_payload, &last_diff_payload);
 
             const status = try self.fetchSessionStatus(session_id);
@@ -955,6 +960,7 @@ const EventStreamContext = struct {
     request: provider_types.SendPromptRequest,
     child: ?std.process.Child = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
+    stream_delta_coalesce: std.ArrayListUnmanaged(u8) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
     open_state: EventStreamOpenState = .starting,
@@ -962,9 +968,11 @@ const EventStreamContext = struct {
     session_idle: bool = false,
 
     fn deinit(self: *EventStreamContext) void {
+        flushPendingOpencodeStreamDeltas(self);
         self.allocator.free(self.session_id);
         if (self.baseline_assistant_id) |message_id| self.allocator.free(message_id);
         self.streamed_text.deinit(self.allocator);
+        self.stream_delta_coalesce.deinit(self.allocator);
     }
 };
 
@@ -1498,6 +1506,8 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     if (event_data.items.len > 0) {
         _ = try processEventStreamMessage(context, event_name.items, event_data.items);
     }
+
+    flushPendingOpencodeStreamDeltas(context);
 }
 
 fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpenState) void {
@@ -1576,8 +1586,9 @@ fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []con
 
 fn signalEventStreamIdle(context: *EventStreamContext) void {
     context.mutex.lock();
-    defer context.mutex.unlock();
     context.session_idle = true;
+    context.mutex.unlock();
+    flushPendingOpencodeStreamDeltas(context);
 }
 
 fn eventStreamReachedIdle(context: *EventStreamContext) bool {
@@ -1624,6 +1635,30 @@ fn eventTargetsSession(value: std.json.Value, session_id: []const u8) bool {
     return std.mem.eql(u8, event_session_id, session_id);
 }
 
+fn flushPendingOpencodeStreamDeltas(context: *EventStreamContext) void {
+    const on_stream_delta = context.request.on_stream_delta orelse {
+        context.mutex.lock();
+        context.stream_delta_coalesce.clearRetainingCapacity();
+        context.mutex.unlock();
+        return;
+    };
+
+    context.mutex.lock();
+    if (context.stream_delta_coalesce.items.len == 0) {
+        context.mutex.unlock();
+        return;
+    }
+    const owned = context.stream_delta_coalesce.toOwnedSlice(context.allocator) catch {
+        context.mutex.unlock();
+        return;
+    };
+    context.stream_delta_coalesce = .empty;
+    context.mutex.unlock();
+
+    on_stream_delta(context.request.stream_context, owned);
+    context.allocator.free(owned);
+}
+
 fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Value) !void {
     if (!eventTargetsSession(properties, context.session_id)) return;
 
@@ -1638,13 +1673,28 @@ fn handleMessagePartDelta(context: *EventStreamContext, properties: std.json.Val
     const delta = getOptionalObjectString(properties, "delta") orelse return;
     if (delta.len == 0) return;
 
+    const on_stream_delta = context.request.on_stream_delta orelse {
+        context.mutex.lock();
+        defer context.mutex.unlock();
+        try context.streamed_text.appendSlice(context.allocator, delta);
+        return;
+    };
+
     context.mutex.lock();
     errdefer context.mutex.unlock();
     try context.streamed_text.appendSlice(context.allocator, delta);
+    try context.stream_delta_coalesce.appendSlice(context.allocator, delta);
+    const flush_now = context.stream_delta_coalesce.items.len >= OPENCODE_STREAM_UI_COALESCE_MIN_BYTES or
+        std.mem.indexOfScalar(u8, delta, '\n') != null;
+    if (flush_now) {
+        const owned = try context.stream_delta_coalesce.toOwnedSlice(context.allocator);
+        context.stream_delta_coalesce = .empty;
+        context.mutex.unlock();
+        on_stream_delta(context.request.stream_context, owned);
+        context.allocator.free(owned);
+        return;
+    }
     context.mutex.unlock();
-
-    const on_stream_delta = context.request.on_stream_delta orelse return;
-    on_stream_delta(context.request.stream_context, delta);
 }
 
 fn handleSessionDiff(context: *EventStreamContext, properties: std.json.Value) !void {
