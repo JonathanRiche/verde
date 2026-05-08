@@ -1698,6 +1698,32 @@ pub const AppState = struct {
                 .value = value,
             });
         }
+
+        // OpenCode's configured provider list can be a subset (e.g. only models the user wired
+        // through one vendor). Keep the built-in `opencode/…` presets so OpenCode threads can
+        // still target other bundled routes when those refs are valid for the harness.
+        for (OPENCODE_MODEL_OPTIONS) |preset| {
+            const preset_value = preset.value orelse continue;
+            var already = false;
+            for (self.opencode_model_options.items) |existing| {
+                if (existing.value) |v| {
+                    if (std.mem.eql(u8, v, preset_value)) {
+                        already = true;
+                        break;
+                    }
+                }
+            }
+            if (already) continue;
+
+            const preset_label = try self.allocator.dupeZ(u8, preset.label);
+            errdefer self.allocator.free(preset_label);
+            const preset_value_copy = try self.allocator.dupeZ(u8, preset_value);
+            errdefer self.allocator.free(preset_value_copy);
+            try self.opencode_model_options.append(self.allocator, .{
+                .label = preset_label,
+                .value = preset_value_copy,
+            });
+        }
     }
 
     fn opencodeModelSortLessThan(a: anytype, b: anytype) bool {
