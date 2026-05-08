@@ -129,6 +129,7 @@ pub const SendPromptRequest = struct {
     thread_title: ?[]const u8 = null,
     prompt: []const u8,
     image: ?ImageAttachment = null,
+    images: []const ImageAttachment = &.{},
     cwd: ?[]const u8 = null,
     model: ?[]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,

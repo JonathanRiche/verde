@@ -1928,38 +1928,61 @@ fn buildPromptBody(
     request: provider_types.SendPromptRequest,
 ) ![]u8 {
     const variant = reasoningVariantName(request.reasoning_effort);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{
+        .writer = &writer.writer,
+        .options = .{},
+    };
+
+    try stringify.beginObject();
     if (request.model) |model_ref| {
         const provider_id, const model_id = parseModelRef(model_ref);
-        if (variant) |variant_name| {
-            return stringifyAlloc(allocator, .{
-                .model = .{
-                    .providerID = provider_id,
-                    .modelID = model_id,
-                },
-                .variant = variant_name,
-                .parts = &.{.{ .type = "text", .text = request.prompt }},
-            });
-        }
-
-        return stringifyAlloc(allocator, .{
-            .model = .{
-                .providerID = provider_id,
-                .modelID = model_id,
-            },
-            .parts = &.{.{ .type = "text", .text = request.prompt }},
-        });
+        try stringify.objectField("model");
+        try stringify.beginObject();
+        try stringify.objectField("providerID");
+        try stringify.write(provider_id);
+        try stringify.objectField("modelID");
+        try stringify.write(model_id);
+        try stringify.endObject();
     }
-
     if (variant) |variant_name| {
-        return stringifyAlloc(allocator, .{
-            .variant = variant_name,
-            .parts = &.{.{ .type = "text", .text = request.prompt }},
-        });
+        try stringify.objectField("variant");
+        try stringify.write(variant_name);
     }
+    try stringify.objectField("parts");
+    try stringify.beginArray();
+    try writeTextPart(&stringify, request.prompt);
+    if (request.image) |image| try writeImagePart(&stringify, image.path);
+    for (request.images) |image| try writeImagePart(&stringify, image.path);
+    try stringify.endArray();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
 
-    return stringifyAlloc(allocator, .{
-        .parts = &.{.{ .type = "text", .text = request.prompt }},
-    });
+fn writeTextPart(stringify: *std.json.Stringify, text: []const u8) !void {
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("text");
+    try stringify.objectField("text");
+    try stringify.write(text);
+    try stringify.endObject();
+}
+
+fn writeImagePart(stringify: *std.json.Stringify, path: []const u8) !void {
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("file");
+    try stringify.objectField("filename");
+    try stringify.write(std.fs.path.basename(path));
+    try stringify.objectField("source");
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("path");
+    try stringify.objectField("path");
+    try stringify.write(path);
+    try stringify.endObject();
+    try stringify.endObject();
 }
 
 fn reasoningVariantName(value: ?provider_types.ReasoningEffort) ?[]const u8 {

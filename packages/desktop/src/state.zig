@@ -540,6 +540,7 @@ pub const ChatMessage = struct {
     author: [:0]const u8,
     body: [:0]const u8,
     image: ?ChatImageAttachment = null,
+    extra_images: []ChatImageAttachment = &.{},
 };
 
 pub const ChatImageAttachment = struct {
@@ -583,6 +584,7 @@ pub const ChatThread = struct {
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
     draft_image: ?ChatImageAttachment = null,
+    draft_extra_images: std.ArrayList(ChatImageAttachment),
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
     fn init(allocator: std.mem.Allocator, title: []const u8) !ChatThread {
@@ -607,6 +609,7 @@ pub const ChatThread = struct {
             .transcript_scroll_valid = false,
             .transcript_scroll_y = 0.0,
             .draft_image = null,
+            .draft_extra_images = .empty,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
     }
@@ -635,11 +638,50 @@ pub const ChatThread = struct {
         self.draft_image = try ChatImageAttachment.init(allocator, path, mime, byte_size);
     }
 
+    fn addDraftImage(self: *ChatThread, allocator: std.mem.Allocator, path: []const u8, mime: []const u8, byte_size: usize) !void {
+        if (self.draft_image == null) {
+            self.draft_image = try ChatImageAttachment.init(allocator, path, mime, byte_size);
+            return;
+        }
+        try self.draft_extra_images.append(allocator, try ChatImageAttachment.init(allocator, path, mime, byte_size));
+    }
+
     fn clearDraftImage(self: *ChatThread, allocator: std.mem.Allocator) void {
         if (self.draft_image) |*image| {
             image.deinit(allocator);
             self.draft_image = null;
         }
+        for (self.draft_extra_images.items) |*image| {
+            image.deinit(allocator);
+        }
+        self.draft_extra_images.clearRetainingCapacity();
+    }
+
+    fn clearDraftImageAt(self: *ChatThread, allocator: std.mem.Allocator, index: usize) void {
+        if (index == 0) {
+            if (self.draft_image) |*image| image.deinit(allocator);
+            if (self.draft_extra_images.items.len > 0) {
+                self.draft_image = self.draft_extra_images.orderedRemove(0);
+            } else {
+                self.draft_image = null;
+            }
+            return;
+        }
+        const extra_index = index - 1;
+        if (extra_index >= self.draft_extra_images.items.len) return;
+        var image = self.draft_extra_images.orderedRemove(extra_index);
+        image.deinit(allocator);
+    }
+
+    pub fn draftImageCount(self: *const ChatThread) usize {
+        return (if (self.draft_image != null) @as(usize, 1) else 0) + self.draft_extra_images.items.len;
+    }
+
+    pub fn draftImageAt(self: *const ChatThread, index: usize) ?*const ChatImageAttachment {
+        if (index == 0) return if (self.draft_image) |*image| image else null;
+        const extra_index = index - 1;
+        if (extra_index >= self.draft_extra_images.items.len) return null;
+        return &self.draft_extra_images.items[extra_index];
     }
 
     fn commitFromPrompt(self: *ChatThread, allocator: std.mem.Allocator, prompt: []const u8) !void {
@@ -748,9 +790,12 @@ pub const ChatThread = struct {
             allocator.free(message.author);
             allocator.free(message.body);
             if (message.image) |*image| image.deinit(allocator);
+            for (message.extra_images) |*image| image.deinit(allocator);
+            allocator.free(message.extra_images);
         }
         self.messages.deinit(allocator);
         self.clearDraftImage(allocator);
+        self.draft_extra_images.deinit(allocator);
     }
 };
 pub const PickerStatus = enum {
@@ -1254,6 +1299,10 @@ pub const AppState = struct {
     composer_send_hovered: bool,
     composer_draft_image_clear_valid: bool,
     composer_draft_image_clear_rect: palette.Rect,
+    composer_draft_image_clear_index: usize,
+    composer_draft_image_clear_count: usize,
+    composer_draft_image_clear_rects: [16]palette.Rect,
+    composer_draft_image_clear_indices: [16]usize,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
@@ -1369,6 +1418,10 @@ pub const AppState = struct {
             .composer_send_hovered = false,
             .composer_draft_image_clear_valid = false,
             .composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_draft_image_clear_index = 0,
+            .composer_draft_image_clear_count = 0,
+            .composer_draft_image_clear_rects = [_]palette.Rect{.{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 }} ** 16,
+            .composer_draft_image_clear_indices = [_]usize{0} ** 16,
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
@@ -1662,8 +1715,15 @@ pub const AppState = struct {
         author: []const u8,
         body: []const u8,
         image: ?*const ChatImageAttachment,
+        extra_images: []const ChatImageAttachment,
     ) !void {
         self.trimThreadMessages(thread, 1);
+
+        const copied_extra = try self.allocator.alloc(ChatImageAttachment, extra_images.len);
+        errdefer self.allocator.free(copied_extra);
+        for (extra_images, 0..) |attachment, index| {
+            copied_extra[index] = try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size);
+        }
 
         try thread.messages.append(self.allocator, .{
             .role = role,
@@ -1673,13 +1733,14 @@ pub const AppState = struct {
                 try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size)
             else
                 null,
+            .extra_images = copied_extra,
         });
         thread.touch();
         self.markDirty();
     }
 
     fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
-        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image);
+        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image, &.{});
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
@@ -2174,15 +2235,11 @@ pub const AppState = struct {
     pub fn sendDraft(self: *AppState) !void {
         const draft = self.currentDraft();
         const draft_image = self.currentThread().draft_image;
-        if (draft.len == 0 and draft_image == null) return;
+        const draft_image_count = self.currentThread().draftImageCount();
+        if (draft.len == 0 and draft_image_count == 0) return;
 
         if (self.currentThread().isSendPending()) {
             self.setSidebarNotice("This chat already has a provider request running.");
-            return;
-        }
-
-        if (draft_image != null and self.currentThread().provider != .codex) {
-            self.setSidebarNotice("Image attachments are available for Codex threads only right now.");
             return;
         }
 
@@ -2192,7 +2249,7 @@ pub const AppState = struct {
             try thread.commitFromPrompt(self.allocator, if (trimmed_title.len > 0) trimmed_title else "Image");
         }
         var draft_image_copy = draft_image;
-        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null);
+        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null, thread.draft_extra_images.items);
         self.currentProjectMutable().invalidateSidebarThreadCache();
         try self.beginSendForThread(self.currentProject().path, thread, draft);
         self.clearDraft();
@@ -2239,7 +2296,7 @@ pub const AppState = struct {
             return;
         }
 
-        if (thread.draft_image != null) {
+        if (thread.draftImageCount() > 0) {
             self.setSidebarNotice("Queued follow-up messages do not support image attachments yet.");
             return;
         }
@@ -2398,6 +2455,11 @@ pub const AppState = struct {
 
         const request = try page_alloc.create(SendWorkerRequest);
         errdefer page_alloc.destroy(request);
+        const extra_image_paths = try page_alloc.alloc([]u8, thread.draft_extra_images.items.len);
+        errdefer page_alloc.free(extra_image_paths);
+        for (thread.draft_extra_images.items, 0..) |image, index| {
+            extra_image_paths[index] = try page_alloc.dupe(u8, image.path);
+        }
         request.* = .{
             .send_state_ptr = thread.send_state,
             .provider = thread.provider,
@@ -2405,6 +2467,7 @@ pub const AppState = struct {
             .project_path = try page_alloc.dupe(u8, project_path),
             .prompt = try page_alloc.dupe(u8, prompt),
             .image_path = if (thread.draft_image) |image| try page_alloc.dupe(u8, image.path) else null,
+            .image_paths = extra_image_paths,
             .provider_thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
             .thread_title = try page_alloc.dupe(u8, thread.title),
             .model_ref = if (thread.model_ref) |model_ref| try page_alloc.dupe(u8, model_ref) else null,
@@ -2416,6 +2479,8 @@ pub const AppState = struct {
             page_alloc.free(request.project_path);
             page_alloc.free(request.prompt);
             if (request.image_path) |image_path| page_alloc.free(image_path);
+            for (request.image_paths) |image_path| page_alloc.free(image_path);
+            page_alloc.free(request.image_paths);
             if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
@@ -2895,7 +2960,7 @@ pub const AppState = struct {
         defer self.allocator.free(image_path);
 
         const thread = self.currentThreadMutable();
-        thread.setDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
+        thread.addDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
             log.err("failed to attach draft image: {s}", .{@errorName(err)});
             runtime_log.diagnostic("clipboard image draft attach failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to attach clipboard image.");
@@ -2971,8 +3036,12 @@ pub const AppState = struct {
     }
 
     pub fn clearCurrentDraftImage(self: *AppState) void {
+        self.clearCurrentDraftImageAt(0);
+    }
+
+    pub fn clearCurrentDraftImageAt(self: *AppState, index: usize) void {
         const thread = self.currentThreadMutable();
-        if (thread.draft_image) |image| {
+        if (thread.draftImageAt(index)) |image| {
             var threaded = std.Io.Threaded.init_single_threaded;
             std.Io.Dir.deleteFileAbsolute(threaded.io(), image.path) catch {};
             self.evictCachedImageTexture(image.path);
@@ -2983,7 +3052,7 @@ pub const AppState = struct {
                 }
             }
         }
-        thread.clearDraftImage(self.allocator);
+        thread.clearDraftImageAt(self.allocator, index);
         self.markDirty();
     }
 
@@ -3099,6 +3168,12 @@ pub const AppState = struct {
             var owned_image = image;
             owned_image.deinit(self.allocator);
         }
+        for (message.extra_images) |image| {
+            self.evictCachedImageTexture(image.path);
+            var owned_image = image;
+            owned_image.deinit(self.allocator);
+        }
+        self.allocator.free(message.extra_images);
     }
 
     pub fn ensureImageTexture(self: *AppState, path: [:0]const u8) ?CachedImageTexture {
@@ -3491,6 +3566,11 @@ pub const AppState = struct {
             try buffer.appendSlice(self.allocator, message.author);
 
             if (message.image) |image| {
+                const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
+                defer self.allocator.free(image_label);
+                try buffer.appendSlice(self.allocator, image_label);
+            }
+            for (message.extra_images) |image| {
                 const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
                 defer self.allocator.free(image_label);
                 try buffer.appendSlice(self.allocator, image_label);
@@ -4411,7 +4491,7 @@ pub const AppState = struct {
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
-        self.palette_composer.setPlaceholder(self.allocator, if (thread.draft_image == null) "Ask anything, or use / to show available commands" else " ") catch |err| {
+        self.palette_composer.setPlaceholder(self.allocator, if (thread.draftImageCount() == 0) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
@@ -4756,23 +4836,41 @@ pub const AppState = struct {
     }
 
     pub fn setComposerDraftImageClearRect(self: *AppState, rect: ?palette.Rect) void {
+        self.setComposerDraftImageClearRectAt(rect, 0);
+    }
+
+    pub fn setComposerDraftImageClearRectAt(self: *AppState, rect: ?palette.Rect, index: usize) void {
         if (rect) |value| {
             self.composer_draft_image_clear_valid = true;
             self.composer_draft_image_clear_rect = value;
+            self.composer_draft_image_clear_index = index;
+            if (self.composer_draft_image_clear_count < self.composer_draft_image_clear_rects.len) {
+                const slot = self.composer_draft_image_clear_count;
+                self.composer_draft_image_clear_rects[slot] = value;
+                self.composer_draft_image_clear_indices[slot] = index;
+                self.composer_draft_image_clear_count += 1;
+            }
         } else {
             self.composer_draft_image_clear_valid = false;
             self.composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+            self.composer_draft_image_clear_index = 0;
+            self.composer_draft_image_clear_count = 0;
         }
     }
 
     pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
         if (!self.composer_draft_image_clear_valid) return false;
-        const rect = self.composer_draft_image_clear_rect;
-        if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
-        if (!down) {
-            self.clearCurrentDraftImage();
+        var i: usize = self.composer_draft_image_clear_count;
+        while (i > 0) {
+            i -= 1;
+            const rect = self.composer_draft_image_clear_rects[i];
+            if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) continue;
+            if (!down) {
+                self.clearCurrentDraftImageAt(self.composer_draft_image_clear_indices[i]);
+            }
+            return true;
         }
-        return true;
+        return false;
     }
 
     fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
@@ -5483,6 +5581,7 @@ pub const AppState = struct {
                         "Conversation interrupted",
                         "Tell the model what to do differently.",
                         null,
+                        &.{},
                     ) catch |err| {
                         log.err("failed to append interruption notice: {s}", .{@errorName(err)});
                     };
@@ -5685,7 +5784,7 @@ pub const AppState = struct {
             return;
         }
 
-        self.appendMessageToThread(thread, .user, "You", followup.prompt, null) catch |err| {
+        self.appendMessageToThread(thread, .user, "You", followup.prompt, null, &.{}) catch |err| {
             log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to append the pending follow-up.");
             return;

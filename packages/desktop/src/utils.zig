@@ -369,6 +369,8 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.free(request.project_path);
         page_alloc.free(request.prompt);
         if (request.image_path) |image_path| page_alloc.free(image_path);
+        for (request.image_paths) |image_path| page_alloc.free(image_path);
+        page_alloc.free(request.image_paths);
         if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
         page_alloc.free(request.thread_title);
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
@@ -453,6 +455,7 @@ pub const SendWorkerRequest = struct {
     project_path: []u8,
     prompt: []u8,
     image_path: ?[]u8,
+    image_paths: [][]u8,
     provider_thread_id: ?[]u8,
     thread_title: []u8,
     model_ref: ?[]u8,
@@ -500,11 +503,18 @@ pub fn runSendWorker(
     std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
     runtime_log.diagnostic("send worker connected provider={s}", .{@tagName(request.provider)});
 
+    const image_attachments = try allocator.alloc(ai_harness.types.ImageAttachment, request.image_paths.len);
+    defer allocator.free(image_attachments);
+    for (request.image_paths, 0..) |image_path, index| {
+        image_attachments[index] = .{ .path = image_path };
+    }
+
     const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
         .thread_title = request.thread_title,
         .prompt = request.prompt,
         .image = if (request.image_path) |image_path| .{ .path = image_path } else null,
+        .images = image_attachments,
         .cwd = request.project_path,
         .model = request.model_ref,
         .reasoning_effort = request.reasoning_effort,
