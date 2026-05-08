@@ -39,11 +39,6 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
 
-    queuePaletteRect(state, rect, paletteColor(colors.rgba(18, 20, 25, 255)));
-    renderToolbar(state, rect);
-    if (!state.isBrowserVisible()) {
-        return;
-    }
     const toolbar_height = theme.scaledUi(52.0);
     renderPaneCanvas(state, .{
         .x = rect.x,
@@ -51,6 +46,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
         .w = rect.w,
         .h = @max(rect.h - toolbar_height, theme.scaledUi(180.0)),
     });
+    renderToolbar(state, rect);
 }
 
 pub fn handlePaletteMouseMotion(x: f32, y: f32) void {
@@ -172,6 +168,12 @@ fn queuePaletteRect(state: *app_state.AppState, rect: palette.Rect, color: palet
     };
 }
 
+fn queuePaletteTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color) void {
+    state.palette_overlay_batch.triangle(state.allocator, p0, p1, p2, color) catch |err| {
+        app_state.log.warn("failed to queue browser palette triangle: {s}", .{@errorName(err)});
+    };
+}
+
 fn queuePaletteBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
         app_state.log.warn("failed to queue browser palette border: {s}", .{@errorName(err)});
@@ -230,8 +232,7 @@ fn renderPaletteToolbarButton(
 
 /// Renders the compact browser toolbar with URL entry and primary actions.
 fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
-    const navigate_icon = "->";
-    const inspect_icon = "I";
+    const navigate_icon = ">";
     const close_icon = "x";
     const toolbar_height = theme.scaledUi(52.0);
     const button_size = theme.scaledUi(36.0);
@@ -272,7 +273,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
     renderPaletteToolbarButton(
         state,
         inspect_rect,
-        inspect_icon,
+        "",
         inspector_button_color,
         inspector_hover_color,
         inspector_active_color,
@@ -280,13 +281,14 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
         can_use_inspector and rectHovered(inspect_rect),
         false,
     );
+    drawCursorIcon(state, centeredIconRect(inspect_rect), paletteColor(if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE));
     addPaletteHit(inspect_rect, .inspect_toggle);
 
     const inspect_menu_rect: palette.Rect = .{ .x = inspect_rect.x + inspect_rect.w, .y = address_rect.y, .w = inspect_menu_button_width, .h = button_size };
     renderPaletteToolbarButton(
         state,
         inspect_menu_rect,
-        "v",
+        "⌄",
         inspector_button_color,
         inspector_hover_color,
         inspector_active_color,
@@ -334,6 +336,32 @@ fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, ins
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Box", inspector_mode == .draw_box, .inspect_mode_draw_box);
     y += row_height;
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Freeform", inspector_mode == .draw_freeform, .inspect_mode_draw_freeform);
+}
+
+fn centeredIconRect(rect: palette.Rect) palette.Rect {
+    const size = @min(rect.w, rect.h) * 0.54;
+    return .{
+        .x = rect.x + (rect.w - size) * 0.5,
+        .y = rect.y + (rect.h - size) * 0.5,
+        .w = size,
+        .h = size,
+    };
+}
+
+fn drawCursorIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    const points = [_]palette.draw.Vec2{
+        .{ .x = rect.x + rect.w * 0.16, .y = rect.y + rect.h * 0.06 },
+        .{ .x = rect.x + rect.w * 0.16, .y = rect.y + rect.h * 0.88 },
+        .{ .x = rect.x + rect.w * 0.42, .y = rect.y + rect.h * 0.64 },
+        .{ .x = rect.x + rect.w * 0.58, .y = rect.y + rect.h * 0.96 },
+        .{ .x = rect.x + rect.w * 0.74, .y = rect.y + rect.h * 0.88 },
+        .{ .x = rect.x + rect.w * 0.58, .y = rect.y + rect.h * 0.58 },
+        .{ .x = rect.x + rect.w * 0.88, .y = rect.y + rect.h * 0.58 },
+    };
+    queuePaletteTriangle(state, points[0], points[1], points[2], color);
+    queuePaletteTriangle(state, points[0], points[2], points[6], color);
+    queuePaletteTriangle(state, points[2], points[3], points[4], color);
+    queuePaletteTriangle(state, points[2], points[4], points[5], color);
 }
 
 fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, selected: bool, kind: BrowserHitKind) void {

@@ -5,9 +5,11 @@ const palette = @import("palette");
 
 const app_state = @import("../state.zig");
 const browser_panel = @import("browser.zig");
+const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
 const runtime = @import("runtime.zig");
+const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 
 const TOP_BAR_HEIGHT: f32 = 82.0;
@@ -58,7 +60,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     };
 
     if (state.isBrowserVisible() and body.w >= theme.scaledUi(900.0)) {
-        const browser_width = @min(body.w * 0.42, theme.scaledUi(620.0));
+        const browser_width = body.w * 0.50;
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
         renderTranscript(state, chat_rect);
         browser_panel.renderDockAt(state, .{ .x = chat_rect.x + chat_rect.w, .y = body.y, .w = browser_width, .h = body.h });
@@ -66,7 +68,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
         const terminal_height = @min(body.h * 0.32, theme.scaledUi(260.0));
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w, .h = body.h - terminal_height };
         renderTranscript(state, chat_rect);
-        renderTerminalPlaceholder(state, .{ .x = body.x, .y = chat_rect.y + chat_rect.h, .w = body.w, .h = terminal_height });
+        terminal_panel.renderDockAt(state, .{ .x = body.x, .y = chat_rect.y + chat_rect.h, .w = body.w, .h = terminal_height });
     } else {
         renderTranscript(state, body);
     }
@@ -190,7 +192,18 @@ fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, colum
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(16.0);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
-    const chars_per_line = @max(@as(usize, @intFromFloat((body_width - theme.scaledUi(28.0)) / (font_size * 0.52))), 1);
+    const body_inner_width = @max(body_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
+    if (role == .assistant) {
+        var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
+            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+            const line_count = wrappedLineCount(body, chars_per_line);
+            return theme.scaledUi(44.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
+        };
+        defer view.deinit(std.heap.page_allocator);
+        const measured = chat_markdown.measureBodyHeight(view, body_inner_width, markdownOptions(font_size));
+        return theme.scaledUi(44.0) + measured;
+    }
+    const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
     const line_count = wrappedLineCount(body, chars_per_line);
     return theme.scaledUi(44.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
 }
@@ -214,12 +227,45 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         queueBorder(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0);
     }
     queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
-    renderWrappedBody(state, .{
+    const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
         .y = bubble.y + theme.scaledUi(32.0),
         .w = bubble.w - theme.scaledUi(28.0),
         .h = bubble.h - theme.scaledUi(38.0),
-    }, std.mem.trim(u8, message.body, "\n\r\t "), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+    };
+    const body_text = std.mem.trim(u8, message.body, "\n\r\t ");
+    if (message.role == .assistant) {
+        renderMarkdownBody(state, body_rect, body_text, clip);
+    } else {
+        renderWrappedBody(state, body_rect, body_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+    }
+}
+
+fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
+    return .{
+        .base_font_size = font_size,
+        .line_height = font_size * 1.32,
+        .glyph_width = font_size * 0.55,
+        .code_font_size = font_size * 0.92,
+    };
+}
+
+fn renderMarkdownBody(state: *app_state.AppState, rect: palette.Rect, body: []const u8, clip: palette.Rect) void {
+    if (body.len == 0) return;
+    var view = chat_markdown.buildBodyView(state.allocator, body) catch {
+        renderWrappedBody(state, rect, body, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+        return;
+    };
+    defer view.deinit(state.allocator);
+    var context = chat_markdown.PaletteRenderContext{
+        .allocator = state.allocator,
+        .batch = &state.palette_overlay_batch,
+        .frame_text = &state.palette_frame_text,
+        .cursor = rect,
+        .available_width = rect.w,
+        .clip = clip,
+    };
+    chat_markdown.renderPaletteBody(&context, view, markdownOptions(theme.scaledUi(16.0)));
 }
 
 fn wrappedLineCount(body: []const u8, chars_per_line: usize) usize {
@@ -364,12 +410,17 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }, cached, model_rect);
     }
 
-    drawBoltIcon(state, .{
+    const fast_icon_rect = palette.Rect{
         .x = fast_rect.x + theme.scaledUi(17.0),
         .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
         .w = icon_size,
         .h = icon_size,
-    }, icon_color);
+    };
+    if (state.currentThread().fast_mode == .on) {
+        drawBoltIcon(state, fast_icon_rect, icon_color);
+    } else {
+        drawDefaultModeIcon(state, fast_icon_rect, icon_color);
+    }
 
     drawAccessIcon(state, .{
         .x = access_rect.x + theme.scaledUi(17.0),
@@ -394,6 +445,28 @@ fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.C
     queueTriangle(state, p[5], p[2], p[3], color);
 }
 
+fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    const stroke = @max(rect.w * 0.11, 1.5);
+    queueBorder(state, .{
+        .x = rect.x + rect.w * 0.18,
+        .y = rect.y + rect.h * 0.18,
+        .w = rect.w * 0.64,
+        .h = rect.h * 0.64,
+    }, color, rect.w * 0.32, stroke);
+    queueRect(state, .{
+        .x = rect.x + rect.w * 0.48,
+        .y = rect.y + rect.h * 0.30,
+        .w = stroke,
+        .h = rect.h * 0.24,
+    }, color);
+    queueRect(state, .{
+        .x = rect.x + rect.w * 0.48,
+        .y = rect.y + rect.h * 0.48,
+        .w = rect.w * 0.20,
+        .h = stroke,
+    }, color);
+}
+
 fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
     const stroke = @max(rect.w * 0.12, 1.5);
     const body = palette.Rect{
@@ -412,17 +485,6 @@ fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette
         queueRect(state, .{ .x = rect.x + rect.w * 0.28, .y = rect.y + rect.h * 0.22, .w = rect.w * 0.44, .h = stroke }, color);
         queueRect(state, .{ .x = rect.x + rect.w * 0.72 - stroke, .y = rect.y + rect.h * 0.30, .w = stroke, .h = rect.h * 0.23 }, color);
     }
-}
-
-fn renderTerminalPlaceholder(state: *app_state.AppState, rect: palette.Rect) void {
-    queueRect(state, rect, paletteColor(colors.rgba(13, 18, 19, 255)));
-    queueBorder(state, rect, paletteColor(colors.DARK_BLUE), 0.0, 1.0);
-    queueText(state, .{
-        .x = rect.x + theme.scaledUi(18.0),
-        .y = rect.y + theme.scaledUi(16.0),
-        .w = @max(rect.w - theme.scaledUi(36.0), 1.0),
-        .h = theme.scaledUi(24.0),
-    }, "Terminal dock unavailable in this Palette chat pass", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {

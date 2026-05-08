@@ -93,7 +93,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .fast_icon = "    ",
     .access_icon = "    ",
     .chevron_icon = ">",
-    .send_icon = "^",
+    .send_icon = "↑",
     .stop_icon = "x",
 });
 
@@ -5367,7 +5367,10 @@ pub const AppState = struct {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
                     self.setImportPath(path);
-                    self.setSidebarNotice("Folder selected.");
+                    self.importProjectFromInput() catch |err| {
+                        log.warn("failed to import selected project: {s}", .{@errorName(err)});
+                        self.setSidebarNotice("Folder selected, but project import failed.");
+                    };
                 }
             },
             .cancelled => self.setSidebarNotice("Folder selection cancelled."),
