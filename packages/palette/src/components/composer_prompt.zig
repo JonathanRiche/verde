@@ -582,7 +582,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
             const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
-            const side = m * 0.74;
+            const side = m * 0.52;
             const cx = inner.x + inner.w * 0.5;
             const cy = inner.y + inner.h * 0.5;
             const cr = @max(side * 0.18, 1.5);
@@ -594,30 +594,30 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }, draw.Color.white, cr, button);
         }
 
-        /// Submit arrow uses a looser inset than stop/square so the glyph reads larger ("upscaled") inside the pill.
+        /// Up-arrow send: equilateral head + rectangular stem (reads cleaner than a lone triangle).
         fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
-            const m0 = @min(button.w, button.h);
-            const inset = m0 * 0.068;
-            const inner: draw.Rect = .{
-                .x = button.x + inset,
-                .y = button.y + inset,
-                .w = @max(button.w - 2.0 * inset, 1.0),
-                .h = @max(button.h - 2.0 * inset, 1.0),
-            };
+            const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
             const cx = inner.x + inner.w * 0.5;
-            // Narrow tall chevron in the upper half of the inner box (wide short triangle reads like a tree trunk + canopy).
-            const tip_y = inner.y + m * 0.18;
-            const base_y = inner.y + m * 0.48;
-            const half = m * 0.095;
+            const total_h = m * 0.54;
+            const head_h = total_h * 0.5;
+            const stem_h = total_h * 0.5;
+            const half_w = head_h / @sqrt(3.0);
+            const y0 = inner.y + (inner.h - total_h) * 0.5;
             try batch.triangleClipped(
                 allocator,
-                .{ .x = cx, .y = tip_y },
-                .{ .x = cx - half, .y = base_y },
-                .{ .x = cx + half, .y = base_y },
+                .{ .x = cx, .y = y0 },
+                .{ .x = cx - half_w, .y = y0 + head_h },
+                .{ .x = cx + half_w, .y = y0 + head_h },
                 draw.Color.white,
                 button,
             );
+            try batch.rectClipped(allocator, .{
+                .x = cx - half_w,
+                .y = y0 + head_h,
+                .w = half_w * 2.0,
+                .h = stem_h,
+            }, draw.Color.white, button);
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
