@@ -160,6 +160,24 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the project rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
 }
 
+/// While the current thread is streaming, keep `transcript_auto_follow_pending` on when the viewport
+/// is at (or near) the tail, or during the initial scroll-to-bottom animation. Wheel on the
+/// transcript clears the latch; scrolling back within ~72px of the bottom turns it on again.
+fn updateTranscriptAutoFollowPalette(state: *app_state.AppState, has_pending_stream: bool, max_scroll: f32, scroll_y: f32) void {
+    if (!has_pending_stream) {
+        state.transcript_auto_follow_pending = false;
+        return;
+    }
+    if (state.scroll_transcript_to_bottom_frames > 0 or transcriptScrollNearBottom(scroll_y, max_scroll)) {
+        state.transcript_auto_follow_pending = true;
+    }
+}
+
+fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
+    if (max_scroll <= 0.0) return true;
+    return (max_scroll - scroll_y) <= theme.scaledUi(72.0);
+}
+
 fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     transcript_rect = rect;
     const column_width = @min(rect.w - theme.scaledUi(48.0), theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
@@ -177,6 +195,8 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
 
     const content_height = transcriptContentHeight(thread, column.w);
     const max_scroll = @max(0.0, content_height - column.h);
+    const has_pending_stream = state.hasPendingStream();
+
     var scroll_y = std.math.clamp(state.currentTranscriptScrollY() orelse max_scroll, 0.0, max_scroll);
     if (state.pending_transcript_line_scroll_steps != 0) {
         scroll_y = std.math.clamp(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_line_scroll_steps)) * theme.scaledUi(TRANSCRIPT_LINE_HEIGHT), 0.0, max_scroll);
@@ -186,10 +206,17 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         scroll_y = std.math.clamp(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_scroll_steps)) * column.h * 0.82, 0.0, max_scroll);
         state.pending_transcript_page_scroll_steps = 0;
     }
+
+    updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
+
     if (state.transcript_auto_follow_pending or state.scroll_transcript_to_bottom_frames > 0) {
         scroll_y = max_scroll;
-        if (state.scroll_transcript_to_bottom_frames > 0) state.scroll_transcript_to_bottom_frames -= 1;
-        if (state.scroll_transcript_to_bottom_frames == 0) state.transcript_auto_follow_pending = false;
+    }
+    if (state.scroll_transcript_to_bottom_frames > 0) {
+        state.scroll_transcript_to_bottom_frames -= 1;
+    }
+    if (state.scroll_transcript_to_bottom_frames == 0 and !has_pending_stream) {
+        state.transcript_auto_follow_pending = false;
     }
     state.rememberCurrentTranscriptScroll(scroll_y);
 
@@ -202,9 +229,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         content_y += item_h + theme.scaledUi(12.0);
     }
 
-    if (thread.isSendPendingForUi()) {
-        queueText(state, .{ .x = column.x, .y = @min(content_y + theme.scaledUi(8.0), column.y + column.h - theme.scaledUi(24.0)), .w = column.w, .h = theme.scaledUi(24.0) }, "Working...", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
-    }
+    renderPendingTranscriptStream(state, thread, column, content_y, clip);
 
     if (max_scroll > 1.0) {
         const track = palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(8.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h };
@@ -220,8 +245,76 @@ fn transcriptContentHeight(thread: anytype, width: f32) f32 {
     for (thread.messages.items) |message| {
         total += transcriptMessageHeight(message.body, message.role, width) + theme.scaledUi(12.0);
     }
-    if (thread.isSendPendingForUi()) total += theme.scaledUi(34.0);
+    total += transcriptPendingStreamHeight(thread, width);
     return total;
+}
+
+fn transcriptPendingStreamHeight(thread: *const app_state.ChatThread, column_width: f32) f32 {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return 0;
+
+    var total: f32 = 0;
+    for (send_state.pending_events.items) |event| {
+        total += transcriptMessageHeight(event.body, event.role, column_width) + theme.scaledUi(12.0);
+    }
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    total += transcriptMessageHeight(body_for_height, .assistant, column_width);
+    return total;
+}
+
+fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, content_y: f32, clip: palette.Rect) void {
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return;
+
+    var y = content_y;
+    for (send_state.pending_events.items) |event| {
+        const item_h = transcriptMessageHeight(event.body, event.role, column.w);
+        const role_label: []const u8 = switch (event.role) {
+            .user => "You",
+            .assistant => if (event.author.len > 0) event.author else "Assistant",
+            .system => if (event.author.len > 0) event.author else "System",
+        };
+        if (y + item_h >= column.y and y <= column.y + column.h) {
+            renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, clip);
+        }
+        y += item_h + theme.scaledUi(12.0);
+    }
+
+    var status_buf: [40]u8 = undefined;
+    const working_label = formatPendingWorkingLabel(&status_buf, send_state.started_at_ms);
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    const assistant_h = transcriptMessageHeight(body, .assistant, column.w);
+    if (y + assistant_h >= column.y and y <= column.y + column.h) {
+        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, clip);
+    }
+}
+
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
+    const now_ms = unixTimestampMs();
+    const safe_started_at_ms = @max(started_at_ms, 0);
+    const elapsed_ms = @max(now_ms - safe_started_at_ms, 0);
+    const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
+    const hours = total_seconds / 3600;
+    const minutes = (total_seconds / 60) % 60;
+    const seconds = total_seconds % 60;
+
+    if (hours > 0) {
+        return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "Working - 0:00";
+    }
+    return std.fmt.bufPrint(buf, "Working - {d}:{d:0>2}", .{ minutes, seconds }) catch "Working - 0:00";
 }
 
 fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, column_width: f32) f32 {
@@ -250,10 +343,24 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         .assistant => if (message.author.len > 0) message.author else "Assistant",
         .system => "System",
     };
-    const bubble_width = if (message.role == .user) column.w * 0.62 else column.w;
-    const bubble_x = if (message.role == .user) column.x + column.w - bubble_width else column.x;
+    renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, clip);
+}
+
+fn renderTranscriptBubbleFromParts(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    role_label: []const u8,
+    body_raw: []const u8,
+    muted_body: bool,
+    clip: palette.Rect,
+) void {
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
-    const bg = switch (message.role) {
+    const bg = switch (role) {
         .user => colors.rgba(31, 48, 46, 255),
         .assistant => colors.rgba(22, 30, 32, 242),
         .system => colors.rgba(57, 43, 9, 235),
@@ -267,11 +374,12 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         .w = bubble.w - theme.scaledUi(28.0),
         .h = bubble.h - theme.scaledUi(38.0),
     };
-    const body_text = std.mem.trim(u8, message.body, "\n\r\t ");
-    if (message.role == .assistant) {
+    const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const body_color = if (muted_body) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
+    if (role == .assistant and !muted_body) {
         renderMarkdownBody(state, body_rect, body_text, clip);
     } else {
-        renderWrappedBody(state, body_rect, body_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(16.0), clip);
     }
 }
 

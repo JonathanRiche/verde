@@ -2293,6 +2293,7 @@ pub const AppState = struct {
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.resetComposerInputWidget();
+        self.requestTranscriptScrollToBottom();
         self.setSidebarNotice("Waiting for provider reply...");
     }
 
@@ -5158,6 +5159,10 @@ pub const AppState = struct {
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        // Drop any saved offset so the next transcript layout uses the fresh tail height
+        // (e.g. right after appending the user message and starting a stream).
+        self.currentThreadMutable().transcript_scroll_valid = false;
         self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
     }
