@@ -131,8 +131,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
 });
 
 const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 34.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 40.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 10.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
@@ -393,14 +393,15 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
     .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
     .max_depth = 2,
-    .padding_x = 12.0,
+    .padding_x = 14.0,
     .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = 6.0,
+    .submenu_gap = 8.0,
     .glyph_width = 10.8,
     .font_size = 20.0,
     .chevron_icon = ">",
-    .icon_gap = 10.0,
-    .row_leading_width = 30.0,
+    .icon_gap = 12.0,
+    .row_leading_width = 34.0,
+    .row_leading_to_label_gap = 8.0,
     .render_row_leading = paletteModelCascadeRenderRowLeading,
     .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
     .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },

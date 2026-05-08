@@ -73,6 +73,7 @@ pub const CascadeMenuConfig = struct {
     item_label: ?ItemLabelFn = null,
     child_count: ?ChildCountFn = null,
     row_leading_width: f32 = 0.0,
+    row_leading_to_label_gap: f32 = 0.0,
     render_row_leading: ?RowLeadingRenderFn = null,
 };
 
@@ -648,7 +649,10 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             const text_y = row.y + @max((row.h - metrics_value.line_height) * 0.5, 0.0);
             const label_clip = self.menuContentRect(depth);
             const chevron_w = if (has_children and config.chevron_icon.len > 0) icon_metrics.measureSlice(config.chevron_icon) else 0.0;
-            const leading_pad = if (config.render_row_leading != null and config.row_leading_width > 0.0) config.row_leading_width else 0.0;
+            const leading_pad = if (config.render_row_leading != null and config.row_leading_width > 0.0)
+                config.row_leading_width + config.row_leading_to_label_gap
+            else
+                0.0;
             const label_w = @max(row.w - leading_pad - chevron_w - config.icon_gap, 0.0);
             runs[count] = .{
                 .text = label,
