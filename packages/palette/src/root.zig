@@ -59,6 +59,7 @@ pub const ComposerPromptPart = composer_prompt_component.ComposerPromptPart;
 pub const ComposerPromptSendState = composer_prompt_component.ComposerPromptSendState;
 pub const CascadeMenuCallbacks = cascade_menu_component.CascadeMenuCallbacks;
 pub const CascadeMenuChildCountFn = cascade_menu_component.ChildCountFn;
+pub const CascadeMenuRowLeadingRenderFn = cascade_menu_component.RowLeadingRenderFn;
 pub const CascadeMenuConfig = cascade_menu_component.CascadeMenuConfig;
 pub const CascadeMenuEvent = cascade_menu_component.CascadeMenuEvent;
 pub const CascadeMenuInput = cascade_menu_component.Input;

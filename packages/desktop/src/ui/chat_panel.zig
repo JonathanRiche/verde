@@ -24,6 +24,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
+    state.invalidateComposerToolbarOverlayHitRects();
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     if (state.projects.items.len == 0) {
         renderEmptyProjects(state, rect);
@@ -559,6 +560,7 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     };
     renderComposerDraftImage(state);
     renderComposerToolbarIcons(state);
+    state.syncComposerToolbarOverlayHitRects();
 }
 
 fn renderComposerDraftImage(state: *app_state.AppState) void {
