@@ -4844,9 +4844,6 @@ pub const AppState = struct {
         self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
         self.palette_model_cascade.setFontMetrics(paletteEstimatedFontMetrics(20.0));
         self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
-        if (self.currentThread().committed and self.palette_model_cascade.isOpen()) {
-            _ = self.palette_model_cascade.handleInput(.close);
-        }
     }
 
     pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
@@ -4969,7 +4966,7 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point) and !self.currentThread().committed) {
+        if (self.composer_toolbar_model_rect.contains(point)) {
             self.openPaletteModelCascadeMenu();
             self.palette_composer.focused = false;
             self.composer_focused = false;
