@@ -400,6 +400,27 @@ fn transcriptBubbleCornerRadius() f32 {
     return theme.scaledUi(14.0);
 }
 
+/// Rounded fill with a rounded border ring (avoids `rectBorder`, which draws a sharp axis-aligned outline).
+fn queueRoundedShellClipped(
+    state: *app_state.AppState,
+    bounds: palette.Rect,
+    fill_color: palette.Color,
+    border_color: palette.Color,
+    radius: f32,
+    clip: palette.Rect,
+) void {
+    const inset = @max(theme.scaledUi(1.0), 1.0);
+    queueRoundedClipped(state, bounds, border_color, radius, clip);
+    if (bounds.w > inset * 2.0 and bounds.h > inset * 2.0) {
+        queueRoundedClipped(state, .{
+            .x = bounds.x + inset,
+            .y = bounds.y + inset,
+            .w = bounds.w - inset * 2.0,
+            .h = bounds.h - inset * 2.0,
+        }, fill_color, @max(radius - inset, 0.0), clip);
+    }
+}
+
 fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
         renderCommandEventRow(state, column, y, height, message.author, message.body, clip);
@@ -424,8 +445,14 @@ fn renderCommandEventRow(
 ) void {
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
     const rr = transcriptBubbleCornerRadius();
-    queueRoundedClipped(state, bubble, paletteColor(colors.rgba(28, 29, 34, 255)), rr, clip);
-    queueBorderClipped(state, bubble, paletteColor(colors.DARK_BLUE), rr, 1.0, clip);
+    queueRoundedShellClipped(
+        state,
+        bubble,
+        paletteColor(colors.rgba(28, 29, 34, 255)),
+        paletteColor(colors.DARK_BLUE),
+        rr,
+        clip,
+    );
 
     const pad = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
@@ -468,8 +495,7 @@ fn renderTranscriptBubbleFromParts(
         .system => colors.rgba(57, 43, 9, 235),
     };
     const rr = transcriptBubbleCornerRadius();
-    queueRoundedClipped(state, bubble, paletteColor(bg), rr, clip);
-    queueBorderClipped(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), rr, 1.0, clip);
+    queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(theme.COLOR_PANEL_MUTED), rr, clip);
     queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
@@ -612,8 +638,14 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
 }
 
 fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.ChatImageAttachment, index: usize, preview: palette.Rect, thumb_max: f32) void {
-    queueRounded(state, preview, paletteColor(colors.rgba(7, 13, 14, 255)), theme.scaledUi(9.0));
-    queueBorder(state, preview, paletteColor(colors.rgba(76, 95, 101, 255)), theme.scaledUi(9.0), theme.scaledUi(1.0));
+    queueRoundedShellClipped(
+        state,
+        preview,
+        paletteColor(colors.rgba(7, 13, 14, 255)),
+        paletteColor(colors.rgba(76, 95, 101, 255)),
+        theme.scaledUi(9.0),
+        preview,
+    );
 
     const thumb = palette.Rect{ .x = preview.x + theme.scaledUi(6.0), .y = preview.y + (preview.h - thumb_max) * 0.5, .w = thumb_max, .h = thumb_max };
     queueRounded(state, thumb, paletteColor(colors.rgba(17, 24, 26, 255)), theme.scaledUi(8.0));
@@ -631,8 +663,14 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
     const label_w = @max(clear_rect.x - label_x - theme.scaledUi(12.0), theme.scaledUi(1.0));
     queueText(state, .{ .x = label_x, .y = preview.y + theme.scaledUi(15.0), .w = label_w, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), preview);
     queueText(state, .{ .x = label_x, .y = preview.y + theme.scaledUi(39.0), .w = label_w, .h = theme.scaledUi(18.0) }, size_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), preview);
-    queueRounded(state, clear_rect, paletteColor(colors.rgba(35, 42, 46, 255)), clear_size * 0.5);
-    queueBorder(state, clear_rect, paletteColor(colors.rgba(86, 105, 112, 255)), clear_size * 0.5, theme.scaledUi(1.0));
+    queueRoundedShellClipped(
+        state,
+        clear_rect,
+        paletteColor(colors.rgba(35, 42, 46, 255)),
+        paletteColor(colors.rgba(86, 105, 112, 255)),
+        clear_size * 0.5,
+        clear_rect,
+    );
     queueText(state, .{ .x = clear_rect.x + clear_rect.w * 0.34, .y = clear_rect.y + clear_rect.h * 0.10, .w = clear_rect.w * 0.5, .h = clear_rect.h * 0.8 }, "x", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clear_rect);
 }
 
@@ -759,10 +797,6 @@ fn queueBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Co
 
 fn queueRoundedClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, clip: palette.Rect) void {
     state.palette_overlay_batch.roundedRectClipped(state.allocator, rect, color, radius, clip) catch {};
-}
-
-fn queueBorderClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32, clip: palette.Rect) void {
-    state.palette_overlay_batch.rectBorderClipped(state.allocator, rect, color, radius, width, clip) catch {};
 }
 
 fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, clip: ?palette.Rect) void {

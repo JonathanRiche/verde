@@ -4,6 +4,7 @@ const std = @import("std");
 
 const colors = @import("colors.zig");
 const palette = @import("palette");
+const theme = @import("theme.zig");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
 
@@ -975,8 +976,13 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
     const pad_y = codeBlockPaddingY(options);
     const height = codeBlockHeight(block, line_height, pad_y);
     const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
-    queuePaletteRoundedRect(context, rect, paletteColor(colors.rgba(24, 24, 28, 255)), codeBlockRounding(options));
-    queuePaletteBorder(context, rect, paletteColor(colors.rgba(52, 54, 62, 255)), codeBlockRounding(options), 1.0);
+    queuePaletteRoundedShell(
+        context,
+        rect,
+        paletteColor(colors.rgba(24, 24, 28, 255)),
+        paletteColor(colors.rgba(52, 54, 62, 255)),
+        codeBlockRounding(options),
+    );
 
     var y = start[1] + pad_y;
     for (block.lines) |line| {
@@ -1948,8 +1954,13 @@ fn renderSelectablePaletteCodeBlock(
     const pad_y = codeBlockPaddingY(options);
     const height = codeBlockHeight(block, line_height, pad_y);
     const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
-    queuePaletteRoundedRect(context, rect, paletteColor(colors.rgba(24, 24, 28, 255)), codeBlockRounding(options));
-    queuePaletteBorder(context, rect, paletteColor(colors.rgba(52, 54, 62, 255)), codeBlockRounding(options), 1.0);
+    queuePaletteRoundedShell(
+        context,
+        rect,
+        paletteColor(colors.rgba(24, 24, 28, 255)),
+        paletteColor(colors.rgba(52, 54, 62, 255)),
+        codeBlockRounding(options),
+    );
 
     const lines = try buildSelectableCodeLines(allocator, block, options);
     defer deinitSelectableCodeLines(allocator, lines);
@@ -2222,8 +2233,37 @@ fn queuePaletteRoundedRect(context: *PaletteRenderContext, rect: palette.Rect, c
     context.batch.roundedRect(context.allocator, rect, color, radius) catch {};
 }
 
-fn queuePaletteBorder(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
-    context.batch.rectBorder(context.allocator, rect, color, radius, width) catch {};
+/// Rounded frame without `rectBorder` (axis-aligned quads with sharp corners on top of rounded fills).
+fn queuePaletteRoundedShell(
+    context: *PaletteRenderContext,
+    bounds: palette.Rect,
+    fill_color: palette.Color,
+    border_color: palette.Color,
+    radius: f32,
+) void {
+    const inset = @max(theme.scaledUi(1.0), 1.0);
+    const inner_radius = @max(radius - inset, 0.0);
+    if (context.clip) |clip| {
+        context.batch.roundedRectClipped(context.allocator, bounds, border_color, radius, clip) catch {};
+        if (bounds.w > inset * 2.0 and bounds.h > inset * 2.0) {
+            context.batch.roundedRectClipped(context.allocator, .{
+                .x = bounds.x + inset,
+                .y = bounds.y + inset,
+                .w = bounds.w - inset * 2.0,
+                .h = bounds.h - inset * 2.0,
+            }, fill_color, inner_radius, clip) catch {};
+        }
+    } else {
+        context.batch.roundedRect(context.allocator, bounds, border_color, radius) catch {};
+        if (bounds.w > inset * 2.0 and bounds.h > inset * 2.0) {
+            context.batch.roundedRect(context.allocator, .{
+                .x = bounds.x + inset,
+                .y = bounds.y + inset,
+                .w = bounds.w - inset * 2.0,
+                .h = bounds.h - inset * 2.0,
+            }, fill_color, inner_radius) catch {};
+        }
+    }
 }
 
 fn queuePaletteText(context: *PaletteRenderContext, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
