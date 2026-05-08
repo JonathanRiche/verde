@@ -80,7 +80,15 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
         renderTranscript(state, chat_rect);
-        browser_panel.renderDockAt(state, .{ .x = chat_rect.x + chat_rect.w, .y = body.y, .w = browser_width, .h = body.h });
+        // Transcript uses only `body` (above composer). The browser column is empty to the right of the
+        // composer, so extend the dock through that strip to the same bottom as the composer row.
+        const browser_dock_h = composer_bottom - body.y;
+        browser_panel.renderDockAt(state, .{
+            .x = chat_rect.x + chat_rect.w,
+            .y = body.y,
+            .w = browser_width,
+            .h = @max(browser_dock_h, theme.scaledUi(120.0)),
+        });
     } else {
         renderTranscript(state, body);
     }
