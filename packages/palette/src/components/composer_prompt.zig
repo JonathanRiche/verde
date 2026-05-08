@@ -594,30 +594,32 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }, draw.Color.white, cr, button);
         }
 
-        /// Up-arrow send: equilateral head + rectangular stem (reads cleaner than a lone triangle).
+        /// Send: wide triangular head + narrow stem (same-width stem under an equilateral head reads as a "house").
         fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
             const inner = sendGlyphBounds(button);
             const m = @min(inner.w, inner.h);
             const cx = inner.x + inner.w * 0.5;
-            const total_h = m * 0.54;
-            const head_h = total_h * 0.5;
-            const stem_h = total_h * 0.5;
-            const half_w = head_h / @sqrt(3.0);
+            const total_h = m * 0.56;
+            const head_h = total_h * 0.52;
+            const stem_h = total_h * 0.48;
+            const half_w_head = m * 0.175;
+            const half_w_stem = @max(m * 0.052, 1.25);
             const y0 = inner.y + (inner.h - total_h) * 0.5;
+            // Stem under the head so the junction is a narrow shaft, not a full-width block.
+            try batch.rectClipped(allocator, .{
+                .x = cx - half_w_stem,
+                .y = y0 + head_h,
+                .w = half_w_stem * 2.0,
+                .h = stem_h,
+            }, draw.Color.white, button);
             try batch.triangleClipped(
                 allocator,
                 .{ .x = cx, .y = y0 },
-                .{ .x = cx - half_w, .y = y0 + head_h },
-                .{ .x = cx + half_w, .y = y0 + head_h },
+                .{ .x = cx - half_w_head, .y = y0 + head_h },
+                .{ .x = cx + half_w_head, .y = y0 + head_h },
                 draw.Color.white,
                 button,
             );
-            try batch.rectClipped(allocator, .{
-                .x = cx - half_w,
-                .y = y0 + head_h,
-                .w = half_w * 2.0,
-                .h = stem_h,
-            }, draw.Color.white, button);
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
