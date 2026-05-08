@@ -93,7 +93,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .fast_icon = "    ",
     .access_icon = "    ",
     .chevron_icon = ">",
-    .send_icon = "↑",
+    .send_icon = "",
     .stop_icon = "x",
 });
 
