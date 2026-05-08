@@ -204,7 +204,18 @@ pub const Renderer = struct {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect => try self.appendPanel(allocator, command),
-                .triangle => try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, command.clip),
+                .triangle => {
+                    if (command.clip) |c| {
+                        try self.flush(framebuffer_width, framebuffer_height);
+                        glEnable(GL_SCISSOR_TEST);
+                        applyTextClipScissor(c, framebuffer_height);
+                        try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, null);
+                        try self.flush(framebuffer_width, framebuffer_height);
+                        glDisable(GL_SCISSOR_TEST);
+                    } else {
+                        try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, null);
+                    }
+                },
                 .cursor, .selection, .scrollbar => try self.appendRect(allocator, command.rect, command.color, command.clip),
                 .text => {
                     try self.flush(framebuffer_width, framebuffer_height);
@@ -224,7 +235,18 @@ pub const Renderer = struct {
         for (batch.commands.items) |command| {
             switch (command.kind) {
                 .rect, .cursor, .selection, .scrollbar => try self.appendRect(allocator, command.rect, command.color, command.clip),
-                .triangle => try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, command.clip),
+                .triangle => {
+                    if (command.clip) |c| {
+                        try self.flush(framebuffer_width, framebuffer_height);
+                        glEnable(GL_SCISSOR_TEST);
+                        applyTextClipScissor(c, framebuffer_height);
+                        try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, null);
+                        try self.flush(framebuffer_width, framebuffer_height);
+                        glDisable(GL_SCISSOR_TEST);
+                    } else {
+                        try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, null);
+                    }
+                },
                 .text => try self.appendText(allocator, command),
                 .image => {
                     try self.flush(framebuffer_width, framebuffer_height);
@@ -464,7 +486,7 @@ pub const Renderer = struct {
         try self.appendQuad(allocator, .{ .x = r.x, .y = r.y + cr, .w = cr, .h = r.h - 2.0 * cr }, color);
         try self.appendQuad(allocator, .{ .x = r.x + r.w - cr, .y = r.y + cr, .w = cr, .h = r.h - 2.0 * cr }, color);
 
-        const segments: usize = 8;
+        const segments: usize = 32;
         try self.appendCornerFan(allocator, r.x + cr, r.y + cr, cr, std.math.pi, std.math.pi * 1.5, segments, color);
         try self.appendCornerFan(allocator, r.x + r.w - cr, r.y + cr, cr, std.math.pi * 1.5, std.math.pi * 2.0, segments, color);
         try self.appendCornerFan(allocator, r.x + r.w - cr, r.y + r.h - cr, cr, 0.0, std.math.pi * 0.5, segments, color);

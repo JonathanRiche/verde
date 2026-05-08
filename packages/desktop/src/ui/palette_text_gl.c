@@ -186,6 +186,30 @@ float palette_text_gl_measure_line_width(
     return max_w;
 }
 
+/// Horizontal advance for a single Unicode codepoint using the same font scale as
+/// `palette_text_gl_draw` / `palette_text_gl_measure_line_width`. Characters outside
+/// the baked ASCII range (32–126) return 0 width to match the draw loop, which skips them.
+float palette_text_gl_measure_codepoint_width(
+    const unsigned char *font_data,
+    int font_len,
+    int codepoint,
+    float font_size
+) {
+    (void)font_len;
+    if (!font_data || font_size <= 0.0f) return 0.0f;
+    ensure_measure_font(font_data);
+    if (!g_measure_font_ready) return 0.55f * font_size;
+
+    if (codepoint < 32 || codepoint > 126) return 0.0f;
+
+    const float bucket = roundf(font_size);
+    const float scale = stbtt_ScaleForPixelHeight(&g_measure_font, bucket);
+    int advance = 0;
+    int lsb = 0;
+    stbtt_GetCodepointHMetrics(&g_measure_font, codepoint, &advance, &lsb);
+    return (float)advance * scale;
+}
+
 void palette_text_gl_draw(
     const unsigned char *font_data,
     int font_len,

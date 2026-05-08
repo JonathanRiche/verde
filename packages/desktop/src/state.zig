@@ -17,6 +17,37 @@ const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
 
+/// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
+const palette_ui_ttf = @embedFile("assets/fonts/CalSans-Regular.ttf");
+
+extern fn palette_text_gl_measure_codepoint_width(
+    font_data: [*]const u8,
+    font_len: i32,
+    codepoint: i32,
+    font_size: f32,
+) callconv(.c) f32;
+
+extern fn palette_text_gl_measure_line_width(
+    font_data: [*]const u8,
+    font_len: i32,
+    text: [*]const u8,
+    text_len: i32,
+    font_size: f32,
+) callconv(.c) f32;
+
+/// Width of `text[0..end]` in pixels using the same rules as GL UI text (`palette_text_gl_draw`).
+pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
+    const n = @min(end, text.len);
+    if (n == 0) return 0.0;
+    return palette_text_gl_measure_line_width(
+        palette_ui_ttf.ptr,
+        @intCast(palette_ui_ttf.len),
+        text.ptr,
+        @intCast(n),
+        font_size,
+    );
+}
+
 pub const ReasoningEffort = db_types.ReasoningEffort;
 pub const FastMode = db_types.FastMode;
 pub const AccessMode = db_types.AccessMode;
@@ -81,6 +112,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
     .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
+    .stop_button_color = .{ .r = 0.80, .g = 0.58, .b = 0.10, .a = 1.0 },
+    .stop_button_hover_color = .{ .r = 0.92, .g = 0.68, .b = 0.14, .a = 1.0 },
     .text_color = .{ .r = 0.94, .g = 0.96, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
@@ -136,16 +169,19 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
-    const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
-    const end = @min(byte_offset + byte_len, text.len);
-    const char_width = if (text[byte_offset] < 0x80 and std.ascii.isWhitespace(text[byte_offset]))
-        font_size * 0.34
-    else if (text[byte_offset] < 0x80)
-        font_size * 0.55
-    else
-        font_size * 0.7;
-    const width = @max(char_width, 1.0);
-    return .{ .byte_len = end - byte_offset, .width = width };
+    if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
+    const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
+    const end = @min(byte_offset + seq_len, text.len);
+    const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
+        return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
+    };
+    const w = palette_text_gl_measure_codepoint_width(
+        palette_ui_ttf.ptr,
+        @intCast(palette_ui_ttf.len),
+        @intCast(cp),
+        font_size,
+    );
+    return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
 
 fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
