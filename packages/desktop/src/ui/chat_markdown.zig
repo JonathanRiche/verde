@@ -1099,13 +1099,27 @@ fn walkTextBlockLayout(
 
 fn ignoreTextBlockLayoutStep(_: void, _: TextBlockLayoutStep) void {}
 
-fn measureTextBlockLayout(
-    block: TextBlockView,
-    available_width: f32,
-    options: RenderOptions,
-) f32 {
-    return walkTextBlockLayout(block, available_width, options, {}, ignoreTextBlockLayoutStep);
+fn subsliceByteOffset(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    const hptr = @intFromPtr(haystack.ptr);
+    const nptr = @intFromPtr(needle.ptr);
+    std.debug.assert(nptr >= hptr and nptr + needle.len <= hptr + haystack.len);
+    return nptr - hptr;
 }
+
+fn renderOptionsGlyphWidth(options: RenderOptions) f32 {
+    return options.glyph_width orelse options.base_font_size * 0.55;
+}
+
+const MarkdownCodeBgSpec = struct {
+    rect: palette.Rect,
+    radius: f32,
+};
+
+const MarkdownUnderlineSpec = struct {
+    rect: palette.Rect,
+    color: palette.Color,
+};
 
 fn renderPaletteTextBlockLayout(
     context: *PaletteRenderContext,
@@ -1114,31 +1128,135 @@ fn renderPaletteTextBlockLayout(
     available_width: f32,
     options: RenderOptions,
 ) f32 {
+    var code_backgrounds: std.ArrayList(MarkdownCodeBgSpec) = .empty;
+    defer code_backgrounds.deinit(context.allocator);
+    var underlines: std.ArrayList(MarkdownUnderlineSpec) = .empty;
+    defer underlines.deinit(context.allocator);
+    var text_runs: std.ArrayList(palette.TextRun) = .empty;
+    defer text_runs.deinit(context.allocator);
+
     const RenderContext = struct {
         palette_context: *PaletteRenderContext,
         start: [2]f32,
         options: RenderOptions,
+        block_text: []const u8,
+        text_runs: *std.ArrayList(palette.TextRun),
+        code_backgrounds: *std.ArrayList(MarkdownCodeBgSpec),
+        underlines: *std.ArrayList(MarkdownUnderlineSpec),
 
         fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
-            renderPaletteStyledChunk(
-                ctx.options,
-                ctx.palette_context,
-                .{ ctx.start[0] + step.x, ctx.start[1] + step.y },
-                step.text,
-                step.block_style,
-                step.inline_style,
-                step.font_spec,
-                step.width,
-                step.line_height,
-            );
+            const px = ctx.start[0] + step.x;
+            const py = ctx.start[1] + step.y;
+            if (step.inline_style.code) {
+                ctx.code_backgrounds.append(ctx.palette_context.allocator, .{
+                    .rect = .{
+                        .x = px - 3.0,
+                        .y = py + 1.0,
+                        .w = step.width + 6.0,
+                        .h = step.line_height - 2.0,
+                    },
+                    .radius = 4.0,
+                }) catch return;
+            }
+
+            const draw_font_size = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
+            const color = paletteColor(inlineTextColor(textBlockColor(step.block_style), step.inline_style));
+            const clip = ctx.palette_context.clip;
+            const byte_start = subsliceByteOffset(ctx.block_text, step.text);
+            const byte_end = byte_start + step.text.len;
+
+            ctx.text_runs.append(ctx.palette_context.allocator, .{
+                .text = step.text,
+                .byte_start = byte_start,
+                .byte_end = byte_end,
+                .x = px,
+                .y = py,
+                .font_size = draw_font_size,
+                .line_height = step.line_height,
+                .color = color,
+                .clip = clip,
+            }) catch return;
+
+            if (step.inline_style.strong) {
+                ctx.text_runs.append(ctx.palette_context.allocator, .{
+                    .text = step.text,
+                    .byte_start = byte_start,
+                    .byte_end = byte_end,
+                    .x = px + 0.75,
+                    .y = py,
+                    .font_size = draw_font_size,
+                    .line_height = step.line_height,
+                    .color = color,
+                    .clip = clip,
+                }) catch return;
+            }
+
+            if (step.inline_style.link or step.inline_style.emphasis) {
+                const underline_color = if (step.inline_style.link)
+                    paletteColor(colors.rgb(0x7A, 0xCA, 0xFF))
+                else
+                    color;
+                const underline_h: f32 = if (step.inline_style.link) 1.5 else 1.0;
+                ctx.underlines.append(ctx.palette_context.allocator, .{
+                    .rect = .{
+                        .x = px,
+                        .y = py + step.line_height - 2.0,
+                        .w = step.width,
+                        .h = underline_h,
+                    },
+                    .color = underline_color,
+                }) catch return;
+            }
         }
     };
 
-    return walkTextBlockLayout(block, available_width, options, RenderContext{
+    const height = walkTextBlockLayout(block, available_width, options, RenderContext{
         .palette_context = context,
         .start = start,
         .options = options,
+        .block_text = block.text,
+        .text_runs = &text_runs,
+        .code_backgrounds = &code_backgrounds,
+        .underlines = &underlines,
     }, RenderContext.onStep);
+
+    for (code_backgrounds.items) |spec| {
+        queuePaletteRoundedRect(context, spec.rect, paletteColor(colors.rgba(36, 39, 46, 255)), spec.radius);
+    }
+
+    if (text_runs.items.len > 0) {
+        const cmd_rect: palette.Rect = .{
+            .x = start[0],
+            .y = start[1],
+            .w = available_width,
+            .h = height,
+        };
+        context.batch.textRuns(
+            context.allocator,
+            cmd_rect,
+            block.text,
+            text_runs.items,
+            palette.Color.white,
+            options.base_font_size,
+            context.clip,
+            defaultLineHeight(options),
+            renderOptionsGlyphWidth(options),
+        ) catch {};
+    }
+
+    for (underlines.items) |spec| {
+        queuePaletteRect(context, spec.rect, spec.color);
+    }
+
+    return height;
+}
+
+fn measureTextBlockLayout(
+    block: TextBlockView,
+    available_width: f32,
+    options: RenderOptions,
+) f32 {
+    return walkTextBlockLayout(block, available_width, options, {}, ignoreTextBlockLayoutStep);
 }
 
 const OrderedSelection = struct {
