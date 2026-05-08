@@ -630,7 +630,7 @@ pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Low", .value = .low },
     .{ .label = "Medium", .value = .medium },
     .{ .label = "High", .value = .high },
-    .{ .label = "Extra High", .value = .xhigh },
+    .{ .label = "Xhigh", .value = .xhigh },
 };
 
 pub const CODEX_FAST_MODE_OPTIONS = [_]FastModeOption{
