@@ -1327,6 +1327,42 @@ pub fn captureClipboardImage(allocator: std.mem.Allocator) !?ClipboardImageCaptu
     };
 }
 
+/// Reads text from the system clipboard. SDL is attempted by the caller first;
+/// this covers compositors/toolkits where SDL has no current text owner.
+pub fn captureClipboardText(allocator: std.mem.Allocator) !?[]u8 {
+    return switch (@import("builtin").os.tag) {
+        .macos => captureClipboardTextCommand(allocator, &.{"pbpaste"}),
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            if (try captureClipboardTextCommand(allocator, &.{ "wl-paste", "--no-newline" })) |text| return text;
+            return try captureClipboardTextCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-o" });
+        },
+        else => null,
+    };
+}
+
+fn captureClipboardTextCommand(allocator: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
+    const result = runChild(allocator, argv, ".", 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return null;
+        },
+    }
+    if (result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
 const MacClipboardImageFlavor = struct {
     class_code: []const u8,
     mime: []const u8,

@@ -133,15 +133,14 @@ Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/do
 `packages/desktop` is a native desktop app built on:
 - `SDL3` via `zsdl3` for window creation, events, display/usable-bounds queries, and OpenGL context setup
 - `OpenGL` for final rendering
-- `zgui` as the Zig binding layer for Dear ImGui
-- Dear ImGui for all application UI layout and widgets
+- `palette` for application UI primitives, layout surfaces, retained hit regions, and render-batch commands
 
 In practice:
 - `SDL3` owns the real window size, drawable pixel size, monitor/display scale, and event loop
-- `zgui.backend` bridges SDL3 + OpenGL into ImGui
-- `main.zig` is responsible for choosing the correct size space for layout and for feeding the backend the right dimensions every frame
+- `main.zig` is responsible for choosing the correct size space for layout and for routing SDL events into Palette-owned UI state
+- `palette_gl_renderer.zig` is responsible for drawing Palette batches through OpenGL
 
-When editing UI in `packages/desktop`, assume this is an ImGui app first, not a web/CSS layout.
+When editing UI in `packages/desktop`, assume this is a native Palette app first, not a web/CSS layout.
 
 ## Coordinate Spaces
 
@@ -153,9 +152,9 @@ Always distinguish:
 - `display scale`: the monitor/window scale factor from SDL
 
 Rules:
-- Use the same coordinate space consistently for root layout and ImGui display size.
-- Feed `zgui.backend.newFrame(...)` the drawable framebuffer size, not guessed dimensions.
-- If you change how root layout sizing works, verify that `renderRoot(...)`, `zgui.io.setDisplaySize(...)`, and framebuffer sizing still agree.
+- Use the same coordinate space consistently for root Palette layout and renderer dimensions.
+- Render Palette batches against the drawable framebuffer size, not guessed dimensions.
+- If you change how root layout sizing works, verify that `renderRoot(...)`, Palette command coordinates, and framebuffer sizing still agree.
 - Do not “fix” DPI/layout issues by piling on extra scale factors without checking the underlying SDL values first.
 
 Before changing sizing behavior, inspect:
@@ -167,7 +166,7 @@ SDL_GetWindowDisplayScale(...)
 
 If the UI only fills the top-left portion of the window, assume a coordinate-space mismatch first.
 
-## ImGui Sizing Rules
+## Palette Sizing Rules
 
 Do not introduce new hard-coded layout numbers unless they are true design tokens with clear intent.
 
@@ -180,22 +179,16 @@ const card_width: f32 = 260.0;
 ```
 
 Prefer:
-- sizing from `zgui.getContentRegionAvail()`
+- explicit `palette.Rect` inputs passed down from the root layout
 - ratios with clamps
-- measured text size from `zgui.calcTextSize(...)`
+- measured or estimated Palette text metrics from the local UI helper layer
 - shared helpers such as `clampf(...)`, `scaledUi(...)`, `uiScaleFactor()`
-- style-driven spacing from `zgui.getStyle()`
+- spacing from shared theme tokens
 
 Good patterns:
 ```zig
-const avail = zgui.getContentRegionAvail();
-const sidebar_width = clampf(avail[0] * 0.235, scaledUi(230.0), avail[0] * 0.38);
-const gap = clampf(avail[0] * 0.012, scaledUi(10.0), scaledUi(18.0));
-```
-
-```zig
-const label_width = zgui.calcTextSize(label, .{})[0];
-zgui.setNextItemWidth(label_width + scaledUi(36.0));
+const sidebar_width = clampf(root.w * 0.235, scaledUi(230.0), root.w * 0.38);
+const gap = clampf(root.w * 0.012, scaledUi(10.0), scaledUi(18.0));
 ```
 
 ```zig
@@ -227,7 +220,7 @@ If a section is too tall, do not just shrink fonts. Rebalance the layout:
 - let transcript/composer split adapt to available height
 - allow content regions to own width rather than subtracting arbitrary constants
 
-## Editing Policy For ImGui UI
+## Editing Policy For Palette UI
 
 Before editing:
 1. Identify whether the bug is window sizing, framebuffer sizing, display scale, or widget layout.
@@ -237,8 +230,8 @@ Before editing:
 When editing:
 1. Prefer helper functions over scattering raw numbers.
 2. Keep ratios and clamp ranges close to where they are used, unless shared broadly.
-3. Use `zgui.calcTextSize(...)` for width-sensitive controls.
-4. Use `zgui.getContentRegionAvail()` instead of “subtract magic 24/56/88 pixels”.
+3. Use Palette text metrics or local estimated text metrics for width-sensitive controls.
+4. Pass explicit `palette.Rect` values instead of deriving layout from implicit cursor state.
 5. Keep root/window sizing logic in sync with SDL.
 
 After editing:

@@ -55,6 +55,7 @@ pub const Vertex = extern struct {
 
 pub const CommandKind = enum {
     rect,
+    triangle,
     text,
     image,
     cursor,
@@ -89,6 +90,9 @@ pub const TextRun = struct {
 pub const Command = struct {
     kind: CommandKind,
     rect: Rect,
+    p0: Vec2 = .{},
+    p1: Vec2 = .{},
+    p2: Vec2 = .{},
     uv: Rect = .{},
     color: Color,
     texture: TextureId = .invalid,
@@ -142,6 +146,17 @@ pub const RenderBatch = struct {
 
     pub fn rect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color) !void {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color });
+    }
+
+    pub fn triangle(self: *RenderBatch, allocator: std.mem.Allocator, p0: Vec2, p1: Vec2, p2: Vec2, color: Color) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .triangle,
+            .rect = .{},
+            .p0 = p0,
+            .p1 = p1,
+            .p2 = p2,
+            .color = color,
+        });
     }
 
     pub fn roundedRect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32) !void {

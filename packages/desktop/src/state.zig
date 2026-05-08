@@ -1,8 +1,6 @@
 const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
-const zgui = @import("zgui");
-const zgui_text_select = @import("zgui_text_select");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
@@ -24,6 +22,33 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+
+pub const PaletteModalAction = enum {
+    image_close,
+    project_rename_cancel,
+    project_rename_submit,
+    transcript_close,
+    thread_import_refresh,
+    thread_import_cancel,
+    thread_import_submit,
+    thread_import_select,
+    modal_dismiss,
+    modal_block,
+    project_rename_input,
+    thread_import_input,
+};
+
+pub const PaletteModalHit = struct {
+    rect: palette.Rect,
+    action: PaletteModalAction,
+    index: usize = 0,
+};
+
+pub const PaletteModalTextFocus = enum {
+    none,
+    project_rename,
+    thread_import,
+};
 
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
@@ -63,12 +88,12 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
-    .model_icon = " ",
-    .fast_icon = "⚡",
-    .access_icon = "  ",
-    .chevron_icon = "›",
-    .send_icon = "↑",
-    .stop_icon = "■",
+    .model_icon = "    ",
+    .fast_icon = "    ",
+    .access_icon = "    ",
+    .chevron_icon = ">",
+    .send_icon = "^",
+    .stop_icon = "x",
 });
 
 const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
@@ -87,7 +112,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .submenu_gap = 6.0,
     .glyph_width = 10.8,
     .font_size = 20.0,
-    .chevron_icon = "›",
+    .chevron_icon = ">",
     .icon_gap = 10.0,
     .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
     .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
@@ -108,23 +133,27 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .child_count = paletteModelCascadeChildCount,
 });
 
-fn paletteZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
     const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
     const end = @min(byte_offset + byte_len, text.len);
-    const base_font_size = @max(zgui.getFontSize(), 1.0);
-    const width = zgui.calcTextSize(text[byte_offset..end], .{})[0] * (font_size / base_font_size);
+    const char_width = if (text[byte_offset] < 0x80 and std.ascii.isWhitespace(text[byte_offset]))
+        font_size * 0.34
+    else if (text[byte_offset] < 0x80)
+        font_size * 0.55
+    else
+        font_size * 0.7;
+    const width = @max(char_width, 1.0);
     return .{ .byte_len = end - byte_offset, .width = width };
 }
 
-fn paletteZguiFontMetrics(font_size: f32) palette.FontMetrics {
-    const base_font_size = @max(zgui.getFontSize(), 1.0);
-    const line_height = @max(zgui.getTextLineHeight() * (font_size / base_font_size), font_size);
+fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
+    const line_height = @max(font_size * 1.25, font_size);
     return .{
         .font_size = font_size,
         .line_height = line_height,
         .context = null,
-        .advance = paletteZguiFontAdvance,
+        .advance = paletteEstimatedFontAdvance,
     };
 }
 
@@ -161,7 +190,9 @@ fn paletteMousePoint(x: f32, y: f32, ui_scale: f32) palette.draw.Vec2 {
 
 fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
     const mod_bits = keymodBits(event.mod);
-    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const keyboard_state = sdl.getKeyboardState();
+    const ctrl_down = keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
+    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0 or ctrl_down;
     const shift = (mod_bits & sdl.Keymod.shift) != 0;
     const alt = (mod_bits & sdl.Keymod.alt) != 0;
     const code: palette.Key.Code = switch (event.key) {
@@ -275,6 +306,12 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         .model_clicked, .reasoning_clicked => {},
     }
+}
+
+fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    _ = allocator;
+    const state = appStateFromContext(context) orelse return null;
+    return state.readClipboardTextForPaste();
 }
 
 fn providerForComposerCascadeIndex(index: usize) ?Provider {
@@ -401,30 +438,6 @@ const AccessModeOption = struct {
     value: AccessMode,
 };
 
-const TranscriptSelectableLine = struct {
-    start: usize,
-    len: usize,
-};
-
-const TranscriptSelectableText = struct {
-    owned_body: []u8,
-    lines: []TranscriptSelectableLine,
-    selector: *zgui_text_select.TextSelect,
-
-    fn deinit(self: *TranscriptSelectableText, allocator: std.mem.Allocator) void {
-        self.selector.destroy();
-        allocator.free(self.lines);
-        allocator.free(self.owned_body);
-        allocator.destroy(self);
-    }
-
-    fn lineSlice(self: *const TranscriptSelectableText, index: usize) []const u8 {
-        if (index >= self.lines.len) return "";
-        const line = self.lines[index];
-        return self.owned_body[line.start..][0..line.len];
-    }
-};
-
 const TranscriptMarkdownBody = struct {
     owned_body: []u8,
     view: chat_markdown.BodyView,
@@ -454,62 +467,6 @@ pub const TranscriptMarkdownSelection = struct {
     anchor: TranscriptMarkdownSelectionPoint,
     focus: TranscriptMarkdownSelectionPoint,
 };
-
-fn transcriptSelectableGetLine(context: ?*anyopaque, index: usize) callconv(.c) zgui_text_select.LineSlice {
-    const raw = context orelse return .{};
-    const entry: *TranscriptSelectableText = @ptrCast(@alignCast(raw));
-    return zgui_text_select.LineSlice.fromSlice(entry.lineSlice(index));
-}
-
-fn transcriptSelectableGetNumLines(context: ?*anyopaque) callconv(.c) usize {
-    const raw = context orelse return 0;
-    const entry: *TranscriptSelectableText = @ptrCast(@alignCast(raw));
-    return entry.lines.len;
-}
-
-fn buildTranscriptSelectableLines(allocator: std.mem.Allocator, body: []const u8) ![]TranscriptSelectableLine {
-    var lines = std.ArrayList(TranscriptSelectableLine).empty;
-    errdefer lines.deinit(allocator);
-
-    var start: usize = 0;
-    while (start <= body.len) {
-        const rel_end = std.mem.indexOfScalar(u8, body[start..], '\n') orelse {
-            try lines.append(allocator, .{ .start = start, .len = body.len - start });
-            break;
-        };
-        try lines.append(allocator, .{ .start = start, .len = rel_end });
-        start += rel_end + 1;
-        if (start > body.len) {
-            try lines.append(allocator, .{ .start = body.len, .len = 0 });
-            break;
-        }
-    }
-
-    if (lines.items.len == 0) {
-        try lines.append(allocator, .{ .start = 0, .len = 0 });
-    }
-
-    return lines.toOwnedSlice(allocator);
-}
-
-fn createTranscriptSelectableText(allocator: std.mem.Allocator, body: []const u8) !*TranscriptSelectableText {
-    const entry = try allocator.create(TranscriptSelectableText);
-    errdefer allocator.destroy(entry);
-
-    entry.owned_body = try allocator.dupe(u8, body);
-    errdefer allocator.free(entry.owned_body);
-
-    entry.lines = try buildTranscriptSelectableLines(allocator, entry.owned_body);
-    errdefer allocator.free(entry.lines);
-
-    entry.selector = zgui_text_select.TextSelect.create(.{
-        .context = entry,
-        .get_line = transcriptSelectableGetLine,
-        .get_num_lines = transcriptSelectableGetNumLines,
-    }, true) orelse return error.OutOfMemory;
-
-    return entry;
-}
 
 const InspectorPromptSubmittedEvent = struct {
     payload: struct {
@@ -577,7 +534,7 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Supervised", .value = .supervised },
 };
 
-const ChatMessage = struct {
+pub const ChatMessage = struct {
     role: ChatRole,
     author: [:0]const u8,
     body: [:0]const u8,
@@ -621,7 +578,6 @@ pub const ChatThread = struct {
     messages: std.ArrayList(ChatMessage),
     send_state: *SendState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
-    transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
@@ -646,7 +602,6 @@ pub const ChatThread = struct {
             .messages = .empty,
             .send_state = send_state,
             .transcript_markdown_entries = .empty,
-            .transcript_selectable_entries = .empty,
             .transcript_height_entries = .empty,
             .transcript_scroll_valid = false,
             .transcript_scroll_y = 0.0,
@@ -704,7 +659,7 @@ pub const ChatThread = struct {
         return self.send_state.status == .pending;
     }
 
-    fn isSendPendingForUi(self: *const ChatThread) bool {
+    pub fn isSendPendingForUi(self: *const ChatThread) bool {
         if (!self.send_state.mutex.tryLock()) return true;
         defer self.send_state.mutex.unlock();
         return self.send_state.status == .pending;
@@ -738,25 +693,6 @@ pub const ChatThread = struct {
             if (entry) |owned| owned.deinit(allocator);
         }
         self.transcript_markdown_entries.clearRetainingCapacity();
-    }
-
-    fn ensureTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
-        const message_count = self.messages.items.len;
-        if (self.transcript_selectable_entries.items.len > message_count) {
-            for (self.transcript_selectable_entries.items[message_count..]) |entry| {
-                if (entry) |owned| owned.deinit(allocator);
-            }
-            self.transcript_selectable_entries.shrinkRetainingCapacity(message_count);
-        } else if (self.transcript_selectable_entries.items.len < message_count) {
-            self.transcript_selectable_entries.appendNTimes(allocator, null, message_count - self.transcript_selectable_entries.items.len) catch return;
-        }
-    }
-
-    fn clearTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
-        for (self.transcript_selectable_entries.items) |entry| {
-            if (entry) |owned| owned.deinit(allocator);
-        }
-        self.transcript_selectable_entries.clearRetainingCapacity();
     }
 
     fn ensureTranscriptHeightEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
@@ -803,8 +739,6 @@ pub const ChatThread = struct {
         self.deinitSendState(allocator);
         self.clearTranscriptMarkdownEntries(allocator);
         self.transcript_markdown_entries.deinit(allocator);
-        self.clearTranscriptSelectableEntries(allocator);
-        self.transcript_selectable_entries.deinit(allocator);
         self.transcript_height_entries.deinit(allocator);
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
@@ -1329,6 +1263,11 @@ pub const AppState = struct {
     palette_composer: PaletteComposerPrompt,
     palette_model_cascade: PaletteModelCascadeMenu,
     palette_overlay_batch: palette.RenderBatch,
+    palette_frame_text: std.ArrayList(u8),
+    palette_modal_hits: std.ArrayList(PaletteModalHit),
+    palette_modal_text_focus: PaletteModalTextFocus,
+    project_rename_cursor: usize,
+    thread_import_cursor: usize,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1372,6 +1311,9 @@ pub const AppState = struct {
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
     browser_pane_focused: bool,
+    browser_address_focused: bool,
+    browser_address_cursor: usize,
+    browser_inspector_menu_open: bool,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1385,9 +1327,6 @@ pub const AppState = struct {
     transcript_markdown_project_index: ?usize,
     transcript_markdown_thread_index: ?usize,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
-    transcript_selectable_project_index: ?usize,
-    transcript_selectable_thread_index: ?usize,
-    transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
     pending_transcript_line_scroll_steps: i16,
@@ -1437,6 +1376,11 @@ pub const AppState = struct {
             .palette_composer = PaletteComposerPrompt.init(),
             .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
             .palette_overlay_batch = .{},
+            .palette_frame_text = .empty,
+            .palette_modal_hits = .empty,
+            .palette_modal_text_focus = .none,
+            .project_rename_cursor = 0,
+            .thread_import_cursor = 0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1480,6 +1424,9 @@ pub const AppState = struct {
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .browser_pane_focused = false,
+            .browser_address_focused = false,
+            .browser_address_cursor = 0,
+            .browser_inspector_menu_open = false,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -1493,9 +1440,6 @@ pub const AppState = struct {
             .transcript_markdown_project_index = null,
             .transcript_markdown_thread_index = null,
             .transcript_markdown_entries = .empty,
-            .transcript_selectable_project_index = null,
-            .transcript_selectable_thread_index = null,
-            .transcript_selectable_entries = .empty,
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
             .pending_transcript_line_scroll_steps = 0,
@@ -1814,6 +1758,8 @@ pub const AppState = struct {
         self.selected_project_index = index;
         self.rename_project_index = index;
         self.syncRenameBuffer();
+        self.palette_modal_text_focus = .project_rename;
+        self.project_rename_cursor = self.renameInput().len;
         self.setSidebarNotice("");
     }
 
@@ -1825,6 +1771,8 @@ pub const AppState = struct {
         self.thread_import_project_index = index;
         self.thread_import_selected_index = null;
         self.import_thread_id_storage[0] = 0;
+        self.palette_modal_text_focus = .thread_import;
+        self.thread_import_cursor = 0;
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
         self.refreshThreadImportList();
@@ -1835,6 +1783,8 @@ pub const AppState = struct {
         self.thread_import_project_index = null;
         self.thread_import_selected_index = null;
         self.import_thread_id_storage[0] = 0;
+        if (self.palette_modal_text_focus == .thread_import) self.palette_modal_text_focus = .none;
+        self.thread_import_cursor = 0;
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
     }
@@ -2096,10 +2046,12 @@ pub const AppState = struct {
             }
         }
         self.rename_project_index = null;
+        if (self.palette_modal_text_focus == .project_rename) self.palette_modal_text_focus = .none;
     }
 
     pub fn cancelProjectRename(self: *AppState) void {
         self.rename_project_index = null;
+        if (self.palette_modal_text_focus == .project_rename) self.palette_modal_text_focus = .none;
         self.syncRenameBuffer();
     }
 
@@ -2913,15 +2865,14 @@ pub const AppState = struct {
         self.setSidebarNotice(notice);
     }
 
-    pub fn attachClipboardImageToCurrentDraft(self: *AppState) void {
+    pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
             self.setSidebarNotice("Clipboard image paste failed.");
-            return;
+            return true;
         };
         if (capture == null) {
-            self.setSidebarNotice("No image found on the clipboard.");
-            return;
+            return false;
         }
 
         const image = capture.?;
@@ -2930,7 +2881,7 @@ pub const AppState = struct {
         const image_path = self.writeClipboardImageToStorage(image.mime, image.bytes) catch |err| {
             log.err("failed to persist clipboard image: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to save clipboard image.");
-            return;
+            return true;
         };
         defer self.allocator.free(image_path);
 
@@ -2938,10 +2889,52 @@ pub const AppState = struct {
         thread.setDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
             log.err("failed to attach draft image: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to attach clipboard image.");
-            return;
+            return true;
         };
         self.setSidebarNotice("Clipboard image attached.");
         self.markDirty();
+        return true;
+    }
+
+    pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
+        if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) return false;
+        const text = self.readClipboardTextForPaste() orelse return false;
+        defer self.allocator.free(text);
+        return self.insertTextIntoPaletteComposer(text);
+    }
+
+    fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
+        const clipboard_text = sdl.getClipboardText() catch |err| {
+            log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
+            return utils.captureClipboardText(self.allocator) catch |fallback_err| {
+                log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+                return null;
+            };
+        };
+        defer sdl.free(@ptrCast(clipboard_text));
+        const text = std.mem.span(clipboard_text);
+        if (text.len > 0) return self.allocator.dupe(u8, text) catch null;
+        return utils.captureClipboardText(self.allocator) catch |fallback_err| {
+            log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+            return null;
+        };
+    }
+
+    fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
+        if (text.len == 0) return false;
+        self.palette_composer.focused = true;
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+            log.warn("palette composer paste failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPaletteComposer();
+            self.noteInteraction();
+        }
+        return handled;
     }
 
     pub fn clearCurrentDraftImage(self: *AppState) void {
@@ -2972,7 +2965,6 @@ pub const AppState = struct {
             self.releaseMessage(thread.messages.pop().?);
         }
         thread.clearTranscriptMarkdownEntries(self.allocator);
-        thread.clearTranscriptSelectableEntries(self.allocator);
         thread.clearTranscriptHeightEntries();
     }
 
@@ -3173,13 +3165,11 @@ pub const AppState = struct {
     pub fn openImageModal(self: *AppState, path: [:0]const u8) void {
         if (self.modal_image_path) |existing| {
             if (std.mem.eql(u8, existing, path)) {
-                zgui.openPopup(IMAGE_MODAL_ID, .{});
                 return;
             }
             self.allocator.free(existing);
         }
         self.modal_image_path = self.allocator.dupeZ(u8, path) catch return;
-        zgui.openPopup(IMAGE_MODAL_ID, .{});
     }
 
     pub fn closeImageModal(self: *AppState) void {
@@ -3319,21 +3309,6 @@ pub const AppState = struct {
         return &entry.view;
     }
 
-    pub fn transcriptBodyTextSelector(self: *AppState, message_index: usize, body: []const u8) ?*zgui_text_select.TextSelect {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return null;
-        return entry.selector;
-    }
-
-    pub fn transcriptBodyTextLineCount(self: *AppState, message_index: usize, body: []const u8) usize {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return 0;
-        return entry.lines.len;
-    }
-
-    pub fn transcriptBodyTextLineAt(self: *AppState, message_index: usize, body: []const u8, line_index: usize) []const u8 {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return "";
-        return entry.lineSlice(line_index);
-    }
-
     pub fn cachedTranscriptMessageHeight(
         self: *AppState,
         message_index: usize,
@@ -3469,57 +3444,6 @@ pub const AppState = struct {
             thread.transcript_markdown_entries.items[message_index] = created;
             warmed += 1;
         }
-    }
-
-    fn ensureTranscriptSelectableEntries(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearTranscriptSelectableEntries();
-            return;
-        }
-
-        const project_index = self.selected_project_index;
-        const thread_index = self.currentProject().selected_thread_index;
-        const message_count = self.currentThread().messages.items.len;
-        if (self.transcript_selectable_project_index == project_index and
-            self.transcript_selectable_thread_index == thread_index and
-            self.transcript_selectable_entries.items.len == message_count)
-        {
-            return;
-        }
-
-        self.clearTranscriptSelectableEntries();
-        self.transcript_selectable_entries.appendNTimes(self.allocator, null, message_count) catch return;
-        self.transcript_selectable_project_index = project_index;
-        self.transcript_selectable_thread_index = thread_index;
-    }
-
-    fn clearTranscriptSelectableEntries(self: *AppState) void {
-        for (self.transcript_selectable_entries.items) |entry| {
-            if (entry) |owned| owned.deinit(self.allocator);
-        }
-        self.transcript_selectable_entries.clearRetainingCapacity();
-        self.transcript_selectable_project_index = null;
-        self.transcript_selectable_thread_index = null;
-    }
-
-    fn transcriptBodyTextEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptSelectableText {
-        if (body.len == 0) return null;
-        const thread = self.currentThreadMutable();
-        thread.ensureTranscriptSelectableEntries(self.allocator);
-        if (message_index >= thread.transcript_selectable_entries.items.len) return null;
-
-        if (thread.transcript_selectable_entries.items[message_index]) |entry| {
-            if (!std.mem.eql(u8, entry.owned_body, body)) {
-                entry.deinit(self.allocator);
-                thread.transcript_selectable_entries.items[message_index] = null;
-            } else {
-                return entry;
-            }
-        }
-
-        const created = createTranscriptSelectableText(self.allocator, body) catch return null;
-        thread.transcript_selectable_entries.items[message_index] = created;
-        return created;
     }
 
     fn buildCurrentTranscriptSelectionText(self: *AppState) ![:0]u8 {
@@ -3726,6 +3650,11 @@ pub const AppState = struct {
 
         const restore_last_url = !self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null;
         self.browser_state.setControlsVisible(true);
+        self.browser_address_focused = true;
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.browser_pane_focused = false;
+        self.terminal_focused = false;
+        self.composer_focused = false;
         self.browser_state.status = .opening;
         if (restore_last_url) {
             const url = self.browser_state.current_url.?;
@@ -3757,6 +3686,8 @@ pub const AppState = struct {
         self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
         self.browser_pane_hovered = false;
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
         self.browser_state.controller.shutdown();
         self.browser_state.status = .hidden;
         self.browser_state.setLastError(null) catch {};
@@ -3769,6 +3700,8 @@ pub const AppState = struct {
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
         self.browser_state.controller.hide() catch |err| {
             log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
@@ -4440,10 +4373,10 @@ pub const AppState = struct {
     }
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
-        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent });
-        self.palette_composer.setFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
-        self.palette_composer.setToolbarFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
-        self.palette_composer.setIconFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
+        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
+        self.palette_composer.setFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
+        self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
         const model_options = composerModelOptions(self, thread.provider);
         self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
@@ -4480,7 +4413,7 @@ pub const AppState = struct {
 
     pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
         self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
-        self.palette_model_cascade.setFontMetrics(paletteZguiFontMetrics(20.0));
+        self.palette_model_cascade.setFontMetrics(paletteEstimatedFontMetrics(20.0));
         self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
         if (self.currentThread().committed and self.palette_model_cascade.isOpen()) {
             _ = self.palette_model_cascade.handleInput(.close);
@@ -4556,6 +4489,9 @@ pub const AppState = struct {
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (palette_key.primary and palette_key.code == .v) {
+            return self.pasteClipboardTextIntoPaletteComposer();
+        }
         if (self.routePaletteModelCascadeKey(palette_key)) return true;
         if (!self.palette_composer.focused) return false;
         if (self.handlePaletteComposerNavigationKey(palette_key)) {
@@ -4711,7 +4647,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
@@ -5070,6 +5006,10 @@ pub const AppState = struct {
         return std.mem.sliceTo(self.rename_storage[0..], 0);
     }
 
+    pub fn renameInputPublic(self: *const AppState) []const u8 {
+        return self.renameInput();
+    }
+
     pub fn renameBuffer(self: *AppState) [:0]u8 {
         return self.rename_storage[0 .. self.rename_storage.len - 1 :0];
     }
@@ -5197,10 +5137,11 @@ pub const AppState = struct {
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
+        self.palette_frame_text.deinit(self.allocator);
+        self.palette_modal_hits.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
-        self.transcript_selectable_entries.deinit(self.allocator);
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
@@ -5989,7 +5930,6 @@ pub const AppState = struct {
         self.closeTranscriptSelectionModal();
         self.clearTranscriptMarkdownSelection();
         self.clearTranscriptMarkdownEntries();
-        self.clearTranscriptSelectableEntries();
         for (self.projects.items) |*project| {
             project.deinit(self.allocator);
         }
