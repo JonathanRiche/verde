@@ -460,10 +460,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 );
             }
             const action = keyboard.actionForEvent(&event.key);
-            if (shouldPasteClipboardImage(state, &event.key)) {
-                if (state.attachClipboardImageToCurrentDraft()) return true;
+            const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
+            logPasteShortcutEvent(state, &event.key, paste_shortcut);
+            if (paste_shortcut) {
                 if (state.pasteClipboardTextIntoPaletteComposer()) return true;
-                return true;
+                if (state.attachClipboardImageToCurrentDraft()) return true;
             }
             if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);
@@ -722,6 +723,27 @@ fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardE
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
+}
+
+fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
+    if (event.scancode != .v and event.key != .v) return;
+    const mod_bits = keymodBits(event.mod);
+    runtime_log.diagnostic(
+        "paste key event key={s} scancode={s} down={} repeat={} mod=0x{x} matched={} composer_focused={} palette_composer_focused={} browser_focused={} address_focused={} modal_focus={s}",
+        .{
+            @tagName(event.key),
+            @tagName(event.scancode),
+            event.down,
+            event.repeat,
+            mod_bits,
+            matched,
+            state.composer_focused,
+            state.palette_composer.focused,
+            state.isBrowserPaneFocused(),
+            state.browser_address_focused,
+            @tagName(state.palette_modal_text_focus),
+        },
+    );
 }
 
 fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {

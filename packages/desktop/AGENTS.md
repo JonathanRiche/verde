@@ -218,6 +218,47 @@ If a section is too tall, do not just shrink fonts. Rebalance the layout:
 - reduce reserved height ratios
 - clamp panel heights
 - let transcript/composer split adapt to available height
+
+## Native App Visual Testing
+
+For manual/agent validation of the desktop UI, use the real app. Do not substitute unit tests or alternate build commands when the task is about runtime layout, input, rendering, window resizing, or Palette migration behavior.
+
+Use only:
+```bash
+mise run dev
+```
+
+Recommended agent workflow:
+1. Close stale Verde windows before launching a new one so screenshots and input target the current binary:
+   ```bash
+   hyprctl clients -j | jq -r '.[] | select((.class|test("verde";"i")) or (.title|test("verde";"i"))) | .address' |
+     while read -r addr; do [ -n "$addr" ] && hyprctl dispatch closewindow address:$addr; done
+   ```
+2. Start the app with `mise run dev` from the repo/worktree root.
+3. Use Hyprland to find and focus/move the Verde window:
+   ```bash
+   hyprctl clients -j | jq -r '.[] | [.address,.class,.title] | @tsv' | rg -i 'verde'
+   hyprctl dispatch focuswindow class:com.verde.native
+   hyprctl dispatch movetoworkspacesilent 2,class:com.verde.native
+   ```
+4. Use Wayland tools for interaction when available:
+   ```bash
+   printf 'paste smoke text' | wl-copy
+   wtype -M ctrl -k v -m ctrl
+   ```
+5. Capture screenshots from the compositor instead of guessing from logs:
+   ```bash
+   grim -g "$(hyprctl activewindow -j | jq -r '.at + .size | @tsv' | awk '{print $1","$2" "$3"x"$4}')" /tmp/verde-active.png
+   ```
+
+When checking responsiveness, resize or tile the actual window through Hyprland and take another screenshot. If the UI does not reflow after window changes, inspect the SDL window-size/drawable-size path and Palette root layout invalidation before tuning component dimensions.
+
+Runtime diagnostics are written to:
+```bash
+~/.local/share/verde/Native/logs/verde.stderr.log
+```
+
+For clipboard/input bugs, prefer length-only diagnostics and never log clipboard contents.
 - allow content regions to own width rather than subtracting arbitrary constants
 
 ## Editing Policy For Palette UI

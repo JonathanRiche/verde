@@ -11,6 +11,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
@@ -2897,25 +2898,47 @@ pub const AppState = struct {
     }
 
     pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
-        if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) return false;
-        const text = self.readClipboardTextForPaste() orelse return false;
+        if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) {
+            runtime_log.diagnostic(
+                "palette paste blocked browser_focused={} address_focused={} modal_focus={s}",
+                .{ self.isBrowserPaneFocused(), self.browser_address_focused, @tagName(self.palette_modal_text_focus) },
+            );
+            return false;
+        }
+        const text = self.readClipboardTextForPaste() orelse {
+            runtime_log.diagnostic("palette paste clipboard text unavailable", .{});
+            return false;
+        };
         defer self.allocator.free(text);
-        return self.insertTextIntoPaletteComposer(text);
+        runtime_log.diagnostic("palette paste clipboard text len={d}", .{text.len});
+        const handled = self.insertTextIntoPaletteComposer(text);
+        runtime_log.diagnostic("palette paste insert handled={} draft_len={d}", .{ handled, self.currentDraft().len });
+        return handled;
     }
 
     fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
         const clipboard_text = sdl.getClipboardText() catch |err| {
             log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
             return utils.captureClipboardText(self.allocator) catch |fallback_err| {
                 log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+                runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
                 return null;
             };
         };
         defer sdl.free(@ptrCast(clipboard_text));
         const text = std.mem.span(clipboard_text);
-        if (text.len > 0) return self.allocator.dupe(u8, text) catch null;
+        if (text.len > 0) {
+            runtime_log.diagnostic("palette paste SDL clipboard text len={d}", .{text.len});
+            return self.allocator.dupe(u8, text) catch |err| {
+                runtime_log.diagnostic("palette paste clipboard dupe failed: {s}", .{@errorName(err)});
+                return null;
+            };
+        }
+        runtime_log.diagnostic("palette paste SDL clipboard empty; trying fallback", .{});
         return utils.captureClipboardText(self.allocator) catch |fallback_err| {
             log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+            runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
             return null;
         };
     }
@@ -4490,6 +4513,10 @@ pub const AppState = struct {
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
         if (palette_key.primary and palette_key.code == .v) {
+            runtime_log.diagnostic(
+                "palette composer received primary-v focused={} draft_len={d}",
+                .{ self.palette_composer.focused, self.currentDraft().len },
+            );
             return self.pasteClipboardTextIntoPaletteComposer();
         }
         if (self.routePaletteModelCascadeKey(palette_key)) return true;
