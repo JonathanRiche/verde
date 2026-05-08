@@ -40,6 +40,7 @@ pub const std_options: std.Options = .{
 pub const panic = std.debug.FullPanic(runtime_log.panicFn);
 
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+const GL_MULTISAMPLE: u32 = 0x809D;
 
 const DEFAULT_FONT_SIZE: f32 = ui_theme.DEFAULT_FONT_SIZE;
 const DEFAULT_WINDOW_WIDTH: c_int = 1360;
@@ -61,6 +62,7 @@ const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.
 extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
 extern fn glClear(mask: u32) void;
 extern fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int) void;
+extern fn glEnable(cap: u32) void;
 
 const WindowFrame = struct {
     x: c_int,
@@ -95,6 +97,9 @@ pub fn main(init: std.process.Init) !void {
     try sdl.gl.setAttribute(.context_major_version, 3);
     try sdl.gl.setAttribute(.context_minor_version, 3);
     try sdl.gl.setAttribute(.doublebuffer, 1);
+    // Default framebuffer MSAA: smooths vector edges (composer send/stop, rounded UI).
+    try sdl.gl.setAttribute(.multisamplebuffers, 1);
+    try sdl.gl.setAttribute(.multisamplesamples, 4);
     switch (@import("builtin").os.tag) {
         .macos => try sdl.gl.setAttribute(.context_profile_mask, @intFromEnum(sdl.gl.Profile.core)),
         else => {},
@@ -120,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     const gl_context = try sdl.gl.createContext(window);
     defer sdl.gl.destroyContext(gl_context);
     try sdl.gl.makeCurrent(window, gl_context);
+    glEnable(GL_MULTISAMPLE);
     try sdl.gl.setSwapInterval(1);
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {

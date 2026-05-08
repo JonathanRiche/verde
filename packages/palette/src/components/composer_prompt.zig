@@ -1171,7 +1171,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const toolbar = self.toolbarRect();
             const control_h = @min(toolbar.h, 32.0);
             const y = toolbar.y + (toolbar.h - control_h) * 0.5;
-            const send_size = @min(toolbar.h, 36.0);
+            const send_size = @min(toolbar.h, 40.0);
             const send: draw.Rect = .{
                 .x = toolbar.x + toolbar.w - send_size,
                 .y = toolbar.y + (toolbar.h - send_size) * 0.5,
