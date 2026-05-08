@@ -1095,9 +1095,11 @@ fn renderPaletteTextBlockLayout(
     const RenderContext = struct {
         palette_context: *PaletteRenderContext,
         start: [2]f32,
+        options: RenderOptions,
 
         fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
             renderPaletteStyledChunk(
+                ctx.options,
                 ctx.palette_context,
                 .{ ctx.start[0] + step.x, ctx.start[1] + step.y },
                 step.text,
@@ -1113,6 +1115,7 @@ fn renderPaletteTextBlockLayout(
     return walkTextBlockLayout(block, available_width, options, RenderContext{
         .palette_context = context,
         .start = start,
+        .options = options,
     }, RenderContext.onStep);
 }
 
@@ -1482,6 +1485,7 @@ fn renderSelectableLine(
     start: [2]f32,
     line_index: usize,
     line: SelectableLine,
+    options: RenderOptions,
 ) void {
     noteSelectableLineBounds(output, line_index, line.total_columns);
 
@@ -1529,6 +1533,7 @@ fn renderSelectableLine(
 
     for (line.chunks) |chunk| {
         renderPaletteStyledChunk(
+            options,
             context,
             .{ start[0] + chunk.x, top },
             chunk.text,
@@ -1609,6 +1614,7 @@ fn renderSelectableTextBlock(
             start,
             global_line_index.* + index,
             line,
+            options,
         );
         height = @max(height, line.y + line.height);
     }
@@ -1824,6 +1830,7 @@ fn renderSelectablePaletteCodeBlock(
 }
 
 fn renderPaletteStyledChunk(
+    options: RenderOptions,
     context: *PaletteRenderContext,
     position: [2]f32,
     text: []const u8,
@@ -1834,6 +1841,7 @@ fn renderPaletteStyledChunk(
     line_height: f32,
 ) void {
     const color = inlineTextColor(textBlockColor(block_style), inline_style);
+    const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
 
     if (inline_style.code) {
         queuePaletteRoundedRect(context, .{
@@ -1849,14 +1857,14 @@ fn renderPaletteStyledChunk(
         .y = position[1],
         .w = width,
         .h = line_height,
-    }, text, paletteColor(color), fontSizeForSpec(font_spec), context.clip);
+    }, text, paletteColor(color), draw_font_size, context.clip);
     if (inline_style.strong) {
         queuePaletteText(context, .{
             .x = position[0] + 0.75,
             .y = position[1],
             .w = width,
             .h = line_height,
-        }, text, paletteColor(color), fontSizeForSpec(font_spec), context.clip);
+        }, text, paletteColor(color), draw_font_size, context.clip);
     }
 
     if (inline_style.link or inline_style.emphasis) {
@@ -2119,10 +2127,6 @@ fn codeFontSize(options: RenderOptions) f32 {
 
 fn codeLineHeight(options: RenderOptions) f32 {
     return (options.code_font_size orelse options.base_font_size * 0.92) * 1.25;
-}
-
-fn fontSizeForSpec(spec: FontSpec) f32 {
-    return spec.size orelse 24.0;
 }
 
 fn fontSizeForSpecWithOptions(spec: FontSpec, options: RenderOptions) f32 {
