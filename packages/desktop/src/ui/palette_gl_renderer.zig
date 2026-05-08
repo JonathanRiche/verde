@@ -205,7 +205,10 @@ pub const Renderer = struct {
                 .rect => try self.appendPanel(allocator, command),
                 .triangle => try self.appendTriangle(allocator, command.p0, command.p1, command.p2, command.color, command.clip),
                 .cursor, .selection, .scrollbar => try self.appendRect(allocator, command.rect, command.color, command.clip),
-                .text => {},
+                .text => {
+                    try self.flush(framebuffer_width, framebuffer_height);
+                    self.renderTextCommand(command, batch, framebuffer_width, framebuffer_height);
+                },
                 .image => {
                     try self.flush(framebuffer_width, framebuffer_height);
                     try self.renderImageCommand(allocator, command, framebuffer_width, framebuffer_height);
@@ -213,7 +216,6 @@ pub const Renderer = struct {
             }
         }
         try self.flush(framebuffer_width, framebuffer_height);
-        self.renderTextCommands(batch, framebuffer_width, framebuffer_height);
     }
 
     pub fn renderBatchFallback(self: *Renderer, allocator: std.mem.Allocator, batch: *const palette.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) !void {
@@ -309,17 +311,21 @@ pub const Renderer = struct {
     }
 
     fn renderTextCommands(self: *Renderer, batch: *const palette.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) void {
-        _ = self;
         for (batch.commands.items) |command| {
             if (command.kind != .text) continue;
-            if (command.text_run_count > 0) {
-                const runs = batch.text_runs.items[command.text_run_start..][0..command.text_run_count];
-                for (runs) |run| {
-                    drawTextSlice(run.text, run.x, run.y, run.font_size, run.color, framebuffer_width, framebuffer_height);
-                }
-            } else {
-                drawTextSlice(command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.font_size, command.color, framebuffer_width, framebuffer_height);
+            self.renderTextCommand(command, batch, framebuffer_width, framebuffer_height);
+        }
+    }
+
+    fn renderTextCommand(self: *Renderer, command: palette.draw.Command, batch: *const palette.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) void {
+        _ = self;
+        if (command.text_run_count > 0) {
+            const runs = batch.text_runs.items[command.text_run_start..][0..command.text_run_count];
+            for (runs) |run| {
+                drawTextSlice(run.text, run.x, run.y, run.font_size, run.color, framebuffer_width, framebuffer_height);
             }
+        } else {
+            drawTextSlice(command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.font_size, command.color, framebuffer_width, framebuffer_height);
         }
     }
 

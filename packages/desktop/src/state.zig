@@ -212,6 +212,8 @@ fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
         .c => .c,
         .v => .v,
         .x => .x,
+        .y => .y,
+        .z => .z,
         else => return null,
     };
     return .{ .code = code, .shift = shift, .primary = primary or (code == .enter and !shift), .alt = alt };
