@@ -357,7 +357,10 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                 var index = range.start;
                 while (index < range.end) : (index += 1) {
                     const row = self.rowRect(depth, index);
-                    if (self.highlighted[depth] == index) try batch.rect(allocator, row, config.highlighted_color);
+                    const row_corner = @min(9.0, @max(4.0, config.row_height * 0.38));
+                    if (self.highlighted[depth] == index) {
+                        try batch.roundedRectClipped(allocator, row, config.highlighted_color, row_corner, self.menuContentRect(depth));
+                    }
                     if (config.render_row_leading) |render_leading| {
                         if (config.row_leading_width > 0.0) {
                             var path_buffer: [config.max_depth]usize = undefined;

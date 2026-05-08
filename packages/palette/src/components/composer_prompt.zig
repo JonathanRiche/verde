@@ -669,15 +669,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const rect = self.menuRect(target);
             const previous_z = batch.setZIndex(self.z_index + 1000);
             defer batch.restoreZIndex(previous_z);
-            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, 10.0, 1.0);
+            const menu_corner: f32 = 14.0;
+            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, menu_corner, 1.0);
             const metrics = self.toolbarMetrics();
+            const row_corner = @min(9.0, @max(4.0, metrics.line_height * 0.38));
             var index: usize = 0;
             while (index < options.count) : (index += 1) {
                 const row = self.menuRowRect(target, index);
                 if (self.selectedIndex(target) == index) {
-                    try batch.selection(allocator, row, config.menu_selected_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_selected_color, row_corner, rect);
                 } else if (self.hovered_menu_index == index) {
-                    try batch.rect(allocator, row, config.menu_hover_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_hover_color, row_corner, rect);
                 }
                 const label = options.labelFor(index) orelse continue;
                 const text_rect: draw.Rect = .{
