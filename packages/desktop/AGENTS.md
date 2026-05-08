@@ -142,6 +142,15 @@ In practice:
 
 When editing UI in `packages/desktop`, assume this is a native Palette app first, not a web/CSS layout.
 
+## Provider Integration Rules
+
+When adding a new chat provider, wire it through the shared provider request contract instead of only matching the first provider that works. In particular, prompt image attachments are provider-neutral UI state:
+- Preserve support for multiple pasted prompt images.
+- Map every image in `SendPromptRequest.images` into the provider's native request format.
+- Keep the legacy single `SendPromptRequest.image` path working while the rest of the app still carries compatibility state.
+- If the provider cannot support local image/file inputs, fail explicitly with a user-facing notice instead of silently dropping attachments.
+- Validate both text-only prompts and prompts with more than one image before considering the provider complete.
+
 ## Coordinate Spaces
 
 This app uses multiple size spaces. Mixing them incorrectly causes the exact failures we hit before: top-left-only rendering, giant black unused areas, or UI that changes apparent size across displays.
