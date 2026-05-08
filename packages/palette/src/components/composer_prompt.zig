@@ -119,6 +119,28 @@ pub const MouseWheel = struct {
     y: f32,
 };
 
+const MAX_EDIT_HISTORY = 64;
+
+const EditSnapshot = struct {
+    text: []u8,
+    cursor: usize,
+    selection_anchor: ?usize,
+    selection_focus: ?usize,
+
+    fn capture(allocator: std.mem.Allocator, component: anytype) !EditSnapshot {
+        return .{
+            .text = try allocator.dupe(u8, component.buffer.items),
+            .cursor = component.cursor,
+            .selection_anchor = component.selection_anchor,
+            .selection_focus = component.selection_focus,
+        };
+    }
+
+    fn deinit(self: EditSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
 pub const ComposerPromptEvent = union(enum) {
     text_changed: []const u8,
     submitted: []const u8,
@@ -181,6 +203,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
+        undo_stack: std.ArrayList(EditSnapshot) = .empty,
+        redo_stack: std.ArrayList(EditSnapshot) = .empty,
         font_metrics: ?text_layout.FontMetrics = null,
         toolbar_font_metrics: ?text_layout.FontMetrics = null,
         icon_font_metrics: ?text_layout.FontMetrics = null,
@@ -198,6 +222,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.reasoning_label_buffer.deinit(allocator);
             self.fast_label_buffer.deinit(allocator);
             self.access_label_buffer.deinit(allocator);
+            self.clearEditHistory(allocator);
+            self.undo_stack.deinit(allocator);
+            self.redo_stack.deinit(allocator);
             self.* = undefined;
         }
 
@@ -233,6 +260,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.cursor = self.buffer.items.len;
             self.selection_anchor = null;
             self.selection_focus = null;
+            self.clearEditHistory(allocator);
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
         }
@@ -658,6 +686,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     if (!key.primary) return false;
                     return try self.pasteClipboard(allocator);
                 },
+                .z => {
+                    if (!key.primary) return false;
+                    if (key.shift) try self.redo(allocator) else try self.undo(allocator);
+                    return true;
+                },
+                .y => {
+                    if (!key.primary) return false;
+                    try self.redo(allocator);
+                    return true;
+                },
                 else => return false,
             }
         }
@@ -747,14 +785,63 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
             const safe_start = @min(start, self.buffer.items.len);
             const safe_end = @min(@max(end, safe_start), self.buffer.items.len);
+            try self.recordUndoSnapshot(allocator);
             self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
+            self.clearRedoStack(allocator);
             self.cursor = safe_start + value.len;
             self.selection_anchor = null;
             self.selection_focus = null;
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn undo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.undo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.redo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn redo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.redo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn restoreSnapshot(self: *Component, allocator: std.mem.Allocator, snapshot: EditSnapshot) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, snapshot.text);
+            self.cursor = @min(snapshot.cursor, self.buffer.items.len);
+            self.selection_anchor = snapshot.selection_anchor;
+            self.selection_focus = snapshot.selection_focus;
+            self.ensureCursorVisible();
+            self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn recordUndoSnapshot(self: *Component, allocator: std.mem.Allocator) !void {
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            while (self.undo_stack.items.len > MAX_EDIT_HISTORY) {
+                const dropped = self.undo_stack.orderedRemove(0);
+                dropped.deinit(allocator);
+            }
+        }
+
+        fn clearEditHistory(self: *Component, allocator: std.mem.Allocator) void {
+            self.clearUndoStack(allocator);
+            self.clearRedoStack(allocator);
+        }
+
+        fn clearUndoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.undo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.undo_stack.clearRetainingCapacity();
+        }
+
+        fn clearRedoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.redo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.redo_stack.clearRetainingCapacity();
         }
 
         fn moveCursor(self: *Component, next: usize, extend_selection: bool) void {
