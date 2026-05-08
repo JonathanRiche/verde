@@ -148,6 +148,11 @@ pub const RenderBatch = struct {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color });
     }
 
+    /// Solid rect clipped to `clip` (host renderers intersect geometry with this rect).
+    pub fn rectClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, clip: Rect) !void {
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .clip = clip });
+    }
+
     pub fn triangle(self: *RenderBatch, allocator: std.mem.Allocator, p0: Vec2, p1: Vec2, p2: Vec2, color: Color) !void {
         try self.appendCommand(allocator, .{
             .kind = .triangle,
@@ -163,6 +168,10 @@ pub const RenderBatch = struct {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius });
     }
 
+    pub fn roundedRectClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, clip: Rect) !void {
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius, .clip = clip });
+    }
+
     pub fn rectBorder(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, width: f32) !void {
         try self.appendCommand(allocator, .{
             .kind = .rect,
@@ -171,6 +180,18 @@ pub const RenderBatch = struct {
             .radius = radius,
             .border_width = width,
             .border_color = color,
+        });
+    }
+
+    pub fn rectBorderClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, width: f32, clip: Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .rect,
+            .rect = r,
+            .color = Color.transparent,
+            .radius = radius,
+            .border_width = width,
+            .border_color = color,
+            .clip = clip,
         });
     }
 

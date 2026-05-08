@@ -38,6 +38,7 @@ extern fn glBufferData(target: c_uint, size: isize, data: ?*const anyopaque, usa
 extern fn glDeleteBuffers(n: c_int, buffers: [*]const c_uint) void;
 extern fn glEnable(cap: c_uint) void;
 extern fn glDisable(cap: c_uint) void;
+extern fn glScissor(x: c_int, y: c_int, width: c_int, height: c_int) void;
 extern fn glBlendFunc(sfactor: c_uint, dfactor: c_uint) void;
 extern fn glEnableVertexAttribArray(index: c_uint) void;
 extern fn glVertexAttribPointer(index: c_uint, size: c_int, type: c_uint, normalized: u8, stride: c_int, pointer: ?*const anyopaque) void;
@@ -319,6 +320,13 @@ pub const Renderer = struct {
 
     fn renderTextCommand(self: *Renderer, command: palette.draw.Command, batch: *const palette.RenderBatch, framebuffer_width: f32, framebuffer_height: f32) void {
         _ = self;
+        const clip = command.clip;
+        if (clip) |c| {
+            glEnable(GL_SCISSOR_TEST);
+            applyTextClipScissor(c, framebuffer_height);
+        }
+        defer if (clip != null) glDisable(GL_SCISSOR_TEST);
+
         if (command.text_run_count > 0) {
             const runs = batch.text_runs.items[command.text_run_start..][0..command.text_run_count];
             for (runs) |run| {
@@ -327,6 +335,15 @@ pub const Renderer = struct {
         } else {
             drawTextSlice(command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.font_size, command.color, framebuffer_width, framebuffer_height);
         }
+    }
+
+    /// Palette rects use top-left origin; GL scissor uses bottom-left for `y`.
+    fn applyTextClipScissor(clip: palette.Rect, framebuffer_height: f32) void {
+        const sx = @as(c_int, @intFromFloat(@floor(clip.x)));
+        const sw = @as(c_int, @intFromFloat(@floor(clip.w)));
+        const sh = @as(c_int, @intFromFloat(@floor(clip.h)));
+        const sy = @as(c_int, @intFromFloat(@floor(framebuffer_height - clip.y - clip.h)));
+        glScissor(sx, sy, @max(sw, 1), @max(sh, 1));
     }
 
     fn appendPanel(self: *Renderer, allocator: std.mem.Allocator, command: palette.draw.Command) !void {

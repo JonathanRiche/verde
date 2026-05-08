@@ -143,8 +143,10 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     transcript_rect = rect;
     const column_width = @min(rect.w - theme.scaledUi(48.0), theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
     const column = palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) };
+    // Clip to transcript body (below workspace header) so scrolled bubbles and GL text
+    // cannot paint over the title bar.
+    const clip = palette.Rect{ .x = column.x, .y = rect.y, .w = column.w, .h = rect.h };
     const thread = state.currentThread();
-    const clip = column;
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi()) {
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
@@ -235,8 +237,8 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         .assistant => colors.rgba(22, 30, 32, 242),
         .system => colors.rgba(57, 43, 9, 235),
     };
-    queueRounded(state, bubble, paletteColor(bg), theme.scaledUi(8.0));
-    queueBorder(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0);
+    queueRoundedClipped(state, bubble, paletteColor(bg), theme.scaledUi(8.0), clip);
+    queueBorderClipped(state, bubble, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), 1.0, clip);
     queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
@@ -542,6 +544,14 @@ fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.
 
 fn queueBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
+}
+
+fn queueRoundedClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, clip: palette.Rect) void {
+    state.palette_overlay_batch.roundedRectClipped(state.allocator, rect, color, radius, clip) catch {};
+}
+
+fn queueBorderClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32, clip: palette.Rect) void {
+    state.palette_overlay_batch.rectBorderClipped(state.allocator, rect, color, radius, width, clip) catch {};
 }
 
 fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, clip: ?palette.Rect) void {
