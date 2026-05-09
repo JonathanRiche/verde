@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/// `stbtt_BakeFontBitmap` packs glyphs tightly; linear filtering can sample into
+/// neighboring cells and break narrow stems (especially visible on saturated hues).
+#define PALETTE_TEXT_ATLAS_DIM 1024
+
 typedef struct PaletteTextVertex {
     float x;
     float y;
@@ -19,13 +23,28 @@ typedef struct PaletteTextVertex {
 } PaletteTextVertex;
 
 typedef struct PaletteTextAtlas {
+    /// Rounded em size used as the cache key (matches `roundf(font_size)` from the app).
     float size;
+    /// Pixel height passed to `stbtt_BakeFontBitmap` (>= `size`; typically ~2x for sharper bitmaps).
+    float bake_height;
     float ascent;
     float line_gap;
     GLuint texture;
     stbtt_bakedchar chars[96];
     int ready;
 } PaletteTextAtlas;
+
+/// Bake glyphs taller than layout em so coverage is sampled from a higher-res bitmap.
+static float palette_text_bake_pixel_height(float layout_px) {
+    float t = layout_px * 2.0f;
+    if (t > 88.0f) {
+        t = 88.0f;
+    }
+    if (t < layout_px + 2.0f) {
+        t = layout_px + 2.0f;
+    }
+    return t;
+}
 
 static PaletteTextAtlas g_atlases[8];
 static GLuint g_program;
@@ -34,6 +53,20 @@ static GLuint g_vbo;
 static GLint g_viewport_uniform = -1;
 static GLint g_texture_uniform = -1;
 static int g_gl_ready;
+
+/// Inset UVs by half a texel so `GL_LINEAR` stays inside the baked glyph cell.
+static void shrink_baked_quad_uvs(stbtt_aligned_quad *q, int pw, int ph) {
+    const float du = 0.5f / (float)pw;
+    const float dv = 0.5f / (float)ph;
+    if (q->s1 > q->s0 + du * 2.0f) {
+        q->s0 += du;
+        q->s1 -= du;
+    }
+    if (q->t1 > q->t0 + dv * 2.0f) {
+        q->t0 += dv;
+        q->t1 -= dv;
+    }
+}
 
 static GLuint compile_shader(GLenum kind, const char *source) {
     GLuint shader = glCreateShader(kind);
@@ -66,8 +99,9 @@ static void ensure_gl(void) {
         "uniform sampler2D u_texture;\n"
         "out vec4 color;\n"
         "void main() {\n"
-        "  float alpha = texture(u_texture, v_uv).r;\n"
-        "  color = vec4(v_color.rgb, v_color.a * alpha);\n"
+        "  float cov = texture(u_texture, v_uv).r;\n"
+        "  float a = v_color.a * cov;\n"
+        "  color = vec4(v_color.rgb * a, a);\n"
         "}\n";
 
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_source);
@@ -101,11 +135,17 @@ static PaletteTextAtlas *atlas_for_size(const unsigned char *font_data, int font
     if (!atlas) atlas = &g_atlases[0];
     if (atlas->texture) glDeleteTextures(1, &atlas->texture);
 
-    const int atlas_w = 1024;
-    const int atlas_h = 1024;
+    const int atlas_w = PALETTE_TEXT_ATLAS_DIM;
+    const int atlas_h = PALETTE_TEXT_ATLAS_DIM;
     unsigned char *bitmap = (unsigned char *)calloc((size_t)atlas_w * (size_t)atlas_h, 1);
     if (!bitmap) return 0;
-    int bake = stbtt_BakeFontBitmap(font_data, 0, bucket, bitmap, atlas_w, atlas_h, 32, 96, atlas->chars);
+
+    float bake_h = palette_text_bake_pixel_height(bucket);
+    int bake = stbtt_BakeFontBitmap(font_data, 0, bake_h, bitmap, atlas_w, atlas_h, 32, 96, atlas->chars);
+    if (bake == 0) {
+        bake_h = bucket;
+        bake = stbtt_BakeFontBitmap(font_data, 0, bake_h, bitmap, atlas_w, atlas_h, 32, 96, atlas->chars);
+    }
     if (bake == 0) {
         free(bitmap);
         atlas->ready = 0;
@@ -137,6 +177,7 @@ static PaletteTextAtlas *atlas_for_size(const unsigned char *font_data, int font
     free(bitmap);
 
     atlas->size = bucket;
+    atlas->bake_height = bake_h;
     atlas->ready = 1;
     return atlas;
 }
@@ -246,7 +287,18 @@ void palette_text_gl_draw(
         }
         if (ch < 32 || ch > 126) continue;
         stbtt_aligned_quad q;
-        stbtt_GetBakedQuad(atlas->chars, 1024, 1024, ch - 32, &pen_x, &pen_y, &q, 1);
+        float x_before = pen_x;
+        float y_base = pen_y;
+        stbtt_GetBakedQuad(atlas->chars, PALETTE_TEXT_ATLAS_DIM, PALETTE_TEXT_ATLAS_DIM, ch - 32, &pen_x, &pen_y, &q, 1);
+        shrink_baked_quad_uvs(&q, PALETTE_TEXT_ATLAS_DIM, PALETTE_TEXT_ATLAS_DIM);
+        {
+            const float rescale = font_size / atlas->bake_height;
+            pen_x = x_before + (pen_x - x_before) * rescale;
+            q.x0 = x_before + (q.x0 - x_before) * rescale;
+            q.x1 = x_before + (q.x1 - x_before) * rescale;
+            q.y0 = y_base + (q.y0 - y_base) * rescale;
+            q.y1 = y_base + (q.y1 - y_base) * rescale;
+        }
         PaletteTextVertex v0 = { q.x0, q.y0, q.s0, q.t0, r, g, b, a };
         PaletteTextVertex v1 = { q.x1, q.y0, q.s1, q.t0, r, g, b, a };
         PaletteTextVertex v2 = { q.x1, q.y1, q.s1, q.t1, r, g, b, a };
@@ -261,7 +313,8 @@ void palette_text_gl_draw(
 
     if (count > 0) {
         glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        /* Premultiplied RGBA from fragment shader */
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(g_program);
         glUniform2f(g_viewport_uniform, viewport_w, viewport_h);
         glUniform1i(g_texture_uniform, 0);
