@@ -787,6 +787,14 @@ pub const Client = struct {
             try stringify.write(image.path);
             try stringify.endObject();
         }
+        for (request.images) |image| {
+            try stringify.beginObject();
+            try stringify.objectField("type");
+            try stringify.write("localImage");
+            try stringify.objectField("path");
+            try stringify.write(image.path);
+            try stringify.endObject();
+        }
         try stringify.endArray();
         try stringify.endObject();
         try stringify.endObject();

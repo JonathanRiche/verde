@@ -575,6 +575,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       selection,
       prompt: overlay.promptTextarea.value.trim(),
     });
+    clearSelection();
   });
 
   const enable = (): void => {

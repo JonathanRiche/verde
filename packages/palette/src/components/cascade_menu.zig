@@ -10,6 +10,16 @@ const text_layout = @import("../text_layout.zig");
 
 pub const ItemLabelFn = *const fn (context: ?*anyopaque, path: []const usize, index: usize) []const u8;
 pub const ChildCountFn = *const fn (context: ?*anyopaque, path: []const usize, index: usize) usize;
+pub const RowLeadingRenderFn = *const fn (
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *draw.RenderBatch,
+    depth: usize,
+    path: []const usize,
+    index: usize,
+    clip: draw.Rect,
+    leading_rect: draw.Rect,
+) void;
 
 pub const RootPlacement = enum {
     below,
@@ -62,6 +72,9 @@ pub const CascadeMenuConfig = struct {
     item_count: ?usize = null,
     item_label: ?ItemLabelFn = null,
     child_count: ?ChildCountFn = null,
+    row_leading_width: f32 = 0.0,
+    row_leading_to_label_gap: f32 = 0.0,
+    render_row_leading: ?RowLeadingRenderFn = null,
 };
 
 pub const Key = key_input;
@@ -338,13 +351,40 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             while (depth < self.visibleDepthCount()) : (depth += 1) {
                 _ = batch.setZIndex(self.z_index + @as(i32, @intCast(depth)) * config.submenu_z_offset);
                 const menu = self.menuRect(depth);
-                try batch.panel(allocator, menu, config.background_color, config.border_color, config.corner_radius, config.border_width);
+                const inset = @max(config.border_width, 1.0);
+                try batch.roundedRectClipped(allocator, menu, config.border_color, config.corner_radius, menu);
+                if (menu.w > inset * 2.0 and menu.h > inset * 2.0) {
+                    try batch.roundedRectClipped(allocator, .{
+                        .x = menu.x + inset,
+                        .y = menu.y + inset,
+                        .w = menu.w - inset * 2.0,
+                        .h = menu.h - inset * 2.0,
+                    }, config.background_color, @max(config.corner_radius - inset, 0.0), menu);
+                }
 
                 const range = self.visibleRange(depth);
                 var index = range.start;
                 while (index < range.end) : (index += 1) {
                     const row = self.rowRect(depth, index);
-                    if (self.highlighted[depth] == index) try batch.rect(allocator, row, config.highlighted_color);
+                    const row_corner = @min(9.0, @max(4.0, config.row_height * 0.38));
+                    if (self.highlighted[depth] == index) {
+                        try batch.roundedRectClipped(allocator, row, config.highlighted_color, row_corner, self.menuContentRect(depth));
+                    }
+                    if (config.render_row_leading) |render_leading| {
+                        if (config.row_leading_width > 0.0) {
+                            var path_buffer: [config.max_depth]usize = undefined;
+                            const path = self.pathForDepth(depth, &path_buffer);
+                            const label_clip = self.menuContentRect(depth);
+                            const lw = config.row_leading_width;
+                            const leading_rect = draw.Rect{
+                                .x = row.x,
+                                .y = row.y,
+                                .w = @min(lw, row.w),
+                                .h = row.h,
+                            };
+                            render_leading(self.callbacks.context, allocator, batch, depth, path, index, label_clip, leading_rect);
+                        }
+                    }
                     try self.renderRowLabel(allocator, batch, depth, index, row);
                 }
                 try self.renderScrollbar(allocator, batch, depth);
@@ -621,12 +661,16 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             const text_y = row.y + @max((row.h - metrics_value.line_height) * 0.5, 0.0);
             const label_clip = self.menuContentRect(depth);
             const chevron_w = if (has_children and config.chevron_icon.len > 0) icon_metrics.measureSlice(config.chevron_icon) else 0.0;
-            const label_w = @max(row.w - chevron_w - config.icon_gap, 0.0);
+            const leading_pad = if (config.render_row_leading != null and config.row_leading_width > 0.0)
+                config.row_leading_width + config.row_leading_to_label_gap
+            else
+                0.0;
+            const label_w = @max(row.w - leading_pad - chevron_w - config.icon_gap, 0.0);
             runs[count] = .{
                 .text = label,
                 .byte_start = 0,
                 .byte_end = label.len,
-                .x = row.x,
+                .x = row.x + leading_pad,
                 .y = text_y,
                 .font_size = metrics_value.font_size,
                 .line_height = metrics_value.line_height,
@@ -641,7 +685,7 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                     .text = config.chevron_icon,
                     .byte_start = 0,
                     .byte_end = config.chevron_icon.len,
-                    .x = row.x + label_w + config.icon_gap,
+                    .x = row.x + leading_pad + label_w + config.icon_gap,
                     .y = row.y + @max((row.h - icon_metrics.line_height) * 0.5, 0.0),
                     .font_size = icon_metrics.font_size,
                     .line_height = icon_metrics.line_height,

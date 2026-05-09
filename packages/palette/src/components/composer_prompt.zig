@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const draw = @import("../draw.zig");
+const clipboard = @import("../input/clipboard.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
 const selection_input = @import("../input/selection.zig");
@@ -29,6 +30,8 @@ pub const ComposerPromptConfig = struct {
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
     send_color: draw.Color = .{ .r = 0.32, .g = 0.54, .b = 0.39, .a = 1.0 },
     send_hover_color: draw.Color = .{ .r = 0.38, .g = 0.64, .b = 0.47, .a = 1.0 },
+    stop_button_color: draw.Color = .{ .r = 0.78, .g = 0.58, .b = 0.10, .a = 1.0 },
+    stop_button_hover_color: draw.Color = .{ .r = 0.90, .g = 0.68, .b = 0.14, .a = 1.0 },
     text_color: draw.Color = draw.Color.white,
     placeholder_color: draw.Color = .{ .r = 0.58, .g = 0.62, .b = 0.68, .a = 0.82 },
     icon_color: draw.Color = .{ .r = 0.78, .g = 0.82, .b = 0.88, .a = 1.0 },
@@ -65,6 +68,8 @@ pub const ComposerPromptConfig = struct {
     menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
     menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
+    /// Max rows shown for model/reasoning dropdowns before clipping (scroll not wired for these menus).
+    menu_max_visible_rows: f32 = 14.0,
     row_height: f32 = 28.0,
     pill_padding_x: f32 = 10.0,
     pill_icon_gap: f32 = 7.0,
@@ -118,6 +123,28 @@ pub const MouseWheel = struct {
     y: f32,
 };
 
+const MAX_EDIT_HISTORY = 64;
+
+const EditSnapshot = struct {
+    text: []u8,
+    cursor: usize,
+    selection_anchor: ?usize,
+    selection_focus: ?usize,
+
+    fn capture(allocator: std.mem.Allocator, component: anytype) !EditSnapshot {
+        return .{
+            .text = try allocator.dupe(u8, component.buffer.items),
+            .cursor = component.cursor,
+            .selection_anchor = component.selection_anchor,
+            .selection_focus = component.selection_focus,
+        };
+    }
+
+    fn deinit(self: EditSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
 pub const ComposerPromptEvent = union(enum) {
     text_changed: []const u8,
     submitted: []const u8,
@@ -134,6 +161,11 @@ pub const ComposerPromptEvent = union(enum) {
 pub const ComposerPromptCallbacks = struct {
     context: ?*anyopaque = null,
     on_event: ?*const fn (context: ?*anyopaque, event: ComposerPromptEvent) void = null,
+    get_clipboard: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+
+    fn clipboardProvider(self: ComposerPromptCallbacks) clipboard {
+        return .{ .context = self.context, .get = self.get_clipboard };
+    }
 };
 
 const Options = struct {
@@ -172,14 +204,41 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         hovered_menu_index: ?usize = null,
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
+        show_fast_toggle: bool = true,
+        show_reasoning_toggle: bool = true,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
+        undo_stack: std.ArrayList(EditSnapshot) = .empty,
+        redo_stack: std.ArrayList(EditSnapshot) = .empty,
         font_metrics: ?text_layout.FontMetrics = null,
         toolbar_font_metrics: ?text_layout.FontMetrics = null,
         icon_font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: ComposerPromptCallbacks = .{},
+
+        pub fn setShowReasoningToggle(self: *Component, show: bool) void {
+            self.show_reasoning_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .reasoning) null else self.hovered_part;
+                self.active_menu = if (self.active_menu == .reasoning) null else self.active_menu;
+            }
+        }
+
+        pub fn showReasoningToggle(self: *const Component) bool {
+            return self.show_reasoning_toggle;
+        }
+
+        pub fn setShowFastToggle(self: *Component, show: bool) void {
+            self.show_fast_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .fast) null else self.hovered_part;
+            }
+        }
+
+        pub fn showFastToggle(self: *const Component) bool {
+            return self.show_fast_toggle;
+        }
 
         pub fn init() Component {
             return .{};
@@ -192,6 +251,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.reasoning_label_buffer.deinit(allocator);
             self.fast_label_buffer.deinit(allocator);
             self.access_label_buffer.deinit(allocator);
+            self.clearEditHistory(allocator);
+            self.undo_stack.deinit(allocator);
+            self.redo_stack.deinit(allocator);
             self.* = undefined;
         }
 
@@ -227,6 +289,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.cursor = self.buffer.items.len;
             self.selection_anchor = null;
             self.selection_focus = null;
+            self.clearEditHistory(allocator);
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
         }
@@ -369,8 +432,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const geometry = self.toolbarGeometry();
             if (geometry.send.contains(point)) return .send;
             if (geometry.model.contains(point)) return .model;
-            if (geometry.reasoning.contains(point)) return .reasoning;
-            if (geometry.fast.contains(point)) return .fast;
+            if (self.show_reasoning_toggle and geometry.reasoning.w > 0.0 and geometry.reasoning.contains(point)) return .reasoning;
+            if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
             if (geometry.access.contains(point)) return .access;
             return null;
         }
@@ -446,22 +509,40 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const geometry = self.toolbarGeometry();
             try self.renderPill(allocator, batch, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
+            const left_before_fast: draw.Rect = if (self.show_reasoning_toggle) geometry.reasoning else geometry.model;
+            if (self.show_reasoning_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
+                try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+            }
+            if (self.show_fast_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.fast), geometry.toolbar);
+                try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
+                try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
+            } else {
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.access), geometry.toolbar);
+            }
 
             try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
-            const send_color: draw.Color = if (send_disabled)
-                draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 }
-            else if (self.hovered_part == .send) config.send_hover_color else config.send_color;
-            try batch.panel(allocator, geometry.send, send_color, null, geometry.send.h * 0.5, 0.0);
-            try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            const send_panel_color: draw.Color = blk: {
+                if (send_disabled)
+                    break :blk draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 };
+                if (self.send_state == .stop) {
+                    if (self.hovered_part == .send) break :blk config.stop_button_hover_color;
+                    break :blk config.stop_button_color;
+                }
+                if (self.hovered_part == .send) break :blk config.send_hover_color;
+                break :blk config.send_color;
+            };
+            try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
+            if (self.send_state == .stop) {
+                try renderStopSquare(allocator, batch, geometry.send);
+            } else if (self.send_state == .pending) {
+                try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            } else {
+                try renderSendArrow(allocator, batch, geometry.send);
+            }
         }
 
         fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
@@ -500,6 +581,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
+            if (icon.len == 0) return;
             const metrics = self.iconMetrics();
             const width = metrics.measureSlice(icon);
             const runs = [_]draw.TextRun{.{
@@ -516,6 +598,60 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_id = config.icon_font_id,
             }};
             try batch.textRuns(allocator, rect, icon, &runs, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+        }
+
+        fn sendGlyphBounds(button: draw.Rect) draw.Rect {
+            const m = @min(button.w, button.h);
+            const inset = m * 0.125;
+            return .{
+                .x = button.x + inset,
+                .y = button.y + inset,
+                .w = @max(button.w - 2.0 * inset, 1.0),
+                .h = @max(button.h - 2.0 * inset, 1.0),
+            };
+        }
+
+        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const side = m * 0.52;
+            const cx = inner.x + inner.w * 0.5;
+            const cy = inner.y + inner.h * 0.5;
+            const cr = @max(side * 0.18, 1.5);
+            try batch.roundedRectClipped(allocator, .{
+                .x = cx - side * 0.5,
+                .y = cy - side * 0.5,
+                .w = side,
+                .h = side,
+            }, draw.Color.white, cr, button);
+        }
+
+        /// Send: wide triangular head + narrow stem (same-width stem under an equilateral head reads as a "house").
+        fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const cx = inner.x + inner.w * 0.5;
+            const total_h = m * 0.56;
+            const head_h = total_h * 0.52;
+            const stem_h = total_h * 0.48;
+            const half_w_head = m * 0.175;
+            const half_w_stem = @max(m * 0.052, 1.25);
+            const y0 = inner.y + (inner.h - total_h) * 0.5;
+            // Stem under the head so the junction is a narrow shaft, not a full-width block.
+            try batch.rectClipped(allocator, .{
+                .x = cx - half_w_stem,
+                .y = y0 + head_h,
+                .w = half_w_stem * 2.0,
+                .h = stem_h,
+            }, draw.Color.white, button);
+            try batch.triangleClipped(
+                allocator,
+                .{ .x = cx, .y = y0 },
+                .{ .x = cx - half_w_head, .y = y0 + head_h },
+                .{ .x = cx + half_w_head, .y = y0 + head_h },
+                draw.Color.white,
+                button,
+            );
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
@@ -550,15 +686,27 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const rect = self.menuRect(target);
             const previous_z = batch.setZIndex(self.z_index + 1000);
             defer batch.restoreZIndex(previous_z);
-            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, 10.0, 1.0);
+            const menu_corner: f32 = 14.0;
+            // Rounded shell (avoid `panel` + rectBorder sharp outer frame on top of rounded fills).
+            const inset = @max(1.0, 1.0);
+            try batch.roundedRectClipped(allocator, rect, config.menu_border_color, menu_corner, rect);
+            if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
+                try batch.roundedRectClipped(allocator, .{
+                    .x = rect.x + inset,
+                    .y = rect.y + inset,
+                    .w = rect.w - inset * 2.0,
+                    .h = rect.h - inset * 2.0,
+                }, config.menu_background_color, @max(menu_corner - inset, 0.0), rect);
+            }
             const metrics = self.toolbarMetrics();
+            const row_corner = @min(9.0, @max(4.0, metrics.line_height * 0.38));
             var index: usize = 0;
             while (index < options.count) : (index += 1) {
                 const row = self.menuRowRect(target, index);
                 if (self.selectedIndex(target) == index) {
-                    try batch.selection(allocator, row, config.menu_selected_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_selected_color, row_corner, rect);
                 } else if (self.hovered_menu_index == index) {
-                    try batch.rect(allocator, row, config.menu_hover_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_hover_color, row_corner, rect);
                 }
                 const label = options.labelFor(index) orelse continue;
                 const text_rect: draw.Rect = .{
@@ -648,6 +796,20 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     }
                     return true;
                 },
+                .v => {
+                    if (!key.primary) return false;
+                    return try self.pasteClipboard(allocator);
+                },
+                .z => {
+                    if (!key.primary) return false;
+                    if (key.shift) try self.redo(allocator) else try self.undo(allocator);
+                    return true;
+                },
+                .y => {
+                    if (!key.primary) return false;
+                    try self.redo(allocator);
+                    return true;
+                },
                 else => return false,
             }
         }
@@ -726,17 +888,74 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try self.replaceRange(allocator, range.start, range.end, value);
         }
 
+        fn pasteClipboard(self: *Component, allocator: std.mem.Allocator) !bool {
+            const clipboard_text = self.callbacks.clipboardProvider().read(allocator) orelse return false;
+            defer allocator.free(clipboard_text);
+            if (clipboard_text.len == 0) return false;
+            try self.replaceSelection(allocator, clipboard_text);
+            return true;
+        }
+
         fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
             const safe_start = @min(start, self.buffer.items.len);
             const safe_end = @min(@max(end, safe_start), self.buffer.items.len);
+            try self.recordUndoSnapshot(allocator);
             self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, value) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
+            self.clearRedoStack(allocator);
             self.cursor = safe_start + value.len;
             self.selection_anchor = null;
             self.selection_focus = null;
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn undo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.undo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.redo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn redo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.redo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn restoreSnapshot(self: *Component, allocator: std.mem.Allocator, snapshot: EditSnapshot) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, snapshot.text);
+            self.cursor = @min(snapshot.cursor, self.buffer.items.len);
+            self.selection_anchor = snapshot.selection_anchor;
+            self.selection_focus = snapshot.selection_focus;
+            self.ensureCursorVisible();
+            self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn recordUndoSnapshot(self: *Component, allocator: std.mem.Allocator) !void {
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            while (self.undo_stack.items.len > MAX_EDIT_HISTORY) {
+                const dropped = self.undo_stack.orderedRemove(0);
+                dropped.deinit(allocator);
+            }
+        }
+
+        fn clearEditHistory(self: *Component, allocator: std.mem.Allocator) void {
+            self.clearUndoStack(allocator);
+            self.clearRedoStack(allocator);
+        }
+
+        fn clearUndoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.undo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.undo_stack.clearRetainingCapacity();
+        }
+
+        fn clearRedoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.redo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.redo_stack.clearRetainingCapacity();
         }
 
         fn moveCursor(self: *Component, next: usize, extend_selection: bool) void {
@@ -812,7 +1031,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .reasoning => self.reasoningRect(),
             };
             const options = self.optionsFor(target);
-            const height = @min(@as(f32, @floatFromInt(options.count)) * config.row_height, config.row_height * 6.0);
+            const max_rows = @max(config.menu_max_visible_rows, 1.0);
+            const height = @min(
+                @as(f32, @floatFromInt(options.count)) * config.row_height,
+                config.row_height * max_rows,
+            );
             return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, self.menuContentWidth(target)), .h = height };
         }
 
@@ -998,7 +1221,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const toolbar = self.toolbarRect();
             const control_h = @min(toolbar.h, 32.0);
             const y = toolbar.y + (toolbar.h - control_h) * 0.5;
-            const send_size = @min(toolbar.h, 36.0);
+            const send_size = @min(toolbar.h, 40.0);
             const send: draw.Rect = .{
                 .x = toolbar.x + toolbar.w - send_size,
                 .y = toolbar.y + (toolbar.h - send_size) * 0.5,
@@ -1012,13 +1235,23 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
             x += model_w + config.control_gap;
 
-            const reasoning_w = @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0));
+            const reasoning_w = if (self.show_reasoning_toggle)
+                @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0))
+            else
+                0.0;
             const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
-            x += reasoning_w + config.control_gap;
+            x += reasoning_w;
 
-            const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
-            const fast: draw.Rect = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
-            x += fast_w + config.control_gap;
+            var fast: draw.Rect = undefined;
+            if (self.show_fast_toggle) {
+                x += config.control_gap;
+                const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
+                fast = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
+                x += fast_w + config.control_gap;
+            } else {
+                fast = .{ .x = x, .y = y, .w = 0.0, .h = control_h };
+                x += config.control_gap;
+            }
 
             const access_w = @min(self.pillWidth(config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width), @max(max_x - x, 0.0));
             const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };

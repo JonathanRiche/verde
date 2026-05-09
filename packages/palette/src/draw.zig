@@ -55,6 +55,7 @@ pub const Vertex = extern struct {
 
 pub const CommandKind = enum {
     rect,
+    triangle,
     text,
     image,
     cursor,
@@ -89,6 +90,9 @@ pub const TextRun = struct {
 pub const Command = struct {
     kind: CommandKind,
     rect: Rect,
+    p0: Vec2 = .{},
+    p1: Vec2 = .{},
+    p2: Vec2 = .{},
     uv: Rect = .{},
     color: Color,
     texture: TextureId = .invalid,
@@ -144,8 +148,40 @@ pub const RenderBatch = struct {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color });
     }
 
+    /// Solid rect clipped to `clip` (host renderers intersect geometry with this rect).
+    pub fn rectClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, clip: Rect) !void {
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .clip = clip });
+    }
+
+    pub fn triangle(self: *RenderBatch, allocator: std.mem.Allocator, p0: Vec2, p1: Vec2, p2: Vec2, color: Color) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .triangle,
+            .rect = .{},
+            .p0 = p0,
+            .p1 = p1,
+            .p2 = p2,
+            .color = color,
+        });
+    }
+
+    pub fn triangleClipped(self: *RenderBatch, allocator: std.mem.Allocator, p0: Vec2, p1: Vec2, p2: Vec2, color: Color, clip: Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .triangle,
+            .rect = .{},
+            .p0 = p0,
+            .p1 = p1,
+            .p2 = p2,
+            .color = color,
+            .clip = clip,
+        });
+    }
+
     pub fn roundedRect(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32) !void {
         try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius });
+    }
+
+    pub fn roundedRectClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, clip: Rect) !void {
+        try self.appendCommand(allocator, .{ .kind = .rect, .rect = r, .color = color, .radius = radius, .clip = clip });
     }
 
     pub fn rectBorder(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, width: f32) !void {
@@ -156,6 +192,18 @@ pub const RenderBatch = struct {
             .radius = radius,
             .border_width = width,
             .border_color = color,
+        });
+    }
+
+    pub fn rectBorderClipped(self: *RenderBatch, allocator: std.mem.Allocator, r: Rect, color: Color, radius: f32, width: f32, clip: Rect) !void {
+        try self.appendCommand(allocator, .{
+            .kind = .rect,
+            .rect = r,
+            .color = Color.transparent,
+            .radius = radius,
+            .border_width = width,
+            .border_color = color,
+            .clip = clip,
         });
     }
 
