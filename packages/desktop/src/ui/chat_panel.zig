@@ -1460,6 +1460,7 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
         app_state.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
     };
     renderComposerDraftImage(state);
+    renderComposerFollowupHint(state);
     renderComposerToolbarIcons(state);
     state.syncComposerToolbarOverlayHitRects();
 }
@@ -1537,6 +1538,32 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
         clear_rect,
     );
     queueText(state, .{ .x = clear_rect.x + clear_rect.w * 0.34, .y = clear_rect.y + clear_rect.h * 0.10, .w = clear_rect.w * 0.5, .h = clear_rect.h * 0.8 }, "x", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clear_rect);
+}
+
+/// While a reply is streaming, show Tab queue/steer hint once the user has typed a non-empty draft (matches `handlePendingThreadFollowupShortcut`).
+fn renderComposerFollowupHint(state: *app_state.AppState) void {
+    if (!state.hasPendingStream()) return;
+    if (state.currentThread().draftImageCount() != 0) return;
+    const hint = state.pendingFollowupHint() orelse return;
+    const draft = state.palette_composer.text();
+    if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) return;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(11);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    const tr = state.palette_composer.textRect();
+    const clip: palette.Rect = .{ .x = tr.x, .y = tr.y, .w = tr.w, .h = tr.h };
+    const pad = theme.scaledUi(7.0);
+    const font = theme.scaledUi(13.0);
+    const est_w = @as(f32, @floatFromInt(hint.len)) * font * 0.52;
+    const max_w = @max(tr.w - pad * 2.0, theme.scaledUi(1.0));
+    const label_w = @min(est_w, max_w);
+    queueText(state, .{
+        .x = tr.x + tr.w - label_w - pad,
+        .y = tr.y + tr.h - font - pad,
+        .w = label_w,
+        .h = font,
+    }, hint, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
 }
 
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {
