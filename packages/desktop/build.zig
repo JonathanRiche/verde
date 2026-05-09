@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
+    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu") orelse .gl;
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
@@ -52,6 +53,7 @@ pub fn build(b: *std.Build) void {
     });
     const build_options = b.addOptions();
     build_options.addOption(bool, "ui_debug", ui_debug);
+    build_options.addOption(PaletteRendererBackend, "palette_renderer", palette_renderer);
     build_options.addOption(bool, "cef_sdk_configured", cef_sdk_configured);
     build_options.addOption(bool, "cef_stub_preview", cef_stub_preview);
 
@@ -126,11 +128,13 @@ pub fn build(b: *std.Build) void {
                 exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
             }
             exe.root_module.linkSystemLibrary("SDL3", .{});
+            exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
             exe.root_module.linkSystemLibrary("GL", .{});
             exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
             exe.root_module.linkSystemLibrary("SDL3", .{});
+            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkSystemLibrary("opengl32", .{});
         },
         .macos => {
@@ -142,6 +146,7 @@ pub fn build(b: *std.Build) void {
                 .flags = &.{},
             });
             exe.root_module.linkFramework("SDL3", .{});
+            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkFramework("OpenGL", .{});
             exe.root_module.linkFramework("AppKit", .{});
         },
@@ -345,6 +350,11 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
 }
+
+const PaletteRendererBackend = enum {
+    gl,
+    sdl_gpu,
+};
 
 fn configureLinuxCefBinary(
     b: *std.Build,

@@ -656,47 +656,42 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
             const metrics_value = self.metrics();
             const icon_metrics = self.iconMetrics();
             const has_children = self.childCountAt(depth, index) > 0;
-            var runs: [2]draw.TextRun = undefined;
-            var count: usize = 0;
             const text_y = row.y + @max((row.h - metrics_value.line_height) * 0.5, 0.0);
-            const label_clip = self.menuContentRect(depth);
+            const content_clip = self.menuContentRect(depth);
             const chevron_w = if (has_children and config.chevron_icon.len > 0) icon_metrics.measureSlice(config.chevron_icon) else 0.0;
             const leading_pad = if (config.render_row_leading != null and config.row_leading_width > 0.0)
                 config.row_leading_width + config.row_leading_to_label_gap
             else
                 0.0;
             const label_w = @max(row.w - leading_pad - chevron_w - config.icon_gap, 0.0);
-            runs[count] = .{
-                .text = label,
-                .byte_start = 0,
-                .byte_end = label.len,
-                .x = row.x + leading_pad,
-                .y = text_y,
-                .font_size = metrics_value.font_size,
-                .line_height = metrics_value.line_height,
-                .color = config.text_color,
-                .clip = label_clip,
-                .font_role = config.font_role,
-                .font_id = config.font_id,
+            const label_x = row.x + leading_pad;
+            const label_clip = draw.Rect{
+                .x = label_x,
+                .y = content_clip.y,
+                .w = label_w,
+                .h = content_clip.h,
             };
-            count += 1;
+            try batch.roleText(allocator, .{
+                .x = label_x,
+                .y = text_y,
+                .w = label_w,
+                .h = metrics_value.line_height,
+            }, label, config.text_color, metrics_value.font_size, config.font_role, config.font_id, label_clip);
             if (has_children and config.chevron_icon.len > 0) {
-                runs[count] = .{
-                    .text = config.chevron_icon,
-                    .byte_start = 0,
-                    .byte_end = config.chevron_icon.len,
-                    .x = row.x + leading_pad + label_w + config.icon_gap,
-                    .y = row.y + @max((row.h - icon_metrics.line_height) * 0.5, 0.0),
-                    .font_size = icon_metrics.font_size,
-                    .line_height = icon_metrics.line_height,
-                    .color = config.icon_color,
-                    .clip = label_clip,
-                    .font_role = config.icon_font_role,
-                    .font_id = config.icon_font_id,
+                const chevron_x = row.x + leading_pad + label_w + config.icon_gap;
+                const chevron_clip = draw.Rect{
+                    .x = chevron_x,
+                    .y = content_clip.y,
+                    .w = chevron_w,
+                    .h = content_clip.h,
                 };
-                count += 1;
+                try batch.roleText(allocator, .{
+                    .x = chevron_x,
+                    .y = row.y + @max((row.h - icon_metrics.line_height) * 0.5, 0.0),
+                    .w = chevron_w,
+                    .h = icon_metrics.line_height,
+                }, config.chevron_icon, config.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, chevron_clip);
             }
-            try batch.textRuns(allocator, row, label, runs[0..count], config.text_color, metrics_value.font_size, label_clip, metrics_value.line_height, metrics_value.fixedAdvance());
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, depth: usize) !void {
@@ -924,7 +919,7 @@ test "cascade menu opens child menu and selects leaf with path" {
     try std.testing.expect(!menu.isOpen());
 }
 
-test "cascade menu renders text and icon runs with increasing z-index" {
+test "cascade menu renders labels and chevrons with increasing z-index" {
     const Context = struct {
         fn label(_: ?*anyopaque, path: []const usize, index: usize) []const u8 {
             if (path.len == 0 and index == 0) return "Parent";
@@ -957,10 +952,18 @@ test "cascade menu renders text and icon runs with increasing z-index" {
     defer batch.deinit(std.testing.allocator);
     try menu.render(std.testing.allocator, &batch);
 
-    try std.testing.expect(batch.commands.items.len >= 4);
-    try std.testing.expectEqual(draw.CommandKind.text, batch.commands.items[2].kind);
-    try std.testing.expectEqual(@as(usize, 2), batch.commands.items[2].text_run_count);
-    try std.testing.expectEqual(draw.FontRole.icon, batch.commands.items[2].text_runs[1].font_role.?);
+    var ui_text_count: usize = 0;
+    var icon_text_count: usize = 0;
+    for (batch.commands.items) |command| {
+        if (command.kind != .text) continue;
+        if (command.font_role == draw.FontRole.icon) {
+            icon_text_count += 1;
+        } else if (command.font_role == draw.FontRole.ui) {
+            ui_text_count += 1;
+        }
+    }
+    try std.testing.expect(ui_text_count >= 2);
+    try std.testing.expect(icon_text_count >= 1);
     try std.testing.expect(batch.commands.items[batch.commands.items.len - 1].z_index > batch.commands.items[0].z_index);
 }
 
