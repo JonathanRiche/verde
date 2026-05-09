@@ -48,6 +48,7 @@ pub const ShaderPackage = struct {
 pub const PipelineShaderPackages = struct {
     solid: ShaderPackage,
     text: ShaderPackage,
+    image: ShaderPackage,
 };
 
 pub const RendererConfig = struct {
@@ -58,17 +59,53 @@ pub const RendererConfig = struct {
     font: ?*sdl.Font = null,
 };
 
-const PipelineKind = enum { solid, text };
+const PipelineKind = enum { solid, text, image };
+const TEXT_CACHE_MAX_ENTRIES = 4096;
+const GPU_TEXT_FONT_SCALE: f32 = 0.86;
 
 const ViewportUniform = extern struct {
     viewport_size: [2]f32,
     padding: [2]f32 = .{ 0, 0 },
 };
 
+pub const TextureUploadKind = enum {
+    image,
+    browser,
+};
+
+pub const FrameStats = struct {
+    batch_build_ns: u64 = 0,
+    solid_upload_ns: u64 = 0,
+    image_prepare_ns: u64 = 0,
+    image_upload_ns: u64 = 0,
+    browser_upload_ns: u64 = 0,
+    text_prepare_ns: u64 = 0,
+    text_upload_ns: u64 = 0,
+    submit_present_ns: u64 = 0,
+    image_upload_bytes: usize = 0,
+    browser_upload_bytes: usize = 0,
+    image_upload_count: usize = 0,
+    browser_upload_count: usize = 0,
+
+    pub fn hasWork(self: FrameStats) bool {
+        return self.batch_build_ns != 0 or
+            self.solid_upload_ns != 0 or
+            self.image_prepare_ns != 0 or
+            self.image_upload_ns != 0 or
+            self.browser_upload_ns != 0 or
+            self.text_prepare_ns != 0 or
+            self.text_upload_ns != 0 or
+            self.submit_present_ns != 0 or
+            self.image_upload_count != 0 or
+            self.browser_upload_count != 0;
+    }
+};
+
 pub const Renderer = struct {
     device: ?*c.SDL_GPUDevice = null,
     pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     text_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    image_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
     sampler: ?*c.SDL_GPUSampler = null,
     text_engine: ?*c.TTF_TextEngine = null,
     font: ?*c.TTF_Font = null,
@@ -76,17 +113,28 @@ pub const Renderer = struct {
     index_buffer: ?*c.SDL_GPUBuffer = null,
     text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
     text_index_buffer: ?*c.SDL_GPUBuffer = null,
+    image_vertex_buffer: ?*c.SDL_GPUBuffer = null,
+    image_index_buffer: ?*c.SDL_GPUBuffer = null,
     vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
     index_transfer: ?*c.SDL_GPUTransferBuffer = null,
     text_vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
     text_index_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    image_vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    image_index_transfer: ?*c.SDL_GPUTransferBuffer = null,
     vertex_capacity: usize = 0,
     index_capacity: usize = 0,
     text_vertex_capacity: usize = 0,
     text_index_capacity: usize = 0,
+    image_vertex_capacity: usize = 0,
+    image_index_capacity: usize = 0,
+    textures: std.AutoHashMap(u32, GpuTexture) = std.AutoHashMap(u32, GpuTexture).init(std.heap.smp_allocator),
+    text_cache: std.AutoHashMap(TextCacheKey, TextCacheEntry) = std.AutoHashMap(TextCacheKey, TextCacheEntry).init(std.heap.smp_allocator),
     command_counts: CommandCounts = .{},
+    solid_index_count: u32 = 0,
     unsupported_text_commands: usize = 0,
     unsupported_image_commands: usize = 0,
+    last_frame_stats: FrameStats = .{},
+    pending_upload_stats: FrameStats = .{},
 
     /// Creates the SDL_GPU device. Pass SPIR-V shaders for Vulkan and MSL or
     /// metallib shaders for Metal to create a drawable pipeline.
@@ -109,16 +157,26 @@ pub const Renderer = struct {
         if (self.device) |device| {
             if (self.pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
             if (self.text_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
+            if (self.image_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
             if (self.sampler) |sampler| c.SDL_ReleaseGPUSampler(device, sampler);
             if (self.text_engine) |engine| c.TTF_DestroyGPUTextEngine(engine);
             if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.text_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.text_index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (self.image_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+            if (self.image_index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.text_vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.text_index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            if (self.image_vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            if (self.image_index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            var iterator = self.textures.iterator();
+            while (iterator.next()) |entry| entry.value_ptr.deinit(device);
+            self.textures.deinit();
+            self.clearTextCache();
+            self.text_cache.deinit();
             c.SDL_DestroyGPUDevice(device);
         }
         self.* = undefined;
@@ -133,36 +191,49 @@ pub const Renderer = struct {
         if (self.device) |device| c.SDL_ReleaseWindowFromGPUDevice(device, @ptrCast(window));
     }
 
+    pub fn lastFrameStats(self: *const Renderer) FrameStats {
+        return self.last_frame_stats;
+    }
+
     /// Compatibility entry point for callers that already own a render pass.
     /// This records command accounting and draws existing uploaded buffers when
     /// the renderer has been initialized with shaders and resources.
     pub fn renderBatch(self: *Renderer, pass: *c.SDL_GPURenderPass, batch: *const draw.RenderBatch) void {
         self.command_counts = CommandCounts.fromBatch(batch);
         self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
-        self.unsupported_image_commands = self.command_counts.images;
-        if (self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null or self.command_counts.drawableIndexCount() == 0) return;
+        self.unsupported_image_commands = 0;
+        const index_count = if (self.solid_index_count > 0)
+            self.solid_index_count
+        else
+            @as(u32, @intCast(self.command_counts.drawableIndexCount()));
+        if (self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null or index_count == 0) return;
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.index_buffer.?, .offset = 0 };
         c.SDL_BindGPUGraphicsPipeline(pass, self.pipeline.?);
         c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
         c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        c.SDL_DrawGPUIndexedPrimitives(pass, @intCast(self.command_counts.drawableIndexCount()), 1, 0, 0, 0);
+        c.SDL_DrawGPUIndexedPrimitives(pass, index_count, 1, 0, 0, 0);
     }
 
     /// Builds and uploads the current batch into GPU buffers. Text commands are
     /// intentionally tracked, not discarded; they require an atlas texture path.
-    pub fn prepareBatch(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch) !void {
+    pub fn prepareBatch(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !void {
         var mesh: Mesh = .{};
         defer mesh.deinit(allocator);
+        const build_start = nowNs();
         try buildMesh(allocator, batch, &mesh);
+        stats.batch_build_ns +|= elapsedNs(build_start);
 
         self.command_counts = CommandCounts.fromBatch(batch);
+        self.solid_index_count = @intCast(mesh.indices.items.len);
         self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
-        self.unsupported_image_commands = self.command_counts.images;
+        self.unsupported_image_commands = 0;
         if (mesh.vertices.items.len > 0 and mesh.indices.items.len > 0) {
             try self.ensureBuffers(.solid, mesh.vertices.items.len, mesh.indices.items.len);
+            const upload_start = nowNs();
             try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, std.mem.sliceAsBytes(mesh.vertices.items));
             try self.uploadBuffer(command_buffer, self.index_transfer.?, self.index_buffer.?, std.mem.sliceAsBytes(mesh.indices.items));
+            stats.solid_upload_ns +|= elapsedNs(upload_start);
         }
     }
 
@@ -170,11 +241,14 @@ pub const Renderer = struct {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.pipeline == null) return error.MissingGpuPipeline;
         if (CommandCounts.fromBatch(batch).text > 0 and !self.supportsGpuText()) return error.GpuTextAtlasNotConfigured;
-        if (CommandCounts.fromBatch(batch).images > 0) return error.GpuImageTexturesNotConfigured;
 
+        var stats = self.beginFrameStats();
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
-        try self.prepareBatch(allocator, command_buffer, batch);
-        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch);
+        try self.flushPendingTextureUploads(command_buffer, &stats);
+        try self.prepareBatch(allocator, command_buffer, batch, &stats);
+        var image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, &stats);
+        defer image_frame.deinit(allocator);
+        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, &stats);
         defer text_frame.deinit(allocator);
 
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
@@ -200,10 +274,14 @@ pub const Renderer = struct {
             const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
             c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
             self.renderBatch(pass, batch);
+            self.renderImageFrame(pass, &image_frame, @floatFromInt(height));
             self.renderTextFrame(pass, &text_frame, @floatFromInt(height));
             c.SDL_EndGPURenderPass(pass);
         }
+        const submit_start = nowNs();
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
+        stats.submit_present_ns +|= elapsedNs(submit_start);
+        self.last_frame_stats = stats;
     }
 
     pub fn supportsGpuText(self: *const Renderer) bool {
@@ -238,6 +316,7 @@ pub const Renderer = struct {
     fn createPipelines(self: *Renderer, packages: PipelineShaderPackages) !void {
         try self.createPipeline(packages.solid, .solid);
         try self.createPipeline(packages.text, .text);
+        try self.createPipeline(packages.image, .image);
     }
 
     fn createPipeline(self: *Renderer, package: ShaderPackage, kind: PipelineKind) !void {
@@ -265,7 +344,7 @@ pub const Renderer = struct {
             .entrypoint = package.fragment.entrypoint.ptr,
             .format = package.fragment.format,
             .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT,
-            .num_samplers = if (kind == .text) 1 else 0,
+            .num_samplers = if (kind == .text or kind == .image) 1 else 0,
             .num_storage_textures = 0,
             .num_storage_buffers = 0,
             .num_uniform_buffers = 0,
@@ -333,6 +412,7 @@ pub const Renderer = struct {
         switch (kind) {
             .solid => self.pipeline = pipeline,
             .text => self.text_pipeline = pipeline,
+            .image => self.image_pipeline = pipeline,
         }
     }
 
@@ -341,26 +421,32 @@ pub const Renderer = struct {
         const vertex_buffer = switch (kind) {
             .solid => &self.vertex_buffer,
             .text => &self.text_vertex_buffer,
+            .image => &self.image_vertex_buffer,
         };
         const index_buffer = switch (kind) {
             .solid => &self.index_buffer,
             .text => &self.text_index_buffer,
+            .image => &self.image_index_buffer,
         };
         const vertex_transfer = switch (kind) {
             .solid => &self.vertex_transfer,
             .text => &self.text_vertex_transfer,
+            .image => &self.image_vertex_transfer,
         };
         const index_transfer = switch (kind) {
             .solid => &self.index_transfer,
             .text => &self.text_index_transfer,
+            .image => &self.image_index_transfer,
         };
         const vertex_capacity = switch (kind) {
             .solid => &self.vertex_capacity,
             .text => &self.text_vertex_capacity,
+            .image => &self.image_vertex_capacity,
         };
         const index_capacity = switch (kind) {
             .solid => &self.index_capacity,
             .text => &self.text_index_capacity,
+            .image => &self.image_index_capacity,
         };
         if (vertex_count > vertex_capacity.*) {
             if (vertex_buffer.*) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
@@ -391,18 +477,200 @@ pub const Renderer = struct {
         c.SDL_EndGPUCopyPass(copy_pass);
     }
 
-    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch) !TextFrame {
+    pub const TextureFormat = enum {
+        rgba8,
+        bgra8,
+
+        fn toSdl(self: TextureFormat) c.SDL_GPUTextureFormat {
+            return switch (self) {
+                .rgba8 => c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                .bgra8 => c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+            };
+        }
+    };
+
+    pub fn uploadTexture(self: *Renderer, id: u32, width: u32, height: u32, format: TextureFormat, kind: TextureUploadKind, pixels: []const u8) !void {
+        const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
+        if (id == 0 or width == 0 or height == 0) return error.InvalidGpuTexture;
+        const byte_len: usize = @as(usize, width) * @as(usize, height) * 4;
+        if (pixels.len != byte_len) return error.InvalidGpuTexture;
+
+        const upload_start = nowNs();
+        const texture_entry = try self.ensureTexture(id, width, height, format, byte_len);
+        const mapped = c.SDL_MapGPUTransferBuffer(device, texture_entry.transfer, true) orelse return error.SdlGpuMapFailed;
+        @memcpy(@as([*]u8, @ptrCast(mapped))[0..byte_len], pixels);
+        c.SDL_UnmapGPUTransferBuffer(device, texture_entry.transfer);
+        texture_entry.dirty = true;
+        texture_entry.dirty_kind = kind;
+
+        const elapsed = elapsedNs(upload_start);
+        switch (kind) {
+            .image => {
+                self.pending_upload_stats.image_upload_ns +|= elapsed;
+                self.pending_upload_stats.image_upload_bytes += byte_len;
+                self.pending_upload_stats.image_upload_count += 1;
+            },
+            .browser => {
+                self.pending_upload_stats.browser_upload_ns +|= elapsed;
+                self.pending_upload_stats.browser_upload_bytes += byte_len;
+                self.pending_upload_stats.browser_upload_count += 1;
+            },
+        }
+    }
+
+    fn ensureTexture(self: *Renderer, id: u32, width: u32, height: u32, format: TextureFormat, byte_len: usize) !*GpuTexture {
+        const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
+        if (self.textures.getPtr(id)) |entry| {
+            if (entry.width == width and entry.height == height and entry.format == format and entry.transfer_size >= byte_len) return entry;
+            entry.deinit(device);
+            _ = self.textures.remove(id);
+        }
+
+        const texture = c.SDL_CreateGPUTexture(device, &.{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = format.toSdl(),
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = width,
+            .height = height,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return error.SdlGpuTextureFailed;
+        errdefer c.SDL_ReleaseGPUTexture(device, texture);
+
+        const transfer_size: u32 = @intCast(byte_len);
+        const transfer = c.SDL_CreateGPUTransferBuffer(device, &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = transfer_size,
+            .props = 0,
+        }) orelse return error.SdlGpuTransferBufferFailed;
+        errdefer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+        try self.textures.put(id, .{
+            .texture = texture,
+            .transfer = transfer,
+            .transfer_size = byte_len,
+            .width = width,
+            .height = height,
+            .format = format,
+            .dirty = false,
+            .dirty_kind = .image,
+        });
+        return self.textures.getPtr(id).?;
+    }
+
+    pub fn releaseTexture(self: *Renderer, id: u32) void {
+        const device = self.device orelse return;
+        if (self.textures.fetchRemove(id)) |entry| {
+            var texture = entry.value;
+            texture.deinit(device);
+        }
+    }
+
+    fn beginFrameStats(self: *Renderer) FrameStats {
+        const stats = self.pending_upload_stats;
+        self.pending_upload_stats = .{};
+        return stats;
+    }
+
+    fn flushPendingTextureUploads(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, stats: *FrameStats) !void {
+        var copy_pass: ?*c.SDL_GPUCopyPass = null;
+        defer if (copy_pass) |pass| c.SDL_EndGPUCopyPass(pass);
+
+        var iterator = self.textures.iterator();
+        while (iterator.next()) |entry| {
+            if (!entry.value_ptr.dirty) continue;
+            const pass = copy_pass orelse blk: {
+                const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
+                copy_pass = created;
+                break :blk created;
+            };
+            const texture_entry = entry.value_ptr;
+            const upload_start = nowNs();
+            c.SDL_UploadToGPUTexture(
+                pass,
+                &.{
+                    .transfer_buffer = texture_entry.transfer,
+                    .offset = 0,
+                    .pixels_per_row = texture_entry.width,
+                    .rows_per_layer = texture_entry.height,
+                },
+                &.{
+                    .texture = texture_entry.texture,
+                    .mip_level = 0,
+                    .layer = 0,
+                    .x = 0,
+                    .y = 0,
+                    .z = 0,
+                    .w = texture_entry.width,
+                    .h = texture_entry.height,
+                    .d = 1,
+                },
+                true,
+            );
+            const elapsed = elapsedNs(upload_start);
+            switch (texture_entry.dirty_kind) {
+                .image => stats.image_upload_ns +|= elapsed,
+                .browser => stats.browser_upload_ns +|= elapsed,
+            }
+            texture_entry.dirty = false;
+        }
+    }
+
+    fn prepareImageFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !ImageFrame {
+        var frame: ImageFrame = .{};
+        errdefer frame.deinit(allocator);
+        if (self.image_pipeline == null or self.sampler == null) return frame;
+
+        const prepare_start = nowNs();
+        try frame.mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 4);
+        try frame.mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 6);
+        for (batch.commands.items) |command| {
+            if (command.kind != .image or !command.texture.valid() or command.color.a <= 0.0) continue;
+            const texture = self.textures.get(@intCast(command.texture.value)) orelse {
+                self.unsupported_image_commands += 1;
+                continue;
+            };
+            const first_index: u32 = @intCast(frame.mesh.indices.items.len);
+            try appendQuad(&frame.mesh, allocator, command.rect, command.uv, command.color);
+            const index_count: u32 = @intCast(frame.mesh.indices.items.len - first_index);
+            if (index_count == 0) continue;
+            try frame.draws.append(allocator, .{
+                .texture = texture.texture,
+                .first_index = first_index,
+                .index_count = index_count,
+                .clip = command.clip,
+            });
+        }
+        stats.image_prepare_ns +|= elapsedNs(prepare_start);
+
+        if (frame.mesh.vertices.items.len > 0 and frame.mesh.indices.items.len > 0) {
+            try self.ensureBuffers(.image, frame.mesh.vertices.items.len, frame.mesh.indices.items.len);
+            const upload_start = nowNs();
+            try self.uploadBuffer(command_buffer, self.image_vertex_transfer.?, self.image_vertex_buffer.?, std.mem.sliceAsBytes(frame.mesh.vertices.items));
+            try self.uploadBuffer(command_buffer, self.image_index_transfer.?, self.image_index_buffer.?, std.mem.sliceAsBytes(frame.mesh.indices.items));
+            stats.image_upload_ns +|= elapsedNs(upload_start);
+        }
+        return frame;
+    }
+
+    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !TextFrame {
         var frame: TextFrame = .{};
         errdefer frame.deinit(allocator);
         if (!self.supportsGpuText()) return frame;
+        const prepare_start = nowNs();
         for (batch.commands.items) |command| {
             if (command.kind != .text or command.text.len == 0 or command.color.a <= 0.0) continue;
             try self.appendTextCommand(allocator, &frame, command);
         }
+        stats.text_prepare_ns +|= elapsedNs(prepare_start);
         if (frame.vertices.items.len > 0 and frame.indices.items.len > 0) {
             try self.ensureBuffers(.text, frame.vertices.items.len, frame.indices.items.len);
+            const upload_start = nowNs();
             try self.uploadBuffer(command_buffer, self.text_vertex_transfer.?, self.text_vertex_buffer.?, std.mem.sliceAsBytes(frame.vertices.items));
             try self.uploadBuffer(command_buffer, self.text_index_transfer.?, self.text_index_buffer.?, std.mem.sliceAsBytes(frame.indices.items));
+            stats.text_upload_ns +|= elapsedNs(upload_start);
         }
         return frame;
     }
@@ -410,55 +678,138 @@ pub const Renderer = struct {
     fn appendTextCommand(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, command: draw.Command) !void {
         if (command.text_runs.len > 0) {
             for (command.text_runs) |run| {
-                if (run.text.len == 0 or run.color.a <= 0.0) continue;
-                try self.appendTextSlice(allocator, frame, run.text, run.x, run.y, run.color, run.font_size, run.clip, null);
+                try self.appendNaturalTextSlice(allocator, frame, run.text, run.x - command.scroll.x, run.y - command.scroll.y, run.color, run.font_size, run.clip, null, null);
             }
             return;
         }
-        try self.appendTextSlice(allocator, frame, command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.color, command.font_size, command.clip, if (command.wrap) command.rect.w else null);
+        try self.appendNaturalTextSlice(allocator, frame, command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.color, command.font_size, command.clip, if (command.wrap) command.rect.w else null, null);
     }
 
-    fn appendTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32) !void {
-        if (!c.TTF_SetFontSize(self.font.?, font_size)) return error.SdlTtfTextFailed;
+    fn appendNaturalTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32, target_width: ?f32) !void {
+        const key = textCacheKey(value, font_size, wrap_width);
+        if (self.text_cache.getPtr(key)) |entry| {
+            try appendCachedText(allocator, frame, entry, x, y, color_value, clip, target_width);
+            return;
+        }
+
+        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
+        var cache_entry = try self.createTextCacheEntry(value, font_size, wrap_width);
+        errdefer cache_entry.deinit();
+        try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, target_width);
+        try self.text_cache.put(key, cache_entry);
+    }
+
+    fn appendFixedTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, glyph_width: f32, line_height: f32, clip: ?draw.Rect, wrap_width: ?f32) !void {
+        var cursor_x = x;
+        var cursor_y = y;
+        const max_x = if (wrap_width) |width| x + @max(width, glyph_width) else std.math.floatMax(f32);
+        var index: usize = 0;
+        while (index < value.len) {
+            const byte = value[index];
+            if (byte == '\n') {
+                cursor_x = x;
+                cursor_y += line_height;
+                index += 1;
+                continue;
+            }
+            const len = utf8ByteLen(byte, value.len - index);
+            const slice = value[index .. index + len];
+            const advance = if (byte == '\t') glyph_width * 4.0 else glyph_width;
+            if (wrap_width != null and cursor_x > x and cursor_x + advance > max_x) {
+                cursor_x = x;
+                cursor_y += line_height;
+            }
+            if (!isTextSpace(slice)) {
+                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip);
+            }
+            cursor_x += advance;
+            index += len;
+        }
+    }
+
+    fn appendTextGlyph(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect) !void {
+        const key = textCacheKey(value, font_size, null);
+        if (self.text_cache.getPtr(key)) |entry| {
+            try appendCachedText(allocator, frame, entry, x, y, color_value, clip, null);
+            return;
+        }
+
+        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
+        var cache_entry = try self.createTextCacheEntry(value, font_size, null);
+        errdefer cache_entry.deinit();
+        try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, null);
+        try self.text_cache.put(key, cache_entry);
+    }
+
+    fn createTextCacheEntry(self: *Renderer, value: []const u8, font_size: f32, wrap_width: ?f32) !TextCacheEntry {
+        var entry: TextCacheEntry = .{};
+        errdefer entry.deinit();
+
+        if (!c.TTF_SetFontSize(self.font.?, font_size * GPU_TEXT_FONT_SCALE)) return error.SdlTtfTextFailed;
         const text = c.TTF_CreateText(self.text_engine.?, self.font.?, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
-        defer c.TTF_DestroyText(text);
-        const color = colorBytes(color_value);
-        if (!c.TTF_SetTextColor(text, color[0], color[1], color[2], color[3])) return error.SdlTtfTextFailed;
+        errdefer c.TTF_DestroyText(text);
         if (wrap_width) |width| {
             if (width > 0 and !c.TTF_SetTextWrapWidth(text, @intFromFloat(@ceil(width)))) return error.SdlTtfTextFailed;
         }
         if (!c.TTF_UpdateText(text)) return error.SdlTtfTextFailed;
-        const sequence_head = c.TTF_GetGPUTextDrawData(text) orelse return;
+        const sequence_head = c.TTF_GetGPUTextDrawData(text) orelse return entry;
 
         var sequence: ?*c.TTF_GPUAtlasDrawSequence = sequence_head;
         while (sequence) |seq| : (sequence = seq.next) {
             if (seq.num_vertices <= 0 or seq.num_indices <= 0) continue;
-            const base_vertex: u32 = @intCast(frame.vertices.items.len);
-            const first_index: u32 = @intCast(frame.indices.items.len);
-            try frame.vertices.ensureUnusedCapacity(allocator, @intCast(seq.num_vertices));
-            try frame.indices.ensureUnusedCapacity(allocator, @intCast(seq.num_indices));
+            const base_vertex: u32 = @intCast(entry.vertices.items.len);
+            const first_index: u32 = @intCast(entry.indices.items.len);
+            try entry.vertices.ensureUnusedCapacity(std.heap.smp_allocator, @intCast(seq.num_vertices));
+            try entry.indices.ensureUnusedCapacity(std.heap.smp_allocator, @intCast(seq.num_indices));
 
             const xy = @as([*]const c.SDL_FPoint, @ptrCast(seq.xy))[0..@intCast(seq.num_vertices)];
             const uv = @as([*]const c.SDL_FPoint, @ptrCast(seq.uv))[0..@intCast(seq.num_vertices)];
             for (xy, uv) |point, texcoord| {
-                frame.vertices.appendAssumeCapacity(.{
-                    .pos = .{
-                        .x = x + point.x,
-                        .y = y - point.y,
-                    },
+                entry.min_x = @min(entry.min_x, point.x);
+                entry.max_x = @max(entry.max_x, point.x);
+                entry.vertices.appendAssumeCapacity(.{
+                    .pos = .{ .x = point.x, .y = -point.y },
                     .uv = .{ .x = texcoord.x, .y = texcoord.y },
-                    .color = color_value,
                 });
             }
             const raw_indices = @as([*]const c_int, @ptrCast(seq.indices))[0..@intCast(seq.num_indices)];
-            for (raw_indices) |index| frame.indices.appendAssumeCapacity(base_vertex + @as(u32, @intCast(index)));
-            try frame.draws.append(allocator, .{
-                .atlas_texture = seq.atlas_texture,
+            for (raw_indices) |index| entry.indices.appendAssumeCapacity(base_vertex + @as(u32, @intCast(index)));
+            const atlas_texture = seq.atlas_texture orelse continue;
+            try entry.draws.append(std.heap.smp_allocator, .{
+                .atlas_texture = atlas_texture,
                 .first_index = first_index,
                 .index_count = @intCast(seq.num_indices),
-                .clip = clip,
             });
         }
+        if (!c.TTF_SetTextFont(text, null)) return error.SdlTtfTextFailed;
+        entry.text = text;
+        return entry;
+    }
+
+    fn clearTextCache(self: *Renderer) void {
+        var iterator = self.text_cache.iterator();
+        while (iterator.next()) |entry| entry.value_ptr.deinit();
+        self.text_cache.clearRetainingCapacity();
+    }
+
+    fn renderImageFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const ImageFrame, target_height: f32) void {
+        if (frame.draws.items.len == 0 or self.image_vertex_buffer == null or self.image_index_buffer == null or self.sampler == null) return;
+        var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.image_vertex_buffer.?, .offset = 0 };
+        var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.image_index_buffer.?, .offset = 0 };
+        c.SDL_BindGPUGraphicsPipeline(pass, self.image_pipeline.?);
+        c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
+        c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+        for (frame.draws.items) |draw_call| {
+            if (draw_call.clip) |clip| {
+                var scissor = toSdlRect(clip, target_height);
+                c.SDL_SetGPUScissor(pass, &scissor);
+            }
+            var texture_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = draw_call.texture, .sampler = self.sampler.? };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &texture_binding, 1);
+            c.SDL_DrawGPUIndexedPrimitives(pass, draw_call.index_count, 1, draw_call.first_index, 0, 0);
+        }
+        var full_scissor: c.SDL_Rect = .{ .x = 0, .y = 0, .w = 65535, .h = 65535 };
+        c.SDL_SetGPUScissor(pass, &full_scissor);
     }
 
     fn renderTextFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const TextFrame, target_height: f32) void {
@@ -527,6 +878,41 @@ pub const Mesh = struct {
     }
 };
 
+const GpuTexture = struct {
+    texture: *c.SDL_GPUTexture,
+    transfer: *c.SDL_GPUTransferBuffer,
+    transfer_size: usize,
+    width: u32,
+    height: u32,
+    format: Renderer.TextureFormat,
+    dirty: bool = false,
+    dirty_kind: TextureUploadKind = .image,
+
+    fn deinit(self: *GpuTexture, device: *c.SDL_GPUDevice) void {
+        c.SDL_ReleaseGPUTexture(device, self.texture);
+        c.SDL_ReleaseGPUTransferBuffer(device, self.transfer);
+        self.* = undefined;
+    }
+};
+
+const ImageDraw = struct {
+    texture: *c.SDL_GPUTexture,
+    first_index: u32,
+    index_count: u32,
+    clip: ?draw.Rect,
+};
+
+const ImageFrame = struct {
+    mesh: Mesh = .{},
+    draws: std.ArrayList(ImageDraw) = .empty,
+
+    fn deinit(self: *ImageFrame, allocator: std.mem.Allocator) void {
+        self.mesh.deinit(allocator);
+        self.draws.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 const TextDraw = struct {
     atlas_texture: *c.SDL_GPUTexture,
     first_index: u32,
@@ -545,6 +931,87 @@ const TextFrame = struct {
         self.draws.deinit(allocator);
     }
 };
+
+const TextCacheKey = struct {
+    text_hash: u64,
+    text_len: usize,
+    font_size_bits: u32,
+    wrap_width_bits: u32,
+};
+
+const TextCacheVertex = struct {
+    pos: draw.Vec2,
+    uv: draw.Vec2,
+};
+
+const TextCacheDraw = struct {
+    atlas_texture: *c.SDL_GPUTexture,
+    first_index: u32,
+    index_count: u32,
+};
+
+const TextCacheEntry = struct {
+    vertices: std.ArrayList(TextCacheVertex) = .empty,
+    indices: std.ArrayList(u32) = .empty,
+    draws: std.ArrayList(TextCacheDraw) = .empty,
+    text: ?*c.TTF_Text = null,
+    min_x: f32 = std.math.floatMax(f32),
+    max_x: f32 = -std.math.floatMax(f32),
+
+    fn deinit(self: *TextCacheEntry) void {
+        if (self.text) |text| c.TTF_DestroyText(text);
+        self.vertices.deinit(std.heap.smp_allocator);
+        self.indices.deinit(std.heap.smp_allocator);
+        self.draws.deinit(std.heap.smp_allocator);
+        self.* = .{};
+    }
+};
+
+fn appendCachedText(allocator: std.mem.Allocator, frame: *TextFrame, entry: *const TextCacheEntry, x: f32, y: f32, color: draw.Color, clip: ?draw.Rect, target_width: ?f32) !void {
+    if (entry.vertices.items.len == 0 or entry.indices.items.len == 0) return;
+    const base_vertex: u32 = @intCast(frame.vertices.items.len);
+    const first_index: u32 = @intCast(frame.indices.items.len);
+    try frame.vertices.ensureUnusedCapacity(allocator, entry.vertices.items.len);
+    try frame.indices.ensureUnusedCapacity(allocator, entry.indices.items.len);
+    const natural_width = if (std.math.isFinite(entry.min_x) and std.math.isFinite(entry.max_x)) @max(entry.max_x - entry.min_x, 0.0) else 0.0;
+    const scale_x = if (target_width) |width| if (natural_width > 0.0 and width > 0.0) width / natural_width else 1.0 else 1.0;
+    const origin_x = if (target_width != null and std.math.isFinite(entry.min_x)) entry.min_x else 0.0;
+    for (entry.vertices.items) |vertex| {
+        frame.vertices.appendAssumeCapacity(.{
+            .pos = .{ .x = x + (vertex.pos.x - origin_x) * scale_x, .y = y + vertex.pos.y },
+            .uv = vertex.uv,
+            .color = color,
+        });
+    }
+    for (entry.indices.items) |index| frame.indices.appendAssumeCapacity(base_vertex + index);
+    for (entry.draws.items) |draw_call| {
+        try frame.draws.append(allocator, .{
+            .atlas_texture = draw_call.atlas_texture,
+            .first_index = first_index + draw_call.first_index,
+            .index_count = draw_call.index_count,
+            .clip = clip,
+        });
+    }
+}
+
+fn utf8ByteLen(first: u8, remaining: usize) usize {
+    const requested: usize = if ((first & 0x80) == 0)
+        1
+    else if ((first & 0xe0) == 0xc0)
+        2
+    else if ((first & 0xf0) == 0xe0)
+        3
+    else if ((first & 0xf8) == 0xf0)
+        4
+    else
+        1;
+    return @min(requested, @max(remaining, 1));
+}
+
+fn isTextSpace(value: []const u8) bool {
+    if (value.len == 1) return value[0] == ' ' or value[0] == '\t' or value[0] == '\r';
+    return std.mem.eql(u8, value, "\xc2\xa0");
+}
 
 pub const SdlDebugRenderer = struct {
     allocator: std.mem.Allocator,
@@ -778,22 +1245,27 @@ pub fn sdlFontRendererWithTextures(
 /// Converts retained render commands into indexed quads ready for GPU upload.
 pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, mesh: *Mesh) !void {
     mesh.clear();
-    try mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 20);
-    try mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 30);
+    try mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 8);
+    try mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 12);
     for (batch.commands.items) |command| {
-        appendCommand(mesh, command);
+        try appendCommand(allocator, mesh, command);
     }
 }
 
-fn appendCommand(mesh: *Mesh, command: draw.Command) void {
+fn appendCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Command) !void {
     if (command.kind == .text or command.kind == .image) return;
     if (command.kind == .triangle) {
-        appendTriangle(mesh, command.p0, command.p1, command.p2, command.color);
+        try appendTriangle(allocator, mesh, command.p0, command.p1, command.p2, command.color, command.clip);
         return;
     }
     if (command.border_color) |border| {
         if (command.border_width > 0.0 and border.a > 0.0) {
-            appendBorderQuads(mesh, command.rect, border, command.border_width);
+            const border_width = @max(command.border_width, 1.0);
+            if (command.color.a > 0.0) {
+                try appendRoundedRect(allocator, mesh, command.rect, border, command.radius, command.clip);
+            } else {
+                try appendRoundedBorder(allocator, mesh, command.rect, border, command.radius, border_width, command.clip);
+            }
         }
     }
     if (command.color.a <= 0.0) return;
@@ -801,10 +1273,10 @@ fn appendCommand(mesh: *Mesh, command: draw.Command) void {
         insetRect(command.rect, command.border_width)
     else
         command.rect;
-    appendQuad(mesh, rect, command.uv, command.color);
+    try appendRoundedRect(allocator, mesh, rect, command.color, @max(command.radius - command.border_width, 0.0), command.clip);
 }
 
-fn appendQuad(mesh: *Mesh, rect: draw.Rect, uv: draw.Rect, color: draw.Color) void {
+fn appendQuad(mesh: *Mesh, allocator: std.mem.Allocator, rect: draw.Rect, uv: draw.Rect, color: draw.Color) !void {
     if (rect.w <= 0.0 or rect.h <= 0.0 or color.a <= 0.0) return;
     const base: u32 = @intCast(mesh.vertices.items.len);
     const x0 = rect.x;
@@ -815,28 +1287,129 @@ fn appendQuad(mesh: *Mesh, rect: draw.Rect, uv: draw.Rect, color: draw.Color) vo
     const uv_y0 = uv.y;
     const uv_x1 = uv.x + uv.w;
     const uv_y1 = uv.y + uv.h;
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y0 }, .uv = .{ .x = uv_x0, .y = uv_y0 }, .color = color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y0 }, .uv = .{ .x = uv_x1, .y = uv_y0 }, .color = color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x1, .y = y1 }, .uv = .{ .x = uv_x1, .y = uv_y1 }, .color = color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = .{ .x = x0, .y = y1 }, .uv = .{ .x = uv_x0, .y = uv_y1 }, .color = color });
-    mesh.indices.appendSliceAssumeCapacity(&.{ base, base + 1, base + 2, base, base + 2, base + 3 });
+    try mesh.vertices.appendSlice(allocator, &.{
+        .{ .pos = .{ .x = x0, .y = y0 }, .uv = .{ .x = uv_x0, .y = uv_y0 }, .color = color },
+        .{ .pos = .{ .x = x1, .y = y0 }, .uv = .{ .x = uv_x1, .y = uv_y0 }, .color = color },
+        .{ .pos = .{ .x = x1, .y = y1 }, .uv = .{ .x = uv_x1, .y = uv_y1 }, .color = color },
+        .{ .pos = .{ .x = x0, .y = y1 }, .uv = .{ .x = uv_x0, .y = uv_y1 }, .color = color },
+    });
+    try mesh.indices.appendSlice(allocator, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
 }
 
-fn appendTriangle(mesh: *Mesh, p0: draw.Vec2, p1: draw.Vec2, p2: draw.Vec2, color: draw.Color) void {
+fn appendTriangle(allocator: std.mem.Allocator, mesh: *Mesh, p0: draw.Vec2, p1: draw.Vec2, p2: draw.Vec2, color: draw.Color, clip: ?draw.Rect) !void {
     if (color.a <= 0.0) return;
+    if (clip) |clip_rect| {
+        if (!clip_rect.contains(p0) and !clip_rect.contains(p1) and !clip_rect.contains(p2)) return;
+    }
     const base: u32 = @intCast(mesh.vertices.items.len);
-    mesh.vertices.appendAssumeCapacity(.{ .pos = p0, .uv = .{}, .color = color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = p1, .uv = .{}, .color = color });
-    mesh.vertices.appendAssumeCapacity(.{ .pos = p2, .uv = .{}, .color = color });
-    mesh.indices.appendSliceAssumeCapacity(&.{ base, base + 1, base + 2 });
+    try mesh.vertices.appendSlice(allocator, &.{
+        .{ .pos = p0, .uv = .{}, .color = color },
+        .{ .pos = p1, .uv = .{}, .color = color },
+        .{ .pos = p2, .uv = .{}, .color = color },
+    });
+    try mesh.indices.appendSlice(allocator, &.{ base, base + 1, base + 2 });
 }
 
-fn appendBorderQuads(mesh: *Mesh, rect: draw.Rect, color: draw.Color, width: f32) void {
+fn appendBorderQuads(allocator: std.mem.Allocator, mesh: *Mesh, rect: draw.Rect, color: draw.Color, width: f32, clip: ?draw.Rect) !void {
     const w = @min(@max(width, 0.0), @min(rect.w, rect.h));
-    appendQuad(mesh, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = w }, .{}, color);
-    appendQuad(mesh, .{ .x = rect.x, .y = rect.y + rect.h - w, .w = rect.w, .h = w }, .{}, color);
-    appendQuad(mesh, .{ .x = rect.x, .y = rect.y, .w = w, .h = rect.h }, .{}, color);
-    appendQuad(mesh, .{ .x = rect.x + rect.w - w, .y = rect.y, .w = w, .h = rect.h }, .{}, color);
+    try appendRect(allocator, mesh, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = w }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = rect.x, .y = rect.y + rect.h - w, .w = rect.w, .h = w }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = rect.x, .y = rect.y, .w = w, .h = rect.h }, color, clip);
+    try appendRect(allocator, mesh, .{ .x = rect.x + rect.w - w, .y = rect.y, .w = w, .h = rect.h }, color, clip);
+}
+
+fn appendRect(allocator: std.mem.Allocator, mesh: *Mesh, rect: draw.Rect, color: draw.Color, clip: ?draw.Rect) !void {
+    const clipped = if (clip) |clip_rect| clippedRect(rect, clip_rect) orelse return else rect;
+    try appendQuad(mesh, allocator, clipped, .{}, color);
+}
+
+fn appendRoundedRect(allocator: std.mem.Allocator, mesh: *Mesh, rect: draw.Rect, color: draw.Color, radius: f32, clip: ?draw.Rect) !void {
+    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0) return;
+    const r = if (clip) |clip_rect| clippedRect(rect, clip_rect) orelse return else rect;
+    const cr = clampedRadius(r, radius);
+    if (cr <= 0.5) {
+        try appendQuad(mesh, allocator, r, .{}, color);
+        return;
+    }
+
+    try appendQuad(mesh, allocator, .{ .x = r.x + cr, .y = r.y, .w = r.w - cr * 2.0, .h = r.h }, .{}, color);
+    try appendQuad(mesh, allocator, .{ .x = r.x, .y = r.y + cr, .w = cr, .h = r.h - cr * 2.0 }, .{}, color);
+    try appendQuad(mesh, allocator, .{ .x = r.x + r.w - cr, .y = r.y + cr, .w = cr, .h = r.h - cr * 2.0 }, .{}, color);
+
+    const segments = roundedSegmentCount(cr);
+    try appendCornerFan(allocator, mesh, r.x + cr, r.y + cr, cr, std.math.pi, std.math.pi * 1.5, segments, color);
+    try appendCornerFan(allocator, mesh, r.x + r.w - cr, r.y + cr, cr, std.math.pi * 1.5, std.math.pi * 2.0, segments, color);
+    try appendCornerFan(allocator, mesh, r.x + r.w - cr, r.y + r.h - cr, cr, 0.0, std.math.pi * 0.5, segments, color);
+    try appendCornerFan(allocator, mesh, r.x + cr, r.y + r.h - cr, cr, std.math.pi * 0.5, std.math.pi, segments, color);
+}
+
+fn appendCornerFan(allocator: std.mem.Allocator, mesh: *Mesh, cx: f32, cy: f32, radius: f32, start_angle: f32, end_angle: f32, segments: usize, color: draw.Color) !void {
+    const center: draw.Vertex = .{ .pos = .{ .x = cx, .y = cy }, .uv = .{}, .color = color };
+    var index: usize = 0;
+    while (index < segments) : (index += 1) {
+        const t0 = @as(f32, @floatFromInt(index)) / @as(f32, @floatFromInt(segments));
+        const t1 = @as(f32, @floatFromInt(index + 1)) / @as(f32, @floatFromInt(segments));
+        const a0 = start_angle + (end_angle - start_angle) * t0;
+        const a1 = start_angle + (end_angle - start_angle) * t1;
+        try appendTriangle(allocator, mesh, center.pos, .{
+            .x = cx + @cos(a0) * radius,
+            .y = cy + @sin(a0) * radius,
+        }, .{
+            .x = cx + @cos(a1) * radius,
+            .y = cy + @sin(a1) * radius,
+        }, color, null);
+    }
+}
+
+fn appendRoundedBorder(allocator: std.mem.Allocator, mesh: *Mesh, rect: draw.Rect, color: draw.Color, radius: f32, width: f32, clip: ?draw.Rect) !void {
+    if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0 or width <= 0.0) return;
+    const r = if (clip) |clip_rect| clippedRect(rect, clip_rect) orelse return else rect;
+    const cr = clampedRadius(r, radius);
+    const thickness = @max(width, 1.0);
+    const inner = insetRect(r, thickness);
+    if (cr <= 0.5 or inner.w <= 0.0 or inner.h <= 0.0) {
+        try appendBorderQuads(allocator, mesh, r, color, thickness, null);
+        return;
+    }
+
+    const inner_r = clampedRadius(inner, @max(cr - thickness, 0.0));
+    const y_start: i32 = @intFromFloat(@floor(r.y));
+    const y_end: i32 = @intFromFloat(@ceil(r.y + r.h));
+    var y = y_start;
+    while (y < y_end) : (y += 1) {
+        const fy = @as(f32, @floatFromInt(y)) + 0.5;
+        const outer_inset = roundedInsetForY(r, cr, fy);
+        const outer_x0 = r.x + outer_inset;
+        const outer_x1 = r.x + r.w - outer_inset;
+        if (fy < inner.y or fy >= inner.y + inner.h) {
+            try appendQuad(mesh, allocator, .{ .x = outer_x0, .y = @floatFromInt(y), .w = @max(outer_x1 - outer_x0, 0.0), .h = 1.0 }, .{}, color);
+            continue;
+        }
+        const inner_inset = roundedInsetForY(inner, inner_r, fy);
+        const inner_x0 = inner.x + inner_inset;
+        const inner_x1 = inner.x + inner.w - inner_inset;
+        if (inner_x0 > outer_x0) {
+            try appendQuad(mesh, allocator, .{ .x = outer_x0, .y = @floatFromInt(y), .w = inner_x0 - outer_x0, .h = 1.0 }, .{}, color);
+        }
+        if (outer_x1 > inner_x1) {
+            try appendQuad(mesh, allocator, .{ .x = inner_x1, .y = @floatFromInt(y), .w = outer_x1 - inner_x1, .h = 1.0 }, .{}, color);
+        }
+    }
+}
+
+fn roundedSegmentCount(radius: f32) usize {
+    if (radius >= 18.0) return 18;
+    if (radius >= 10.0) return 12;
+    return 8;
+}
+
+fn clippedRect(rect: draw.Rect, clip: draw.Rect) ?draw.Rect {
+    const x0 = @max(rect.x, clip.x);
+    const y0 = @max(rect.y, clip.y);
+    const x1 = @min(rect.x + rect.w, clip.x + clip.w);
+    const y1 = @min(rect.y + rect.h, clip.y + clip.h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 fn visualLineEnd(text: []const u8, max_columns: usize) usize {
@@ -978,9 +1551,10 @@ fn rectToSdl(rect: draw.Rect) sdl.Rect {
 }
 
 fn toSdlRect(rect: draw.Rect, target_height: f32) c.SDL_Rect {
+    _ = target_height;
     return .{
         .x = @intFromFloat(@floor(rect.x)),
-        .y = @intFromFloat(@floor(target_height - rect.y - rect.h)),
+        .y = @intFromFloat(@floor(rect.y)),
         .w = @intFromFloat(@ceil(rect.w)),
         .h = @intFromFloat(@ceil(rect.h)),
     };
@@ -997,6 +1571,16 @@ fn colorToSdl(color: draw.Color) sdl.Color {
 
 fn colorByte(value: f32) u8 {
     return @intFromFloat(@min(@max(value, 0.0), 1.0) * 255.0);
+}
+
+fn textCacheKey(value: []const u8, font_size: f32, wrap_width: ?f32) TextCacheKey {
+    const wrap_value = wrap_width orelse 0.0;
+    return .{
+        .text_hash = std.hash.Wyhash.hash(0, value),
+        .text_len = value.len,
+        .font_size_bits = @bitCast(font_size),
+        .wrap_width_bits = @bitCast(wrap_value),
+    };
 }
 
 fn growCapacity(required: usize) usize {
@@ -1021,15 +1605,30 @@ fn alphaBlendState() c.SDL_GPUColorTargetBlendState {
     };
 }
 
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(i128, @intCast(ts.nsec));
+}
+
+fn elapsedNs(start: i128) u64 {
+    const end = nowNs();
+    if (end <= start) return 0;
+    return @intCast(end - start);
+}
+
 pub const ShaderSource = struct {
     pub const vertex_hlsl = @embedFile("shaders/ui.vert.hlsl");
     pub const fragment_hlsl = @embedFile("shaders/ui.frag.hlsl");
     pub const vertex_spirv = @embedFile("shaders/ui.vert.spv");
     pub const solid_fragment_spirv = @embedFile("shaders/ui.solid.frag.spv");
     pub const text_fragment_spirv = @embedFile("shaders/ui.text.frag.spv");
+    pub const image_fragment_spirv = @embedFile("shaders/ui.image.frag.spv");
     pub const vertex_msl = @embedFile("shaders/ui.vert.msl");
     pub const solid_fragment_msl = @embedFile("shaders/ui.solid.frag.msl");
     pub const text_fragment_msl = @embedFile("shaders/ui.text.frag.msl");
+    pub const image_fragment_msl = @embedFile("shaders/ui.image.frag.msl");
 
     pub fn vulkanPackages() PipelineShaderPackages {
         return .{
@@ -1040,6 +1639,10 @@ pub const ShaderSource = struct {
             .text = .{
                 .vertex = .{ .format = ShaderFormat.spirv, .code = vertex_spirv },
                 .fragment = .{ .format = ShaderFormat.spirv, .code = text_fragment_spirv },
+            },
+            .image = .{
+                .vertex = .{ .format = ShaderFormat.spirv, .code = vertex_spirv },
+                .fragment = .{ .format = ShaderFormat.spirv, .code = image_fragment_spirv },
             },
         };
     }
@@ -1053,6 +1656,10 @@ pub const ShaderSource = struct {
             .text = .{
                 .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
                 .fragment = .{ .format = ShaderFormat.msl, .code = text_fragment_msl },
+            },
+            .image = .{
+                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
+                .fragment = .{ .format = ShaderFormat.msl, .code = image_fragment_msl },
             },
         };
     }

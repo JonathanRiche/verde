@@ -309,7 +309,7 @@ fn transcriptMarkdownBubbleHit(
     var content_y = column.y - scroll_y;
 
     for (thread.messages.items, 0..) |message, msg_idx| {
-        const item_h = transcriptMessageHeight(message.body, message.role, column.w, message.author, false);
+        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             continue;
@@ -328,7 +328,7 @@ fn transcriptMarkdownBubbleHit(
     const base_idx = thread.messages.items.len;
     for (send_state.pending_events.items, 0..) |event, pi| {
         const msg_idx = base_idx + pi;
-        const item_h = transcriptMessageHeight(event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             content_y += item_h + theme.scaledUi(12.0);
             continue;
@@ -342,7 +342,7 @@ fn transcriptMarkdownBubbleHit(
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
-    const assistant_h = transcriptMessageHeight(body, .assistant, column.w, "", stream_plain);
+    const assistant_h = transcriptMessageHeight(null, null, body, .assistant, column.w, "", stream_plain);
     const stream_idx = base_idx + send_state.pending_events.items.len;
     return assistantTranscriptMarkdownHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, stream_idx, mouse_x, mouse_y);
 }
@@ -1014,7 +1014,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         return;
     }
 
-    const content_height = transcriptContentHeight(thread, column.w);
+    const content_height = transcriptContentHeight(state, thread, column.w);
     const max_scroll = @max(0.0, content_height - column.h);
     const has_pending_stream = state.hasPendingStream();
 
@@ -1055,7 +1055,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
 
     var content_y = column.y - scroll_y;
     for (thread.messages.items, 0..) |message, msg_idx| {
-        const item_h = transcriptMessageHeight(message.body, message.role, column.w, message.author, false);
+        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
             renderTranscriptMessage(state, column, content_y, item_h, message, clip, msg_idx);
         }
@@ -1073,10 +1073,10 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     }
 }
 
-fn transcriptContentHeight(thread: anytype, width: f32) f32 {
+fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32) f32 {
     var total: f32 = theme.scaledUi(4.0);
-    for (thread.messages.items) |message| {
-        total += transcriptMessageHeight(message.body, message.role, width, message.author, false) + theme.scaledUi(12.0);
+    for (thread.messages.items, 0..) |message, message_index| {
+        total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
     }
     total += transcriptPendingStreamHeight(thread, width);
     return total;
@@ -1090,12 +1090,12 @@ fn transcriptPendingStreamHeight(thread: *const app_state.ChatThread, column_wid
 
     var total: f32 = 0;
     for (send_state.pending_events.items) |event| {
-        total += transcriptMessageHeight(event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
+        total += transcriptMessageHeight(null, null, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
     }
     const stream_text: []const u8 = send_state.partial_text.items;
     const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
-    total += transcriptMessageHeight(body_for_height, .assistant, column_width, "", stream_plain) + theme.scaledUi(12.0);
+    total += transcriptMessageHeight(null, null, body_for_height, .assistant, column_width, "", stream_plain) + theme.scaledUi(12.0);
     return total;
 }
 
@@ -1108,7 +1108,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     var y = content_y;
     for (send_state.pending_events.items, 0..) |event, pi| {
         const msg_idx = base_message_index + pi;
-        const item_h = transcriptMessageHeight(event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
                 renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip);
@@ -1131,7 +1131,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const stream_text: []const u8 = send_state.partial_text.items;
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
-    const assistant_h = transcriptMessageHeight(body, .assistant, column.w, "", stream_plain);
+    const assistant_h = transcriptMessageHeight(null, null, body, .assistant, column.w, "", stream_plain);
     const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
         renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx);
@@ -1206,7 +1206,26 @@ fn transcriptCommandEventHeight(original_author: []const u8, body_raw: []const u
     return pad_y * 2.0 + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
 }
 
-fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, column_width: f32, message_author: []const u8, assistant_plain_layout: bool) f32 {
+fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: usize, message: app_state.ChatMessage, column_width: f32) f32 {
+    const image_present = message.image != null or message.extra_images.len > 0;
+    if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
+        return height;
+    }
+
+    const height = transcriptMessageHeight(state, message_index, message.body, message.role, column_width, message.author, false);
+    state.putTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present, height);
+    return height;
+}
+
+fn transcriptMessageHeight(
+    state: ?*app_state.AppState,
+    message_index: ?usize,
+    body_raw: []const u8,
+    role: app_state.ChatRole,
+    column_width: f32,
+    message_author: []const u8,
+    assistant_plain_layout: bool,
+) f32 {
     if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
         return transcriptCommandEventHeight(message_author, body_raw, column_width);
     }
@@ -1215,6 +1234,14 @@ fn transcriptMessageHeight(body_raw: []const u8, role: app_state.ChatRole, colum
     const body_width = if (role == .user) column_width * 0.62 else column_width;
     const body_inner_width = @max(body_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
     if (role == .assistant and !assistant_plain_layout) {
+        if (state) |app| {
+            if (message_index) |index| {
+                if (app.transcriptMarkdownBodyView(index, body)) |view| {
+                    const measured = chat_markdown.measureBodyHeight(view.*, body_inner_width, markdownOptions(font_size));
+                    return theme.scaledUi(44.0) + measured;
+                }
+            }
+        }
         var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
             const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
             const line_count = wrappedLineCount(body, chars_per_line);
@@ -1358,11 +1385,20 @@ fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
 
 fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect) void {
     if (body.len == 0) return;
+    if (state.transcriptMarkdownBodyView(message_index, body)) |view| {
+        renderMarkdownBodyView(state, message_index, rect, view.*, clip);
+        return;
+    }
+
     var view = chat_markdown.buildBodyView(state.allocator, body) catch {
         renderWrappedBody(state, rect, body, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
         return;
     };
     defer view.deinit(state.allocator);
+    renderMarkdownBodyView(state, message_index, rect, view, clip);
+}
+
+fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect: palette.Rect, view: chat_markdown.BodyView, clip: palette.Rect) void {
     const font_size = theme.scaledUi(16.0);
     const md_opts = markdownOptions(font_size);
     const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {

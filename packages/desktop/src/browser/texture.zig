@@ -13,6 +13,25 @@ const GL_TEXTURE_WRAP_S = 0x2802;
 const GL_TEXTURE_WRAP_T = 0x2803;
 const GL_CLAMP_TO_EDGE = 0x812F;
 const GL_UNPACK_ALIGNMENT = 0x0CF5;
+const EXTERNAL_BROWSER_UPLOAD_INTERVAL_MS = 33;
+
+pub const PixelFormat = enum {
+    rgba,
+    bgra,
+};
+
+pub const ExternalUploadFn = *const fn (context: ?*anyopaque, texture: *PaneTexture, width: u32, height: u32, format: PixelFormat, pixels: []const u8) anyerror!void;
+pub const ExternalReleaseFn = *const fn (context: ?*anyopaque, texture_id: c_uint) void;
+
+var external_upload_context: ?*anyopaque = null;
+var external_upload_fn: ?ExternalUploadFn = null;
+var external_release_fn: ?ExternalReleaseFn = null;
+
+pub fn configureExternalUploader(context: ?*anyopaque, upload_fn: ?ExternalUploadFn, release_fn: ?ExternalReleaseFn) void {
+    external_upload_context = context;
+    external_upload_fn = upload_fn;
+    external_release_fn = release_fn;
+}
 
 extern fn glGenTextures(n: c_int, textures: [*]c_uint) void;
 extern fn glBindTexture(target: c_uint, texture: c_uint) void;
@@ -28,12 +47,17 @@ pub const PaneTexture = struct {
     width: u32 = 0,
     height: u32 = 0,
     dirty: bool = false,
+    last_upload_ms: i64 = 0,
 
     /// Releases the underlying OpenGL texture if one exists.
     pub fn deinit(self: *PaneTexture) void {
         if (self.texture_id != 0) {
-            const textures = [_]c_uint{self.texture_id};
-            glDeleteTextures(1, &textures);
+            if (external_release_fn) |release_fn| {
+                release_fn(external_upload_context, self.texture_id);
+            } else {
+                const textures = [_]c_uint{self.texture_id};
+                glDeleteTextures(1, &textures);
+            }
         }
         self.clear();
     }
@@ -49,6 +73,7 @@ pub const PaneTexture = struct {
         self.width = width;
         self.height = height;
         self.dirty = dirty;
+        self.last_upload_ms = monotonicTimestampMs();
     }
 
     /// Reports whether the pane has a valid GPU texture to present.
@@ -74,6 +99,13 @@ pub const PaneTexture = struct {
 
     // Reuses the existing texture storage when the browser viewport size stays stable.
     fn uploadPixels(self: *PaneTexture, width: u32, height: u32, format: c_uint, pixels: []const u8) !void {
+        if (external_upload_fn) |upload_fn| {
+            if (self.texture_id != 0 and shouldThrottleExternalUpload(self.last_upload_ms)) return;
+            const external_format: PixelFormat = if (format == GL_BGRA) .bgra else .rgba;
+            try upload_fn(external_upload_context, self, width, height, external_format, pixels);
+            return;
+        }
+
         if (self.texture_id == 0) {
             var textures = [_]c_uint{0};
             glGenTextures(1, &textures);
@@ -116,3 +148,15 @@ pub const PaneTexture = struct {
         self.update(self.texture_id, width, height, true);
     }
 };
+
+fn shouldThrottleExternalUpload(last_upload_ms: i64) bool {
+    if (last_upload_ms == 0) return false;
+    return monotonicTimestampMs() - last_upload_ms < EXTERNAL_BROWSER_UPLOAD_INTERVAL_MS;
+}
+
+fn monotonicTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}

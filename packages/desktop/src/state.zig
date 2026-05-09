@@ -21,7 +21,7 @@ const utils = @import("utils.zig");
 const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 
 /// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
-const palette_ui_ttf = @embedFile("assets/fonts/CalSans-Regular.ttf");
+const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
 
 extern fn palette_text_gl_measure_codepoint_width(
     font_data: [*]const u8,
@@ -139,9 +139,9 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .stop_icon = "x",
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 400.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 40.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 10.0;
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
@@ -568,6 +568,8 @@ const TranscriptMarkdownBody = struct {
 
 const TranscriptHeightEntry = struct {
     valid: bool = false,
+    role: ChatRole = .assistant,
+    assistant_plain_layout: bool = false,
     width: f32 = 0.0,
     body_hash: u64 = 0,
     author_hash: u64 = 0,
@@ -1033,14 +1035,20 @@ const FileSearchState = struct {
 };
 
 extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
+pub const TextureBackend = enum {
+    gl,
+    external,
+};
+
 pub const CachedImageTexture = struct {
-    texture_id: c_uint,
-    width: i32,
-    height: i32,
-    valid: bool,
+    texture_id: c_uint = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    valid: bool = false,
+    backend: TextureBackend = .gl,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0) return;
+        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
         var textures = [_]c_uint{self.texture_id};
         glDeleteTextures(1, &textures);
     }
@@ -1449,6 +1457,10 @@ pub const AppState = struct {
     palette_frame_text: std.ArrayList(u8),
     palette_modal_hits: std.ArrayList(PaletteModalHit),
     palette_modal_text_focus: PaletteModalTextFocus,
+    gl_texture_uploads_enabled: bool,
+    browser_textures_enabled: bool,
+    texture_upload_context: ?*anyopaque,
+    texture_upload_fn: ?TextureUploadFn,
     project_rename_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
@@ -1545,7 +1557,16 @@ pub const AppState = struct {
     last_interaction_at_ms: i64,
     pending_send_count: usize,
 
-    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
+    pub const InitOptions = struct {
+        gl_texture_uploads_enabled: bool = true,
+        browser_textures_enabled: bool = true,
+        texture_upload_context: ?*anyopaque = null,
+        texture_upload_fn: ?TextureUploadFn = null,
+    };
+
+    pub const TextureUploadFn = *const fn (context: ?*anyopaque, loaded: stb_image.LoadedImage) ?CachedImageTexture;
+
+    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
         errdefer browser_state.deinit();
 
@@ -1594,6 +1615,10 @@ pub const AppState = struct {
             .palette_frame_text = .empty,
             .palette_modal_hits = .empty,
             .palette_modal_text_focus = .none,
+            .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
+            .browser_textures_enabled = options.browser_textures_enabled,
+            .texture_upload_context = options.texture_upload_context,
+            .texture_upload_fn = options.texture_upload_fn,
             .project_rename_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
@@ -1693,16 +1718,35 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        state.logo_texture = utils.loadEmbeddedTexture(VERDE_LOGO_BYTES);
-        state.opencode_logo_texture = utils.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
-        state.codex_logo_texture = utils.loadEmbeddedTexture(CODEX_LOGO_BYTES);
-        state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
-        state.cursor_logo_texture = utils.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
-        state.emacs_logo_texture = utils.loadEmbeddedTexture(EMACS_LOGO_BYTES);
-        state.neovim_logo_texture = utils.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
-        state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
-        state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        if (options.gl_texture_uploads_enabled or options.texture_upload_fn != null) {
+            state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
+            state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
+            state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
+            state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
+            state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
+            state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
+            state.neovim_logo_texture = state.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
+            state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
+            state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        }
         return state;
+    }
+
+    fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
+        const loaded = stb_image.loadFromMemory(bytes) catch |err| {
+            log.err("failed to decode embedded texture: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer loaded.deinit();
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    fn uploadLoadedTexture(self: *AppState, loaded: stb_image.LoadedImage) ?CachedImageTexture {
+        if (self.texture_upload_fn) |upload_fn| {
+            return upload_fn(self.texture_upload_context, loaded);
+        }
+        if (!self.gl_texture_uploads_enabled) return null;
+        return uploadTexture(loaded);
     }
 
     pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
@@ -3549,6 +3593,8 @@ pub const AppState = struct {
     }
 
     pub fn ensureImageTexture(self: *AppState, path: [:0]const u8) ?CachedImageTexture {
+        if (!self.gl_texture_uploads_enabled and self.texture_upload_fn == null) return null;
+
         if (self.image_texture_cache.getPtr(path)) |cached| {
             return if (cached.valid) cached.* else null;
         }
@@ -3568,7 +3614,7 @@ pub const AppState = struct {
         };
         defer loaded.deinit();
 
-        const cached = uploadTexture(loaded) orelse {
+        const cached = self.uploadLoadedTexture(loaded) orelse {
             self.image_texture_cache.put(owned_key, .{
                 .texture_id = 0,
                 .width = 0,
@@ -3812,7 +3858,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
     ) ?f32 {
         const thread = self.currentThreadMutable();
@@ -3821,6 +3869,8 @@ pub const AppState = struct {
 
         const entry = thread.transcript_height_entries.items[message_index];
         if (!entry.valid) return null;
+        if (entry.role != role) return null;
+        if (entry.assistant_plain_layout != assistant_plain_layout) return null;
         if (@abs(entry.width - width) > 0.5) return null;
         if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
         if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
@@ -3833,7 +3883,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
         height: f32,
     ) void {
@@ -3844,6 +3896,8 @@ pub const AppState = struct {
 
         thread.transcript_height_entries.items[message_index] = .{
             .valid = true,
+            .role = role,
+            .assistant_plain_layout = assistant_plain_layout,
             .width = width,
             .body_hash = std.hash.Wyhash.hash(0, body),
             .author_hash = std.hash.Wyhash.hash(0, author),
@@ -4136,6 +4190,8 @@ pub const AppState = struct {
 
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
@@ -4146,6 +4202,11 @@ pub const AppState = struct {
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) {
+            self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+            return;
+        }
+
         if (self.browser_state.controls_visible) {
             self.hideBrowser();
             return;
@@ -4421,6 +4482,8 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
 
         if (self.browser_launch_open_delay_frames > 0) {
@@ -4969,19 +5032,27 @@ pub const AppState = struct {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
 
+        const composer_rect: palette.Rect = if (self.composer_input_bounds_valid) .{
+            .x = self.composer_input_min[0],
+            .y = self.composer_input_min[1],
+            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
+            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
+        } else anchor;
         const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
         const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const viewport_top: f32 = 8.0;
+        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y - COMPOSER_MODEL_CASCADE_PADDING_Y);
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
         self.palette_model_cascade.setAnchorRect(anchor);
-        self.palette_model_cascade.clearForbiddenRect();
+        self.palette_model_cascade.setForbiddenRect(composer_rect);
         self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
-            .y = 8.0,
+            .y = viewport_top,
             .w = @max(max_x - min_x, total_width),
-            .h = @max(anchor.y - 16.0, root_height),
+            .h = @max(viewport_bottom - viewport_top, root_height),
         });
         self.palette_model_cascade.setBounds(.{
             .x = x,

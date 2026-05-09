@@ -81,10 +81,11 @@ const CommandQueue = struct {
 
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     queue: *CommandQueue,
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa_state.allocator();
 
@@ -96,6 +97,7 @@ pub fn main() !void {
 
     var reader_context: ReaderContext = .{
         .allocator = allocator,
+        .io = init.io,
         .queue = &queue,
     };
     const reader_thread = try std.Thread.spawn(.{}, stdinReaderMain, .{&reader_context});
@@ -109,8 +111,8 @@ pub fn main() !void {
             }
         }
 
-        try flushBrowserEvents(allocator, browser);
-        try flushBrowserFrames(allocator, browser);
+        try flushBrowserEvents(allocator, init.io, browser);
+        try flushBrowserFrames(allocator, init.io, browser);
         if (queue.isDrained()) {
             std.process.exit(0);
         }
@@ -120,9 +122,9 @@ pub fn main() !void {
 
 /// Reads JSON-line commands from stdin and forwards them into the helper's command queue.
 fn stdinReaderMain(context: *ReaderContext) !void {
-    const stdin_file = std.fs.File.stdin();
+    const stdin_file = std.Io.File.stdin();
     var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = stdin_file.reader(&read_buffer);
+    var reader = stdin_file.readerStreaming(context.io, &read_buffer);
 
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
@@ -240,10 +242,10 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
 }
 
 /// Serializes any pending GTK/WebKit events onto stdout as JSON lines.
-fn flushBrowserEvents(allocator: std.mem.Allocator, browser: *RawBrowser) !void {
-    const stdout_file = std.fs.File.stdout();
+fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !void {
+    const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
-    var writer = stdout_file.writer(&write_buffer);
+    var writer = stdout_file.writerStreaming(io, &write_buffer);
     defer writer.interface.flush() catch {};
 
     while (true) {
@@ -264,10 +266,10 @@ fn flushBrowserEvents(allocator: std.mem.Allocator, browser: *RawBrowser) !void 
 }
 
 /// Serializes any newly rendered browser snapshot onto stdout as a frame-ready event.
-fn flushBrowserFrames(allocator: std.mem.Allocator, browser: *RawBrowser) !void {
-    const stdout_file = std.fs.File.stdout();
+fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !void {
+    const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
-    var writer = stdout_file.writer(&write_buffer);
+    var writer = stdout_file.writerStreaming(io, &write_buffer);
     defer writer.interface.flush() catch {};
 
     while (true) {
