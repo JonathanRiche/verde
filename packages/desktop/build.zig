@@ -28,15 +28,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zgui_text_select = b.dependency("zgui_text_select", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zgui = b.dependency("zgui", .{
-        .backend = .sdl3_opengl3,
-        .shared = false,
-        .use_wchar32 = true,
-    });
     const zsdl = b.dependency("zsdl", .{});
     const ghostty = b.dependency("ghostty", .{
         .target = target,
@@ -54,22 +45,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "palette", .module = palette.module("palette") },
             .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
             .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-            .{ .name = "zgui", .module = zgui.module("root") },
         },
     });
-    const imgui = zgui.artifact("imgui");
     const build_options = b.addOptions();
     build_options.addOption(bool, "ui_debug", ui_debug);
     build_options.addOption(bool, "cef_sdk_configured", cef_sdk_configured);
     build_options.addOption(bool, "cef_stub_preview", cef_stub_preview);
-
-    // zgui's sdl3_opengl3 backend currently adds the nested SDL3 include dir,
-    // but imgui_impl_sdl3.cpp includes <SDL3/SDL.h> and needs the parent root.
-    if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
-        imgui.root_module.addIncludePath(zsdl.path("libs/sdl3/include"));
-    }
 
     const build_inspector_bundle = b.addSystemCommand(&.{
         "bun",
@@ -102,10 +86,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "palette", .module = palette.module("palette") },
-                .{ .name = "zgui_text_select", .module = zgui_text_select.module("zgui_text_select") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
-                .{ .name = "zgui", .module = zgui.module("root") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },
@@ -125,7 +107,6 @@ pub fn build(b: *std.Build) void {
     });
     build_fff.setCwd(fff_root);
     exe.step.dependOn(&build_fff.step);
-    exe.root_module.linkLibrary(imgui);
     exe.root_module.link_libc = true;
     exe.root_module.addIncludePath(b.path("../../vendor"));
     exe.root_module.addIncludePath(b.path("../../vendor/fff/crates/fff-c/include"));
@@ -134,6 +115,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFile(.{
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
+    });
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("src/ui/palette_text_gl.c"),
+        .flags = &.{"-DGL_GLEXT_PROTOTYPES"},
     });
     switch (target.result.os.tag) {
         .linux => {
@@ -294,8 +279,12 @@ pub fn build(b: *std.Build) void {
     const chat_markdown_tests = b.addTest(.{
         .root_module = chat_markdown,
     });
-    chat_markdown_tests.root_module.linkLibrary(imgui);
     chat_markdown_tests.root_module.link_libc = true;
+    chat_markdown_tests.root_module.addIncludePath(b.path("../../vendor"));
+    chat_markdown_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/ui/palette_text_gl.c"),
+        .flags = &.{"-DGL_GLEXT_PROTOTYPES"},
+    });
     if (target.result.os.tag == .linux) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
             chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
@@ -314,8 +303,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
+                .{ .name = "palette", .module = palette.module("palette") },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
-                .{ .name = "zgui", .module = zgui.module("root") },
+                .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
                 .{ .name = "zqlite", .module = zqlite.module("zqlite") },
             },

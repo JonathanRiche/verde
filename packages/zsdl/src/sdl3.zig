@@ -1625,7 +1625,16 @@ extern fn SDL_DestroySurface(surface: *Surface) void;
 // Clipboard Handling (SDL_clipboard.h)
 //
 //--------------------------------------------------------------------------------------------------
-// TODO
+pub fn setClipboardText(text: [:0]const u8) Error!void {
+    if (!SDL_SetClipboardText(@ptrCast(text.ptr))) return makeError();
+}
+extern fn SDL_SetClipboardText(text: [*c]const u8) bool;
+
+pub fn getClipboardText() Error![*:0]u8 {
+    const text = SDL_GetClipboardText() orelse return makeError();
+    return @ptrCast(text);
+}
+extern fn SDL_GetClipboardText() ?[*:0]u8;
 
 //--------------------------------------------------------------------------------------------------
 //

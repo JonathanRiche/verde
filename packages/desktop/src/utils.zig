@@ -369,9 +369,12 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.free(request.project_path);
         page_alloc.free(request.prompt);
         if (request.image_path) |image_path| page_alloc.free(image_path);
+        for (request.image_paths) |image_path| page_alloc.free(image_path);
+        page_alloc.free(request.image_paths);
         if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
         page_alloc.free(request.thread_title);
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
+        if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
         page_alloc.destroy(request);
     }
 
@@ -453,10 +456,13 @@ pub const SendWorkerRequest = struct {
     project_path: []u8,
     prompt: []u8,
     image_path: ?[]u8,
+    image_paths: [][]u8,
     provider_thread_id: ?[]u8,
     thread_title: []u8,
     model_ref: ?[]u8,
     reasoning_effort: ?app_state.ReasoningEffort,
+    /// Owned; OpenCode-only. Duplicated from thread `opencode_reasoning_variant`.
+    opencode_reasoning_variant: ?[]u8,
     fast_mode: app_state.FastMode,
     access_mode: app_state.AccessMode,
 };
@@ -500,14 +506,22 @@ pub fn runSendWorker(
     std.debug.print("[codex-debug] send worker connected provider={s}\n", .{@tagName(request.provider)});
     runtime_log.diagnostic("send worker connected provider={s}", .{@tagName(request.provider)});
 
+    const image_attachments = try allocator.alloc(ai_harness.types.ImageAttachment, request.image_paths.len);
+    defer allocator.free(image_attachments);
+    for (request.image_paths, 0..) |image_path, index| {
+        image_attachments[index] = .{ .path = image_path };
+    }
+
     const result = client.sendPrompt(allocator, .{
         .thread_id = request.provider_thread_id,
         .thread_title = request.thread_title,
         .prompt = request.prompt,
         .image = if (request.image_path) |image_path| .{ .path = image_path } else null,
+        .images = image_attachments,
         .cwd = request.project_path,
         .model = request.model_ref,
-        .reasoning_effort = request.reasoning_effort,
+        .opencode_variant = if (request.provider == .opencode) request.opencode_reasoning_variant else null,
+        .reasoning_effort = if (request.provider == .opencode and request.opencode_reasoning_variant != null) null else request.reasoning_effort,
         .service_tier = serviceTierForMode(request.provider, request.fast_mode),
         .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),
         .sandbox_mode = sandboxModeForMode(request.provider, request.access_mode),
@@ -1327,6 +1341,42 @@ pub fn captureClipboardImage(allocator: std.mem.Allocator) !?ClipboardImageCaptu
     };
 }
 
+/// Reads text from the system clipboard. SDL is attempted by the caller first;
+/// this covers compositors/toolkits where SDL has no current text owner.
+pub fn captureClipboardText(allocator: std.mem.Allocator) !?[]u8 {
+    return switch (@import("builtin").os.tag) {
+        .macos => captureClipboardTextCommand(allocator, &.{"pbpaste"}),
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            if (try captureClipboardTextCommand(allocator, &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --no-newline" })) |text| return text;
+            return try captureClipboardTextCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-o" });
+        },
+        else => null,
+    };
+}
+
+fn captureClipboardTextCommand(allocator: std.mem.Allocator, argv: []const []const u8) !?[]u8 {
+    const result = runChild(allocator, argv, ".", 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return null;
+        },
+    }
+    if (result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
 const MacClipboardImageFlavor = struct {
     class_code: []const u8,
     mime: []const u8,
@@ -1534,12 +1584,16 @@ fn convertClipboardTiffToPng(
 
 fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCapture {
     var threaded = std.Io.Threaded.init_single_threaded;
-    const types_result = std.process.run(allocator, threaded.io(), .{
-        .argv = &.{ "wl-paste", "--list-types" },
-        .cwd = .{ .path = "." },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    }) catch |err| switch (err) {
+    const types_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-types-{d}.txt", .{std.c.getpid()});
+    defer allocator.free(types_path);
+    defer std.Io.Dir.deleteFileAbsolute(threaded.io(), types_path) catch {};
+
+    const types_result = runChild(
+        allocator,
+        &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --list-types > \"$1\"", "sh", types_path },
+        ".",
+        16 * 1024,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -1547,35 +1601,72 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
     defer allocator.free(types_result.stderr);
 
     switch (types_result.term) {
-        .exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) {
+            runtime_log.diagnostic("clipboard image wayland list-types exited code={d} stderr_len={d}", .{ code, types_result.stderr.len });
+            return null;
+        },
         else => return null,
     }
 
-    const mime = selectClipboardImageMime(types_result.stdout) orelse return null;
-    const image_result = runChild(allocator, &.{ "wl-paste", "--no-newline", "--type", mime }, ".", CLIPBOARD_IMAGE_MAX_BYTES) catch |err| switch (err) {
+    const types_output = types_output: {
+        var types_file = try std.Io.Dir.openFileAbsolute(threaded.io(), types_path, .{ .mode = .read_only });
+        defer types_file.close(threaded.io());
+        const types_size = try types_file.stat(threaded.io());
+        if (types_size.size == 0) return null;
+        if (types_size.size > 16 * 1024) return error.StreamTooLong;
+        var read_buffer: [1024]u8 = undefined;
+        var reader = types_file.reader(threaded.io(), &read_buffer);
+        break :types_output try reader.interface.readAlloc(allocator, @intCast(types_size.size));
+    };
+    defer allocator.free(types_output);
+
+    const mime = selectClipboardImageMime(types_output) orelse return null;
+    runtime_log.diagnostic("clipboard image wayland mime={s}", .{mime});
+    const output_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-image-{d}.bin", .{std.c.getpid()});
+    defer allocator.free(output_path);
+    defer std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};
+
+    const image_result = runChild(
+        allocator,
+        &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --no-newline --type \"$1\" > \"$2\"", "sh", mime, output_path },
+        ".",
+        16 * 1024,
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
+    defer allocator.free(image_result.stdout);
     defer allocator.free(image_result.stderr);
 
     switch (image_result.term) {
         .exited => |code| if (code != 0) {
-            allocator.free(image_result.stdout);
+            runtime_log.diagnostic("clipboard image wayland paste exited code={d} stderr_len={d}", .{ code, image_result.stderr.len });
             return null;
         },
         else => {
-            allocator.free(image_result.stdout);
+            runtime_log.diagnostic("clipboard image wayland paste did not exit normally", .{});
             return null;
         },
     }
+    runtime_log.diagnostic("clipboard image wayland temp written stdout_len={d} stderr_len={d}", .{ image_result.stdout.len, image_result.stderr.len });
 
-    if (image_result.stdout.len == 0) {
-        allocator.free(image_result.stdout);
-        return null;
-    }
+    const bytes = bytes: {
+        var image_file = try std.Io.Dir.openFileAbsolute(threaded.io(), output_path, .{ .mode = .read_only });
+        defer image_file.close(threaded.io());
+        const image_size = try image_file.stat(threaded.io());
+        runtime_log.diagnostic("clipboard image wayland temp size={d}", .{image_size.size});
+        if (image_size.size == 0) return null;
+        if (image_size.size > CLIPBOARD_IMAGE_MAX_BYTES) return error.StreamTooLong;
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = image_file.reader(threaded.io(), &read_buffer);
+        break :bytes reader.interface.readAlloc(allocator, @intCast(image_size.size)) catch |err| {
+            runtime_log.diagnostic("clipboard image wayland temp read failed: {s}", .{@errorName(err)});
+            return err;
+        };
+    };
 
     return .{
-        .bytes = image_result.stdout,
+        .bytes = bytes,
         .mime = mime,
     };
 }
@@ -1594,30 +1685,33 @@ pub fn captureClipboardImageX11(allocator: std.mem.Allocator) !?ClipboardImageCa
     }
 
     const mime = selectClipboardImageMime(targets_result.stdout) orelse return null;
-    const image_result = runChild(allocator, &.{ "xclip", "-selection", "clipboard", "-t", mime, "-o" }, ".", CLIPBOARD_IMAGE_MAX_BYTES) catch |err| switch (err) {
+    const child_allocator = std.heap.page_allocator;
+    const image_result = runChild(child_allocator, &.{ "xclip", "-selection", "clipboard", "-t", mime, "-o" }, ".", CLIPBOARD_IMAGE_MAX_BYTES) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer allocator.free(image_result.stderr);
+    defer child_allocator.free(image_result.stderr);
 
     switch (image_result.term) {
         .exited => |code| if (code != 0) {
-            allocator.free(image_result.stdout);
+            child_allocator.free(image_result.stdout);
             return null;
         },
         else => {
-            allocator.free(image_result.stdout);
+            child_allocator.free(image_result.stdout);
             return null;
         },
     }
 
     if (image_result.stdout.len == 0) {
-        allocator.free(image_result.stdout);
+        child_allocator.free(image_result.stdout);
         return null;
     }
+    defer child_allocator.free(image_result.stdout);
+    const bytes = try allocator.dupe(u8, image_result.stdout);
 
     return .{
-        .bytes = image_result.stdout,
+        .bytes = bytes,
         .mime = mime,
     };
 }
