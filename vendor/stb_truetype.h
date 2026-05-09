@@ -1,7 +1,7 @@
-// [DEAR IMGUI]
+// [LOCAL PATCH]
 // This is a slightly modified version of stb_truetype.h 1.26.
 // Mostly fixing for compiler and static analyzer warnings.
-// Grep for [DEAR IMGUI] to find the changes.
+// Grep for [LOCAL PATCH] to find the changes.
 
 // stb_truetype.h - v1.26 - public domain
 // authored from 2009-2021 by Sean Barrett / RAD Game Tools
@@ -2008,7 +2008,7 @@ static stbtt__buf stbtt__cid_get_glyph_subrs(const stbtt_fontinfo *info, int gly
          start = end;
       }
    }
-   if (fdselector == -1) return stbtt__new_buf(NULL, 0); // [DEAR IMGUI] fixed, see #6007 and nothings/stb#1422
+   if (fdselector == -1) return stbtt__new_buf(NULL, 0); // [LOCAL PATCH] fixed, see #6007 and nothings/stb#1422
    return stbtt__get_subrs(info->cff, stbtt__cff_index_get(info->fontdicts, fdselector));
 }
 
@@ -3202,7 +3202,7 @@ static void stbtt__fill_active_edges_new(float *scanline, float *scanline_fill, 
                if (y_final > y_bottom) {
                   int denom = (x2 - (x1+1));
                   y_final = y_bottom;
-                  if (denom != 0) { // [DEAR IMGUI] Avoid div by zero (https://github.com/nothings/stb/issues/1316)
+                  if (denom != 0) { // [LOCAL PATCH] Avoid div by zero (https://github.com/nothings/stb/issues/1316)
                      dy = (y_final - y_crossing ) / denom; // if denom=0, y_final = y_crossing, so y_final <= y_bottom
                   }
                }
@@ -4310,7 +4310,7 @@ STBTT_DEF void stbtt_PackFontRangesPackRects(stbtt_pack_context *spc, stbrp_rect
 STBTT_DEF int stbtt_PackFontRanges(stbtt_pack_context *spc, const unsigned char *fontdata, int font_index, stbtt_pack_range *ranges, int num_ranges)
 {
    stbtt_fontinfo info;
-   int i, j, n, return_value; // [DEAR IMGUI] removed = 1;
+   int i, j, n, return_value; // [LOCAL PATCH] removed = 1;
    //stbrp_context *context = (stbrp_context *) spc->pack_info;
    stbrp_rect    *rects;
 

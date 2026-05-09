@@ -1,6 +1,6 @@
 # `verde`
 
-`verde` is the desktop app in this repo. It is a standalone Zig application built with SDL3, OpenGL, and zgui.
+`verde` is the desktop app in this repo. It is a standalone Zig application built with SDL3, OpenGL, and Palette.
 
 If you cloned the repo and want to run the app locally, you can use `zig build run` from the repo root or work directly from this directory.
 
@@ -293,9 +293,12 @@ Custom actions run through `sh -lc` with the selected project as the working dir
 
 Third-party Zig dependencies are declared in `build.zig.zon`:
 
-- `zgui`
+- `palette`
 - `zsdl`
 - `zqlite`
+- `zig_dif`
+- `zig_markdown`
+- `ghostty`
 
 Zig fetches them automatically during build.
 
@@ -307,8 +310,7 @@ The desktop app depends on the following upstream projects:
 - Codicon by Microsoft. Used for file-type glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/Codicon.ttf`](src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
 - Symbols Nerd Font Mono by Nerd Fonts. Used for language-specific file glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
 - `nvim-web-devicons`. Used as the reference mapping for many file-type glyph choices in the native picker. License: MIT.
-- Dear ImGui by Omar Cornut. Used as the immediate-mode UI library underneath the native shell. Brought in through `zgui`. License: MIT.
-- `zgui` from `zig-gamedev`. Used for Zig bindings and SDL/OpenGL backend integration for Dear ImGui. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
+- `palette`. Used for native UI primitives and render-batch driven desktop UI. Declared in [`build.zig.zon`](build.zig.zon).
 - `zsdl` from `zig-gamedev`. Used for Zig bindings to SDL3. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
 - SDL3 from libsdl-org. Used for window creation, events, monitor/display integration, and OpenGL context setup.
 - `zqlite` by Karl Seguin. Used for SQLite-backed state and persistence. Declared in [`build.zig.zon`](build.zig.zon). License: MIT-style.
