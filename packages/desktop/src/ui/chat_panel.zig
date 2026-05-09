@@ -19,6 +19,28 @@ const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 
 var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
+const WorkspaceHeaderOpenMenuRow = enum {
+    folder,
+    configured_editor,
+    cursor,
+    vscode,
+    zed,
+};
+
+const WorkspaceHeaderHitCache = struct {
+    header_rect: palette.Rect = .{},
+    open_main_rect: palette.Rect = .{},
+    chevron_rect: palette.Rect = .{},
+    browser_rect: palette.Rect = .{},
+    menu_panel_rect: palette.Rect = .{},
+    menu_row_count: usize = 0,
+    menu_row_rects: [5]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 5,
+    menu_row_kind: [5]WorkspaceHeaderOpenMenuRow = [_]WorkspaceHeaderOpenMenuRow{.folder} ** 5,
+    menu_row_enabled: [5]bool = [_]bool{false} ** 5,
+};
+
+var workspace_header_hits: WorkspaceHeaderHitCache = .{};
+
 pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void {
     renderWorkspaceAt(state, .{ .x = estimateWorkspaceOriginX(state, width), .y = 0.0, .w = width, .h = height });
 }
@@ -27,6 +49,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     state.invalidateComposerToolbarOverlayHitRects();
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     if (state.projects.items.len == 0) {
+        state.workspace_header_open_menu_open = false;
         renderEmptyProjects(state, rect);
         return;
     }
@@ -121,6 +144,84 @@ fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f3
             theme.clampf(total_width * 0.235, theme.scaledUi(230.0), @min(theme.scaledUi(360.0), total_width * 0.38));
     }
     return sidebar_width;
+}
+
+pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    if (!down) return false;
+    if (state.projects.items.len == 0) return false;
+
+    if (state.workspace_header_open_menu_open and rectContains(workspace_header_hits.menu_panel_rect, x, y)) {
+        var i: usize = 0;
+        while (i < workspace_header_hits.menu_row_count) : (i += 1) {
+            if (!rectContains(workspace_header_hits.menu_row_rects[i], x, y)) continue;
+            state.workspace_header_open_menu_open = false;
+            state.blurPaletteComposer();
+            if (!workspace_header_hits.menu_row_enabled[i]) {
+                runtime.log.info(
+                    "workspace header open menu row hit (disabled) kind={s} x={d:.1} y={d:.1}",
+                    .{ @tagName(workspace_header_hits.menu_row_kind[i]), x, y },
+                );
+                return true;
+            }
+            runtime.log.info(
+                "workspace header open menu row kind={s} x={d:.1} y={d:.1}",
+                .{ @tagName(workspace_header_hits.menu_row_kind[i]), x, y },
+            );
+            switch (workspace_header_hits.menu_row_kind[i]) {
+                .folder => state.openCurrentProjectDirectory(),
+                .configured_editor => state.openCurrentProjectEditor(.configured),
+                .cursor => state.openCurrentProjectEditor(.cursor),
+                .vscode => state.openCurrentProjectEditor(.vscode),
+                .zed => state.openCurrentProjectEditor(.zed),
+            }
+            state.noteInteraction();
+            return true;
+        }
+        state.workspace_header_open_menu_open = false;
+        state.blurPaletteComposer();
+        runtime.log.info("workspace header open menu panel hit (no row) x={d:.1} y={d:.1}", .{ x, y });
+        return true;
+    }
+
+    if (rectContains(workspace_header_hits.open_main_rect, x, y)) {
+        state.workspace_header_open_menu_open = false;
+        state.blurPaletteComposer();
+        const can = state.canRunDefaultOpenAction();
+        runtime.log.info(
+            "workspace header default Open click x={d:.1} y={d:.1} can_run={}",
+            .{ x, y, can },
+        );
+        if (can) {
+            state.runDefaultOpenAction();
+        } else {
+            state.setSidebarNotice(state.defaultOpenTooltip());
+        }
+        state.noteInteraction();
+        return true;
+    }
+    if (rectContains(workspace_header_hits.chevron_rect, x, y)) {
+        state.workspace_header_open_menu_open = !state.workspace_header_open_menu_open;
+        state.blurPaletteComposer();
+        runtime.log.info(
+            "workspace header chevron click menu_open={} x={d:.1} y={d:.1}",
+            .{ state.workspace_header_open_menu_open, x, y },
+        );
+        state.noteInteraction();
+        return true;
+    }
+    if (rectContains(workspace_header_hits.browser_rect, x, y)) {
+        state.workspace_header_open_menu_open = false;
+        state.blurPaletteComposer();
+        state.toggleBrowser();
+        state.noteInteraction();
+        return true;
+    }
+
+    if (state.workspace_header_open_menu_open) {
+        state.workspace_header_open_menu_open = false;
+        runtime.log.info("workspace header dismissed open menu (click outside controls) x={d:.1} y={d:.1}", .{ x, y });
+    }
+    return false;
 }
 
 pub fn handleFileSearchPaletteMouseButton(_: *app_state.AppState, _: f32, _: f32, _: bool) bool {
@@ -460,21 +561,362 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
     return try out.toOwnedSlice(state.allocator);
 }
 
+fn truncateWorkspaceTitle(buf: []u8, title: []const u8, max_width: f32, font_size: f32) []const u8 {
+    const gw = font_size * 0.52;
+    if (max_width <= 0.0 or buf.len == 0) return "";
+    var total: f32 = 0;
+    var i: usize = 0;
+    while (i < title.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(title[i]) catch return title;
+        const end = @min(i + seq, title.len);
+        total += gw * @max(1.0, @as(f32, @floatFromInt(end - i)));
+        i = end;
+    }
+    if (total <= max_width) {
+        const n = @min(title.len, buf.len);
+        @memcpy(buf[0..n], title[0..n]);
+        return buf[0..n];
+    }
+    const ellipsis = "...";
+    const ellipsis_w = @as(f32, @floatFromInt(ellipsis.len)) * gw;
+    if (ellipsis_w > max_width) return "";
+    i = 0;
+    total = 0;
+    while (i < title.len) {
+        const seq = std.unicode.utf8ByteSequenceLength(title[i]) catch break;
+        const end = @min(i + seq, title.len);
+        const adv = gw * @max(1.0, @as(f32, @floatFromInt(end - i)));
+        if (total + adv + ellipsis_w > max_width) break;
+        total += adv;
+        i = end;
+    }
+    const prefix_len = i;
+    if (prefix_len + ellipsis.len > buf.len) return title;
+    @memcpy(buf[0..prefix_len], title[0..prefix_len]);
+    @memcpy(buf[prefix_len..][0..ellipsis.len], ellipsis);
+    return buf[0 .. prefix_len + ellipsis.len];
+}
+
+fn queueWorkspaceHeaderFolderIcon(state: *app_state.AppState, x: f32, center_y: f32, color: palette.Color) void {
+    const col = color;
+    const fw = theme.scaledUi(13.0);
+    const fh = theme.scaledUi(9.0);
+    queueRounded(state, .{
+        .x = x,
+        .y = center_y - fh * 0.5 - theme.scaledUi(2.0),
+        .w = fw * 0.4,
+        .h = theme.scaledUi(3.0),
+    }, col, theme.scaledUi(1.0));
+    queueRounded(state, .{
+        .x = x,
+        .y = center_y - fh * 0.5,
+        .w = fw,
+        .h = fh,
+    }, col, theme.scaledUi(1.5));
+}
+
+fn queueWorkspaceHeaderChevron(state: *app_state.AppState, cx: f32, cy: f32, color: palette.Color) void {
+    const half = theme.scaledUi(4.0);
+    queueTriangle(
+        state,
+        .{ .x = cx - half, .y = cy - half },
+        .{ .x = cx, .y = cy },
+        .{ .x = cx - half, .y = cy + half },
+        color,
+    );
+}
+
+fn queueWorkspaceHeaderGlobe(state: *app_state.AppState, cx: f32, cy: f32, size: f32, color: palette.Color) void {
+    const r = size * 0.5;
+    const sq = palette.Rect{ .x = cx - r, .y = cy - r, .w = size, .h = size };
+    queueBorder(state, sq, color, r, theme.scaledUi(1.3));
+    queueRect(state, .{ .x = cx - r, .y = cy - 0.5, .w = size, .h = 1.0 }, color);
+}
+
 fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
+    workspace_header_hits = .{};
+    workspace_header_hits.header_rect = rect;
+
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(colors.DARK_BLUE));
 
-    const project = state.currentProject();
+    const padding_x = theme.scaledUi(28.0);
     const thread = state.currentThread();
-    const title = if (thread.title.len > 0) thread.title else project.label;
+    const title_src: []const u8 = if (thread.committed)
+        if (thread.title.len > 0) thread.title else "New chat"
+    else
+        "New chat";
+
+    const button_h = theme.scaledUi(30.0);
+    const button_gap = theme.scaledUi(8.0);
+    const title_gap = theme.scaledUi(16.0);
+    const label_font = theme.scaledUi(14.0);
+    const title_font = theme.scaledUi(18.0);
+
+    const open_label = state.defaultOpenButtonLabel();
+    const open_folder = state.defaultOpenShowsFolderIcon();
+    const open_tex = state.defaultOpenIconTexture();
+    const open_has_icon = open_folder or open_tex != null;
+    const label_w = @as(f32, @floatFromInt(open_label.len)) * label_font * 0.52;
+    const open_main_w = theme.clampf(
+        label_w + theme.scaledUi(if (open_has_icon) 54.0 else 28.0),
+        theme.scaledUi(82.0),
+        theme.scaledUi(184.0),
+    );
+    const chevron_w = theme.scaledUi(30.0);
+    const browser_w = theme.scaledUi(106.0);
+    const open_combo_w = open_main_w + chevron_w;
+    const actions_w = open_combo_w + button_gap + browser_w;
+
+    const header_inner_w = rect.w - padding_x * 2.0;
+    const actions_x = rect.x + padding_x + @max(theme.scaledUi(180.0), header_inner_w - actions_w);
+    const title_max_w = @max(actions_x - rect.x - padding_x - title_gap, theme.scaledUi(96.0));
+
+    var title_buf: [256]u8 = undefined;
+    const title_display = truncateWorkspaceTitle(&title_buf, title_src, title_max_w, title_font);
     const title_line_h = theme.scaledUi(32.0);
     const title_y = rect.y + @max((rect.h - title_line_h) * 0.5, theme.scaledUi(4.0));
     queueText(state, .{
-        .x = rect.x + theme.scaledUi(32.0),
+        .x = rect.x + padding_x,
         .y = title_y,
-        .w = @max(rect.w - theme.scaledUi(64.0), 1.0),
+        .w = title_max_w,
         .h = title_line_h,
-    }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(18.0), rect);
+    }, stableText(state, title_display), paletteColor(theme.COLOR_WHITE), title_font, rect);
+
+    const mx = state.palette_mouse_x;
+    const my = state.palette_mouse_y;
+    const mouse_ok = state.palette_mouse_in_workspace;
+
+    const actions_y = rect.y + @max((rect.h - button_h) * 0.5, theme.scaledUi(4.0));
+    const open_combo_x = actions_x;
+    const open_main_rect = palette.Rect{ .x = open_combo_x, .y = actions_y, .w = open_main_w, .h = button_h };
+    const chevron_rect = palette.Rect{ .x = open_combo_x + open_main_w, .y = actions_y, .w = chevron_w, .h = button_h };
+    const browser_rect = palette.Rect{ .x = open_combo_x + open_combo_w + button_gap, .y = actions_y, .w = browser_w, .h = button_h };
+
+    workspace_header_hits.open_main_rect = open_main_rect;
+    workspace_header_hits.chevron_rect = chevron_rect;
+    workspace_header_hits.browser_rect = browser_rect;
+
+    const open_main_hover = mouse_ok and rectContains(open_main_rect, mx, my);
+    const chevron_hover = mouse_ok and rectContains(chevron_rect, mx, my);
+    const combo_hover = open_main_hover or chevron_hover;
+    const browser_hover = mouse_ok and rectContains(browser_rect, mx, my);
+
+    const combo_base = theme.COLOR_PANEL_ALT;
+    const combo_bg = if (combo_hover) theme.lighten(combo_base, 0.08) else combo_base;
+    const open_combo_rect = palette.Rect{ .x = open_combo_x, .y = actions_y, .w = open_combo_w, .h = button_h };
+    const combo_radius = theme.scaledUi(10.0);
+    queueRounded(state, open_combo_rect, paletteColor(combo_bg), combo_radius);
+
+    const sep_col = colors.rgba(22, 24, 28, 110);
+    queueRect(state, .{
+        .x = chevron_rect.x,
+        .y = chevron_rect.y + theme.scaledUi(5.0),
+        .w = 1.0,
+        .h = button_h - theme.scaledUi(10.0),
+    }, paletteColor(sep_col));
+
+    const icon_slot = theme.scaledUi(16.0);
+    const icon_x = open_main_rect.x + theme.scaledUi(14.0);
+    const icon_cy = open_main_rect.y + button_h * 0.5;
+    const text_color_open: palette.Color = paletteColor(if (!state.canRunDefaultOpenAction())
+        theme.COLOR_TEXT_MUTED
+    else if (combo_hover)
+        theme.COLOR_WHITE
+    else
+        theme.COLOR_TEXT_MUTED);
+    if (open_folder) {
+        queueWorkspaceHeaderFolderIcon(state, icon_x, icon_cy, text_color_open);
+    } else if (open_tex) |cached| {
+        const scaled = runtime.scaledImageSize(cached.width, cached.height, icon_slot, icon_slot);
+        queueImage(state, .{
+            .x = icon_x + (icon_slot - scaled[0]) * 0.5,
+            .y = open_main_rect.y + (button_h - scaled[1]) * 0.5,
+            .w = scaled[0],
+            .h = scaled[1],
+        }, cached, rect);
+    }
+    const text_x = if (open_has_icon)
+        icon_x + icon_slot + theme.scaledUi(10.0)
+    else
+        open_main_rect.x + theme.scaledUi(14.0);
+    queueFixedTextLine(state, .{
+        .x = text_x,
+        .y = open_main_rect.y + (button_h - label_font * 1.25) * 0.5,
+        .w = open_main_w - (text_x - open_main_rect.x) - theme.scaledUi(8.0),
+        .h = label_font * 1.25,
+    }, stableText(state, open_label), text_color_open, label_font, rect);
+
+    const chev_cx = chevron_rect.x + chevron_rect.w * 0.5 + theme.scaledUi(2.0);
+    const chev_cy = chevron_rect.y + chevron_rect.h * 0.5;
+    queueWorkspaceHeaderChevron(
+        state,
+        chev_cx,
+        chev_cy,
+        paletteColor(if (chevron_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE),
+    );
+
+    const browser_base = theme.COLOR_PANEL_ALT;
+    const browser_bg = if (browser_hover) theme.lighten(browser_base, 0.08) else browser_base;
+    const browser_radius = theme.scaledUi(6.0);
+    queueRounded(state, browser_rect, paletteColor(browser_bg), browser_radius);
+    queueBorder(state, browser_rect, paletteColor(theme.lighten(browser_bg, 0.06)), browser_radius, theme.scaledUi(1.0));
+
+    const browser_label = "Browser";
+    const globe_size = theme.scaledUi(14.0);
+    const icon_gap = theme.scaledUi(5.0);
+    const browser_text_w = @as(f32, @floatFromInt(browser_label.len)) * label_font * 0.52;
+    const browser_content_w = globe_size + icon_gap + browser_text_w;
+    const browser_start_x = browser_rect.x + (browser_rect.w - browser_content_w) * 0.5;
+    const browser_cy = browser_rect.y + browser_rect.h * 0.5;
+    queueWorkspaceHeaderGlobe(state, browser_start_x + globe_size * 0.5, browser_cy, globe_size, paletteColor(theme.COLOR_TEXT_MUTED));
+    queueFixedTextLine(state, .{
+        .x = browser_start_x + globe_size + icon_gap,
+        .y = browser_rect.y + (browser_rect.h - label_font * 1.25) * 0.5,
+        .w = browser_text_w + theme.scaledUi(4.0),
+        .h = label_font * 1.25,
+    }, stableText(state, browser_label), paletteColor(theme.COLOR_WHITE), label_font, rect);
+
+    if (!state.workspace_header_open_menu_open) return;
+
+    var kinds: [5]WorkspaceHeaderOpenMenuRow = undefined;
+    var enabled: [5]bool = undefined;
+    var label_storage: [5][96]u8 = undefined;
+    var labels: [5][]const u8 = undefined;
+    var count: usize = 0;
+
+    kinds[count] = .folder;
+    enabled[count] = state.canOpenCurrentProjectDirectory();
+    labels[count] = "Open folder";
+    count += 1;
+
+    if (state.canOpenCurrentProjectEditor(.configured)) {
+        kinds[count] = .configured_editor;
+        enabled[count] = true;
+        labels[count] = if (state.configuredEditorDisplayName()) |name|
+            std.fmt.bufPrint(&label_storage[count], "Open in {s}", .{name}) catch "Open in configured editor"
+        else
+            "Open in configured editor";
+        count += 1;
+    }
+    if (state.canOpenCurrentProjectEditor(.cursor)) {
+        kinds[count] = .cursor;
+        enabled[count] = true;
+        labels[count] = "Open in Cursor";
+        count += 1;
+    }
+    if (state.canOpenCurrentProjectEditor(.vscode)) {
+        kinds[count] = .vscode;
+        enabled[count] = true;
+        labels[count] = "Open in VS Code";
+        count += 1;
+    }
+    if (state.canOpenCurrentProjectEditor(.zed)) {
+        kinds[count] = .zed;
+        enabled[count] = true;
+        labels[count] = "Open in Zed";
+        count += 1;
+    }
+
+    const menu_w = theme.scaledUi(250.0);
+    const menu_pad = theme.scaledUi(8.0);
+    const menu_row_h = theme.scaledUi(34.0);
+    const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(count)) * menu_row_h;
+    const menu_x = @max(rect.x + theme.scaledUi(12.0), chevron_rect.x + chevron_rect.w - menu_w);
+    const menu_y = chevron_rect.y + chevron_rect.h + theme.scaledUi(6.0);
+    workspace_header_hits.menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+
+    const menu_clip = workspace_header_hits.menu_panel_rect;
+    queueRounded(state, workspace_header_hits.menu_panel_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(12.0));
+    queueBorder(state, workspace_header_hits.menu_panel_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+
+    workspace_header_hits.menu_row_count = count;
+    var ri: usize = 0;
+    var ry = menu_y + menu_pad;
+    while (ri < count) : (ri += 1) {
+        workspace_header_hits.menu_row_kind[ri] = kinds[ri];
+        workspace_header_hits.menu_row_enabled[ri] = enabled[ri];
+
+        const rr = palette.Rect{
+            .x = menu_x + theme.scaledUi(4.0),
+            .y = ry,
+            .w = menu_w - theme.scaledUi(8.0),
+            .h = menu_row_h,
+        };
+        workspace_header_hits.menu_row_rects[ri] = rr;
+
+        const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
+        if (row_hover) {
+            queueRounded(state, rr, paletteColor(colors.rgba(42, 44, 52, 255)), theme.scaledUi(8.0));
+        }
+
+        const row_icon_x = rr.x + theme.scaledUi(12.0);
+        const row_icon_cy = rr.y + menu_row_h * 0.5;
+        const row_text_x = row_icon_x + theme.scaledUi(18.0) + theme.scaledUi(10.0);
+        const row_col = paletteColor(if (!enabled[ri])
+            theme.COLOR_TEXT_SUBTLE
+        else if (row_hover)
+            theme.COLOR_WHITE
+        else
+            theme.COLOR_TEXT_MUTED);
+
+        switch (kinds[ri]) {
+            .folder => queueWorkspaceHeaderFolderIcon(state, row_icon_x, row_icon_cy, row_col),
+            .configured_editor => {
+                if (state.editorLogoTextureForTarget(.configured)) |cached| {
+                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                    queueImage(state, .{
+                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
+                        .w = scaled[0],
+                        .h = scaled[1],
+                    }, cached, menu_clip);
+                }
+            },
+            .cursor => {
+                if (state.editorLogoTextureForTarget(.cursor)) |cached| {
+                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                    queueImage(state, .{
+                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
+                        .w = scaled[0],
+                        .h = scaled[1],
+                    }, cached, menu_clip);
+                }
+            },
+            .vscode => {
+                if (state.editorLogoTextureForTarget(.vscode)) |cached| {
+                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                    queueImage(state, .{
+                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
+                        .w = scaled[0],
+                        .h = scaled[1],
+                    }, cached, menu_clip);
+                }
+            },
+            .zed => {
+                if (state.editorLogoTextureForTarget(.zed)) |cached| {
+                    const scaled = runtime.scaledImageSize(cached.width, cached.height, theme.scaledUi(18.0), theme.scaledUi(18.0));
+                    queueImage(state, .{
+                        .x = row_icon_x + (theme.scaledUi(18.0) - scaled[0]) * 0.5,
+                        .y = rr.y + (menu_row_h - scaled[1]) * 0.5,
+                        .w = scaled[0],
+                        .h = scaled[1],
+                    }, cached, menu_clip);
+                }
+            },
+        }
+
+        queueFixedTextLine(state, .{
+            .x = row_text_x,
+            .y = rr.y + (menu_row_h - label_font * 1.25) * 0.5,
+            .w = rr.w - (row_text_x - rr.x) - theme.scaledUi(8.0),
+            .h = label_font * 1.25,
+        }, stableText(state, labels[ri]), row_col, label_font, menu_clip);
+
+        ry += menu_row_h;
+    }
 }
 
 fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
