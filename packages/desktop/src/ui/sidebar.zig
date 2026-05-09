@@ -99,8 +99,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .add_project => {
                 state.show_project_creator = true;
                 state.setSidebarCollapsed(false);
+                state.clearImportPath();
+                state.project_import_cursor = 0;
+                state.palette_modal_text_focus = .project_import;
                 state.setSidebarNotice("");
-                state.browseForProjectDirectory();
+                state.markDirty();
             },
             .new_thread => {
                 if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
