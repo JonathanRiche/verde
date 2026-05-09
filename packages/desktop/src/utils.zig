@@ -189,19 +189,33 @@ pub fn runCustomProjectCommand(
 pub fn pickerWorker(state: *app_state.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 
+    runtime_log.diagnostic("pickerWorker start path={s}", .{start_path});
     const result = pickDirectory(std.heap.page_allocator, start_path);
 
     state.mutex.lock();
     defer state.mutex.unlock();
 
     if (result) |path| {
+        runtime_log.diagnostic("pickerWorker selected path={s}", .{path});
         state.selected_path = path;
         state.status = .selected;
     } else |err| switch (err) {
-        error.UserCancelled => state.status = .cancelled,
-        error.UnsupportedOperatingSystem => state.status = .unavailable,
-        error.FolderPickerUnavailable => state.status = .unavailable,
-        else => state.status = .failed,
+        error.UserCancelled => {
+            runtime_log.diagnostic("pickerWorker cancelled", .{});
+            state.status = .cancelled;
+        },
+        error.UnsupportedOperatingSystem => {
+            runtime_log.diagnostic("pickerWorker unavailable: unsupported os", .{});
+            state.status = .unavailable;
+        },
+        error.FolderPickerUnavailable => {
+            runtime_log.diagnostic("pickerWorker unavailable: no picker command", .{});
+            state.status = .unavailable;
+        },
+        else => {
+            runtime_log.diagnostic("pickerWorker failed: {s}", .{@errorName(err)});
+            state.status = .failed;
+        },
     }
 }
 pub fn pickDirectory(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
@@ -259,49 +273,27 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
 
 pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
     if (commandExists("zenity")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "zenity",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\zenity --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("kdialog")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "kdialog",
-            "--getexistingdirectory",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\kdialog --getexistingdirectory "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("yad")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "yad",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\yad --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("qarma")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "qarma",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\qarma --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("python3")) {
@@ -335,27 +327,65 @@ pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) 
     return error.FolderPickerUnavailable;
 }
 
+fn runLinuxGuiDirectoryPickerCommand(
+    allocator: std.mem.Allocator,
+    comptime picker_command: []const u8,
+    start_path: []const u8,
+    unavailable_exit_code: ?u8,
+) PickDirectoryError![]u8 {
+    const script =
+        \\export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        \\if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        \\  for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        \\    [ -S "$socket" ] || continue
+        \\    export WAYLAND_DISPLAY="$(basename "$socket")"
+        \\    break
+        \\  done
+        \\fi
+        \\if [ -z "${DISPLAY:-}" ] && [ -d /tmp/.X11-unix ]; then
+        \\  for socket in /tmp/.X11-unix/X*; do
+        \\    [ -S "$socket" ] || continue
+        \\    export DISPLAY=":${socket##*/X}"
+        \\    break
+        \\  done
+        \\fi
+        \\
+    ++ picker_command;
+    return runDirectoryPickerCommand(allocator, &.{ "sh", "-c", script, "verde-folder-picker", start_path }, unavailable_exit_code);
+}
+
 fn runDirectoryPickerCommand(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     unavailable_exit_code: ?u8,
 ) PickDirectoryError![]u8 {
+    runtime_log.diagnostic("runDirectoryPickerCommand argv={s}", .{argv[0]});
     const result = runChild(allocator, argv, null, 16 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return error.FolderPickerUnavailable,
-        else => return err,
+        error.FileNotFound => {
+            runtime_log.diagnostic("runDirectoryPickerCommand file not found argv={s}", .{argv[0]});
+            return error.FolderPickerUnavailable;
+        },
+        else => {
+            runtime_log.diagnostic("runDirectoryPickerCommand spawn failed argv={s}: {s}", .{ argv[0], @errorName(err) });
+            return err;
+        },
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| {
+            runtime_log.diagnostic("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d} stderr={s}", .{ argv[0], code, result.stdout.len, result.stderr.len, result.stderr });
             if (code == 1) return error.UserCancelled;
             if (unavailable_exit_code) |expected| {
                 if (code == expected) return error.FolderPickerUnavailable;
             }
             if (code != 0) return error.ChildProcessFailed;
         },
-        else => return error.ChildProcessFailed,
+        else => {
+            runtime_log.diagnostic("runDirectoryPickerCommand did not exit normally argv={s}", .{argv[0]});
+            return error.ChildProcessFailed;
+        },
     }
 
     const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);

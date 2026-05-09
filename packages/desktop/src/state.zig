@@ -1477,6 +1477,7 @@ pub const AppState = struct {
     thread_import_selected_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
+    project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
     file_search_state: FileSearchState,
@@ -1608,6 +1609,7 @@ pub const AppState = struct {
             .thread_import_selected_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
+            .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
             .file_search_state = .{},
@@ -2053,10 +2055,16 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        log.info("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
+            runtime_log.diagnostic("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            log.warn("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.setSidebarNotice(@errorName(err));
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory target_path={s}", .{target_path});
+        log.info("browseForProjectDirectory target_path={s}", .{target_path});
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
             self.allocator.free(target_path);
@@ -2069,6 +2077,8 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
+            runtime_log.diagnostic("browseForProjectDirectory ignored: picker already pending", .{});
+            log.info("browseForProjectDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.setSidebarNotice("Folder picker already open.");
             return;
@@ -2079,10 +2089,29 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
+            runtime_log.diagnostic("browseForProjectDirectory failed to spawn picker worker", .{});
+            log.warn("browseForProjectDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory spawned picker worker", .{});
+        log.info("browseForProjectDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
+    }
+
+    pub fn requestBrowseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("requestBrowseForProjectDirectory queued", .{});
+        log.info("requestBrowseForProjectDirectory queued", .{});
+        self.project_directory_browse_requested = true;
+        self.markDirty();
+    }
+
+    pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
+        if (!self.project_directory_browse_requested) return;
+        runtime_log.diagnostic("processDeferredProjectDirectoryBrowse running", .{});
+        log.info("processDeferredProjectDirectoryBrowse running", .{});
+        self.project_directory_browse_requested = false;
+        self.browseForProjectDirectory();
     }
 
     fn renameSelectedProject(self: *AppState) void {
@@ -5575,6 +5604,7 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
+        self.markDirty();
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -5743,6 +5773,8 @@ pub const AppState = struct {
         self.picker_state.mutex.unlock();
 
         if (next_status != .idle) {
+            runtime_log.diagnostic("pollPicker completed status={s}", .{@tagName(next_status)});
+            log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
         }
 
