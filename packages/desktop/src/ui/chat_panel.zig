@@ -236,10 +236,13 @@ pub fn pointerOverTranscript(x: f32, y: f32) bool {
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or !rectContains(transcript_rect, x, y)) return false;
     state.transcript_focused = true;
-    const current = state.currentTranscriptScrollY() orelse 0.0;
-    state.rememberCurrentTranscriptScroll(@max(0.0, current - wheel_y * theme.scaledUi(64.0)));
+    const ramp = 1.0 - app_state.TRANSCRIPT_SCROLL_FRICTION;
+    state.transcript_scroll_velocity_y += -wheel_y * theme.scaledUi(64.0) * ramp;
+    const max_v = theme.scaledUi(3600.0);
+    state.transcript_scroll_velocity_y = std.math.clamp(state.transcript_scroll_velocity_y, -max_v, max_v);
     state.transcript_auto_follow_pending = false;
     state.scroll_transcript_to_bottom_frames = 0;
+    state.markDirty();
     return true;
 }
 
@@ -1014,18 +1017,31 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     const has_pending_stream = state.hasPendingStream();
 
     var scroll_y = std.math.clamp(state.currentTranscriptScrollY() orelse max_scroll, 0.0, max_scroll);
-    if (state.pending_transcript_line_scroll_steps != 0) {
-        scroll_y = std.math.clamp(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_line_scroll_steps)) * theme.scaledUi(TRANSCRIPT_LINE_HEIGHT), 0.0, max_scroll);
-        state.pending_transcript_line_scroll_steps = 0;
+
+    const pi = state.selected_project_index;
+    const ti = state.currentProject().selected_thread_index;
+    if (state.transcript_scroll_velocity_track_p != pi or state.transcript_scroll_velocity_track_t != ti) {
+        state.transcript_scroll_velocity_y = 0;
+        state.transcript_scroll_velocity_track_p = pi;
+        state.transcript_scroll_velocity_track_t = ti;
     }
-    if (state.pending_transcript_page_scroll_steps != 0) {
-        scroll_y = std.math.clamp(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_scroll_steps)) * column.h * 0.82, 0.0, max_scroll);
-        state.pending_transcript_page_scroll_steps = 0;
+
+    scroll_y = std.math.clamp(scroll_y + state.transcript_scroll_velocity_y, 0.0, max_scroll);
+    state.transcript_scroll_velocity_y *= app_state.TRANSCRIPT_SCROLL_FRICTION;
+    if (@abs(state.transcript_scroll_velocity_y) < 0.15) {
+        state.transcript_scroll_velocity_y = 0;
+    }
+    if (scroll_y <= 0 and state.transcript_scroll_velocity_y < 0) {
+        state.transcript_scroll_velocity_y = 0;
+    }
+    if (scroll_y >= max_scroll and state.transcript_scroll_velocity_y > 0) {
+        state.transcript_scroll_velocity_y = 0;
     }
 
     updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
 
     if (state.transcript_auto_follow_pending or state.scroll_transcript_to_bottom_frames > 0) {
+        state.transcript_scroll_velocity_y = 0;
         scroll_y = max_scroll;
     }
     if (state.scroll_transcript_to_bottom_frames > 0) {

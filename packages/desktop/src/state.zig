@@ -17,6 +17,11 @@ const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
 
+/// Per paint, transcript scroll velocity is multiplied by this factor (inertial smoothing).
+/// Keyboard/wheel impulses use `(1 - FRICTION)` so total distance matches legacy step sizes.
+pub const TRANSCRIPT_SCROLL_FRICTION: f32 = 0.83;
+const TRANSCRIPT_SCROLL_LINE_PX: f32 = 22.0;
+
 /// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
 const palette_ui_ttf = @embedFile("assets/fonts/CalSans-Regular.ttf");
 
@@ -1532,8 +1537,11 @@ pub const AppState = struct {
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
-    pending_transcript_line_scroll_steps: i16,
-    pending_transcript_page_scroll_steps: i16,
+    /// Vertical scroll speed (px/frame, signed down-positive) for smooth transcript scrolling.
+    transcript_scroll_velocity_y: f32,
+    /// Clears `transcript_scroll_velocity_y` when the visible thread changes.
+    transcript_scroll_velocity_track_p: usize,
+    transcript_scroll_velocity_track_t: usize,
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
@@ -1669,8 +1677,9 @@ pub const AppState = struct {
             .transcript_markdown_entries = .empty,
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
-            .pending_transcript_line_scroll_steps = 0,
-            .pending_transcript_page_scroll_steps = 0,
+            .transcript_scroll_velocity_y = 0,
+            .transcript_scroll_velocity_track_p = std.math.maxInt(usize),
+            .transcript_scroll_velocity_track_t = std.math.maxInt(usize),
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
@@ -5570,6 +5579,7 @@ pub const AppState = struct {
         self.currentThreadMutable().transcript_scroll_valid = false;
         self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
+        self.transcript_scroll_velocity_y = 0;
     }
 
     pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
@@ -5577,8 +5587,9 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
-        self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
+        const ramp = 1.0 - TRANSCRIPT_SCROLL_FRICTION;
+        self.transcript_scroll_velocity_y += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_SCROLL_LINE_PX) * ramp;
+        self.markDirty();
     }
 
     pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
@@ -5586,8 +5597,15 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
-        self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
+        const h = self.transcript_palette_column.h;
+        const page_h = if (h > 2.0) h * 0.82 else theme.scaledUi(480.0) * 0.82;
+        const ramp = 1.0 - TRANSCRIPT_SCROLL_FRICTION;
+        self.transcript_scroll_velocity_y += @as(f32, @floatFromInt(delta)) * page_h * ramp;
+        self.markDirty();
+    }
+
+    pub fn transcriptScrollAnimating(self: *const AppState) bool {
+        return @abs(self.transcript_scroll_velocity_y) > 0.08;
     }
 
     pub fn importDirectoryDraft(self: *const AppState) []const u8 {
