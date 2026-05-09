@@ -64,10 +64,14 @@ pub const PaletteModalAction = enum {
     thread_import_cancel,
     thread_import_submit,
     thread_import_select,
+    project_import_browse,
+    project_import_submit,
+    project_import_cancel,
     modal_dismiss,
     modal_block,
     project_rename_input,
     thread_import_input,
+    project_import_input,
 };
 
 pub const PaletteModalHit = struct {
@@ -80,6 +84,7 @@ pub const PaletteModalTextFocus = enum {
     none,
     project_rename,
     thread_import,
+    project_import,
 };
 
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
@@ -1436,6 +1441,7 @@ pub const AppState = struct {
     palette_modal_hits: std.ArrayList(PaletteModalHit),
     palette_modal_text_focus: PaletteModalTextFocus,
     project_rename_cursor: usize,
+    project_import_cursor: usize,
     thread_import_cursor: usize,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
@@ -1566,6 +1572,7 @@ pub const AppState = struct {
             .palette_modal_hits = .empty,
             .palette_modal_text_focus = .none,
             .project_rename_cursor = 0,
+            .project_import_cursor = 0,
             .thread_import_cursor = 0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
@@ -2008,7 +2015,7 @@ pub const AppState = struct {
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
-        const trimmed = std.mem.trim(u8, self.importPath(), &std.ascii.whitespace);
+        const trimmed = std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace);
         if (trimmed.len == 0) {
             self.setSidebarNotice("Enter a project directory path first.");
             return;
@@ -2026,9 +2033,22 @@ pub const AppState = struct {
         const add_result = try self.addProject(label, resolved, 0);
         self.selected_project_index = self.projects.items.len - 1;
         self.clearImportPath();
+        self.project_import_cursor = 0;
         self.syncRenameBuffer();
         self.setSidebarNotice(if (add_result == .restored) "Project restored from archive." else "Project imported.");
         self.show_project_creator = false;
+        self.palette_modal_text_focus = .none;
+        self.markDirty();
+    }
+
+    pub fn cancelProjectImport(self: *AppState) void {
+        self.show_project_creator = false;
+        self.clearImportPath();
+        self.project_import_cursor = 0;
+        if (self.palette_modal_text_focus == .project_import) {
+            self.palette_modal_text_focus = .none;
+        }
+        self.setSidebarNotice("");
         self.markDirty();
     }
 
@@ -2085,6 +2105,7 @@ pub const AppState = struct {
 
     pub fn beginProjectRename(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
+        if (self.show_project_creator) self.cancelProjectImport();
         self.selected_project_index = index;
         self.rename_project_index = index;
         self.syncRenameBuffer();
@@ -2095,6 +2116,7 @@ pub const AppState = struct {
 
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.projects.items.len) return;
+        if (self.show_project_creator) self.cancelProjectImport();
         self.selected_project_index = index;
         self.rename_project_index = null;
         self.thread_import_provider = provider;
@@ -5504,7 +5526,7 @@ pub const AppState = struct {
         self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
     }
 
-    fn importPath(self: *const AppState) []const u8 {
+    pub fn importDirectoryDraft(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_path_storage[0..], 0);
     }
 
@@ -5728,11 +5750,18 @@ pub const AppState = struct {
             .selected => {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
-                    self.setImportPath(path);
-                    self.importProjectFromInput() catch |err| {
-                        log.warn("failed to import selected project: {s}", .{@errorName(err)});
-                        self.setSidebarNotice("Folder selected, but project import failed.");
-                    };
+                    if (self.show_project_creator) {
+                        self.setImportPath(path);
+                        self.project_import_cursor = self.importDirectoryDraft().len;
+                        self.setSidebarNotice("Folder selected.");
+                        self.markDirty();
+                    } else {
+                        self.setImportPath(path);
+                        self.importProjectFromInput() catch |err| {
+                            log.warn("failed to import selected project: {s}", .{@errorName(err)});
+                            self.setSidebarNotice("Folder selected, but project import failed.");
+                        };
+                    }
                 }
             },
             .cancelled => self.setSidebarNotice("Folder selection cancelled."),
@@ -6474,8 +6503,8 @@ pub const AppState = struct {
     }
 
     fn defaultExplorerPath(self: *AppState) ![]u8 {
-        if (self.importPath().len > 0) {
-            return self.resolveProjectPath(std.mem.trim(u8, self.importPath(), &std.ascii.whitespace));
+        if (self.importDirectoryDraft().len > 0) {
+            return self.resolveProjectPath(std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace));
         }
 
         if (self.projects.items.len > 0) {

@@ -25,6 +25,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     chat_panel.renderWorkspaceAt(state, root_layout.workspace);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
+    renderProjectAddModal(state, width, height);
     renderProjectRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     debug_window.render(state, width, height);
@@ -158,6 +159,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_cancel => state.cancelThreadImport(),
             .thread_import_submit => state.importSelectedThread(),
             .thread_import_select => state.selectThreadImport(hit.index),
+            .project_import_browse => state.browseForProjectDirectory(),
+            .project_import_submit => {
+                state.importProjectFromInput() catch |err| {
+                    runtime.log.warn("project import failed: {s}", .{@errorName(err)});
+                    state.setSidebarNotice("Could not add that directory path.");
+                };
+            },
+            .project_import_cancel => state.cancelProjectImport(),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => state.palette_modal_text_focus = .none,
             .project_rename_input => {
@@ -167,6 +176,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_input => {
                 state.palette_modal_text_focus = .thread_import;
                 state.thread_import_cursor = state.threadImportThreadId().len;
+            },
+            .project_import_input => {
+                state.palette_modal_text_focus = .project_import;
+                state.project_import_cursor = state.importDirectoryDraft().len;
             },
         }
         return true;
@@ -178,20 +191,35 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
     return switch (state.palette_modal_text_focus) {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
+        .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
         .none => false,
     };
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null) return false;
+    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator) return false;
     switch (event.key) {
         .escape => {
             dismissTopModal(state);
             return true;
         },
         .@"return", .kp_enter => {
-            if (state.palette_modal_text_focus == .project_rename) state.finishProjectRename() else if (state.palette_modal_text_focus == .thread_import) state.importSelectedThread();
-            return state.palette_modal_text_focus != .none;
+            if (state.palette_modal_text_focus == .project_rename) {
+                state.finishProjectRename();
+                return true;
+            }
+            if (state.palette_modal_text_focus == .thread_import) {
+                state.importSelectedThread();
+                return true;
+            }
+            if (state.palette_modal_text_focus == .project_import) {
+                state.importProjectFromInput() catch |err| {
+                    runtime.log.warn("project import failed: {s}", .{@errorName(err)});
+                    state.setSidebarNotice("Could not add that directory path.");
+                };
+                return true;
+            }
+            return false;
         },
         .left => return moveModalCursor(state, -1),
         .right => return moveModalCursor(state, 1),
@@ -221,6 +249,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.closeImageModal();
     } else if (state.transcriptSelectionBuffer() != null) {
         state.closeTranscriptSelectionModal();
+    } else if (state.show_project_creator) {
+        state.cancelProjectImport();
     } else if (state.rename_project_index != null) {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
@@ -283,6 +313,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
+        .project_import => &state.project_import_cursor,
         .none => null,
     };
 }
@@ -291,6 +322,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
+        .project_import => state.importPathBuffer(),
         .none => null,
     };
 }
@@ -299,6 +331,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
     return switch (state.palette_modal_text_focus) {
         .project_rename => state.renameInputPublic().len,
         .thread_import => state.threadImportThreadId().len,
+        .project_import => state.importDirectoryDraft().len,
         .none => 0,
     };
 }
@@ -378,6 +411,36 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
     drawActionButton(state, submit_rect, "Rename", theme.COLOR_SECONDARY_GREEN);
     queueModalHit(state, cancel_rect, .project_rename_cancel, 0);
     queueModalHit(state, submit_rect, .project_rename_submit, 0);
+}
+
+fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.show_project_creator) return;
+    const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
+    const modal_h = theme.scaledUi(252.0);
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    drawModalChrome(state, width, height, modal, true);
+    const pad = theme.scaledUi(18.0);
+    var y = modal.y + pad;
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add project", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    y += theme.scaledUi(30.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Choose a directory for a new workspace, or paste a path below.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    y += theme.scaledUi(48.0);
+    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(36.0) };
+    drawActionButton(state, browse_rect, "Browse for folder", theme.COLOR_PANEL_ALT);
+    queueModalHit(state, browse_rect, .project_import_browse, 0);
+    y += theme.scaledUi(44.0);
+    const add_w = theme.scaledUi(76.0);
+    const row_gap = theme.scaledUi(10.0);
+    const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
+    const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
+    drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/project", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
+    queueModalHit(state, input_rect, .project_import_input, 0);
+    drawActionButton(state, add_rect, "Add", theme.COLOR_SECONDARY_GREEN);
+    queueModalHit(state, add_rect, .project_import_submit, 0);
+    y += theme.scaledUi(46.0);
+    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
+    drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
+    queueModalHit(state, cancel_rect, .project_import_cancel, 0);
 }
 
 fn renderTranscriptSelectionModal(state: *runtime.AppState, width: f32, height: f32) void {
