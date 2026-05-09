@@ -829,12 +829,17 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
 
 fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
     if (!event.down or event.repeat) return false;
-    if (event.key != .a) return false;
+    const key_is_a = event.key == .a or event.scancode == .a;
+    if (!key_is_a) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
     if (state.composer_focused) return false;
     if (state.terminal_focused) return false;
     if (state.isBrowserPaneFocused()) return false;
-    if (!state.isTranscriptFocused()) return false;
+    const over_transcript = state.palette_mouse_in_workspace and
+        chat_panel_ui.pointerOverTranscript(state.palette_mouse_x, state.palette_mouse_y);
+    if (!state.transcript_focused and !state.transcriptMarkdownSelectionActive() and !over_transcript) {
+        return false;
+    }
     if (!chat_panel_ui.selectAllTranscriptMarkdownInThread(state)) return false;
     state.markDirty();
     return true;
