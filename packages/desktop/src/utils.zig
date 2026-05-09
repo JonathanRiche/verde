@@ -488,6 +488,12 @@ pub fn runSendWorker(
                 .launch_on_connect = true,
             },
         },
+        .cursor => ai_harness.ProviderConfig{
+            .cursor = .{
+                .cwd = request.project_path,
+                .model = request.model_ref,
+            },
+        },
     };
 
     log.info(
@@ -979,6 +985,18 @@ fn formatSendWorkerError(
         error.OpencodeEmptyReply => allocator.dupe(
             u8,
             "OpenCode ended the turn without producing any output. Please retry the prompt.",
+        ),
+        error.CursorAttachmentsUnsupported => allocator.dupe(
+            u8,
+            "Cursor does not currently support local image attachments through this provider.",
+        ),
+        error.CursorSignedOut => allocator.dupe(
+            u8,
+            "Cursor is not authenticated. Set CURSOR_API_KEY or sign in before sending.",
+        ),
+        error.CursorBridgeFailed => allocator.dupe(
+            u8,
+            "Cursor provider request failed. Check Cursor authentication and @cursor/sdk availability.",
         ),
         else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
     };

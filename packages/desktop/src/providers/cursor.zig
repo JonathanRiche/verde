@@ -86,6 +86,8 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
+        if (hasPromptAttachments(request)) return error.CursorAttachmentsUnsupported;
+
         const bridge_response = try self.runBridge(.send_prompt, allocator, .{
             .request = request,
         });
@@ -156,6 +158,10 @@ pub const Client = struct {
 };
 
 pub fn shutdownOwnedServer() void {}
+
+fn hasPromptAttachments(request: provider_types.SendPromptRequest) bool {
+    return request.image != null or request.images.len > 0;
+}
 
 const BridgeResponse = struct {
     thread_id: []u8 = &.{},
@@ -277,6 +283,21 @@ fn parseBridgeEventsAlloc(
             }
             continue;
         }
+        if (std.mem.eql(u8, event_type, "command")) {
+            const body = getOptionalObjectString(parsed.value, "command") orelse getOptionalObjectString(parsed.value, "body") orelse continue;
+            const failed = getOptionalObjectBool(parsed.value, "failed") orelse false;
+            if (request) |send_request| {
+                if (send_request.on_stream_event) |on_stream_event| {
+                    on_stream_event(send_request.stream_context, .{
+                        .message = .{
+                            .title = if (failed) "Command failed" else "Ran command",
+                            .body = body,
+                        },
+                    });
+                }
+            }
+            continue;
+        }
         if (std.mem.eql(u8, event_type, "items")) {
             const json = getObjectField(parsed.value, "items") orelse continue;
             response.items = try std.json.Stringify.valueAlloc(allocator, json, .{ .whitespace = .minified });
@@ -328,6 +349,14 @@ fn getOptionalObjectInteger(value: std.json.Value, key: []const u8) ?i64 {
     const field = getObjectField(value, key) orelse return null;
     return switch (field) {
         .integer => |number| number,
+        else => null,
+    };
+}
+
+fn getOptionalObjectBool(value: std.json.Value, key: []const u8) ?bool {
+    const field = getObjectField(value, key) orelse return null;
+    return switch (field) {
+        .bool => |boolean| boolean,
         else => null,
     };
 }
@@ -583,4 +612,55 @@ test "makeBridgeRequestJsonAlloc keeps cursor model and cwd" {
     try std.testing.expectEqualStrings("/tmp/project", getOptionalObjectString(parsed.value, "cwd").?);
     try std.testing.expectEqualStrings("composer-2", getOptionalObjectString(parsed.value, "model").?);
     try std.testing.expectEqualStrings("send_prompt", getOptionalObjectString(parsed.value, "command").?);
+}
+
+test "hasPromptAttachments rejects legacy and multi image requests" {
+    try std.testing.expect(!hasPromptAttachments(.{ .prompt = "text only" }));
+    try std.testing.expect(hasPromptAttachments(.{
+        .prompt = "legacy",
+        .image = .{ .path = "/tmp/one.png" },
+    }));
+
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/one.png" },
+        .{ .path = "/tmp/two.png" },
+    };
+    try std.testing.expect(hasPromptAttachments(.{
+        .prompt = "multi",
+        .images = images[0..],
+    }));
+}
+
+test "parseBridgeEventsAlloc maps command events to stream events" {
+    const Context = struct {
+        title: []const u8 = "",
+        body: []const u8 = "",
+
+        fn onEvent(raw: ?*anyopaque, event: provider_types.StreamEvent) void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw orelse return));
+            switch (event) {
+                .message => |message| {
+                    ctx.title = message.title;
+                    ctx.body = message.body;
+                },
+                .diff => {},
+            }
+        }
+    };
+
+    var ctx: Context = .{};
+    const payload =
+        \\{"type":"thread","threadId":"agent_123"}
+        \\{"type":"command","command":"bash -lc zig build test","failed":true}
+        \\
+    ;
+    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, .{
+        .prompt = "hello",
+        .stream_context = &ctx,
+        .on_stream_event = Context.onEvent,
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Command failed", ctx.title);
+    try std.testing.expectEqualStrings("bash -lc zig build test", ctx.body);
 }
