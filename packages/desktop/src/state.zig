@@ -119,6 +119,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
+    .menu_background_color = .{ .r = 0.075, .g = 0.09, .b = 0.105, .a = 1.0 },
+    .menu_border_color = .{ .r = 0.28, .g = 0.34, .b = 0.38, .a = 1.0 },
+    .menu_selected_color = .{ .r = 0.19, .g = 0.31, .b = 0.39, .a = 1.0 },
+    .menu_hover_color = .{ .r = 0.17, .g = 0.20, .b = 0.24, .a = 1.0 },
     .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .stop_button_color = .{ .r = 0.80, .g = 0.58, .b = 0.10, .a = 1.0 },
@@ -137,6 +141,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .chevron_icon = ">",
     .send_icon = "",
     .stop_icon = "x",
+    .z_index = 120,
 });
 
 const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
@@ -436,9 +441,9 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .row_leading_width = 34.0,
     .row_leading_to_label_gap = 8.0,
     .render_row_leading = paletteModelCascadeRenderRowLeading,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 },
     .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 },
     .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
     .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
@@ -446,8 +451,8 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .scrollbar_width = 5.0,
     .corner_radius = 14.0,
     .border_width = 1.0,
-    .z_index = 200,
-    .submenu_z_offset = 10,
+    .z_index = 1400,
+    .submenu_z_offset = 20,
     .placement = .above,
     .submenu_placement = .right,
     .item_count = COMPOSER_PROVIDER_OPTIONS.len,
@@ -5066,6 +5071,8 @@ pub const AppState = struct {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
         self.syncPaletteModelCascadeMenu();
         self.setPaletteModelCascadeBoundsFromToolbar();
         _ = self.palette_model_cascade.handleInput(.open);
@@ -5088,6 +5095,13 @@ pub const AppState = struct {
                 }
             }
         }
+    }
+
+    fn currentThreadNeedsProviderModelCascade(self: *const AppState) bool {
+        const thread = self.currentThread();
+        return thread.messages.items.len == 0 and
+            thread.provider_thread_id == null and
+            !thread.isSendPendingForUi();
     }
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
@@ -5156,7 +5170,7 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point)) {
+        if (self.composer_toolbar_model_rect.contains(point) and self.currentThreadNeedsProviderModelCascade()) {
             self.openPaletteModelCascadeMenu();
             self.palette_composer.focused = false;
             self.composer_focused = false;
@@ -5174,6 +5188,7 @@ pub const AppState = struct {
         else
             return false;
 
+        _ = self.palette_model_cascade.handleInput(.close);
         const target_point: palette.draw.Vec2 = .{
             .x = target.x + target.w * 0.5,
             .y = target.y + target.h * 0.5,
