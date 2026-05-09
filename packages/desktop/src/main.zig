@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const sdl = @import("zsdl3");
-const zgui = @import("zgui");
 
 const app_config = @import("config.zig");
 const browser_runtime = @import("browser/mod.zig");
@@ -15,6 +14,10 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const sidebar_ui = @import("ui/sidebar.zig");
+const chat_panel_ui = @import("ui/chat_panel.zig");
+const browser_ui = @import("ui/browser.zig");
+const debug_ui = @import("ui/debug.zig");
 const palette_gl_renderer = @import("ui/palette_gl_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
@@ -37,6 +40,7 @@ pub const std_options: std.Options = .{
 pub const panic = std.debug.FullPanic(runtime_log.panicFn);
 
 const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+const GL_MULTISAMPLE: u32 = 0x809D;
 
 const DEFAULT_FONT_SIZE: f32 = ui_theme.DEFAULT_FONT_SIZE;
 const DEFAULT_WINDOW_WIDTH: c_int = 1360;
@@ -57,6 +61,8 @@ const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.
 
 extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
 extern fn glClear(mask: u32) void;
+extern fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int) void;
+extern fn glEnable(cap: u32) void;
 
 const WindowFrame = struct {
     x: c_int,
@@ -91,6 +97,9 @@ pub fn main(init: std.process.Init) !void {
     try sdl.gl.setAttribute(.context_major_version, 3);
     try sdl.gl.setAttribute(.context_minor_version, 3);
     try sdl.gl.setAttribute(.doublebuffer, 1);
+    // Default framebuffer MSAA: smooths vector edges (composer send/stop, rounded UI).
+    try sdl.gl.setAttribute(.multisamplebuffers, 1);
+    try sdl.gl.setAttribute(.multisamplesamples, 4);
     switch (@import("builtin").os.tag) {
         .macos => try sdl.gl.setAttribute(.context_profile_mask, @intFromEnum(sdl.gl.Profile.core)),
         else => {},
@@ -116,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     const gl_context = try sdl.gl.createContext(window);
     defer sdl.gl.destroyContext(gl_context);
     try sdl.gl.makeCurrent(window, gl_context);
+    glEnable(GL_MULTISAMPLE);
     try sdl.gl.setSwapInterval(1);
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
@@ -123,10 +133,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
 
-    //NOTE: Initialize the core ImGui/zgui context and allocate its global state.
-    zgui.init(allocator);
-    defer zgui.deinit();
-    // Install the font atlas used by the desktop UI before the backend starts rendering.
+    // Install the font metrics used by the Palette desktop UI.
     ui_theme.installFonts(
         CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
         NOTO_SANS_BOLD_BYTES[0..NOTO_SANS_BOLD_BYTES.len],
@@ -136,9 +143,6 @@ pub fn main(init: std.process.Init) !void {
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
         loaded_app_config.font_size,
     );
-    // Bind ImGui to the SDL window and OpenGL context so frames can be drawn.
-    zgui.backend.init(window, gl_context);
-    defer zgui.backend.deinit();
     var palette_renderer = palette_gl_renderer.Renderer.init();
     defer palette_renderer.deinit(allocator);
 
@@ -158,6 +162,8 @@ pub fn main(init: std.process.Init) !void {
 
     var running = true;
     var needs_render = true;
+    var last_framebuffer_width: c_int = 0;
+    var last_framebuffer_height: c_int = 0;
     while (running) {
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
@@ -191,7 +197,16 @@ pub fn main(init: std.process.Init) !void {
             }
         }.run, .{&state});
 
-        needs_render = needs_render or had_event or appNeedsContinuousFrames(&state);
+        var observed_fb_width: c_int = 0;
+        var observed_fb_height: c_int = 0;
+        getWindowSizeInPixels(window, &observed_fb_width, &observed_fb_height);
+        const framebuffer_size_changed = observed_fb_width != last_framebuffer_width or observed_fb_height != last_framebuffer_height;
+        if (framebuffer_size_changed) {
+            last_framebuffer_width = observed_fb_width;
+            last_framebuffer_height = observed_fb_height;
+        }
+
+        needs_render = needs_render or had_event or framebuffer_size_changed or appNeedsContinuousFrames(&state);
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             continue;
@@ -214,11 +229,11 @@ pub fn main(init: std.process.Init) !void {
                     current_scale.* = next_ui_scale;
                     ui_theme.applyTheme(current_scale.*);
                 }
-
-                zgui.backend.newFrame(@intCast(framebuffer_width.*), @intCast(framebuffer_height.*));
+                glViewport(0, 0, framebuffer_width.*, framebuffer_height.*);
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
         state.palette_overlay_batch.clear();
+        state.palette_frame_text.clearRetainingCapacity();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {
@@ -241,7 +256,6 @@ pub fn main(init: std.process.Init) !void {
                 framebuffer_width: c_int,
                 framebuffer_height: c_int,
             ) void {
-                zgui.backend.draw();
                 palette_command_renderer.renderBatch(
                     allocator_arg,
                     &app_state.palette_overlay_batch,
@@ -430,19 +444,19 @@ fn processOneEvent(
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.hasAnyPendingSends() or
         state.isPickerPending() or
+        state.isBrowserVisible() or
         state.hasVisibleTerminalSessions() or
         state.transcriptMarkdownSelectionDragging();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
 }
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
-    _ = zgui.backend.processEvent(event);
     switch (event.type) {
         .quit => return false,
         .key_down => {
@@ -453,8 +467,25 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 );
             }
             const action = keyboard.actionForEvent(&event.key);
+            const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
+            logPasteShortcutEvent(state, &event.key, paste_shortcut);
+            if (paste_shortcut) {
+                if (state.attachClipboardImageToCurrentDraft()) return true;
+                if (state.pasteClipboardTextIntoPaletteComposer()) return true;
+            }
+            if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (handleFontSizeShortcut(state, &event.key)) {
+                return true;
+            }
             if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .new_thread) {
                 handleKeyboardAction(state, keyboard, action.?);
+                return true;
+            }
+            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
                 return true;
             }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
@@ -465,10 +496,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (terminal_key_handled) {
                 return true;
             }
-            if (shouldPasteClipboardImage(state, &event.key)) {
-                state.attachClipboardImageToCurrentDraft();
-                return true;
-            }
             if (handleFileSearchNavigation(state, &event.key)) {
                 return true;
             }
@@ -476,6 +503,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handleComposerFocusShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleTranscriptMarkdownCopyShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleTranscriptMarkdownSelectAllShortcut(state, &event.key)) {
                 return true;
             }
             if (state.routePaletteComposerKeyDown(&event.key)) {
@@ -510,11 +543,19 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     .{ text_input, state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
+            if (ui_layout.handlePaletteTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             const browser_text_handled = state.handleBrowserKey(.{
                 .key_code = 0,
                 .text = text_input,
                 .pressed = true,
             });
+            if (browser_ui.handlePaletteTextInput(state, text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (browser_text_handled) {
                 return true;
             }
@@ -528,12 +569,24 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_motion => {
+            state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
+            chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
+            browser_ui.handlePaletteMouseMotion(event.motion.x, event.motion.y);
+            sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
                 return true;
             }
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and debug_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (browserInputDebugEnabled()) {
                 log.info(
                     "browser-input sdl mouse_button down={} button={} x={d:.1} y={d:.1} contains={} focused={}",
@@ -547,11 +600,37 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     },
                 );
             }
+            if (event.button.button == 1 and browser_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             const handled = state.handleBrowserMouse(browserMouseButtonEvent(&event.button));
             if (!handled and event.button.down) {
                 state.unfocusBrowserPane();
             }
             if (handled) {
+                return true;
+            }
+            if (event.button.button == 1 and sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and chat_panel_ui.handleFileSearchPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and chat_panel_ui.handleTranscriptPaletteMouseButton(
+                state,
+                event.button.x,
+                event.button.y,
+                event.button.down,
+                event.button.clicks,
+            )) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and state.handleComposerDraftImageClearMouseButton(event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
                 return true;
             }
             if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
@@ -561,6 +640,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             syncWindowTextInput(window, state);
         },
         .mouse_wheel => {
+            if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
+            if (chat_panel_ui.handleTranscriptPaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
             if (state.routePaletteComposerWheel(&event.wheel, ui_scale)) {
                 return true;
             }
@@ -581,7 +666,7 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused() and !state.palette_composer.focused) return;
+    if (!state.isBrowserPaneFocused() and !state.palette_composer.focused and !state.browser_address_focused and state.palette_modal_text_focus == .none) return;
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
@@ -667,10 +752,31 @@ fn keymodBits(modifier_state: sdl.Keymod) u16 {
 }
 
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
-    if (!state.composer_focused) return false;
+    if (state.isBrowserPaneFocused() or state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
+}
+
+fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
+    if (event.scancode != .v and event.key != .v) return;
+    const mod_bits = keymodBits(event.mod);
+    runtime_log.diagnostic(
+        "paste key event key={s} scancode={s} down={} repeat={} mod=0x{x} matched={} composer_focused={} palette_composer_focused={} browser_focused={} address_focused={} modal_focus={s}",
+        .{
+            @tagName(event.key),
+            @tagName(event.scancode),
+            event.down,
+            event.repeat,
+            mod_bits,
+            matched,
+            state.composer_focused,
+            state.palette_composer.focused,
+            state.isBrowserPaneFocused(),
+            state.browser_address_focused,
+            @tagName(state.palette_modal_text_focus),
+        },
+    );
 }
 
 fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent) bool {
@@ -721,6 +827,46 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     return true;
 }
 
+fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    const key_is_a = event.key == .a or event.scancode == .a;
+    if (!key_is_a) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (state.composer_focused) return false;
+    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused()) return false;
+    const over_transcript = state.palette_mouse_in_workspace and
+        chat_panel_ui.pointerOverTranscript(state.palette_mouse_x, state.palette_mouse_y);
+    if (!state.transcript_focused and !state.transcriptMarkdownSelectionActive() and !over_transcript) {
+        return false;
+    }
+    if (!chat_panel_ui.selectAllTranscriptMarkdownInThread(state)) return false;
+    state.markDirty();
+    return true;
+}
+
+fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (event.key != .c) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (state.composer_focused) return false;
+    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused()) return false;
+    if (!state.transcriptMarkdownSelectionActive()) return false;
+
+    const maybe = chat_panel_ui.transcriptMarkdownSelectionPlainText(state) catch return false;
+    const plain = maybe orelse return false;
+    defer state.allocator.free(plain);
+    const z = state.allocator.dupeZ(u8, plain) catch return false;
+    defer state.allocator.free(z);
+    sdl.setClipboardText(z) catch |err| {
+        log.warn("failed to set transcript markdown selection clipboard: {s}", .{@errorName(err)});
+        return true;
+    };
+    state.markDirty();
+    return true;
+}
+
 fn isCtrlPressed() bool {
     const keyboard_state = sdl.getKeyboardState();
     return keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
@@ -728,7 +874,7 @@ fn isCtrlPressed() bool {
 
 fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
     if (builtin.os.tag != .macos) {
-        return isCtrlPressed();
+        return isCtrlPressed() or isKeymodPressed(modifier_state, sdl.Keymod.ctrl);
     }
 
     return isKeymodPressed(modifier_state, sdl.Keymod.gui);
@@ -761,11 +907,36 @@ fn handleKeyboardAction(
     }
 }
 
+fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    const delta: f32 = switch (event.key) {
+        .plus, .kp_plus, .equals => 1.0,
+        .minus, .kp_minus => -1.0,
+        else => return false,
+    };
+    const current = state.app_config.font_size;
+    const next = clampf(current + delta, 11.0, 24.0);
+    if (@abs(next - current) < 0.01) return true;
+    state.app_config.font_size = next;
+    ui_theme.installFonts(
+        CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
+        NOTO_SANS_BOLD_BYTES[0..NOTO_SANS_BOLD_BYTES.len],
+        NOTO_SANS_ITALIC_BYTES[0..NOTO_SANS_ITALIC_BYTES.len],
+        NOTO_SANS_BOLD_ITALIC_BYTES[0..NOTO_SANS_BOLD_ITALIC_BYTES.len],
+        CODICON_BYTES[0..CODICON_BYTES.len],
+        NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
+        next,
+    );
+    state.markDirty();
+    return true;
+}
+
 fn canHandleTranscriptScrollAction(state: *const AppState) bool {
     if (state.projects.items.len == 0) return false;
     if (state.isBrowserPaneFocused()) return false;
     if (state.terminal_focused) return false;
-    return !zgui.io.getWantCaptureKeyboard();
+    return !state.composer_focused and state.palette_modal_text_focus == .none;
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {

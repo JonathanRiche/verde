@@ -984,7 +984,7 @@ extern "C" int verde_cef_send_mouse_wheel(double x,
   sendFocusToBrowser();
   const CefMouseEvent event = makeMouseEvent(x, y, modifiers);
   const int wheel_x = static_cast<int>(delta_x * 120.0);
-  const int wheel_y = static_cast<int>(-delta_y * 120.0);
+  const int wheel_y = static_cast<int>(delta_y * 120.0);
   g_runtime.browser->GetHost()->SendMouseWheelEvent(event, wheel_x, wheel_y);
   return 1;
 }

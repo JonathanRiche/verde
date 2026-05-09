@@ -147,7 +147,7 @@ pub const Client = struct {
         defer threads.deinit(allocator);
 
         var thread_rows = try self.conn.rows(
-            "select id, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
+            "select id, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
                 "from threads where project_id = ?1 order by sort_index",
             .{project_id},
         );
@@ -163,16 +163,17 @@ pub const Client = struct {
                 .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(5)),
                 .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(6)),
                 .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(7)),
-                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(8)),
-                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(9)),
-                .provider = decodeEnumOr(db_types.Provider, thread_row.int(10), .opencode),
-                .harness = decodeEnumOr(db_types.Harness, thread_row.int(11), .local_cli),
-                .draft = try allocator.dupe(u8, thread_row.text(12)),
+                .reasoning_variant = try dupeOptionalText(allocator, thread_row.nullableText(8)),
+                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(9)),
+                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(10)),
+                .provider = decodeEnumOr(db_types.Provider, thread_row.int(11), .opencode),
+                .harness = decodeEnumOr(db_types.Harness, thread_row.int(12), .local_cli),
+                .draft = try allocator.dupe(u8, thread_row.text(13)),
                 .draft_image = try loadOptionalImage(
                     allocator,
-                    thread_row.nullableText(13),
                     thread_row.nullableText(14),
-                    thread_row.nullableInt(15),
+                    thread_row.nullableText(15),
+                    thread_row.nullableInt(16),
                 ),
                 .messages = try self.loadMessages(allocator, thread_id),
             });
@@ -247,8 +248,8 @@ pub const Client = struct {
         for (threads, 0..) |thread, thread_index| {
             const draft_image = thread.draft_image;
             try self.conn.exec(
-                "insert into threads (project_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "insert into threads (project_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 .{
                     project_id,
                     @as(i64, @intCast(thread_index)),
@@ -259,6 +260,7 @@ pub const Client = struct {
                     thread.provider_thread_id,
                     thread.model_ref,
                     encodeOptionalEnum(thread.reasoning_effort),
+                    thread.reasoning_variant,
                     encodeOptionalEnum(thread.fast_mode),
                     encodeOptionalEnum(thread.access_mode),
                     @as(i64, @intFromEnum(thread.provider)),

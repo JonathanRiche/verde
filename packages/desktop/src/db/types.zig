@@ -52,6 +52,8 @@ pub const PersistedThread = struct {
     provider_thread_id: ?[]const u8 = null,
     model_ref: ?[]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
+    /// OpenCode JSON `variant` string when the model exposes variant keys (distinct from Codex `reasoning_effort`).
+    reasoning_variant: ?[]const u8 = null,
     fast_mode: ?FastMode = null,
     access_mode: ?AccessMode = null,
     provider: Provider = .opencode,

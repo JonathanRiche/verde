@@ -60,6 +60,7 @@ Run the visual labs:
 
 ```bash
 zig build run-text-area-lab
+zig build run-text-lab
 zig build run-component-lab
 zig build run-layout-lab
 zig build run-composer-prompt-lab
@@ -256,6 +257,36 @@ Palette owns text layout for retained controls. Components do not ask the host t
 recompute wrapping, cursor placement, selection rectangles, or scroll offsets.
 Instead, the host can provide font metrics and Palette emits laid-out text runs in
 the render batch.
+
+For app text outside retained controls, use `palette.TextStack` instead of
+measuring or baking fonts in the app:
+
+```zig
+const font = palette.TextFontFace.defaultUi(font_bytes, 16);
+try palette.TextStack.appendTextToBatch(allocator, &batch, .{
+    .rect = text_rect,
+    .text = "UTF-8 text: 界面 🙂",
+    .color = palette.Color.white,
+    .font = &font,
+    .wrap = true,
+});
+```
+
+`TextStack` decodes UTF-8 scalar values. Invalid byte sequences become U+FFFD by
+default, or can be skipped with `DecodePolicy.skip`. NBSP is measured as a space
+that remains part of the run. CJK and emoji codepoints use deterministic fallback
+advances unless a backend supplies tighter font metrics. Full complex shaping
+such as RTL reordering, ligatures, and combining mark positioning is out of
+scope for this stack.
+
+Migration note for custom GL text: delete app-local text measurement and font
+baking code such as `palette_text_gl.c`. Keep submitting `RenderBatch` commands,
+or call `palette.TextStack.appendTextToBatch()` for manual text. In the renderer,
+draw `command.text_runs` exactly as positioned by Palette. A GL backend can keep
+its shader/texture upload code, but the canonical source of UTF-8 decoding,
+wrapping, line height, and advances is `palette.TextStack`; do not re-wrap or
+re-measure in the app renderer. `zig build run-text-lab` prints a wrapped UTF-8
+batch that renderer implementations can use as a minimal reference.
 
 Use fixed metrics for monospace/debug renderers:
 

@@ -11,12 +11,6 @@
         .palette = .{
             .path = "../palette",
         },
-        .zgui_text_select = .{
-            .path = "../zgui_text_select",
-        },
-        .zgui = .{
-            .path = "../zgui",
-        },
         .zsdl = .{
             .path = "../zsdl",
         },

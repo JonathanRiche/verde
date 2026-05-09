@@ -90,12 +90,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .palette_mod = palette_mod,
     });
+    const text_lab = addCliExample(b, .{
+        .name = "palette-text-lab",
+        .root_source_file = "examples/text_lab.zig",
+        .target = target,
+        .optimize = optimize,
+        .palette_mod = palette_mod,
+    });
     const run_text_area_lab_step = b.step("run-text-area-lab", "Run the Text/TextArea component lab");
     const run_component_lab_step = b.step("run-component-lab", "Run the retained component visual lab");
     const run_layout_lab_step = b.step("run-layout-lab", "Run the runtime layout visual lab");
     const run_composer_prompt_lab_step = b.step("run-composer-prompt-lab", "Run the composer prompt visual lab");
     const run_layout_review_step = b.step("run-layout-review", "Run the runtime layout review example");
     const run_composer_prompt_review_step = b.step("run-composer-prompt-review", "Run the composer prompt review example");
+    const run_text_lab_step = b.step("run-text-lab", "Run the UTF-8 text batch lab");
     const examples_step = b.step("examples", "Build palette examples");
     wireExampleRun(b, text_area_lab, run_text_area_lab_step, examples_step);
     wireExampleRun(b, component_lab, run_component_lab_step, examples_step);
@@ -103,6 +111,7 @@ pub fn build(b: *std.Build) void {
     wireExampleRun(b, composer_prompt_lab, run_composer_prompt_lab_step, examples_step);
     wireExampleRun(b, layout_review, run_layout_review_step, examples_step);
     wireExampleRun(b, composer_prompt_review, run_composer_prompt_review_step, examples_step);
+    wireExampleRun(b, text_lab, run_text_lab_step, examples_step);
     examples_step.dependOn(font_loading_check.step);
 
     const component_catalog_tests = b.addTest(.{
