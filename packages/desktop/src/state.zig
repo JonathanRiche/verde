@@ -1392,6 +1392,12 @@ pub const SidebarThreadHover = struct {
     thread_index: usize,
 };
 
+pub const SidebarContextMenuKind = enum {
+    none,
+    project,
+    thread,
+};
+
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1495,6 +1501,12 @@ pub const AppState = struct {
     browser_inspector_menu_open: bool,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
+    sidebar_context_menu_open: bool,
+    sidebar_context_menu_kind: SidebarContextMenuKind,
+    sidebar_context_menu_project_index: usize,
+    sidebar_context_menu_thread_index: usize,
+    sidebar_context_menu_anchor_x: f32,
+    sidebar_context_menu_anchor_y: f32,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1627,6 +1639,12 @@ pub const AppState = struct {
             .browser_address_cursor = 0,
             .browser_inspector_menu_open = false,
             .workspace_header_open_menu_open = false,
+            .sidebar_context_menu_open = false,
+            .sidebar_context_menu_kind = .none,
+            .sidebar_context_menu_project_index = 0,
+            .sidebar_context_menu_thread_index = 0,
+            .sidebar_context_menu_anchor_x = 0.0,
+            .sidebar_context_menu_anchor_y = 0.0,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -3735,6 +3753,13 @@ pub const AppState = struct {
     pub fn blurPaletteComposer(self: *AppState) void {
         self.palette_composer.focused = false;
         self.composer_focused = false;
+    }
+
+    pub fn closeSidebarContextMenu(self: *AppState) void {
+        if (!self.sidebar_context_menu_open) return;
+        self.sidebar_context_menu_open = false;
+        self.sidebar_context_menu_kind = .none;
+        self.markDirty();
     }
 
     pub fn selectAllTranscriptMarkdownSelection(
