@@ -127,8 +127,14 @@ pub fn handleFileSearchPaletteMouseButton(_: *app_state.AppState, _: f32, _: f32
     return false;
 }
 
+/// True when `(x, y)` lies inside the transcript pane last painted by `renderTranscript`.
+pub fn pointerOverTranscript(x: f32, y: f32) bool {
+    return rectContains(transcript_rect, x, y);
+}
+
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or !rectContains(transcript_rect, x, y)) return false;
+    state.transcript_focused = true;
     const current = state.currentTranscriptScrollY() orelse 0.0;
     state.rememberCurrentTranscriptScroll(@max(0.0, current - wheel_y * theme.scaledUi(64.0)));
     state.transcript_auto_follow_pending = false;
