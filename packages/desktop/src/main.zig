@@ -629,6 +629,17 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handled) {
                 return true;
             }
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                !sidebar_ui.pointerOverSidebar(event.button.x, event.button.y))
+            {
+                state.closeSidebarContextMenu();
+            }
+            if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
+                sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             // Workspace header (Open / Browser) must run before the sidebar rail so hits are never
             // swallowed by expanded sidebar geometry or rail chrome.
             if (event.button.button == 1 and chat_panel_ui.handleWorkspaceHeaderPaletteMouseButton(
