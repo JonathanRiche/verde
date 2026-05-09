@@ -26,6 +26,39 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerThreadImportModalHits(state, width, height);
 }
 
+/// Updates import-modal thread list hover using hits from `refreshPaletteModalHits`.
+pub fn updateThreadImportModalHover(state: *runtime.AppState, x: f32, y: f32) void {
+    if (state.thread_import_provider == null) {
+        if (state.thread_import_hover_index != null) {
+            state.thread_import_hover_index = null;
+            state.markDirty();
+        }
+        return;
+    }
+
+    var new_hover: ?usize = null;
+    var i = state.palette_modal_hits.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = state.palette_modal_hits.items[i];
+        if (hit.action != .thread_import_select) continue;
+        if (!rectContainsModalPoint(hit.rect, x, y)) continue;
+        new_hover = hit.index;
+        break;
+    }
+    if (new_hover) |hi| {
+        if (hi >= state.thread_import_threads.items.len) new_hover = null;
+    }
+
+    if (state.thread_import_hover_index == new_hover) return;
+    state.thread_import_hover_index = new_hover;
+    state.markDirty();
+}
+
+fn rectContainsModalPoint(rect: palette.Rect, x: f32, y: f32) bool {
+    return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
+}
+
 /// Lays out the root window and routes to the main UI regions.
 pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     state.resetUiDebugFrame();
@@ -623,9 +656,21 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
             if (row.y + row.h > list_rect.y + list_rect.h) break;
             const selected = state.thread_import_selected_index != null and state.thread_import_selected_index.? == index;
-            if (selected) queuePaletteRoundedRect(state, row, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0));
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, thread.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_rect);
-            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, thread.id, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), list_rect);
+            const row_hovered = state.thread_import_hover_index != null and state.thread_import_hover_index.? == index;
+            if (selected) {
+                const sel_bg = if (row_hovered)
+                    paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10))
+                else
+                    paletteColor(theme.COLOR_PANEL_MUTED);
+                queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
+            } else if (row_hovered) {
+                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.14)), theme.scaledUi(6.0));
+                queuePaletteBorder(state, row, paletteColor(theme.lighten(colors.DARK_BLUE, 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+            }
+            const title_col = paletteColor(theme.COLOR_WHITE);
+            const id_col = paletteColor(if (row_hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, thread.title, title_col, theme.scaledUi(13.0), list_rect);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, thread.id, id_col, theme.scaledUi(12.0), list_rect);
         }
     }
 

@@ -1481,6 +1481,8 @@ pub const AppState = struct {
     thread_import_provider: ?Provider,
     thread_import_project_index: ?usize,
     thread_import_selected_index: ?usize,
+    /// Row index in `thread_import_threads` under the cursor (import modal list).
+    thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
     project_directory_browse_requested: bool,
@@ -1621,6 +1623,7 @@ pub const AppState = struct {
             .thread_import_provider = null,
             .thread_import_project_index = null,
             .thread_import_selected_index = null,
+            .thread_import_hover_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
             .project_directory_browse_requested = false,
@@ -5645,6 +5648,7 @@ pub const AppState = struct {
         }
         self.thread_import_threads.clearRetainingCapacity();
         self.thread_import_selected_index = null;
+        self.thread_import_hover_index = null;
     }
 
     pub fn flushIfDirty(self: *AppState) void {
