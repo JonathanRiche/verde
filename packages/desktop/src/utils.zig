@@ -931,8 +931,34 @@ fn executableTargetBasenameAlloc(allocator: std.mem.Allocator, resolved_path: []
     return try allocator.dupe(u8, std.fs.path.basename(resolved_path));
 }
 
-/// Cursor IDE ships a `cursor` CLI; `cursor-agent` is a separate automation CLI without the desktop app.
-/// Only treat PATH `cursor` as the IDE when the resolved target is not `cursor-agent`.
+fn resolvedPathLooksLikeCursorIdeBinary(resolved_path: []const u8) bool {
+    switch (builtin.os.tag) {
+        .windows => {
+            const ext = std.fs.path.extension(resolved_path);
+            if (std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat"))
+                return false;
+            return true;
+        },
+        .macos => {
+            const fd = std.posix.openat(std.posix.AT.FDCWD, resolved_path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+            defer _ = std.c.close(fd);
+            var header: [4]u8 = undefined;
+            const n = std.posix.read(fd, &header) catch return false;
+            if (n >= 2 and header[0] == '#' and header[1] == '!') return false;
+            return true;
+        },
+        else => {
+            const fd = std.posix.openat(std.posix.AT.FDCWD, resolved_path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+            defer _ = std.c.close(fd);
+            var header: [4]u8 = undefined;
+            const n = std.posix.read(fd, &header) catch return false;
+            if (n >= 2 and header[0] == '#' and header[1] == '!') return false;
+            return n >= 4 and header[0] == 0x7f and header[1] == 'E' and header[2] == 'L' and header[3] == 'F';
+        },
+    }
+}
+
+/// Cursor IDE ships a native `cursor` CLI; `cursor-agent` / shell shims are not the desktop editor.
 fn hasCursorIdeCliResolved(allocator: std.mem.Allocator) bool {
     var env_map = process_env.buildAugmentedEnvMap(allocator) catch return false;
     defer env_map.deinit();
@@ -943,10 +969,12 @@ fn hasCursorIdeCliResolved(allocator: std.mem.Allocator) bool {
     const base = base_owned;
     if (std.ascii.eqlIgnoreCase(base, "cursor-agent") or std.ascii.eqlIgnoreCase(base, "cursor-agent.exe"))
         return false;
-    if (std.ascii.eqlIgnoreCase(base, "cursor") or std.ascii.eqlIgnoreCase(base, "cursor.exe"))
-        return true;
-    // Channel builds sometimes use `cursor-<channel>`; still exclude anything `cursor-agent*`.
-    return std.ascii.startsWithIgnoreCase(base, "cursor-") and !std.ascii.startsWithIgnoreCase(base, "cursor-agent");
+
+    const basename_ok = (std.ascii.eqlIgnoreCase(base, "cursor") or std.ascii.eqlIgnoreCase(base, "cursor.exe")) or
+        (std.ascii.startsWithIgnoreCase(base, "cursor-") and !std.ascii.startsWithIgnoreCase(base, "cursor-agent"));
+    if (!basename_ok) return false;
+
+    return resolvedPathLooksLikeCursorIdeBinary(resolved);
 }
 
 fn hasVsCodeExeResolved(allocator: std.mem.Allocator, exe_name: []const u8) bool {
