@@ -2206,7 +2206,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2321,7 +2321,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2397,7 +2397,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
