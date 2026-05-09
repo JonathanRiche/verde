@@ -1120,11 +1120,6 @@ fn renderOptionsGlyphWidth(options: RenderOptions) f32 {
     return options.glyph_width orelse options.base_font_size * 0.55;
 }
 
-const MarkdownCodeBgSpec = struct {
-    rect: palette.Rect,
-    radius: f32,
-};
-
 const MarkdownUnderlineSpec = struct {
     rect: palette.Rect,
     color: palette.Color,
@@ -1137,8 +1132,6 @@ fn renderPaletteTextBlockLayout(
     available_width: f32,
     options: RenderOptions,
 ) f32 {
-    var code_backgrounds: std.ArrayList(MarkdownCodeBgSpec) = .empty;
-    defer code_backgrounds.deinit(context.allocator);
     var underlines: std.ArrayList(MarkdownUnderlineSpec) = .empty;
     defer underlines.deinit(context.allocator);
     var text_runs: std.ArrayList(palette.TextRun) = .empty;
@@ -1150,25 +1143,11 @@ fn renderPaletteTextBlockLayout(
         options: RenderOptions,
         block_text: []const u8,
         text_runs: *std.ArrayList(palette.TextRun),
-        code_backgrounds: *std.ArrayList(MarkdownCodeBgSpec),
         underlines: *std.ArrayList(MarkdownUnderlineSpec),
 
         fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
             const px = ctx.start[0] + step.x;
             const py = ctx.start[1] + step.y;
-            if (step.inline_style.code) {
-                const code_font = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
-                const pill_r = @max(6.0, code_font * 0.32);
-                ctx.code_backgrounds.append(ctx.palette_context.allocator, .{
-                    .rect = .{
-                        .x = px - 3.0,
-                        .y = py + 1.0,
-                        .w = step.width + 6.0,
-                        .h = step.line_height - 2.0,
-                    },
-                    .radius = pill_r,
-                }) catch return;
-            }
 
             const draw_font_size = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
             const color = paletteColor(inlineTextColor(textBlockColor(step.block_style), step.inline_style));
@@ -1227,13 +1206,8 @@ fn renderPaletteTextBlockLayout(
         .options = options,
         .block_text = block.text,
         .text_runs = &text_runs,
-        .code_backgrounds = &code_backgrounds,
         .underlines = &underlines,
     }, RenderContext.onStep);
-
-    for (code_backgrounds.items) |spec| {
-        queuePaletteRoundedRect(context, spec.rect, paletteColor(colors.rgba(36, 39, 46, 255)), spec.radius);
-    }
 
     if (text_runs.items.len > 0) {
         // `block.text` is freed when the BodyView is deinit'd after this frame's layout
@@ -2207,15 +2181,6 @@ fn renderPaletteStyledChunk(
 ) void {
     const color = inlineTextColor(textBlockColor(block_style), inline_style);
     const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
-
-    if (inline_style.code) {
-        queuePaletteRoundedRect(context, .{
-            .x = position[0] - 3.0,
-            .y = position[1] + 1.0,
-            .w = width + 6.0,
-            .h = line_height - 2.0,
-        }, paletteColor(colors.rgba(36, 39, 46, 255)), 4.0);
-    }
 
     queuePaletteText(context, .{
         .x = position[0],
