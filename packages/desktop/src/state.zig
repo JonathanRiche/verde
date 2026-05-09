@@ -5556,11 +5556,11 @@ pub const AppState = struct {
     pub fn markDirty(self: *AppState) void {
         self.noteInteraction();
         self.dirty = true;
-        self.last_dirty_at_ms = 0;
+        self.last_dirty_at_ms = unixTimestampMs();
     }
 
     pub fn noteInteraction(self: *AppState) void {
-        self.last_interaction_at_ms = 0;
+        self.last_interaction_at_ms = unixTimestampMs();
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
@@ -5653,10 +5653,20 @@ pub const AppState = struct {
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
-        if (0 - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
-        if (0 - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+        const now = unixTimestampMs();
+        if (now - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (now - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
 
         self.flushDirtyNow();
+    }
+
+    fn flushDirtyBlocking(self: *AppState) void {
+        if (!self.dirty) return;
+        self.storage.save(self) catch |err| {
+            log.err("failed to save native state: {s}", .{@errorName(err)});
+            return;
+        };
+        self.dirty = false;
     }
 
     fn flushDirtyNow(self: *AppState) void {
@@ -5688,7 +5698,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
         }
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.clearProjects();
 
         if (try self.storage.load(self.allocator)) |persisted_value| {
@@ -5741,7 +5751,7 @@ pub const AppState = struct {
         self.finishOpencodeModelCacheThread();
         self.finishAllSendThreads();
         self.pollSend();
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
