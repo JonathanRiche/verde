@@ -7,6 +7,7 @@ pub fn providerLabel(provider: anytype) [:0]const u8 {
     return switch (provider) {
         .opencode => "OpenCode",
         .codex => "Codex",
+        .claude => "Claude",
     };
 }
 
@@ -31,6 +32,7 @@ pub fn modelOptions(comptime Option: type, provider: anytype, opencode_options: 
     return switch (provider) {
         .opencode => opencode_options,
         .codex => codex_options,
+        .claude => codex_options[0..0],
     };
 }
 

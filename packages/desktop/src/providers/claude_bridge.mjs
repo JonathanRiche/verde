@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
+import { randomUUID } from "node:crypto";
 
 async function loadSdk() {
   try {
@@ -33,10 +36,89 @@ function textFromContent(content) {
   return chunks.join("");
 }
 
+function mimeTypeForPath(path) {
+  switch (extname(path).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    default:
+      return undefined;
+  }
+}
+
+async function buildPrompt(request) {
+  const images = Array.isArray(request.images) ? request.images : [];
+  if (images.length === 0) return request.prompt;
+
+  const content = [];
+  if (request.prompt) content.push({ type: "text", text: request.prompt });
+  for (const image of images) {
+    const path = image?.path;
+    if (typeof path !== "string" || path.length === 0) {
+      throw new Error("Claude image attachment is missing a local path.");
+    }
+    const mediaType = mimeTypeForPath(path);
+    if (!mediaType) {
+      throw new Error(`Claude image attachment has an unsupported file type: ${path}`);
+    }
+    const bytes = await readFile(path);
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mediaType,
+        data: bytes.toString("base64"),
+      },
+    });
+  }
+
+  return (async function* promptMessages() {
+    yield {
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+    };
+  })();
+}
+
 function emitSdkMessage(message) {
   const role = roleFromSdkMessage(message);
   const text = textFromContent(message?.message?.content ?? message?.content);
   if (role && text) write({ type: "message", role, text });
+}
+
+function commandFromToolUse(item) {
+  if (item?.type !== "tool_use") return null;
+  const name = String(item.name ?? "").toLowerCase();
+  if (name !== "bash" && name !== "shell") return null;
+  const input = item.input ?? {};
+  return input.command ?? input.cmd ?? null;
+}
+
+function emitToolEvents(message, commandByToolUseId) {
+  const content = message?.message?.content ?? message?.content;
+  if (!Array.isArray(content)) return;
+  for (const item of content) {
+    const command = commandFromToolUse(item);
+    if (typeof command === "string" && command.length > 0) {
+      if (typeof item.id === "string") commandByToolUseId.set(item.id, command);
+      write({ type: "stream_event", title: "Ran command", body: command });
+      continue;
+    }
+    if (item?.type === "tool_result" && item.is_error === true) {
+      const failedCommand = commandByToolUseId.get(item.tool_use_id);
+      if (failedCommand) {
+        write({ type: "stream_event", title: "Command failed", body: failedCommand });
+      }
+    }
+  }
 }
 
 function permissionMode(approvalPolicy, sandboxMode) {
@@ -123,12 +205,13 @@ async function handleReadThread(sdk, request) {
 
 async function handleSendPrompt(sdk, request) {
   const query = sdk.query({
-    prompt: request.prompt,
+    prompt: await buildPrompt(request),
     options: buildOptions(request),
   });
 
   let sessionId = request.thread_id ?? null;
   let reply = "";
+  const commandByToolUseId = new Map();
   for await (const message of query) {
     if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
       sessionId = message.session_id;
@@ -141,6 +224,7 @@ async function handleSendPrompt(sdk, request) {
       continue;
     }
     emitSdkMessage(message);
+    emitToolEvents(message, commandByToolUseId);
     const delta = textFromContent(message?.message?.content ?? message?.content);
     if (message?.type === "assistant" && delta) {
       reply += delta;
