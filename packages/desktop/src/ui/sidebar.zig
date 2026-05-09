@@ -512,9 +512,13 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
     const hovered = if (state.sidebar_thread_hover) |h| h.project_index == project_index and h.thread_index == thread_index else false;
     if (selected) {
-        queuePaletteRoundedRect(state, rect, paletteColor(colors.DARK_BLUE), theme.scaledUi(4.0));
+        const bg = if (hovered)
+            paletteColor(theme.lighten(colors.DARK_BLUE, 0.09))
+        else
+            paletteColor(colors.DARK_BLUE);
+        queuePaletteRoundedRect(state, rect, bg, theme.scaledUi(4.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.CHAT_BLACK, 0.14)), theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.GREEN_600, 0.10)), theme.scaledUi(4.0));
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
@@ -525,12 +529,13 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(84.0)) / theme.scaledUi(7.0), 8.0));
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
 
+    const title_emphasis = selected or hovered;
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(24.0),
         .y = rect.y + theme.scaledUi(4.0),
         .w = rect.w - theme.scaledUi(86.0),
         .h = rect.h,
-    }, row_label, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
         .y = rect.y + theme.scaledUi(4.0),
