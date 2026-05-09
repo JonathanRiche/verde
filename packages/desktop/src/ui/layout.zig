@@ -15,12 +15,22 @@ const RootLayout = struct {
     workspace: palette.Rect,
 };
 
+/// Rebuilds palette modal hit targets from the current window size **before** SDL input is
+/// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
+pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    state.palette_modal_hits.clearRetainingCapacity();
+    registerImageModalHits(state, width, height);
+    registerTranscriptSelectionModalHits(state, width, height);
+    registerProjectAddModalHits(state, width, height);
+    registerProjectRenameModalHits(state, width, height);
+    registerThreadImportModalHits(state, width, height);
+}
+
 /// Lays out the root window and routes to the main UI regions.
 pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     state.resetUiDebugFrame();
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
-    state.palette_modal_hits.clearRetainingCapacity();
     sidebar.renderPalette(state, root_layout.sidebar);
     chat_panel.renderWorkspaceAt(state, root_layout.workspace);
     renderImageModal(state, width, height);
@@ -114,11 +124,15 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
     }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
 }
 
-fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect, dismissible: bool) void {
+fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
     queuePaletteRoundedRect(state, scrim, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.46 }, 0.0);
     queuePaletteRoundedRect(state, modal, paletteColor(colors.rgba(24, 25, 30, 248)), theme.scaledUi(16.0));
     queuePaletteBorder(state, modal, paletteColor(colors.rgba(74, 78, 88, 255)), theme.scaledUi(16.0), theme.scaledUi(1.0));
+}
+
+fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect, dismissible: bool) void {
+    const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
     if (dismissible) queueModalHit(state, scrim, .modal_dismiss, 0);
     queueModalHit(state, modal, .modal_block, 0);
 }
@@ -144,12 +158,17 @@ fn pointInRect(x: f32, y: f32, rect: palette.Rect) bool {
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (state.palette_modal_hits.items.len == 0) return false;
-    if (down) return true;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
         i -= 1;
         const hit = state.palette_modal_hits.items[i];
         if (!pointInRect(x, y, hit.rect)) continue;
+        if (hit.action == .project_import_browse) {
+            runtime.log.info("project import browse hit down={} x={d:.1} y={d:.1}", .{ down, x, y });
+            if (!down) state.requestBrowseForProjectDirectory();
+            return true;
+        }
+        if (!down) return true;
         switch (hit.action) {
             .image_close => state.closeImageModal(),
             .project_rename_cancel => state.cancelProjectRename(),
@@ -159,7 +178,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_cancel => state.cancelThreadImport(),
             .thread_import_submit => state.importSelectedThread(),
             .thread_import_select => state.selectThreadImport(hit.index),
-            .project_import_browse => state.browseForProjectDirectory(),
+            .project_import_browse => unreachable,
             .project_import_submit => {
                 state.importProjectFromInput() catch |err| {
                     runtime.log.warn("project import failed: {s}", .{@errorName(err)});
@@ -336,6 +355,112 @@ fn focusedTextLen(state: *runtime.AppState) usize {
     };
 }
 
+fn registerImageModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.modal_image_path == null) return;
+    const modal_padding_x: f32 = 22.0;
+    const modal_padding_y: f32 = 20.0;
+    const modal_width = @min(width * 0.78, 980.0);
+    const modal_height = @min(height * 0.82, 760.0);
+    const modal: palette.Rect = .{ .x = (width - modal_width) * 0.5, .y = (height - modal_height) * 0.5, .w = modal_width, .h = modal_height };
+    registerModalChromeHits(state, width, height, modal, true);
+    const content: palette.Rect = .{ .x = modal.x + modal_padding_x, .y = modal.y + modal_padding_y, .w = modal.w - modal_padding_x * 2.0, .h = modal.h - modal_padding_y * 2.0 };
+    const close_size: f32 = 28.0;
+    const close_rect: palette.Rect = .{ .x = content.x + content.w - close_size, .y = content.y, .w = close_size, .h = close_size };
+    queueModalHit(state, close_rect, .image_close, 0);
+}
+
+fn registerTranscriptSelectionModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.transcriptSelectionBuffer() == null) return;
+    const modal: palette.Rect = .{ .x = (width - @min(width * 0.76, theme.scaledUi(980.0))) * 0.5, .y = (height - @min(height * 0.8, theme.scaledUi(760.0))) * 0.5, .w = @min(width * 0.76, theme.scaledUi(980.0)), .h = @min(height * 0.8, theme.scaledUi(760.0)) };
+    registerModalChromeHits(state, width, height, modal, true);
+    const pad = theme.scaledUi(18.0);
+    const close_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = theme.scaledUi(112.0), .h = theme.scaledUi(34.0) };
+    queueModalHit(state, close_rect, .transcript_close, 0);
+}
+
+fn registerProjectAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.show_project_creator) return;
+    const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
+    const notice_h: f32 = if (state.sidebarNotice().len > 0) theme.scaledUi(24.0) else 0.0;
+    const modal_h = theme.scaledUi(252.0) + notice_h;
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    registerModalChromeHits(state, width, height, modal, false);
+    const pad = theme.scaledUi(18.0);
+    var y = modal.y + pad;
+    y += theme.scaledUi(30.0);
+    y += theme.scaledUi(48.0);
+    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(36.0) };
+    queueModalHit(state, browse_rect, .project_import_browse, 0);
+    y += theme.scaledUi(44.0);
+    const add_w = theme.scaledUi(76.0);
+    const row_gap = theme.scaledUi(10.0);
+    const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
+    const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
+    queueModalHit(state, input_rect, .project_import_input, 0);
+    queueModalHit(state, add_rect, .project_import_submit, 0);
+    y += theme.scaledUi(46.0);
+    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
+    queueModalHit(state, cancel_rect, .project_import_cancel, 0);
+}
+
+fn registerProjectRenameModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    const rename_index = state.rename_project_index orelse return;
+    if (rename_index >= state.projects.items.len) return;
+    const modal_w = theme.clampf(width * 0.28, theme.scaledUi(320.0), theme.scaledUi(420.0));
+    const modal_h = theme.scaledUi(188.0);
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    registerModalChromeHits(state, width, height, modal, true);
+    const pad = theme.scaledUi(18.0);
+    const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
+    const gap = theme.scaledUi(10.0);
+    const button_w = (input_rect.w - gap) * 0.5;
+    const cancel_rect: palette.Rect = .{ .x = input_rect.x, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = button_w, .h = theme.scaledUi(34.0) };
+    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + cancel_rect.w + gap, .y = cancel_rect.y, .w = button_w, .h = cancel_rect.h };
+    queueModalHit(state, input_rect, .project_rename_input, 0);
+    queueModalHit(state, cancel_rect, .project_rename_cancel, 0);
+    queueModalHit(state, submit_rect, .project_rename_submit, 0);
+}
+
+fn registerThreadImportModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.thread_import_provider == null) return;
+    const project_index = state.thread_import_project_index orelse return;
+    if (project_index >= state.projects.items.len) return;
+    const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
+    const modal_h = theme.clampf(height * 0.66, theme.scaledUi(420.0), theme.scaledUi(620.0));
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    registerModalChromeHits(state, width, height, modal, true);
+    const pad = theme.scaledUi(18.0);
+    var y = modal.y + pad;
+    y += theme.scaledUi(26.0);
+    y += theme.scaledUi(20.0);
+    y += theme.scaledUi(24.0);
+    y += theme.scaledUi(48.0);
+    const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
+    queueModalHit(state, input_rect, .thread_import_input, 0);
+    y += theme.scaledUi(44.0);
+    const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), input_rect.w * 0.28), .h = theme.scaledUi(32.0) };
+    queueModalHit(state, refresh_rect, .thread_import_refresh, 0);
+    y += theme.scaledUi(42.0);
+    const notice_h = if (state.threadImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
+    const button_h = theme.scaledUi(34.0);
+    const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = input_rect.w, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
+    if (state.thread_import_threads.items.len != 0) {
+        const row_h = theme.scaledUi(42.0);
+        for (state.thread_import_threads.items, 0..) |_, index| {
+            const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
+            if (row.y + row.h > list_rect.y + list_rect.h) break;
+            queueModalHit(state, row, .thread_import_select, index);
+        }
+    }
+    const button_y = modal.y + modal.h - pad - button_h;
+    const gap = theme.scaledUi(10.0);
+    const button_w = (input_rect.w - gap) * 0.5;
+    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
+    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
+    queueModalHit(state, cancel_rect, .thread_import_cancel, 0);
+    queueModalHit(state, submit_rect, .thread_import_submit, 0);
+}
+
 /// Shows the attachment preview modal for the selected image.
 fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const modal_path = state.modal_image_path orelse return;
@@ -344,7 +469,7 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const modal_width = @min(width * 0.78, 980.0);
     const modal_height = @min(height * 0.82, 760.0);
     const modal: palette.Rect = .{ .x = (width - modal_width) * 0.5, .y = (height - modal_height) * 0.5, .w = modal_width, .h = modal_height };
-    drawModalChrome(state, width, height, modal, true);
+    drawModalChromeVisual(state, width, height, modal);
 
     const texture = state.ensureImageTexture(modal_path);
     const close_size: f32 = 28.0;
@@ -353,7 +478,6 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const header_text_width = @max(content.w - close_size - header_gap, 160.0);
     const close_rect: palette.Rect = .{ .x = content.x + content.w - close_size, .y = content.y, .w = close_size, .h = close_size };
     drawActionButton(state, close_rect, "x", colors.rgba(46, 48, 56, 220));
-    queueModalHit(state, close_rect, .image_close, 0);
     queuePaletteText(state, .{ .x = content.x, .y = content.y, .w = header_text_width, .h = theme.scaledUi(22.0) }, std.fs.path.basename(modal_path), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), modal);
     queuePaletteText(state, .{ .x = content.x, .y = content.y + theme.scaledUi(24.0), .w = header_text_width, .h = theme.scaledUi(20.0) }, modal_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
 
@@ -396,29 +520,28 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
     const modal_w = theme.clampf(width * 0.28, theme.scaledUi(320.0), theme.scaledUi(420.0));
     const modal_h = theme.scaledUi(188.0);
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-    drawModalChrome(state, width, height, modal, true);
+    drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Rename project", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(44.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, state.projects.items[rename_index].path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
     drawTextField(state, input_rect, state.renameInputPublic(), "Project label", state.palette_modal_text_focus == .project_rename, state.project_rename_cursor);
-    queueModalHit(state, input_rect, .project_rename_input, 0);
     const gap = theme.scaledUi(10.0);
     const button_w = (input_rect.w - gap) * 0.5;
     const cancel_rect: palette.Rect = .{ .x = input_rect.x, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = button_w, .h = theme.scaledUi(34.0) };
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + cancel_rect.w + gap, .y = cancel_rect.y, .w = button_w, .h = cancel_rect.h };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
     drawActionButton(state, submit_rect, "Rename", theme.COLOR_SECONDARY_GREEN);
-    queueModalHit(state, cancel_rect, .project_rename_cancel, 0);
-    queueModalHit(state, submit_rect, .project_rename_submit, 0);
 }
 
 fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.show_project_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
-    const modal_h = theme.scaledUi(252.0);
+    const notice = state.sidebarNotice();
+    const notice_h: f32 = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
+    const modal_h = theme.scaledUi(252.0) + notice_h;
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-    drawModalChrome(state, width, height, modal, true);
+    drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     var y = modal.y + pad;
     queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add project", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
@@ -427,27 +550,27 @@ fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void
     y += theme.scaledUi(48.0);
     const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(36.0) };
     drawActionButton(state, browse_rect, "Browse for folder", theme.COLOR_PANEL_ALT);
-    queueModalHit(state, browse_rect, .project_import_browse, 0);
     y += theme.scaledUi(44.0);
     const add_w = theme.scaledUi(76.0);
     const row_gap = theme.scaledUi(10.0);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
     const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
     drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/project", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
-    queueModalHit(state, input_rect, .project_import_input, 0);
     drawActionButton(state, add_rect, "Add", theme.COLOR_SECONDARY_GREEN);
-    queueModalHit(state, add_rect, .project_import_submit, 0);
     y += theme.scaledUi(46.0);
     const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
-    queueModalHit(state, cancel_rect, .project_import_cancel, 0);
+    if (notice.len > 0) {
+        y += theme.scaledUi(42.0);
+        queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), modal);
+    }
 }
 
 fn renderTranscriptSelectionModal(state: *runtime.AppState, width: f32, height: f32) void {
     const transcript_text = state.transcriptSelectionBuffer() orelse return;
     _ = state.consumeTranscriptSelectionModalRequest();
     const modal: palette.Rect = .{ .x = (width - @min(width * 0.76, theme.scaledUi(980.0))) * 0.5, .y = (height - @min(height * 0.8, theme.scaledUi(760.0))) * 0.5, .w = @min(width * 0.76, theme.scaledUi(980.0)), .h = @min(height * 0.8, theme.scaledUi(760.0)) };
-    drawModalChrome(state, width, height, modal, true);
+    drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Thread text", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(44.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, "Ctrl+C copies the modal text.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
@@ -457,7 +580,6 @@ fn renderTranscriptSelectionModal(state: *runtime.AppState, width: f32, height: 
     queuePaletteBorder(state, text_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queuePaletteText(state, .{ .x = text_rect.x + theme.scaledUi(12.0), .y = text_rect.y + theme.scaledUi(10.0), .w = text_rect.w - theme.scaledUi(24.0), .h = text_rect.h - theme.scaledUi(20.0) }, transcript_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), text_rect);
     drawActionButton(state, close_rect, "Close", theme.COLOR_PANEL_ALT);
-    queueModalHit(state, close_rect, .transcript_close, 0);
 }
 
 fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) void {
@@ -470,7 +592,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
     const modal_h = theme.clampf(height * 0.66, theme.scaledUi(420.0), theme.scaledUi(620.0));
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
-    drawModalChrome(state, width, height, modal, true);
+    drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     var y = modal.y + pad;
     const project = &state.projects.items[project_index];
@@ -484,11 +606,9 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     y += theme.scaledUi(48.0);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
     drawTextField(state, input_rect, state.threadImportThreadId(), threadImportHint(provider), state.palette_modal_text_focus == .thread_import, state.thread_import_cursor);
-    queueModalHit(state, input_rect, .thread_import_input, 0);
     y += theme.scaledUi(44.0);
     const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), input_rect.w * 0.28), .h = theme.scaledUi(32.0) };
     drawActionButton(state, refresh_rect, "Refresh list", theme.COLOR_PANEL_ALT);
-    queueModalHit(state, refresh_rect, .thread_import_refresh, 0);
     y += theme.scaledUi(42.0);
     const notice_h = if (state.threadImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
     const button_h = theme.scaledUi(34.0);
@@ -506,7 +626,6 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
             if (selected) queuePaletteRoundedRect(state, row, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(6.0));
             queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(4.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, thread.title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_rect);
             queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(22.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, thread.id, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), list_rect);
-            queueModalHit(state, row, .thread_import_select, index);
         }
     }
 
@@ -520,8 +639,6 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
     drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
     drawActionButton(state, submit_rect, "Import", theme.COLOR_SECONDARY_GREEN);
-    queueModalHit(state, cancel_rect, .thread_import_cancel, 0);
-    queueModalHit(state, submit_rect, .thread_import_submit, 0);
 }
 
 fn threadImportHeading(provider: runtime.Provider) []const u8 {

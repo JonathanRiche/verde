@@ -169,8 +169,17 @@ pub fn main(init: std.process.Init) !void {
         syncWindowTextInput(window, &state);
         var had_event = false;
         var event_wait_ns: u64 = 0;
+        var input_fb_w: c_int = 0;
+        var input_fb_h: c_int = 0;
+        getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
+        ui_layout.refreshPaletteModalHits(&state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
         running = processEvents(window, &state, &keyboard, ui_scale, &had_event, &frame_sample, &event_wait_ns);
         frame_sample.waited_ns = event_wait_ns;
+        recordSpan(&frame_sample, .poll_picker, struct {
+            fn run(app_state: *AppState) void {
+                app_state.processDeferredProjectDirectoryBrowse();
+            }
+        }.run, .{&state});
         recordSpan(&frame_sample, .poll_picker, struct {
             fn run(app_state: *AppState) void {
                 app_state.pollPicker();
@@ -436,6 +445,15 @@ fn processOneEvent(
 ) bool {
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
+    switch (event.type) {
+        .mouse_motion, .mouse_button_down, .mouse_button_up, .mouse_wheel => {
+            var input_fb_w: c_int = 0;
+            var input_fb_h: c_int = 0;
+            getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
+            ui_layout.refreshPaletteModalHits(state, @floatFromInt(input_fb_w), @floatFromInt(input_fb_h));
+        },
+        else => {},
+    }
     const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
