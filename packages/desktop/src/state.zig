@@ -1493,6 +1493,8 @@ pub const AppState = struct {
     browser_address_focused: bool,
     browser_address_cursor: usize,
     browser_inspector_menu_open: bool,
+    /// Split "Open" header menu (folder / editors); palette workspace chrome only.
+    workspace_header_open_menu_open: bool,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1624,6 +1626,7 @@ pub const AppState = struct {
             .browser_address_focused = false,
             .browser_address_cursor = 0,
             .browser_inspector_menu_open = false,
+            .workspace_header_open_menu_open = false,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -3175,6 +3178,8 @@ pub const AppState = struct {
             return;
         }
 
+        log.info("runDefaultOpenAction invoked for project path={s}", .{self.currentProject().path});
+
         switch (self.app_config.default_open_action) {
             .folder => self.openCurrentProjectDirectory(),
             .editor => self.openCurrentProjectEditor(.configured),
@@ -3224,6 +3229,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project folder.");
             return;
         };
+        log.info("openCurrentProjectDirectory completed", .{});
         self.setSidebarNotice("Opened project folder.");
     }
 
@@ -3238,6 +3244,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project editor.");
             return;
         };
+        log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
         self.setSidebarNotice(projectEditorOpenedNotice(target));
     }
 
