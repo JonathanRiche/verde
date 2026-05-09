@@ -1496,6 +1496,14 @@ pub const AppState = struct {
     transcript_markdown_selection_anchor: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_focus: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_dragging: bool,
+    /// Last pointer position in palette framebuffer space (updated from workspace mouse motion).
+    palette_mouse_x: f32,
+    palette_mouse_y: f32,
+    palette_mouse_in_workspace: bool,
+    /// Cached transcript layout from the last `chat_panel` paint (used for hit-testing between frames).
+    transcript_palette_column: palette.Rect,
+    transcript_palette_scroll_y: f32,
+    transcript_palette_clip: palette.Rect,
     transcript_markdown_project_index: ?usize,
     transcript_markdown_thread_index: ?usize,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
@@ -1617,6 +1625,12 @@ pub const AppState = struct {
             .transcript_markdown_selection_anchor = null,
             .transcript_markdown_selection_focus = null,
             .transcript_markdown_selection_dragging = false,
+            .palette_mouse_x = 0.0,
+            .palette_mouse_y = 0.0,
+            .palette_mouse_in_workspace = false,
+            .transcript_palette_column = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            .transcript_palette_scroll_y = 0.0,
+            .transcript_palette_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
             .transcript_markdown_project_index = null,
             .transcript_markdown_thread_index = null,
             .transcript_markdown_entries = .empty,
@@ -3652,6 +3666,17 @@ pub const AppState = struct {
 
     pub fn endTranscriptMarkdownSelection(self: *AppState) void {
         self.transcript_markdown_selection_dragging = false;
+    }
+
+    pub fn notePaletteWorkspaceMouseMotion(self: *AppState, x: f32, y: f32) void {
+        self.palette_mouse_x = x;
+        self.palette_mouse_y = y;
+        self.palette_mouse_in_workspace = true;
+    }
+
+    pub fn blurPaletteComposer(self: *AppState) void {
+        self.palette_composer.focused = false;
+        self.composer_focused = false;
     }
 
     pub fn selectAllTranscriptMarkdownSelection(

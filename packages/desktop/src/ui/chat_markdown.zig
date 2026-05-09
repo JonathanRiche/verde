@@ -32,6 +32,9 @@ fn glTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
 
 const Allocator = std.mem.Allocator;
 
+/// Opaque fill: translucent alpha looked muddy over dark transcript bubbles under GL blending.
+const markdown_selection_fill_rgba = colors.rgba(88, 166, 255, 255);
+
 pub const RenderOptions = struct {
     base_font_size: f32 = 24.0,
     line_height: ?f32 = null,
@@ -1330,9 +1333,211 @@ fn orderSelection(selection: SelectionRange) OrderedSelection {
     };
 }
 
-fn selectionPointLessThan(lhs: SelectionPoint, rhs: SelectionPoint) bool {
+pub fn selectionPointLessThan(lhs: SelectionPoint, rhs: SelectionPoint) bool {
     return lhs.line_index < rhs.line_index or
         (lhs.line_index == rhs.line_index and lhs.column < rhs.column);
+}
+
+pub fn orderTranscriptMarkdownEndpoints(
+    anchor_msg: usize,
+    anchor_pt: SelectionPoint,
+    focus_msg: usize,
+    focus_pt: SelectionPoint,
+) struct { start_msg: usize, start_pt: SelectionPoint, end_msg: usize, end_pt: SelectionPoint } {
+    if (anchor_msg < focus_msg) {
+        return .{ .start_msg = anchor_msg, .start_pt = anchor_pt, .end_msg = focus_msg, .end_pt = focus_pt };
+    }
+    if (focus_msg < anchor_msg) {
+        return .{ .start_msg = focus_msg, .start_pt = focus_pt, .end_msg = anchor_msg, .end_pt = anchor_pt };
+    }
+    if (selectionPointLessThan(anchor_pt, focus_pt)) {
+        return .{ .start_msg = anchor_msg, .start_pt = anchor_pt, .end_msg = focus_msg, .end_pt = focus_pt };
+    }
+    return .{ .start_msg = anchor_msg, .start_pt = focus_pt, .end_msg = focus_msg, .end_pt = anchor_pt };
+}
+
+pub fn lastSelectablePointInBody(
+    allocator: Allocator,
+    view: BodyView,
+    available_width: f32,
+    options: RenderOptions,
+) Allocator.Error!SelectionPoint {
+    const width = @max(available_width, 1.0);
+    var global_line_index: usize = 0;
+    var previous: ?BlockView = null;
+    var last: SelectionPoint = .{ .line_index = 0, .column = 0 };
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                last = .{ .line_index = global_line_index, .column = 0 };
+                global_line_index += 1;
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                last = .{ .line_index = global_line_index, .column = 0 };
+                global_line_index += 1;
+            },
+            .text => |text_block| {
+                const indent = indentWidth(text_block.indent);
+                const lines = try buildSelectableTextLines(allocator, text_block, @max(width - indent, 1.0), options);
+                defer deinitSelectableLines(allocator, lines);
+                for (lines) |line| {
+                    last = .{ .line_index = global_line_index, .column = line.total_columns };
+                    global_line_index += 1;
+                }
+            },
+            .fenced_code => |code_block| {
+                const lines = try buildSelectableCodeLines(allocator, code_block, options);
+                defer deinitSelectableCodeLines(allocator, lines);
+                for (lines) |line| {
+                    last = .{ .line_index = global_line_index, .column = line.total_columns };
+                    global_line_index += 1;
+                }
+            },
+            .thematic_break => {},
+        }
+
+        previous = block;
+    }
+
+    return last;
+}
+
+pub fn localMarkdownSelectionRangeForMessage(
+    allocator: Allocator,
+    anchor_msg: usize,
+    anchor_pt: SelectionPoint,
+    focus_msg: usize,
+    focus_pt: SelectionPoint,
+    message_index: usize,
+    view: BodyView,
+    available_width: f32,
+    options: RenderOptions,
+) Allocator.Error!?SelectionRange {
+    const o = orderTranscriptMarkdownEndpoints(anchor_msg, anchor_pt, focus_msg, focus_pt);
+    if (message_index < o.start_msg or message_index > o.end_msg) return null;
+    if (o.start_msg == o.end_msg and message_index == o.start_msg) {
+        return .{ .anchor = o.start_pt, .focus = o.end_pt };
+    }
+    if (message_index == o.start_msg) {
+        const last = try lastSelectablePointInBody(allocator, view, available_width, options);
+        return .{ .anchor = o.start_pt, .focus = last };
+    }
+    if (message_index == o.end_msg) {
+        return .{ .anchor = .{ .line_index = 0, .column = 0 }, .focus = o.end_pt };
+    }
+    const last = try lastSelectablePointInBody(allocator, view, available_width, options);
+    return .{ .anchor = .{ .line_index = 0, .column = 0 }, .focus = last };
+}
+
+/// Hit-tests markdown body layout in the same coordinate space as [`PaletteRenderContext.cursor`]
+/// (origin at `body_rect` top-left). Returns null when the pointer is outside selectable lines.
+pub fn hitTestSelectablePaletteBody(
+    allocator: Allocator,
+    view: BodyView,
+    options: RenderOptions,
+    body_rect: palette.Rect,
+    available_width: f32,
+    mouse_x: f32,
+    mouse_y: f32,
+) Allocator.Error!?SelectionPoint {
+    const mouse = [2]f32{ mouse_x, mouse_y };
+    const width = @max(available_width, 1.0);
+    var context_cursor = body_rect;
+    var global_line_index: usize = 0;
+    var previous: ?BlockView = null;
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options);
+                const start = .{ context_cursor.x, context_cursor.y };
+                const top = start[1];
+                const bottom = top + gap_height;
+                if (mouse[1] >= top and mouse[1] <= bottom and mouse[0] >= body_rect.x and mouse[0] <= body_rect.x + body_rect.w) {
+                    return .{ .line_index = global_line_index, .column = 0 };
+                }
+                context_cursor.y += gap_height;
+                context_cursor.h = @max(context_cursor.h, gap_height);
+                global_line_index += 1;
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                const height = blankBlockHeight(options);
+                const start = .{ context_cursor.x, context_cursor.y };
+                const top = start[1];
+                const bottom = top + height;
+                if (mouse[1] >= top and mouse[1] <= bottom and mouse[0] >= body_rect.x and mouse[0] <= body_rect.x + body_rect.w) {
+                    return .{ .line_index = global_line_index, .column = 0 };
+                }
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+                global_line_index += 1;
+            },
+            .text => |text_block| {
+                const indent = indentWidth(text_block.indent);
+                const start = .{ context_cursor.x + indent, context_cursor.y };
+                const line_width = @max(width - indent, 1.0);
+                const lines = try buildSelectableTextLines(allocator, text_block, line_width, options);
+                defer deinitSelectableLines(allocator, lines);
+
+                var height: f32 = 0.0;
+                for (lines, 0..) |line, index| {
+                    const top = start[1] + line.y;
+                    const bottom = top + line.height;
+                    if (mouse[1] >= top and mouse[1] <= bottom) {
+                        const col = hoveredColumnForLine(line, mouse[0] - start[0]);
+                        return .{ .line_index = global_line_index + index, .column = col };
+                    }
+                    height = @max(height, line.y + line.height);
+                }
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+                global_line_index += lines.len;
+            },
+            .fenced_code => |code_block| {
+                const indent = indentWidth(code_block.indent);
+                const start = .{ context_cursor.x + indent, context_cursor.y };
+                const line_height = codeLineHeight(options);
+                const pad_x = codeBlockPaddingX(options);
+                const pad_y = codeBlockPaddingY(options);
+                const height = codeBlockHeight(code_block, line_height, pad_y);
+                const content_start = .{ start[0] + pad_x, start[1] + pad_y };
+
+                const lines = try buildSelectableCodeLines(allocator, code_block, options);
+                defer deinitSelectableCodeLines(allocator, lines);
+
+                for (lines, 0..) |line, index| {
+                    const top = content_start[1] + line.y;
+                    const bottom = top + line.height;
+                    if (mouse[1] >= top and mouse[1] <= bottom) {
+                        const col = hoveredColumnForCodeLine(line, mouse[0] - content_start[0]);
+                        return .{ .line_index = global_line_index + index, .column = col };
+                    }
+                }
+
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+                global_line_index += lines.len;
+            },
+            .thematic_break => |rule| {
+                const indent = indentWidth(rule.indent);
+                const height = thematicBreakHeight(options);
+                _ = indent;
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+            },
+        }
+
+        previous = block;
+    }
+
+    return null;
 }
 
 fn selectionColumnsForLine(selection: OrderedSelection, line_index: usize, total_columns: usize) ?struct { start: usize, end: usize } {
@@ -1657,7 +1862,7 @@ fn renderSelectableLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = paletteColor(colors.rgba(88, 166, 255, 72));
+                const selection_col = paletteColor(markdown_selection_fill_rgba);
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
@@ -1891,7 +2096,7 @@ fn renderSelectableCodeLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = paletteColor(colors.rgba(88, 166, 255, 72));
+                const selection_col = paletteColor(markdown_selection_fill_rgba);
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
