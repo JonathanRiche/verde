@@ -136,6 +136,324 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
     return true;
 }
 
+const TranscriptMarkdownHit = struct {
+    message_index: usize,
+    point: chat_markdown.SelectionPoint,
+};
+
+fn assistantTranscriptMarkdownHit(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    body_raw: []const u8,
+    muted_body: bool,
+    assistant_plain_layout: bool,
+    message_index: usize,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?TranscriptMarkdownHit {
+    if (!(role == .assistant and !muted_body and !assistant_plain_layout)) return null;
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
+    const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
+
+    const body_rect = palette.Rect{
+        .x = bubble.x + theme.scaledUi(14.0),
+        .y = bubble.y + theme.scaledUi(32.0),
+        .w = bubble.w - theme.scaledUi(28.0),
+        .h = bubble.h - theme.scaledUi(38.0),
+    };
+    if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
+
+    const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
+    var view = chat_markdown.buildBodyView(state.allocator, body_text) catch return null;
+    defer view.deinit(state.allocator);
+    const pt = chat_markdown.hitTestSelectablePaletteBody(
+        state.allocator,
+        view,
+        markdownOptions(theme.scaledUi(16.0)),
+        body_rect,
+        body_rect.w,
+        mouse_x,
+        mouse_y,
+    ) catch return null;
+    const p = pt orelse return null;
+    return .{ .message_index = message_index, .point = p };
+}
+
+fn transcriptMarkdownBubbleHit(
+    state: *app_state.AppState,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?TranscriptMarkdownHit {
+    const column = state.transcript_palette_column;
+    const clip = state.transcript_palette_clip;
+    if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
+
+    const thread = state.currentThread();
+    const scroll_y = state.transcript_palette_scroll_y;
+    var content_y = column.y - scroll_y;
+
+    for (thread.messages.items, 0..) |message, msg_idx| {
+        const item_h = transcriptMessageHeight(message.body, message.role, column.w, message.author, false);
+        if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
+            content_y += item_h + theme.scaledUi(12.0);
+            continue;
+        }
+        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, message.role, message.body, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
+            return hit;
+        }
+        content_y += item_h + theme.scaledUi(12.0);
+    }
+
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return null;
+
+    const base_idx = thread.messages.items.len;
+    for (send_state.pending_events.items, 0..) |event, pi| {
+        const msg_idx = base_idx + pi;
+        const item_h = transcriptMessageHeight(event.body, event.role, column.w, event.author, false);
+        if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
+            content_y += item_h + theme.scaledUi(12.0);
+            continue;
+        }
+        if (assistantTranscriptMarkdownHit(state, column, content_y, item_h, event.role, event.body, false, false, msg_idx, mouse_x, mouse_y)) |hit| {
+            return hit;
+        }
+        content_y += item_h + theme.scaledUi(12.0);
+    }
+
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    const stream_plain = stream_text.len > 0;
+    const assistant_h = transcriptMessageHeight(body, .assistant, column.w, "", stream_plain);
+    const stream_idx = base_idx + send_state.pending_events.items.len;
+    return assistantTranscriptMarkdownHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, stream_idx, mouse_x, mouse_y);
+}
+
+pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
+    if (!state.transcriptMarkdownSelectionDragging()) return;
+    const hit = transcriptMarkdownBubbleHit(state, state.palette_mouse_x, state.palette_mouse_y) orelse return;
+    state.updateTranscriptMarkdownSelection(hit.message_index, hit.point);
+}
+
+fn applyTranscriptMarkdownMulticlick(state: *app_state.AppState, hit: TranscriptMarkdownHit, clicks: usize) void {
+    if (clicks < 2) return;
+    const snap = transcriptMarkdownMessageSnapshot(state, hit.message_index) orelse return;
+    var view = chat_markdown.buildBodyView(state.allocator, snap.body_trim) catch return;
+    defer view.deinit(state.allocator);
+    const md = markdownOptions(theme.scaledUi(16.0));
+    const range = chat_markdown.selectionRangeForClickCount(
+        state.allocator,
+        view,
+        snap.body_inner_w,
+        md,
+        hit.point,
+        clicks,
+    ) orelse {
+        state.beginTranscriptMarkdownSelection(hit.message_index, hit.point);
+        return;
+    };
+    state.selectAllTranscriptMarkdownSelection(
+        hit.message_index,
+        range.anchor,
+        hit.message_index,
+        range.focus,
+    );
+}
+
+pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    if (!down) {
+        if (state.transcriptMarkdownSelectionDragging()) {
+            state.endTranscriptMarkdownSelection();
+        }
+        return false;
+    }
+
+    if (!rectContains(transcript_rect, x, y)) return false;
+
+    state.transcript_focused = true;
+    if (transcriptMarkdownBubbleHit(state, x, y)) |hit| {
+        state.blurPaletteComposer();
+        if (clicks >= 2) {
+            applyTranscriptMarkdownMulticlick(state, hit, @intCast(clicks));
+        } else {
+            state.beginTranscriptMarkdownSelection(hit.message_index, hit.point);
+        }
+        return true;
+    }
+    state.clearTranscriptMarkdownSelection();
+    state.blurPaletteComposer();
+    return false;
+}
+
+/// Selects all assistant markdown in the current thread (persisted messages, pending timeline, and stream tail when present).
+pub fn selectAllTranscriptMarkdownInThread(state: *app_state.AppState) bool {
+    var list = std.ArrayList(usize).empty;
+    defer list.deinit(state.allocator);
+
+    const thread = state.currentThread();
+    for (thread.messages.items, 0..) |_, i| {
+        if (transcriptMarkdownMessageSnapshot(state, i) == null) continue;
+        list.append(state.allocator, i) catch return false;
+    }
+
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    const pending_active = send_state.status == .pending;
+    const pending_count: usize = if (pending_active) send_state.pending_events.items.len else 0;
+    send_state.mutex.unlock();
+
+    const base = thread.messages.items.len;
+    if (pending_active) {
+        for (0..pending_count) |pi| {
+            const idx = base + pi;
+            if (transcriptMarkdownMessageSnapshot(state, idx) == null) continue;
+            list.append(state.allocator, idx) catch return false;
+        }
+        const stream_idx = base + pending_count;
+        if (transcriptMarkdownMessageSnapshot(state, stream_idx) != null) {
+            list.append(state.allocator, stream_idx) catch return false;
+        }
+    }
+
+    if (list.items.len == 0) return false;
+    const first_msg = list.items[0];
+    const last_msg = list.items[list.items.len - 1];
+    const last_snap = transcriptMarkdownMessageSnapshot(state, last_msg) orelse return false;
+
+    var last_view = chat_markdown.buildBodyView(state.allocator, last_snap.body_trim) catch return false;
+    defer last_view.deinit(state.allocator);
+    const md = markdownOptions(theme.scaledUi(16.0));
+    const last_pt = chat_markdown.lastSelectablePointInBody(
+        state.allocator,
+        last_view,
+        last_snap.body_inner_w,
+        md,
+    ) catch return false;
+
+    state.selectAllTranscriptMarkdownSelection(
+        first_msg,
+        .{ .line_index = 0, .column = 0 },
+        last_msg,
+        last_pt,
+    );
+    return true;
+}
+
+fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: usize) ?struct {
+    body_trim: []const u8,
+    body_inner_w: f32,
+    markdown: bool,
+} {
+    const column = state.transcript_palette_column;
+    if (column.w <= 0.0) return null;
+
+    const thread = state.currentThread();
+    const n = thread.messages.items.len;
+    if (message_index < n) {
+        const m = thread.messages.items[message_index];
+        if (m.role == .system and shouldRenderPaletteCommandRow(m.author, m.body)) return null;
+        if (m.role != .assistant) return null;
+        const body_trim = std.mem.trim(u8, m.body, "\n\r\t ");
+        const bubble_w = column.w;
+        const inner = @max(bubble_w - theme.scaledUi(28.0), theme.scaledUi(80.0));
+        return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+    }
+
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return null;
+    const pi = message_index - n;
+    if (pi < send_state.pending_events.items.len) {
+        const ev = send_state.pending_events.items[pi];
+        if (ev.role == .system and shouldRenderPaletteCommandRow(ev.author, ev.body)) return null;
+        if (ev.role != .assistant) return null;
+        const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
+        const bubble_w = column.w;
+        const inner = @max(bubble_w - theme.scaledUi(28.0), theme.scaledUi(80.0));
+        return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+    }
+    if (pi != send_state.pending_events.items.len) return null;
+
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    const body_trim = std.mem.trim(u8, body, "\n\r\t ");
+    const inner = @max(column.w - theme.scaledUi(28.0), theme.scaledUi(80.0));
+    return .{ .body_trim = body_trim, .body_inner_w = inner, .markdown = true };
+}
+
+pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.Allocator.Error!?[]u8 {
+    const sel = state.transcriptMarkdownSelection() orelse return null;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(state.allocator);
+
+    const o = chat_markdown.orderTranscriptMarkdownEndpoints(
+        sel.anchor.message_index,
+        sel.anchor.point,
+        sel.focus.message_index,
+        sel.focus.point,
+    );
+
+    var mi = o.start_msg;
+    while (mi <= o.end_msg) : (mi += 1) {
+        const snap = transcriptMarkdownMessageSnapshot(state, mi) orelse continue;
+        if (!snap.markdown) continue;
+
+        var view = try chat_markdown.buildBodyView(state.allocator, snap.body_trim);
+        defer view.deinit(state.allocator);
+
+        const local = try chat_markdown.localMarkdownSelectionRangeForMessage(
+            state.allocator,
+            sel.anchor.message_index,
+            sel.anchor.point,
+            sel.focus.message_index,
+            sel.focus.point,
+            mi,
+            view,
+            snap.body_inner_w,
+            markdownOptions(theme.scaledUi(16.0)),
+        ) orelse continue;
+
+        var scratch_batch = palette.RenderBatch{};
+        defer scratch_batch.deinit(state.allocator);
+        var scratch_text = std.ArrayList(u8).empty;
+        defer scratch_text.deinit(state.allocator);
+
+        var ctx = chat_markdown.PaletteRenderContext{
+            .allocator = state.allocator,
+            .batch = &scratch_batch,
+            .frame_text = &scratch_text,
+            .cursor = .{ .x = 0.0, .y = 0.0, .w = snap.body_inner_w, .h = 100000.0 },
+            .available_width = snap.body_inner_w,
+        };
+        var sel_out = chat_markdown.renderSelectablePaletteBody(
+            &ctx,
+            state.allocator,
+            view,
+            markdownOptions(theme.scaledUi(16.0)),
+            local,
+            true,
+        );
+        defer sel_out.deinit(state.allocator);
+        if (sel_out.copied_text) |z| {
+            const slice = std.mem.sliceTo(z, 0);
+            if (slice.len == 0) continue;
+            if (out.items.len > 0) try out.append(state.allocator, '\n');
+            try out.appendSlice(state.allocator, slice);
+        }
+    }
+
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(state.allocator);
+}
+
 fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(colors.DARK_BLUE));
@@ -186,9 +504,13 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
+    state.transcript_palette_column = column;
+    state.transcript_palette_clip = clip;
+
     const thread = state.currentThread();
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi()) {
+        state.transcript_palette_scroll_y = 0.0;
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
         queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
         return;
@@ -220,17 +542,18 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         state.transcript_auto_follow_pending = false;
     }
     state.rememberCurrentTranscriptScroll(scroll_y);
+    state.transcript_palette_scroll_y = scroll_y;
 
     var content_y = column.y - scroll_y;
-    for (thread.messages.items) |message| {
+    for (thread.messages.items, 0..) |message, msg_idx| {
         const item_h = transcriptMessageHeight(message.body, message.role, column.w, message.author, false);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
-            renderTranscriptMessage(state, column, content_y, item_h, message, clip);
+            renderTranscriptMessage(state, column, content_y, item_h, message, clip, msg_idx);
         }
         content_y += item_h + theme.scaledUi(12.0);
     }
 
-    renderPendingTranscriptStream(state, thread, column, content_y, clip);
+    renderPendingTranscriptStream(state, thread, column, content_y, clip, thread.messages.items.len);
 
     if (max_scroll > 1.0) {
         const track = palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(8.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h };
@@ -267,14 +590,15 @@ fn transcriptPendingStreamHeight(thread: *const app_state.ChatThread, column_wid
     return total;
 }
 
-fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, content_y: f32, clip: palette.Rect) void {
+fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, content_y: f32, clip: palette.Rect, base_message_index: usize) void {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return;
 
     var y = content_y;
-    for (send_state.pending_events.items) |event| {
+    for (send_state.pending_events.items, 0..) |event, pi| {
+        const msg_idx = base_message_index + pi;
         const item_h = transcriptMessageHeight(event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -287,7 +611,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
                 .system => if (event.author.len > 0) event.author else "System",
             };
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip);
+                renderTranscriptBubbleFromParts(state, column, y, item_h, event.role, role_label, event.body, false, false, clip, msg_idx);
             }
         }
         y += item_h + theme.scaledUi(12.0);
@@ -299,8 +623,9 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
     const stream_plain = stream_text.len > 0;
     const assistant_h = transcriptMessageHeight(body, .assistant, column.w, "", stream_plain);
+    const stream_msg_idx = base_message_index + send_state.pending_events.items.len;
     if (y + assistant_h >= column.y and y <= column.y + column.h) {
-        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip);
+        renderTranscriptBubbleFromParts(state, column, y, assistant_h, .assistant, working_label, body, stream_text.len == 0, stream_plain, clip, stream_msg_idx);
     }
 }
 
@@ -421,7 +746,7 @@ fn queueRoundedShellClipped(
     }
 }
 
-fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
+fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
         renderCommandEventRow(state, column, y, height, message.author, message.body, clip);
         return;
@@ -431,7 +756,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         .assistant => if (message.author.len > 0) message.author else "Assistant",
         .system => "System",
     };
-    renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip);
+    renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip, message_index);
 }
 
 fn renderCommandEventRow(
@@ -485,6 +810,7 @@ fn renderTranscriptBubbleFromParts(
     muted_body: bool,
     assistant_plain_layout: bool,
     clip: palette.Rect,
+    message_index: usize,
 ) void {
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
@@ -506,7 +832,7 @@ fn renderTranscriptBubbleFromParts(
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
     const body_color = if (muted_body) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
     if (role == .assistant and !muted_body and !assistant_plain_layout) {
-        renderMarkdownBody(state, body_rect, body_text, clip);
+        renderMarkdownBody(state, message_index, body_rect, body_text, clip);
     } else {
         renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(16.0), clip);
     }
@@ -521,22 +847,52 @@ fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
     };
 }
 
-fn renderMarkdownBody(state: *app_state.AppState, rect: palette.Rect, body: []const u8, clip: palette.Rect) void {
+fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect) void {
     if (body.len == 0) return;
     var view = chat_markdown.buildBodyView(state.allocator, body) catch {
         renderWrappedBody(state, rect, body, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
         return;
     };
     defer view.deinit(state.allocator);
+    const font_size = theme.scaledUi(16.0);
+    const md_opts = markdownOptions(font_size);
+    const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {
+        break :blk chat_markdown.localMarkdownSelectionRangeForMessage(
+            state.allocator,
+            s.anchor.message_index,
+            s.anchor.point,
+            s.focus.message_index,
+            s.focus.point,
+            message_index,
+            view,
+            rect.w,
+            md_opts,
+        ) catch null;
+    } else null;
+
+    const mx = state.palette_mouse_x;
+    const my = state.palette_mouse_y;
+    const hovered = state.palette_mouse_in_workspace and rectContains(rect, mx, my) and rectContains(clip, mx, my);
+
     var context = chat_markdown.PaletteRenderContext{
         .allocator = state.allocator,
         .batch = &state.palette_overlay_batch,
         .frame_text = &state.palette_frame_text,
         .cursor = rect,
         .available_width = rect.w,
+        .mouse_pos = if (state.palette_mouse_in_workspace) .{ mx, my } else .{ -1.0, -1.0 },
+        .hovered = hovered,
         .clip = clip,
     };
-    chat_markdown.renderPaletteBody(&context, view, markdownOptions(theme.scaledUi(16.0)));
+    var sel_out = chat_markdown.renderSelectablePaletteBody(
+        &context,
+        state.allocator,
+        view,
+        md_opts,
+        local_sel,
+        false,
+    );
+    defer sel_out.deinit(state.allocator);
 }
 
 fn wrappedLineCount(body: []const u8, chars_per_line: usize) usize {

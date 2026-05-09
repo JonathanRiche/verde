@@ -505,6 +505,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleComposerFocusShortcut(state, &event.key)) {
                 return true;
             }
+            if (handleTranscriptMarkdownCopyShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleTranscriptMarkdownSelectAllShortcut(state, &event.key)) {
+                return true;
+            }
             if (state.routePaletteComposerKeyDown(&event.key)) {
                 return true;
             }
@@ -563,6 +569,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_motion => {
+            state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
+            chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             browser_ui.handlePaletteMouseMotion(event.motion.x, event.motion.y);
             sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
@@ -608,6 +616,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and chat_panel_ui.handleFileSearchPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and chat_panel_ui.handleTranscriptPaletteMouseButton(
+                state,
+                event.button.x,
+                event.button.y,
+                event.button.down,
+                event.button.clicks,
+            )) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -806,6 +824,41 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     }
 
     state.requestComposerFocus();
+    return true;
+}
+
+fn handleTranscriptMarkdownSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (event.key != .a) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (state.composer_focused) return false;
+    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused()) return false;
+    if (!state.isTranscriptFocused()) return false;
+    if (!chat_panel_ui.selectAllTranscriptMarkdownInThread(state)) return false;
+    state.markDirty();
+    return true;
+}
+
+fn handleTranscriptMarkdownCopyShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (event.key != .c) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (state.composer_focused) return false;
+    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused()) return false;
+    if (!state.transcriptMarkdownSelectionActive()) return false;
+
+    const maybe = chat_panel_ui.transcriptMarkdownSelectionPlainText(state) catch return false;
+    const plain = maybe orelse return false;
+    defer state.allocator.free(plain);
+    const z = state.allocator.dupeZ(u8, plain) catch return false;
+    defer state.allocator.free(z);
+    sdl.setClipboardText(z) catch |err| {
+        log.warn("failed to set transcript markdown selection clipboard: {s}", .{@errorName(err)});
+        return true;
+    };
+    state.markDirty();
     return true;
 }
 
