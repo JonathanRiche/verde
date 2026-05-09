@@ -11,7 +11,9 @@ const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
-const MAX_CONNECT_WAIT_ATTEMPTS = 30;
+/// Poll interval while waiting for `codex app-server` after spawn (100ms × attempts).
+const MAX_CONNECT_WAIT_ATTEMPTS = 120;
+const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
 
 fn sleepMs(ms: u64) void {
     const request: std.c.timespec = .{
@@ -77,6 +79,7 @@ pub const Client = struct {
             .config = config,
             .loaded_threads = std.StringHashMap(void).init(allocator),
         };
+        errdefer client.deinit();
         client.ensureConnected() catch |err| {
             runtime_log.diagnostic("codex.Client.init ensureConnected failed: {s}", .{@errorName(err)});
             return err;
@@ -387,6 +390,9 @@ pub const Client = struct {
             return err;
         };
 
+        // Brief pause so the child can bind and accept before we hammer the port.
+        sleepMs(80);
+
         if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
             runtime_log.diagnostic("codex.connectWebSocket connected after spawn", .{});
             self.stream = stream;
@@ -556,11 +562,24 @@ pub const Client = struct {
             },
         };
 
-        const payload = try self.callRpcForResultAlloc("initialize", params);
-        self.allocator.free(payload);
+        var attempt: usize = 0;
+        while (attempt < MAX_PROTOCOL_INIT_ATTEMPTS) : (attempt += 1) {
+            const payload = self.callRpcForResultAlloc("initialize", params) catch |err| switch (err) {
+                error.CodexRpcFailed, error.ServerOverloaded => {
+                    if (attempt + 1 >= MAX_PROTOCOL_INIT_ATTEMPTS) return err;
+                    runtime_log.diagnostic("codex.initializeProtocol retry attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
+                    sleepMs(120 + @as(u64, attempt) * 80);
+                    continue;
+                },
+                else => return err,
+            };
+            defer self.allocator.free(payload);
 
-        try self.sendNotification("initialized", .{});
-        self.initialized = true;
+            try self.sendNotification("initialized", .{});
+            self.initialized = true;
+            return;
+        }
+        return error.CodexRpcFailed;
     }
 
     fn startThread(
