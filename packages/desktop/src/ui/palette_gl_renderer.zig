@@ -384,11 +384,66 @@ pub const Renderer = struct {
                     }
                     return;
                 }
-                try self.appendBorder(allocator, command.rect, border_color, command.border_width, command.clip);
+                const cr = clampedRadius(command.rect, command.radius);
+                if (cr > 0.5) {
+                    try self.appendRoundedBorder(allocator, command.rect, border_color, command.radius, command.border_width, command.clip);
+                } else {
+                    try self.appendBorder(allocator, command.rect, border_color, command.border_width, command.clip);
+                }
             }
         }
         if (command.color.a > 0.0) {
             try self.appendRoundedRect(allocator, command.rect, command.color, command.radius, command.clip);
+        }
+    }
+
+    fn appendRoundedBorder(self: *Renderer, allocator: std.mem.Allocator, rect: palette.Rect, color: palette.Color, radius: f32, width: f32, clip: ?palette.Rect) !void {
+        if (color.a <= 0.0 or rect.w <= 0.0 or rect.h <= 0.0 or width <= 0.0) return;
+        const r = if (clip) |clip_rect| clippedRect(rect, clip_rect) orelse return else rect;
+        const cr = clampedRadius(r, radius);
+        const thickness = @max(width, 1.0);
+        const inner = insetPaletteRect(r, thickness);
+        if (cr <= 0.5 or inner.w <= 0.0 or inner.h <= 0.0) {
+            try self.appendBorder(allocator, r, color, thickness, clip);
+            return;
+        }
+        const inner_r = clampedRadius(inner, @max(cr - thickness, 0.0));
+        const y_start: i32 = @intFromFloat(@floor(r.y));
+        const y_end: i32 = @intFromFloat(@ceil(r.y + r.h));
+        var y: i32 = y_start;
+        while (y < y_end) : (y += 1) {
+            const fy = @as(f32, @floatFromInt(y)) + 0.5;
+            const outer_inset = roundedInsetAtY(r, cr, fy);
+            const outer_x0 = r.x + outer_inset;
+            const outer_x1 = r.x + r.w - outer_inset;
+            if (fy < inner.y or fy >= inner.y + inner.h) {
+                try self.appendRect(allocator, .{
+                    .x = outer_x0,
+                    .y = @floatFromInt(y),
+                    .w = @max(outer_x1 - outer_x0, 0.0),
+                    .h = 1.0,
+                }, color, clip);
+                continue;
+            }
+            const inner_inset = roundedInsetAtY(inner, inner_r, fy);
+            const inner_x0 = inner.x + inner_inset;
+            const inner_x1 = inner.x + inner.w - inner_inset;
+            if (inner_x0 > outer_x0) {
+                try self.appendRect(allocator, .{
+                    .x = outer_x0,
+                    .y = @floatFromInt(y),
+                    .w = inner_x0 - outer_x0,
+                    .h = 1.0,
+                }, color, clip);
+            }
+            if (outer_x1 > inner_x1) {
+                try self.appendRect(allocator, .{
+                    .x = inner_x1,
+                    .y = @floatFromInt(y),
+                    .w = outer_x1 - inner_x1,
+                    .h = 1.0,
+                }, color, clip);
+            }
         }
     }
 
@@ -605,6 +660,31 @@ fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palett
 
 fn clampedRadius(rect: palette.Rect, radius: f32) f32 {
     return @min(@max(radius, 0.0), @min(@max(rect.w, 0.0), @max(rect.h, 0.0)) * 0.5);
+}
+
+fn insetPaletteRect(rect: palette.Rect, amount: f32) palette.Rect {
+    const amt = @max(amount, 0.0);
+    return .{
+        .x = rect.x + amt,
+        .y = rect.y + amt,
+        .w = @max(rect.w - amt * 2.0, 0.0),
+        .h = @max(rect.h - amt * 2.0, 0.0),
+    };
+}
+
+fn roundedInsetAtY(rect: palette.Rect, radius: f32, y: f32) f32 {
+    const r = clampedRadius(rect, radius);
+    if (r <= 0.0) return 0.0;
+    const top_center = rect.y + r;
+    const bottom_center = rect.y + rect.h - r;
+    const dy = if (y < top_center)
+        top_center - y
+    else if (y > bottom_center)
+        y - bottom_center
+    else
+        0.0;
+    if (dy <= 0.0) return 0.0;
+    return @max(r - @sqrt(@max(r * r - dy * dy, 0.0)), 0.0);
 }
 
 fn vertex(x: f32, y: f32, color: palette.Color) Vertex {
