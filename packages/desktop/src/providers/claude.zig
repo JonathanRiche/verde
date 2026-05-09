@@ -156,10 +156,14 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
+        const image_attachments = try collectImageAttachments(allocator, request);
+        defer allocator.free(image_attachments);
+
         const bridge_request = BridgeSendPromptRequest{
             .command = "send_prompt",
             .thread_id = request.thread_id,
             .prompt = request.prompt,
+            .images = image_attachments,
             .cwd = request.cwd orelse self.config.cwd,
             .model = request.model,
             .reasoning_effort = if (request.reasoning_effort) |effort| @tagName(effort) else null,
@@ -286,6 +290,17 @@ pub const Client = struct {
             parsed.deinit();
             return;
         }
+        if (std.mem.eql(u8, kind, "stream_event")) {
+            if (stream_request) |request| {
+                if (request.on_stream_event) |on_stream_event| {
+                    const title = getOptionalObjectString(parsed.value, "title") orelse "Claude";
+                    const body = getOptionalObjectString(parsed.value, "body") orelse "";
+                    on_stream_event(request.stream_context, .{ .message = .{ .title = title, .body = body } });
+                }
+            }
+            parsed.deinit();
+            return;
+        }
         if (std.mem.eql(u8, kind, "result")) {
             if (response.result_tree) |*old| old.deinit();
             response.result_tree = parsed;
@@ -333,6 +348,7 @@ const BridgeSendPromptRequest = struct {
     command: []const u8,
     thread_id: ?[]const u8 = null,
     prompt: []const u8,
+    images: []const provider_types.ImageAttachment = &.{},
     cwd: ?[]const u8 = null,
     model: ?[]const u8 = null,
     reasoning_effort: ?[]const u8 = null,
@@ -340,6 +356,29 @@ const BridgeSendPromptRequest = struct {
     sandbox_mode: ?[]const u8 = null,
     claude_executable: []const u8,
 };
+
+fn collectImageAttachments(
+    allocator: std.mem.Allocator,
+    request: provider_types.SendPromptRequest,
+) ![]const provider_types.ImageAttachment {
+    const legacy_count: usize = if (request.image) |legacy|
+        if (containsImagePath(request.images, legacy.path)) 0 else 1
+    else
+        0;
+    const images = try allocator.alloc(provider_types.ImageAttachment, request.images.len + legacy_count);
+    @memcpy(images[0..request.images.len], request.images);
+    if (request.image) |legacy| {
+        if (legacy_count == 1) images[request.images.len] = legacy;
+    }
+    return images;
+}
+
+fn containsImagePath(images: []const provider_types.ImageAttachment, path: []const u8) bool {
+    for (images) |image| {
+        if (std.mem.eql(u8, image.path, path)) return true;
+    }
+    return false;
+}
 
 fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
@@ -393,4 +432,41 @@ test "parseRole maps Claude roles" {
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("assistant"));
     try std.testing.expectEqual(provider_types.MessageRole.system, parseRole("system"));
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("other"));
+}
+
+test "collectImageAttachments preserves multi-image and legacy compatibility" {
+    const modern = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/one.png" },
+        .{ .path = "/tmp/two.png" },
+    };
+    const collected = try collectImageAttachments(std.testing.allocator, .{
+        .prompt = "hello",
+        .image = .{ .path = "/tmp/legacy.png" },
+        .images = modern[0..],
+    });
+    defer std.testing.allocator.free(collected);
+
+    try std.testing.expectEqual(@as(usize, 3), collected.len);
+    try std.testing.expectEqualStrings("/tmp/one.png", collected[0].path);
+    try std.testing.expectEqualStrings("/tmp/two.png", collected[1].path);
+    try std.testing.expectEqualStrings("/tmp/legacy.png", collected[2].path);
+}
+
+test "BridgeSendPromptRequest serializes multiple images" {
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/one.png" },
+        .{ .path = "/tmp/two.png" },
+    };
+    const payload = BridgeSendPromptRequest{
+        .command = "send_prompt",
+        .prompt = "describe",
+        .images = images[0..],
+        .claude_executable = "claude",
+    };
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, payload, .{});
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"images\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/one.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/two.png") != null);
 }

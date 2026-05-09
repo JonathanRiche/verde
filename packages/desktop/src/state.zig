@@ -267,6 +267,7 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
+        .claude => "claude-sonnet-4-5",
     };
 }
 
@@ -404,6 +405,7 @@ fn paletteModelCascadeRenderRowLeading(
     const tex = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .claude => null,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
     const sz = @min(leading_rect.w, leading_rect.h) * 0.68;
@@ -1681,6 +1683,7 @@ pub const AppState = struct {
     pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
+            .claude => "claude-sonnet-4-5",
             .opencode => blk: {
                 for (self.opencodeModelOptionsSnapshot()) |option| {
                     if (option.value) |value| break :blk value;
@@ -2166,6 +2169,11 @@ pub const AppState = struct {
                     .launch_if_missing = true,
                 },
             },
+            .claude => ai_harness.ProviderConfig{
+                .claude = .{
+                    .cwd = project.path,
+                },
+            },
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2281,6 +2289,11 @@ pub const AppState = struct {
                     .launch_if_missing = true,
                 },
             },
+            .claude => ai_harness.ProviderConfig{
+                .claude = .{
+                    .cwd = project.path,
+                },
+            },
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2355,6 +2368,11 @@ pub const AppState = struct {
                     .allocator = self.allocator,
                     .working_directory = project.path,
                     .launch_if_missing = true,
+                },
+            },
+            .claude => ai_harness.ProviderConfig{
+                .claude = .{
+                    .cwd = project.path,
                 },
             },
         };
@@ -2591,6 +2609,7 @@ pub const AppState = struct {
         const kind: FollowupKind = switch (thread.provider) {
             .codex => .steer,
             .opencode => .queue,
+            .claude => .queue,
         };
 
         const send_state = thread.send_state;
@@ -2638,6 +2657,7 @@ pub const AppState = struct {
         return switch (thread.provider) {
             .codex => "Tab to steer",
             .opencode => "Tab to queue",
+            .claude => "Tab to queue",
         };
     }
 
@@ -2661,6 +2681,11 @@ pub const AppState = struct {
                 .codex = .{
                     .cwd = project.path,
                     .launch_on_connect = false,
+                },
+            },
+            .claude => ai_harness.ProviderConfig{
+                .claude = .{
+                    .cwd = project.path,
                 },
             },
         };
@@ -2701,6 +2726,11 @@ pub const AppState = struct {
                 .codex = .{
                     .cwd = project_path,
                     .launch_on_connect = false,
+                },
+            },
+            .claude => ai_harness.ProviderConfig{
+                .claude = .{
+                    .cwd = project_path,
                 },
             },
         };
@@ -6031,7 +6061,7 @@ pub const AppState = struct {
             else
                 null;
             if (pending_thread_id) |resolved_thread_id| {
-                if (provider == .opencode or send_state.active_turn_id != null) {
+                if (provider == .opencode or provider == .claude or send_state.active_turn_id != null) {
                     thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                     turn_id = if (send_state.active_turn_id) |active_turn_id|
                         self.allocator.dupe(u8, active_turn_id) catch null
@@ -6536,6 +6566,12 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "This provider does not support thread imports.",
             else => "Failed to load OpenCode threads.",
         },
+        .claude => switch (err) {
+            error.ClaudeRequestFailed => "Failed to load Claude threads.",
+            error.FileNotFound => "The node executable was not found on PATH.",
+            error.UnsupportedOperation => "Claude thread imports are not supported by this SDK.",
+            else => "Failed to load Claude threads.",
+        },
     };
 }
 
@@ -6590,6 +6626,12 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "This provider does not support thread sync.",
             else => "Failed to sync the OpenCode thread.",
         },
+        .claude => switch (err) {
+            error.ClaudeRequestFailed => "Failed to sync the Claude thread.",
+            error.FileNotFound => "The node executable was not found on PATH.",
+            error.UnsupportedOperation => "Claude thread sync is not supported by this SDK.",
+            else => "Failed to sync the Claude thread.",
+        },
     };
 }
 
@@ -6597,6 +6639,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to store Codex thread list.",
         .opencode => "Failed to store OpenCode thread list.",
+        .claude => "Failed to store Claude thread list.",
     };
 }
 
@@ -6604,6 +6647,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "No recent Codex threads found.",
         .opencode => "No recent OpenCode threads found.",
+        .claude => "No recent Claude threads found.",
     };
 }
 
@@ -6611,6 +6655,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Select a Codex thread or paste a thread ID.",
         .opencode => "Select an OpenCode thread or paste a thread ID.",
+        .claude => "Select a Claude thread or paste a thread ID.",
     };
 }
 
@@ -6618,6 +6663,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Enter a Codex thread ID or select one from the list.",
         .opencode => "Enter an OpenCode thread ID or select one from the list.",
+        .claude => "Enter a Claude thread ID or select one from the list.",
     };
 }
 
@@ -6625,6 +6671,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Codex thread already exists in this project.",
         .opencode => "OpenCode thread already exists in this project.",
+        .claude => "Claude thread already exists in this project.",
     };
 }
 
@@ -6632,6 +6679,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to create the imported thread.",
         .opencode => "Failed to create the imported thread.",
+        .claude => "Failed to create the imported thread.",
     };
 }
 
@@ -6639,6 +6687,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to add the imported thread.",
         .opencode => "Failed to add the imported thread.",
+        .claude => "Failed to add the imported thread.",
     };
 }
 
@@ -6646,6 +6695,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Codex thread imported.",
         .opencode => "OpenCode thread imported.",
+        .claude => "Claude thread imported.",
     };
 }
 
@@ -6653,6 +6703,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Thread synced from Codex.",
         .opencode => "Thread synced from OpenCode.",
+        .claude => "Thread synced from Claude.",
     };
 }
 

@@ -488,6 +488,11 @@ pub fn runSendWorker(
                 .launch_on_connect = true,
             },
         },
+        .claude => ai_harness.ProviderConfig{
+            .claude = .{
+                .cwd = request.project_path,
+            },
+        },
     };
 
     log.info(

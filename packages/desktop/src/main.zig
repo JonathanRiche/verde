@@ -963,3 +963,7 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
     state.replaceAppConfig(next_app_config);
     state.setSidebarNotice("App, config, and keybinds refreshed.");
 }
+
+test {
+    _ = @import("providers/claude.zig");
+}
