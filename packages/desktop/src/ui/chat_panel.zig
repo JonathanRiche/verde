@@ -21,6 +21,8 @@ const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
 const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
 /// Draft attachment previews sit above the composer card when they overlap the dock.
 const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
+/// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
+const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -1625,7 +1627,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     };
     if (provider_icon) |cached| {
         queueImage(state, .{
-            .x = model_rect.x + theme.scaledUi(17.0),
+            .x = model_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
             .y = model_rect.y + (model_rect.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
@@ -1634,7 +1636,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
 
     if (state.currentThread().provider == .codex) {
         const fast_icon_rect = palette.Rect{
-            .x = fast_rect.x + theme.scaledUi(17.0),
+            .x = fast_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
             .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
@@ -1647,7 +1649,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     }
 
     drawAccessIcon(state, .{
-        .x = access_rect.x + theme.scaledUi(17.0),
+        .x = access_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
         .y = access_rect.y + (access_rect.h - icon_size) * 0.5,
         .w = icon_size,
         .h = icon_size,

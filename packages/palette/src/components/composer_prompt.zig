@@ -82,6 +82,11 @@ pub const ComposerPromptConfig = struct {
     fast_max_width: f32 = 120.0,
     access_min_width: f32 = 0.0,
     access_max_width: f32 = 170.0,
+    /// When > 0, model / fast / access pills reserve this width (plus `pill_icon_gap`) for leading
+    /// toolbar glyphs drawn outside text metrics (e.g. textures in the host). Skips rendering
+    /// `model_icon` / `fast_icon` / `access_icon` text when those strings are empty.
+    /// Should be about `toolbar_icon_drawn_width + gap_after_icon - pill_icon_gap` (see host overlay).
+    pill_overlay_icon_reserve: f32 = 0.0,
     z_index: i32 = 0,
 };
 
@@ -508,21 +513,26 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const geometry = self.toolbarGeometry();
-            try self.renderPill(allocator, batch, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
             const left_before_fast: draw.Rect = if (self.show_reasoning_toggle) geometry.reasoning else geometry.model;
+            // Draw separators under pills so divider lines cannot cover trailing chevrons in the gap.
             if (self.show_reasoning_toggle) {
                 try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
-                try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
             }
             if (self.show_fast_toggle) {
                 try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.fast), geometry.toolbar);
-                try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
                 try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
             } else {
                 try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.access), geometry.toolbar);
             }
 
-            try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
+            try self.renderPill(allocator, batch, true, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
+            if (self.show_reasoning_toggle) {
+                try self.renderPill(allocator, batch, false, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+            }
+            if (self.show_fast_toggle) {
+                try self.renderPill(allocator, batch, true, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
+            }
+            try self.renderPill(allocator, batch, true, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
             const send_panel_color: draw.Color = blk: {
@@ -545,7 +555,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
         }
 
-        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
+        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, overlay_leading: bool, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
             try batch.panel(allocator, rect, if (hovered) config.control_hover_color else config.control_background_color, null, rect.h * 0.5, 0.0);
             const text_metrics = self.toolbarMetrics();
@@ -553,7 +563,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             var runs: [3]draw.TextRun = undefined;
             var count: usize = 0;
             var x = rect.x + config.pill_padding_x;
-            if (left_icon.len > 0) {
+            if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
+                x += config.pill_overlay_icon_reserve + config.pill_icon_gap;
+            } else if (left_icon.len > 0) {
                 runs[count] = iconRun(left_icon, x, rect, icon_metrics, config.icon_color);
                 x += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
                 count += 1;
@@ -1227,21 +1239,30 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const measured = icon_metrics.measureSlice(right_icon);
             // Measured advance for icon glyphs (e.g. ">") can be tighter than GPU text; reserve at least
             // a column so labels are not clipped and the chevron does not collide with the label.
-            const min_cell = @max(icon_metrics.font_size * 0.62, 15.0);
+            const min_cell = @max(icon_metrics.font_size * 0.82, 21.0);
             return config.pill_chevron_gap + @max(measured, min_cell);
         }
 
         fn toolbarLabelMeasureSlack(text_metrics: text_layout.FontMetrics) f32 {
-            return @max(6.0, text_metrics.font_size * 0.22);
+            return @max(8.0, text_metrics.font_size * 0.28);
         }
 
-        fn pillWidth(self: *const Component, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
+        fn pillWidth(self: *const Component, overlay_leading: bool, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
             const text_metrics = self.toolbarMetrics();
             const icon_metrics = self.iconMetrics();
             var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label) + toolbarLabelMeasureSlack(text_metrics);
-            if (left_icon.len > 0) width += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
+            if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
+                width += config.pill_overlay_icon_reserve + config.pill_icon_gap;
+            } else if (left_icon.len > 0) {
+                width += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
+            }
             if (right_icon.len > 0) width += self.trailingChevronReserve(right_icon);
             return @min(@max(width, min_width), max_width);
+        }
+
+        /// Unclamped width needed for the current label/icons (ignores configured min/max caps).
+        fn pillNaturalNeedWidth(self: *const Component, overlay_leading: bool, left_icon: []const u8, label: []const u8, right_icon: []const u8) f32 {
+            return self.pillWidth(overlay_leading, left_icon, label, right_icon, 0.0, std.math.floatMax(f32));
         }
 
         fn menuContentWidth(self: *const Component, target: ComposerPromptOptionTarget) f32 {
@@ -1272,16 +1293,27 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         /// When natural pill widths exceed the toolbar budget, shrink pills proportionally down to their
         /// configured minimums (access and fast give way before reasoning and model).
         fn shrinkToolbarPillWidthsToFit(self: *const Component, avail: f32, model_w: *f32, reasoning_w: *f32, fast_w: *f32, access_w: *f32) void {
+            const need_m = self.pillNaturalNeedWidth(true, config.model_icon, self.modelLabel(), config.chevron_icon);
+            const need_r = if (self.show_reasoning_toggle)
+                self.pillNaturalNeedWidth(false, "", self.reasoningLabel(), config.chevron_icon)
+            else
+                0.0;
+            const need_f = if (self.show_fast_toggle)
+                self.pillNaturalNeedWidth(true, config.fast_icon, self.fastLabel(), "")
+            else
+                0.0;
+            const need_a = self.pillNaturalNeedWidth(true, config.access_icon, self.accessLabel(), "");
+
             var iter: u32 = 0;
             while (iter < 16) : (iter += 1) {
                 const total = self.toolbarPillsTotalWidth(model_w.*, reasoning_w.*, fast_w.*, access_w.*);
                 if (total <= avail + 0.5) return;
                 const overflow = total - avail;
 
-                const min_m = config.model_min_width;
-                const min_r = if (self.show_reasoning_toggle) config.reasoning_min_width else 0.0;
-                const min_f = if (self.show_fast_toggle) config.fast_min_width else 0.0;
-                const min_a = config.access_min_width;
+                const min_m = @max(config.model_min_width, @min(need_m, config.model_max_width));
+                const min_r = if (self.show_reasoning_toggle) @max(config.reasoning_min_width, @min(need_r, config.reasoning_max_width)) else 0.0;
+                const min_f = if (self.show_fast_toggle) @max(config.fast_min_width, @min(need_f, config.fast_max_width)) else 0.0;
+                const min_a = @max(config.access_min_width, @min(need_a, config.access_max_width));
 
                 const flex_m = @max(0.0, model_w.* - min_m);
                 const flex_r = @max(0.0, reasoning_w.* - min_r);
@@ -1324,16 +1356,16 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const max_x = send.x - config.control_gap * 2.5;
             const avail = @max(max_x - toolbar.x, 0.0);
 
-            var model_w = self.pillWidth(config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
+            var model_w = self.pillWidth(true, config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
             var reasoning_w: f32 = if (self.show_reasoning_toggle)
-                self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width)
+                self.pillWidth(false, "", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width)
             else
                 0.0;
             var fast_w: f32 = if (self.show_fast_toggle)
-                self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width)
+                self.pillWidth(true, config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width)
             else
                 0.0;
-            var access_w = self.pillWidth(config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width);
+            var access_w = self.pillWidth(true, config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width);
 
             self.shrinkToolbarPillWidthsToFit(avail, &model_w, &reasoning_w, &fast_w, &access_w);
 
@@ -1530,8 +1562,8 @@ test "composer prompt sizes toolbar pills from measured content" {
     });
     var prompt = Prompt.init();
     const model = prompt.modelRect();
-    const slack = @max(6.0, 14.0 * 0.22);
-    const trailing = 3.0 + @max(6.0, @max(16.0 * 0.62, 15.0));
+    const slack = @max(8.0, 14.0 * 0.28);
+    const trailing = 3.0 + @max(6.0, @max(16.0 * 0.82, 21.0));
     const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + slack + trailing;
     try std.testing.expectEqual(expected, model.w);
 }
