@@ -87,6 +87,8 @@ pub const ComposerPromptConfig = struct {
     /// `model_icon` / `fast_icon` / `access_icon` text when those strings are empty.
     /// Should be about `toolbar_icon_drawn_width + gap_after_icon - pill_icon_gap` (see host overlay).
     pill_overlay_icon_reserve: f32 = 0.0,
+    /// Extra horizontal room for toolbar pill labels (bold vs measured regular advances, shaping, etc.).
+    pill_label_width_fudge: f32 = 0.0,
     z_index: i32 = 0,
 };
 
@@ -1247,10 +1249,21 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return @max(8.0, text_metrics.font_size * 0.28);
         }
 
+        /// Toolbar pills render with `bold_font_role`; measurement uses `toolbarMetrics` (often regular).
+        fn pillToolbarLabelSlack(_: *const Component, text_metrics: text_layout.FontMetrics) f32 {
+            var s = toolbarLabelMeasureSlack(text_metrics);
+            if (config.bold_font_role != null and config.font_role != null and
+                config.bold_font_role.? != config.font_role.?)
+            {
+                s *= 1.28;
+            }
+            return s;
+        }
+
         fn pillWidth(self: *const Component, overlay_leading: bool, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
             const text_metrics = self.toolbarMetrics();
             const icon_metrics = self.iconMetrics();
-            var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label) + toolbarLabelMeasureSlack(text_metrics);
+            var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label) + self.pillToolbarLabelSlack(text_metrics) + config.pill_label_width_fudge;
             if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
                 width += config.pill_overlay_icon_reserve + config.pill_icon_gap;
             } else if (left_icon.len > 0) {
@@ -1562,7 +1575,7 @@ test "composer prompt sizes toolbar pills from measured content" {
     });
     var prompt = Prompt.init();
     const model = prompt.modelRect();
-    const slack = @max(8.0, 14.0 * 0.28);
+    const slack = @max(8.0, 14.0 * 0.28) * 1.28;
     const trailing = 3.0 + @max(6.0, @max(16.0 * 0.82, 21.0));
     const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + slack + trailing;
     try std.testing.expectEqual(expected, model.w);

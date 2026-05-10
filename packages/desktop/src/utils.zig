@@ -95,6 +95,58 @@ pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTextur
         .valid = true,
     };
 }
+
+/// Normalized device / layout rectangle for bitmap draws (avoids anonymous-struct mismatch).
+pub const ImageLayoutRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+/// Aspect-fill inside a fixed slot so non-square bitmaps are not stretched to a square
+/// (which blurs logos). Same slot bounds; excess is cropped by the clip rect.
+pub fn imageRectCover(tex_w: i32, tex_h: i32, slot_x: f32, slot_y: f32, slot_w: f32, slot_h: f32) ImageLayoutRect {
+    if (tex_w <= 0 or tex_h <= 0 or slot_w <= 0.0 or slot_h <= 0.0) {
+        return .{ .x = slot_x, .y = slot_y, .w = slot_w, .h = slot_h };
+    }
+    const iw: f32 = @floatFromInt(tex_w);
+    const ih: f32 = @floatFromInt(tex_h);
+    const scale = @max(slot_w / iw, slot_h / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    return .{
+        .x = slot_x + (slot_w - dw) * 0.5,
+        .y = slot_y + (slot_h - dh) * 0.5,
+        .w = dw,
+        .h = dh,
+    };
+}
+
+/// Like CSS `object-fit: contain`: full bitmap visible, aspect preserved, centered in the slot.
+pub fn imageRectContain(tex_w: i32, tex_h: i32, slot_x: f32, slot_y: f32, slot_w: f32, slot_h: f32) ImageLayoutRect {
+    if (tex_w <= 0 or tex_h <= 0 or slot_w <= 0.0 or slot_h <= 0.0) {
+        return .{ .x = slot_x, .y = slot_y, .w = slot_w, .h = slot_h };
+    }
+    const iw: f32 = @floatFromInt(tex_w);
+    const ih: f32 = @floatFromInt(tex_h);
+    const scale = @min(slot_w / iw, slot_h / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    return .{
+        .x = slot_x + (slot_w - dw) * 0.5,
+        .y = slot_y + (slot_h - dh) * 0.5,
+        .w = dw,
+        .h = dh,
+    };
+}
+
+/// Integer pixel bounds for texture quads so bilinear sampling is not shifted by
+/// sub-pixel placement (reduces mushy edges on tiny minified logos).
+pub fn snapImageRectToPixels(r: ImageLayoutRect) ImageLayoutRect {
+    return .{
+        .x = @round(r.x),
+        .y = @round(r.y),
+        .w = @max(1, @round(r.w)),
+        .h = @max(1, @round(r.h)),
+    };
+}
+
 pub fn projectLabelFromPath(path: []const u8) []const u8 {
     const basename = std.fs.path.basename(path);
     return if (basename.len == 0) path else basename;
