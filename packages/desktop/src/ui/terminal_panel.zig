@@ -533,7 +533,8 @@ fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, 
 }
 
 fn queueFixedText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
-    state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * 0.58, font_size * 1.28, false) catch {};
+    const font_role: ?palette.FontRole = if (terminalGlyphNeedsIconFont(value)) .icon else .mono;
+    state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, font_role, null, clip) catch {};
 }
 
 fn paletteColor(color: [4]f32) palette.Color {
@@ -546,5 +547,31 @@ fn rgbPaletteColor(rgb: ghostty_vt.color.RGB, alpha: f32) palette.Color {
         .g = @as(f32, @floatFromInt(rgb.g)) / 255.0,
         .b = @as(f32, @floatFromInt(rgb.b)) / 255.0,
         .a = alpha,
+    };
+}
+
+fn terminalGlyphNeedsIconFont(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const view = std.unicode.Utf8View.init(value) catch return false;
+    var iter = view.iterator();
+    const cp = iter.nextCodepoint() orelse return false;
+    return switch (cp) {
+        0x23fb...0x23fe,
+        0x2630,
+        0x2665,
+        0x26a1,
+        0x276c...0x2771,
+        0x2b58,
+        0xe000...0xe00a,
+        0xe0a0...0xe0d7,
+        0xe200...0xe2a9,
+        0xe300...0xe3e3,
+        0xe5fa...0xe8ef,
+        0xea60...0xec1e,
+        0xed00...0xefce,
+        0xf000...0xf533,
+        0xf0001...0xf1af0,
+        => true,
+        else => false,
     };
 }

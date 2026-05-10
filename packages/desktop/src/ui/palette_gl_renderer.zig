@@ -62,6 +62,7 @@ extern fn palette_text_gl_draw(
 ) void;
 
 const ui_font_bytes = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+const icon_font_bytes = @embedFile("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 const Vertex = extern struct {
     x: f32,
@@ -352,10 +353,10 @@ pub const Renderer = struct {
         if (command.text_run_count > 0) {
             const runs = batch.text_runs.items[command.text_run_start..][0..command.text_run_count];
             for (runs) |run| {
-                drawTextSlice(run.text, run.x, run.y, run.font_size, run.color, framebuffer_width, framebuffer_height);
+                drawTextSlice(run.text, run.x, run.y, run.font_size, run.color, run.font_role, framebuffer_width, framebuffer_height);
             }
         } else {
-            drawTextSlice(command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.font_size, command.color, framebuffer_width, framebuffer_height);
+            drawTextSlice(command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.font_size, command.color, command.font_role, framebuffer_width, framebuffer_height);
         }
     }
 
@@ -639,11 +640,12 @@ fn normalizedUv(uv: palette.Rect) palette.Rect {
     return if (uv.w == 0.0 and uv.h == 0.0) .{ .w = 1.0, .h = 1.0 } else uv;
 }
 
-fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palette.Color, framebuffer_width: f32, framebuffer_height: f32) void {
+fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palette.Color, font_role: ?palette.FontRole, framebuffer_width: f32, framebuffer_height: f32) void {
     if (text.len == 0 or color.a <= 0.0) return;
+    const font_bytes = if (font_role == .icon) icon_font_bytes else ui_font_bytes;
     palette_text_gl_draw(
-        ui_font_bytes.ptr,
-        @intCast(ui_font_bytes.len),
+        font_bytes.ptr,
+        @intCast(font_bytes.len),
         text.ptr,
         @intCast(text.len),
         x,
