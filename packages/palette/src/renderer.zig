@@ -109,6 +109,7 @@ pub const Renderer = struct {
     sampler: ?*c.SDL_GPUSampler = null,
     text_engine: ?*c.TTF_TextEngine = null,
     font: ?*c.TTF_Font = null,
+    icon_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
     text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -360,8 +361,13 @@ pub const Renderer = struct {
     }
 
     pub fn configureGpuText(self: *Renderer, font: *sdl.Font) !void {
+        try self.configureGpuTextWithFonts(font, null);
+    }
+
+    pub fn configureGpuTextWithFonts(self: *Renderer, font: *sdl.Font, icon_font: ?*sdl.Font) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         self.font = @ptrCast(font);
+        self.icon_font = if (icon_font) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
@@ -763,22 +769,23 @@ pub const Renderer = struct {
     fn appendTextCommand(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, command: draw.Command) !void {
         if (command.text_runs.len > 0) {
             for (command.text_runs) |run| {
-                try self.appendNaturalTextSlice(allocator, frame, run.text, run.x - command.scroll.x, run.y - command.scroll.y, run.color, run.font_size, run.clip, null, null);
+                try self.appendNaturalTextSlice(allocator, frame, run.text, run.x - command.scroll.x, run.y - command.scroll.y, run.color, run.font_size, run.clip, null, null, run.font_role);
             }
             return;
         }
-        try self.appendNaturalTextSlice(allocator, frame, command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.color, command.font_size, command.clip, if (command.wrap) command.rect.w else null, null);
+        try self.appendNaturalTextSlice(allocator, frame, command.text, command.rect.x - command.scroll.x, command.rect.y - command.scroll.y, command.color, command.font_size, command.clip, if (command.wrap) command.rect.w else null, null, command.font_role);
     }
 
-    fn appendNaturalTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32, target_width: ?f32) !void {
-        const key = textCacheKey(value, font_size, wrap_width);
+    fn appendNaturalTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32, target_width: ?f32, font_role: ?draw.FontRole) !void {
+        const font = self.fontForRole(font_role);
+        const key = textCacheKey(value, font_size, wrap_width, font_role);
         if (self.text_cache.getPtr(key)) |entry| {
             try appendCachedText(allocator, frame, entry, x, y, color_value, clip, target_width);
             return;
         }
 
         if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
-        var cache_entry = try self.createTextCacheEntry(value, font_size, wrap_width);
+        var cache_entry = try self.createTextCacheEntry(font, value, font_size, wrap_width);
         errdefer cache_entry.deinit();
         try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, target_width);
         try self.text_cache.put(key, cache_entry);
@@ -805,33 +812,34 @@ pub const Renderer = struct {
                 cursor_y += line_height;
             }
             if (!isTextSpace(slice)) {
-                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip);
+                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip, null);
             }
             cursor_x += advance;
             index += len;
         }
     }
 
-    fn appendTextGlyph(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect) !void {
-        const key = textCacheKey(value, font_size, null);
+    fn appendTextGlyph(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, font_role: ?draw.FontRole) !void {
+        const font = self.fontForRole(font_role);
+        const key = textCacheKey(value, font_size, null, font_role);
         if (self.text_cache.getPtr(key)) |entry| {
             try appendCachedText(allocator, frame, entry, x, y, color_value, clip, null);
             return;
         }
 
         if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
-        var cache_entry = try self.createTextCacheEntry(value, font_size, null);
+        var cache_entry = try self.createTextCacheEntry(font, value, font_size, null);
         errdefer cache_entry.deinit();
         try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, null);
         try self.text_cache.put(key, cache_entry);
     }
 
-    fn createTextCacheEntry(self: *Renderer, value: []const u8, font_size: f32, wrap_width: ?f32) !TextCacheEntry {
+    fn createTextCacheEntry(self: *Renderer, font: *c.TTF_Font, value: []const u8, font_size: f32, wrap_width: ?f32) !TextCacheEntry {
         var entry: TextCacheEntry = .{};
         errdefer entry.deinit();
 
-        if (!c.TTF_SetFontSize(self.font.?, font_size * GPU_TEXT_FONT_SCALE)) return error.SdlTtfTextFailed;
-        const text = c.TTF_CreateText(self.text_engine.?, self.font.?, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
+        if (!c.TTF_SetFontSize(font, font_size * GPU_TEXT_FONT_SCALE)) return error.SdlTtfTextFailed;
+        const text = c.TTF_CreateText(self.text_engine.?, font, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
         errdefer c.TTF_DestroyText(text);
         if (wrap_width) |width| {
             if (width > 0 and !c.TTF_SetTextWrapWidth(text, @intFromFloat(@ceil(width)))) return error.SdlTtfTextFailed;
@@ -869,6 +877,13 @@ pub const Renderer = struct {
         if (!c.TTF_SetTextFont(text, null)) return error.SdlTtfTextFailed;
         entry.text = text;
         return entry;
+    }
+
+    fn fontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
+        if (role == .icon) {
+            if (self.icon_font) |font_value| return font_value;
+        }
+        return self.font.?;
     }
 
     fn clearTextCache(self: *Renderer) void {
@@ -1046,6 +1061,7 @@ const TextCacheKey = struct {
     text_len: usize,
     font_size_bits: u32,
     wrap_width_bits: u32,
+    font_role: u8,
 };
 
 const TextCacheVertex = struct {
@@ -1693,14 +1709,24 @@ fn colorByte(value: f32) u8 {
     return @intFromFloat(@min(@max(value, 0.0), 1.0) * 255.0);
 }
 
-fn textCacheKey(value: []const u8, font_size: f32, wrap_width: ?f32) TextCacheKey {
+fn textCacheKey(value: []const u8, font_size: f32, wrap_width: ?f32, font_role: ?draw.FontRole) TextCacheKey {
     const wrap_value = wrap_width orelse 0.0;
     return .{
         .text_hash = std.hash.Wyhash.hash(0, value),
         .text_len = value.len,
         .font_size_bits = @bitCast(font_size),
         .wrap_width_bits = @bitCast(wrap_value),
+        .font_role = fontRoleCacheValue(font_role),
     };
+}
+
+fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
+    return if (font_role) |role| switch (role) {
+        .ui => 1,
+        .ui_bold => 2,
+        .icon => 3,
+        .mono => 4,
+    } else 0;
 }
 
 fn growCapacity(required: usize) usize {
