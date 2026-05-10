@@ -100,18 +100,19 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_height = 48.0,
     .toolbar_gap = 14.0,
     .control_gap = 14.0,
-    .pill_padding_x = 16.0,
-    .pill_icon_gap = 10.0,
-    .pill_chevron_gap = 10.0,
-    .model_min_width = 138.0,
+    .pill_padding_x = 21.0,
+    .pill_icon_gap = 13.0,
+    .pill_chevron_gap = 18.0,
+    .model_min_width = 146.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 420.0,
-    .reasoning_min_width = 92.0,
-    .reasoning_max_width = 150.0,
-    .fast_min_width = 116.0,
-    .fast_max_width = 132.0,
-    .access_min_width = 172.0,
-    .access_max_width = 192.0,
+    .reasoning_min_width = 98.0,
+    .reasoning_max_width = 218.0,
+    .fast_min_width = 124.0,
+    .fast_max_width = 178.0,
+    .access_min_width = 202.0,
+    // Toolbar label + lock icon + padding exceeds 230 at 26/30px; a higher cap avoids clipping "Full access".
+    .access_max_width = 300.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -4970,7 +4971,7 @@ pub const AppState = struct {
         const thread = self.currentThread();
         const show_fast_toggle = thread.provider == .codex;
         self.palette_composer.setShowFastToggle(show_fast_toggle);
-        const hide_placeholder = thread.draftImageCount() > 0 or self.palette_model_cascade.isOpen();
+        const hide_placeholder = thread.draftImageCount() > 0;
         self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
