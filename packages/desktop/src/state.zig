@@ -4970,7 +4970,8 @@ pub const AppState = struct {
         const thread = self.currentThread();
         const show_fast_toggle = thread.provider == .codex;
         self.palette_composer.setShowFastToggle(show_fast_toggle);
-        self.palette_composer.setPlaceholder(self.allocator, if (thread.draftImageCount() == 0) "Ask anything, or use / to show available commands" else " ") catch |err| {
+        const hide_placeholder = thread.draftImageCount() > 0 or self.palette_model_cascade.isOpen();
+        self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
