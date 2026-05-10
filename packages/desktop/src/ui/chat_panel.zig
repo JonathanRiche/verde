@@ -4,6 +4,7 @@ const std = @import("std");
 const palette = @import("palette");
 
 const app_state = @import("../state.zig");
+const utils = @import("../utils.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
@@ -23,6 +24,8 @@ const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
 const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
+/// Provider logo in the model pill (~50% larger than vector toolbar glyphs for readability).
+const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 22.0 * 1.5;
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -1611,6 +1614,15 @@ fn renderComposerFollowupHint(state: *app_state.AppState) void {
     }, hint, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
 }
 
+fn snapIconRectOrigin(rect: palette.Rect) palette.Rect {
+    return .{
+        .x = @round(rect.x * 2.0) * 0.5,
+        .y = @round(rect.y * 2.0) * 0.5,
+        .w = rect.w,
+        .h = rect.h,
+    };
+}
+
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_TOOLBAR_OVERLAY_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
@@ -1620,27 +1632,30 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const fast_rect = state.palette_composer.fastRect();
     const access_rect = state.palette_composer.accessRect();
     const icon_size = theme.scaledUi(22.0);
+    const provider_slot = theme.scaledUi(COMPOSER_PROVIDER_LOGO_SLOT_CSS);
+    const model_icon_slot = palette.Rect{
+        .x = model_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
+        .y = model_rect.y + (model_rect.h - provider_slot) * 0.5,
+        .w = provider_slot,
+        .h = provider_slot,
+    };
 
     const provider_icon = switch (state.currentThread().provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
     };
     if (provider_icon) |cached| {
-        queueImage(state, .{
-            .x = model_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
-            .y = model_rect.y + (model_rect.h - icon_size) * 0.5,
-            .w = icon_size,
-            .h = icon_size,
-        }, cached, model_rect);
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
     if (state.currentThread().provider == .codex) {
-        const fast_icon_rect = palette.Rect{
+        const fast_icon_rect = snapIconRectOrigin(palette.Rect{
             .x = fast_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
             .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,
             .w = icon_size,
             .h = icon_size,
-        };
+        });
         if (state.currentThread().fast_mode == .on) {
             drawBoltIcon(state, fast_icon_rect, icon_color);
         } else {
@@ -1648,12 +1663,12 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }
     }
 
-    drawAccessIcon(state, .{
+    drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
         .x = access_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
         .y = access_rect.y + (access_rect.h - icon_size) * 0.5,
         .w = icon_size,
         .h = icon_size,
-    }, icon_color);
+    }), icon_color);
 }
 
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {

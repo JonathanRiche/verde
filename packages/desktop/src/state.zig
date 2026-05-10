@@ -109,12 +109,14 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .reasoning_min_width = 118.0,
     .reasoning_max_width = 248.0,
     .fast_min_width = 124.0,
-    .fast_max_width = 228.0,
+    .fast_max_width = 280.0,
     .access_min_width = 218.0,
     // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
     .access_max_width = 328.0,
     // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
-    .pill_overlay_icon_reserve = 18.0,
+    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
+    .pill_overlay_icon_reserve = 29.0,
+    .pill_label_width_fudge = 14.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -419,10 +421,13 @@ fn paletteModelCascadeRenderRowLeading(
         .opencode => state.opencode_logo_texture,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
-    const sz = @min(leading_rect.w, leading_rect.h) * 0.68;
+    const inner = @min(leading_rect.w, leading_rect.h);
+    const sz = inner * @min(0.68 * 1.5, 0.96);
     const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
     const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
-    const r: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const slot: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, slot.x, slot.y, slot.w, slot.h));
+    const r: palette.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
     batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,

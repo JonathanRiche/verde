@@ -5,10 +5,25 @@ const palette = @import("palette");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
+const utils = @import("../utils.zig");
 const native_state = @import("../state.zig");
 const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
+
+/// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
+const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0 * 1.5;
+/// Thread row height must fit `SIDEBAR_THREAD_PROVIDER_GLYPH_CSS` with a little vertical air.
+const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 36.0;
+/// Vertical advance per thread row (row + gap).
+const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 40.0;
+const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 8.0;
+/// Horizontal gap between the icon slot and the title.
+const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 6.0;
+/// Relative-time label starts this far from the row's right edge.
+const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
+/// Padding between truncated title and the time column.
+const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
 
 const SidebarHitKind = enum {
     collapse,
@@ -433,10 +448,10 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                     .x = x + theme.scaledUi(24.0),
                     .y = y,
                     .w = rail_w - theme.scaledUi(42.0),
-                    .h = theme.scaledUi(26.0),
+                    .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
                 };
                 if (rowVisible(thread_rect, rect)) renderPaletteThreadRow(state, project_index, thread_index, thread, thread_rect, clip);
-                y += theme.scaledUi(28.0);
+                y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
             }
             if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) };
@@ -522,26 +537,31 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
-    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(8.0), rect.y + rect.h * 0.5, clip);
+    const title_left_css = SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
+    const title_area_right_css = title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS + SIDEBAR_THREAD_TITLE_TIME_GAP_CSS;
+    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS), rect.y + rect.h * 0.5, clip);
     var time_buf: [24]u8 = undefined;
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
     var title_buf = std.mem.zeroes([64:0]u8);
-    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(84.0)) / theme.scaledUi(7.0), 8.0));
+    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
 
     const title_emphasis = selected or hovered;
+    const title_font = theme.scaledUi(14.0);
+    const title_line = title_font * 1.25;
+    const title_y = rect.y + (rect.h - title_line) * 0.5;
     queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(24.0),
-        .y = rect.y + theme.scaledUi(4.0),
-        .w = rect.w - theme.scaledUi(86.0),
+        .x = rect.x + theme.scaledUi(title_left_css),
+        .y = title_y,
+        .w = rect.w - theme.scaledUi(title_area_right_css),
         .h = rect.h,
-    }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
-        .y = rect.y + theme.scaledUi(4.0),
+        .y = title_y,
         .w = theme.scaledUi(58.0),
         .h = rect.h,
-    }, relative_time, paletteColor(colors.TIME_LABEL), theme.scaledUi(14.0), clip);
+    }, relative_time, paletteColor(colors.TIME_LABEL), title_font, clip);
 }
 
 fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {
@@ -750,7 +770,7 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
 }
 
 fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
-    const image_size = theme.scaledUi(13.0);
+    const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
     const image_rect: palette.Rect = .{
         .x = x,
         .y = center_y - image_size * 0.5,
@@ -762,7 +782,9 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .opencode => state.opencode_logo_texture,
     };
     if (texture) |cached| {
-        if (queuePaletteImage(state, image_rect, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
+        const draw: palette.Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
     }
 
     const label = switch (provider) {
