@@ -6,7 +6,6 @@ const palette = @import("palette");
 
 const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
-const terminal = @import("../terminal/terminal.zig");
 const theme = @import("theme.zig");
 
 const MAX_PANE_HITS = 64;
@@ -225,11 +224,8 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
     const cell_w = @max(rect.w / cols_f, 1.0);
     const cell_h = @max(rect.h / rows_f, 1.0);
-    const base_cell_w = @as(f32, @floatFromInt(terminal.CELL_PIXEL_WIDTH));
-    const base_cell_h = @as(f32, @floatFromInt(terminal.CELL_PIXEL_HEIGHT));
-    const geometry_scale = @min(cell_w / base_cell_w, cell_h / base_cell_h);
-    const font_size = @max(theme.terminal_font_size * geometry_scale, theme.scaledUi(10.0));
-    const text_y_offset = @max((cell_h - font_size) * 0.12, 0.0);
+    const font_size = terminalFontSizeForCell(cell_w, cell_h);
+    const text_y_offset = @max((cell_h - font_size) * 0.34, 0.0);
 
     queueRect(state, rect, rgbPaletteColor(render_state.colors.background, 1.0));
     const row_data = render_state.row_data.slice();
@@ -524,7 +520,7 @@ fn blendChannel(a: u8, b: u8, t: f32) u8 {
 }
 
 fn expandedCellRect(rect: palette.Rect) palette.Rect {
-    const bleed = theme.scaledUi(0.65);
+    const bleed = theme.scaledUi(0.35);
     return .{
         .x = rect.x - bleed,
         .y = rect.y - bleed,
@@ -537,10 +533,10 @@ fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyph
     return switch (glyph_kind) {
         .text => .{ .x = rect.x, .y = rect.y + y_offset, .w = rect.w, .h = rect.h },
         .icon => .{
-            .x = rect.x - rect.w * 0.08,
-            .y = rect.y + y_offset - rect.h * 0.10,
-            .w = rect.w * 1.22,
-            .h = rect.h * 1.16,
+            .x = rect.x - rect.w * 0.04,
+            .y = rect.y + y_offset - rect.h * 0.04,
+            .w = rect.w * 1.10,
+            .h = rect.h * 1.08,
         },
         .powerline => .{
             .x = rect.x - rect.w * 0.16,
@@ -554,9 +550,15 @@ fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyph
 fn terminalTextFontSize(font_size: f32, glyph_kind: TerminalGlyphKind) f32 {
     return switch (glyph_kind) {
         .text => font_size,
-        .icon => font_size * 0.98,
+        .icon => font_size * 0.92,
         .powerline => font_size * 1.18,
     };
+}
+
+fn terminalFontSizeForCell(cell_w: f32, cell_h: f32) f32 {
+    const by_height = cell_h * 0.72;
+    const by_width = cell_w * 1.48;
+    return theme.clampf(@min(by_height, by_width), 8.0, cell_h * 0.82);
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
@@ -598,11 +600,11 @@ fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []co
 }
 
 fn queuePowerlineGlyph(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) void {
-    const bleed = theme.scaledUi(0.8);
+    const bleed = theme.scaledUi(0.2);
     const left = rect.x - bleed;
     const right = rect.x + rect.w + bleed;
-    const top = rect.y - bleed;
-    const bottom = rect.y + rect.h + bleed;
+    const top = rect.y;
+    const bottom = rect.y + rect.h;
     const mid_y = rect.y + rect.h * 0.5;
     switch (cp) {
         0xe0b0, 0xe0b4, 0xe0b8, 0xe0bc, 0xe0c0, 0xe0c4 => queueTriangle(
