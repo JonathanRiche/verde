@@ -14,6 +14,13 @@ const theme = @import("theme.zig");
 
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
 const COMPOSER_HEIGHT: f32 = 220.0;
+/// Toolbar logos and drawn icons must sit above `PaletteComposerPrompt` geometry (`z_index` 120) so
+/// interleaved SDL_GPU rendering does not paint the composer panel over them.
+const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
+/// Hint text in the draft area; above composer content (z 120) but below toolbar chrome (130).
+const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
+/// Draft attachment previews sit above the composer card when they overlap the dock.
+const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -1507,7 +1514,7 @@ fn renderComposerDraftImage(state: *app_state.AppState) void {
         state.setComposerDraftImageClearRect(null);
         return;
     }
-    const previous_z = state.palette_overlay_batch.setZIndex(10);
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_DRAFT_IMAGE_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
     const composer = state.palette_composer.bounds();
@@ -1584,7 +1591,7 @@ fn renderComposerFollowupHint(state: *app_state.AppState) void {
     const draft = state.palette_composer.text();
     if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) return;
 
-    const previous_z = state.palette_overlay_batch.setZIndex(11);
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FOLLOWUP_HINT_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
     const tr = state.palette_composer.textRect();
@@ -1603,6 +1610,9 @@ fn renderComposerFollowupHint(state: *app_state.AppState) void {
 }
 
 fn renderComposerToolbarIcons(state: *app_state.AppState) void {
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_TOOLBAR_OVERLAY_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
     const icon_color = paletteColor(.{ 0.82, 0.85, 0.91, 1.0 });
     const model_rect = state.palette_composer.modelRect();
     const fast_rect = state.palette_composer.fastRect();
