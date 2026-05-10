@@ -274,6 +274,10 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             var text_buf: [128]u8 = undefined;
             const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
             const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
+            if (glyph_kind == .powerline) {
+                queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, 1.0), rect);
+                continue;
+            }
             const text_rect = terminalTextRect(cell_rect, text_y_offset, glyph_kind);
             const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
             queueTerminalText(state, .{
@@ -565,6 +569,14 @@ fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Colo
     state.palette_overlay_batch.rect(state.allocator, rect, color) catch {};
 }
 
+fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color, clip: ?palette.Rect) void {
+    if (clip) |clip_rect| {
+        state.palette_overlay_batch.triangleClipped(state.allocator, p0, p1, p2, color, clip_rect) catch {};
+    } else {
+        state.palette_overlay_batch.triangle(state.allocator, p0, p1, p2, color) catch {};
+    }
+}
+
 fn queueRounded(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
     state.palette_overlay_batch.roundedRect(state.allocator, rect, color, radius) catch {};
 }
@@ -583,6 +595,34 @@ fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []co
         .icon, .powerline => .icon,
     };
     state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, font_role, null, clip) catch {};
+}
+
+fn queuePowerlineGlyph(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) void {
+    const bleed = theme.scaledUi(0.8);
+    const left = rect.x - bleed;
+    const right = rect.x + rect.w + bleed;
+    const top = rect.y - bleed;
+    const bottom = rect.y + rect.h + bleed;
+    const mid_y = rect.y + rect.h * 0.5;
+    switch (cp) {
+        0xe0b0, 0xe0b4, 0xe0b8, 0xe0bc, 0xe0c0, 0xe0c4 => queueTriangle(
+            state,
+            .{ .x = left, .y = top },
+            .{ .x = left, .y = bottom },
+            .{ .x = right, .y = mid_y },
+            color,
+            clip,
+        ),
+        0xe0b2, 0xe0b6, 0xe0ba, 0xe0be, 0xe0c2, 0xe0c6 => queueTriangle(
+            state,
+            .{ .x = right, .y = top },
+            .{ .x = right, .y = bottom },
+            .{ .x = left, .y = mid_y },
+            color,
+            clip,
+        ),
+        else => queueTerminalText(state, terminalTextRect(rect, 0.0, .icon), "?", color, rect.h, clip, .icon),
+    }
 }
 
 fn paletteColor(color: [4]f32) palette.Color {
