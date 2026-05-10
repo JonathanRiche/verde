@@ -149,6 +149,7 @@ const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
 const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
@@ -456,6 +457,8 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .submenu_z_offset = 20,
     .placement = .above,
     .submenu_placement = .right,
+    .avoid_forbidden_for_root = false,
+    .avoid_forbidden_for_submenus = true,
     .item_count = COMPOSER_PROVIDER_OPTIONS.len,
     .item_label = paletteModelCascadeLabel,
     .child_count = paletteModelCascadeChildCount,
@@ -5034,20 +5037,6 @@ pub const AppState = struct {
         self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
     }
 
-    fn paletteModelCascadeMenuHeight(item_count: usize) f32 {
-        const visible_rows = @min(@max(item_count, 1), COMPOSER_MODEL_CASCADE_VISIBLE_ROWS);
-        return COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
-            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(visible_rows));
-    }
-
-    fn paletteModelCascadeMaxModelCount(self: *AppState) usize {
-        var max_count: usize = 1;
-        for (COMPOSER_PROVIDER_OPTIONS) |provider| {
-            max_count = @max(max_count, composerModelOptions(self, provider).len);
-        }
-        return max_count;
-    }
-
     pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
@@ -5058,25 +5047,18 @@ pub const AppState = struct {
             .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
             .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
         } else anchor;
-        const root_height = paletteModelCascadeMenuHeight(COMPOSER_PROVIDER_OPTIONS.len);
-        const submenu_height = paletteModelCascadeMenuHeight(self.paletteModelCascadeMaxModelCount());
+        const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
+            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
         const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + COMPOSER_MODEL_CASCADE_GAP;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
         const viewport_top: f32 = 8.0;
-        const viewport_bottom = @max(viewport_top + @max(root_height, submenu_height), composer_rect.y - COMPOSER_MODEL_CASCADE_GAP);
+        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y + composer_rect.h);
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        const last_provider_row = if (COMPOSER_PROVIDER_OPTIONS.len > 0) COMPOSER_PROVIDER_OPTIONS.len - 1 else 0;
-        const lowest_submenu_top = composer_rect.y - COMPOSER_MODEL_CASCADE_GAP - submenu_height;
-        const desired_root_y = lowest_submenu_top -
-            COMPOSER_MODEL_CASCADE_PADDING_Y -
-            @as(f32, @floatFromInt(last_provider_row)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
-        const max_root_y = @max(viewport_top, composer_rect.y - COMPOSER_MODEL_CASCADE_GAP - root_height);
-        const root_y = theme.clampf(desired_root_y, viewport_top, max_root_y);
         var menu_anchor = anchor;
-        menu_anchor.y = root_y + root_height + COMPOSER_MODEL_CASCADE_GAP;
+        menu_anchor.y += COMPOSER_MODEL_CASCADE_ROOT_DROP;
         self.palette_model_cascade.setAnchorRect(menu_anchor);
-        self.palette_model_cascade.setForbiddenRect(composer_rect);
+        self.palette_model_cascade.setForbiddenRect(self.palette_composer.toolbarRect());
         self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
             .y = viewport_top,
@@ -5085,7 +5067,7 @@ pub const AppState = struct {
         });
         self.palette_model_cascade.setBounds(.{
             .x = x,
-            .y = root_y,
+            .y = anchor.y,
             .w = COMPOSER_MODEL_CASCADE_WIDTH,
             .h = root_height,
         });

@@ -68,6 +68,8 @@ pub const CascadeMenuConfig = struct {
     viewport_rect: ?draw.Rect = null,
     anchor_rect: ?draw.Rect = null,
     forbidden_rect: ?draw.Rect = null,
+    avoid_forbidden_for_root: bool = true,
+    avoid_forbidden_for_submenus: bool = true,
     scroll_enabled: bool = true,
     item_count: ?usize = null,
     item_label: ?ItemLabelFn = null,
@@ -726,7 +728,9 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                 .auto => rect_value.y = self.autoRootY(anchor, rect_value.h),
             }
             rect_value.x = anchor.x;
-            rect_value = self.avoidForbidden(rect_value, true);
+            if (config.avoid_forbidden_for_root) {
+                rect_value = self.avoidForbidden(rect_value, true);
+            }
             return self.clampToViewport(rect_value);
         }
 
@@ -760,7 +764,9 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                 .left => parent.x - placed.w - config.submenu_gap,
                 .auto => self.autoSubmenuX(parent, placed.w),
             };
-            placed = self.avoidForbidden(placed, false);
+            if (config.avoid_forbidden_for_submenus) {
+                placed = self.avoidForbidden(placed, false);
+            }
             return self.clampToViewport(placed);
         }
 
