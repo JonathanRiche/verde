@@ -21,6 +21,7 @@ const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
 const debug_ui = @import("ui/debug.zig");
+const terminal_panel_ui = @import("ui/terminal_panel.zig");
 const palette_frame_renderer = @import("ui/palette_frame_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
@@ -814,6 +815,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (terminal_panel_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.routePaletteComposerMouseButton(&event.button, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -847,7 +852,7 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused() and !state.palette_composer.focused and !state.browser_address_focused and state.palette_modal_text_focus == .none) return;
+    if (!state.isBrowserPaneFocused() and !state.terminal_focused and !state.palette_composer.focused and !state.browser_address_focused and state.palette_modal_text_focus == .none) return;
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
