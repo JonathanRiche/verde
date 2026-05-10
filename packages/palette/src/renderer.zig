@@ -206,22 +206,79 @@ pub const Renderer = struct {
             self.solid_index_count
         else
             @as(u32, @intCast(self.command_counts.drawableIndexCount()));
-        if (self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null or index_count == 0) return;
+        self.renderSolidIndexedRange(pass, 0, index_count);
+    }
+
+    fn renderSolidIndexedRange(self: *Renderer, pass: *c.SDL_GPURenderPass, first_index: u32, index_count: u32) void {
+        if (index_count == 0 or self.pipeline == null or self.vertex_buffer == null or self.index_buffer == null) return;
+        gpuSetFullScissor(pass);
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.index_buffer.?, .offset = 0 };
         c.SDL_BindGPUGraphicsPipeline(pass, self.pipeline.?);
         c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
         c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        c.SDL_DrawGPUIndexedPrimitives(pass, index_count, 1, 0, 0, 0);
+        c.SDL_DrawGPUIndexedPrimitives(pass, index_count, 1, first_index, 0, 0);
+    }
+
+    /// Walks commands in batch order (already sorted by `z_index`) and draws solids, images, and
+    /// text in one combined order. Without this, `renderTextFrame` would paint all text after all
+    /// solid geometry, ignoring per-command z layering (e.g. composer placeholder over a menu).
+    fn renderBatchInterleaved(
+        self: *Renderer,
+        pass: *c.SDL_GPURenderPass,
+        batch: *const draw.RenderBatch,
+        solid_indices_after_cmd: []const u32,
+        image_frame: *const ImageFrame,
+        image_draws_after_cmd: []const u32,
+        text_frame: *const TextFrame,
+        text_draws_after_cmd: []const u32,
+        target_height: f32,
+    ) void {
+        const cmds = batch.commands.items;
+        std.debug.assert(solid_indices_after_cmd.len == cmds.len);
+        std.debug.assert(image_draws_after_cmd.len == cmds.len);
+        std.debug.assert(text_draws_after_cmd.len == cmds.len);
+
+        var i: usize = 0;
+        while (i < cmds.len) {
+            switch (cmds[i].kind) {
+                .rect, .triangle, .cursor, .selection, .scrollbar => {
+                    const start = i;
+                    i += 1;
+                    while (i < cmds.len) {
+                        switch (cmds[i].kind) {
+                            .rect, .triangle, .cursor, .selection, .scrollbar => i += 1,
+                            else => break,
+                        }
+                    }
+                    const prev: u32 = if (start == 0) 0 else solid_indices_after_cmd[start - 1];
+                    const end: u32 = solid_indices_after_cmd[i - 1];
+                    self.renderSolidIndexedRange(pass, prev, end - prev);
+                },
+                .image => {
+                    const prev_d: u32 = if (i == 0) 0 else image_draws_after_cmd[i - 1];
+                    const end_d: u32 = image_draws_after_cmd[i];
+                    self.renderImageFrameSlice(pass, image_frame, prev_d, end_d, target_height);
+                    i += 1;
+                },
+                .text => {
+                    const prev_d: u32 = if (i == 0) 0 else text_draws_after_cmd[i - 1];
+                    const end_d: u32 = text_draws_after_cmd[i];
+                    self.renderTextFrameSlice(pass, text_frame, prev_d, end_d, target_height);
+                    i += 1;
+                },
+            }
+        }
     }
 
     /// Builds and uploads the current batch into GPU buffers. Text commands are
     /// intentionally tracked, not discarded; they require an atlas texture path.
-    pub fn prepareBatch(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !void {
+    pub fn prepareBatch(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, solid_indices_after_cmd: []u32, stats: *FrameStats) !void {
+        std.debug.assert(solid_indices_after_cmd.len == batch.commands.items.len);
         var mesh: Mesh = .{};
         defer mesh.deinit(allocator);
         const build_start = nowNs();
-        try buildMesh(allocator, batch, &mesh);
+        try buildMesh(allocator, batch, &mesh, solid_indices_after_cmd);
         stats.batch_build_ns +|= elapsedNs(build_start);
 
         self.command_counts = CommandCounts.fromBatch(batch);
@@ -245,10 +302,17 @@ pub const Renderer = struct {
         var stats = self.beginFrameStats();
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
         try self.flushPendingTextureUploads(command_buffer, &stats);
-        try self.prepareBatch(allocator, command_buffer, batch, &stats);
-        var image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, &stats);
+        const cmd_n = batch.commands.items.len;
+        const solid_ends = try allocator.alloc(u32, cmd_n);
+        defer allocator.free(solid_ends);
+        const image_draw_ends = try allocator.alloc(u32, cmd_n);
+        defer allocator.free(image_draw_ends);
+        const text_draw_ends = try allocator.alloc(u32, cmd_n);
+        defer allocator.free(text_draw_ends);
+        try self.prepareBatch(allocator, command_buffer, batch, solid_ends, &stats);
+        var image_frame = try self.prepareImageFrame(allocator, command_buffer, batch, image_draw_ends, &stats);
         defer image_frame.deinit(allocator);
-        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, &stats);
+        var text_frame = try self.prepareTextFrame(allocator, command_buffer, batch, text_draw_ends, &stats);
         defer text_frame.deinit(allocator);
 
         var swapchain_texture: ?*c.SDL_GPUTexture = null;
@@ -273,9 +337,16 @@ pub const Renderer = struct {
             };
             const pass = c.SDL_BeginGPURenderPass(command_buffer, &target, 1, null) orelse return error.SdlGpuRenderPassFailed;
             c.SDL_PushGPUVertexUniformData(command_buffer, 0, &ViewportUniform{ .viewport_size = .{ @floatFromInt(width), @floatFromInt(height) } }, @sizeOf(ViewportUniform));
-            self.renderBatch(pass, batch);
-            self.renderImageFrame(pass, &image_frame, @floatFromInt(height));
-            self.renderTextFrame(pass, &text_frame, @floatFromInt(height));
+            self.renderBatchInterleaved(
+                pass,
+                batch,
+                solid_ends,
+                &image_frame,
+                image_draw_ends,
+                &text_frame,
+                text_draw_ends,
+                @floatFromInt(height),
+            );
             c.SDL_EndGPURenderPass(pass);
         }
         const submit_start = nowNs();
@@ -618,30 +689,38 @@ pub const Renderer = struct {
         }
     }
 
-    fn prepareImageFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !ImageFrame {
+    fn prepareImageFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, image_draws_after_cmd: []u32, stats: *FrameStats) !ImageFrame {
         var frame: ImageFrame = .{};
         errdefer frame.deinit(allocator);
-        if (self.image_pipeline == null or self.sampler == null) return frame;
+        std.debug.assert(image_draws_after_cmd.len == batch.commands.items.len);
+        if (self.image_pipeline == null or self.sampler == null) {
+            @memset(image_draws_after_cmd, 0);
+            return frame;
+        }
 
         const prepare_start = nowNs();
         try frame.mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 4);
         try frame.mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 6);
-        for (batch.commands.items) |command| {
-            if (command.kind != .image or !command.texture.valid() or command.color.a <= 0.0) continue;
-            const texture = self.textures.get(@intCast(command.texture.value)) orelse {
-                self.unsupported_image_commands += 1;
-                continue;
-            };
-            const first_index: u32 = @intCast(frame.mesh.indices.items.len);
-            try appendQuad(&frame.mesh, allocator, command.rect, command.uv, command.color);
-            const index_count: u32 = @intCast(frame.mesh.indices.items.len - first_index);
-            if (index_count == 0) continue;
-            try frame.draws.append(allocator, .{
-                .texture = texture.texture,
-                .first_index = first_index,
-                .index_count = index_count,
-                .clip = command.clip,
-            });
+        for (batch.commands.items, 0..) |command, cmd_i| {
+            if (command.kind == .image and command.texture.valid() and command.color.a > 0.0) {
+                const texture = self.textures.get(@intCast(command.texture.value)) orelse {
+                    self.unsupported_image_commands += 1;
+                    image_draws_after_cmd[cmd_i] = @intCast(frame.draws.items.len);
+                    continue;
+                };
+                const first_index: u32 = @intCast(frame.mesh.indices.items.len);
+                try appendQuad(&frame.mesh, allocator, command.rect, command.uv, command.color);
+                const index_count: u32 = @intCast(frame.mesh.indices.items.len - first_index);
+                if (index_count > 0) {
+                    try frame.draws.append(allocator, .{
+                        .texture = texture.texture,
+                        .first_index = first_index,
+                        .index_count = index_count,
+                        .clip = command.clip,
+                    });
+                }
+            }
+            image_draws_after_cmd[cmd_i] = @intCast(frame.draws.items.len);
         }
         stats.image_prepare_ns +|= elapsedNs(prepare_start);
 
@@ -655,14 +734,20 @@ pub const Renderer = struct {
         return frame;
     }
 
-    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, stats: *FrameStats) !TextFrame {
+    fn prepareTextFrame(self: *Renderer, allocator: std.mem.Allocator, command_buffer: *c.SDL_GPUCommandBuffer, batch: *const draw.RenderBatch, text_draws_after_cmd: []u32, stats: *FrameStats) !TextFrame {
         var frame: TextFrame = .{};
         errdefer frame.deinit(allocator);
-        if (!self.supportsGpuText()) return frame;
+        std.debug.assert(text_draws_after_cmd.len == batch.commands.items.len);
+        if (!self.supportsGpuText()) {
+            @memset(text_draws_after_cmd, 0);
+            return frame;
+        }
         const prepare_start = nowNs();
-        for (batch.commands.items) |command| {
-            if (command.kind != .text or command.text.len == 0 or command.color.a <= 0.0) continue;
-            try self.appendTextCommand(allocator, &frame, command);
+        for (batch.commands.items, 0..) |command, cmd_i| {
+            if (command.kind == .text and command.text.len > 0 and command.color.a > 0.0) {
+                try self.appendTextCommand(allocator, &frame, command);
+            }
+            text_draws_after_cmd[cmd_i] = @intCast(frame.draws.items.len);
         }
         stats.text_prepare_ns +|= elapsedNs(prepare_start);
         if (frame.vertices.items.len > 0 and frame.indices.items.len > 0) {
@@ -793,43 +878,67 @@ pub const Renderer = struct {
     }
 
     fn renderImageFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const ImageFrame, target_height: f32) void {
-        if (frame.draws.items.len == 0 or self.image_vertex_buffer == null or self.image_index_buffer == null or self.sampler == null) return;
+        self.renderImageFrameSlice(pass, frame, 0, frame.draws.items.len, target_height);
+    }
+
+    fn renderImageFrameSlice(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const ImageFrame, draw_begin: usize, draw_end: usize, target_height: f32) void {
+        if (self.image_vertex_buffer == null or self.image_index_buffer == null or self.sampler == null) {
+            gpuSetFullScissor(pass);
+            return;
+        }
+        if (frame.draws.items.len == 0 or draw_begin >= draw_end) {
+            gpuSetFullScissor(pass);
+            return;
+        }
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.image_vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.image_index_buffer.?, .offset = 0 };
         c.SDL_BindGPUGraphicsPipeline(pass, self.image_pipeline.?);
         c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
         c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        for (frame.draws.items) |draw_call| {
+        for (frame.draws.items[draw_begin..draw_end]) |draw_call| {
             if (draw_call.clip) |clip| {
                 var scissor = toSdlRect(clip, target_height);
                 c.SDL_SetGPUScissor(pass, &scissor);
+            } else {
+                gpuSetFullScissor(pass);
             }
             var texture_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = draw_call.texture, .sampler = self.sampler.? };
             c.SDL_BindGPUFragmentSamplers(pass, 0, &texture_binding, 1);
             c.SDL_DrawGPUIndexedPrimitives(pass, draw_call.index_count, 1, draw_call.first_index, 0, 0);
         }
-        var full_scissor: c.SDL_Rect = .{ .x = 0, .y = 0, .w = 65535, .h = 65535 };
-        c.SDL_SetGPUScissor(pass, &full_scissor);
+        gpuSetFullScissor(pass);
     }
 
     fn renderTextFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const TextFrame, target_height: f32) void {
-        if (frame.draws.items.len == 0 or self.text_vertex_buffer == null or self.text_index_buffer == null) return;
+        self.renderTextFrameSlice(pass, frame, 0, frame.draws.items.len, target_height);
+    }
+
+    fn renderTextFrameSlice(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const TextFrame, draw_begin: usize, draw_end: usize, target_height: f32) void {
+        if (self.text_vertex_buffer == null or self.text_index_buffer == null) {
+            gpuSetFullScissor(pass);
+            return;
+        }
+        if (frame.draws.items.len == 0 or draw_begin >= draw_end) {
+            gpuSetFullScissor(pass);
+            return;
+        }
         var vertex_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.text_vertex_buffer.?, .offset = 0 };
         var index_binding: c.SDL_GPUBufferBinding = .{ .buffer = self.text_index_buffer.?, .offset = 0 };
         c.SDL_BindGPUGraphicsPipeline(pass, self.text_pipeline.?);
         c.SDL_BindGPUVertexBuffers(pass, 0, &vertex_binding, 1);
         c.SDL_BindGPUIndexBuffer(pass, &index_binding, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
-        for (frame.draws.items) |draw_call| {
+        for (frame.draws.items[draw_begin..draw_end]) |draw_call| {
             if (draw_call.clip) |clip| {
                 var scissor = toSdlRect(clip, target_height);
                 c.SDL_SetGPUScissor(pass, &scissor);
+            } else {
+                gpuSetFullScissor(pass);
             }
             var texture_binding: c.SDL_GPUTextureSamplerBinding = .{ .texture = draw_call.atlas_texture, .sampler = self.sampler.? };
             c.SDL_BindGPUFragmentSamplers(pass, 0, &texture_binding, 1);
             c.SDL_DrawGPUIndexedPrimitives(pass, draw_call.index_count, 1, draw_call.first_index, 0, 0);
         }
-        var full_scissor: c.SDL_Rect = .{ .x = 0, .y = 0, .w = 65535, .h = 65535 };
-        c.SDL_SetGPUScissor(pass, &full_scissor);
+        gpuSetFullScissor(pass);
     }
 };
 
@@ -1243,12 +1352,18 @@ pub fn sdlFontRendererWithTextures(
 }
 
 /// Converts retained render commands into indexed quads ready for GPU upload.
-pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, mesh: *Mesh) !void {
+pub fn buildMesh(allocator: std.mem.Allocator, batch: *const draw.RenderBatch, mesh: *Mesh, solid_indices_after_cmd: ?[]u32) !void {
     mesh.clear();
+    if (solid_indices_after_cmd) |ends| {
+        std.debug.assert(ends.len == batch.commands.items.len);
+    }
     try mesh.vertices.ensureUnusedCapacity(allocator, batch.commands.items.len * 8);
     try mesh.indices.ensureUnusedCapacity(allocator, batch.commands.items.len * 12);
-    for (batch.commands.items) |command| {
+    for (batch.commands.items, 0..) |command, i| {
         try appendCommand(allocator, mesh, command);
+        if (solid_indices_after_cmd) |ends| {
+            ends[i] = @intCast(mesh.indices.items.len);
+        }
     }
 }
 
@@ -1560,6 +1675,11 @@ fn toSdlRect(rect: draw.Rect, target_height: f32) c.SDL_Rect {
     };
 }
 
+fn gpuSetFullScissor(pass: *c.SDL_GPURenderPass) void {
+    var full: c.SDL_Rect = .{ .x = 0, .y = 0, .w = 65535, .h = 65535 };
+    c.SDL_SetGPUScissor(pass, &full);
+}
+
 fn colorBytes(color: draw.Color) [4]u8 {
     return .{ colorByte(color.r), colorByte(color.g), colorByte(color.b), colorByte(color.a) };
 }
@@ -1680,7 +1800,7 @@ test "renderer builds indexed quads from commands" {
 
     var mesh: Mesh = .{};
     defer mesh.deinit(std.testing.allocator);
-    try buildMesh(std.testing.allocator, &batch, &mesh);
+    try buildMesh(std.testing.allocator, &batch, &mesh, null);
 
     try std.testing.expectEqual(@as(usize, 8), mesh.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 12), mesh.indices.items.len);
