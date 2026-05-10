@@ -31,6 +31,12 @@ const TerminalContextMenuAction = enum {
     close_pane,
 };
 
+const TerminalGlyphKind = enum {
+    text,
+    icon,
+    powerline,
+};
+
 const PaneHit = struct {
     pane_id: u32 = 0,
     rect: palette.Rect = .{},
@@ -262,17 +268,20 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             }
 
             if (!rgbEql(bg, render_state.colors.background) or rawCellNeedsFill(raw_cell)) {
-                queueRect(state, cell_rect, rgbPaletteColor(bg, 1.0));
+                queueRect(state, expandedCellRect(cell_rect), rgbPaletteColor(bg, 1.0));
             }
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
             var text_buf: [128]u8 = undefined;
             const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
-            queueFixedText(state, .{
-                .x = cell_rect.x,
-                .y = cell_rect.y + text_y_offset,
-                .w = cell_rect.w,
-                .h = cell_rect.h,
-            }, text, rgbPaletteColor(fg, 1.0), font_size, if (glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect);
+            const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
+            const text_rect = terminalTextRect(cell_rect, text_y_offset, glyph_kind);
+            const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
+            queueTerminalText(state, .{
+                .x = text_rect.x,
+                .y = text_rect.y,
+                .w = text_rect.w,
+                .h = text_rect.h,
+            }, text, rgbPaletteColor(fg, 1.0), draw_font_size, if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, glyph_kind);
         }
     }
 }
@@ -482,7 +491,7 @@ fn cellText(raw_cell: ghostty_vt.Cell, graphemes: []const u21, buffer: []u8) ?[]
 
 fn glyphNeedsRelaxedClip(cp: u21) bool {
     return switch (cp) {
-        0xe0a0...0xe0d7,
+        0xe0a0...0xe0af,
         0xe5fa...0xe7ff,
         0xf000...0xf8ff,
         0xf0000...0xf20ff,
@@ -510,6 +519,42 @@ fn blendChannel(a: u8, b: u8, t: f32) u8 {
     return @intFromFloat(lhs + (rhs - lhs) * t);
 }
 
+fn expandedCellRect(rect: palette.Rect) palette.Rect {
+    const bleed = theme.scaledUi(0.65);
+    return .{
+        .x = rect.x - bleed,
+        .y = rect.y - bleed,
+        .w = rect.w + bleed * 2.0,
+        .h = rect.h + bleed * 2.0,
+    };
+}
+
+fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyphKind) palette.Rect {
+    return switch (glyph_kind) {
+        .text => .{ .x = rect.x, .y = rect.y + y_offset, .w = rect.w, .h = rect.h },
+        .icon => .{
+            .x = rect.x - rect.w * 0.08,
+            .y = rect.y + y_offset - rect.h * 0.10,
+            .w = rect.w * 1.22,
+            .h = rect.h * 1.16,
+        },
+        .powerline => .{
+            .x = rect.x - rect.w * 0.16,
+            .y = rect.y + y_offset - rect.h * 0.18,
+            .w = rect.w * 1.42,
+            .h = rect.h * 1.28,
+        },
+    };
+}
+
+fn terminalTextFontSize(font_size: f32, glyph_kind: TerminalGlyphKind) f32 {
+    return switch (glyph_kind) {
+        .text => font_size,
+        .icon => font_size * 0.98,
+        .powerline => font_size * 1.18,
+    };
+}
+
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
     const start = state.palette_frame_text.items.len;
     state.palette_frame_text.appendSlice(state.allocator, value) catch return "";
@@ -532,8 +577,11 @@ fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, 
     state.palette_overlay_batch.text(state.allocator, rect, stableText(state, value), color, font_size, clip) catch {};
 }
 
-fn queueFixedText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
-    const font_role: ?palette.FontRole = if (terminalGlyphNeedsIconFont(value)) .icon else .mono;
+fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect, glyph_kind: TerminalGlyphKind) void {
+    const font_role: ?palette.FontRole = switch (glyph_kind) {
+        .text => .mono,
+        .icon, .powerline => .icon,
+    };
     state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, font_role, null, clip) catch {};
 }
 
@@ -550,12 +598,14 @@ fn rgbPaletteColor(rgb: ghostty_vt.color.RGB, alpha: f32) palette.Color {
     };
 }
 
-fn terminalGlyphNeedsIconFont(value: []const u8) bool {
-    if (value.len == 0) return false;
-    const view = std.unicode.Utf8View.init(value) catch return false;
-    var iter = view.iterator();
-    const cp = iter.nextCodepoint() orelse return false;
+fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
     return switch (cp) {
+        0xe0b0...0xe0c8,
+        0xe0ca,
+        0xe0cc...0xe0d2,
+        0xe0d4,
+        0xe0d6...0xe0d7,
+        => .powerline,
         0x23fb...0x23fe,
         0x2630,
         0x2665,
@@ -563,7 +613,7 @@ fn terminalGlyphNeedsIconFont(value: []const u8) bool {
         0x276c...0x2771,
         0x2b58,
         0xe000...0xe00a,
-        0xe0a0...0xe0d7,
+        0xe0a0...0xe0af,
         0xe200...0xe2a9,
         0xe300...0xe3e3,
         0xe5fa...0xe8ef,
@@ -571,7 +621,7 @@ fn terminalGlyphNeedsIconFont(value: []const u8) bool {
         0xed00...0xefce,
         0xf000...0xf533,
         0xf0001...0xf1af0,
-        => true,
-        else => false,
+        => .icon,
+        else => .text,
     };
 }
