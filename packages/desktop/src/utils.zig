@@ -458,6 +458,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.free(request.thread_title);
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
+        if (request.cursor_model_params_json) |params| page_alloc.free(params);
         page_alloc.destroy(request);
     }
 
@@ -546,6 +547,7 @@ pub const SendWorkerRequest = struct {
     reasoning_effort: ?app_state.ReasoningEffort,
     /// Owned; OpenCode-only. Duplicated from thread `opencode_reasoning_variant`.
     opencode_reasoning_variant: ?[]u8,
+    cursor_model_params_json: ?[]u8,
     fast_mode: app_state.FastMode,
     access_mode: app_state.AccessMode,
 };
@@ -610,6 +612,7 @@ pub fn runSendWorker(
         .cwd = request.project_path,
         .model = request.model_ref,
         .opencode_variant = if (request.provider == .opencode) request.opencode_reasoning_variant else null,
+        .cursor_model_params_json = if (request.provider == .cursor) request.cursor_model_params_json else null,
         .reasoning_effort = if (request.provider == .opencode and request.opencode_reasoning_variant != null) null else request.reasoning_effort,
         .service_tier = serviceTierForMode(request.provider, request.fast_mode),
         .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),

@@ -313,6 +313,18 @@ fn makeBridgeRequestJsonAlloc(
     try stringify.write(if (input.request) |request| request.cwd orelse config.cwd else config.cwd);
     try stringify.objectField("model");
     try stringify.write(if (input.request) |request| request.model orelse config.model orelse DEFAULT_MODEL else config.model orelse DEFAULT_MODEL);
+    try stringify.objectField("modelParams");
+    if (input.request) |request| {
+        if (request.cursor_model_params_json) |params_json| {
+            var parsed_params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
+            defer parsed_params.deinit();
+            try stringify.write(parsed_params.value);
+        } else {
+            try stringify.write(null);
+        }
+    } else {
+        try stringify.write(null);
+    }
     try stringify.objectField("threadId");
     try stringify.write(input.thread_id orelse if (input.request) |request| request.thread_id else null);
     try stringify.objectField("turnId");
@@ -534,7 +546,7 @@ fn parseModelsAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provid
         if (item != .object) continue;
         const id = getOptionalObjectString(item, "id") orelse continue;
         const name = getOptionalObjectString(item, "displayName") orelse id;
-        try appendModel(allocator, &models, id, name);
+        try appendCursorModelFromJson(allocator, &models, item, id, name);
     }
 
     if (models.items.len == 0) return staticModelsAlloc(allocator);
@@ -548,6 +560,7 @@ fn staticModelsAlloc(allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
         models.deinit(allocator);
     }
 
+    try appendModel(allocator, &models, "default", "Auto");
     try appendModel(allocator, &models, "composer-2", "Composer 2");
     try appendModel(allocator, &models, "gpt-5.5", "GPT-5.5");
     try appendModel(allocator, &models, "gpt-5.4", "GPT-5.4");
@@ -568,6 +581,85 @@ fn appendModel(
         .model_id = try allocator.dupe(u8, id),
         .model_name = try allocator.dupe(u8, name),
     });
+}
+
+fn appendCursorModelFromJson(
+    allocator: std.mem.Allocator,
+    models: *std.ArrayList(provider_types.ModelInfo),
+    item: std.json.Value,
+    id: []const u8,
+    name: []const u8,
+) !void {
+    var fast_supported = false;
+    var reasoning_param_id: ?[]const u8 = null;
+    var reasoning_values: ?[][:0]const u8 = null;
+    var requires_thinking = false;
+
+    if (item.object.get("parameters")) |params_value| {
+        if (params_value == .array) {
+            var effort_values: ?std.json.Value = null;
+            var reasoning_param_values: ?std.json.Value = null;
+            var has_thinking = false;
+            for (params_value.array.items) |param| {
+                if (param != .object) continue;
+                const param_id = getOptionalObjectString(param, "id") orelse continue;
+                if (std.mem.eql(u8, param_id, "fast")) {
+                    fast_supported = true;
+                } else if (std.mem.eql(u8, param_id, "thinking")) {
+                    has_thinking = true;
+                } else if (std.mem.eql(u8, param_id, "reasoning")) {
+                    reasoning_param_values = param.object.get("values");
+                    reasoning_param_id = "reasoning";
+                } else if (std.mem.eql(u8, param_id, "effort")) {
+                    effort_values = param.object.get("values");
+                }
+            }
+            if (reasoning_param_values == null and effort_values != null) {
+                reasoning_param_values = effort_values;
+                reasoning_param_id = "effort";
+                requires_thinking = has_thinking;
+            }
+            if (reasoning_param_values) |values| {
+                reasoning_values = try cursorParamValuesAlloc(allocator, values);
+            }
+        }
+    }
+
+    errdefer if (reasoning_values) |values| {
+        for (values) |value| allocator.free(value);
+        allocator.free(values);
+    };
+
+    try models.append(allocator, .{
+        .provider_id = try allocator.dupe(u8, "cursor"),
+        .provider_name = try allocator.dupe(u8, "Cursor"),
+        .model_id = try allocator.dupe(u8, id),
+        .model_name = try allocator.dupe(u8, name),
+        .cursor_fast_supported = fast_supported,
+        .cursor_reasoning_param_id = if (reasoning_param_id) |param_id| try allocator.dupe(u8, param_id) else null,
+        .cursor_reasoning_values = reasoning_values,
+        .cursor_reasoning_requires_thinking = requires_thinking,
+    });
+}
+
+fn cursorParamValuesAlloc(allocator: std.mem.Allocator, values: std.json.Value) !?[][:0]const u8 {
+    if (values != .array) return null;
+    var out: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (out.items) |value| allocator.free(value);
+        out.deinit(allocator);
+    }
+    for (values.array.items) |value_obj| {
+        if (value_obj != .object) continue;
+        const value = getOptionalObjectString(value_obj, "value") orelse continue;
+        if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "true")) continue;
+        try out.append(allocator, try allocator.dupeZ(u8, value));
+    }
+    if (out.items.len == 0) {
+        out.deinit(allocator);
+        return null;
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ChatMessage {
@@ -616,10 +708,20 @@ const BRIDGE_SCRIPT =
     \\  process.exit(1);
     \\};
     \\const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
-    \\const modelSelection = (id) => id ? { id } : undefined;
+    \\const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
+    \\  const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    \\  promise.then((value) => {
+    \\    clearTimeout(timer);
+    \\    resolve(value);
+    \\  }, (error) => {
+    \\    clearTimeout(timer);
+    \\    reject(error);
+    \\  });
+    \\});
+    \\const modelSelection = (id, params) => id ? { id, ...(Array.isArray(params) && params.length ? { params } : {}) } : undefined;
     \\const agentOptions = () => ({
     \\  apiKey: process.env.CURSOR_API_KEY,
-    \\  model: modelSelection(input.model || "composer-2"),
+    \\  model: modelSelection(input.model || "composer-2", input.modelParams),
     \\  name: input.title || undefined,
     \\  local: { cwd: input.cwd || process.cwd() },
     \\});
@@ -660,7 +762,7 @@ const BRIDGE_SCRIPT =
     \\    await Cursor.me({ apiKey: process.env.CURSOR_API_KEY });
     \\    emit({ type: "ok" });
     \\  } else if (input.command === "list_models") {
-    \\    const models = await Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY });
+    \\    const models = await withTimeout(Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }), 5000, "Cursor model discovery");
     \\    emit({ type: "items", items: models });
     \\  } else if (input.command === "list_threads") {
     \\    const result = await Agent.list({ runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 100 });
@@ -681,7 +783,7 @@ const BRIDGE_SCRIPT =
     \\    ? await Agent.resume(input.threadId, agentOptions())
     \\    : await Agent.create(agentOptions());
     \\  emit({ type: "thread", threadId: agentId(agent), title: input.title || agentId(agent) });
-    \\  const run = await agent.send(input.prompt || "", { model: modelSelection(input.model || "composer-2") });
+    \\  const run = await agent.send(input.prompt || "", { model: modelSelection(input.model || "composer-2", input.modelParams) });
     \\  emit({ type: "turn", runId: run.id });
     \\  let deltaCount = 0;
     \\  for await (const event of run.stream()) {

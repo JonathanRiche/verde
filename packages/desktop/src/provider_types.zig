@@ -48,6 +48,10 @@ pub const ModelInfo = struct {
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` object keys (API variant names). Null when none are declared.
     reasoning_variant_keys: ?[][:0]const u8 = null,
+    cursor_fast_supported: bool = false,
+    cursor_reasoning_param_id: ?[]const u8 = null,
+    cursor_reasoning_values: ?[][:0]const u8 = null,
+    cursor_reasoning_requires_thinking: bool = false,
 
     pub fn deinit(self: ModelInfo, allocator: anytype) void {
         allocator.free(self.provider_id);
@@ -57,6 +61,11 @@ pub const ModelInfo = struct {
         if (self.reasoning_variant_keys) |keys| {
             for (keys) |key| allocator.free(key);
             allocator.free(keys);
+        }
+        if (self.cursor_reasoning_param_id) |param_id| allocator.free(param_id);
+        if (self.cursor_reasoning_values) |values| {
+            for (values) |value| allocator.free(value);
+            allocator.free(values);
         }
     }
 };
@@ -143,6 +152,7 @@ pub const SendPromptRequest = struct {
     model: ?[]const u8 = null,
     /// When set (OpenCode), sent as the JSON `variant` string instead of mapping `reasoning_effort`.
     opencode_variant: ?[]const u8 = null,
+    cursor_model_params_json: ?[]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
     service_tier: ?ServiceTier = null,
     approval_policy: ?ApprovalPolicy = null,
