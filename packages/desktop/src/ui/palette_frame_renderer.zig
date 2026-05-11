@@ -20,6 +20,7 @@ pub const Renderer = struct {
     gl: ?palette_gl_renderer.Renderer = null,
     gpu: ?palette.renderer.Renderer = null,
     gpu_font: ?*palette.sdl.Font = null,
+    gpu_mono_font: ?*palette.sdl.Font = null,
     gpu_icon_font: ?*palette.sdl.Font = null,
     gpu_ttf_initialized: bool = false,
     next_texture_id: u32 = 1,
@@ -28,6 +29,7 @@ pub const Renderer = struct {
         requested_backend: Backend,
         window: *sdl.Window,
         font_path: [:0]const u8,
+        mono_font_path: [:0]const u8,
         icon_font_path: [:0]const u8,
     };
 
@@ -54,13 +56,14 @@ pub const Renderer = struct {
         try palette.sdl.ttfInit();
         result.gpu_ttf_initialized = true;
         result.gpu_font = try palette.sdl.ttfOpenFont(options.font_path, 16.0);
+        result.gpu_mono_font = try palette.sdl.ttfOpenFont(options.mono_font_path, 16.0);
         result.gpu_icon_font = try palette.sdl.ttfOpenFont(options.icon_font_path, 16.0);
         result.gpu = try palette.renderer.Renderer.init(.{
             .debug_mode = builtin.mode == .Debug,
             .shader_formats = palette.renderer.ShaderFormat.defaultForTarget(builtin.os.tag),
             .shader_packages = palette.renderer.ShaderSource.packagesForTarget(builtin.os.tag),
         });
-        try result.gpu.?.configureGpuTextWithFonts(result.gpu_font.?, result.gpu_icon_font);
+        try result.gpu.?.configureGpuTextWithRoleFonts(result.gpu_font.?, result.gpu_mono_font, result.gpu_icon_font);
         try result.gpu.?.claimWindow(@ptrCast(options.window));
         return result;
     }
@@ -71,6 +74,7 @@ pub const Renderer = struct {
             gpu.deinit();
         }
         if (self.gpu_icon_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_mono_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_ttf_initialized) palette.sdl.ttfQuit();
         if (self.gl) |*gl| gl.deinit(allocator);

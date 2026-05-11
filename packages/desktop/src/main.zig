@@ -64,6 +64,12 @@ const PALETTE_GPU_ICON_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/SymbolsNerdFontMono-Regular.ttf",
     "packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf",
 };
+const PALETTE_GPU_MONO_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
+    "packages/desktop/src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+};
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
 const NOTO_SANS_BOLD_BYTES = @embedFile("assets/fonts/NotoSans-Bold.ttf");
@@ -164,12 +170,15 @@ pub fn main(init: std.process.Init) !void {
     );
     const palette_gpu_font_path = try paletteGpuFontPath(allocator);
     defer allocator.free(palette_gpu_font_path);
+    const palette_gpu_mono_font_path = try paletteGpuMonoFontPath(allocator);
+    defer allocator.free(palette_gpu_mono_font_path);
     const palette_gpu_icon_font_path = try paletteGpuIconFontPath(allocator);
     defer allocator.free(palette_gpu_icon_font_path);
     var palette_renderer = try palette_frame_renderer.Renderer.init(.{
         .requested_backend = requested_renderer_backend,
         .window = window,
         .font_path = palette_gpu_font_path,
+        .mono_font_path = palette_gpu_mono_font_path,
         .icon_font_path = palette_gpu_icon_font_path,
     });
     defer palette_renderer.deinit(allocator);
@@ -361,6 +370,14 @@ fn paletteGpuIconFontPath(allocator: std.mem.Allocator) ![:0]u8 {
         return try allocator.dupeZ(u8, candidate);
     }
     return try allocator.dupeZ(u8, PALETTE_GPU_ICON_FONT_PATHS[0]);
+}
+
+fn paletteGpuMonoFontPath(allocator: std.mem.Allocator) ![:0]u8 {
+    for (PALETTE_GPU_MONO_FONT_PATHS) |candidate| {
+        if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
+        return try allocator.dupeZ(u8, candidate);
+    }
+    return try allocator.dupeZ(u8, PALETTE_GPU_MONO_FONT_PATHS[0]);
 }
 
 const EventFlags = struct {
