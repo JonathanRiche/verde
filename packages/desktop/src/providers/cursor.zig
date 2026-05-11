@@ -7,6 +7,7 @@
 const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const MAX_BRIDGE_STDOUT_BYTES = 16 * 1024 * 1024;
 const MAX_BRIDGE_STDERR_BYTES = 512 * 1024;
@@ -129,6 +130,8 @@ pub const Client = struct {
     ) !BridgeResponse {
         const request_json = try makeBridgeRequestJsonAlloc(allocator, self.config, command, input);
         defer allocator.free(request_json);
+        const bridge_cwd = try resolveBridgeCwdAlloc(allocator, self.config.cwd);
+        defer if (bridge_cwd) |path| allocator.free(path);
 
         var env_map = try process_env.buildAugmentedEnvMap(allocator);
         defer env_map.deinit();
@@ -140,12 +143,19 @@ pub const Client = struct {
         const executable = try process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, self.config.executable);
         defer allocator.free(executable);
 
+        if (command == .send_prompt) {
+            runtime_log.diagnostic("cursor.runBridge send_prompt bridge_cwd={s} request_json_len={d}", .{ bridge_cwd orelse "(inherit)", request_json.len });
+            return self.runBridgeStreaming(allocator, input, executable, bridge_cwd, &env_map);
+        }
+
         var threaded = std.Io.Threaded.init(allocator, .{});
         defer threaded.deinit();
 
         const result = try std.process.run(allocator, threaded.io(), .{
             .argv = &.{ executable, "--input-type=module", "--eval", BRIDGE_SCRIPT },
-            .cwd = if (if (input.request) |request| request.cwd orelse self.config.cwd else self.config.cwd) |path| .{ .path = path } else .inherit,
+            // Keep Node module resolution anchored at Verde's launch cwd; the selected
+            // project is still passed to Cursor through `local.cwd` in the JSON request.
+            .cwd = if (bridge_cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
             .stdout_limit = .limited(MAX_BRIDGE_STDOUT_BYTES),
             .stderr_limit = .limited(MAX_BRIDGE_STDERR_BYTES),
@@ -155,12 +165,82 @@ pub const Client = struct {
 
         return parseBridgeEventsAlloc(allocator, result.stdout, result.term, if (input.request) |request| request else null);
     }
+
+    fn runBridgeStreaming(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        input: BridgeInput,
+        executable: []const u8,
+        bridge_cwd: ?[]const u8,
+        env_map: *const std.process.Environ.Map,
+    ) !BridgeResponse {
+        _ = self;
+        var threaded = std.Io.Threaded.init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        runtime_log.diagnostic("cursor.spawn streaming bridge cwd={s}", .{bridge_cwd orelse "(inherit)"});
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ executable, "--input-type=module", "--eval", BRIDGE_SCRIPT },
+            .cwd = if (bridge_cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = env_map,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
+        defer if (child.id != null) child.kill(io);
+
+        var state: BridgeParseState = .{};
+        errdefer state.deinit(allocator);
+
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = child.stdout.?.readerStreaming(io, &read_buffer);
+        while (try reader.interface.takeDelimiter('\n')) |raw_line| {
+            if (try processBridgeLine(allocator, raw_line, if (input.request) |request| request else null, &state)) {
+                break;
+            }
+        }
+
+        _ = child.kill(io);
+        child.id = null;
+        const term: std.process.Child.Term = .{ .exited = 0 };
+        runtime_log.diagnostic("cursor.streaming bridge finished reply_len={d}", .{state.reply.items.len});
+        try finishBridgeResponse(term, state.saw_error);
+        state.response.reply_text = try state.reply.toOwnedSlice(allocator);
+        state.reply = .empty;
+        const response = state.response;
+        state.response = .{};
+        return response;
+    }
 };
 
 pub fn shutdownOwnedServer() void {}
 
 fn hasPromptAttachments(request: provider_types.SendPromptRequest) bool {
     return request.image != null or request.images.len > 0;
+}
+
+fn resolveBridgeCwdAlloc(allocator: std.mem.Allocator, configured_cwd: ?[]const u8) !?[]u8 {
+    if (configured_cwd) |cwd| {
+        if (hasCursorSdkNodeModule(cwd)) return try allocator.dupe(u8, cwd);
+    }
+
+    const candidates = [_][]const u8{ ".", "..", "../.." };
+    for (candidates) |candidate| {
+        if (hasCursorSdkNodeModule(candidate)) return try allocator.dupe(u8, candidate);
+    }
+    return null;
+}
+
+fn hasCursorSdkNodeModule(cwd: []const u8) bool {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const manifest = std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "{s}/node_modules/@cursor/sdk/package.json",
+        .{cwd},
+    ) catch return false;
+    defer std.heap.page_allocator.free(manifest);
+    std.Io.Dir.cwd().access(threaded.io(), manifest, .{}) catch return false;
+    return true;
 }
 
 const BridgeResponse = struct {
@@ -177,6 +257,17 @@ const BridgeResponse = struct {
         if (self.reply_text.len > 0) allocator.free(self.reply_text);
         if (self.title) |title| allocator.free(title);
         if (self.items) |items| allocator.free(items);
+    }
+};
+
+const BridgeParseState = struct {
+    response: BridgeResponse = .{},
+    reply: std.ArrayList(u8) = .empty,
+    saw_error: bool = false,
+
+    fn deinit(self: *BridgeParseState, allocator: std.mem.Allocator) void {
+        self.response.deinit(allocator);
+        self.reply.deinit(allocator);
     }
 };
 
@@ -233,91 +324,116 @@ fn parseBridgeEventsAlloc(
     term: std.process.Child.Term,
     request: ?provider_types.SendPromptRequest,
 ) !BridgeResponse {
-    var response: BridgeResponse = .{};
-    errdefer response.deinit(allocator);
-
-    var reply: std.ArrayList(u8) = .empty;
-    defer reply.deinit(allocator);
+    var state: BridgeParseState = .{};
+    errdefer state.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, payload, '\n');
-    var saw_error = false;
     while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-
-        const event_type = getOptionalObjectString(parsed.value, "type") orelse continue;
-        if (std.mem.eql(u8, event_type, "error")) {
-            saw_error = true;
-            if (isAuthError(getOptionalObjectString(parsed.value, "message"))) return error.CursorSignedOut;
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "thread")) {
-            if (response.thread_id.len == 0) {
-                const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse continue;
-                response.thread_id = try allocator.dupe(u8, thread_id);
-            }
-            if (response.title == null) {
-                if (getOptionalObjectString(parsed.value, "title")) |title| response.title = try allocator.dupe(u8, title);
-            }
-            response.updated_at = getOptionalObjectInteger(parsed.value, "updatedAt") orelse response.updated_at;
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "turn")) {
-            if (response.run_id == null) {
-                const run_id = getOptionalObjectString(parsed.value, "runId") orelse continue;
-                response.run_id = try allocator.dupe(u8, run_id);
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "delta")) {
-            const text = getOptionalObjectString(parsed.value, "text") orelse continue;
-            try reply.appendSlice(allocator, text);
-            if (request) |send_request| {
-                if (send_request.on_stream_delta) |on_stream_delta| {
-                    on_stream_delta(send_request.stream_context, text);
-                }
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "command")) {
-            const body = getOptionalObjectString(parsed.value, "command") orelse getOptionalObjectString(parsed.value, "body") orelse continue;
-            const failed = getOptionalObjectBool(parsed.value, "failed") orelse false;
-            if (request) |send_request| {
-                if (send_request.on_stream_event) |on_stream_event| {
-                    on_stream_event(send_request.stream_context, .{
-                        .message = .{
-                            .title = if (failed) "Command failed" else "Ran command",
-                            .body = body,
-                        },
-                    });
-                }
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "items")) {
-            const json = getObjectField(parsed.value, "items") orelse continue;
-            response.items = try std.json.Stringify.valueAlloc(allocator, json, .{ .whitespace = .minified });
-            continue;
-        }
-        if (std.mem.eql(u8, event_type, "final")) {
-            if (getOptionalObjectString(parsed.value, "replyText")) |text| {
-                reply.clearRetainingCapacity();
-                try reply.appendSlice(allocator, text);
-            }
-            if (response.thread_id.len == 0) {
-                const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse "";
-                if (thread_id.len > 0) response.thread_id = try allocator.dupe(u8, thread_id);
-            }
-            if (response.run_id == null) {
-                if (getOptionalObjectString(parsed.value, "runId")) |run_id| response.run_id = try allocator.dupe(u8, run_id);
-            }
-        }
+        _ = try processBridgeLine(allocator, raw_line, request, &state);
     }
 
+    try finishBridgeResponse(term, state.saw_error);
+
+    state.response.reply_text = try state.reply.toOwnedSlice(allocator);
+    state.reply = .empty;
+    const response = state.response;
+    state.response = .{};
+    return response;
+}
+
+fn processBridgeLine(
+    allocator: std.mem.Allocator,
+    raw_line: []const u8,
+    request: ?provider_types.SendPromptRequest,
+    state: *BridgeParseState,
+) !bool {
+    const line = std.mem.trim(u8, raw_line, " \t\r");
+    if (line.len == 0) return false;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const event_type = getOptionalObjectString(parsed.value, "type") orelse return false;
+    if (std.mem.eql(u8, event_type, "error")) {
+        state.saw_error = true;
+        if (isAuthError(getOptionalObjectString(parsed.value, "message"))) return error.CursorSignedOut;
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "thread")) {
+        if (state.response.thread_id.len == 0) {
+            const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse return false;
+            state.response.thread_id = try allocator.dupe(u8, thread_id);
+        }
+        if (state.response.title == null) {
+            if (getOptionalObjectString(parsed.value, "title")) |title| state.response.title = try allocator.dupe(u8, title);
+        }
+        state.response.updated_at = getOptionalObjectInteger(parsed.value, "updatedAt") orelse state.response.updated_at;
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "turn")) {
+        if (state.response.run_id == null) {
+            const run_id = getOptionalObjectString(parsed.value, "runId") orelse return false;
+            state.response.run_id = try allocator.dupe(u8, run_id);
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "delta")) {
+        const text = getOptionalObjectString(parsed.value, "text") orelse return false;
+        try state.reply.appendSlice(allocator, text);
+        if (request) |send_request| {
+            if (send_request.on_stream_delta) |on_stream_delta| {
+                on_stream_delta(send_request.stream_context, text);
+            }
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "command")) {
+        const body = getOptionalObjectString(parsed.value, "command") orelse getOptionalObjectString(parsed.value, "body") orelse return false;
+        const failed = getOptionalObjectBool(parsed.value, "failed") orelse false;
+        if (request) |send_request| {
+            if (send_request.on_stream_event) |on_stream_event| {
+                on_stream_event(send_request.stream_context, .{
+                    .message = .{
+                        .title = if (failed) "Command failed" else "Ran command",
+                        .body = body,
+                    },
+                });
+            }
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "debug")) {
+        const name = getOptionalObjectString(parsed.value, "name") orelse "unknown";
+        const value = getOptionalObjectInteger(parsed.value, "value") orelse 0;
+        runtime_log.diagnostic("cursor.bridge debug {s}={d}", .{ name, value });
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "items")) {
+        const json = getObjectField(parsed.value, "items") orelse return false;
+        state.response.items = try std.json.Stringify.valueAlloc(allocator, json, .{ .whitespace = .minified });
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "final")) {
+        if (getOptionalObjectString(parsed.value, "replyText")) |text| {
+            if (text.len > 0) {
+                state.reply.clearRetainingCapacity();
+                try state.reply.appendSlice(allocator, text);
+            }
+        }
+        if (state.response.thread_id.len == 0) {
+            const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse "";
+            if (thread_id.len > 0) state.response.thread_id = try allocator.dupe(u8, thread_id);
+        }
+        if (state.response.run_id == null) {
+            if (getOptionalObjectString(parsed.value, "runId")) |run_id| state.response.run_id = try allocator.dupe(u8, run_id);
+        }
+        return true;
+    }
+    return false;
+}
+
+fn finishBridgeResponse(term: std.process.Child.Term, saw_error: bool) !void {
     switch (term) {
         .exited => |code| if (code != 0) {
             if (saw_error) return error.CursorBridgeFailed;
@@ -325,10 +441,6 @@ fn parseBridgeEventsAlloc(
         },
         else => return error.CursorBridgeFailed,
     }
-
-    response.reply_text = try reply.toOwnedSlice(allocator);
-    reply = .empty;
-    return response;
 }
 
 fn getOptionalObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
@@ -561,16 +673,33 @@ const BRIDGE_SCRIPT =
     \\  emit({ type: "thread", threadId: agentId(agent), title: input.title || agentId(agent) });
     \\  const run = await agent.send(input.prompt || "", { model: modelSelection(input.model || "composer-2") });
     \\  emit({ type: "turn", runId: run.id });
-    \\  let reply = "";
+    \\  let deltaCount = 0;
     \\  for await (const event of run.stream()) {
-    \\    if (event?.type !== "assistant") continue;
-    \\    const text = messageText(event.message);
-    \\    if (!text) continue;
-    \\    reply += text;
-    \\    emit({ type: "delta", text });
+    \\    if (event?.type === "assistant") {
+    \\      const content = Array.isArray(event.message?.content) ? event.message.content : [];
+    \\      const text = content
+    \\        .filter((block) => block?.type === "text" && typeof block.text === "string")
+    \\        .map((block) => block.text)
+    \\        .join("");
+    \\      if (!text) continue;
+    \\      deltaCount += 1;
+    \\      emit({ type: "delta", text });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "text-delta") {
+    \\      const text = typeof event.text === "string" ? event.text : "";
+    \\      if (!text) continue;
+    \\      deltaCount += 1;
+    \\      emit({ type: "delta", text });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "tool_call" && event.name) {
+    \\      emit({ type: "command", command: `${event.name} ${JSON.stringify(event.args ?? {})}`, failed: event.status === "error" });
+    \\    }
     \\  }
     \\  const result = await run.wait();
-    \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: result?.result || reply });
+    \\  emit({ type: "debug", name: "deltaCount", value: deltaCount });
+    \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: result?.result || "" });
     \\  } else {
     \\    fail(`unsupported command: ${input.command}`);
     \\  }
