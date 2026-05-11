@@ -25,23 +25,15 @@ DEST_APP_DIR="$APPLICATIONS_DIR/Verde.app"
 
 source "$SCRIPT_DIR/cef-common.sh"
 ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64) ZIG_ARCH="x86_64" ;;
-  arm64) ZIG_ARCH="aarch64" ;;
-  *)
-    echo "unsupported architecture: $ARCH" >&2
-    exit 1
-    ;;
-esac
 MACOS_MIN_VERSION="${VERDE_MACOS_MIN_VERSION:-13.0}"
-ZIG_TARGET="${ZIG_ARCH}-macos.${MACOS_MIN_VERSION}"
 need_cmd zig
 need_cmake
 need_cmd bash
 
 cd "$REPO_ROOT/packages/desktop"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
 export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
-BUILD_ARGS=(zig build --release=safe "-Dtarget=$ZIG_TARGET" -p "$PREFIX_DIR")
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
   BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
