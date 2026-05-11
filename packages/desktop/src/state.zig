@@ -4173,7 +4173,11 @@ pub const AppState = struct {
 
         const is_visible = dock.toggle();
         if (!is_visible) self.endTerminalResizeDrag();
-        self.terminal_focused = is_visible;
+        if (is_visible) {
+            self.requestTerminalFocus();
+        } else {
+            self.terminal_focused = false;
+        }
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
@@ -4918,6 +4922,15 @@ pub const AppState = struct {
         self.browser_pane_focused = false;
     }
 
+    pub fn requestTerminalFocus(self: *AppState) void {
+        self.terminal_focused = true;
+        self.composer_focused = false;
+        self.palette_composer.focused = false;
+        self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.palette_modal_text_focus = .none;
+    }
+
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
         const requested = self.composer_focus_requested;
         self.composer_focus_requested = false;
@@ -5120,6 +5133,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
@@ -5133,6 +5147,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.terminal_focused) return false;
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
         if (palette_key.primary and palette_key.code == .v) {
             runtime_log.diagnostic(

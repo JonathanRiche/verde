@@ -101,9 +101,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     }
     renderContextMenu(state, dock, rect);
     if (dock.takeFocusRequest()) {
-        state.terminal_focused = true;
-        state.composer_focused = false;
-        state.unfocusBrowserPane();
+        state.requestTerminalFocus();
     }
 }
 
@@ -391,9 +389,7 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
 }
 
 fn focusTerminal(state: *app_state.AppState) void {
-    state.terminal_focused = true;
-    state.composer_focused = false;
-    state.unfocusBrowserPane();
+    state.requestTerminalFocus();
 }
 
 fn openContextMenu(kind: TerminalContextMenuKind, tab_index: usize, pane_id: u32, x: f32, y: f32) void {
