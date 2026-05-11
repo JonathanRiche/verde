@@ -1,7 +1,11 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#if defined(__APPLE__)
+#include <OpenGL/gl3.h>
+#else
 #include <GL/gl.h>
+#endif
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
