@@ -22,7 +22,6 @@ const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 
 /// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
 const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
-const PALETTE_TEXT_RENDER_SCALE: f32 = 0.86;
 
 extern fn palette_text_gl_measure_codepoint_width(
     font_data: [*]const u8,
@@ -48,7 +47,7 @@ pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f3
         @intCast(palette_ui_ttf.len),
         text.ptr,
         @intCast(n),
-        font_size * PALETTE_TEXT_RENDER_SCALE,
+        font_size,
     );
 }
 
@@ -159,19 +158,18 @@ const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
-    const measured_font_size = font_size * PALETTE_TEXT_RENDER_SCALE;
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
     if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
     const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
     const end = @min(byte_offset + seq_len, text.len);
     const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
-        return .{ .byte_len = 1, .width = @max(measured_font_size * 0.55, 1.0) };
+        return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
     const w = palette_text_gl_measure_codepoint_width(
         palette_ui_ttf.ptr,
         @intCast(palette_ui_ttf.len),
         @intCast(cp),
-        measured_font_size,
+        font_size,
     );
     return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
