@@ -1640,14 +1640,13 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    switch (state.currentThread().provider) {
-        .codex => if (state.codex_logo_texture) |cached| {
-            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-            queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
-        },
-        .opencode => {
-            drawOpenCodeMark(state, snapIconRectOrigin(model_icon_slot), icon_color);
-        },
+    const provider_icon = switch (state.currentThread().provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    };
+    if (provider_icon) |cached| {
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
     if (state.currentThread().provider == .codex) {
@@ -1685,18 +1684,6 @@ fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.C
     queueTriangle(state, p[0], p[2], p[5], color);
     queueTriangle(state, p[5], p[3], p[4], color);
     queueTriangle(state, p[5], p[2], p[3], color);
-}
-
-fn drawOpenCodeMark(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const size = @min(rect.w, rect.h);
-    const stroke = @max(size * 0.13, 1.6);
-    const mark = palette.Rect{
-        .x = rect.x + (rect.w - size) * 0.5 + stroke * 0.5,
-        .y = rect.y + (rect.h - size) * 0.5 + stroke * 0.5,
-        .w = @max(size - stroke, 1.0),
-        .h = @max(size - stroke, 1.0),
-    };
-    queueBorder(state, mark, color, mark.w * 0.5, stroke);
 }
 
 fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
