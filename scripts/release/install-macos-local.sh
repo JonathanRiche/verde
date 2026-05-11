@@ -39,7 +39,7 @@ need_cmd zig
 need_cmake
 need_cmd bash
 
-cd "$REPO_ROOT"
+cd "$REPO_ROOT/packages/desktop"
 BUILD_ARGS=(zig build --release=safe "-Dtarget=$ZIG_TARGET" -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
