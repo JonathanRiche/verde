@@ -25,6 +25,12 @@ case "$ARCH" in
     ;;
 esac
 
+MACOS_MIN_VERSION="${VERDE_MACOS_MIN_VERSION:-13.0}"
+case "$ARCH" in
+  x86_64) ZIG_TARGET="x86_64-macos.${MACOS_MIN_VERSION}" ;;
+  arm64) ZIG_TARGET="aarch64-macos.${MACOS_MIN_VERSION}" ;;
+esac
+
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -41,7 +47,7 @@ need_cmd bash
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO_ROOT"
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
+BUILD_ARGS=(zig build --release=safe "-Dtarget=$ZIG_TARGET" -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
   BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
