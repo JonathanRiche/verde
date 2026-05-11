@@ -145,6 +145,17 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},
             });
+            if (b.findProgram(&.{"brew"}, &.{})) |brew_path| {
+                const brew_prefix = std.process.Child.run(.{
+                    .allocator = b.allocator,
+                    .argv = &.{ brew_path, "--prefix" },
+                }) catch null;
+                if (brew_prefix) |prefix_result| {
+                    const prefix = std.mem.trim(u8, prefix_result.stdout, " \t\r\n");
+                    exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+                    exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+                }
+            } else |_| {}
             exe.root_module.linkFramework("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkFramework("OpenGL", .{});
