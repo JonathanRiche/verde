@@ -5,6 +5,7 @@ pub const types = @import("provider_types.zig");
 const opencode = @import("providers/opencode.zig");
 const codex = @import("providers/codex.zig");
 const cursor = @import("providers/cursor.zig");
+const runtime_log = @import("runtime_log.zig");
 
 pub const Provider = types.Provider;
 pub const HarnessKind = types.HarnessKind;
@@ -116,7 +117,13 @@ pub fn connect(
 }
 
 pub fn shutdownOwnedProviderProcesses() void {
+    runtime_log.diagnostic("provider shutdown begin opencode", .{});
     opencode.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done opencode", .{});
+    runtime_log.diagnostic("provider shutdown begin codex", .{});
     codex.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done codex", .{});
+    runtime_log.diagnostic("provider shutdown begin cursor", .{});
     cursor.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done cursor", .{});
 }
