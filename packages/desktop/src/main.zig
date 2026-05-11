@@ -208,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
     defer state.deinit();
     state.openBrowserOnLaunchIfRequested();
     state.startOpencodeModelOptionsRefresh();
+    state.startCursorModelOptionsRefresh();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
 
@@ -245,6 +246,7 @@ pub fn main(init: std.process.Init) !void {
         recordSpan(&frame_sample, .poll_models, struct {
             fn run(app_state: *AppState) void {
                 app_state.pollOpencodeModelOptionsCache();
+                app_state.pollCursorModelOptionsCache();
             }
         }.run, .{&state});
         recordSpan(&frame_sample, .poll_send, struct {

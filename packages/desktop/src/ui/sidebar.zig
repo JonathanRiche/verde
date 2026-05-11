@@ -780,6 +780,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .cursor => state.cursor_logo_texture,
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
@@ -790,6 +791,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     const label = switch (provider) {
         .codex => "C",
         .opencode => "O",
+        .cursor => "Cu",
     };
     const font_size = theme.scaledUi(11.0);
     queuePaletteText(state, .{

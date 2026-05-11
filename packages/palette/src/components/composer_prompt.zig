@@ -68,7 +68,7 @@ pub const ComposerPromptConfig = struct {
     menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
     menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
-    /// Max rows shown for model/reasoning dropdowns before clipping (scroll not wired for these menus).
+    /// Max rows shown for model/reasoning dropdowns before clipping.
     menu_max_visible_rows: f32 = 14.0,
     row_height: f32 = 28.0,
     pill_padding_x: f32 = 10.0,
@@ -265,6 +265,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         reasoning_index: ?usize = null,
         active_menu: ?ComposerPromptOptionTarget = null,
         hovered_menu_index: ?usize = null,
+        menu_scroll_y: f32 = 0.0,
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
         show_fast_toggle: bool = true,
@@ -451,6 +452,13 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     return was_dragging;
                 },
                 .mouse_wheel => |wheel| {
+                    if (self.active_menu) |target| {
+                        if (self.menuRect(target).contains(wheel.point)) {
+                            self.setMenuScrollY(target, self.menu_scroll_y - wheel.y * config.row_height * 3.0);
+                            self.hovered_menu_index = self.menuIndexAtPoint(wheel.point);
+                            return true;
+                        }
+                    }
                     if (!self.textRect().contains(wheel.point)) return false;
                     self.scrollBy(-wheel.y * self.textMetrics().line_height * 3.0);
                     return true;
@@ -562,12 +570,46 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const metrics = self.textMetrics();
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
-            try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            if (self.buffer.items.len == 0) {
+                try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            } else {
+                try self.appendPromptGlyphRuns(allocator, color, &runs);
+            }
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             if (self.focused and self.buffer.items.len > 0) {
                 const cursor = self.cursorRect();
                 if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
+            }
+        }
+
+        fn appendPromptGlyphRuns(self: *const Component, allocator: std.mem.Allocator, color: draw.Color, out: *std.ArrayList(draw.TextRun)) !void {
+            const value = self.buffer.items;
+            const options = self.textLayoutOptions(value, color);
+            var index: usize = 0;
+            while (index < value.len) {
+                const byte = value[index];
+                const len = if (byte == '\n') @as(usize, 1) else std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                defer index += len;
+                if (byte == '\n') continue;
+
+                const pos = text_layout.positionForOffset(options, index);
+                if (options.clip) |clip| {
+                    if (pos.y + options.metrics.line_height <= clip.y or pos.y >= clip.y + clip.h) continue;
+                }
+                try out.append(allocator, .{
+                    .text = value[index..@min(index + len, value.len)],
+                    .byte_start = index,
+                    .byte_end = @min(index + len, value.len),
+                    .x = pos.x,
+                    .y = pos.y,
+                    .font_size = options.metrics.font_size,
+                    .line_height = options.metrics.line_height,
+                    .color = color,
+                    .clip = options.clip,
+                    .font_role = config.font_role,
+                    .font_id = config.font_id,
+                });
             }
         }
 
@@ -821,6 +863,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             var index: usize = 0;
             while (index < options.count) : (index += 1) {
                 const row = self.menuRowRect(target, index);
+                if (row.y + row.h < rect.y or row.y > rect.y + rect.h) continue;
                 if (self.selectedIndex(target) == index) {
                     try batch.roundedRectClipped(allocator, row, config.menu_selected_color, row_corner, rect);
                 } else if (self.hovered_menu_index == index) {
@@ -848,6 +891,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 }};
                 try batch.textRuns(allocator, text_rect, label, &runs, config.text_color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             }
+            try self.renderMenuScrollbar(allocator, batch, target);
         }
 
         fn handleKey(self: *Component, allocator: std.mem.Allocator, key: key_input) !bool {
@@ -1115,9 +1159,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (self.active_menu == target) {
                 self.active_menu = null;
                 self.hovered_menu_index = null;
+                self.menu_scroll_y = 0.0;
             } else {
                 self.active_menu = target;
                 self.hovered_menu_index = self.selectedIndex(target) orelse 0;
+                self.menu_scroll_y = 0.0;
+                self.ensureMenuIndexVisible(target, self.hovered_menu_index orelse 0);
             }
         }
 
@@ -1138,6 +1185,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             self.active_menu = null;
             self.hovered_menu_index = null;
+            self.menu_scroll_y = 0.0;
         }
 
         fn setFocused(self: *Component, focused: bool) void {
@@ -1168,16 +1216,64 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn menuRowRect(self: *const Component, target: ComposerPromptOptionTarget, index: usize) draw.Rect {
             const menu = self.menuRect(target);
-            return .{ .x = menu.x, .y = menu.y + @as(f32, @floatFromInt(index)) * config.row_height, .w = menu.w, .h = config.row_height };
+            return .{ .x = menu.x, .y = menu.y + @as(f32, @floatFromInt(index)) * config.row_height - self.menu_scroll_y, .w = menu.w, .h = config.row_height };
         }
 
         fn menuIndexAtPoint(self: *const Component, point: draw.Vec2) ?usize {
             const target = self.active_menu orelse return null;
             const menu = self.menuRect(target);
             if (!menu.contains(point)) return null;
-            const index: usize = @intFromFloat(@floor((point.y - menu.y) / config.row_height));
+            const index: usize = @intFromFloat(@floor((point.y - menu.y + self.menu_scroll_y) / config.row_height));
             if (index >= self.optionsFor(target).count) return null;
             return index;
+        }
+
+        fn menuScrollMetrics(self: *const Component, target: ComposerPromptOptionTarget) scroll.Metrics {
+            return .{
+                .enabled = true,
+                .content_height = @as(f32, @floatFromInt(self.optionsFor(target).count)) * config.row_height,
+                .visible_height = self.menuRect(target).h,
+                .line_height = config.row_height,
+                .scrollbar_width = config.scrollbar_width,
+            };
+        }
+
+        fn setMenuScrollY(self: *Component, target: ComposerPromptOptionTarget, value: f32) void {
+            self.menu_scroll_y = scroll.clampOffsetY(value, self.menuScrollMetrics(target));
+        }
+
+        fn ensureMenuIndexVisible(self: *Component, target: ComposerPromptOptionTarget, index: usize) void {
+            const top = @as(f32, @floatFromInt(index)) * config.row_height;
+            const bottom = top + config.row_height;
+            const visible_height = self.menuRect(target).h;
+            if (top < self.menu_scroll_y) {
+                self.menu_scroll_y = top;
+            } else if (bottom > self.menu_scroll_y + visible_height) {
+                self.menu_scroll_y = bottom - visible_height;
+            }
+            self.setMenuScrollY(target, self.menu_scroll_y);
+        }
+
+        fn menuScrollbarTrackRect(self: *const Component, target: ComposerPromptOptionTarget) draw.Rect {
+            const menu = self.menuRect(target);
+            const track_w = @min(config.scrollbar_width, menu.w);
+            return .{
+                .x = menu.x + menu.w - track_w - 2.0,
+                .y = menu.y + 6.0,
+                .w = track_w,
+                .h = @max(menu.h - 12.0, 0.0),
+            };
+        }
+
+        fn renderMenuScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, target: ComposerPromptOptionTarget) !void {
+            if (config.scrollbar_width <= 0.0) return;
+            const metrics = self.menuScrollMetrics(target);
+            if (scroll.maxOffsetY(metrics) <= 0.0) return;
+            const track = self.menuScrollbarTrackRect(target);
+            try batch.scrollbar(allocator, track, config.scrollbar_track_color);
+            if (scroll.thumbRect(track, metrics, self.menu_scroll_y)) |thumb| {
+                try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
+            }
         }
 
         fn selectedIndex(self: *const Component, target: ComposerPromptOptionTarget) ?usize {
@@ -1615,6 +1711,39 @@ test "composer prompt owns text options toggles and send input" {
     try std.testing.expectEqual(@as(usize, 1), probe.model_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.fast_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
+}
+
+fn manyModelOption(_: ?*anyopaque, index: usize) []const u8 {
+    return switch (index) {
+        0 => "Auto",
+        1 => "Composer 2",
+        2 => "GPT-5.5",
+        3 => "Codex 5.3",
+        4 => "Sonnet 4.6",
+        5 => "Opus 4.7",
+        6 => "Grok 4.3",
+        7 => "GPT-5.4",
+        8 => "Opus 4.6",
+        9 => "Opus 4.5",
+        10 => "GPT-5.2",
+        else => "Gemini 3.1 Pro",
+    };
+}
+
+test "composer prompt model dropdown scrolls overflow rows" {
+    const Prompt = ComposerPrompt(.{ .menu_max_visible_rows = 4, .row_height = 20 });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    prompt.setModelOptions(null, 12, manyModelOption);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.modelRect().x + 2, .y = prompt.modelRect().y + 2 } }));
+    try std.testing.expect(prompt.active_menu == .model);
+    const menu = prompt.menuRect(.model);
+    try std.testing.expectEqual(@as(?usize, 0), prompt.menuIndexAtPoint(.{ .x = menu.x + 4, .y = menu.y + 4 }));
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_wheel = .{ .point = .{ .x = menu.x + 4, .y = menu.y + 4 }, .y = -3 } }));
+    try std.testing.expect(prompt.menu_scroll_y > 0.0);
+    try std.testing.expectEqual(@as(?usize, 8), prompt.menuIndexAtPoint(.{ .x = menu.x + 4, .y = menu.y + 4 }));
 }
 
 test "composer prompt drops text-input control and replacement glyphs" {

@@ -7,6 +7,7 @@ pub fn providerLabel(provider: anytype) [:0]const u8 {
     return switch (provider) {
         .opencode => "OpenCode",
         .codex => "Codex",
+        .cursor => "Cursor",
     };
 }
 
@@ -27,23 +28,36 @@ pub fn accessModeLabel(mode: anytype) [:0]const u8 {
 }
 
 /// Returns the model options for the active provider.
-pub fn modelOptions(comptime Option: type, provider: anytype, opencode_options: []const Option, codex_options: []const Option) []const Option {
+pub fn modelOptions(
+    comptime Option: type,
+    provider: anytype,
+    opencode_options: []const Option,
+    codex_options: []const Option,
+    cursor_options: []const Option,
+) []const Option {
     return switch (provider) {
         .opencode => opencode_options,
         .codex => codex_options,
+        .cursor => cursor_options,
     };
 }
 
 /// Returns the current model label for a thread.
-pub fn selectedModelLabel(comptime Option: type, thread: anytype, opencode_options: []const Option, codex_options: []const Option) [:0]const u8 {
+pub fn selectedModelLabel(
+    comptime Option: type,
+    thread: anytype,
+    opencode_options: []const Option,
+    codex_options: []const Option,
+    cursor_options: []const Option,
+) [:0]const u8 {
     if (thread.model_ref) |model_ref| {
-        for (modelOptions(Option, thread.provider, opencode_options, codex_options)) |option| {
+        for (modelOptions(Option, thread.provider, opencode_options, codex_options, cursor_options)) |option| {
             if (option.value) |value| {
                 if (std.mem.eql(u8, model_ref, value)) return option.label;
             }
         }
     }
-    const options = modelOptions(Option, thread.provider, opencode_options, codex_options);
+    const options = modelOptions(Option, thread.provider, opencode_options, codex_options, cursor_options);
     return if (options.len > 0) options[0].label else "Model";
 }
 

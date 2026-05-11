@@ -458,6 +458,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         page_alloc.free(request.thread_title);
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
+        if (request.cursor_model_params_json) |params| page_alloc.free(params);
         page_alloc.destroy(request);
     }
 
@@ -546,6 +547,7 @@ pub const SendWorkerRequest = struct {
     reasoning_effort: ?app_state.ReasoningEffort,
     /// Owned; OpenCode-only. Duplicated from thread `opencode_reasoning_variant`.
     opencode_reasoning_variant: ?[]u8,
+    cursor_model_params_json: ?[]u8,
     fast_mode: app_state.FastMode,
     access_mode: app_state.AccessMode,
 };
@@ -569,6 +571,12 @@ pub fn runSendWorker(
             .codex = .{
                 .cwd = request.project_path,
                 .launch_on_connect = true,
+            },
+        },
+        .cursor => ai_harness.ProviderConfig{
+            .cursor = .{
+                .cwd = request.project_path,
+                .model = request.model_ref,
             },
         },
     };
@@ -604,6 +612,7 @@ pub fn runSendWorker(
         .cwd = request.project_path,
         .model = request.model_ref,
         .opencode_variant = if (request.provider == .opencode) request.opencode_reasoning_variant else null,
+        .cursor_model_params_json = if (request.provider == .cursor) request.cursor_model_params_json else null,
         .reasoning_effort = if (request.provider == .opencode and request.opencode_reasoning_variant != null) null else request.reasoning_effort,
         .service_tier = serviceTierForMode(request.provider, request.fast_mode),
         .approval_policy = approvalPolicyForMode(request.provider, request.access_mode),
@@ -613,6 +622,7 @@ pub fn runSendWorker(
         .on_turn_id = handleSendTurnId,
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
+        .on_should_stop = handleSendShouldStop,
         .on_approval_request = handleSendApprovalRequest,
     }) catch |err| {
         std.debug.print(
@@ -1206,6 +1216,18 @@ fn formatSendWorkerError(
             u8,
             "OpenCode ended the turn without producing any output. Please retry the prompt.",
         ),
+        error.CursorAttachmentsUnsupported => allocator.dupe(
+            u8,
+            "Cursor does not currently support local image attachments through this provider.",
+        ),
+        error.CursorSignedOut => allocator.dupe(
+            u8,
+            "Cursor is not authenticated. Set CURSOR_API_KEY or sign in before sending.",
+        ),
+        error.CursorBridgeFailed => allocator.dupe(
+            u8,
+            "Cursor provider request failed. Check Cursor authentication and @cursor/sdk availability.",
+        ),
         else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
     };
 }
@@ -1344,6 +1366,14 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
         },
     }
 }
+
+fn handleSendShouldStop(context: ?*anyopaque) bool {
+    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return true));
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    return send_state.stop_requested;
+}
+
 pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocator: std.mem.Allocator) void {
     if (send_state.partial_text.items.len == 0) return;
     const provider = send_state.provider orelse return;
