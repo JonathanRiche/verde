@@ -151,6 +151,7 @@ jobs:
             libgbm-dev \
             libglib2.0-dev \
             libgtk-3-dev \
+            libsdl3-ttf-dev \
             libnspr4-dev \
             libnss3-dev \
             libxcomposite-dev \

@@ -128,7 +128,7 @@ pub fn build(b: *std.Build) void {
                 exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
             }
             exe.root_module.linkSystemLibrary("SDL3", .{});
-            exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
+            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkSystemLibrary("GL", .{});
             exe.root_module.linkSystemLibrary("util", .{});
         },
