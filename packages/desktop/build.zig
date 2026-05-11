@@ -41,12 +41,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const palette_module = palette.module("palette");
     const chat_markdown = b.createModule(.{
         .root_source_file = b.path("src/ui/chat_markdown.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "palette", .module = palette.module("palette") },
+            .{ .name = "palette", .module = palette_module },
             .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
             .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
         },
@@ -87,7 +88,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
-                .{ .name = "palette", .module = palette.module("palette") },
+                .{ .name = "palette", .module = palette_module },
                 .{ .name = "zig_dif", .module = zig_dif.module("zig_dif") },
                 .{ .name = "zig_markdown", .module = zig_markdown.module("zig_markdown") },
                 .{ .name = "zsdl3", .module = zsdl.module("zsdl3") },
@@ -143,6 +144,7 @@ pub fn build(b: *std.Build) void {
             }
             if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
                 exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System", "Library", "Frameworks" }) });
+                exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "usr", "include" }) });
             }
             exe.root_module.addCSourceFile(.{
                 .file = b.path("src/platform/macos_clipboard.m"),
@@ -151,6 +153,7 @@ pub fn build(b: *std.Build) void {
             if (b.graph.environ_map.get("HOMEBREW_PREFIX")) |prefix| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+                palette_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
             }
             exe.root_module.linkFramework("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
