@@ -125,6 +125,62 @@ pub const ComposerPromptInput = union(enum) {
     focus: bool,
 };
 
+const SanitizedText = struct {
+    value: []const u8,
+    owned: []u8 = &.{},
+
+    fn deinit(self: SanitizedText, allocator: std.mem.Allocator) void {
+        if (self.owned.len > 0) allocator.free(self.owned);
+    }
+
+    fn items(self: SanitizedText) []const u8 {
+        return if (self.owned.len > 0) self.owned else self.value;
+    }
+};
+
+fn sanitizedText(allocator: std.mem.Allocator, value: []const u8, allow_newlines: bool) !SanitizedText {
+    if (value.len == 0) return .{ .value = value };
+    var sanitized: std.ArrayList(u8) = .empty;
+    errdefer sanitized.deinit(allocator);
+    var changed = false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (byte == '\r' or (byte == '\n' and !allow_newlines) or (byte < 0x20 and byte != '\t' and byte != '\n')) {
+            changed = true;
+            index += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            changed = true;
+            index += 1;
+            continue;
+        };
+        if (index + len > value.len) {
+            changed = true;
+            break;
+        }
+        const slice = value[index .. index + len];
+        const cp = std.unicode.utf8Decode(slice) catch {
+            changed = true;
+            index += len;
+            continue;
+        };
+        if (cp == 0xfffd or cp == 0x7f or (cp >= 0x80 and cp <= 0x9f)) {
+            changed = true;
+            index += len;
+            continue;
+        }
+        try sanitized.appendSlice(allocator, slice);
+        index += len;
+    }
+    if (!changed) {
+        sanitized.deinit(allocator);
+        return .{ .value = value };
+    }
+    return .{ .value = value, .owned = try sanitized.toOwnedSlice(allocator) };
+}
+
 pub const MouseWheel = struct {
     point: draw.Vec2,
     y: f32,
@@ -291,8 +347,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            const sanitized = try sanitizedText(allocator, value, true);
+            defer sanitized.deinit(allocator);
             self.buffer.clearRetainingCapacity();
-            try self.buffer.appendSlice(allocator, value);
+            try self.buffer.appendSlice(allocator, sanitized.items());
             self.cursor = self.buffer.items.len;
             self.selection_anchor = null;
             self.selection_focus = null;
@@ -945,37 +1003,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn insertTextInput(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             if (value.len == 0) return;
-            var sanitized: std.ArrayList(u8) = .empty;
+            const sanitized = try sanitizedText(allocator, value, false);
             defer sanitized.deinit(allocator);
-            var changed = false;
-            var index: usize = 0;
-            while (index < value.len) {
-                const byte = value[index];
-                if (byte == '\n' or byte == '\r' or (byte < 0x20 and byte != '\t')) {
-                    changed = true;
-                    index += 1;
-                    continue;
-                }
-                const len = std.unicode.utf8ByteSequenceLength(byte) catch {
-                    changed = true;
-                    index += 1;
-                    continue;
-                };
-                if (index + len > value.len) {
-                    changed = true;
-                    break;
-                }
-                const slice = value[index .. index + len];
-                if (std.mem.eql(u8, slice, "\xef\xbf\xbd")) {
-                    changed = true;
-                    index += len;
-                    continue;
-                }
-                try sanitized.appendSlice(allocator, slice);
-                index += len;
-            }
-            if (!changed) return self.insertText(allocator, value);
-            return self.insertText(allocator, sanitized.items);
+            return self.insertText(allocator, sanitized.items());
         }
 
         fn replaceSelection(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
@@ -994,12 +1024,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
             const safe_start = @min(start, self.buffer.items.len);
             const safe_end = @min(@max(end, safe_start), self.buffer.items.len);
+            const sanitized = try sanitizedText(allocator, value, true);
+            defer sanitized.deinit(allocator);
             try self.recordUndoSnapshot(allocator);
-            self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, value) catch |err| switch (err) {
+            self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, sanitized.items()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
             self.clearRedoStack(allocator);
-            self.cursor = safe_start + value.len;
+            self.cursor = safe_start + sanitized.items().len;
             self.selection_anchor = null;
             self.selection_focus = null;
             self.ensureCursorVisible();
@@ -1595,6 +1627,8 @@ test "composer prompt drops text-input control and replacement glyphs" {
     try std.testing.expectEqualStrings("abcd", prompt.text());
     try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
     try std.testing.expectEqualStrings("abcd\n", prompt.text());
+    try prompt.setText(std.testing.allocator, "one\xef\xbf\xbd\ntwo\rthree");
+    try std.testing.expectEqualStrings("one\ntwothree", prompt.text());
 }
 
 fn proportionalAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, _: f32) text_layout.Advance {
