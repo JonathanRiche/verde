@@ -26,6 +26,8 @@ pub const Code = enum {
     c,
     v,
     x,
+    y,
+    z,
 };
 
 /// Converts SDL keyboard events into Palette's platform-neutral key model.
@@ -51,6 +53,8 @@ pub fn fromSdl(event: sdl.KeyboardEvent) ?Self {
         .c => .c,
         .v => .v,
         .x => .x,
+        .y => .y,
+        .z => .z,
         else => return null,
     };
     return .{ .code = code, .shift = shift, .primary = primary, .alt = alt };

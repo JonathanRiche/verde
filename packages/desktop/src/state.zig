@@ -1,8 +1,6 @@
 const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
-const zgui = @import("zgui");
-const zgui_text_select = @import("zgui_text_select");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
@@ -13,10 +11,45 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
+
+/// Arrow-key line step for transcript scroll (scaled px per key repeat).
+const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
+
+/// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
+const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
+
+extern fn palette_text_gl_measure_codepoint_width(
+    font_data: [*]const u8,
+    font_len: i32,
+    codepoint: i32,
+    font_size: f32,
+) callconv(.c) f32;
+
+extern fn palette_text_gl_measure_line_width(
+    font_data: [*]const u8,
+    font_len: i32,
+    text: [*]const u8,
+    text_len: i32,
+    font_size: f32,
+) callconv(.c) f32;
+
+/// Width of `text[0..end]` in pixels using the same rules as GL UI text (`palette_text_gl_draw`).
+pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
+    const n = @min(end, text.len);
+    if (n == 0) return 0.0;
+    return palette_text_gl_measure_line_width(
+        palette_ui_ttf.ptr,
+        @intCast(palette_ui_ttf.len),
+        text.ptr,
+        @intCast(n),
+        font_size,
+    );
+}
 
 pub const ReasoningEffort = db_types.ReasoningEffort;
 pub const FastMode = db_types.FastMode;
@@ -25,9 +58,42 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
+pub const PaletteModalAction = enum {
+    image_close,
+    project_rename_cancel,
+    project_rename_submit,
+    transcript_close,
+    thread_import_refresh,
+    thread_import_cancel,
+    thread_import_submit,
+    thread_import_select,
+    project_import_browse,
+    project_import_submit,
+    project_import_cancel,
+    modal_dismiss,
+    modal_block,
+    project_rename_input,
+    thread_import_input,
+    project_import_input,
+};
+
+pub const PaletteModalHit = struct {
+    rect: palette.Rect,
+    action: PaletteModalAction,
+    index: usize = 0,
+};
+
+pub const PaletteModalTextFocus = enum {
+    none,
+    project_rename,
+    thread_import,
+    project_import,
+};
+
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.14;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
@@ -35,17 +101,23 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_height = 48.0,
     .toolbar_gap = 14.0,
     .control_gap = 14.0,
-    .pill_padding_x = 16.0,
-    .pill_icon_gap = 10.0,
-    .pill_chevron_gap = 10.0,
-    .model_min_width = 138.0,
-    .model_max_width = 220.0,
-    .reasoning_min_width = 92.0,
-    .reasoning_max_width = 150.0,
-    .fast_min_width = 116.0,
-    .fast_max_width = 132.0,
-    .access_min_width = 172.0,
-    .access_max_width = 192.0,
+    .pill_padding_x = 21.0,
+    .pill_icon_gap = 13.0,
+    .pill_chevron_gap = 22.0,
+    .model_min_width = 176.0,
+    // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
+    .model_max_width = 420.0,
+    .reasoning_min_width = 118.0,
+    .reasoning_max_width = 248.0,
+    .fast_min_width = 124.0,
+    .fast_max_width = 280.0,
+    .access_min_width = 218.0,
+    // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
+    .access_max_width = 328.0,
+    // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
+    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
+    .pill_overlay_icon_reserve = 29.0,
+    .pill_label_width_fudge = 14.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -53,8 +125,14 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
+    .menu_background_color = .{ .r = 0.075, .g = 0.09, .b = 0.105, .a = 1.0 },
+    .menu_border_color = .{ .r = 0.28, .g = 0.34, .b = 0.38, .a = 1.0 },
+    .menu_selected_color = .{ .r = 0.19, .g = 0.31, .b = 0.39, .a = 1.0 },
+    .menu_hover_color = .{ .r = 0.17, .g = 0.20, .b = 0.24, .a = 1.0 },
     .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
+    .stop_button_color = .{ .r = 0.80, .g = 0.58, .b = 0.10, .a = 1.0 },
+    .stop_button_hover_color = .{ .r = 0.92, .g = 0.68, .b = 0.14, .a = 1.0 },
     .text_color = .{ .r = 0.94, .g = 0.96, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
@@ -63,69 +141,60 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
-    .model_icon = " ",
-    .fast_icon = "⚡",
-    .access_icon = "  ",
-    .chevron_icon = "›",
-    .send_icon = "↑",
-    .stop_icon = "■",
+    .model_icon = "",
+    .fast_icon = "",
+    .access_icon = "",
+    .chevron_icon = ">",
+    .send_icon = "",
+    .stop_icon = "x",
+    .z_index = 120,
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 292.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 34.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
+const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
-pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
-    .width = COMPOSER_MODEL_CASCADE_WIDTH,
-    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
-    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
-    .max_depth = 2,
-    .padding_x = 12.0,
-    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = 6.0,
-    .glyph_width = 10.8,
-    .font_size = 20.0,
-    .chevron_icon = "›",
-    .icon_gap = 10.0,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
-    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
-    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
-    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
-    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
-    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
-    .scrollbar_width = 5.0,
-    .corner_radius = 10.0,
-    .border_width = 1.0,
-    .z_index = 200,
-    .submenu_z_offset = 10,
-    .placement = .above,
-    .submenu_placement = .right,
-    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
-    .item_label = paletteModelCascadeLabel,
-    .child_count = paletteModelCascadeChildCount,
-});
-
-fn paletteZguiFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
-    const byte_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
-    const end = @min(byte_offset + byte_len, text.len);
-    const base_font_size = @max(zgui.getFontSize(), 1.0);
-    const width = zgui.calcTextSize(text[byte_offset..end], .{})[0] * (font_size / base_font_size);
-    return .{ .byte_len = end - byte_offset, .width = width };
+    if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
+    const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
+    const end = @min(byte_offset + seq_len, text.len);
+    const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
+        return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
+    };
+    const w = palette_text_gl_measure_codepoint_width(
+        palette_ui_ttf.ptr,
+        @intCast(palette_ui_ttf.len),
+        @intCast(cp),
+        font_size,
+    );
+    return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
 
-fn paletteZguiFontMetrics(font_size: f32) palette.FontMetrics {
-    const base_font_size = @max(zgui.getFontSize(), 1.0);
-    const line_height = @max(zgui.getTextLineHeight() * (font_size / base_font_size), font_size);
+fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
+    const line_height = @max(font_size * 1.25, font_size);
     return .{
         .font_size = font_size,
         .line_height = line_height,
         .context = null,
-        .advance = paletteZguiFontAdvance,
+        .advance = paletteEstimatedFontAdvance,
     };
+}
+
+fn paletteComposerTextFontAdvance(context: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+    var measured = paletteEstimatedFontAdvance(context, text, byte_offset, font_size);
+    measured.width *= PALETTE_COMPOSER_TEXT_ADVANCE_SCALE;
+    return measured;
+}
+
+fn paletteComposerTextFontMetrics(font_size: f32) palette.FontMetrics {
+    var metrics = paletteEstimatedFontMetrics(font_size);
+    metrics.advance = paletteComposerTextFontAdvance;
+    return metrics;
 }
 
 const Mutex = struct {
@@ -161,7 +230,9 @@ fn paletteMousePoint(x: f32, y: f32, ui_scale: f32) palette.draw.Vec2 {
 
 fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
     const mod_bits = keymodBits(event.mod);
-    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const keyboard_state = sdl.getKeyboardState();
+    const ctrl_down = keyboard_state[@intFromEnum(sdl.Scancode.lctrl)] or keyboard_state[@intFromEnum(sdl.Scancode.rctrl)];
+    const primary = (mod_bits & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0 or ctrl_down;
     const shift = (mod_bits & sdl.Keymod.shift) != 0;
     const alt = (mod_bits & sdl.Keymod.alt) != 0;
     const code: palette.Key.Code = switch (event.key) {
@@ -180,6 +251,8 @@ fn paletteComposerKeyFromSdl(event: *const sdl.KeyboardEvent) ?palette.Key {
         .c => .c,
         .v => .v,
         .x => .x,
+        .y => .y,
+        .z => .z,
         else => return null,
     };
     return .{ .code = code, .shift = shift, .primary = primary or (code == .enter and !shift), .alt = alt };
@@ -202,9 +275,16 @@ fn paletteModelLabel(context: ?*anyopaque, index: usize) []const u8 {
     return options[index].label;
 }
 
-fn paletteReasoningLabel(_: ?*anyopaque, index: usize) []const u8 {
-    if (index >= CODEX_REASONING_OPTIONS.len) return "";
-    return CODEX_REASONING_OPTIONS[index].label;
+fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const thread = state.currentThread();
+    if (thread.provider == .codex) {
+        if (index >= CODEX_REASONING_OPTIONS.len) return "";
+        return CODEX_REASONING_OPTIONS[index].label;
+    }
+    const rows = state.opencode_reasoning_menu.items;
+    if (index >= rows.len) return "";
+    return rows[index].label;
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
@@ -238,18 +318,36 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.setCurrentThreadModelRef(options[index].value);
         },
         .reasoning_changed => |index| {
-            if (index >= CODEX_REASONING_OPTIONS.len) return;
             const thread = state.currentThreadMutable();
-            const next = CODEX_REASONING_OPTIONS[index].value;
-            const changed = if (next) |value|
-                thread.reasoning_effort == null or thread.reasoning_effort.? != value
-            else
-                thread.reasoning_effort != null;
-            if (!changed) return;
-            thread.reasoning_effort = next;
+            if (thread.provider == .codex) {
+                if (index >= CODEX_REASONING_OPTIONS.len) return;
+                const next = CODEX_REASONING_OPTIONS[index].value;
+                const changed = if (next) |value|
+                    thread.reasoning_effort == null or thread.reasoning_effort.? != value
+                else
+                    thread.reasoning_effort != null;
+                if (!changed) return;
+                thread.reasoning_effort = next;
+                state.markDirty();
+                return;
+            }
+            const rows = state.opencode_reasoning_menu.items;
+            if (index >= rows.len) return;
+            const row = rows[index];
+            const matches = blk: {
+                if (thread.opencode_reasoning_variant == null and row.variant == null) break :blk true;
+                if (thread.opencode_reasoning_variant) |existing| {
+                    if (row.variant) |rv| break :blk std.mem.eql(u8, existing, rv);
+                }
+                break :blk false;
+            };
+            if (matches) return;
+            if (thread.opencode_reasoning_variant) |old| state.allocator.free(old);
+            thread.opencode_reasoning_variant = if (row.variant) |rv| state.allocator.dupeZ(u8, rv) catch null else null;
             state.markDirty();
         },
         .fast_changed => |enabled| {
+            if (state.currentThread().provider != .codex) return;
             const next: FastMode = if (enabled) .on else .off;
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
@@ -275,6 +373,12 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         },
         .model_clicked, .reasoning_clicked => {},
     }
+}
+
+fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    _ = allocator;
+    const state = appStateFromContext(context) orelse return null;
+    return state.readClipboardTextForPaste();
 }
 
 fn providerForComposerCascadeIndex(index: usize) ?Provider {
@@ -310,6 +414,76 @@ fn paletteModelCascadeChildCount(context: ?*anyopaque, path: []const usize, inde
     const provider = providerForComposerCascadeIndex(index) orelse return 0;
     return composerModelOptions(state, provider).len;
 }
+
+fn paletteModelCascadeRenderRowLeading(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    depth: usize,
+    path: []const usize,
+    index: usize,
+    clip: palette.draw.Rect,
+    leading_rect: palette.draw.Rect,
+) void {
+    _ = path;
+    if (depth != 0) return;
+    const state = appStateFromContext(context) orelse return;
+    const provider = providerForComposerCascadeIndex(index) orelse return;
+    const tex = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    } orelse return;
+    if (!tex.valid or tex.texture_id == 0) return;
+    const inner = @min(leading_rect.w, leading_rect.h);
+    const sz = inner * @min(0.68 * 1.5, 0.96);
+    const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
+    const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
+    const slot: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, slot.x, slot.y, slot.w, slot.h));
+    const r: palette.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
+    batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
+        .x = 0.0,
+        .y = 0.0,
+        .w = 1.0,
+        .h = 1.0,
+    }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+}
+
+pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
+    .width = COMPOSER_MODEL_CASCADE_WIDTH,
+    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
+    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
+    .max_depth = 2,
+    .padding_x = 14.0,
+    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
+    .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
+    .glyph_width = 10.8,
+    .font_size = 20.0,
+    .chevron_icon = ">",
+    .icon_gap = 12.0,
+    .row_leading_width = 34.0,
+    .row_leading_to_label_gap = 8.0,
+    .render_row_leading = paletteModelCascadeRenderRowLeading,
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 },
+    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 },
+    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
+    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
+    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
+    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
+    .scrollbar_width = 5.0,
+    .corner_radius = 14.0,
+    .border_width = 1.0,
+    .z_index = 1400,
+    .submenu_z_offset = 20,
+    .placement = .above,
+    .submenu_placement = .right,
+    .avoid_forbidden_for_root = false,
+    .avoid_forbidden_for_submenus = true,
+    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
+    .item_label = paletteModelCascadeLabel,
+    .child_count = paletteModelCascadeChildCount,
+});
 
 fn paletteModelCascadeEvent(context: ?*anyopaque, event: palette.CascadeMenuEvent) void {
     const state = appStateFromContext(context) orelse return;
@@ -384,6 +558,16 @@ const uploadTexture = utils.uploadTexture;
 pub const ModelOption = struct {
     label: [:0]const u8,
     value: ?[:0]const u8 = null,
+    /// From OpenCode model metadata (`capabilities.reasoning`); presets default to true.
+    reasoning_supported: bool = true,
+    /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
+    reasoning_variant_keys: ?[][:0]const u8 = null,
+};
+
+const OpencodeReasoningMenuRow = struct {
+    label: [:0]const u8,
+    /// Null selects the default (no `variant` field on the wire).
+    variant: ?[:0]const u8,
 };
 
 pub const ReasoningOption = struct {
@@ -401,30 +585,6 @@ const AccessModeOption = struct {
     value: AccessMode,
 };
 
-const TranscriptSelectableLine = struct {
-    start: usize,
-    len: usize,
-};
-
-const TranscriptSelectableText = struct {
-    owned_body: []u8,
-    lines: []TranscriptSelectableLine,
-    selector: *zgui_text_select.TextSelect,
-
-    fn deinit(self: *TranscriptSelectableText, allocator: std.mem.Allocator) void {
-        self.selector.destroy();
-        allocator.free(self.lines);
-        allocator.free(self.owned_body);
-        allocator.destroy(self);
-    }
-
-    fn lineSlice(self: *const TranscriptSelectableText, index: usize) []const u8 {
-        if (index >= self.lines.len) return "";
-        const line = self.lines[index];
-        return self.owned_body[line.start..][0..line.len];
-    }
-};
-
 const TranscriptMarkdownBody = struct {
     owned_body: []u8,
     view: chat_markdown.BodyView,
@@ -438,6 +598,8 @@ const TranscriptMarkdownBody = struct {
 
 const TranscriptHeightEntry = struct {
     valid: bool = false,
+    role: ChatRole = .assistant,
+    assistant_plain_layout: bool = false,
     width: f32 = 0.0,
     body_hash: u64 = 0,
     author_hash: u64 = 0,
@@ -454,62 +616,6 @@ pub const TranscriptMarkdownSelection = struct {
     anchor: TranscriptMarkdownSelectionPoint,
     focus: TranscriptMarkdownSelectionPoint,
 };
-
-fn transcriptSelectableGetLine(context: ?*anyopaque, index: usize) callconv(.c) zgui_text_select.LineSlice {
-    const raw = context orelse return .{};
-    const entry: *TranscriptSelectableText = @ptrCast(@alignCast(raw));
-    return zgui_text_select.LineSlice.fromSlice(entry.lineSlice(index));
-}
-
-fn transcriptSelectableGetNumLines(context: ?*anyopaque) callconv(.c) usize {
-    const raw = context orelse return 0;
-    const entry: *TranscriptSelectableText = @ptrCast(@alignCast(raw));
-    return entry.lines.len;
-}
-
-fn buildTranscriptSelectableLines(allocator: std.mem.Allocator, body: []const u8) ![]TranscriptSelectableLine {
-    var lines = std.ArrayList(TranscriptSelectableLine).empty;
-    errdefer lines.deinit(allocator);
-
-    var start: usize = 0;
-    while (start <= body.len) {
-        const rel_end = std.mem.indexOfScalar(u8, body[start..], '\n') orelse {
-            try lines.append(allocator, .{ .start = start, .len = body.len - start });
-            break;
-        };
-        try lines.append(allocator, .{ .start = start, .len = rel_end });
-        start += rel_end + 1;
-        if (start > body.len) {
-            try lines.append(allocator, .{ .start = body.len, .len = 0 });
-            break;
-        }
-    }
-
-    if (lines.items.len == 0) {
-        try lines.append(allocator, .{ .start = 0, .len = 0 });
-    }
-
-    return lines.toOwnedSlice(allocator);
-}
-
-fn createTranscriptSelectableText(allocator: std.mem.Allocator, body: []const u8) !*TranscriptSelectableText {
-    const entry = try allocator.create(TranscriptSelectableText);
-    errdefer allocator.destroy(entry);
-
-    entry.owned_body = try allocator.dupe(u8, body);
-    errdefer allocator.free(entry.owned_body);
-
-    entry.lines = try buildTranscriptSelectableLines(allocator, entry.owned_body);
-    errdefer allocator.free(entry.lines);
-
-    entry.selector = zgui_text_select.TextSelect.create(.{
-        .context = entry,
-        .get_line = transcriptSelectableGetLine,
-        .get_num_lines = transcriptSelectableGetNumLines,
-    }, true) orelse return error.OutOfMemory;
-
-    return entry;
-}
 
 const InspectorPromptSubmittedEvent = struct {
     payload: struct {
@@ -564,7 +670,7 @@ pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
     .{ .label = "Low", .value = .low },
     .{ .label = "Medium", .value = .medium },
     .{ .label = "High", .value = .high },
-    .{ .label = "Extra High", .value = .xhigh },
+    .{ .label = "Xhigh", .value = .xhigh },
 };
 
 pub const CODEX_FAST_MODE_OPTIONS = [_]FastModeOption{
@@ -577,11 +683,12 @@ pub const CODEX_ACCESS_MODE_OPTIONS = [_]AccessModeOption{
     .{ .label = "Supervised", .value = .supervised },
 };
 
-const ChatMessage = struct {
+pub const ChatMessage = struct {
     role: ChatRole,
     author: [:0]const u8,
     body: [:0]const u8,
     image: ?ChatImageAttachment = null,
+    extra_images: []ChatImageAttachment = &.{},
 };
 
 pub const ChatImageAttachment = struct {
@@ -614,6 +721,8 @@ pub const ChatThread = struct {
     provider_thread_id: ?[:0]const u8 = null,
     model_ref: ?[:0]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
+    /// OpenCode JSON `variant` when the configured model exposes variant keys.
+    opencode_reasoning_variant: ?[:0]const u8 = null,
     fast_mode: FastMode = .off,
     access_mode: AccessMode = .full_access,
     provider: Provider = .opencode,
@@ -621,11 +730,11 @@ pub const ChatThread = struct {
     messages: std.ArrayList(ChatMessage),
     send_state: *SendState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
-    transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
     transcript_scroll_valid: bool = false,
     transcript_scroll_y: f32 = 0.0,
     draft_image: ?ChatImageAttachment = null,
+    draft_extra_images: std.ArrayList(ChatImageAttachment),
     draft_storage: [AppState.DRAFT_CAPACITY:0]u8,
 
     fn init(allocator: std.mem.Allocator, title: []const u8) !ChatThread {
@@ -646,11 +755,11 @@ pub const ChatThread = struct {
             .messages = .empty,
             .send_state = send_state,
             .transcript_markdown_entries = .empty,
-            .transcript_selectable_entries = .empty,
             .transcript_height_entries = .empty,
             .transcript_scroll_valid = false,
             .transcript_scroll_y = 0.0,
             .draft_image = null,
+            .draft_extra_images = .empty,
             .draft_storage = std.mem.zeroes([AppState.DRAFT_CAPACITY:0]u8),
         };
     }
@@ -679,11 +788,50 @@ pub const ChatThread = struct {
         self.draft_image = try ChatImageAttachment.init(allocator, path, mime, byte_size);
     }
 
+    fn addDraftImage(self: *ChatThread, allocator: std.mem.Allocator, path: []const u8, mime: []const u8, byte_size: usize) !void {
+        if (self.draft_image == null) {
+            self.draft_image = try ChatImageAttachment.init(allocator, path, mime, byte_size);
+            return;
+        }
+        try self.draft_extra_images.append(allocator, try ChatImageAttachment.init(allocator, path, mime, byte_size));
+    }
+
     fn clearDraftImage(self: *ChatThread, allocator: std.mem.Allocator) void {
         if (self.draft_image) |*image| {
             image.deinit(allocator);
             self.draft_image = null;
         }
+        for (self.draft_extra_images.items) |*image| {
+            image.deinit(allocator);
+        }
+        self.draft_extra_images.clearRetainingCapacity();
+    }
+
+    fn clearDraftImageAt(self: *ChatThread, allocator: std.mem.Allocator, index: usize) void {
+        if (index == 0) {
+            if (self.draft_image) |*image| image.deinit(allocator);
+            if (self.draft_extra_images.items.len > 0) {
+                self.draft_image = self.draft_extra_images.orderedRemove(0);
+            } else {
+                self.draft_image = null;
+            }
+            return;
+        }
+        const extra_index = index - 1;
+        if (extra_index >= self.draft_extra_images.items.len) return;
+        var image = self.draft_extra_images.orderedRemove(extra_index);
+        image.deinit(allocator);
+    }
+
+    pub fn draftImageCount(self: *const ChatThread) usize {
+        return (if (self.draft_image != null) @as(usize, 1) else 0) + self.draft_extra_images.items.len;
+    }
+
+    pub fn draftImageAt(self: *const ChatThread, index: usize) ?*const ChatImageAttachment {
+        if (index == 0) return if (self.draft_image) |*image| image else null;
+        const extra_index = index - 1;
+        if (extra_index >= self.draft_extra_images.items.len) return null;
+        return &self.draft_extra_images.items[extra_index];
     }
 
     fn commitFromPrompt(self: *ChatThread, allocator: std.mem.Allocator, prompt: []const u8) !void {
@@ -704,7 +852,7 @@ pub const ChatThread = struct {
         return self.send_state.status == .pending;
     }
 
-    fn isSendPendingForUi(self: *const ChatThread) bool {
+    pub fn isSendPendingForUi(self: *const ChatThread) bool {
         if (!self.send_state.mutex.tryLock()) return true;
         defer self.send_state.mutex.unlock();
         return self.send_state.status == .pending;
@@ -738,25 +886,6 @@ pub const ChatThread = struct {
             if (entry) |owned| owned.deinit(allocator);
         }
         self.transcript_markdown_entries.clearRetainingCapacity();
-    }
-
-    fn ensureTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
-        const message_count = self.messages.items.len;
-        if (self.transcript_selectable_entries.items.len > message_count) {
-            for (self.transcript_selectable_entries.items[message_count..]) |entry| {
-                if (entry) |owned| owned.deinit(allocator);
-            }
-            self.transcript_selectable_entries.shrinkRetainingCapacity(message_count);
-        } else if (self.transcript_selectable_entries.items.len < message_count) {
-            self.transcript_selectable_entries.appendNTimes(allocator, null, message_count - self.transcript_selectable_entries.items.len) catch return;
-        }
-    }
-
-    fn clearTranscriptSelectableEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
-        for (self.transcript_selectable_entries.items) |entry| {
-            if (entry) |owned| owned.deinit(allocator);
-        }
-        self.transcript_selectable_entries.clearRetainingCapacity();
     }
 
     fn ensureTranscriptHeightEntries(self: *ChatThread, allocator: std.mem.Allocator) void {
@@ -803,19 +932,21 @@ pub const ChatThread = struct {
         self.deinitSendState(allocator);
         self.clearTranscriptMarkdownEntries(allocator);
         self.transcript_markdown_entries.deinit(allocator);
-        self.clearTranscriptSelectableEntries(allocator);
-        self.transcript_selectable_entries.deinit(allocator);
         self.transcript_height_entries.deinit(allocator);
         allocator.free(self.title);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
+        if (self.opencode_reasoning_variant) |variant| allocator.free(variant);
         for (self.messages.items) |message| {
             allocator.free(message.author);
             allocator.free(message.body);
             if (message.image) |*image| image.deinit(allocator);
+            for (message.extra_images) |*image| image.deinit(allocator);
+            allocator.free(message.extra_images);
         }
         self.messages.deinit(allocator);
         self.clearDraftImage(allocator);
+        self.draft_extra_images.deinit(allocator);
     }
 };
 pub const PickerStatus = enum {
@@ -934,14 +1065,20 @@ const FileSearchState = struct {
 };
 
 extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
+pub const TextureBackend = enum {
+    gl,
+    external,
+};
+
 pub const CachedImageTexture = struct {
-    texture_id: c_uint,
-    width: i32,
-    height: i32,
-    valid: bool,
+    texture_id: c_uint = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    valid: bool = false,
+    backend: TextureBackend = .gl,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0) return;
+        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
         var textures = [_]c_uint{self.texture_id};
         glDeleteTextures(1, &textures);
     }
@@ -1290,6 +1427,18 @@ fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup
         followup.* = null;
     }
 }
+
+pub const SidebarThreadHover = struct {
+    project_index: usize,
+    thread_index: usize,
+};
+
+pub const SidebarContextMenuKind = enum {
+    none,
+    project,
+    thread,
+};
+
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1317,6 +1466,12 @@ pub const AppState = struct {
     composer_send_max: [2]f32,
     composer_send_pressed: bool,
     composer_send_hovered: bool,
+    composer_draft_image_clear_valid: bool,
+    composer_draft_image_clear_rect: palette.Rect,
+    composer_draft_image_clear_index: usize,
+    composer_draft_image_clear_count: usize,
+    composer_draft_image_clear_rects: [16]palette.Rect,
+    composer_draft_image_clear_indices: [16]usize,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
@@ -1329,6 +1484,16 @@ pub const AppState = struct {
     palette_composer: PaletteComposerPrompt,
     palette_model_cascade: PaletteModelCascadeMenu,
     palette_overlay_batch: palette.RenderBatch,
+    palette_frame_text: std.ArrayList(u8),
+    palette_modal_hits: std.ArrayList(PaletteModalHit),
+    palette_modal_text_focus: PaletteModalTextFocus,
+    gl_texture_uploads_enabled: bool,
+    browser_textures_enabled: bool,
+    texture_upload_context: ?*anyopaque,
+    texture_upload_fn: ?TextureUploadFn,
+    project_rename_cursor: usize,
+    project_import_cursor: usize,
+    thread_import_cursor: usize,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1344,6 +1509,7 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
+    opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
     opencode_logo_texture: ?CachedImageTexture,
@@ -1360,8 +1526,11 @@ pub const AppState = struct {
     thread_import_provider: ?Provider,
     thread_import_project_index: ?usize,
     thread_import_selected_index: ?usize,
+    /// Row index in `thread_import_threads` under the cursor (import modal list).
+    thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
+    project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
     file_search_state: FileSearchState,
@@ -1371,7 +1540,20 @@ pub const AppState = struct {
     browser_pane_max: [2]f32,
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
+    /// Palette sidebar thread row under the cursor (hover highlight).
+    sidebar_thread_hover: ?SidebarThreadHover,
     browser_pane_focused: bool,
+    browser_address_focused: bool,
+    browser_address_cursor: usize,
+    browser_inspector_menu_open: bool,
+    /// Split "Open" header menu (folder / editors); palette workspace chrome only.
+    workspace_header_open_menu_open: bool,
+    sidebar_context_menu_open: bool,
+    sidebar_context_menu_kind: SidebarContextMenuKind,
+    sidebar_context_menu_project_index: usize,
+    sidebar_context_menu_thread_index: usize,
+    sidebar_context_menu_anchor_x: f32,
+    sidebar_context_menu_anchor_y: f32,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1382,22 +1564,39 @@ pub const AppState = struct {
     transcript_markdown_selection_anchor: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_focus: ?TranscriptMarkdownSelectionPoint,
     transcript_markdown_selection_dragging: bool,
+    /// Last pointer position in palette framebuffer space (updated from workspace mouse motion).
+    palette_mouse_x: f32,
+    palette_mouse_y: f32,
+    palette_mouse_in_workspace: bool,
+    /// Cached transcript layout from the last `chat_panel` paint (used for hit-testing between frames).
+    transcript_palette_column: palette.Rect,
+    transcript_palette_scroll_y: f32,
+    transcript_palette_clip: palette.Rect,
     transcript_markdown_project_index: ?usize,
     transcript_markdown_thread_index: ?usize,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
-    transcript_selectable_project_index: ?usize,
-    transcript_selectable_thread_index: ?usize,
-    transcript_selectable_entries: std.ArrayList(?*TranscriptSelectableText),
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
-    pending_transcript_line_scroll_steps: i16,
-    pending_transcript_page_scroll_steps: i16,
+    /// Keyboard fine scroll: applied once on next transcript layout (px); cleared after paint.
+    pending_transcript_scroll_px: f32,
+    pending_transcript_page_steps: i16,
+    transcript_scroll_pending_track_p: usize,
+    transcript_scroll_pending_track_t: usize,
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
     pending_send_count: usize,
 
-    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
+    pub const InitOptions = struct {
+        gl_texture_uploads_enabled: bool = true,
+        browser_textures_enabled: bool = true,
+        texture_upload_context: ?*anyopaque = null,
+        texture_upload_fn: ?TextureUploadFn = null,
+    };
+
+    pub const TextureUploadFn = *const fn (context: ?*anyopaque, loaded: stb_image.LoadedImage) ?CachedImageTexture;
+
+    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
         errdefer browser_state.deinit();
 
@@ -1425,6 +1624,12 @@ pub const AppState = struct {
             .composer_send_max = .{ 0.0, 0.0 },
             .composer_send_pressed = false,
             .composer_send_hovered = false,
+            .composer_draft_image_clear_valid = false,
+            .composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
+            .composer_draft_image_clear_index = 0,
+            .composer_draft_image_clear_count = 0,
+            .composer_draft_image_clear_rects = [_]palette.Rect{.{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 }} ** 16,
+            .composer_draft_image_clear_indices = [_]usize{0} ** 16,
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
@@ -1437,6 +1642,16 @@ pub const AppState = struct {
             .palette_composer = PaletteComposerPrompt.init(),
             .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
             .palette_overlay_batch = .{},
+            .palette_frame_text = .empty,
+            .palette_modal_hits = .empty,
+            .palette_modal_text_focus = .none,
+            .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
+            .browser_textures_enabled = options.browser_textures_enabled,
+            .texture_upload_context = options.texture_upload_context,
+            .texture_upload_fn = options.texture_upload_fn,
+            .project_rename_cursor = 0,
+            .project_import_cursor = 0,
+            .thread_import_cursor = 0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
@@ -1452,6 +1667,7 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
+            .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
             .opencode_logo_texture = null,
@@ -1468,8 +1684,10 @@ pub const AppState = struct {
             .thread_import_provider = null,
             .thread_import_project_index = null,
             .thread_import_selected_index = null,
+            .thread_import_hover_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
+            .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
             .file_search_state = .{},
@@ -1479,7 +1697,18 @@ pub const AppState = struct {
             .browser_pane_max = .{ 0.0, 0.0 },
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
+            .sidebar_thread_hover = null,
             .browser_pane_focused = false,
+            .browser_address_focused = false,
+            .browser_address_cursor = 0,
+            .browser_inspector_menu_open = false,
+            .workspace_header_open_menu_open = false,
+            .sidebar_context_menu_open = false,
+            .sidebar_context_menu_kind = .none,
+            .sidebar_context_menu_project_index = 0,
+            .sidebar_context_menu_thread_index = 0,
+            .sidebar_context_menu_anchor_x = 0.0,
+            .sidebar_context_menu_anchor_y = 0.0,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -1490,16 +1719,21 @@ pub const AppState = struct {
             .transcript_markdown_selection_anchor = null,
             .transcript_markdown_selection_focus = null,
             .transcript_markdown_selection_dragging = false,
+            .palette_mouse_x = 0.0,
+            .palette_mouse_y = 0.0,
+            .palette_mouse_in_workspace = false,
+            .transcript_palette_column = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            .transcript_palette_scroll_y = 0.0,
+            .transcript_palette_clip = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
             .transcript_markdown_project_index = null,
             .transcript_markdown_thread_index = null,
             .transcript_markdown_entries = .empty,
-            .transcript_selectable_project_index = null,
-            .transcript_selectable_thread_index = null,
-            .transcript_selectable_entries = .empty,
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
-            .pending_transcript_line_scroll_steps = 0,
-            .pending_transcript_page_scroll_steps = 0,
+            .pending_transcript_scroll_px = 0,
+            .pending_transcript_page_steps = 0,
+            .transcript_scroll_pending_track_p = std.math.maxInt(usize),
+            .transcript_scroll_pending_track_t = std.math.maxInt(usize),
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
@@ -1514,16 +1748,35 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        state.logo_texture = utils.loadEmbeddedTexture(VERDE_LOGO_BYTES);
-        state.opencode_logo_texture = utils.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
-        state.codex_logo_texture = utils.loadEmbeddedTexture(CODEX_LOGO_BYTES);
-        state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
-        state.cursor_logo_texture = utils.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
-        state.emacs_logo_texture = utils.loadEmbeddedTexture(EMACS_LOGO_BYTES);
-        state.neovim_logo_texture = utils.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
-        state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
-        state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        if (options.gl_texture_uploads_enabled or options.texture_upload_fn != null) {
+            state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
+            state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
+            state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
+            state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
+            state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
+            state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
+            state.neovim_logo_texture = state.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
+            state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
+            state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        }
         return state;
+    }
+
+    fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
+        const loaded = stb_image.loadFromMemory(bytes) catch |err| {
+            log.err("failed to decode embedded texture: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer loaded.deinit();
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    fn uploadLoadedTexture(self: *AppState, loaded: stb_image.LoadedImage) ?CachedImageTexture {
+        if (self.texture_upload_fn) |upload_fn| {
+            return upload_fn(self.texture_upload_context, loaded);
+        }
+        if (!self.gl_texture_uploads_enabled) return null;
+        return uploadTexture(loaded);
     }
 
     pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
@@ -1565,39 +1818,64 @@ pub const AppState = struct {
         };
     }
 
+    fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[][:0]const u8) !?[][:0]const u8 {
+        const keys = src orelse return null;
+        if (keys.len == 0) return null;
+        const out = try allocator.alloc([:0]const u8, keys.len);
+        errdefer {
+            for (out) |k| allocator.free(k);
+            allocator.free(out);
+        }
+        for (keys, 0..) |k, i| {
+            out[i] = try allocator.dupeZ(u8, k);
+        }
+        return out;
+    }
+
     fn populateOpencodeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
-        const SortedModel = struct {
-            provider_name: []const u8,
-            provider_id: []const u8,
-            model_name: []const u8,
-            model_id: []const u8,
-        };
+        var order = try self.allocator.alloc(usize, models.len);
+        defer self.allocator.free(order);
+        for (0..models.len) |i| order[i] = i;
 
-        var sorted_models = try self.allocator.alloc(SortedModel, models.len);
-        defer self.allocator.free(sorted_models);
-
-        for (models, 0..) |model, index| {
-            sorted_models[index] = .{
-                .provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id,
-                .provider_id = model.provider_id,
-                .model_name = if (model.model_name.len > 0) model.model_name else model.model_id,
-                .model_id = model.model_id,
-            };
-        }
-
-        var i: usize = 1;
-        while (i < sorted_models.len) : (i += 1) {
-            const current = sorted_models[i];
-            var j = i;
-            while (j > 0 and opencodeModelSortLessThan(current, sorted_models[j - 1])) : (j -= 1) {
-                sorted_models[j] = sorted_models[j - 1];
+        var sort_i: usize = 1;
+        while (sort_i < order.len) : (sort_i += 1) {
+            const cur_idx = order[sort_i];
+            var j = sort_i;
+            while (j > 0 and opencodeModelSortLessThan(models[cur_idx], models[order[j - 1]])) : (j -= 1) {
+                order[j] = order[j - 1];
             }
-            sorted_models[j] = current;
+            order[j] = cur_idx;
         }
 
-        for (sorted_models) |model| {
-            const model_name = model.model_name;
-            const provider_name = model.provider_name;
+        // Preset `opencode/…` routes first when the API list omits them (common when only one vendor
+        // is configured). Skip a preset when any API row already exposes the same model id so we do
+        // not list two entries for the same model (e.g. `openai/gpt-5.4` vs `opencode/gpt-5.4`).
+        for (OPENCODE_MODEL_OPTIONS) |preset| {
+            const preset_value = preset.value orelse continue;
+            const preset_model_id = opencodeModelIdSuffixFromRef(preset_value) orelse continue;
+            if (opencodeSortedModelsContainModelIdFromOrder(order, models, preset_model_id)) continue;
+
+            const preset_label = try self.allocator.dupeZ(u8, preset.label);
+            errdefer self.allocator.free(preset_label);
+            const preset_value_copy = try self.allocator.dupeZ(u8, preset_value);
+            errdefer self.allocator.free(preset_value_copy);
+            const preset_keys = try duplicateReasoningVariantKeys(self.allocator, preset.reasoning_variant_keys);
+            errdefer if (preset_keys) |pk| {
+                for (pk) |k| self.allocator.free(k);
+                self.allocator.free(pk);
+            };
+            try self.opencode_model_options.append(self.allocator, .{
+                .label = preset_label,
+                .value = preset_value_copy,
+                .reasoning_supported = preset.reasoning_supported,
+                .reasoning_variant_keys = preset_keys,
+            });
+        }
+
+        for (order) |mi| {
+            const model = models[mi];
+            const model_name = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const provider_name = if (model.provider_name.len > 0) model.provider_name else model.provider_id;
             const label_text = try std.fmt.allocPrint(self.allocator, "{s} ({s})", .{ model_name, provider_name });
             defer self.allocator.free(label_text);
             const label = try self.allocator.dupeZ(u8, label_text);
@@ -1608,18 +1886,43 @@ pub const AppState = struct {
             const value = try self.allocator.dupeZ(u8, value_text);
             errdefer self.allocator.free(value);
 
+            const keys = try duplicateReasoningVariantKeys(self.allocator, model.reasoning_variant_keys);
+            errdefer if (keys) |k| {
+                for (k) |x| self.allocator.free(x);
+                self.allocator.free(k);
+            };
+
             try self.opencode_model_options.append(self.allocator, .{
                 .label = label,
                 .value = value,
+                .reasoning_supported = model.reasoning_supported,
+                .reasoning_variant_keys = keys,
             });
         }
     }
 
-    fn opencodeModelSortLessThan(a: anytype, b: anytype) bool {
-        const provider_cmp = asciiCaseInsensitiveCompare(a.provider_name, b.provider_name);
+    fn opencodeModelIdSuffixFromRef(model_ref: []const u8) ?[]const u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, model_ref, '/') orelse return null;
+        if (slash + 1 >= model_ref.len) return null;
+        return model_ref[slash + 1 ..];
+    }
+
+    fn opencodeSortedModelsContainModelIdFromOrder(order: []const usize, model_list: []const ai_harness.ModelInfo, model_id: []const u8) bool {
+        for (order) |mi| {
+            if (std.mem.eql(u8, model_list[mi].model_id, model_id)) return true;
+        }
+        return false;
+    }
+
+    fn opencodeModelSortLessThan(a: ai_harness.ModelInfo, b: ai_harness.ModelInfo) bool {
+        const provider_name_a = if (a.provider_name.len > 0) a.provider_name else a.provider_id;
+        const provider_name_b = if (b.provider_name.len > 0) b.provider_name else b.provider_id;
+        const provider_cmp = asciiCaseInsensitiveCompare(provider_name_a, provider_name_b);
         if (provider_cmp != .eq) return provider_cmp == .lt;
 
-        const model_cmp = asciiCaseInsensitiveCompare(a.model_name, b.model_name);
+        const model_name_a = if (a.model_name.len > 0) a.model_name else a.model_id;
+        const model_name_b = if (b.model_name.len > 0) b.model_name else b.model_id;
+        const model_cmp = asciiCaseInsensitiveCompare(model_name_a, model_name_b);
         if (model_cmp != .eq) return model_cmp == .lt;
 
         const provider_id_cmp = asciiCaseInsensitiveCompare(a.provider_id, b.provider_id);
@@ -1659,22 +1962,100 @@ pub const AppState = struct {
         if (thread.model_ref) |model_ref| {
             for (self.opencode_model_options.items) |option| {
                 if (option.value) |value| {
-                    if (std.mem.eql(u8, model_ref, value)) return;
+                    if (std.mem.eql(u8, model_ref, value)) {
+                        self.normalizeOpencodeReasoningVariant(thread);
+                        return;
+                    }
                 }
             }
             self.allocator.free(model_ref);
         }
 
         thread.model_ref = self.allocator.dupeZ(u8, fallback_model_ref) catch null;
+        self.normalizeOpencodeReasoningVariant(thread);
         self.markDirty();
+    }
+
+    fn opencodeModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
+        const ref = model_ref orelse return null;
+        for (self.opencode_model_options.items) |opt| {
+            if (opt.value) |v| {
+                if (std.mem.eql(u8, ref, v)) return opt;
+            }
+        }
+        return null;
+    }
+
+    fn refreshOpencodeReasoningMenu(self: *AppState, thread: *const ChatThread) !void {
+        self.clearOpencodeReasoningMenu();
+        errdefer self.clearOpencodeReasoningMenu();
+
+        if (thread.provider != .opencode) return;
+        const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
+        if (!opt.reasoning_supported) return;
+        const keys = opt.reasoning_variant_keys orelse return;
+        if (keys.len == 0) return;
+
+        const default_label = try self.allocator.dupeZ(u8, "Default");
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = default_label, .variant = null });
+
+        for (keys) |key| {
+            const label = try self.allocator.dupeZ(u8, key);
+            const variant_copy = try self.allocator.dupeZ(u8, key);
+            try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+        }
+    }
+
+    fn normalizeOpencodeReasoningVariant(self: *AppState, thread: *ChatThread) void {
+        if (thread.provider != .opencode) return;
+        if (thread.opencode_reasoning_variant) |cur| {
+            const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            };
+            if (!opt.reasoning_supported) {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            }
+            const keys = opt.reasoning_variant_keys orelse {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            };
+            if (keys.len == 0) {
+                self.allocator.free(cur);
+                thread.opencode_reasoning_variant = null;
+                return;
+            }
+            for (keys) |k| {
+                if (std.mem.eql(u8, cur, k)) return;
+            }
+            self.allocator.free(cur);
+            thread.opencode_reasoning_variant = null;
+        }
     }
 
     fn clearDynamicOpencodeModelOptions(self: *AppState) void {
         for (self.opencode_model_options.items) |option| {
             self.allocator.free(option.label);
             if (option.value) |value| self.allocator.free(value);
+            if (option.reasoning_variant_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
         }
         self.opencode_model_options.clearRetainingCapacity();
+        self.clearOpencodeReasoningMenu();
+    }
+
+    fn clearOpencodeReasoningMenu(self: *AppState) void {
+        for (self.opencode_reasoning_menu.items) |row| {
+            self.allocator.free(row.label);
+            if (row.variant) |v| self.allocator.free(v);
+        }
+        self.opencode_reasoning_menu.clearRetainingCapacity();
     }
 
     fn clearOpencodeModelOptions(self: *AppState) void {
@@ -1713,8 +2094,15 @@ pub const AppState = struct {
         author: []const u8,
         body: []const u8,
         image: ?*const ChatImageAttachment,
+        extra_images: []const ChatImageAttachment,
     ) !void {
         self.trimThreadMessages(thread, 1);
+
+        const copied_extra = try self.allocator.alloc(ChatImageAttachment, extra_images.len);
+        errdefer self.allocator.free(copied_extra);
+        for (extra_images, 0..) |attachment, index| {
+            copied_extra[index] = try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size);
+        }
 
         try thread.messages.append(self.allocator, .{
             .role = role,
@@ -1724,17 +2112,18 @@ pub const AppState = struct {
                 try ChatImageAttachment.init(self.allocator, attachment.path, attachment.mime, attachment.byte_size)
             else
                 null,
+            .extra_images = copied_extra,
         });
         thread.touch();
         self.markDirty();
     }
 
     fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
-        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image);
+        return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image, &.{});
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
-        const trimmed = std.mem.trim(u8, self.importPath(), &std.ascii.whitespace);
+        const trimmed = std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace);
         if (trimmed.len == 0) {
             self.setSidebarNotice("Enter a project directory path first.");
             return;
@@ -1752,17 +2141,36 @@ pub const AppState = struct {
         const add_result = try self.addProject(label, resolved, 0);
         self.selected_project_index = self.projects.items.len - 1;
         self.clearImportPath();
+        self.project_import_cursor = 0;
         self.syncRenameBuffer();
         self.setSidebarNotice(if (add_result == .restored) "Project restored from archive." else "Project imported.");
         self.show_project_creator = false;
+        self.palette_modal_text_focus = .none;
+        self.markDirty();
+    }
+
+    pub fn cancelProjectImport(self: *AppState) void {
+        self.show_project_creator = false;
+        self.clearImportPath();
+        self.project_import_cursor = 0;
+        if (self.palette_modal_text_focus == .project_import) {
+            self.palette_modal_text_focus = .none;
+        }
+        self.setSidebarNotice("");
         self.markDirty();
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        log.info("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
+            runtime_log.diagnostic("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            log.warn("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.setSidebarNotice(@errorName(err));
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory target_path={s}", .{target_path});
+        log.info("browseForProjectDirectory target_path={s}", .{target_path});
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
             self.allocator.free(target_path);
@@ -1775,6 +2183,8 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
+            runtime_log.diagnostic("browseForProjectDirectory ignored: picker already pending", .{});
+            log.info("browseForProjectDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.setSidebarNotice("Folder picker already open.");
             return;
@@ -1785,10 +2195,29 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
+            runtime_log.diagnostic("browseForProjectDirectory failed to spawn picker worker", .{});
+            log.warn("browseForProjectDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory spawned picker worker", .{});
+        log.info("browseForProjectDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
+    }
+
+    pub fn requestBrowseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("requestBrowseForProjectDirectory queued", .{});
+        log.info("requestBrowseForProjectDirectory queued", .{});
+        self.project_directory_browse_requested = true;
+        self.markDirty();
+    }
+
+    pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
+        if (!self.project_directory_browse_requested) return;
+        runtime_log.diagnostic("processDeferredProjectDirectoryBrowse running", .{});
+        log.info("processDeferredProjectDirectoryBrowse running", .{});
+        self.project_directory_browse_requested = false;
+        self.browseForProjectDirectory();
     }
 
     fn renameSelectedProject(self: *AppState) void {
@@ -1811,20 +2240,26 @@ pub const AppState = struct {
 
     pub fn beginProjectRename(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
+        if (self.show_project_creator) self.cancelProjectImport();
         self.selected_project_index = index;
         self.rename_project_index = index;
         self.syncRenameBuffer();
+        self.palette_modal_text_focus = .project_rename;
+        self.project_rename_cursor = self.renameInput().len;
         self.setSidebarNotice("");
     }
 
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.projects.items.len) return;
+        if (self.show_project_creator) self.cancelProjectImport();
         self.selected_project_index = index;
         self.rename_project_index = null;
         self.thread_import_provider = provider;
         self.thread_import_project_index = index;
         self.thread_import_selected_index = null;
         self.import_thread_id_storage[0] = 0;
+        self.palette_modal_text_focus = .thread_import;
+        self.thread_import_cursor = 0;
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
         self.refreshThreadImportList();
@@ -1835,6 +2270,8 @@ pub const AppState = struct {
         self.thread_import_project_index = null;
         self.thread_import_selected_index = null;
         self.import_thread_id_storage[0] = 0;
+        if (self.palette_modal_text_focus == .thread_import) self.palette_modal_text_focus = .none;
+        self.thread_import_cursor = 0;
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
     }
@@ -1854,7 +2291,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -1969,7 +2406,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2045,7 +2482,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2096,10 +2533,12 @@ pub const AppState = struct {
             }
         }
         self.rename_project_index = null;
+        if (self.palette_modal_text_focus == .project_rename) self.palette_modal_text_focus = .none;
     }
 
     pub fn cancelProjectRename(self: *AppState) void {
         self.rename_project_index = null;
+        if (self.palette_modal_text_focus == .project_rename) self.palette_modal_text_focus = .none;
         self.syncRenameBuffer();
     }
 
@@ -2217,15 +2656,11 @@ pub const AppState = struct {
     pub fn sendDraft(self: *AppState) !void {
         const draft = self.currentDraft();
         const draft_image = self.currentThread().draft_image;
-        if (draft.len == 0 and draft_image == null) return;
+        const draft_image_count = self.currentThread().draftImageCount();
+        if (draft.len == 0 and draft_image_count == 0) return;
 
         if (self.currentThread().isSendPending()) {
             self.setSidebarNotice("This chat already has a provider request running.");
-            return;
-        }
-
-        if (draft_image != null and self.currentThread().provider != .codex) {
-            self.setSidebarNotice("Image attachments are available for Codex threads only right now.");
             return;
         }
 
@@ -2235,12 +2670,13 @@ pub const AppState = struct {
             try thread.commitFromPrompt(self.allocator, if (trimmed_title.len > 0) trimmed_title else "Image");
         }
         var draft_image_copy = draft_image;
-        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null);
+        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null, thread.draft_extra_images.items);
         self.currentProjectMutable().invalidateSidebarThreadCache();
         try self.beginSendForThread(self.currentProject().path, thread, draft);
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.resetComposerInputWidget();
+        self.requestTranscriptScrollToBottom();
         self.setSidebarNotice("Waiting for provider reply...");
     }
 
@@ -2282,7 +2718,7 @@ pub const AppState = struct {
             return;
         }
 
-        if (thread.draft_image != null) {
+        if (thread.draftImageCount() > 0) {
             self.setSidebarNotice("Queued follow-up messages do not support image attachments yet.");
             return;
         }
@@ -2373,7 +2809,8 @@ pub const AppState = struct {
             .prompt = prompt,
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
-            .reasoning_effort = thread.reasoning_effort,
+            .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+            .reasoning_effort = if (thread.provider == .opencode and thread.opencode_reasoning_variant != null) null else thread.reasoning_effort,
             .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
             .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
             .sandbox_mode = sandboxModeForMode(thread.provider, thread.access_mode),
@@ -2441,6 +2878,11 @@ pub const AppState = struct {
 
         const request = try page_alloc.create(SendWorkerRequest);
         errdefer page_alloc.destroy(request);
+        const extra_image_paths = try page_alloc.alloc([]u8, thread.draft_extra_images.items.len);
+        errdefer page_alloc.free(extra_image_paths);
+        for (thread.draft_extra_images.items, 0..) |image, index| {
+            extra_image_paths[index] = try page_alloc.dupe(u8, image.path);
+        }
         request.* = .{
             .send_state_ptr = thread.send_state,
             .provider = thread.provider,
@@ -2448,10 +2890,18 @@ pub const AppState = struct {
             .project_path = try page_alloc.dupe(u8, project_path),
             .prompt = try page_alloc.dupe(u8, prompt),
             .image_path = if (thread.draft_image) |image| try page_alloc.dupe(u8, image.path) else null,
+            .image_paths = extra_image_paths,
             .provider_thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
             .thread_title = try page_alloc.dupe(u8, thread.title),
             .model_ref = if (thread.model_ref) |model_ref| try page_alloc.dupe(u8, model_ref) else null,
             .reasoning_effort = thread.reasoning_effort,
+            .opencode_reasoning_variant = blk: {
+                if (thread.provider != .opencode) break :blk null;
+                if (thread.opencode_reasoning_variant) |v| {
+                    break :blk try page_alloc.dupe(u8, v);
+                }
+                break :blk null;
+            },
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
         };
@@ -2459,9 +2909,12 @@ pub const AppState = struct {
             page_alloc.free(request.project_path);
             page_alloc.free(request.prompt);
             if (request.image_path) |image_path| page_alloc.free(image_path);
+            for (request.image_paths) |image_path| page_alloc.free(image_path);
+            page_alloc.free(request.image_paths);
             if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
+            if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
         }
 
         const send_state = thread.send_state;
@@ -2553,6 +3006,11 @@ pub const AppState = struct {
                     else
                         null;
                     thread.reasoning_effort = persisted_thread.reasoning_effort;
+                    if (thread.opencode_reasoning_variant) |v| self.allocator.free(v);
+                    thread.opencode_reasoning_variant = if (persisted_thread.reasoning_variant) |rv|
+                        try self.allocator.dupeZ(u8, rv)
+                    else
+                        null;
                     thread.fast_mode = persisted_thread.fast_mode orelse .off;
                     thread.access_mode = persisted_thread.access_mode orelse .full_access;
                     thread.provider = persisted_thread.provider;
@@ -2593,7 +3051,7 @@ pub const AppState = struct {
                 var thread = try ChatThread.init(self.allocator, "New thread");
                 thread.archived = project.archived;
                 thread.committed = project.messages.len > 0;
-                thread.last_activity_at = if (thread.committed) 0 else 0;
+                thread.last_activity_at = 0;
                 thread.provider = project.provider;
                 thread.harness = project.harness;
                 thread.setDraft(project.draft);
@@ -2722,6 +3180,7 @@ pub const AppState = struct {
             .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
             .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
             .reasoning_effort = thread.reasoning_effort,
+            .reasoning_variant = try dupeOptionalSlice(allocator, if (thread.opencode_reasoning_variant) |v| v else null),
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
             .provider = thread.provider,
@@ -2822,6 +3281,8 @@ pub const AppState = struct {
             return;
         }
 
+        log.info("runDefaultOpenAction invoked for project path={s}", .{self.currentProject().path});
+
         switch (self.app_config.default_open_action) {
             .folder => self.openCurrentProjectDirectory(),
             .editor => self.openCurrentProjectEditor(.configured),
@@ -2871,6 +3332,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project folder.");
             return;
         };
+        log.info("openCurrentProjectDirectory completed", .{});
         self.setSidebarNotice("Opened project folder.");
     }
 
@@ -2885,6 +3347,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project editor.");
             return;
         };
+        log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
         self.setSidebarNotice(projectEditorOpenedNotice(target));
     }
 
@@ -2913,40 +3376,113 @@ pub const AppState = struct {
         self.setSidebarNotice(notice);
     }
 
-    pub fn attachClipboardImageToCurrentDraft(self: *AppState) void {
+    pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image capture failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Clipboard image paste failed.");
-            return;
+            return false;
         };
         if (capture == null) {
-            self.setSidebarNotice("No image found on the clipboard.");
-            return;
+            runtime_log.diagnostic("clipboard image capture unavailable", .{});
+            return false;
         }
 
         const image = capture.?;
         defer self.allocator.free(image.bytes);
+        runtime_log.diagnostic("clipboard image captured mime={s} bytes={d}", .{ image.mime, image.bytes.len });
 
         const image_path = self.writeClipboardImageToStorage(image.mime, image.bytes) catch |err| {
             log.err("failed to persist clipboard image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image persist failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to save clipboard image.");
-            return;
+            return true;
         };
         defer self.allocator.free(image_path);
 
         const thread = self.currentThreadMutable();
-        thread.setDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
+        thread.addDraftImage(self.allocator, image_path, image.mime, image.bytes.len) catch |err| {
             log.err("failed to attach draft image: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("clipboard image draft attach failed: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to attach clipboard image.");
-            return;
+            return true;
         };
+        runtime_log.diagnostic("clipboard image attached mime={s} bytes={d}", .{ image.mime, image.bytes.len });
         self.setSidebarNotice("Clipboard image attached.");
         self.markDirty();
+        return true;
+    }
+
+    pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
+        if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) {
+            runtime_log.diagnostic(
+                "palette paste blocked browser_focused={} address_focused={} modal_focus={s}",
+                .{ self.isBrowserPaneFocused(), self.browser_address_focused, @tagName(self.palette_modal_text_focus) },
+            );
+            return false;
+        }
+        const text = self.readClipboardTextForPaste() orelse {
+            runtime_log.diagnostic("palette paste clipboard text unavailable", .{});
+            return false;
+        };
+        defer self.allocator.free(text);
+        runtime_log.diagnostic("palette paste clipboard text len={d}", .{text.len});
+        const handled = self.insertTextIntoPaletteComposer(text);
+        runtime_log.diagnostic("palette paste insert handled={} draft_len={d}", .{ handled, self.currentDraft().len });
+        return handled;
+    }
+
+    fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
+        const clipboard_text = sdl.getClipboardText() catch |err| {
+            log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
+            return utils.captureClipboardText(self.allocator) catch |fallback_err| {
+                log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+                runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
+                return null;
+            };
+        };
+        defer sdl.free(@ptrCast(clipboard_text));
+        const text = std.mem.span(clipboard_text);
+        if (text.len > 0) {
+            runtime_log.diagnostic("palette paste SDL clipboard text len={d}", .{text.len});
+            return self.allocator.dupe(u8, text) catch |err| {
+                runtime_log.diagnostic("palette paste clipboard dupe failed: {s}", .{@errorName(err)});
+                return null;
+            };
+        }
+        runtime_log.diagnostic("palette paste SDL clipboard empty; trying fallback", .{});
+        return utils.captureClipboardText(self.allocator) catch |fallback_err| {
+            log.warn("failed to read fallback clipboard text: {s}", .{@errorName(fallback_err)});
+            runtime_log.diagnostic("palette paste fallback clipboard read failed: {s}", .{@errorName(fallback_err)});
+            return null;
+        };
+    }
+
+    fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
+        if (text.len == 0) return false;
+        self.palette_composer.focused = true;
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.browser_pane_focused = false;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+            log.warn("palette composer paste failed: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (handled) {
+            self.syncDraftFromPaletteComposer();
+            self.noteInteraction();
+        }
+        return handled;
     }
 
     pub fn clearCurrentDraftImage(self: *AppState) void {
+        self.clearCurrentDraftImageAt(0);
+    }
+
+    pub fn clearCurrentDraftImageAt(self: *AppState, index: usize) void {
         const thread = self.currentThreadMutable();
-        if (thread.draft_image) |image| {
+        if (thread.draftImageAt(index)) |image| {
             var threaded = std.Io.Threaded.init_single_threaded;
             std.Io.Dir.deleteFileAbsolute(threaded.io(), image.path) catch {};
             self.evictCachedImageTexture(image.path);
@@ -2957,7 +3493,7 @@ pub const AppState = struct {
                 }
             }
         }
-        thread.clearDraftImage(self.allocator);
+        thread.clearDraftImageAt(self.allocator, index);
         self.markDirty();
     }
 
@@ -2972,7 +3508,6 @@ pub const AppState = struct {
             self.releaseMessage(thread.messages.pop().?);
         }
         thread.clearTranscriptMarkdownEntries(self.allocator);
-        thread.clearTranscriptSelectableEntries(self.allocator);
         thread.clearTranscriptHeightEntries();
     }
 
@@ -3017,6 +3552,11 @@ pub const AppState = struct {
             hydrated.provider = existing.provider;
             hydrated.harness = existing.harness;
             hydrated.reasoning_effort = existing.reasoning_effort;
+            if (hydrated.opencode_reasoning_variant) |v| self.allocator.free(v);
+            hydrated.opencode_reasoning_variant = if (existing.opencode_reasoning_variant) |v|
+                try self.allocator.dupeZ(u8, v)
+            else
+                null;
             hydrated.fast_mode = existing.fast_mode;
             hydrated.access_mode = existing.access_mode;
 
@@ -3074,9 +3614,17 @@ pub const AppState = struct {
             var owned_image = image;
             owned_image.deinit(self.allocator);
         }
+        for (message.extra_images) |image| {
+            self.evictCachedImageTexture(image.path);
+            var owned_image = image;
+            owned_image.deinit(self.allocator);
+        }
+        self.allocator.free(message.extra_images);
     }
 
     pub fn ensureImageTexture(self: *AppState, path: [:0]const u8) ?CachedImageTexture {
+        if (!self.gl_texture_uploads_enabled and self.texture_upload_fn == null) return null;
+
         if (self.image_texture_cache.getPtr(path)) |cached| {
             return if (cached.valid) cached.* else null;
         }
@@ -3096,7 +3644,7 @@ pub const AppState = struct {
         };
         defer loaded.deinit();
 
-        const cached = uploadTexture(loaded) orelse {
+        const cached = self.uploadLoadedTexture(loaded) orelse {
             self.image_texture_cache.put(owned_key, .{
                 .texture_id = 0,
                 .width = 0,
@@ -3173,13 +3721,11 @@ pub const AppState = struct {
     pub fn openImageModal(self: *AppState, path: [:0]const u8) void {
         if (self.modal_image_path) |existing| {
             if (std.mem.eql(u8, existing, path)) {
-                zgui.openPopup(IMAGE_MODAL_ID, .{});
                 return;
             }
             self.allocator.free(existing);
         }
         self.modal_image_path = self.allocator.dupeZ(u8, path) catch return;
-        zgui.openPopup(IMAGE_MODAL_ID, .{});
     }
 
     pub fn closeImageModal(self: *AppState) void {
@@ -3285,6 +3831,24 @@ pub const AppState = struct {
         self.transcript_markdown_selection_dragging = false;
     }
 
+    pub fn notePaletteWorkspaceMouseMotion(self: *AppState, x: f32, y: f32) void {
+        self.palette_mouse_x = x;
+        self.palette_mouse_y = y;
+        self.palette_mouse_in_workspace = true;
+    }
+
+    pub fn blurPaletteComposer(self: *AppState) void {
+        self.palette_composer.focused = false;
+        self.composer_focused = false;
+    }
+
+    pub fn closeSidebarContextMenu(self: *AppState) void {
+        if (!self.sidebar_context_menu_open) return;
+        self.sidebar_context_menu_open = false;
+        self.sidebar_context_menu_kind = .none;
+        self.markDirty();
+    }
+
     pub fn selectAllTranscriptMarkdownSelection(
         self: *AppState,
         first_message_index: usize,
@@ -3319,27 +3883,14 @@ pub const AppState = struct {
         return &entry.view;
     }
 
-    pub fn transcriptBodyTextSelector(self: *AppState, message_index: usize, body: []const u8) ?*zgui_text_select.TextSelect {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return null;
-        return entry.selector;
-    }
-
-    pub fn transcriptBodyTextLineCount(self: *AppState, message_index: usize, body: []const u8) usize {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return 0;
-        return entry.lines.len;
-    }
-
-    pub fn transcriptBodyTextLineAt(self: *AppState, message_index: usize, body: []const u8, line_index: usize) []const u8 {
-        const entry = self.transcriptBodyTextEntry(message_index, body) orelse return "";
-        return entry.lineSlice(line_index);
-    }
-
     pub fn cachedTranscriptMessageHeight(
         self: *AppState,
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
     ) ?f32 {
         const thread = self.currentThreadMutable();
@@ -3348,6 +3899,8 @@ pub const AppState = struct {
 
         const entry = thread.transcript_height_entries.items[message_index];
         if (!entry.valid) return null;
+        if (entry.role != role) return null;
+        if (entry.assistant_plain_layout != assistant_plain_layout) return null;
         if (@abs(entry.width - width) > 0.5) return null;
         if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
         if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
@@ -3360,7 +3913,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
         height: f32,
     ) void {
@@ -3371,6 +3926,8 @@ pub const AppState = struct {
 
         thread.transcript_height_entries.items[message_index] = .{
             .valid = true,
+            .role = role,
+            .assistant_plain_layout = assistant_plain_layout,
             .width = width,
             .body_hash = std.hash.Wyhash.hash(0, body),
             .author_hash = std.hash.Wyhash.hash(0, author),
@@ -3471,57 +4028,6 @@ pub const AppState = struct {
         }
     }
 
-    fn ensureTranscriptSelectableEntries(self: *AppState) void {
-        if (self.projects.items.len == 0) {
-            self.clearTranscriptSelectableEntries();
-            return;
-        }
-
-        const project_index = self.selected_project_index;
-        const thread_index = self.currentProject().selected_thread_index;
-        const message_count = self.currentThread().messages.items.len;
-        if (self.transcript_selectable_project_index == project_index and
-            self.transcript_selectable_thread_index == thread_index and
-            self.transcript_selectable_entries.items.len == message_count)
-        {
-            return;
-        }
-
-        self.clearTranscriptSelectableEntries();
-        self.transcript_selectable_entries.appendNTimes(self.allocator, null, message_count) catch return;
-        self.transcript_selectable_project_index = project_index;
-        self.transcript_selectable_thread_index = thread_index;
-    }
-
-    fn clearTranscriptSelectableEntries(self: *AppState) void {
-        for (self.transcript_selectable_entries.items) |entry| {
-            if (entry) |owned| owned.deinit(self.allocator);
-        }
-        self.transcript_selectable_entries.clearRetainingCapacity();
-        self.transcript_selectable_project_index = null;
-        self.transcript_selectable_thread_index = null;
-    }
-
-    fn transcriptBodyTextEntry(self: *AppState, message_index: usize, body: []const u8) ?*TranscriptSelectableText {
-        if (body.len == 0) return null;
-        const thread = self.currentThreadMutable();
-        thread.ensureTranscriptSelectableEntries(self.allocator);
-        if (message_index >= thread.transcript_selectable_entries.items.len) return null;
-
-        if (thread.transcript_selectable_entries.items[message_index]) |entry| {
-            if (!std.mem.eql(u8, entry.owned_body, body)) {
-                entry.deinit(self.allocator);
-                thread.transcript_selectable_entries.items[message_index] = null;
-            } else {
-                return entry;
-            }
-        }
-
-        const created = createTranscriptSelectableText(self.allocator, body) catch return null;
-        thread.transcript_selectable_entries.items[message_index] = created;
-        return created;
-    }
-
     fn buildCurrentTranscriptSelectionText(self: *AppState) ![:0]u8 {
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
@@ -3534,6 +4040,11 @@ pub const AppState = struct {
             try buffer.appendSlice(self.allocator, message.author);
 
             if (message.image) |image| {
+                const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
+                defer self.allocator.free(image_label);
+                try buffer.appendSlice(self.allocator, image_label);
+            }
+            for (message.extra_images) |image| {
                 const image_label = try std.fmt.allocPrint(self.allocator, "\n[Image: {s}]", .{image.file_name});
                 defer self.allocator.free(image_label);
                 try buffer.appendSlice(self.allocator, image_label);
@@ -3675,7 +4186,11 @@ pub const AppState = struct {
 
         const is_visible = dock.toggle();
         if (!is_visible) self.endTerminalResizeDrag();
-        self.terminal_focused = is_visible;
+        if (is_visible) {
+            self.requestTerminalFocus();
+        } else {
+            self.terminal_focused = false;
+        }
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
@@ -3709,6 +4224,8 @@ pub const AppState = struct {
 
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
@@ -3719,6 +4236,11 @@ pub const AppState = struct {
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) {
+            self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+            return;
+        }
+
         if (self.browser_state.controls_visible) {
             self.hideBrowser();
             return;
@@ -3726,6 +4248,11 @@ pub const AppState = struct {
 
         const restore_last_url = !self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null;
         self.browser_state.setControlsVisible(true);
+        self.browser_address_focused = true;
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.browser_pane_focused = false;
+        self.terminal_focused = false;
+        self.composer_focused = false;
         self.browser_state.status = .opening;
         if (restore_last_url) {
             const url = self.browser_state.current_url.?;
@@ -3757,6 +4284,8 @@ pub const AppState = struct {
         self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
         self.browser_pane_hovered = false;
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
         self.browser_state.controller.shutdown();
         self.browser_state.status = .hidden;
         self.browser_state.setLastError(null) catch {};
@@ -3769,6 +4298,8 @@ pub const AppState = struct {
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
         self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
         self.browser_state.controller.hide() catch |err| {
             log.err("failed to hide browser runtime: {s}", .{@errorName(err)});
             self.browser_state.status = .failed;
@@ -3985,6 +4516,8 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
 
         if (self.browser_launch_open_delay_frames > 0) {
@@ -4402,6 +4935,15 @@ pub const AppState = struct {
         self.browser_pane_focused = false;
     }
 
+    pub fn requestTerminalFocus(self: *AppState) void {
+        self.terminal_focused = true;
+        self.composer_focused = false;
+        self.palette_composer.focused = false;
+        self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.palette_modal_text_focus = .none;
+    }
+
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
         const requested = self.composer_focus_requested;
         self.composer_focus_requested = false;
@@ -4439,37 +4981,83 @@ pub const AppState = struct {
         });
     }
 
+    /// Cleared at the start of each workspace paint; see `syncComposerToolbarOverlayHitRects`.
+    pub fn invalidateComposerToolbarOverlayHitRects(self: *AppState) void {
+        self.composer_toolbar_overlay_valid = false;
+    }
+
+    /// Hit targets for `routePaletteComposerToolbarOverlayClick` (cascade on new threads, synthetic
+    /// toolbar clicks when the overlay batch sits above the composer's own hit testing).
+    pub fn syncComposerToolbarOverlayHitRects(self: *AppState) void {
+        self.composer_toolbar_model_rect = self.palette_composer.modelRect();
+        self.composer_toolbar_reasoning_rect = self.palette_composer.reasoningRect();
+        self.composer_toolbar_fast_rect = self.palette_composer.fastRect();
+        self.composer_toolbar_access_rect = self.palette_composer.accessRect();
+        self.composer_toolbar_overlay_valid = true;
+    }
+
     pub fn syncPaletteComposerControls(self: *AppState) void {
-        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent });
-        self.palette_composer.setFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
-        self.palette_composer.setToolbarFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
-        self.palette_composer.setIconFontMetrics(paletteZguiFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
+        self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
+        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
+        self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
+        const show_fast_toggle = thread.provider == .codex;
+        self.palette_composer.setShowFastToggle(show_fast_toggle);
+        const hide_placeholder = thread.draftImageCount() > 0;
+        self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
+            log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
+        };
         const model_options = composerModelOptions(self, thread.provider);
         self.palette_composer.setModelOptions(self, model_options.len, paletteModelLabel);
-        self.palette_composer.setReasoningOptions(null, CODEX_REASONING_OPTIONS.len, paletteReasoningLabel);
+        self.refreshOpencodeReasoningMenu(thread) catch |err| {
+            log.warn("failed to refresh OpenCode reasoning menu: {s}", .{@errorName(err)});
+            self.clearOpencodeReasoningMenu();
+        };
+        const show_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
+        self.palette_composer.setShowReasoningToggle(show_reasoning);
+        const reasoning_count: usize = if (thread.provider == .codex)
+            CODEX_REASONING_OPTIONS.len
+        else
+            self.opencode_reasoning_menu.items.len;
+        self.palette_composer.setReasoningOptions(self, reasoning_count, paletteReasoningLabel);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
-        self.palette_composer.reasoning_index = composerReasoningIndex(thread.reasoning_effort);
-        self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        self.palette_composer.reasoning_index = composerReasoningIndexForThread(self, thread);
+        if (show_fast_toggle) {
+            self.palette_composer.fast_enabled = thread.fast_mode == .on;
+        } else {
+            self.palette_composer.fast_enabled = false;
+        }
         self.palette_composer.access_enabled = thread.access_mode == .full_access;
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
             if (index < model_options.len) {
-                self.palette_composer.setModelLabel(self.allocator, model_options[index].label) catch |err| {
+                self.palette_composer.setModelLabel(self.allocator, std.mem.sliceTo(model_options[index].label, 0)) catch |err| {
                     log.warn("failed to sync palette composer model label: {s}", .{@errorName(err)});
                 };
             }
         }
         if (self.palette_composer.reasoning_index) |index| {
-            if (index < CODEX_REASONING_OPTIONS.len) {
-                self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
-                    log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
-                };
+            if (thread.provider == .codex) {
+                if (index < CODEX_REASONING_OPTIONS.len) {
+                    self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
+                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
+                    };
+                }
+            } else {
+                const rows = self.opencode_reasoning_menu.items;
+                if (index < rows.len) {
+                    self.palette_composer.setReasoningLabel(self.allocator, std.mem.sliceTo(rows[index].label, 0)) catch |err| {
+                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
+                    };
+                }
             }
         }
-        self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
-            log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
-        };
+        if (show_fast_toggle) {
+            self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
+                log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
+            };
+        }
         self.palette_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
             .full_access => "Full access",
             .supervised => "Supervised",
@@ -4480,30 +5068,37 @@ pub const AppState = struct {
 
     pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
         self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
-        self.palette_model_cascade.setFontMetrics(paletteZguiFontMetrics(20.0));
+        self.palette_model_cascade.setFontMetrics(paletteEstimatedFontMetrics(20.0));
         self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
-        if (self.currentThread().committed and self.palette_model_cascade.isOpen()) {
-            _ = self.palette_model_cascade.handleInput(.close);
-        }
     }
 
     pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
 
+        const composer_rect: palette.Rect = if (self.composer_input_bounds_valid) .{
+            .x = self.composer_input_min[0],
+            .y = self.composer_input_min[1],
+            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
+            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
+        } else anchor;
         const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
+        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + COMPOSER_MODEL_CASCADE_GAP;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const viewport_top: f32 = 8.0;
+        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y + composer_rect.h);
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        self.palette_model_cascade.setAnchorRect(anchor);
-        self.palette_model_cascade.clearForbiddenRect();
+        var menu_anchor = anchor;
+        menu_anchor.y += COMPOSER_MODEL_CASCADE_ROOT_DROP;
+        self.palette_model_cascade.setAnchorRect(menu_anchor);
+        self.palette_model_cascade.setForbiddenRect(self.palette_composer.toolbarRect());
         self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
-            .y = 8.0,
+            .y = viewport_top,
             .w = @max(max_x - min_x, total_width),
-            .h = @max(anchor.y - 16.0, root_height),
+            .h = @max(viewport_bottom - viewport_top, root_height),
         });
         self.palette_model_cascade.setBounds(.{
             .x = x,
@@ -4517,6 +5112,8 @@ pub const AppState = struct {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
         self.syncPaletteModelCascadeMenu();
         self.setPaletteModelCascadeBoundsFromToolbar();
         _ = self.palette_model_cascade.handleInput(.open);
@@ -4541,7 +5138,15 @@ pub const AppState = struct {
         }
     }
 
+    fn currentThreadNeedsProviderModelCascade(self: *const AppState) bool {
+        const thread = self.currentThread();
+        return thread.messages.items.len == 0 and
+            thread.provider_thread_id == null and
+            !thread.isSendPendingForUi();
+    }
+
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
@@ -4555,7 +5160,15 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.terminal_focused) return false;
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (palette_key.primary and palette_key.code == .v) {
+            runtime_log.diagnostic(
+                "palette composer received primary-v focused={} draft_len={d}",
+                .{ self.palette_composer.focused, self.currentDraft().len },
+            );
+            return self.pasteClipboardTextIntoPaletteComposer();
+        }
         if (self.routePaletteModelCascadeKey(palette_key)) return true;
         if (!self.palette_composer.focused) return false;
         if (self.handlePaletteComposerNavigationKey(palette_key)) {
@@ -4600,7 +5213,7 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point) and !self.currentThread().committed) {
+        if (self.composer_toolbar_model_rect.contains(point) and self.currentThreadNeedsProviderModelCascade()) {
             self.openPaletteModelCascadeMenu();
             self.palette_composer.focused = false;
             self.composer_focused = false;
@@ -4611,13 +5224,14 @@ pub const AppState = struct {
             self.palette_composer.modelRect()
         else if (self.composer_toolbar_reasoning_rect.contains(point))
             self.palette_composer.reasoningRect()
-        else if (self.composer_toolbar_fast_rect.contains(point))
+        else if (self.currentThread().provider == .codex and self.composer_toolbar_fast_rect.contains(point))
             self.palette_composer.fastRect()
         else if (self.composer_toolbar_access_rect.contains(point))
             self.palette_composer.accessRect()
         else
             return false;
 
+        _ = self.palette_model_cascade.handleInput(.close);
         const target_point: palette.draw.Vec2 = .{
             .x = target.x + target.w * 0.5,
             .y = target.y + target.h * 0.5,
@@ -4711,7 +5325,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteZguiFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
@@ -4779,6 +5393,44 @@ pub const AppState = struct {
         self.composer_input_max = input_max;
     }
 
+    pub fn setComposerDraftImageClearRect(self: *AppState, rect: ?palette.Rect) void {
+        self.setComposerDraftImageClearRectAt(rect, 0);
+    }
+
+    pub fn setComposerDraftImageClearRectAt(self: *AppState, rect: ?palette.Rect, index: usize) void {
+        if (rect) |value| {
+            self.composer_draft_image_clear_valid = true;
+            self.composer_draft_image_clear_rect = value;
+            self.composer_draft_image_clear_index = index;
+            if (self.composer_draft_image_clear_count < self.composer_draft_image_clear_rects.len) {
+                const slot = self.composer_draft_image_clear_count;
+                self.composer_draft_image_clear_rects[slot] = value;
+                self.composer_draft_image_clear_indices[slot] = index;
+                self.composer_draft_image_clear_count += 1;
+            }
+        } else {
+            self.composer_draft_image_clear_valid = false;
+            self.composer_draft_image_clear_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+            self.composer_draft_image_clear_index = 0;
+            self.composer_draft_image_clear_count = 0;
+        }
+    }
+
+    pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
+        if (!self.composer_draft_image_clear_valid) return false;
+        var i: usize = self.composer_draft_image_clear_count;
+        while (i > 0) {
+            i -= 1;
+            const rect = self.composer_draft_image_clear_rects[i];
+            if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) continue;
+            if (!down) {
+                self.clearCurrentDraftImageAt(self.composer_draft_image_clear_indices[i]);
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn setCurrentThreadProvider(self: *AppState, provider: Provider) void {
         const thread = self.currentThreadMutable();
         if (thread.provider == provider) return;
@@ -4789,6 +5441,10 @@ pub const AppState = struct {
         if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
         thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
         thread.reasoning_effort = null;
+        if (thread.opencode_reasoning_variant) |v| {
+            self.allocator.free(v);
+            thread.opencode_reasoning_variant = null;
+        }
         thread.fast_mode = .off;
         self.markDirty();
     }
@@ -4806,6 +5462,7 @@ pub const AppState = struct {
         }
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
+        self.normalizeOpencodeReasoningVariant(thread);
         self.markDirty();
     }
 
@@ -4826,6 +5483,24 @@ pub const AppState = struct {
             if (value != null and option.value != null and value.? == option.value.?) return index;
         }
         return null;
+    }
+
+    fn composerReasoningIndexForThread(self: *const AppState, thread: *const ChatThread) ?usize {
+        if (thread.provider == .codex) {
+            return composerReasoningIndex(thread.reasoning_effort);
+        }
+        const rows = self.opencode_reasoning_menu.items;
+        for (rows, 0..) |row, i| {
+            const matches = blk: {
+                if (thread.opencode_reasoning_variant == null and row.variant == null) break :blk true;
+                if (thread.opencode_reasoning_variant) |v| {
+                    if (row.variant) |rv| break :blk std.mem.eql(u8, v, rv);
+                }
+                break :blk false;
+            };
+            if (matches) return i;
+        }
+        return if (rows.len > 0) 0 else null;
     }
 
     fn composerFastModeIndex(value: FastMode) ?usize {
@@ -5018,16 +5693,22 @@ pub const AppState = struct {
     pub fn markDirty(self: *AppState) void {
         self.noteInteraction();
         self.dirty = true;
-        self.last_dirty_at_ms = 0;
+        self.last_dirty_at_ms = unixTimestampMs();
     }
 
     pub fn noteInteraction(self: *AppState) void {
-        self.last_interaction_at_ms = 0;
+        self.last_interaction_at_ms = unixTimestampMs();
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        // Drop any saved offset so the next transcript layout uses the fresh tail height
+        // (e.g. right after appending the user message and starting a stream).
+        self.currentThreadMutable().transcript_scroll_valid = false;
         self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
+        self.pending_transcript_scroll_px = 0;
+        self.pending_transcript_page_steps = 0;
     }
 
     pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
@@ -5035,8 +5716,8 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
-        self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
+        self.pending_transcript_scroll_px += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_KEYBOARD_LINE_PX);
+        self.markDirty();
     }
 
     pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
@@ -5044,11 +5725,12 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
-        self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
+        const next = @as(i32, self.pending_transcript_page_steps) + @as(i32, delta);
+        self.pending_transcript_page_steps = @intCast(std.math.clamp(next, -12, 12));
+        self.markDirty();
     }
 
-    fn importPath(self: *const AppState) []const u8 {
+    pub fn importDirectoryDraft(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_path_storage[0..], 0);
     }
 
@@ -5068,6 +5750,10 @@ pub const AppState = struct {
 
     fn renameInput(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.rename_storage[0..], 0);
+    }
+
+    pub fn renameInputPublic(self: *const AppState) []const u8 {
+        return self.renameInput();
     }
 
     pub fn renameBuffer(self: *AppState) [:0]u8 {
@@ -5093,6 +5779,7 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
+        self.markDirty();
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -5101,14 +5788,25 @@ pub const AppState = struct {
         }
         self.thread_import_threads.clearRetainingCapacity();
         self.thread_import_selected_index = null;
+        self.thread_import_hover_index = null;
     }
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
-        if (0 - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
-        if (0 - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+        const now = unixTimestampMs();
+        if (now - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (now - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
 
         self.flushDirtyNow();
+    }
+
+    fn flushDirtyBlocking(self: *AppState) void {
+        if (!self.dirty) return;
+        self.storage.save(self) catch |err| {
+            log.err("failed to save native state: {s}", .{@errorName(err)});
+            return;
+        };
+        self.dirty = false;
     }
 
     fn flushDirtyNow(self: *AppState) void {
@@ -5140,7 +5838,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
         }
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.clearProjects();
 
         if (try self.storage.load(self.allocator)) |persisted_value| {
@@ -5193,17 +5891,20 @@ pub const AppState = struct {
         self.finishOpencodeModelCacheThread();
         self.finishAllSendThreads();
         self.pollSend();
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
+        self.palette_frame_text.deinit(self.allocator);
+        self.palette_modal_hits.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
-        self.transcript_selectable_entries.deinit(self.allocator);
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
+        self.clearOpencodeModelOptions();
+        self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
@@ -5258,6 +5959,8 @@ pub const AppState = struct {
         self.picker_state.mutex.unlock();
 
         if (next_status != .idle) {
+            runtime_log.diagnostic("pollPicker completed status={s}", .{@tagName(next_status)});
+            log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
         }
 
@@ -5265,8 +5968,18 @@ pub const AppState = struct {
             .selected => {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
-                    self.setImportPath(path);
-                    self.setSidebarNotice("Folder selected.");
+                    if (self.show_project_creator) {
+                        self.setImportPath(path);
+                        self.project_import_cursor = self.importDirectoryDraft().len;
+                        self.setSidebarNotice("Folder selected.");
+                        self.markDirty();
+                    } else {
+                        self.setImportPath(path);
+                        self.importProjectFromInput() catch |err| {
+                            log.warn("failed to import selected project: {s}", .{@errorName(err)});
+                            self.setSidebarNotice("Folder selected, but project import failed.");
+                        };
+                    }
                 }
             },
             .cancelled => self.setSidebarNotice("Folder selection cancelled."),
@@ -5312,6 +6025,7 @@ pub const AppState = struct {
                     return;
                 };
                 self.normalizeCurrentOpencodeThreadModel();
+                self.normalizeOpencodeReasoningVariant(self.currentThreadMutable());
             },
             .failed => {
                 log.warn("failed to refresh OpenCode model cache", .{});
@@ -5482,6 +6196,7 @@ pub const AppState = struct {
                         "Conversation interrupted",
                         "Tell the model what to do differently.",
                         null,
+                        &.{},
                     ) catch |err| {
                         log.err("failed to append interruption notice: {s}", .{@errorName(err)});
                     };
@@ -5684,7 +6399,7 @@ pub const AppState = struct {
             return;
         }
 
-        self.appendMessageToThread(thread, .user, "You", followup.prompt, null) catch |err| {
+        self.appendMessageToThread(thread, .user, "You", followup.prompt, null, &.{}) catch |err| {
             log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to append the pending follow-up.");
             return;
@@ -5989,7 +6704,6 @@ pub const AppState = struct {
         self.closeTranscriptSelectionModal();
         self.clearTranscriptMarkdownSelection();
         self.clearTranscriptMarkdownEntries();
-        self.clearTranscriptSelectableEntries();
         for (self.projects.items) |*project| {
             project.deinit(self.allocator);
         }
@@ -6007,8 +6721,8 @@ pub const AppState = struct {
     }
 
     fn defaultExplorerPath(self: *AppState) ![]u8 {
-        if (self.importPath().len > 0) {
-            return self.resolveProjectPath(std.mem.trim(u8, self.importPath(), &std.ascii.whitespace));
+        if (self.importDirectoryDraft().len > 0) {
+            return self.resolveProjectPath(std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace));
         }
 
         if (self.projects.items.len > 0) {

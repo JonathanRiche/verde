@@ -94,8 +94,11 @@ pub const Backend = struct {
 
     /// Resizes the pane placeholder without forwarding anything into the legacy backend.
     pub fn resizePane(self: *Backend, width: u32, height: u32) !void {
-        self.pane_width = @max(width, 1);
-        self.pane_height = @max(height, 1);
+        const next_width = @max(width, 1);
+        const next_height = @max(height, 1);
+        if (self.pane_width == next_width and self.pane_height == next_height) return;
+        self.pane_width = next_width;
+        self.pane_height = next_height;
         if (builtin.os.tag == .linux) {
             try self.platform.resizePane(self.pane_width, self.pane_height);
         }

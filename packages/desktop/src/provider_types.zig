@@ -43,12 +43,20 @@ pub const ModelInfo = struct {
     provider_name: []const u8,
     model_id: []const u8,
     model_name: []const u8,
+    /// From OpenCode model JSON `capabilities.reasoning` (defaults true when absent).
+    reasoning_supported: bool = true,
+    /// Sorted OpenCode `variants` object keys (API variant names). Null when none are declared.
+    reasoning_variant_keys: ?[][:0]const u8 = null,
 
     pub fn deinit(self: ModelInfo, allocator: anytype) void {
         allocator.free(self.provider_id);
         allocator.free(self.provider_name);
         allocator.free(self.model_id);
         allocator.free(self.model_name);
+        if (self.reasoning_variant_keys) |keys| {
+            for (keys) |key| allocator.free(key);
+            allocator.free(keys);
+        }
     }
 };
 
@@ -129,8 +137,11 @@ pub const SendPromptRequest = struct {
     thread_title: ?[]const u8 = null,
     prompt: []const u8,
     image: ?ImageAttachment = null,
+    images: []const ImageAttachment = &.{},
     cwd: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    /// When set (OpenCode), sent as the JSON `variant` string instead of mapping `reasoning_effort`.
+    opencode_variant: ?[]const u8 = null,
     reasoning_effort: ?ReasoningEffort = null,
     service_tier: ?ServiceTier = null,
     approval_policy: ?ApprovalPolicy = null,
