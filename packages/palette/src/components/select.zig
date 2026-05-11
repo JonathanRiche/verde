@@ -495,80 +495,44 @@ pub fn Select(comptime config: SelectConfig) type {
 
         fn renderLabel(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, label: []const u8, color: draw.Color, clip: draw.Rect) !void {
             const metrics_value = self.metrics();
-            const runs = [_]draw.TextRun{.{
-                .text = label,
-                .byte_start = 0,
-                .byte_end = label.len,
-                .x = rect.x,
-                .y = rect.y,
-                .font_size = metrics_value.font_size,
-                .line_height = metrics_value.line_height,
-                .color = color,
-                .clip = clip,
-                .font_role = config.font_role,
-                .font_id = config.font_id,
-            }};
-            try batch.textRuns(allocator, rect, label, &runs, color, metrics_value.font_size, clip, metrics_value.line_height, metrics_value.fixedAdvance());
+            try batch.roleText(allocator, rect, label, color, metrics_value.font_size, config.font_role, config.font_id, clip);
         }
 
         fn renderControlLabel(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, label: []const u8) !void {
             const control = self.controlRect();
             const metrics_value = self.metrics();
             const icon_metrics = self.iconMetrics();
-            var runs: [3]draw.TextRun = undefined;
-            var count: usize = 0;
             var x = control.x + config.padding_x;
             if (config.left_icon.len > 0) {
-                runs[count] = .{
-                    .text = config.left_icon,
-                    .byte_start = 0,
-                    .byte_end = config.left_icon.len,
+                const icon_w = icon_metrics.measureSlice(config.left_icon);
+                const icon_clip = draw.Rect{ .x = x, .y = control.y, .w = icon_w, .h = control.h };
+                try batch.roleText(allocator, .{
                     .x = x,
                     .y = control.y + @max((control.h - icon_metrics.line_height) * 0.5, 0.0),
-                    .font_size = icon_metrics.font_size,
-                    .line_height = icon_metrics.line_height,
-                    .color = config.icon_color,
-                    .clip = control,
-                    .font_role = config.icon_font_role,
-                    .font_id = config.icon_font_id,
-                };
+                    .w = icon_w,
+                    .h = icon_metrics.line_height,
+                }, config.left_icon, config.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, icon_clip);
                 x += icon_metrics.measureSlice(config.left_icon) + config.icon_gap;
-                count += 1;
             }
-            runs[count] = .{
-                .text = label,
-                .byte_start = 0,
-                .byte_end = label.len,
+            const chevron_w = if (config.chevron_icon.len > 0) icon_metrics.measureSlice(config.chevron_icon) else 0.0;
+            const chevron_x = if (config.chevron_icon.len > 0) control.x + control.w - config.padding_x - chevron_w else control.x + control.w - config.padding_x;
+            const label_w = @max(chevron_x - x - config.icon_gap, 0.0);
+            const label_clip = draw.Rect{ .x = x, .y = control.y, .w = label_w, .h = control.h };
+            try batch.roleText(allocator, .{
                 .x = x,
                 .y = control.y + @max((control.h - metrics_value.line_height) * 0.5, 0.0),
-                .font_size = metrics_value.font_size,
-                .line_height = metrics_value.line_height,
-                .color = config.text_color,
-                .clip = control,
-                .font_role = config.font_role,
-                .font_id = config.font_id,
-            };
-            x += metrics_value.measureSlice(label) + config.icon_gap;
-            count += 1;
+                .w = label_w,
+                .h = metrics_value.line_height,
+            }, label, config.text_color, metrics_value.font_size, config.font_role, config.font_id, label_clip);
             if (config.chevron_icon.len > 0) {
-                const chevron_w = icon_metrics.measureSlice(config.chevron_icon);
-                const chevron_x = @max(x, control.x + control.w - config.padding_x - chevron_w);
-                runs[count] = .{
-                    .text = config.chevron_icon,
-                    .byte_start = 0,
-                    .byte_end = config.chevron_icon.len,
+                const chevron_clip = draw.Rect{ .x = chevron_x, .y = control.y, .w = chevron_w, .h = control.h };
+                try batch.roleText(allocator, .{
                     .x = chevron_x,
                     .y = control.y + @max((control.h - icon_metrics.line_height) * 0.5, 0.0),
-                    .font_size = icon_metrics.font_size,
-                    .line_height = icon_metrics.line_height,
-                    .color = config.icon_color,
-                    .clip = control,
-                    .font_role = config.icon_font_role,
-                    .font_id = config.icon_font_id,
-                };
-                count += 1;
+                    .w = chevron_w,
+                    .h = icon_metrics.line_height,
+                }, config.chevron_icon, config.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, chevron_clip);
             }
-            try batch.textRuns(allocator, control, label, runs[0..count], config.text_color, metrics_value.font_size, control, metrics_value.line_height, metrics_value.fixedAdvance());
         }
 
         fn metrics(self: *const Component) text_layout.FontMetrics {

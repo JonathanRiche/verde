@@ -5,10 +5,25 @@ const palette = @import("palette");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
+const utils = @import("../utils.zig");
 const native_state = @import("../state.zig");
 const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
+
+/// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
+const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0 * 1.5;
+/// Thread row height must fit `SIDEBAR_THREAD_PROVIDER_GLYPH_CSS` with a little vertical air.
+const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 36.0;
+/// Vertical advance per thread row (row + gap).
+const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 40.0;
+const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 8.0;
+/// Horizontal gap between the icon slot and the title.
+const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 6.0;
+/// Relative-time label starts this far from the row's right edge.
+const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
+/// Padding between truncated title and the time column.
+const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
 
 const SidebarHitKind = enum {
     collapse,
@@ -33,6 +48,23 @@ var palette_sidebar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var sidebar_scroll_y: f32 = 0.0;
 var sidebar_max_scroll_y: f32 = 0.0;
 
+const SidebarContextMenuAction = enum {
+    project_new_chat,
+    project_rename,
+    project_import_codex,
+    project_import_opencode,
+    project_archive,
+    thread_sync,
+    thread_archive,
+};
+
+var sidebar_menu_panel_rect: palette.Rect = .{};
+var sidebar_menu_row_rects: [8]palette.Rect = undefined;
+var sidebar_menu_row_actions: [8]SidebarContextMenuAction = undefined;
+var sidebar_menu_row_enabled: [8]bool = undefined;
+var sidebar_menu_row_labels: [8][]const u8 = undefined;
+var sidebar_menu_row_count: usize = 0;
+
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
@@ -51,6 +83,13 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     } else {
         renderPaletteExpandedSidebar(state, rect);
     }
+    if (state.sidebar_context_menu_open and !state.isSidebarCollapsed()) {
+        renderSidebarContextMenu(state, rect);
+    }
+}
+
+pub fn pointerOverSidebar(x: f32, y: f32) bool {
+    return rectContainsPoint(palette_sidebar_rect, x, y);
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
@@ -86,6 +125,10 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return rectContainsPoint(palette_sidebar_rect, x, y);
     if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
+
+    if (state.sidebar_context_menu_open and handleSidebarContextMenuPrimary(state, x, y)) {
+        return true;
+    }
 
     var index = palette_hit_count;
     while (index > 0) {
@@ -143,6 +186,201 @@ pub fn handlePaletteWheel(x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or !rectContainsPoint(palette_sidebar_rect, x, y)) return false;
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y - wheel_y * theme.scaledUi(64.0), 0.0, sidebar_max_scroll_y);
     return true;
+}
+
+/// SDL mouse button id for right-click (`SDL_BUTTON_RIGHT`).
+pub const palette_mouse_button_secondary: u8 = 3;
+
+pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
+    if (!down) return false;
+    if (state.isSidebarCollapsed()) return false;
+    if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
+
+    var index = palette_hit_count;
+    while (index > 0) {
+        index -= 1;
+        const hit = palette_hits[index];
+        if (!rectContainsPoint(hit.rect, x, y)) continue;
+
+        switch (hit.kind) {
+            .project_row => {
+                state.workspace_header_open_menu_open = false;
+                state.sidebar_context_menu_anchor_x = x;
+                state.sidebar_context_menu_anchor_y = y;
+                state.sidebar_context_menu_project_index = hit.project_index;
+                state.sidebar_context_menu_thread_index = 0;
+                state.sidebar_context_menu_kind = .project;
+                state.sidebar_context_menu_open = true;
+                state.blurPaletteComposer();
+                state.noteInteraction();
+                state.markDirty();
+                return true;
+            },
+            .thread_row => {
+                state.workspace_header_open_menu_open = false;
+                state.sidebar_context_menu_anchor_x = x;
+                state.sidebar_context_menu_anchor_y = y;
+                state.sidebar_context_menu_project_index = hit.project_index;
+                state.sidebar_context_menu_thread_index = hit.thread_index;
+                state.sidebar_context_menu_kind = .thread;
+                state.sidebar_context_menu_open = true;
+                state.blurPaletteComposer();
+                state.noteInteraction();
+                state.markDirty();
+                return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {
+    if (!state.sidebar_context_menu_open) return false;
+
+    if (rectContainsPoint(sidebar_menu_panel_rect, x, y)) {
+        const pi = state.sidebar_context_menu_project_index;
+        const ti = state.sidebar_context_menu_thread_index;
+        var idx = sidebar_menu_row_count;
+        while (idx > 0) {
+            idx -= 1;
+            if (!rectContainsPoint(sidebar_menu_row_rects[idx], x, y)) continue;
+            const enabled = sidebar_menu_row_enabled[idx];
+            const action = sidebar_menu_row_actions[idx];
+            state.closeSidebarContextMenu();
+            state.workspace_header_open_menu_open = false;
+            if (!enabled) return true;
+            state.blurPaletteComposer();
+            state.noteInteraction();
+            switch (action) {
+                .project_new_chat => {
+                    if (pi < state.projects.items.len) state.createThreadForProject(pi);
+                },
+                .project_rename => state.beginProjectRename(pi),
+                .project_import_codex => state.beginThreadImport(pi, .codex),
+                .project_import_opencode => state.beginThreadImport(pi, .opencode),
+                .project_archive => state.archiveProjectAtIndex(pi),
+                .thread_sync => state.syncThreadFromProvider(pi, ti),
+                .thread_archive => state.archiveThreadAtIndex(pi, ti),
+            }
+            return true;
+        }
+        state.closeSidebarContextMenu();
+        state.workspace_header_open_menu_open = false;
+        return true;
+    }
+
+    state.closeSidebarContextMenu();
+    state.workspace_header_open_menu_open = false;
+    return true;
+}
+
+fn appendSidebarContextMenuRow(action: SidebarContextMenuAction, enabled: bool, label: []const u8) void {
+    if (sidebar_menu_row_count >= sidebar_menu_row_rects.len) return;
+    sidebar_menu_row_actions[sidebar_menu_row_count] = action;
+    sidebar_menu_row_enabled[sidebar_menu_row_count] = enabled;
+    sidebar_menu_row_labels[sidebar_menu_row_count] = label;
+    sidebar_menu_row_count += 1;
+}
+
+fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect) void {
+    if (!state.sidebar_context_menu_open) return;
+
+    const pad = theme.scaledUi(6.0);
+    const menu_w = theme.scaledUi(248.0);
+    const menu_pad = theme.scaledUi(8.0);
+    const menu_row_h = theme.scaledUi(34.0);
+    const font_size = theme.scaledUi(14.0);
+
+    sidebar_menu_row_count = 0;
+    switch (state.sidebar_context_menu_kind) {
+        .none => return,
+        .project => {
+            const pi = state.sidebar_context_menu_project_index;
+            appendSidebarContextMenuRow(.project_new_chat, true, "Start a new chat");
+            appendSidebarContextMenuRow(.project_rename, true, "Rename project");
+            appendSidebarContextMenuRow(.project_import_codex, true, "Import Codex thread");
+            appendSidebarContextMenuRow(.project_import_opencode, true, "Import OpenCode thread");
+            var busy = false;
+            if (pi < state.projects.items.len) {
+                for (state.projects.items[pi].threads.items) |*th| {
+                    if (th.isSendPendingForUi()) {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+            appendSidebarContextMenuRow(.project_archive, !busy, "Archive project");
+        },
+        .thread => {
+            const pi = state.sidebar_context_menu_project_index;
+            const ti = state.sidebar_context_menu_thread_index;
+            var can_sync = false;
+            var can_archive = true;
+            if (pi < state.projects.items.len) {
+                const proj = state.projects.items[pi];
+                if (ti < proj.threads.items.len) {
+                    const th = proj.threads.items[ti];
+                    can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
+                    can_archive = !th.isSendPendingForUi();
+                }
+            }
+            appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
+            appendSidebarContextMenuRow(.thread_archive, can_archive, "Archive thread");
+        },
+    }
+
+    if (sidebar_menu_row_count == 0) return;
+
+    const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(sidebar_menu_row_count)) * menu_row_h;
+    var menu_x = state.sidebar_context_menu_anchor_x;
+    var menu_y = state.sidebar_context_menu_anchor_y;
+    menu_x = theme.clampf(menu_x, sidebar_rect.x + pad, sidebar_rect.x + sidebar_rect.w - menu_w - pad);
+    menu_y = theme.clampf(menu_y, sidebar_rect.y + pad, sidebar_rect.y + sidebar_rect.h - menu_h - pad);
+
+    sidebar_menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    const clip = sidebar_menu_panel_rect;
+
+    queuePaletteRoundedRect(state, sidebar_menu_panel_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(12.0));
+    queuePaletteBorder(state, sidebar_menu_panel_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+
+    const mx = state.palette_mouse_x;
+    const my = state.palette_mouse_y;
+    const mouse_ok = state.palette_mouse_in_workspace;
+
+    var ry = menu_y + menu_pad;
+    var ri: usize = 0;
+    while (ri < sidebar_menu_row_count) : (ri += 1) {
+        const rr: palette.Rect = .{
+            .x = menu_x + theme.scaledUi(4.0),
+            .y = ry,
+            .w = menu_w - theme.scaledUi(8.0),
+            .h = menu_row_h,
+        };
+        sidebar_menu_row_rects[ri] = rr;
+
+        const row_hover = mouse_ok and sidebar_menu_row_enabled[ri] and rectContainsPoint(rr, mx, my);
+        if (row_hover) {
+            queuePaletteRoundedRect(state, rr, paletteColor(colors.rgba(42, 44, 52, 255)), theme.scaledUi(8.0));
+        }
+
+        const row_col = paletteColor(if (!sidebar_menu_row_enabled[ri])
+            theme.COLOR_TEXT_SUBTLE
+        else if (row_hover)
+            theme.COLOR_WHITE
+        else
+            theme.COLOR_TEXT_MUTED);
+
+        const label = sidebar_menu_row_labels[ri];
+        queuePaletteText(state, .{
+            .x = rr.x + theme.scaledUi(12.0),
+            .y = rr.y + (menu_row_h - font_size * 1.25) * 0.5,
+            .w = rr.w - theme.scaledUi(16.0),
+            .h = font_size * 1.25,
+        }, label, row_col, font_size, clip);
+
+        ry += menu_row_h;
+    }
 }
 
 fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
@@ -210,10 +448,10 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                     .x = x + theme.scaledUi(24.0),
                     .y = y,
                     .w = rail_w - theme.scaledUi(42.0),
-                    .h = theme.scaledUi(26.0),
+                    .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
                 };
                 if (rowVisible(thread_rect, rect)) renderPaletteThreadRow(state, project_index, thread_index, thread, thread_rect, clip);
-                y += theme.scaledUi(28.0);
+                y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
             }
             if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) };
@@ -289,31 +527,41 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
     const hovered = if (state.sidebar_thread_hover) |h| h.project_index == project_index and h.thread_index == thread_index else false;
     if (selected) {
-        queuePaletteRoundedRect(state, rect, paletteColor(colors.DARK_BLUE), theme.scaledUi(4.0));
+        const bg = if (hovered)
+            paletteColor(theme.lighten(colors.DARK_BLUE, 0.09))
+        else
+            paletteColor(colors.DARK_BLUE);
+        queuePaletteRoundedRect(state, rect, bg, theme.scaledUi(4.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.CHAT_BLACK, 0.14)), theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.GREEN_600, 0.10)), theme.scaledUi(4.0));
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
-    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(8.0), rect.y + rect.h * 0.5, clip);
+    const title_left_css = SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
+    const title_area_right_css = title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS + SIDEBAR_THREAD_TITLE_TIME_GAP_CSS;
+    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS), rect.y + rect.h * 0.5, clip);
     var time_buf: [24]u8 = undefined;
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
     var title_buf = std.mem.zeroes([64:0]u8);
-    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(84.0)) / theme.scaledUi(7.0), 8.0));
+    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
 
+    const title_emphasis = selected or hovered;
+    const title_font = theme.scaledUi(14.0);
+    const title_line = title_font * 1.25;
+    const title_y = rect.y + (rect.h - title_line) * 0.5;
     queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(24.0),
-        .y = rect.y + theme.scaledUi(4.0),
-        .w = rect.w - theme.scaledUi(86.0),
+        .x = rect.x + theme.scaledUi(title_left_css),
+        .y = title_y,
+        .w = rect.w - theme.scaledUi(title_area_right_css),
         .h = rect.h,
-    }, row_label, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+    }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
-        .y = rect.y + theme.scaledUi(4.0),
+        .y = title_y,
         .w = theme.scaledUi(58.0),
         .h = rect.h,
-    }, relative_time, paletteColor(colors.TIME_LABEL), theme.scaledUi(14.0), clip);
+    }, relative_time, paletteColor(colors.TIME_LABEL), title_font, clip);
 }
 
 fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {
@@ -522,7 +770,7 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
 }
 
 fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
-    const image_size = theme.scaledUi(13.0);
+    const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
     const image_rect: palette.Rect = .{
         .x = x,
         .y = center_y - image_size * 0.5,
@@ -534,7 +782,9 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .opencode => state.opencode_logo_texture,
     };
     if (texture) |cached| {
-        if (queuePaletteImage(state, image_rect, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
+        const draw: palette.Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
     }
 
     const label = switch (provider) {

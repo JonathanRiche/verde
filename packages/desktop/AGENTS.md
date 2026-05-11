@@ -200,6 +200,32 @@ The Palette transcript uses a **compact command row** (dark gray card, `>_` pref
 3. Open `src/ui/chat_panel.zig` and confirm whether your system messages need updates to **`shouldRenderPaletteCommandRow`**, **`paletteCommandRowDisplayAuthor`**, or dedicated render branches (mirroring what `master` did for zgui in `chat_panel.zig` if needed).
 4. Manually verify with `mise run dev`: tail auto-scroll, command rows, and failure styling for your provider’s happy path and error path.
 
+## Transcript scrolling (Palette chat)
+
+The Palette transcript uses **direct scrolling**: there is **no inertia or velocity decay**. When input stops, the view stops immediately—do not reintroduce multi-frame glide unless product explicitly asks for it.
+
+### Wheel (mouse / trackpad)
+
+- **Handler:** `handleTranscriptPaletteWheel` in `src/ui/chat_panel.zig`.
+- **Behavior:** Each wheel event adjusts the saved scroll offset once via `rememberCurrentTranscriptScroll` (negated `wheel_y` × scaled pixels).
+- **Tune speed:** constant `TRANSCRIPT_WHEEL_PIXELS` in `chat_panel.zig` (default `96.0`, scaled with `theme.scaledUi`). Larger = faster per notch; motion stays instantaneous either way.
+
+### Keyboard (arrows, Page Up/Down)
+
+- **API:** `AppState.requestTranscriptLineScroll` and `requestTranscriptPageScroll` in `src/state.zig`.
+- **Line step:** `TRANSCRIPT_KEYBOARD_LINE_PX` in `state.zig` (default `29.0`, scaled). Arrow deltas accumulate into `pending_transcript_scroll_px`.
+- **Page step:** Accumulates signed steps in `pending_transcript_page_steps` (clamped ±12). Applied in `renderTranscript` as `column.h * TRANSCRIPT_PAGE_VIEW_FRAC` per step (`TRANSCRIPT_PAGE_VIEW_FRAC` is in `chat_panel.zig`, default `0.88`).
+- **Apply path:** `renderTranscript` in `chat_panel.zig` consumes pending values once per layout pass and zeros them—no animation tick.
+
+### Thread switch / jump to bottom
+
+- Changing the visible thread clears stale keyboard pending scroll: `transcript_scroll_pending_track_p` / `transcript_scroll_pending_track_t` vs `selected_project_index` / current thread index (see `renderTranscript`).
+- `requestTranscriptScrollToBottom` clears both pending fields alongside auto-follow flags.
+
+### Main loop
+
+Transcript scroll **does not** require continuous frames for decay; do not wire scroll velocity into `appNeedsContinuousFrames` or `eventWaitTimeoutMs` in `main.zig` unless you add a new animated scroll path.
+
 ## Coordinate Spaces
 
 This app uses multiple size spaces. Mixing them incorrectly causes the exact failures we hit before: top-left-only rendering, giant black unused areas, or UI that changes apparent size across displays.

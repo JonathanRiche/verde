@@ -10,6 +10,6 @@ struct PSInput
 
 float4 main(PSInput input) : SV_Target0
 {
-    float alpha = font_atlas.Sample(font_sampler, input.uv).r;
+    float alpha = font_atlas.Sample(font_sampler, input.uv).a;
     return float4(input.color.rgb, input.color.a * alpha);
 }
