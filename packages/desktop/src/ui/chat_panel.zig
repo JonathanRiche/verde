@@ -24,8 +24,8 @@ const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
 const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
-/// Provider logo in the model pill (~50% larger than vector toolbar glyphs for readability).
-const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 22.0 * 1.5;
+/// Provider logo slot in the model pill.
+const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 22.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -1640,13 +1640,12 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    const provider_icon = switch (state.currentThread().provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-    };
-    if (provider_icon) |cached| {
-        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+    switch (state.currentThread().provider) {
+        .codex => if (state.codex_logo_texture) |cached| {
+            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+            queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+        },
+        .opencode => drawOpenCodeComposerBadge(state, model_icon_slot),
     }
 
     if (state.currentThread().provider == .codex) {
@@ -1669,6 +1668,24 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .w = icon_size,
         .h = icon_size,
     }), icon_color);
+}
+
+fn drawOpenCodeComposerBadge(state: *app_state.AppState, slot: palette.Rect) void {
+    const size = @round(@min(slot.w, slot.h));
+    const x = @round(slot.x + (slot.w - size) * 0.5);
+    const y = @round(slot.y + (slot.h - size) * 0.5);
+    const bg = paletteColor(.{ 0.86, 0.87, 0.90, 1.0 });
+    const mark = paletteColor(.{ 0.17, 0.16, 0.17, 1.0 });
+    const mark_w = @round(size * 0.46);
+    const mark_h = @round(size * 0.66);
+
+    queueRect(state, .{ .x = x, .y = y, .w = size, .h = size }, bg);
+    queueRect(state, .{
+        .x = @round(x + (size - mark_w) * 0.5),
+        .y = @round(y + (size - mark_h) * 0.5),
+        .w = mark_w,
+        .h = mark_h,
+    }, mark);
 }
 
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
