@@ -668,6 +668,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
+            state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+            if (terminal_key_handled) {
+                return true;
+            }
             if (handleFontSizeShortcut(state, &event.key)) {
                 return true;
             }
@@ -680,11 +685,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
-                return true;
-            }
-            const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
-            state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
-            if (terminal_key_handled) {
                 return true;
             }
             if (handleFileSearchNavigation(state, &event.key)) {
@@ -1127,6 +1127,7 @@ fn handleKeyboardAction(
 
 fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
     if (!event.down or event.repeat) return false;
+    if (state.terminal_focused) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
     const delta: f32 = switch (event.key) {
         .plus, .kp_plus, .equals => 1.0,
