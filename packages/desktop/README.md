@@ -1,227 +1,76 @@
-# `verde`
+# `verde` Desktop
 
-`verde` is the desktop app in this repo. It is a standalone Zig application built with SDL3, OpenGL, and Palette.
-
-If you cloned the repo and want to run the app locally, you can use `zig build run` from the repo root or work directly from this directory.
+This package contains Verde's standalone Zig desktop app. It uses SDL3, OpenGL, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
 
 ## Prerequisites
 
-- Zig `0.15.x`
+- Zig `0.16.0` through the repo-root [`mise.toml`](../../mise.toml)
 - OpenGL development libraries for your platform
-- SDL3 available for your platform
-  - Linux and Windows: install SDL3 development files
-  - macOS: the build uses the bundled SDL3 framework from the Zig dependency
-- Optional but required for actual provider requests:
-  - `codex` on your `PATH` for Codex threads
-  - `opencode` on your `PATH` for OpenCode threads
+- SDL3 development files for your platform
+- Provider setup for the providers you want to use:
+  - Codex: `codex` on your `PATH` and `codex login`
+  - OpenCode: `opencode` on your `PATH`
+  - Cursor: `CURSOR_API_KEY` set in the environment used to launch Verde
 
-On this repo, `zig build` and `zig build test` succeed with Zig `0.15.2`.
+## Development
 
-## Build and run
-
-From the repo root:
+Run development tasks from the repo root with `mise`:
 
 ```bash
-zig build
-zig build run
-zig build run -Dui-debug=true
-zig build test
-zig build -Doptimize=ReleaseSafe
-zig build -Doptimize=ReleaseFast
-zig build --release=safe -p ~/.local
-zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
-zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
-zig build run -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
-zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
+mise install
+mise run setup
+mise run dev
 ```
 
-These root commands delegate into `packages/desktop/`.
+Common tasks:
 
-From this directory directly:
+- `mise run setup`: downloads the CEF SDK into the local build cache.
+- `mise run dev`: builds and runs Verde from the repo-local Zig build output.
+- `mise run run`: builds and launches Verde in development mode.
+- `mise run debug`: launches Verde with the in-app diagnostics window enabled.
+- `mise run build`: creates a local release-style build for the current platform.
+- `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
 
-```bash
-zig build
-zig build run
-zig build run -Dui-debug=true
-zig build test
-zig build -Doptimize=ReleaseSafe
-zig build -Doptimize=ReleaseFast
-zig build run -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
-zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._linux64_minimal
-zig build run -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
-zig build --release=safe -p ~/.local -Dcef-sdk-path=/path/to/cef_binary_..._macosarm64_minimal
-```
+## CEF Browser Pane
 
-What these do:
+The in-app browser pane uses CEF when a CEF SDK is available. The `mise` tasks and release install scripts use the repo's CEF helper scripts so developers do not need to pass CEF build flags manually.
 
-- `zig build`: build the app
-- `zig build run`: build and launch the app
-- `zig build run -Dui-debug=true`: build and launch the app with the `UI Debug` window enabled
-- `zig build test`: run the Zig tests plus the format check from `build.zig`
+Useful environment variables:
 
-The built executable is:
+- `VERDE_CEF_SDK_PATH`: use a specific cached CEF SDK.
+- `VERDE_CEF_DISABLE_DOWNLOAD=1`: skip the CEF download and build without CEF for faster local iteration.
+- `VERDE_OPEN_BROWSER_ON_START=1`: smoke-test the browser pane during startup.
 
-```bash
-zig-out/bin/verde
-```
+Keep the CEF SDK in a persistent directory such as `$HOME/.cache/verde/cef-sdk`; do not keep it under `/tmp`.
 
-From the repo root, `zig build -p <prefix>` now forwards the install prefix into this package. On Linux and macOS, that gives you a one-command install such as:
+## Embedded Terminal
 
-```bash
-zig build --release=safe -p ~/.local
-zig build --release=safe -p /usr/local
-```
+The desktop shell includes a bottom-docked embedded terminal powered by Ghostty's `libghostty-vt`.
 
-The `/usr/local` example requires write access to that prefix.
+- Toggle it with `CommandOrControl+J`.
+- It starts in the selected project's directory.
+- `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale while the terminal is focused.
 
-## CEF browser pane
+Use `mise run debug` when you need the diagnostics window for focus, input-routing, or terminal hitbox debugging.
 
-The in-app browser pane uses CEF when the build is pointed at a real CEF SDK. If you want the installed app to include the CEF browser path, pass `-Dcef-sdk-path=...` at build/install time.
+## Providers
 
-Without that flag:
+The desktop app talks to local provider runtimes rather than a hosted Verde backend.
 
-- the app still builds and installs
-- the CEF helper binaries are not built
-- the app falls back to the non-CEF browser backend
+- Codex uses the local `codex` CLI and starts `codex app-server` automatically when needed.
+- OpenCode uses the local `opencode` CLI and can start `opencode serve` automatically when needed.
+- Cursor uses `@cursor/sdk` and requires `CURSOR_API_KEY`.
 
-With that flag:
+Requests run against the project directory selected in Verde. If prompt sending fails, check that the selected provider is installed, available to Verde's launch environment, and authenticated.
 
-- the CEF helper binaries are built and installed into `zig-out/bin`
-- the required platform CEF runtime files are copied into the install prefix
-- the in-app browser pane uses the CEF path
+## State And Config
 
-Typical Linux run:
-
-```bash
-zig build run -Dcef-sdk-path=$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
-```
-
-Typical Linux install to `~/.local`:
-
-```bash
-zig build --release=safe -p ~/.local \
-  -Dcef-sdk-path=$HOME/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
-```
-
-Or, from the repo root, use the helper installer:
-
-```bash
-bash ./scripts/release/install-linux-local-cef.sh
-```
-
-You do not need `VERDE_OPEN_BROWSER_ON_START=1` for normal use. That env var is only useful for smoke-testing the browser pane during startup.
-
-Do not keep the CEF SDK under `/tmp`. Many Linux systems clear `/tmp` on reboot, which will break future builds or installs that still point at that path. Use a persistent directory such as:
-
-```bash
-$HOME/.cache/verde/cef-sdk
-```
-
-Typical macOS app install:
-
-```bash
-./scripts/release/install-macos-local.sh
-```
-
-Typical macOS pinned-SDK app install:
-
-```bash
-./scripts/release/install-macos-local.sh
-```
-
-On Linux, the install step also writes:
-
-- `share/applications/verde.desktop`
-- `share/pixmaps/verde.png`
-
-On macOS, the prefix install places the executable, `libfff_c.dylib`, `SDL3.framework`, and, when configured, the CEF helper binaries plus `Chromium Embedded Framework.framework` under the chosen prefix. It does not create a `.app` bundle for Finder or the Dock.
-
-For a local app install on macOS, run this from the repo root:
-
-```bash
-./scripts/release/install-macos-local.sh
-```
-
-That installer now downloads and bundles the matching CEF runtime automatically by default.
-
-To pin the build to a specific cached SDK instead, set `VERDE_CEF_SDK_PATH` when running the script:
-
-```bash
-VERDE_CEF_SDK_PATH=$HOME/.cache/verde/cef-sdk/cef_binary_..._macosarm64_minimal \
-  ./scripts/release/install-macos-local.sh
-```
-
-To skip the CEF download and build a no-CEF app bundle, set:
-
-```bash
-VERDE_CEF_DISABLE_DOWNLOAD=1 ./scripts/release/install-macos-local.sh
-```
-
-That installs `Verde.app` into `~/Applications` by default. Pass `/Applications` if you want the system-wide Applications folder instead.
-
-## Embedded terminal
-
-The desktop shell now includes a bottom-docked embedded terminal powered by Ghostty's `libghostty-vt`.
-
-- Toggle it with `CommandOrControl+J`
-- The terminal is scoped to the selected project and starts in that project's directory
-- The dock only consumes vertical space in the chat workspace and leaves the sidebar untouched
-- While the terminal is focused, `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale
-
-For terminal/composer focus debugging, run:
-
-```bash
-zig build run -Dui-debug=true
-```
-
-That opens a separate `UI Debug` window showing focus state, ImGui capture flags, terminal hitbox state, and recent terminal key/text routing.
-
-## Typical development loop
-
-1. Edit files in `src/`.
-2. Run `zig build run` to launch the desktop app.
-3. Run `zig build test` before handing off changes.
-
-Main files:
-
-- `build.zig`: build entrypoint, links SDL3/OpenGL, defines `run` and `test` steps
-- `src/main.zig`: app entrypoint, window/UI shell, provider controls
-- `src/state.zig`: app state, persistence, projects, threads
-- `src/harness.zig`: provider-neutral interface
-- `src/providers/codex.zig`: Codex integration through `codex app-server`
-- `src/providers/opencode.zig`: OpenCode integration through the local HTTP server
-- `src/config.zig`: user config loading
-- `src/keybinds.zig`: keyboard shortcut parsing and overrides
-
-## How provider runtime works
-
-The desktop app uses local CLIs for provider access.
-
-### Codex
-
-- Uses the local `codex` CLI.
-- Starts `codex app-server --listen ws://127.0.0.1:4500` automatically when needed.
-- New threads default to the Codex provider.
-- Image attachments currently work with Codex threads only.
-
-### OpenCode
-
-- Uses the local `opencode` CLI.
-- Starts `opencode serve --hostname 127.0.0.1 --port 4096` automatically when needed.
-- Requests are sent against the selected project directory.
-
-If sending prompts fails, check that the relevant CLI exists on your `PATH` and is already authenticated.
-
-## State and config
-
-The app persists session state through SDL's pref path as `state.json`. The exact location depends on the platform because it comes from `SDL_GetPrefPath`.
-
-User config is loaded from:
+App state is stored through SDL's pref path in `state.sqlite`. User config is loaded from:
 
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
 
-Current supported config includes UI font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`. Example:
+Config supports UI font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
 
 ```json
 {
@@ -237,44 +86,26 @@ Current supported config includes UI font size, keybind overrides, and the defau
     "sidebar": "CommandOrControl+S",
     "browser": "Ctrl+B",
     "terminal": {
-      "toggle":       "CommandOrControl+J",
-      "new_tab":      "CommandOrControl+Shift+T",
-      "close":        "CommandOrControl+Shift+W",
-      "rename_tab":   "CommandOrControl+Shift+R",
+      "toggle": "CommandOrControl+J",
+      "new_tab": "CommandOrControl+Shift+T",
+      "close": "CommandOrControl+Shift+W",
+      "rename_tab": "CommandOrControl+Shift+R",
       "tab_previous": "CommandOrControl+Shift+PageUp",
-      "tab_next":     "CommandOrControl+Shift+PageDown",
-      "split_up":     "CommandOrControl+Shift+Up",
-      "split_down":   ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
-      "split_left":   "CommandOrControl+Shift+Left",
-      "split_right":  ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
-      "focus_up":     "CommandOrControl+Alt+Up",
-      "focus_down":   "CommandOrControl+Alt+Down",
-      "focus_left":   "CommandOrControl+Alt+Left",
-      "focus_right":  "CommandOrControl+Alt+Right"
-    },
-    "chat_up": "Up",
-    "chat_down": "Down",
-    "chat_page_up": "PageUp",
-    "chat_page_down": "PageDown"
+      "tab_next": "CommandOrControl+Shift+PageDown",
+      "split_up": "CommandOrControl+Shift+Up",
+      "split_down": ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
+      "split_left": "CommandOrControl+Shift+Left",
+      "split_right": ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
+      "focus_up": "CommandOrControl+Alt+Up",
+      "focus_down": "CommandOrControl+Alt+Down",
+      "focus_left": "CommandOrControl+Alt+Left",
+      "focus_right": "CommandOrControl+Alt+Right"
+    }
   }
 }
 ```
 
-Keybinds are read from the user config on startup and on app refresh. Use a string for one shortcut or a string array for multiple shortcuts for the same action.
-
-Built-in refresh bindings are `CommandOrControl+R`, `CommandOrControl+Shift+R`, and `F5`. Built-in open binding is `Alt+O`. Built-in sidebar toggle binding is `CommandOrControl+S`. Built-in browser toggle binding is `Ctrl+B`. Built-in terminal toggle binding is `CommandOrControl+J`. Built-in terminal workspace bindings are `CommandOrControl+Shift+T`, `W`, `R`, `PageUp`, `PageDown`, `Up`, `Left`, `E`/`Down`, `O`/`Right`, plus pane focus on `CommandOrControl+Alt+Arrow`. Built-in transcript scroll bindings are `Up`, `Down`, `PageUp`, and `PageDown`. Refresh reloads app state from disk, config, and keybinds.
-
-For backward compatibility, `keybinds.terminal` still accepts a string or string array to override only the terminal toggle shortcut.
-
-`open.default` accepts lower-case string values:
-
-- `folder`
-- `editor`
-- `cursor`
-- `vscode`
-- `zed`
-
-You can also provide a custom shell action instead of a named built-in action:
+`open.default` accepts `folder`, `editor`, `cursor`, `vscode`, `zed`, or a custom shell action:
 
 ```json
 {
@@ -289,9 +120,20 @@ You can also provide a custom shell action instead of a named built-in action:
 
 Custom actions run through `sh -lc` with the selected project as the working directory. The command also receives the project path as `$1`.
 
+## Key Files
+
+- [`src/main.zig`](src/main.zig): app entrypoint, window/UI shell, provider controls
+- [`src/state.zig`](src/state.zig): app state, persistence, projects, threads
+- [`src/harness.zig`](src/harness.zig): provider-neutral interface
+- [`src/providers/codex.zig`](src/providers/codex.zig): Codex integration
+- [`src/providers/opencode.zig`](src/providers/opencode.zig): OpenCode integration
+- [`src/providers/cursor.zig`](src/providers/cursor.zig): Cursor integration
+- [`src/config.zig`](src/config.zig): user config loading
+- [`src/keybinds.zig`](src/keybinds.zig): keyboard shortcut parsing and overrides
+
 ## Dependencies
 
-Third-party Zig dependencies are declared in `build.zig.zon`:
+Third-party Zig dependencies are declared in [`build.zig.zon`](build.zig.zon):
 
 - `palette`
 - `zsdl`
@@ -300,25 +142,20 @@ Third-party Zig dependencies are declared in `build.zig.zon`:
 - `zig_markdown`
 - `ghostty`
 
-Zig fetches them automatically during build.
+The repo also uses `@cursor/sdk` from the root npm package for Cursor provider integration.
 
 ## Third-Party Attribution
 
-The desktop app depends on the following upstream projects:
+Main upstream components used by the desktop app:
 
-- `fff.nvim` / `fff-c` / `fff-search` by Dmitriy Kovalenko. Used for project-scoped file indexing and the chat composer `@` file search. Vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
-- Codicon by Microsoft. Used for file-type glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/Codicon.ttf`](src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
-- Symbols Nerd Font Mono by Nerd Fonts. Used for language-specific file glyphs in the chat composer `@` file search results. Vendored in [`src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
-- `nvim-web-devicons`. Used as the reference mapping for many file-type glyph choices in the native picker. License: MIT.
-- `palette`. Used for native UI primitives and render-batch driven desktop UI. Declared in [`build.zig.zon`](build.zig.zon).
-- `zsdl` from `zig-gamedev`. Used for Zig bindings to SDL3. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
-- SDL3 from libsdl-org. Used for window creation, events, monitor/display integration, and OpenGL context setup.
-- `zqlite` by Karl Seguin. Used for SQLite-backed state and persistence. Declared in [`build.zig.zon`](build.zig.zon). License: MIT-style.
-- `stb_image` by Sean Barrett and contributors. Used for image decoding. Vendored in [`../../vendor/stb_image.h`](../../vendor/stb_image.h). License: public domain or MIT.
-- Ghostty / `libghostty-vt` by Mitchell Hashimoto and contributors. Used for terminal emulation and VT parsing in the embedded terminal dock. Declared in [`build.zig.zon`](build.zig.zon). License: MIT.
+- `@cursor/sdk` for Cursor provider integration.
+- `fff.nvim` / `fff-c` / `fff-search` for project-scoped file indexing and composer file search, vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
+- Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.
+- `zsdl` from `zig-gamedev` for Zig bindings to SDL3. License: MIT.
+- SDL3 from libsdl-org for window creation, events, monitor/display integration, and rendering support.
+- `zqlite` by Karl Seguin for SQLite-backed state and persistence. License: MIT-style.
+- `zig_dif` and `zig_markdown` for chat markdown and code rendering.
+- `stb_image` by Sean Barrett and contributors for image decoding, vendored in [`../../vendor/stb_image.h`](../../vendor/stb_image.h). License: public domain or MIT.
+- Codicon, Nerd Fonts, Noto Sans, JetBrains Mono Nerd Font, and Cal Sans font assets for the native UI. See notices in [`src/assets/fonts`](src/assets/fonts).
 
 When distributing the desktop app, keep the applicable upstream licenses and notices for vendored or bundled components.
-
-## Notes
-
-- From the repo root, the desktop app lives in `packages/desktop/`.
