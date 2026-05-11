@@ -26,9 +26,24 @@ DEST_APP_DIR="$APPLICATIONS_DIR/Verde.app"
 source "$SCRIPT_DIR/cef-common.sh"
 ARCH="$(uname -m)"
 MACOS_MIN_VERSION="${VERDE_MACOS_MIN_VERSION:-13.0}"
+MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
 need_cmd zig
 need_cmake
 need_cmd bash
+need_cmd xcrun
+
+set_macos_build_version() {
+  local binary="$1"
+  local patched="$binary.patched"
+
+  xcrun vtool \
+    -set-build-version macos "$MACOS_MIN_VERSION" "$MACOS_SDK_VERSION" \
+    -replace \
+    -output "$patched" \
+    "$binary" >/dev/null
+  mv "$patched" "$binary"
+  chmod 755 "$binary"
+}
 
 cd "$REPO_ROOT/packages/desktop"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
@@ -59,6 +74,7 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
   ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
+set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
