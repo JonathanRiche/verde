@@ -141,6 +141,9 @@ pub fn build(b: *std.Build) void {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
                 exe.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));
             }
+            if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+                exe.root_module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdkroot, "System", "Library", "Frameworks" }) });
+            }
             exe.root_module.addCSourceFile(.{
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},

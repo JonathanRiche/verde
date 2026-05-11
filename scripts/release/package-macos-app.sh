@@ -47,6 +47,7 @@ need_cmd bash
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO_ROOT/packages/desktop"
+export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 BUILD_ARGS=(zig build --release=safe "-Dtarget=$ZIG_TARGET" -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
