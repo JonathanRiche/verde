@@ -46,10 +46,34 @@ latest_release_json() {
 
 asset_url_for() {
   pattern="$1"
-  latest_release_json |
+  printf '%s\n' "$RELEASE_JSON" |
     sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' |
     grep -E "$pattern" |
     head -n 1
+}
+
+latest_tag_from_json() {
+  printf '%s\n' "$RELEASE_JSON" |
+    sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' |
+    head -n 1
+}
+
+normalize_version() {
+  printf '%s\n' "$1" | sed 's/^v//'
+}
+
+linux_installed_version() {
+  version_file="$PREFIX/share/verde/VERSION"
+  if [ -r "$version_file" ]; then
+    sed -n '1p' "$version_file"
+  fi
+}
+
+macos_installed_version() {
+  info_plist="$MACOS_APP_DIR/Verde.app/Contents/Info.plist"
+  if [ -r "$info_plist" ]; then
+    sed -n '/<key>CFBundleShortVersionString<\/key>/{n;s/.*<string>\([^<]*\)<\/string>.*/\1/p;q;}' "$info_plist"
+  fi
 }
 
 make_temp_dir() {
@@ -79,6 +103,30 @@ esac
 
 if [ "$platform" = "linux" ] && [ "$arch" != "x86_64" ]; then
   fail "Linux release artifacts are currently published for x86_64 only"
+fi
+
+if [ "$platform" = "macos" ] && [ -z "$MACOS_APP_DIR" ]; then
+  if [ -w /Applications ]; then
+    MACOS_APP_DIR="/Applications"
+  else
+    MACOS_APP_DIR="$HOME/Applications"
+  fi
+fi
+
+RELEASE_JSON="$(latest_release_json)"
+latest_tag="$(latest_tag_from_json)"
+[ -n "$latest_tag" ] || fail "could not determine latest release version"
+latest_version="$(normalize_version "$latest_tag")"
+installed_version=""
+if [ "$platform" = "linux" ]; then
+  installed_version="$(linux_installed_version || true)"
+else
+  installed_version="$(macos_installed_version || true)"
+fi
+
+if [ -n "$installed_version" ] && [ "$(normalize_version "$installed_version")" = "$latest_version" ]; then
+  say "Verde $latest_version is already installed. Nothing to do."
+  exit 0
 fi
 
 work_dir="$(make_temp_dir)"
@@ -113,14 +161,6 @@ else
   unzip -q "$archive" -d "$work_dir/unpacked"
   app_path="$(find "$work_dir/unpacked" -maxdepth 2 -type d -name 'Verde.app' | head -n 1)"
   [ -n "$app_path" ] || fail "release archive did not contain Verde.app"
-
-  if [ -z "$MACOS_APP_DIR" ]; then
-    if [ -w /Applications ]; then
-      MACOS_APP_DIR="/Applications"
-    else
-      MACOS_APP_DIR="$HOME/Applications"
-    fi
-  fi
 
   mkdir -p "$MACOS_APP_DIR"
   rm -rf "$MACOS_APP_DIR/Verde.app"

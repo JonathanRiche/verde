@@ -106,6 +106,7 @@ zig build --release=safe -p "$PREFIX_DIR" -Dcef-sdk-path="$VERDE_CEF_SDK_PATH_RE
 
 mkdir -p \
   "$PACKAGE_ROOT/bin" \
+  "$PACKAGE_ROOT/share/verde" \
   "$PACKAGE_ROOT/share/applications" \
   "$PACKAGE_ROOT/share/pixmaps"
 
@@ -129,6 +130,7 @@ install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
 install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
 cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
+printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
 
