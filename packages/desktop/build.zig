@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
-    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu") orelse .gl;
+    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu") orelse .sdl_gpu;
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
