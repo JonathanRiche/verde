@@ -805,15 +805,15 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
 }
 
 fn queuePaletteOpenCodeMark(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
-    const w = @max(rect.w * 0.62, 1.0);
-    const x = rect.x + (rect.w - w) * 0.5;
-    const top_h = @max(rect.h * 0.30, 1.0);
-    const body_h = @max(rect.h * 0.46, 1.0);
-    const top_y = rect.y + rect.h * 0.14;
-    const body_y = top_y + top_h;
-    const body_color = palette.Color{ .r = color.r * 0.78, .g = color.g * 0.78, .b = color.b * 0.78, .a = color.a };
-    state.palette_overlay_batch.rectClipped(state.allocator, .{ .x = x, .y = top_y, .w = w, .h = top_h }, color, clip) catch {};
-    state.palette_overlay_batch.rectClipped(state.allocator, .{ .x = x, .y = body_y, .w = w, .h = body_h }, body_color, clip) catch {};
+    const size = @min(rect.w, rect.h);
+    const stroke = @max(size * 0.13, 1.4);
+    const mark = palette.Rect{
+        .x = rect.x + (rect.w - size) * 0.5 + stroke * 0.5,
+        .y = rect.y + (rect.h - size) * 0.5 + stroke * 0.5,
+        .w = @max(size - stroke, 1.0),
+        .h = @max(size - stroke, 1.0),
+    };
+    state.palette_overlay_batch.rectBorderClipped(state.allocator, mark, color, mark.w * 0.5, stroke, clip) catch {};
 }
 
 /// Queues a small speech bubble icon for thread rows.
