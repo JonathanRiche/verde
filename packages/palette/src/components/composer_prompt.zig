@@ -598,15 +598,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
             count += 1;
             if (right_icon.len > 0) {
-                const measured = icon_metrics.measureSlice(right_icon);
                 const reserve = self.trailingChevronReserve(right_icon);
                 const cell = reserve - config.pill_chevron_gap;
                 const cell_x = rect.x + rect.w - config.pill_padding_x - cell;
                 const cell_rect_full: draw.Rect = .{ .x = cell_x, .y = rect.y, .w = cell, .h = rect.h };
                 const cell_rect = clippedRect(rect, cell_rect_full) orelse cell_rect_full;
-                const chevron_x = cell_x + @max(0.0, (cell - measured) * 0.5);
-                runs[count] = iconRunWithClip(right_icon, chevron_x, cell_rect, icon_metrics, config.icon_color);
-                count += 1;
+                try renderDisclosureArrow(allocator, batch, cell_rect, config.icon_color);
             }
             try batch.textRuns(allocator, rect, label, runs[0..count], config.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
         }
@@ -682,6 +679,22 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .{ .x = cx + half_w_head, .y = y0 + head_h },
                 draw.Color.white,
                 button,
+            );
+        }
+
+        fn renderDisclosureArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, color: draw.Color) !void {
+            const m = @max(@min(rect.w, rect.h), 1.0);
+            const cx = rect.x + rect.w * 0.5;
+            const cy = rect.y + rect.h * 0.5;
+            const half_h = m * 0.18;
+            const half_w = m * 0.14;
+            try batch.triangleClipped(
+                allocator,
+                .{ .x = cx - half_w, .y = cy - half_h },
+                .{ .x = cx - half_w, .y = cy + half_h },
+                .{ .x = cx + half_w, .y = cy },
+                color,
+                rect,
             );
         }
 
@@ -1447,6 +1460,7 @@ test "composer prompt emits styled font-role commands" {
     try prompt.render(std.testing.allocator, &batch);
 
     var icon_runs: usize = 0;
+    var disclosure_arrows: usize = 0;
     var rounded_send = false;
     for (batch.commands.items) |command| {
         if (command.kind == .text) {
@@ -1454,9 +1468,11 @@ test "composer prompt emits styled font-role commands" {
                 if (run.font_role == .icon) icon_runs += 1;
             }
         }
+        if (command.kind == .triangle and command.color.a > 0.9 and command.color.r > 0.7) disclosure_arrows += 1;
         if (command.kind == .rect and command.radius >= 16.0 and command.color.g > 0.4) rounded_send = true;
     }
-    try std.testing.expect(icon_runs >= 4);
+    try std.testing.expect(icon_runs >= 3);
+    try std.testing.expect(disclosure_arrows >= 2);
     try std.testing.expect(rounded_send);
 }
 

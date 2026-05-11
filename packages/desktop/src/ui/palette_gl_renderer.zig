@@ -61,7 +61,7 @@ extern fn palette_text_gl_draw(
     viewport_h: f32,
 ) void;
 
-const ui_font_bytes = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+const ui_font_bytes = @embedFile("../assets/fonts/NotoSans-Bold.ttf");
 const mono_font_bytes = @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
 const icon_font_bytes = @embedFile("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
