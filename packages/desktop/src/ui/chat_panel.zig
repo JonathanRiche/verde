@@ -26,6 +26,7 @@ const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
 /// Provider logo in the model pill (~50% larger than vector toolbar glyphs for readability).
 const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 22.0 * 1.5;
+const OPENCODE_LOGO_MARK_UV: palette.Rect = .{ .x = 0.25, .y = 0.396667, .w = 0.5, .h = 0.403333 };
 const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -1640,13 +1641,17 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    const provider_icon = switch (state.currentThread().provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-    };
-    if (provider_icon) |cached| {
-        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+    switch (state.currentThread().provider) {
+        .codex => if (state.codex_logo_texture) |cached| {
+            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+            queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+        },
+        .opencode => if (state.opencode_logo_texture) |cached| {
+            const crop_w = @as(f32, @floatFromInt(cached.width)) * OPENCODE_LOGO_MARK_UV.w;
+            const crop_h = @as(f32, @floatFromInt(cached.height)) * OPENCODE_LOGO_MARK_UV.h;
+            const r = utils.snapImageRectToPixels(utils.imageRectContain(@intFromFloat(crop_w), @intFromFloat(crop_h), model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+            queueImageUv(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, OPENCODE_LOGO_MARK_UV, model_rect);
+        },
     }
 
     if (state.currentThread().provider == .codex) {
@@ -1755,13 +1760,12 @@ fn queueRoundedClipped(state: *app_state.AppState, rect: palette.Rect, color: pa
 }
 
 fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, clip: ?palette.Rect) void {
+    queueImageUv(state, rect, texture, .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 }, clip);
+}
+
+fn queueImageUv(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, uv: palette.Rect, clip: ?palette.Rect) void {
     if (!texture.valid or texture.texture_id == 0) return;
-    state.palette_overlay_batch.image(state.allocator, rect, palette.TextureId.init(texture.texture_id), .{
-        .x = 0.0,
-        .y = 0.0,
-        .w = 1.0,
-        .h = 1.0,
-    }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
+    state.palette_overlay_batch.image(state.allocator, rect, palette.TextureId.init(texture.texture_id), uv, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
 }
 
 fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
