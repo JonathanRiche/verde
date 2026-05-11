@@ -307,7 +307,10 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
 fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromptEvent) void {
     const state = appStateFromContext(context) orelse return;
     switch (event) {
-        .text_changed => |text| state.setDraft(text),
+        .text_changed => |text| {
+            state.setDraft(text);
+            state.updateFileSearch();
+        },
         .submitted => {
             if (state.currentThread().isSendPendingForUi()) {
                 state.setSidebarNotice("This thread is still running. Press Tab to queue or steer a follow-up.");
