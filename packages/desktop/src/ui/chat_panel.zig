@@ -1640,13 +1640,14 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    const provider_icon = switch (state.currentThread().provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-    };
-    if (provider_icon) |cached| {
-        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+    switch (state.currentThread().provider) {
+        .codex => if (state.codex_logo_texture) |cached| {
+            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+            queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
+        },
+        .opencode => {
+            drawOpenCodeMark(state, snapIconRectOrigin(model_icon_slot), icon_color);
+        },
     }
 
     if (state.currentThread().provider == .codex) {
@@ -1684,6 +1685,18 @@ fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.C
     queueTriangle(state, p[0], p[2], p[5], color);
     queueTriangle(state, p[5], p[3], p[4], color);
     queueTriangle(state, p[5], p[2], p[3], color);
+}
+
+fn drawOpenCodeMark(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    const w = @max(rect.w * 0.62, 1.0);
+    const x = rect.x + (rect.w - w) * 0.5;
+    const top_h = @max(rect.h * 0.30, 1.0);
+    const body_h = @max(rect.h * 0.46, 1.0);
+    const top_y = rect.y + rect.h * 0.14;
+    const body_y = top_y + top_h;
+    const body_color = palette.Color{ .r = color.r * 0.78, .g = color.g * 0.78, .b = color.b * 0.78, .a = color.a };
+    queueRect(state, .{ .x = x, .y = top_y, .w = w, .h = top_h }, color);
+    queueRect(state, .{ .x = x, .y = body_y, .w = w, .h = body_h }, body_color);
 }
 
 fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {

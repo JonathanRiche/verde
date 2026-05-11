@@ -777,6 +777,10 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .w = image_size,
         .h = image_size,
     };
+    if (provider == .opencode) {
+        queuePaletteOpenCodeMark(state, image_rect, paletteColor(theme.COLOR_WHITE), clip);
+        return;
+    }
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
@@ -798,6 +802,18 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .w = theme.scaledUi(14.0),
         .h = font_size * 1.25,
     }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, null);
+}
+
+fn queuePaletteOpenCodeMark(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
+    const w = @max(rect.w * 0.62, 1.0);
+    const x = rect.x + (rect.w - w) * 0.5;
+    const top_h = @max(rect.h * 0.30, 1.0);
+    const body_h = @max(rect.h * 0.46, 1.0);
+    const top_y = rect.y + rect.h * 0.14;
+    const body_y = top_y + top_h;
+    const body_color = palette.Color{ .r = color.r * 0.78, .g = color.g * 0.78, .b = color.b * 0.78, .a = color.a };
+    state.palette_overlay_batch.rectClipped(state.allocator, .{ .x = x, .y = top_y, .w = w, .h = top_h }, color, clip) catch {};
+    state.palette_overlay_batch.rectClipped(state.allocator, .{ .x = x, .y = body_y, .w = w, .h = body_h }, body_color, clip) catch {};
 }
 
 /// Queues a small speech bubble icon for thread rows.
