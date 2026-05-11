@@ -64,6 +64,39 @@ normalize_fff_dependency() {
   patchelf --replace-needed "$original_needed" "$replacement_needed" "$path"
 }
 
+copy_runtime_library() {
+  local library_name="$1"
+  local destination_dir="$2"
+  local library_path=""
+
+  if command -v ldconfig >/dev/null 2>&1; then
+    library_path="$(ldconfig -p | awk -v name="$library_name" '$1 == name { print $NF; exit }')"
+  fi
+
+  if [[ -z "$library_path" && -e "/usr/lib/x86_64-linux-gnu/$library_name" ]]; then
+    library_path="/usr/lib/x86_64-linux-gnu/$library_name"
+  fi
+
+  if [[ -z "$library_path" || ! -e "$library_path" ]]; then
+    echo "missing required runtime library: $library_name" >&2
+    exit 1
+  fi
+
+  cp -a "$(readlink -f "$library_path")" "$destination_dir/"
+  local real_name
+  real_name="$(basename "$(readlink -f "$library_path")")"
+  if [[ "$real_name" != "$library_name" ]]; then
+    ln -sfn "$real_name" "$destination_dir/$library_name"
+  fi
+  if command -v readelf >/dev/null 2>&1; then
+    local soname
+    soname="$(readelf -d "$(readlink -f "$library_path")" | awk '/SONAME/ { gsub(/[\[\]]/, "", $5); print $5; exit }')"
+    if [[ -n "$soname" && "$soname" != "$real_name" ]]; then
+      ln -sfn "$real_name" "$destination_dir/$soname"
+    fi
+  fi
+}
+
 mkdir -p "$OUTPUT_DIR"
 need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
@@ -79,6 +112,7 @@ mkdir -p \
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
 install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
+copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
 install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
 install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"
 install -m 755 "$PREFIX_DIR/bin/libcef.so" "$PACKAGE_ROOT/bin/libcef.so"
@@ -105,6 +139,7 @@ normalize_fff_dependency \
 
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
+strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3_ttf.so"
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef"
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef-process"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libfff_c.so"
