@@ -619,6 +619,7 @@ pub fn runSendWorker(
         .on_turn_id = handleSendTurnId,
         .on_stream_delta = handleSendStreamDelta,
         .on_stream_event = handleSendStreamEvent,
+        .on_should_stop = handleSendShouldStop,
         .on_approval_request = handleSendApprovalRequest,
     }) catch |err| {
         std.debug.print(
@@ -1362,6 +1363,14 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
         },
     }
 }
+
+fn handleSendShouldStop(context: ?*anyopaque) bool {
+    const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return true));
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    return send_state.stop_requested;
+}
+
 pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocator: std.mem.Allocator) void {
     if (send_state.partial_text.items.len == 0) return;
     const provider = send_state.provider orelse return;

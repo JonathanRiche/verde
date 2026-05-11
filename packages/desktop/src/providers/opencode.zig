@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const log = std.log.scoped(.native_opencode);
 
@@ -379,6 +380,7 @@ pub const Client = struct {
             .stderr = .inherit,
             .cwd = if (self.config.working_directory) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
+            .pgid = 0,
         });
 
         shared_server_state.child = child;
@@ -921,8 +923,14 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            var threaded = std.Io.Threaded.init_single_threaded;
-            child.kill(threaded.io());
+            const pid = child.id orelse -1;
+            runtime_log.diagnostic("opencode.stopOwnedServer signalling pid={d}", .{pid});
+            if (child.id) |child_pid| {
+                std.posix.kill(-child_pid, std.posix.SIG.TERM) catch |err| {
+                    runtime_log.diagnostic("opencode.stopOwnedServer group SIGTERM failed pid={d}: {s}", .{ child_pid, @errorName(err) });
+                    std.posix.kill(child_pid, std.posix.SIG.TERM) catch {};
+                };
+            }
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;

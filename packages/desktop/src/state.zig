@@ -873,10 +873,14 @@ pub const ChatThread = struct {
         self.send_state.mutex.lock();
         const maybe_worker = self.send_state.worker;
         self.send_state.worker = null;
+        const status = self.send_state.status;
+        const provider = self.provider;
         self.send_state.mutex.unlock();
 
         if (maybe_worker) |worker| {
+            runtime_log.diagnostic("shutdown joining send thread provider={s} status={s}", .{ @tagName(provider), @tagName(status) });
             worker.join();
+            runtime_log.diagnostic("shutdown joined send thread provider={s}", .{@tagName(provider)});
         }
     }
 
@@ -6517,6 +6521,7 @@ pub const AppState = struct {
         send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
+        runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
         send_state.mutex.unlock();
 
         self.issuePendingThreadStop(project_path, thread);

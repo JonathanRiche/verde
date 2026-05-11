@@ -198,6 +198,16 @@ pub const Client = struct {
             if (try processBridgeLine(allocator, raw_line, if (input.request) |request| request else null, &state)) {
                 break;
             }
+            if (input.request) |send_request| {
+                if (send_request.on_should_stop) |should_stop| {
+                    if (should_stop(send_request.stream_context)) {
+                        runtime_log.diagnostic("cursor.streaming bridge stopping on shutdown request", .{});
+                        _ = child.kill(io);
+                        child.id = null;
+                        return error.CodexTurnInterrupted;
+                    }
+                }
+            }
         }
 
         _ = child.kill(io);

@@ -69,6 +69,13 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer, allocator: std.mem.Allocator) void {
+        if (self.active_backend == .sdl_gpu) {
+            // SDL_GPU teardown can block indefinitely on some Linux/NVIDIA/Wayland
+            // close paths. The process is exiting, so prefer prompt shutdown and let
+            // the OS/driver reclaim GPU resources.
+            self.* = undefined;
+            return;
+        }
         if (self.gpu) |*gpu| {
             if (self.window) |window| gpu.releaseWindow(@ptrCast(window));
             gpu.deinit();
