@@ -1640,12 +1640,13 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .h = provider_slot,
     };
 
-    switch (state.currentThread().provider) {
-        .codex => if (state.codex_logo_texture) |cached| {
-            const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
-            queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
-        },
-        .opencode => drawOpenCodeComposerBadge(state, model_icon_slot),
+    const provider_icon = switch (state.currentThread().provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+    };
+    if (provider_icon) |cached| {
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
+        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
     if (state.currentThread().provider == .codex) {
@@ -1668,24 +1669,6 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         .w = icon_size,
         .h = icon_size,
     }), icon_color);
-}
-
-fn drawOpenCodeComposerBadge(state: *app_state.AppState, slot: palette.Rect) void {
-    const size = @round(@min(slot.w, slot.h));
-    const x = @round(slot.x + (slot.w - size) * 0.5);
-    const y = @round(slot.y + (slot.h - size) * 0.5);
-    const bg = paletteColor(.{ 0.86, 0.87, 0.90, 1.0 });
-    const mark = paletteColor(.{ 0.17, 0.16, 0.17, 1.0 });
-    const mark_w = @round(size * 0.46);
-    const mark_h = @round(size * 0.66);
-
-    queueRect(state, .{ .x = x, .y = y, .w = size, .h = size }, bg);
-    queueRect(state, .{
-        .x = @round(x + (size - mark_w) * 0.5),
-        .y = @round(y + (size - mark_h) * 0.5),
-        .w = mark_w,
-        .h = mark_h,
-    }, mark);
 }
 
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
