@@ -690,6 +690,7 @@ fn threadImportHeading(provider: runtime.Provider) []const u8 {
     return switch (provider) {
         .codex => "Import Codex thread",
         .opencode => "Import OpenCode thread",
+        .cursor => "Import Cursor thread",
     };
 }
 
@@ -697,6 +698,7 @@ fn threadImportDescription(provider: runtime.Provider) []const u8 {
     return switch (provider) {
         .codex => "Import loads the existing Codex transcript into this project and binds future turns to the same thread.",
         .opencode => "Import loads the existing OpenCode transcript into this project and binds future turns to the same thread.",
+        .cursor => "Import loads the existing Cursor transcript into this project and binds future turns to the same thread.",
     };
 }
 
@@ -704,6 +706,7 @@ fn threadImportHint(provider: runtime.Provider) [:0]const u8 {
     return switch (provider) {
         .codex => "Paste a Codex thread ID",
         .opencode => "Paste an OpenCode thread ID",
+        .cursor => "Paste a Cursor thread ID",
     };
 }
 
@@ -711,5 +714,6 @@ fn emptyThreadImportListNotice(provider: runtime.Provider) []const u8 {
     return switch (provider) {
         .codex => "No cached Codex threads to show.",
         .opencode => "No cached OpenCode threads to show.",
+        .cursor => "No cached Cursor threads to show.",
     };
 }

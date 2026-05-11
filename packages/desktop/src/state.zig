@@ -156,7 +156,7 @@ const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
 const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .cursor };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -288,14 +288,14 @@ fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
-    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..]);
+    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..], CURSOR_MODEL_OPTIONS[0..]);
 }
 
 fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
-        .cursor => DEFAULT_CODEX_MODEL,
+        .cursor => DEFAULT_CURSOR_MODEL,
     };
 }
 
@@ -433,7 +433,7 @@ fn paletteModelCascadeRenderRowLeading(
     const tex = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
-        .cursor => null,
+        .cursor => state.cursor_logo_texture,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
     const inner = @min(leading_rect.w, leading_rect.h);
@@ -517,6 +517,7 @@ pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
+pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
@@ -665,6 +666,14 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.3 Codex Spark", .value = "gpt-5.3-codex-spark" },
     .{ .label = "GPT-5.2 Codex", .value = "gpt-5.2-codex" },
     .{ .label = "GPT-5.2", .value = "gpt-5.2" },
+};
+
+pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL },
+    .{ .label = "GPT-5.5", .value = "gpt-5.5" },
+    .{ .label = "GPT-5.4", .value = "gpt-5.4" },
+    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
+    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
@@ -1791,7 +1800,7 @@ pub const AppState = struct {
     pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
-            .cursor => DEFAULT_CODEX_MODEL,
+            .cursor => DEFAULT_CURSOR_MODEL,
             .opencode => blk: {
                 for (self.opencodeModelOptionsSnapshot()) |option| {
                     if (option.value) |value| break :blk value;

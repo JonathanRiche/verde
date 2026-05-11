@@ -1643,6 +1643,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const provider_icon = switch (state.currentThread().provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .cursor => state.cursor_logo_texture,
     };
     if (provider_icon) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, model_icon_slot.x, model_icon_slot.y, model_icon_slot.w, model_icon_slot.h));
