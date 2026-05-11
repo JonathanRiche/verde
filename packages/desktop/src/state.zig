@@ -93,7 +93,7 @@ pub const PaletteModalTextFocus = enum {
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
-const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.14;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
