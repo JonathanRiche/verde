@@ -93,6 +93,7 @@ pub const PaletteModalTextFocus = enum {
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.14;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
@@ -182,6 +183,18 @@ fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
         .context = null,
         .advance = paletteEstimatedFontAdvance,
     };
+}
+
+fn paletteComposerTextFontAdvance(context: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+    var measured = paletteEstimatedFontAdvance(context, text, byte_offset, font_size);
+    measured.width *= PALETTE_COMPOSER_TEXT_ADVANCE_SCALE;
+    return measured;
+}
+
+fn paletteComposerTextFontMetrics(font_size: f32) palette.FontMetrics {
+    var metrics = paletteEstimatedFontMetrics(font_size);
+    metrics.advance = paletteComposerTextFontAdvance;
+    return metrics;
 }
 
 const Mutex = struct {
@@ -4985,7 +4998,7 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
-        self.palette_composer.setFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
@@ -5312,7 +5325,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
