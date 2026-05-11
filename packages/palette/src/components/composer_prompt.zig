@@ -562,12 +562,46 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const metrics = self.textMetrics();
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
-            try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            if (self.buffer.items.len == 0) {
+                try text_layout.appendRuns(allocator, self.textLayoutOptions(value, color), &runs);
+            } else {
+                try self.appendPromptGlyphRuns(allocator, color, &runs);
+            }
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             if (self.focused and self.buffer.items.len > 0) {
                 const cursor = self.cursorRect();
                 if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
+            }
+        }
+
+        fn appendPromptGlyphRuns(self: *const Component, allocator: std.mem.Allocator, color: draw.Color, out: *std.ArrayList(draw.TextRun)) !void {
+            const value = self.buffer.items;
+            const options = self.textLayoutOptions(value, color);
+            var index: usize = 0;
+            while (index < value.len) {
+                const byte = value[index];
+                const len = if (byte == '\n') @as(usize, 1) else std.unicode.utf8ByteSequenceLength(byte) catch 1;
+                defer index += len;
+                if (byte == '\n') continue;
+
+                const pos = text_layout.positionForOffset(options, index);
+                if (options.clip) |clip| {
+                    if (pos.y + options.metrics.line_height <= clip.y or pos.y >= clip.y + clip.h) continue;
+                }
+                try out.append(allocator, .{
+                    .text = value[index .. @min(index + len, value.len)],
+                    .byte_start = index,
+                    .byte_end = @min(index + len, value.len),
+                    .x = pos.x,
+                    .y = pos.y,
+                    .font_size = options.metrics.font_size,
+                    .line_height = options.metrics.line_height,
+                    .color = color,
+                    .clip = options.clip,
+                    .font_role = config.font_role,
+                    .font_id = config.font_id,
+                });
             }
         }
 
