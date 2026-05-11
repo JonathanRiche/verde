@@ -783,6 +783,7 @@ pub const Renderer = struct {
     }
 
     fn appendNaturalTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32, target_width: ?f32, font_role: ?draw.FontRole) !void {
+        if (value.len == 0 or color_value.a <= 0.0) return;
         const font = self.fontForRole(font_role);
         const key = textCacheKey(value, font_size, wrap_width, font_role);
         if (self.text_cache.getPtr(key)) |entry| {
