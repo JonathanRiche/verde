@@ -109,6 +109,7 @@ pub const Renderer = struct {
     sampler: ?*c.SDL_GPUSampler = null,
     text_engine: ?*c.TTF_TextEngine = null,
     font: ?*c.TTF_Font = null,
+    mono_font: ?*c.TTF_Font = null,
     icon_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
@@ -365,8 +366,13 @@ pub const Renderer = struct {
     }
 
     pub fn configureGpuTextWithFonts(self: *Renderer, font: *sdl.Font, icon_font: ?*sdl.Font) !void {
+        try self.configureGpuTextWithRoleFonts(font, null, icon_font);
+    }
+
+    pub fn configureGpuTextWithRoleFonts(self: *Renderer, font: *sdl.Font, mono_font: ?*sdl.Font, icon_font: ?*sdl.Font) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         self.font = @ptrCast(font);
+        self.mono_font = if (mono_font) |fallback| @ptrCast(fallback) else null;
         self.icon_font = if (icon_font) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
@@ -880,6 +886,9 @@ pub const Renderer = struct {
     }
 
     fn fontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
+        if (role == .mono) {
+            if (self.mono_font) |font_value| return font_value;
+        }
         if (role == .icon) {
             if (self.icon_font) |font_value| return font_value;
         }

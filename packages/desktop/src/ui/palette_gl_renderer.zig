@@ -62,6 +62,7 @@ extern fn palette_text_gl_draw(
 ) void;
 
 const ui_font_bytes = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+const mono_font_bytes = @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
 const icon_font_bytes = @embedFile("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 const Vertex = extern struct {
@@ -642,7 +643,11 @@ fn normalizedUv(uv: palette.Rect) palette.Rect {
 
 fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palette.Color, font_role: ?palette.FontRole, framebuffer_width: f32, framebuffer_height: f32) void {
     if (text.len == 0 or color.a <= 0.0) return;
-    const font_bytes = if (font_role == .icon) icon_font_bytes else ui_font_bytes;
+    const font_bytes = switch (font_role orelse .ui) {
+        .mono => mono_font_bytes,
+        .icon => icon_font_bytes,
+        else => ui_font_bytes,
+    };
     palette_text_gl_draw(
         font_bytes.ptr,
         @intCast(font_bytes.len),
