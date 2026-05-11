@@ -106,7 +106,11 @@ if [ "$platform" = "linux" ] && [ "$arch" != "x86_64" ]; then
 fi
 
 if [ "$platform" = "macos" ] && [ -z "$MACOS_APP_DIR" ]; then
-  if [ -w /Applications ]; then
+  if [ -d "$HOME/Applications/Verde.app" ]; then
+    MACOS_APP_DIR="$HOME/Applications"
+  elif [ -d /Applications/Verde.app ]; then
+    MACOS_APP_DIR="/Applications"
+  elif [ -w /Applications ]; then
     MACOS_APP_DIR="/Applications"
   else
     MACOS_APP_DIR="$HOME/Applications"
