@@ -197,7 +197,7 @@ jobs:
           cmake -S "SDL3_ttf-${SDL_TTF_VERSION}" -B SDL3_ttf-build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DSDLTTF_VENDORED=ON
+            -DSDLTTF_VENDORED=OFF
           cmake --build SDL3_ttf-build --parallel
           $SUDO cmake --install SDL3_ttf-build
           $SUDO ldconfig
