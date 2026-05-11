@@ -375,7 +375,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             switch (input) {
                 .text => |value| {
                     if (!self.focused) return false;
-                    try self.insertText(allocator, value);
+                    try self.insertTextInput(allocator, value);
                     return true;
                 },
                 .key => |key| return try self.handleKey(allocator, key),
@@ -941,6 +941,41 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (value.len == 0) return;
             if (self.selection()) |_| return self.replaceSelection(allocator, value);
             try self.replaceRange(allocator, self.cursor, self.cursor, value);
+        }
+
+        fn insertTextInput(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            if (value.len == 0) return;
+            var sanitized: std.ArrayList(u8) = .empty;
+            defer sanitized.deinit(allocator);
+            var changed = false;
+            var index: usize = 0;
+            while (index < value.len) {
+                const byte = value[index];
+                if (byte == '\n' or byte == '\r' or (byte < 0x20 and byte != '\t')) {
+                    changed = true;
+                    index += 1;
+                    continue;
+                }
+                const len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                    changed = true;
+                    index += 1;
+                    continue;
+                };
+                if (index + len > value.len) {
+                    changed = true;
+                    break;
+                }
+                const slice = value[index .. index + len];
+                if (std.mem.eql(u8, slice, "\xef\xbf\xbd")) {
+                    changed = true;
+                    index += len;
+                    continue;
+                }
+                try sanitized.appendSlice(allocator, slice);
+                index += len;
+            }
+            if (!changed) return self.insertText(allocator, value);
+            return self.insertText(allocator, sanitized.items);
         }
 
         fn replaceSelection(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
@@ -1548,6 +1583,18 @@ test "composer prompt owns text options toggles and send input" {
     try std.testing.expectEqual(@as(usize, 1), probe.model_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.fast_changed);
     try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
+}
+
+test "composer prompt drops text-input control and replacement glyphs" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 2, .y = prompt.textRect().y + 2 } }));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .text = "ab\r\n\xef\xbf\xbdcd" }));
+    try std.testing.expectEqualStrings("abcd", prompt.text());
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
+    try std.testing.expectEqualStrings("abcd\n", prompt.text());
 }
 
 fn proportionalAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, _: f32) text_layout.Advance {
