@@ -1,8 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{ .default_target = nativeDefaultTarget() });
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu") orelse .sdl_gpu;
@@ -360,19 +359,6 @@ pub fn build(b: *std.Build) void {
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
-}
-
-fn nativeDefaultTarget() std.Target.Query {
-    if (builtin.os.tag != .macos) return .{};
-
-    return .{
-        .os_tag = .macos,
-        .os_version_min = .{ .semver = .{
-            .major = 13,
-            .minor = 0,
-            .patch = 0,
-        } },
-    };
 }
 
 const PaletteRendererBackend = enum {
