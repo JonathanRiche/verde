@@ -64,7 +64,6 @@ extern fn palette_text_gl_draw(
 const ui_font_bytes = @embedFile("../assets/fonts/NotoSans-Bold.ttf");
 const mono_font_bytes = @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
 const icon_font_bytes = @embedFile("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
-const PALETTE_TEXT_RENDER_SCALE: f32 = 0.86;
 
 const Vertex = extern struct {
     x: f32,
@@ -656,7 +655,7 @@ fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palett
         @intCast(text.len),
         x,
         y,
-        font_size * PALETTE_TEXT_RENDER_SCALE,
+        font_size,
         color.r,
         color.g,
         color.b,
