@@ -12,6 +12,6 @@ fragment float4 main(
     texture2d<float> font_atlas [[texture(0)]],
     sampler font_sampler [[sampler(0)]]
 ) {
-    float alpha = font_atlas.sample(font_sampler, input.uv).r;
+    float alpha = font_atlas.sample(font_sampler, input.uv).a;
     return float4(input.color.rgb, input.color.a * alpha);
 }

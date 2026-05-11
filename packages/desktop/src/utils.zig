@@ -5,6 +5,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const chat_threads = @import("chat/threads.zig");
 const std = @import("std");
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.native_utils);
 
@@ -94,6 +95,58 @@ pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTextur
         .valid = true,
     };
 }
+
+/// Normalized device / layout rectangle for bitmap draws (avoids anonymous-struct mismatch).
+pub const ImageLayoutRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+/// Aspect-fill inside a fixed slot so non-square bitmaps are not stretched to a square
+/// (which blurs logos). Same slot bounds; excess is cropped by the clip rect.
+pub fn imageRectCover(tex_w: i32, tex_h: i32, slot_x: f32, slot_y: f32, slot_w: f32, slot_h: f32) ImageLayoutRect {
+    if (tex_w <= 0 or tex_h <= 0 or slot_w <= 0.0 or slot_h <= 0.0) {
+        return .{ .x = slot_x, .y = slot_y, .w = slot_w, .h = slot_h };
+    }
+    const iw: f32 = @floatFromInt(tex_w);
+    const ih: f32 = @floatFromInt(tex_h);
+    const scale = @max(slot_w / iw, slot_h / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    return .{
+        .x = slot_x + (slot_w - dw) * 0.5,
+        .y = slot_y + (slot_h - dh) * 0.5,
+        .w = dw,
+        .h = dh,
+    };
+}
+
+/// Like CSS `object-fit: contain`: full bitmap visible, aspect preserved, centered in the slot.
+pub fn imageRectContain(tex_w: i32, tex_h: i32, slot_x: f32, slot_y: f32, slot_w: f32, slot_h: f32) ImageLayoutRect {
+    if (tex_w <= 0 or tex_h <= 0 or slot_w <= 0.0 or slot_h <= 0.0) {
+        return .{ .x = slot_x, .y = slot_y, .w = slot_w, .h = slot_h };
+    }
+    const iw: f32 = @floatFromInt(tex_w);
+    const ih: f32 = @floatFromInt(tex_h);
+    const scale = @min(slot_w / iw, slot_h / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    return .{
+        .x = slot_x + (slot_w - dw) * 0.5,
+        .y = slot_y + (slot_h - dh) * 0.5,
+        .w = dw,
+        .h = dh,
+    };
+}
+
+/// Integer pixel bounds for texture quads so bilinear sampling is not shifted by
+/// sub-pixel placement (reduces mushy edges on tiny minified logos).
+pub fn snapImageRectToPixels(r: ImageLayoutRect) ImageLayoutRect {
+    return .{
+        .x = @round(r.x),
+        .y = @round(r.y),
+        .w = @max(1, @round(r.w)),
+        .h = @max(1, @round(r.h)),
+    };
+}
+
 pub fn projectLabelFromPath(path: []const u8) []const u8 {
     const basename = std.fs.path.basename(path);
     return if (basename.len == 0) path else basename;
@@ -189,19 +242,33 @@ pub fn runCustomProjectCommand(
 pub fn pickerWorker(state: *app_state.PickerState, start_path: []u8) void {
     defer std.heap.page_allocator.free(start_path);
 
+    runtime_log.diagnostic("pickerWorker start path={s}", .{start_path});
     const result = pickDirectory(std.heap.page_allocator, start_path);
 
     state.mutex.lock();
     defer state.mutex.unlock();
 
     if (result) |path| {
+        runtime_log.diagnostic("pickerWorker selected path={s}", .{path});
         state.selected_path = path;
         state.status = .selected;
     } else |err| switch (err) {
-        error.UserCancelled => state.status = .cancelled,
-        error.UnsupportedOperatingSystem => state.status = .unavailable,
-        error.FolderPickerUnavailable => state.status = .unavailable,
-        else => state.status = .failed,
+        error.UserCancelled => {
+            runtime_log.diagnostic("pickerWorker cancelled", .{});
+            state.status = .cancelled;
+        },
+        error.UnsupportedOperatingSystem => {
+            runtime_log.diagnostic("pickerWorker unavailable: unsupported os", .{});
+            state.status = .unavailable;
+        },
+        error.FolderPickerUnavailable => {
+            runtime_log.diagnostic("pickerWorker unavailable: no picker command", .{});
+            state.status = .unavailable;
+        },
+        else => {
+            runtime_log.diagnostic("pickerWorker failed: {s}", .{@errorName(err)});
+            state.status = .failed;
+        },
     }
 }
 pub fn pickDirectory(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
@@ -259,49 +326,27 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
 
 pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
     if (commandExists("zenity")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "zenity",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\zenity --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("kdialog")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "kdialog",
-            "--getexistingdirectory",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\kdialog --getexistingdirectory "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("yad")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "yad",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\yad --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("qarma")) {
-        return runDirectoryPickerCommand(allocator, &.{
-            "qarma",
-            "--file-selection",
-            "--directory",
-            "--filename",
-            start_path,
-            "--title",
-            "Select project folder",
-        }, null);
+        return runLinuxGuiDirectoryPickerCommand(allocator,
+            \\qarma --file-selection --directory --filename "$1" --title "Select project folder"
+        , start_path, null);
     }
 
     if (commandExists("python3")) {
@@ -335,27 +380,65 @@ pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) 
     return error.FolderPickerUnavailable;
 }
 
+fn runLinuxGuiDirectoryPickerCommand(
+    allocator: std.mem.Allocator,
+    comptime picker_command: []const u8,
+    start_path: []const u8,
+    unavailable_exit_code: ?u8,
+) PickDirectoryError![]u8 {
+    const script =
+        \\export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        \\if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        \\  for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        \\    [ -S "$socket" ] || continue
+        \\    export WAYLAND_DISPLAY="$(basename "$socket")"
+        \\    break
+        \\  done
+        \\fi
+        \\if [ -z "${DISPLAY:-}" ] && [ -d /tmp/.X11-unix ]; then
+        \\  for socket in /tmp/.X11-unix/X*; do
+        \\    [ -S "$socket" ] || continue
+        \\    export DISPLAY=":${socket##*/X}"
+        \\    break
+        \\  done
+        \\fi
+        \\
+    ++ picker_command;
+    return runDirectoryPickerCommand(allocator, &.{ "sh", "-c", script, "verde-folder-picker", start_path }, unavailable_exit_code);
+}
+
 fn runDirectoryPickerCommand(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     unavailable_exit_code: ?u8,
 ) PickDirectoryError![]u8 {
+    runtime_log.diagnostic("runDirectoryPickerCommand argv={s}", .{argv[0]});
     const result = runChild(allocator, argv, null, 16 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return error.FolderPickerUnavailable,
-        else => return err,
+        error.FileNotFound => {
+            runtime_log.diagnostic("runDirectoryPickerCommand file not found argv={s}", .{argv[0]});
+            return error.FolderPickerUnavailable;
+        },
+        else => {
+            runtime_log.diagnostic("runDirectoryPickerCommand spawn failed argv={s}: {s}", .{ argv[0], @errorName(err) });
+            return err;
+        },
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| {
+            runtime_log.diagnostic("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d} stderr={s}", .{ argv[0], code, result.stdout.len, result.stderr.len, result.stderr });
             if (code == 1) return error.UserCancelled;
             if (unavailable_exit_code) |expected| {
                 if (code == expected) return error.FolderPickerUnavailable;
             }
             if (code != 0) return error.ChildProcessFailed;
         },
-        else => return error.ChildProcessFailed,
+        else => {
+            runtime_log.diagnostic("runDirectoryPickerCommand did not exit normally argv={s}", .{argv[0]});
+            return error.ChildProcessFailed;
+        },
     }
 
     const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
@@ -599,19 +682,52 @@ fn escapeAppleScriptString(allocator: std.mem.Allocator, value: []const u8) ![]u
     return escaped.toOwnedSlice(allocator);
 }
 
+fn spawnArg0IsQualifiedPath(arg0: []const u8) bool {
+    if (builtin.os.tag == .windows) {
+        if (std.mem.indexOfAny(u8, arg0, "\\/") != null) return true;
+        return arg0.len >= 2 and arg0[1] == ':';
+    }
+    return std.mem.indexOfScalar(u8, arg0, '/') != null;
+}
+
 fn spawnDetached(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     cwd: ?[]const u8,
-) std.process.SpawnError!void {
+) (std.mem.Allocator.Error || std.process.SpawnError)!void {
+    // GUI/desktop launches often inherit a minimal PATH. We pass an augmented environ_map so the
+    // child sees ~/.local/bin, mise shims, etc. However, Zig's `process.spawn` resolves argv[0]
+    // using the parent's environment only — not PATH from environ_map — so bare names like `zed`
+    // fail with FileNotFound unless we pre-resolve against the same augmented PATH we give the child.
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+
+    var argv_storage: std.ArrayList([]const u8) = .empty;
+    defer argv_storage.deinit(allocator);
+    var resolved_arg0: ?[]const u8 = null;
+    defer if (resolved_arg0) |p| allocator.free(p);
+
+    if (argv.len > 0 and !spawnArg0IsQualifiedPath(argv[0])) {
+        resolved_arg0 = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, argv[0]) catch null;
+        if (resolved_arg0) |exe| {
+            try argv_storage.append(allocator, exe);
+            try argv_storage.appendSlice(allocator, argv[1..]);
+        } else {
+            try argv_storage.appendSlice(allocator, argv);
+        }
+    } else {
+        try argv_storage.appendSlice(allocator, argv);
+    }
+
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const child = try std.process.spawn(threaded.io(), .{
-        .argv = argv,
+        .argv = argv_storage.items,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = &env_map,
     });
     _ = child;
 }
@@ -855,60 +971,170 @@ fn launchConfiguredEditorInMacTerminal(
     return spawnDetached(allocator, &.{ "osascript", "-e", apple_script }, null);
 }
 
+/// Basename of the executable after resolving symlinks (PATH shims often point at another binary).
+fn executableTargetBasenameAlloc(allocator: std.mem.Allocator, resolved_path: []const u8) std.mem.Allocator.Error![]const u8 {
+    const use_realpath = builtin.link_libc and switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        else => false,
+    };
+    if (use_realpath) {
+        const path_z = try allocator.dupeZ(u8, resolved_path);
+        defer allocator.free(path_z);
+        var resolved_buf: [std.posix.PATH_MAX]u8 = undefined;
+        if (std.c.realpath(path_z.ptr, resolved_buf[0..].ptr)) |p| {
+            const canon = std.mem.sliceTo(p, 0);
+            return try allocator.dupe(u8, std.fs.path.basename(canon));
+        }
+    }
+    return try allocator.dupe(u8, std.fs.path.basename(resolved_path));
+}
+
+fn resolvedPathLooksLikeCursorIdeBinary(resolved_path: []const u8) bool {
+    switch (builtin.os.tag) {
+        .windows => {
+            const ext = std.fs.path.extension(resolved_path);
+            if (std.ascii.eqlIgnoreCase(ext, ".cmd") or std.ascii.eqlIgnoreCase(ext, ".bat"))
+                return false;
+            return true;
+        },
+        .macos => {
+            const fd = std.posix.openat(std.posix.AT.FDCWD, resolved_path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+            defer _ = std.c.close(fd);
+            var header: [4]u8 = undefined;
+            const n = std.posix.read(fd, &header) catch return false;
+            if (n >= 2 and header[0] == '#' and header[1] == '!') return false;
+            return true;
+        },
+        else => {
+            const fd = std.posix.openat(std.posix.AT.FDCWD, resolved_path, .{ .ACCMODE = .RDONLY }, 0) catch return false;
+            defer _ = std.c.close(fd);
+            var header: [4]u8 = undefined;
+            const n = std.posix.read(fd, &header) catch return false;
+            if (n >= 2 and header[0] == '#' and header[1] == '!') return false;
+            return n >= 4 and header[0] == 0x7f and header[1] == 'E' and header[2] == 'L' and header[3] == 'F';
+        },
+    }
+}
+
+/// Cursor IDE ships a native `cursor` CLI; `cursor-agent` / shell shims are not the desktop editor.
+fn hasCursorIdeCliResolved(allocator: std.mem.Allocator) bool {
+    var env_map = process_env.buildAugmentedEnvMap(allocator) catch return false;
+    defer env_map.deinit();
+    const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "cursor") catch return false;
+    defer allocator.free(resolved);
+    const base_owned = executableTargetBasenameAlloc(allocator, resolved) catch return false;
+    defer allocator.free(base_owned);
+    const base = base_owned;
+    if (std.ascii.eqlIgnoreCase(base, "cursor-agent") or std.ascii.eqlIgnoreCase(base, "cursor-agent.exe"))
+        return false;
+
+    const basename_ok = (std.ascii.eqlIgnoreCase(base, "cursor") or std.ascii.eqlIgnoreCase(base, "cursor.exe")) or
+        (std.ascii.startsWithIgnoreCase(base, "cursor-") and !std.ascii.startsWithIgnoreCase(base, "cursor-agent"));
+    if (!basename_ok) return false;
+
+    return resolvedPathLooksLikeCursorIdeBinary(resolved);
+}
+
+fn hasVsCodeExeResolved(allocator: std.mem.Allocator, exe_name: []const u8) bool {
+    var env_map = process_env.buildAugmentedEnvMap(allocator) catch return false;
+    defer env_map.deinit();
+    const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, exe_name) catch return false;
+    defer allocator.free(resolved);
+    const base_owned = executableTargetBasenameAlloc(allocator, resolved) catch return false;
+    defer allocator.free(base_owned);
+    const base = base_owned;
+    if (std.ascii.eqlIgnoreCase(base, exe_name)) return true;
+    var buf: [96]u8 = undefined;
+    const as_exe = std.fmt.bufPrint(&buf, "{s}.exe", .{exe_name}) catch return false;
+    if (std.ascii.eqlIgnoreCase(base, as_exe)) return true;
+    const as_cmd = std.fmt.bufPrint(&buf, "{s}.cmd", .{exe_name}) catch return false;
+    return std.ascii.eqlIgnoreCase(base, as_cmd);
+}
+
+fn hasZedExeResolved(allocator: std.mem.Allocator, exe_name: []const u8) bool {
+    var env_map = process_env.buildAugmentedEnvMap(allocator) catch return false;
+    defer env_map.deinit();
+    const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, exe_name) catch return false;
+    defer allocator.free(resolved);
+    const base_owned = executableTargetBasenameAlloc(allocator, resolved) catch return false;
+    defer allocator.free(base_owned);
+    const base = base_owned;
+    if (std.ascii.eqlIgnoreCase(base, exe_name)) return true;
+    var buf: [96]u8 = undefined;
+    const as_exe = std.fmt.bufPrint(&buf, "{s}.exe", .{exe_name}) catch return false;
+    return std.ascii.eqlIgnoreCase(base, as_exe);
+}
+
 fn hasCursorLauncher() bool {
-    if (commandExists("cursor")) return true;
-    return macApplicationExists("Cursor");
+    if (macApplicationExists("Cursor")) return true;
+    return hasCursorIdeCliResolved(std.heap.page_allocator);
 }
 
 fn openCursor(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
-    if (commandExists("cursor")) return spawnDetached(allocator, &.{ "cursor", project_path }, project_path);
     if (macApplicationExists("Cursor")) return openMacApplication(allocator, "Cursor", project_path);
+    if (hasCursorIdeCliResolved(std.heap.page_allocator))
+        return spawnDetached(allocator, &.{ "cursor", project_path }, project_path);
     return error.LauncherUnavailable;
 }
 
 fn openCursorPath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
-    if (commandExists("cursor")) return spawnDetached(allocator, &.{ "cursor", file_path }, working_dir);
     if (macApplicationExists("Cursor")) return openMacApplication(allocator, "Cursor", file_path);
+    if (hasCursorIdeCliResolved(std.heap.page_allocator))
+        return spawnDetached(allocator, &.{ "cursor", file_path }, working_dir);
     return error.LauncherUnavailable;
 }
 
 fn hasVsCodeLauncher() bool {
-    if (commandExists("code") or commandExists("code-insiders")) return true;
-    return macApplicationExists("Visual Studio Code") or macApplicationExists("Visual Studio Code - Insiders");
+    if (macApplicationExists("Visual Studio Code") or macApplicationExists("Visual Studio Code - Insiders")) return true;
+    const a = std.heap.page_allocator;
+    return hasVsCodeExeResolved(a, "code") or hasVsCodeExeResolved(a, "code-insiders");
 }
 
 fn openVsCode(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
-    if (commandExists("code")) return spawnDetached(allocator, &.{ "code", project_path }, project_path);
-    if (commandExists("code-insiders")) return spawnDetached(allocator, &.{ "code-insiders", project_path }, project_path);
     if (macApplicationExists("Visual Studio Code")) return openMacApplication(allocator, "Visual Studio Code", project_path);
     if (macApplicationExists("Visual Studio Code - Insiders")) return openMacApplication(allocator, "Visual Studio Code - Insiders", project_path);
+    const a = std.heap.page_allocator;
+    if (hasVsCodeExeResolved(a, "code"))
+        return spawnDetached(allocator, &.{ "code", project_path }, project_path);
+    if (hasVsCodeExeResolved(a, "code-insiders"))
+        return spawnDetached(allocator, &.{ "code-insiders", project_path }, project_path);
     return error.LauncherUnavailable;
 }
 
 fn openVsCodePath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
-    if (commandExists("code")) return spawnDetached(allocator, &.{ "code", file_path }, working_dir);
-    if (commandExists("code-insiders")) return spawnDetached(allocator, &.{ "code-insiders", file_path }, working_dir);
     if (macApplicationExists("Visual Studio Code")) return openMacApplication(allocator, "Visual Studio Code", file_path);
     if (macApplicationExists("Visual Studio Code - Insiders")) return openMacApplication(allocator, "Visual Studio Code - Insiders", file_path);
+    const a = std.heap.page_allocator;
+    if (hasVsCodeExeResolved(a, "code"))
+        return spawnDetached(allocator, &.{ "code", file_path }, working_dir);
+    if (hasVsCodeExeResolved(a, "code-insiders"))
+        return spawnDetached(allocator, &.{ "code-insiders", file_path }, working_dir);
     return error.LauncherUnavailable;
 }
 
 fn hasZedLauncher() bool {
-    if (commandExists("zed") or commandExists("zeditor")) return true;
-    return macApplicationExists("Zed");
+    if (macApplicationExists("Zed")) return true;
+    const a = std.heap.page_allocator;
+    return hasZedExeResolved(a, "zed") or hasZedExeResolved(a, "zeditor");
 }
 
 fn openZed(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
-    if (commandExists("zed")) return spawnDetached(allocator, &.{ "zed", project_path }, project_path);
-    if (commandExists("zeditor")) return spawnDetached(allocator, &.{ "zeditor", project_path }, project_path);
     if (macApplicationExists("Zed")) return openMacApplication(allocator, "Zed", project_path);
+    const a = std.heap.page_allocator;
+    if (hasZedExeResolved(a, "zed"))
+        return spawnDetached(allocator, &.{ "zed", project_path }, project_path);
+    if (hasZedExeResolved(a, "zeditor"))
+        return spawnDetached(allocator, &.{ "zeditor", project_path }, project_path);
     return error.LauncherUnavailable;
 }
 
 fn openZedPath(allocator: std.mem.Allocator, working_dir: []const u8, file_path: []const u8) OpenProjectError!void {
-    if (commandExists("zed")) return spawnDetached(allocator, &.{ "zed", file_path }, working_dir);
-    if (commandExists("zeditor")) return spawnDetached(allocator, &.{ "zeditor", file_path }, working_dir);
     if (macApplicationExists("Zed")) return openMacApplication(allocator, "Zed", file_path);
+    const a = std.heap.page_allocator;
+    if (hasZedExeResolved(a, "zed"))
+        return spawnDetached(allocator, &.{ "zed", file_path }, working_dir);
+    if (hasZedExeResolved(a, "zeditor"))
+        return spawnDetached(allocator, &.{ "zeditor", file_path }, working_dir);
     return error.LauncherUnavailable;
 }
 

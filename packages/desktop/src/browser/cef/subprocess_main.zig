@@ -134,16 +134,18 @@ const CommandQueue = struct {
 
 const ReaderContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     queue: *CommandQueue,
 };
 
 const FrameStore = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     path: []u8,
-    file: std.fs.File,
+    file: std.Io.File,
 
     /// Creates the helper-owned raw frame file in `/tmp`.
-    fn init(allocator: std.mem.Allocator) !FrameStore {
+    fn init(allocator: std.mem.Allocator, io: std.Io) !FrameStore {
         const frame_path = try std.fmt.allocPrint(
             allocator,
             "/tmp/verde-cef-frame-{d}.rgba",
@@ -151,12 +153,13 @@ const FrameStore = struct {
         );
         errdefer allocator.free(frame_path);
 
-        const file = try std.fs.createFileAbsolute(frame_path, .{
+        const file = try std.Io.Dir.createFileAbsolute(io, frame_path, .{
             .read = true,
             .truncate = true,
         });
         return .{
             .allocator = allocator,
+            .io = io,
             .path = frame_path,
             .file = file,
         };
@@ -164,17 +167,15 @@ const FrameStore = struct {
 
     /// Closes and removes the helper frame file.
     fn deinit(self: *FrameStore) void {
-        self.file.close();
-        var threaded = std.Io.Threaded.init_single_threaded;
-        std.Io.Dir.deleteFileAbsolute(threaded.io(), self.path) catch {};
+        self.file.close(self.io);
+        std.Io.Dir.deleteFileAbsolute(self.io, self.path) catch {};
         self.allocator.free(self.path);
     }
 
     /// Overwrites the shared frame file with the latest browser frame bytes.
     fn writeFrame(self: *FrameStore, pixels: []const u8) !void {
-        try self.file.seekTo(0);
-        try self.file.setEndPos(@intCast(pixels.len));
-        try self.file.writeAll(pixels);
+        try self.file.setLength(self.io, @intCast(pixels.len));
+        try self.file.writePositionalAll(self.io, pixels, 0);
     }
 };
 
@@ -197,7 +198,7 @@ const HelperState = struct {
 };
 
 /// Runs either as the Linux CEF browser helper or as a Chromium subprocess.
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     const allocator = gpa_state.allocator();
 
@@ -237,7 +238,7 @@ pub fn main() !void {
 
     var helper_state: HelperState = .{
         .allocator = allocator,
-        .frame_store = try FrameStore.init(allocator),
+        .frame_store = try FrameStore.init(allocator, init.io),
     };
     defer helper_state.deinit();
 
@@ -246,6 +247,7 @@ pub fn main() !void {
 
     var reader_context: ReaderContext = .{
         .allocator = allocator,
+        .io = init.io,
         .queue = &command_queue,
     };
     const reader_thread = try std.Thread.spawn(.{}, stdinReaderMain, .{&reader_context});
@@ -254,8 +256,8 @@ pub fn main() !void {
     while (true) {
         while (command_queue.pop()) |command| {
             defer if (command.payload) |payload| allocator.free(payload);
-            const keep_running = applyCommand(&helper_state, command) catch |err| {
-                try emitEvent(allocator, .{
+            const keep_running = applyCommand(&helper_state, init.io, command) catch |err| {
+                try emitEvent(allocator, init.io, .{
                     .kind = .failed,
                     .payload = @errorName(err),
                 });
@@ -265,8 +267,8 @@ pub fn main() !void {
         }
 
         browser_native.doMessageLoopWork();
-        try flushNativeEvents(allocator);
-        try publishLatestFrame(allocator, &helper_state);
+        try flushNativeEvents(allocator, init.io);
+        try publishLatestFrame(allocator, init.io, &helper_state);
         if (command_queue.isDrained()) std.process.exit(0);
         std.atomic.spinLoopHint();
     }
@@ -282,9 +284,9 @@ fn isChromiumSubprocess(args: []const [*:0]const u8) bool {
 
 /// Reads JSON-line helper commands from stdin and queues them for the browser loop.
 fn stdinReaderMain(context: *ReaderContext) !void {
-    const stdin_file = std.fs.File.stdin();
+    const stdin_file = std.Io.File.stdin();
     var read_buffer: [16 * 1024]u8 = undefined;
-    var reader = stdin_file.reader(&read_buffer);
+    var reader = stdin_file.readerStreaming(context.io, &read_buffer);
 
     while (true) {
         const maybe_line = try reader.interface.takeDelimiter('\n');
@@ -316,7 +318,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
 }
 
 /// Applies one helper command on the local browser-process runtime.
-fn applyCommand(state: *HelperState, command: ipc.Command) !bool {
+fn applyCommand(state: *HelperState, io: std.Io, command: ipc.Command) !bool {
     switch (command.kind) {
         .show => {
             state.updatePaneSize(command.width, command.height);
@@ -346,14 +348,14 @@ fn applyCommand(state: *HelperState, command: ipc.Command) !bool {
             const owned_js = try state.allocator.dupeZ(u8, js);
             defer state.allocator.free(owned_js);
             if (!browser_native.eval(owned_js)) return error.EvalFailed;
-            try emitEvent(state.allocator, .{
+            try emitEvent(state.allocator, io, .{
                 .kind = .eval_result,
                 .payload = SYNTHETIC_EVAL_RESULT,
             });
         },
         .post_json => {
             if (command.payload) |payload| {
-                try emitEvent(state.allocator, .{
+                try emitEvent(state.allocator, io, .{
                     .kind = .js_message,
                     .payload = payload,
                 });
@@ -381,22 +383,22 @@ fn ensureBrowserCreated(state: *HelperState, url: []const u8) !void {
 }
 
 /// Translates native browser events into helper JSON events for the desktop shell.
-fn flushNativeEvents(allocator: std.mem.Allocator) !void {
+fn flushNativeEvents(allocator: std.mem.Allocator, io: std.Io) !void {
     var buffer: [MAX_NATIVE_EVENT_BYTES]u8 = undefined;
     while (browser_native.popEvent(buffer[0..])) |native_event| {
         const payload = buffer[0..native_event.len];
         switch (native_event.kind) {
-            .opened => try emitEvent(allocator, .{ .kind = .opened }),
-            .closed => try emitEvent(allocator, .{ .kind = .closed }),
-            .navigated => try emitEvent(allocator, .{
+            .opened => try emitEvent(allocator, io, .{ .kind = .opened }),
+            .closed => try emitEvent(allocator, io, .{ .kind = .closed }),
+            .navigated => try emitEvent(allocator, io, .{
                 .kind = .navigated,
                 .payload = payload,
             }),
-            .title_changed => try emitEvent(allocator, .{
+            .title_changed => try emitEvent(allocator, io, .{
                 .kind = .title_changed,
                 .payload = payload,
             }),
-            .failed => try emitEvent(allocator, .{
+            .failed => try emitEvent(allocator, io, .{
                 .kind = .failed,
                 .payload = payload,
             }),
@@ -406,7 +408,7 @@ fn flushNativeEvents(allocator: std.mem.Allocator) !void {
 }
 
 /// Publishes the latest dirty CEF frame into the helper frame file and notifies the desktop app.
-fn publishLatestFrame(allocator: std.mem.Allocator, state: *HelperState) !void {
+fn publishLatestFrame(allocator: std.mem.Allocator, io: std.Io, state: *HelperState) !void {
     const frame = browser_native.getFrame();
     if (!frame.dirty or frame.pixels == null or frame.width == 0 or frame.height == 0) return;
 
@@ -416,7 +418,7 @@ fn publishLatestFrame(allocator: std.mem.Allocator, state: *HelperState) !void {
     try state.frame_store.writeFrame(frame.pixels.?[0..expected_len]);
     browser_native.clearFrameDirty();
 
-    try emitEvent(allocator, .{
+    try emitEvent(allocator, io, .{
         .kind = .frame_ready,
         .width = frame.width,
         .height = frame.height,
@@ -426,10 +428,10 @@ fn publishLatestFrame(allocator: std.mem.Allocator, state: *HelperState) !void {
 }
 
 /// Serializes one helper event to stdout as a JSON line.
-fn emitEvent(allocator: std.mem.Allocator, event: ipc.Event) !void {
-    const stdout_file = std.fs.File.stdout();
+fn emitEvent(allocator: std.mem.Allocator, io: std.Io, event: ipc.Event) !void {
+    const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
-    var writer = stdout_file.writer(&write_buffer);
+    var writer = stdout_file.writerStreaming(io, &write_buffer);
     defer writer.interface.flush() catch {};
 
     const encoded = try std.json.Stringify.valueAlloc(allocator, event, .{});

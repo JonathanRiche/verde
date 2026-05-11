@@ -271,7 +271,7 @@ pub const Client = struct {
         const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/abort", .{request.thread_id});
         defer self.allocator.free(path);
 
-        const response = try self.requestJson(.POST, path, null);
+        const response = try self.requestJson(.POST, path, "{}");
         defer self.allocator.free(response.body);
 
         if (response.status != .ok and response.status != .no_content) {

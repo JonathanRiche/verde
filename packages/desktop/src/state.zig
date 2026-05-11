@@ -17,8 +17,11 @@ const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
 
+/// Arrow-key line step for transcript scroll (scaled px per key repeat).
+const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
+
 /// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
-const palette_ui_ttf = @embedFile("assets/fonts/CalSans-Regular.ttf");
+const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
 
 extern fn palette_text_gl_measure_codepoint_width(
     font_data: [*]const u8,
@@ -90,6 +93,7 @@ pub const PaletteModalTextFocus = enum {
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.14;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
@@ -97,18 +101,23 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_height = 48.0,
     .toolbar_gap = 14.0,
     .control_gap = 14.0,
-    .pill_padding_x = 16.0,
-    .pill_icon_gap = 10.0,
-    .pill_chevron_gap = 10.0,
-    .model_min_width = 138.0,
+    .pill_padding_x = 21.0,
+    .pill_icon_gap = 13.0,
+    .pill_chevron_gap = 22.0,
+    .model_min_width = 176.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 420.0,
-    .reasoning_min_width = 92.0,
-    .reasoning_max_width = 150.0,
-    .fast_min_width = 116.0,
-    .fast_max_width = 132.0,
-    .access_min_width = 172.0,
-    .access_max_width = 192.0,
+    .reasoning_min_width = 118.0,
+    .reasoning_max_width = 248.0,
+    .fast_min_width = 124.0,
+    .fast_max_width = 280.0,
+    .access_min_width = 218.0,
+    // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
+    .access_max_width = 328.0,
+    // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
+    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
+    .pill_overlay_icon_reserve = 29.0,
+    .pill_label_width_fudge = 14.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -116,6 +125,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
+    .menu_background_color = .{ .r = 0.075, .g = 0.09, .b = 0.105, .a = 1.0 },
+    .menu_border_color = .{ .r = 0.28, .g = 0.34, .b = 0.38, .a = 1.0 },
+    .menu_selected_color = .{ .r = 0.19, .g = 0.31, .b = 0.39, .a = 1.0 },
+    .menu_hover_color = .{ .r = 0.17, .g = 0.20, .b = 0.24, .a = 1.0 },
     .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .stop_button_color = .{ .r = 0.80, .g = 0.58, .b = 0.10, .a = 1.0 },
@@ -128,18 +141,21 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
-    .model_icon = "    ",
-    .fast_icon = "    ",
-    .access_icon = "    ",
+    .model_icon = "",
+    .fast_icon = "",
+    .access_icon = "",
     .chevron_icon = ">",
     .send_icon = "",
     .stop_icon = "x",
+    .z_index = 120,
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 400.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 40.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 10.0;
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
+const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
@@ -167,6 +183,18 @@ fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
         .context = null,
         .advance = paletteEstimatedFontAdvance,
     };
+}
+
+fn paletteComposerTextFontAdvance(context: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+    var measured = paletteEstimatedFontAdvance(context, text, byte_offset, font_size);
+    measured.width *= PALETTE_COMPOSER_TEXT_ADVANCE_SCALE;
+    return measured;
+}
+
+fn paletteComposerTextFontMetrics(font_size: f32) palette.FontMetrics {
+    var metrics = paletteEstimatedFontMetrics(font_size);
+    metrics.advance = paletteComposerTextFontAdvance;
+    return metrics;
 }
 
 const Mutex = struct {
@@ -408,10 +436,13 @@ fn paletteModelCascadeRenderRowLeading(
         .cursor => null,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
-    const sz = @min(leading_rect.w, leading_rect.h) * 0.68;
+    const inner = @min(leading_rect.w, leading_rect.h);
+    const sz = inner * @min(0.68 * 1.5, 0.96);
     const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
     const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
-    const r: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const slot: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, slot.x, slot.y, slot.w, slot.h));
+    const r: palette.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
     batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,
@@ -427,7 +458,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .max_depth = 2,
     .padding_x = 14.0,
     .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = 8.0,
+    .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
     .glyph_width = 10.8,
     .font_size = 20.0,
     .chevron_icon = ">",
@@ -435,9 +466,9 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .row_leading_width = 34.0,
     .row_leading_to_label_gap = 8.0,
     .render_row_leading = paletteModelCascadeRenderRowLeading,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 },
     .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 },
     .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
     .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
@@ -445,10 +476,12 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .scrollbar_width = 5.0,
     .corner_radius = 14.0,
     .border_width = 1.0,
-    .z_index = 200,
-    .submenu_z_offset = 10,
+    .z_index = 1400,
+    .submenu_z_offset = 20,
     .placement = .above,
     .submenu_placement = .right,
+    .avoid_forbidden_for_root = false,
+    .avoid_forbidden_for_submenus = true,
     .item_count = COMPOSER_PROVIDER_OPTIONS.len,
     .item_label = paletteModelCascadeLabel,
     .child_count = paletteModelCascadeChildCount,
@@ -567,6 +600,8 @@ const TranscriptMarkdownBody = struct {
 
 const TranscriptHeightEntry = struct {
     valid: bool = false,
+    role: ChatRole = .assistant,
+    assistant_plain_layout: bool = false,
     width: f32 = 0.0,
     body_hash: u64 = 0,
     author_hash: u64 = 0,
@@ -1032,14 +1067,20 @@ const FileSearchState = struct {
 };
 
 extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
+pub const TextureBackend = enum {
+    gl,
+    external,
+};
+
 pub const CachedImageTexture = struct {
-    texture_id: c_uint,
-    width: i32,
-    height: i32,
-    valid: bool,
+    texture_id: c_uint = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    valid: bool = false,
+    backend: TextureBackend = .gl,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0) return;
+        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
         var textures = [_]c_uint{self.texture_id};
         glDeleteTextures(1, &textures);
     }
@@ -1394,6 +1435,12 @@ pub const SidebarThreadHover = struct {
     thread_index: usize,
 };
 
+pub const SidebarContextMenuKind = enum {
+    none,
+    project,
+    thread,
+};
+
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1442,6 +1489,10 @@ pub const AppState = struct {
     palette_frame_text: std.ArrayList(u8),
     palette_modal_hits: std.ArrayList(PaletteModalHit),
     palette_modal_text_focus: PaletteModalTextFocus,
+    gl_texture_uploads_enabled: bool,
+    browser_textures_enabled: bool,
+    texture_upload_context: ?*anyopaque,
+    texture_upload_fn: ?TextureUploadFn,
     project_rename_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
@@ -1477,8 +1528,11 @@ pub const AppState = struct {
     thread_import_provider: ?Provider,
     thread_import_project_index: ?usize,
     thread_import_selected_index: ?usize,
+    /// Row index in `thread_import_threads` under the cursor (import modal list).
+    thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
+    project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
     file_search_state: FileSearchState,
@@ -1494,6 +1548,14 @@ pub const AppState = struct {
     browser_address_focused: bool,
     browser_address_cursor: usize,
     browser_inspector_menu_open: bool,
+    /// Split "Open" header menu (folder / editors); palette workspace chrome only.
+    workspace_header_open_menu_open: bool,
+    sidebar_context_menu_open: bool,
+    sidebar_context_menu_kind: SidebarContextMenuKind,
+    sidebar_context_menu_project_index: usize,
+    sidebar_context_menu_thread_index: usize,
+    sidebar_context_menu_anchor_x: f32,
+    sidebar_context_menu_anchor_y: f32,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1517,14 +1579,26 @@ pub const AppState = struct {
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
-    pending_transcript_line_scroll_steps: i16,
-    pending_transcript_page_scroll_steps: i16,
+    /// Keyboard fine scroll: applied once on next transcript layout (px); cleared after paint.
+    pending_transcript_scroll_px: f32,
+    pending_transcript_page_steps: i16,
+    transcript_scroll_pending_track_p: usize,
+    transcript_scroll_pending_track_t: usize,
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
     pending_send_count: usize,
 
-    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
+    pub const InitOptions = struct {
+        gl_texture_uploads_enabled: bool = true,
+        browser_textures_enabled: bool = true,
+        texture_upload_context: ?*anyopaque = null,
+        texture_upload_fn: ?TextureUploadFn = null,
+    };
+
+    pub const TextureUploadFn = *const fn (context: ?*anyopaque, loaded: stb_image.LoadedImage) ?CachedImageTexture;
+
+    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
         errdefer browser_state.deinit();
 
@@ -1573,6 +1647,10 @@ pub const AppState = struct {
             .palette_frame_text = .empty,
             .palette_modal_hits = .empty,
             .palette_modal_text_focus = .none,
+            .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
+            .browser_textures_enabled = options.browser_textures_enabled,
+            .texture_upload_context = options.texture_upload_context,
+            .texture_upload_fn = options.texture_upload_fn,
             .project_rename_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
@@ -1608,8 +1686,10 @@ pub const AppState = struct {
             .thread_import_provider = null,
             .thread_import_project_index = null,
             .thread_import_selected_index = null,
+            .thread_import_hover_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
+            .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
             .file_search_state = .{},
@@ -1624,6 +1704,13 @@ pub const AppState = struct {
             .browser_address_focused = false,
             .browser_address_cursor = 0,
             .browser_inspector_menu_open = false,
+            .workspace_header_open_menu_open = false,
+            .sidebar_context_menu_open = false,
+            .sidebar_context_menu_kind = .none,
+            .sidebar_context_menu_project_index = 0,
+            .sidebar_context_menu_thread_index = 0,
+            .sidebar_context_menu_anchor_x = 0.0,
+            .sidebar_context_menu_anchor_y = 0.0,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -1645,8 +1732,10 @@ pub const AppState = struct {
             .transcript_markdown_entries = .empty,
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
-            .pending_transcript_line_scroll_steps = 0,
-            .pending_transcript_page_scroll_steps = 0,
+            .pending_transcript_scroll_px = 0,
+            .pending_transcript_page_steps = 0,
+            .transcript_scroll_pending_track_p = std.math.maxInt(usize),
+            .transcript_scroll_pending_track_t = std.math.maxInt(usize),
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
@@ -1661,16 +1750,35 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        state.logo_texture = utils.loadEmbeddedTexture(VERDE_LOGO_BYTES);
-        state.opencode_logo_texture = utils.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
-        state.codex_logo_texture = utils.loadEmbeddedTexture(CODEX_LOGO_BYTES);
-        state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
-        state.cursor_logo_texture = utils.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
-        state.emacs_logo_texture = utils.loadEmbeddedTexture(EMACS_LOGO_BYTES);
-        state.neovim_logo_texture = utils.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
-        state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
-        state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        if (options.gl_texture_uploads_enabled or options.texture_upload_fn != null) {
+            state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
+            state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
+            state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
+            state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
+            state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
+            state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
+            state.neovim_logo_texture = state.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
+            state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
+            state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        }
         return state;
+    }
+
+    fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
+        const loaded = stb_image.loadFromMemory(bytes) catch |err| {
+            log.err("failed to decode embedded texture: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer loaded.deinit();
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    fn uploadLoadedTexture(self: *AppState, loaded: stb_image.LoadedImage) ?CachedImageTexture {
+        if (self.texture_upload_fn) |upload_fn| {
+            return upload_fn(self.texture_upload_context, loaded);
+        }
+        if (!self.gl_texture_uploads_enabled) return null;
+        return uploadTexture(loaded);
     }
 
     pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
@@ -2056,10 +2164,16 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        log.info("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
+            runtime_log.diagnostic("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            log.warn("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.setSidebarNotice(@errorName(err));
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory target_path={s}", .{target_path});
+        log.info("browseForProjectDirectory target_path={s}", .{target_path});
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
             self.allocator.free(target_path);
@@ -2072,6 +2186,8 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
+            runtime_log.diagnostic("browseForProjectDirectory ignored: picker already pending", .{});
+            log.info("browseForProjectDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.setSidebarNotice("Folder picker already open.");
             return;
@@ -2082,10 +2198,29 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
+            runtime_log.diagnostic("browseForProjectDirectory failed to spawn picker worker", .{});
+            log.warn("browseForProjectDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory spawned picker worker", .{});
+        log.info("browseForProjectDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
+    }
+
+    pub fn requestBrowseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("requestBrowseForProjectDirectory queued", .{});
+        log.info("requestBrowseForProjectDirectory queued", .{});
+        self.project_directory_browse_requested = true;
+        self.markDirty();
+    }
+
+    pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
+        if (!self.project_directory_browse_requested) return;
+        runtime_log.diagnostic("processDeferredProjectDirectoryBrowse running", .{});
+        log.info("processDeferredProjectDirectoryBrowse running", .{});
+        self.project_directory_browse_requested = false;
+        self.browseForProjectDirectory();
     }
 
     fn renameSelectedProject(self: *AppState) void {
@@ -2159,7 +2294,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2275,7 +2410,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2352,7 +2487,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -3168,6 +3303,8 @@ pub const AppState = struct {
             return;
         }
 
+        log.info("runDefaultOpenAction invoked for project path={s}", .{self.currentProject().path});
+
         switch (self.app_config.default_open_action) {
             .folder => self.openCurrentProjectDirectory(),
             .editor => self.openCurrentProjectEditor(.configured),
@@ -3217,6 +3354,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project folder.");
             return;
         };
+        log.info("openCurrentProjectDirectory completed", .{});
         self.setSidebarNotice("Opened project folder.");
     }
 
@@ -3231,6 +3369,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project editor.");
             return;
         };
+        log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
         self.setSidebarNotice(projectEditorOpenedNotice(target));
     }
 
@@ -3506,6 +3645,8 @@ pub const AppState = struct {
     }
 
     pub fn ensureImageTexture(self: *AppState, path: [:0]const u8) ?CachedImageTexture {
+        if (!self.gl_texture_uploads_enabled and self.texture_upload_fn == null) return null;
+
         if (self.image_texture_cache.getPtr(path)) |cached| {
             return if (cached.valid) cached.* else null;
         }
@@ -3525,7 +3666,7 @@ pub const AppState = struct {
         };
         defer loaded.deinit();
 
-        const cached = uploadTexture(loaded) orelse {
+        const cached = self.uploadLoadedTexture(loaded) orelse {
             self.image_texture_cache.put(owned_key, .{
                 .texture_id = 0,
                 .width = 0,
@@ -3723,6 +3864,13 @@ pub const AppState = struct {
         self.composer_focused = false;
     }
 
+    pub fn closeSidebarContextMenu(self: *AppState) void {
+        if (!self.sidebar_context_menu_open) return;
+        self.sidebar_context_menu_open = false;
+        self.sidebar_context_menu_kind = .none;
+        self.markDirty();
+    }
+
     pub fn selectAllTranscriptMarkdownSelection(
         self: *AppState,
         first_message_index: usize,
@@ -3762,7 +3910,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
     ) ?f32 {
         const thread = self.currentThreadMutable();
@@ -3771,6 +3921,8 @@ pub const AppState = struct {
 
         const entry = thread.transcript_height_entries.items[message_index];
         if (!entry.valid) return null;
+        if (entry.role != role) return null;
+        if (entry.assistant_plain_layout != assistant_plain_layout) return null;
         if (@abs(entry.width - width) > 0.5) return null;
         if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
         if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
@@ -3783,7 +3935,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
         height: f32,
     ) void {
@@ -3794,6 +3948,8 @@ pub const AppState = struct {
 
         thread.transcript_height_entries.items[message_index] = .{
             .valid = true,
+            .role = role,
+            .assistant_plain_layout = assistant_plain_layout,
             .width = width,
             .body_hash = std.hash.Wyhash.hash(0, body),
             .author_hash = std.hash.Wyhash.hash(0, author),
@@ -4052,7 +4208,11 @@ pub const AppState = struct {
 
         const is_visible = dock.toggle();
         if (!is_visible) self.endTerminalResizeDrag();
-        self.terminal_focused = is_visible;
+        if (is_visible) {
+            self.requestTerminalFocus();
+        } else {
+            self.terminal_focused = false;
+        }
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
@@ -4086,6 +4246,8 @@ pub const AppState = struct {
 
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
@@ -4096,6 +4258,11 @@ pub const AppState = struct {
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) {
+            self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+            return;
+        }
+
         if (self.browser_state.controls_visible) {
             self.hideBrowser();
             return;
@@ -4371,6 +4538,8 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
 
         if (self.browser_launch_open_delay_frames > 0) {
@@ -4788,6 +4957,15 @@ pub const AppState = struct {
         self.browser_pane_focused = false;
     }
 
+    pub fn requestTerminalFocus(self: *AppState) void {
+        self.terminal_focused = true;
+        self.composer_focused = false;
+        self.palette_composer.focused = false;
+        self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.palette_modal_text_focus = .none;
+    }
+
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
         const requested = self.composer_focus_requested;
         self.composer_focus_requested = false;
@@ -4842,13 +5020,14 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
-        self.palette_composer.setFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
         const show_fast_toggle = thread.provider == .codex;
         self.palette_composer.setShowFastToggle(show_fast_toggle);
-        self.palette_composer.setPlaceholder(self.allocator, if (thread.draftImageCount() == 0) "Ask anything, or use / to show available commands" else " ") catch |err| {
+        const hide_placeholder = thread.draftImageCount() > 0;
+        self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
@@ -4919,19 +5098,29 @@ pub const AppState = struct {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
 
+        const composer_rect: palette.Rect = if (self.composer_input_bounds_valid) .{
+            .x = self.composer_input_min[0],
+            .y = self.composer_input_min[1],
+            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
+            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
+        } else anchor;
         const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
+        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + COMPOSER_MODEL_CASCADE_GAP;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const viewport_top: f32 = 8.0;
+        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y + composer_rect.h);
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        self.palette_model_cascade.setAnchorRect(anchor);
-        self.palette_model_cascade.clearForbiddenRect();
+        var menu_anchor = anchor;
+        menu_anchor.y += COMPOSER_MODEL_CASCADE_ROOT_DROP;
+        self.palette_model_cascade.setAnchorRect(menu_anchor);
+        self.palette_model_cascade.setForbiddenRect(self.palette_composer.toolbarRect());
         self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
-            .y = 8.0,
+            .y = viewport_top,
             .w = @max(max_x - min_x, total_width),
-            .h = @max(anchor.y - 16.0, root_height),
+            .h = @max(viewport_bottom - viewport_top, root_height),
         });
         self.palette_model_cascade.setBounds(.{
             .x = x,
@@ -4945,6 +5134,8 @@ pub const AppState = struct {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
         self.syncPaletteModelCascadeMenu();
         self.setPaletteModelCascadeBoundsFromToolbar();
         _ = self.palette_model_cascade.handleInput(.open);
@@ -4969,7 +5160,15 @@ pub const AppState = struct {
         }
     }
 
+    fn currentThreadNeedsProviderModelCascade(self: *const AppState) bool {
+        const thread = self.currentThread();
+        return thread.messages.items.len == 0 and
+            thread.provider_thread_id == null and
+            !thread.isSendPendingForUi();
+    }
+
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
@@ -4983,6 +5182,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.terminal_focused) return false;
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
         if (palette_key.primary and palette_key.code == .v) {
             runtime_log.diagnostic(
@@ -5035,7 +5235,7 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point)) {
+        if (self.composer_toolbar_model_rect.contains(point) and self.currentThreadNeedsProviderModelCascade()) {
             self.openPaletteModelCascadeMenu();
             self.palette_composer.focused = false;
             self.composer_focused = false;
@@ -5053,6 +5253,7 @@ pub const AppState = struct {
         else
             return false;
 
+        _ = self.palette_model_cascade.handleInput(.close);
         const target_point: palette.draw.Vec2 = .{
             .x = target.x + target.w * 0.5,
             .y = target.y + target.h * 0.5,
@@ -5146,7 +5347,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
@@ -5514,11 +5715,11 @@ pub const AppState = struct {
     pub fn markDirty(self: *AppState) void {
         self.noteInteraction();
         self.dirty = true;
-        self.last_dirty_at_ms = 0;
+        self.last_dirty_at_ms = unixTimestampMs();
     }
 
     pub fn noteInteraction(self: *AppState) void {
-        self.last_interaction_at_ms = 0;
+        self.last_interaction_at_ms = unixTimestampMs();
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
@@ -5528,6 +5729,8 @@ pub const AppState = struct {
         self.currentThreadMutable().transcript_scroll_valid = false;
         self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
+        self.pending_transcript_scroll_px = 0;
+        self.pending_transcript_page_steps = 0;
     }
 
     pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
@@ -5535,8 +5738,8 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
-        self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
+        self.pending_transcript_scroll_px += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_KEYBOARD_LINE_PX);
+        self.markDirty();
     }
 
     pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
@@ -5544,8 +5747,9 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
-        self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
+        const next = @as(i32, self.pending_transcript_page_steps) + @as(i32, delta);
+        self.pending_transcript_page_steps = @intCast(std.math.clamp(next, -12, 12));
+        self.markDirty();
     }
 
     pub fn importDirectoryDraft(self: *const AppState) []const u8 {
@@ -5597,6 +5801,7 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
+        self.markDirty();
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -5605,14 +5810,25 @@ pub const AppState = struct {
         }
         self.thread_import_threads.clearRetainingCapacity();
         self.thread_import_selected_index = null;
+        self.thread_import_hover_index = null;
     }
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
-        if (0 - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
-        if (0 - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+        const now = unixTimestampMs();
+        if (now - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (now - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
 
         self.flushDirtyNow();
+    }
+
+    fn flushDirtyBlocking(self: *AppState) void {
+        if (!self.dirty) return;
+        self.storage.save(self) catch |err| {
+            log.err("failed to save native state: {s}", .{@errorName(err)});
+            return;
+        };
+        self.dirty = false;
     }
 
     fn flushDirtyNow(self: *AppState) void {
@@ -5644,7 +5860,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
         }
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.clearProjects();
 
         if (try self.storage.load(self.allocator)) |persisted_value| {
@@ -5697,7 +5913,7 @@ pub const AppState = struct {
         self.finishOpencodeModelCacheThread();
         self.finishAllSendThreads();
         self.pollSend();
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
@@ -5765,6 +5981,8 @@ pub const AppState = struct {
         self.picker_state.mutex.unlock();
 
         if (next_status != .idle) {
+            runtime_log.diagnostic("pollPicker completed status={s}", .{@tagName(next_status)});
+            log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
         }
 
