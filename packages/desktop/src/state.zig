@@ -93,7 +93,7 @@ pub const PaletteModalTextFocus = enum {
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
-const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.14;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
@@ -156,7 +156,7 @@ const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
 const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
 const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .cursor };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -282,19 +282,25 @@ fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
         if (index >= CODEX_REASONING_OPTIONS.len) return "";
         return CODEX_REASONING_OPTIONS[index].label;
     }
+    if (thread.provider == .cursor) {
+        const rows = state.opencode_reasoning_menu.items;
+        if (index >= rows.len) return "";
+        return rows[index].label;
+    }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
     return rows[index].label;
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
-    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..]);
+    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..], state.cursorModelOptionsSnapshot());
 }
 
 fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
+        .cursor => DEFAULT_CURSOR_MODEL,
     };
 }
 
@@ -347,7 +353,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.markDirty();
         },
         .fast_changed => |enabled| {
-            if (state.currentThread().provider != .codex) return;
+            if (state.currentThread().provider != .codex and state.currentThread().provider != .cursor) return;
             const next: FastMode = if (enabled) .on else .off;
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
@@ -432,6 +438,7 @@ fn paletteModelCascadeRenderRowLeading(
     const tex = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .cursor => state.cursor_logo_texture,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
     const inner = @min(leading_rect.w, leading_rect.h);
@@ -513,8 +520,10 @@ pub const log = std.log.scoped(.native_shell);
 pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
+const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
+pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
@@ -562,6 +571,10 @@ pub const ModelOption = struct {
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
     reasoning_variant_keys: ?[][:0]const u8 = null,
+    cursor_fast_supported: bool = false,
+    cursor_reasoning_param_id: ?[:0]const u8 = null,
+    cursor_reasoning_values: ?[][:0]const u8 = null,
+    cursor_reasoning_requires_thinking: bool = false,
 };
 
 const OpencodeReasoningMenuRow = struct {
@@ -569,6 +582,25 @@ const OpencodeReasoningMenuRow = struct {
     /// Null selects the default (no `variant` field on the wire).
     variant: ?[:0]const u8,
 };
+
+const PersistedCursorModelOption = struct {
+    label: []const u8,
+    value: []const u8,
+    fast_supported: bool = false,
+    reasoning_param_id: ?[]const u8 = null,
+    reasoning_values: ?[]const []const u8 = null,
+    reasoning_requires_thinking: bool = false,
+};
+
+fn cursorReasoningValueLabel(value: []const u8) []const u8 {
+    if (std.mem.eql(u8, value, "low")) return "Low";
+    if (std.mem.eql(u8, value, "medium")) return "Medium";
+    if (std.mem.eql(u8, value, "high")) return "High";
+    if (std.mem.eql(u8, value, "extra-high") or std.mem.eql(u8, value, "xhigh")) return "Extra High";
+    if (std.mem.eql(u8, value, "max")) return "Max";
+    if (std.mem.eql(u8, value, "none")) return "None";
+    return value;
+}
 
 pub const ReasoningOption = struct {
     label: [:0]const u8,
@@ -663,6 +695,15 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.3 Codex Spark", .value = "gpt-5.3-codex-spark" },
     .{ .label = "GPT-5.2 Codex", .value = "gpt-5.2-codex" },
     .{ .label = "GPT-5.2", .value = "gpt-5.2" },
+};
+
+pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Auto", .value = "default" },
+    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL },
+    .{ .label = "GPT-5.5", .value = "gpt-5.5" },
+    .{ .label = "GPT-5.4", .value = "gpt-5.4" },
+    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
+    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
@@ -862,10 +903,14 @@ pub const ChatThread = struct {
         self.send_state.mutex.lock();
         const maybe_worker = self.send_state.worker;
         self.send_state.worker = null;
+        const status = self.send_state.status;
+        const provider = self.provider;
         self.send_state.mutex.unlock();
 
         if (maybe_worker) |worker| {
+            runtime_log.diagnostic("shutdown joining send thread provider={s} status={s}", .{ @tagName(provider), @tagName(status) });
             worker.join();
+            runtime_log.diagnostic("shutdown joined send thread provider={s}", .{@tagName(provider)});
         }
     }
 
@@ -974,6 +1019,15 @@ const OpencodeModelCacheStatus = enum {
 const OpencodeModelCacheState = struct {
     mutex: Mutex = .{},
     status: OpencodeModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+const CursorModelCacheStatus = OpencodeModelCacheStatus;
+
+const CursorModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: CursorModelCacheStatus = .idle,
     models: ?[]ai_harness.ModelInfo = null,
     worker: ?std.Thread = null,
 };
@@ -1509,6 +1563,7 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
+    cursor_model_options: std.ArrayList(ModelOption),
     opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
@@ -1533,6 +1588,7 @@ pub const AppState = struct {
     project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
+    cursor_model_cache_state: CursorModelCacheState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
     browser_launch_open_delay_frames: u8,
@@ -1667,6 +1723,7 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
+            .cursor_model_options = .empty,
             .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
@@ -1690,6 +1747,7 @@ pub const AppState = struct {
             .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
+            .cursor_model_cache_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
             .browser_launch_open_delay_frames = 0,
@@ -1748,6 +1806,10 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
+        state.loadCursorModelOptionsDiskCache() catch |err| {
+            log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
+            state.clearCursorModelOptions();
+        };
         if (options.gl_texture_uploads_enabled or options.texture_upload_fn != null) {
             state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
             state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
@@ -1786,9 +1848,17 @@ pub const AppState = struct {
             OPENCODE_MODEL_OPTIONS[0..];
     }
 
+    pub fn cursorModelOptionsSnapshot(self: *const AppState) []const ModelOption {
+        return if (self.cursor_model_options.items.len > 0)
+            self.cursor_model_options.items
+        else
+            CURSOR_MODEL_OPTIONS[0..];
+    }
+
     pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
+            .cursor => DEFAULT_CURSOR_MODEL,
             .opencode => blk: {
                 for (self.opencodeModelOptionsSnapshot()) |option| {
                     if (option.value) |value| break :blk value;
@@ -1800,6 +1870,10 @@ pub const AppState = struct {
 
     pub fn startOpencodeModelOptionsRefresh(self: *AppState) void {
         self.refreshOpencodeModelOptionsCacheAsync();
+    }
+
+    pub fn startCursorModelOptionsRefresh(self: *AppState) void {
+        self.refreshCursorModelOptionsCacheAsync();
     }
 
     fn refreshOpencodeModelOptionsCacheAsync(self: *AppState) void {
@@ -1814,6 +1888,22 @@ pub const AppState = struct {
             &self.opencode_model_cache_state,
         }) catch {
             self.opencode_model_cache_state.status = .idle;
+            return;
+        };
+    }
+
+    fn refreshCursorModelOptionsCacheAsync(self: *AppState) void {
+        self.pollCursorModelOptionsCache();
+
+        self.cursor_model_cache_state.mutex.lock();
+        defer self.cursor_model_cache_state.mutex.unlock();
+        if (self.cursor_model_cache_state.status == .pending) return;
+
+        self.cursor_model_cache_state.status = .pending;
+        self.cursor_model_cache_state.worker = std.Thread.spawn(.{}, cursorModelCacheWorker, .{
+            &self.cursor_model_cache_state,
+        }) catch {
+            self.cursor_model_cache_state.status = .idle;
             return;
         };
     }
@@ -1931,6 +2021,34 @@ pub const AppState = struct {
         return asciiCaseInsensitiveCompare(a.model_id, b.model_id) == .lt;
     }
 
+    fn populateCursorModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
+        for (models) |model| {
+            if (model.model_id.len == 0) continue;
+            const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const label = try self.allocator.dupeZ(u8, label_text);
+            errdefer self.allocator.free(label);
+            const value = try self.allocator.dupeZ(u8, model.model_id);
+            errdefer self.allocator.free(value);
+            const reasoning_param_id = if (model.cursor_reasoning_param_id) |param_id| try self.allocator.dupeZ(u8, param_id) else null;
+            errdefer if (reasoning_param_id) |param_id| self.allocator.free(param_id);
+            const cursor_reasoning_values = try duplicateReasoningVariantKeys(self.allocator, model.cursor_reasoning_values);
+            errdefer if (cursor_reasoning_values) |values| {
+                for (values) |reasoning_value| self.allocator.free(reasoning_value);
+                self.allocator.free(values);
+            };
+
+            try self.cursor_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+                .reasoning_supported = model.reasoning_supported,
+                .cursor_fast_supported = model.cursor_fast_supported,
+                .cursor_reasoning_param_id = reasoning_param_id,
+                .cursor_reasoning_values = cursor_reasoning_values,
+                .cursor_reasoning_requires_thinking = model.cursor_reasoning_requires_thinking,
+            });
+        }
+    }
+
     fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order {
         var index: usize = 0;
         const min_len = @min(a.len, b.len);
@@ -1990,6 +2108,7 @@ pub const AppState = struct {
         self.clearOpencodeReasoningMenu();
         errdefer self.clearOpencodeReasoningMenu();
 
+        if (thread.provider == .cursor) return self.refreshCursorReasoningMenu(thread);
         if (thread.provider != .opencode) return;
         const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
         if (!opt.reasoning_supported) return;
@@ -2004,6 +2123,80 @@ pub const AppState = struct {
             const variant_copy = try self.allocator.dupeZ(u8, key);
             try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
         }
+    }
+
+    fn refreshCursorReasoningMenu(self: *AppState, thread: *const ChatThread) !void {
+        const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return;
+        const values = opt.cursor_reasoning_values orelse return;
+        if (values.len == 0) return;
+
+        const default_label = try self.allocator.dupeZ(u8, "Default");
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = default_label, .variant = null });
+
+        for (values) |value| {
+            const label_text = cursorReasoningValueLabel(value);
+            const label = try self.allocator.dupeZ(u8, label_text);
+            const variant_copy = try self.allocator.dupeZ(u8, value);
+            try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+        }
+    }
+
+    fn cursorModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
+        const ref = model_ref orelse DEFAULT_CURSOR_MODEL;
+        for (self.cursorModelOptionsSnapshot()) |opt| {
+            if (opt.value) |v| {
+                if (std.mem.eql(u8, ref, v)) return opt;
+            }
+        }
+        return null;
+    }
+
+    fn cursorModelParamsJsonAlloc(self: *const AppState, allocator: std.mem.Allocator, thread: *const ChatThread) !?[]u8 {
+        if (thread.provider != .cursor) return null;
+        const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return null;
+
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginArray();
+        var wrote_any = false;
+
+        if (opt.cursor_reasoning_requires_thinking and thread.opencode_reasoning_variant != null) {
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write("thinking");
+            try stringify.objectField("value");
+            try stringify.write("true");
+            try stringify.endObject();
+            wrote_any = true;
+        }
+        if (opt.cursor_reasoning_param_id) |param_id| {
+            if (thread.opencode_reasoning_variant) |value| {
+                try stringify.beginObject();
+                try stringify.objectField("id");
+                try stringify.write(std.mem.sliceTo(param_id, 0));
+                try stringify.objectField("value");
+                try stringify.write(std.mem.sliceTo(value, 0));
+                try stringify.endObject();
+                wrote_any = true;
+            }
+        }
+        if (opt.cursor_fast_supported) {
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write("fast");
+            try stringify.objectField("value");
+            try stringify.write(if (thread.fast_mode == .on) "true" else "false");
+            try stringify.endObject();
+            wrote_any = true;
+        }
+
+        try stringify.endArray();
+        if (!wrote_any) {
+            writer.deinit();
+            return null;
+        }
+        return try writer.toOwnedSlice();
     }
 
     fn normalizeOpencodeReasoningVariant(self: *AppState, thread: *ChatThread) void {
@@ -2060,6 +2253,118 @@ pub const AppState = struct {
 
     fn clearOpencodeModelOptions(self: *AppState) void {
         self.clearDynamicOpencodeModelOptions();
+    }
+
+    fn clearDynamicCursorModelOptions(self: *AppState) void {
+        for (self.cursor_model_options.items) |option| {
+            self.allocator.free(option.label);
+            if (option.value) |value| self.allocator.free(value);
+            if (option.reasoning_variant_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
+            if (option.cursor_reasoning_param_id) |param_id| self.allocator.free(param_id);
+            if (option.cursor_reasoning_values) |values| {
+                for (values) |value| self.allocator.free(value);
+                self.allocator.free(values);
+            }
+        }
+        self.cursor_model_options.clearRetainingCapacity();
+    }
+
+    fn clearCursorModelOptions(self: *AppState) void {
+        self.clearDynamicCursorModelOptions();
+    }
+
+    fn loadCursorModelOptionsDiskCache(self: *AppState) !void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.storage.pref_path, .{});
+        defer dir.close(threaded.io());
+
+        const bytes = dir.readFileAlloc(threaded.io(), CURSOR_MODEL_CACHE_FILE_NAME, self.allocator, .limited(512 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(bytes);
+
+        var parsed = try std.json.parseFromSlice([]PersistedCursorModelOption, self.allocator, bytes, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+
+        self.clearCursorModelOptions();
+        errdefer self.clearCursorModelOptions();
+        for (parsed.value) |option| {
+            if (option.label.len == 0 or option.value.len == 0) continue;
+            const label = try self.allocator.dupeZ(u8, option.label);
+            errdefer self.allocator.free(label);
+            const value = try self.allocator.dupeZ(u8, option.value);
+            errdefer self.allocator.free(value);
+            const reasoning_param_id = if (option.reasoning_param_id) |param_id| try self.allocator.dupeZ(u8, param_id) else null;
+            errdefer if (reasoning_param_id) |param_id| self.allocator.free(param_id);
+            const reasoning_values = if (option.reasoning_values) |values| blk: {
+                const out = try self.allocator.alloc([:0]const u8, values.len);
+                errdefer {
+                    for (out) |v| self.allocator.free(v);
+                    self.allocator.free(out);
+                }
+                for (values, 0..) |v, i| out[i] = try self.allocator.dupeZ(u8, v);
+                break :blk out;
+            } else null;
+            errdefer if (reasoning_values) |values| {
+                for (values) |v| self.allocator.free(v);
+                self.allocator.free(values);
+            };
+            try self.cursor_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+                .cursor_fast_supported = option.fast_supported,
+                .cursor_reasoning_param_id = reasoning_param_id,
+                .cursor_reasoning_values = reasoning_values,
+                .cursor_reasoning_requires_thinking = option.reasoning_requires_thinking,
+            });
+        }
+    }
+
+    fn saveCursorModelOptionsDiskCache(self: *AppState) !void {
+        if (self.cursor_model_options.items.len == 0) return;
+
+        var persisted: std.ArrayList(PersistedCursorModelOption) = .empty;
+        defer persisted.deinit(self.allocator);
+        for (self.cursor_model_options.items) |option| {
+            const value = option.value orelse continue;
+            try persisted.append(self.allocator, .{
+                .label = std.mem.sliceTo(option.label, 0),
+                .value = std.mem.sliceTo(value, 0),
+                .fast_supported = option.cursor_fast_supported,
+                .reasoning_param_id = if (option.cursor_reasoning_param_id) |param_id| std.mem.sliceTo(param_id, 0) else null,
+                .reasoning_values = if (option.cursor_reasoning_values) |values| blk: {
+                    const out = try self.allocator.alloc([]const u8, values.len);
+                    for (values, 0..) |v, i| out[i] = std.mem.sliceTo(v, 0);
+                    break :blk out;
+                } else null,
+                .reasoning_requires_thinking = option.cursor_reasoning_requires_thinking,
+            });
+        }
+        defer {
+            for (persisted.items) |option| {
+                if (option.reasoning_values) |values| self.allocator.free(values);
+            }
+        }
+        if (persisted.items.len == 0) return;
+
+        const json = try std.json.Stringify.valueAlloc(self.allocator, persisted.items, .{ .whitespace = .minified });
+        defer self.allocator.free(json);
+
+        const path = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, CURSOR_MODEL_CACHE_FILE_NAME });
+        defer self.allocator.free(path);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
+        defer file.close(threaded.io());
+        try file.writeStreamingAll(threaded.io(), json);
     }
 
     const AddProjectResult = enum {
@@ -2301,6 +2606,7 @@ pub const AppState = struct {
                     .launch_if_missing = true,
                 },
             },
+            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2416,6 +2722,7 @@ pub const AppState = struct {
                     .launch_if_missing = true,
                 },
             },
+            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2491,6 +2798,10 @@ pub const AppState = struct {
                     .working_directory = project.path,
                     .launch_if_missing = true,
                 },
+            },
+            .cursor => {
+                self.setSidebarNotice(syncThreadFailureMessage(provider, error.UnsupportedOperation));
+                return;
             },
         };
 
@@ -2726,6 +3037,7 @@ pub const AppState = struct {
         const kind: FollowupKind = switch (thread.provider) {
             .codex => .steer,
             .opencode => .queue,
+            .cursor => .queue,
         };
 
         const send_state = thread.send_state;
@@ -2773,6 +3085,7 @@ pub const AppState = struct {
         return switch (thread.provider) {
             .codex => "Tab to steer",
             .opencode => "Tab to queue",
+            .cursor => "Tab to queue",
         };
     }
 
@@ -2798,10 +3111,19 @@ pub const AppState = struct {
                     .launch_on_connect = false,
                 },
             },
+            .cursor => ai_harness.ProviderConfig{
+                .cursor = .{
+                    .cwd = project.path,
+                    .model = if (thread.model_ref) |model_ref| model_ref else null,
+                },
+            },
         };
 
         var client = try ai_harness.connect(self.allocator, provider_config);
         defer client.deinit();
+
+        const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(self.allocator, thread) else null;
+        defer if (cursor_model_params_json) |params| self.allocator.free(params);
 
         return client.sendPrompt(self.allocator, .{
             .thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
@@ -2810,6 +3132,7 @@ pub const AppState = struct {
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
             .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+            .cursor_model_params_json = cursor_model_params_json,
             .reasoning_effort = if (thread.provider == .opencode and thread.opencode_reasoning_variant != null) null else thread.reasoning_effort,
             .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
             .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
@@ -2836,6 +3159,11 @@ pub const AppState = struct {
                 .codex = .{
                     .cwd = project_path,
                     .launch_on_connect = false,
+                },
+            },
+            .cursor => ai_harness.ProviderConfig{
+                .cursor = .{
+                    .cwd = project_path,
                 },
             },
         };
@@ -2902,6 +3230,7 @@ pub const AppState = struct {
                 }
                 break :blk null;
             },
+            .cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null,
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
         };
@@ -2915,6 +3244,7 @@ pub const AppState = struct {
             page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
             if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
+            if (request.cursor_model_params_json) |params| page_alloc.free(params);
         }
 
         const send_state = thread.send_state;
@@ -5002,7 +5332,8 @@ pub const AppState = struct {
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
-        const show_fast_toggle = thread.provider == .codex;
+        const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
+        const show_fast_toggle = thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
         self.palette_composer.setShowFastToggle(show_fast_toggle);
         const hide_placeholder = thread.draftImageCount() > 0;
         self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
@@ -5111,6 +5442,9 @@ pub const AppState = struct {
     pub fn openPaletteModelCascadeMenu(self: *AppState) void {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
+        }
+        if (self.cursor_model_options.items.len == 0) {
+            self.refreshCursorModelOptionsCacheAsync();
         }
         self.palette_composer.active_menu = null;
         self.palette_composer.hovered_menu_index = null;
@@ -5463,6 +5797,17 @@ pub const AppState = struct {
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
         self.normalizeOpencodeReasoningVariant(thread);
+        if (thread.provider == .cursor) {
+            if (thread.opencode_reasoning_variant) |v| {
+                self.allocator.free(v);
+                thread.opencode_reasoning_variant = null;
+            }
+            if (self.cursorModelOptionForRef(thread.model_ref)) |opt| {
+                if (!opt.cursor_fast_supported) thread.fast_mode = .off;
+            } else {
+                thread.fast_mode = .off;
+            }
+        }
         self.markDirty();
     }
 
@@ -5849,6 +6194,7 @@ pub const AppState = struct {
             try self.seedDefaultState();
         }
         self.refreshOpencodeModelOptionsCacheAsync();
+        self.refreshCursorModelOptionsCacheAsync();
 
         self.setSidebarNotice("App refreshed from disk.");
         self.requestTranscriptScrollToBottom();
@@ -5885,13 +6231,23 @@ pub const AppState = struct {
     }
 
     pub fn deinit(self: *AppState) void {
+        runtime_log.diagnostic("AppState.deinit begin", .{});
         self.preparePendingSendsForShutdown();
-        ai_harness.shutdownOwnedProviderProcesses();
+        runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
+        runtime_log.diagnostic("AppState.deinit picker finished", .{});
         self.finishOpencodeModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit opencode model cache finished", .{});
+        self.finishCursorModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishAllSendThreads();
+        runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         self.pollSend();
+        runtime_log.diagnostic("AppState.deinit sends polled", .{});
+        ai_harness.shutdownOwnedProviderProcesses();
+        runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
         self.flushDirtyBlocking();
+        runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
@@ -5904,11 +6260,14 @@ pub const AppState = struct {
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         self.clearOpencodeModelOptions();
+        self.clearCursorModelOptions();
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
+        self.cursor_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
+        runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
     fn preparePendingSendsForShutdown(self: *AppState) void {
@@ -6029,6 +6388,52 @@ pub const AppState = struct {
             },
             .failed => {
                 log.warn("failed to refresh OpenCode model cache", .{});
+            },
+            else => {},
+        }
+    }
+
+    pub fn pollCursorModelOptionsCache(self: *AppState) void {
+        var loaded_models: ?[]ai_harness.ModelInfo = null;
+        var next_status: CursorModelCacheStatus = .idle;
+
+        self.cursor_model_cache_state.mutex.lock();
+        switch (self.cursor_model_cache_state.status) {
+            .completed => {
+                loaded_models = self.cursor_model_cache_state.models;
+                self.cursor_model_cache_state.models = null;
+                self.cursor_model_cache_state.status = .idle;
+                next_status = .completed;
+            },
+            .failed => {
+                self.cursor_model_cache_state.status = .idle;
+                next_status = .failed;
+            },
+            else => {},
+        }
+        self.cursor_model_cache_state.mutex.unlock();
+
+        if (next_status != .idle) {
+            self.finishCursorModelCacheThread();
+        }
+
+        switch (next_status) {
+            .completed => {
+                const models = loaded_models orelse return;
+                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+                self.clearCursorModelOptions();
+                if (models.len == 0) return;
+                self.populateCursorModelOptions(models) catch |err| {
+                    log.warn("failed to cache Cursor models: {s}", .{@errorName(err)});
+                    self.clearDynamicCursorModelOptions();
+                    return;
+                };
+                self.saveCursorModelOptionsDiskCache() catch |err| {
+                    log.warn("failed to save Cursor model cache: {s}", .{@errorName(err)});
+                };
+            },
+            .failed => {
+                log.warn("failed to refresh Cursor model cache", .{});
             },
             else => {},
         }
@@ -6456,6 +6861,23 @@ pub const AppState = struct {
         }
     }
 
+    fn finishCursorModelCacheThread(self: *AppState) void {
+        self.cursor_model_cache_state.mutex.lock();
+        const maybe_worker = self.cursor_model_cache_state.worker;
+        self.cursor_model_cache_state.worker = null;
+        const maybe_models = self.cursor_model_cache_state.models;
+        self.cursor_model_cache_state.models = null;
+        self.cursor_model_cache_state.status = .idle;
+        self.cursor_model_cache_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+        if (maybe_models) |models| {
+            ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        }
+    }
+
     fn finishAllSendThreads(self: *AppState) void {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
@@ -6486,6 +6908,7 @@ pub const AppState = struct {
         send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
+        runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
         send_state.mutex.unlock();
 
         self.issuePendingThreadStop(project_path, thread);
@@ -6754,6 +7177,12 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "This provider does not support thread imports.",
             else => "Failed to load OpenCode threads.",
         },
+        .cursor => switch (err) {
+            error.FileNotFound => "Node was not found on PATH for Cursor.",
+            error.CursorSignedOut => "Cursor is not authenticated.",
+            error.UnsupportedOperation => "Cursor thread imports are not supported yet.",
+            else => "Failed to load Cursor threads.",
+        },
     };
 }
 
@@ -6790,6 +7219,35 @@ fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {
     }
 }
 
+fn cursorModelCacheWorker(state: *CursorModelCacheState) void {
+    const provider_config = ai_harness.ProviderConfig{
+        .cursor = .{},
+    };
+
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
+            log.warn("failed to connect to Cursor for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load Cursor models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
+
 fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
     return switch (provider) {
         .codex => switch (err) {
@@ -6808,6 +7266,12 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "This provider does not support thread sync.",
             else => "Failed to sync the OpenCode thread.",
         },
+        .cursor => switch (err) {
+            error.FileNotFound => "Node was not found on PATH for Cursor.",
+            error.CursorSignedOut => "Cursor is not authenticated.",
+            error.UnsupportedOperation => "Cursor thread sync is not supported yet.",
+            else => "Failed to sync the Cursor thread.",
+        },
     };
 }
 
@@ -6815,6 +7279,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to store Codex thread list.",
         .opencode => "Failed to store OpenCode thread list.",
+        .cursor => "Failed to store Cursor thread list.",
     };
 }
 
@@ -6822,6 +7287,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "No recent Codex threads found.",
         .opencode => "No recent OpenCode threads found.",
+        .cursor => "No recent Cursor threads found.",
     };
 }
 
@@ -6829,6 +7295,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Select a Codex thread or paste a thread ID.",
         .opencode => "Select an OpenCode thread or paste a thread ID.",
+        .cursor => "Select a Cursor thread or paste a thread ID.",
     };
 }
 
@@ -6836,6 +7303,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Enter a Codex thread ID or select one from the list.",
         .opencode => "Enter an OpenCode thread ID or select one from the list.",
+        .cursor => "Enter a Cursor thread ID or select one from the list.",
     };
 }
 
@@ -6843,6 +7311,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Codex thread already exists in this project.",
         .opencode => "OpenCode thread already exists in this project.",
+        .cursor => "Cursor thread already exists in this project.",
     };
 }
 
@@ -6850,6 +7319,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to create the imported thread.",
         .opencode => "Failed to create the imported thread.",
+        .cursor => "Failed to create the imported thread.",
     };
 }
 
@@ -6857,6 +7327,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Failed to add the imported thread.",
         .opencode => "Failed to add the imported thread.",
+        .cursor => "Failed to add the imported thread.",
     };
 }
 
@@ -6864,6 +7335,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Codex thread imported.",
         .opencode => "OpenCode thread imported.",
+        .cursor => "Cursor thread imported.",
     };
 }
 
@@ -6871,6 +7343,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
     return switch (provider) {
         .codex => "Thread synced from Codex.",
         .opencode => "Thread synced from OpenCode.",
+        .cursor => "Thread synced from Cursor.",
     };
 }
 
