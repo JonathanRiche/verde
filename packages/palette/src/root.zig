@@ -29,6 +29,7 @@ pub const text_component = @import("components/text.zig");
 pub const text_area_component = @import("components/text_area.zig");
 pub const text_input_component = @import("components/text_input.zig");
 pub const toolbar_component = @import("components/toolbar.zig");
+pub const text_stack = @import("text.zig");
 pub const text_layout = @import("text_layout.zig");
 pub const virtual_list_component = @import("components/virtual_list.zig");
 
@@ -58,6 +59,7 @@ pub const ComposerPromptPart = composer_prompt_component.ComposerPromptPart;
 pub const ComposerPromptSendState = composer_prompt_component.ComposerPromptSendState;
 pub const CascadeMenuCallbacks = cascade_menu_component.CascadeMenuCallbacks;
 pub const CascadeMenuChildCountFn = cascade_menu_component.ChildCountFn;
+pub const CascadeMenuRowLeadingRenderFn = cascade_menu_component.RowLeadingRenderFn;
 pub const CascadeMenuConfig = cascade_menu_component.CascadeMenuConfig;
 pub const CascadeMenuEvent = cascade_menu_component.CascadeMenuEvent;
 pub const CascadeMenuInput = cascade_menu_component.Input;
@@ -128,7 +130,11 @@ pub const LayoutTrack = layout.Track;
 pub const FontAdvance = text_layout.Advance;
 pub const FontAdvanceFn = text_layout.AdvanceFn;
 pub const FontMetrics = text_layout.FontMetrics;
+pub const TextFontFace = text_stack.FontFace;
+pub const TextGlyphPlacement = text_stack.GlyphPlacement;
+pub const TextMetrics = text_stack.Metrics;
 pub const TextLayout = text_layout;
+pub const TextStack = text_stack;
 pub const ScrollState = scroll;
 pub const SelectionRange = input_selection.Range;
 pub const SelectionState = input_selection;
@@ -263,5 +269,7 @@ test {
     _ = text_area_component;
     _ = text_input_component;
     _ = toolbar_component;
+    _ = text_stack;
+    _ = text_layout;
     _ = virtual_list_component;
 }

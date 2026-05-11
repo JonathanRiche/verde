@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const draw = @import("../draw.zig");
+const clipboard = @import("../input/clipboard.zig");
 const key_input = @import("../input/key.zig");
 const scroll = @import("../scroll.zig");
 const selection_input = @import("../input/selection.zig");
@@ -29,6 +30,8 @@ pub const ComposerPromptConfig = struct {
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
     send_color: draw.Color = .{ .r = 0.32, .g = 0.54, .b = 0.39, .a = 1.0 },
     send_hover_color: draw.Color = .{ .r = 0.38, .g = 0.64, .b = 0.47, .a = 1.0 },
+    stop_button_color: draw.Color = .{ .r = 0.78, .g = 0.58, .b = 0.10, .a = 1.0 },
+    stop_button_hover_color: draw.Color = .{ .r = 0.90, .g = 0.68, .b = 0.14, .a = 1.0 },
     text_color: draw.Color = draw.Color.white,
     placeholder_color: draw.Color = .{ .r = 0.58, .g = 0.62, .b = 0.68, .a = 0.82 },
     icon_color: draw.Color = .{ .r = 0.78, .g = 0.82, .b = 0.88, .a = 1.0 },
@@ -65,6 +68,8 @@ pub const ComposerPromptConfig = struct {
     menu_border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     menu_selected_color: draw.Color = .{ .r = 0.18, .g = 0.34, .b = 0.44, .a = 0.85 },
     menu_hover_color: draw.Color = .{ .r = 0.22, .g = 0.27, .b = 0.30, .a = 0.85 },
+    /// Max rows shown for model/reasoning dropdowns before clipping (scroll not wired for these menus).
+    menu_max_visible_rows: f32 = 14.0,
     row_height: f32 = 28.0,
     pill_padding_x: f32 = 10.0,
     pill_icon_gap: f32 = 7.0,
@@ -77,6 +82,13 @@ pub const ComposerPromptConfig = struct {
     fast_max_width: f32 = 120.0,
     access_min_width: f32 = 0.0,
     access_max_width: f32 = 170.0,
+    /// When > 0, model / fast / access pills reserve this width (plus `pill_icon_gap`) for leading
+    /// toolbar glyphs drawn outside text metrics (e.g. textures in the host). Skips rendering
+    /// `model_icon` / `fast_icon` / `access_icon` text when those strings are empty.
+    /// Should be about `toolbar_icon_drawn_width + gap_after_icon - pill_icon_gap` (see host overlay).
+    pill_overlay_icon_reserve: f32 = 0.0,
+    /// Extra horizontal room for toolbar pill labels (bold vs measured regular advances, shaping, etc.).
+    pill_label_width_fudge: f32 = 0.0,
     z_index: i32 = 0,
 };
 
@@ -113,9 +125,87 @@ pub const ComposerPromptInput = union(enum) {
     focus: bool,
 };
 
+const SanitizedText = struct {
+    value: []const u8,
+    owned: []u8 = &.{},
+
+    fn deinit(self: SanitizedText, allocator: std.mem.Allocator) void {
+        if (self.owned.len > 0) allocator.free(self.owned);
+    }
+
+    fn items(self: SanitizedText) []const u8 {
+        return if (self.owned.len > 0) self.owned else self.value;
+    }
+};
+
+fn sanitizedText(allocator: std.mem.Allocator, value: []const u8, allow_newlines: bool) !SanitizedText {
+    if (value.len == 0) return .{ .value = value };
+    var sanitized: std.ArrayList(u8) = .empty;
+    errdefer sanitized.deinit(allocator);
+    var changed = false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (byte == '\r' or (byte == '\n' and !allow_newlines) or (byte < 0x20 and byte != '\t' and byte != '\n')) {
+            changed = true;
+            index += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            changed = true;
+            index += 1;
+            continue;
+        };
+        if (index + len > value.len) {
+            changed = true;
+            break;
+        }
+        const slice = value[index .. index + len];
+        const cp = std.unicode.utf8Decode(slice) catch {
+            changed = true;
+            index += len;
+            continue;
+        };
+        if (cp == 0xfffd or cp == 0x7f or (cp >= 0x80 and cp <= 0x9f)) {
+            changed = true;
+            index += len;
+            continue;
+        }
+        try sanitized.appendSlice(allocator, slice);
+        index += len;
+    }
+    if (!changed) {
+        sanitized.deinit(allocator);
+        return .{ .value = value };
+    }
+    return .{ .value = value, .owned = try sanitized.toOwnedSlice(allocator) };
+}
+
 pub const MouseWheel = struct {
     point: draw.Vec2,
     y: f32,
+};
+
+const MAX_EDIT_HISTORY = 64;
+
+const EditSnapshot = struct {
+    text: []u8,
+    cursor: usize,
+    selection_anchor: ?usize,
+    selection_focus: ?usize,
+
+    fn capture(allocator: std.mem.Allocator, component: anytype) !EditSnapshot {
+        return .{
+            .text = try allocator.dupe(u8, component.buffer.items),
+            .cursor = component.cursor,
+            .selection_anchor = component.selection_anchor,
+            .selection_focus = component.selection_focus,
+        };
+    }
+
+    fn deinit(self: EditSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
 };
 
 pub const ComposerPromptEvent = union(enum) {
@@ -134,6 +224,11 @@ pub const ComposerPromptEvent = union(enum) {
 pub const ComposerPromptCallbacks = struct {
     context: ?*anyopaque = null,
     on_event: ?*const fn (context: ?*anyopaque, event: ComposerPromptEvent) void = null,
+    get_clipboard: ?*const fn (context: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+
+    fn clipboardProvider(self: ComposerPromptCallbacks) clipboard {
+        return .{ .context = self.context, .get = self.get_clipboard };
+    }
 };
 
 const Options = struct {
@@ -172,14 +267,41 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         hovered_menu_index: ?usize = null,
         hovered_part: ?ComposerPromptPart = null,
         focused: bool = false,
+        show_fast_toggle: bool = true,
+        show_reasoning_toggle: bool = true,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
+        undo_stack: std.ArrayList(EditSnapshot) = .empty,
+        redo_stack: std.ArrayList(EditSnapshot) = .empty,
         font_metrics: ?text_layout.FontMetrics = null,
         toolbar_font_metrics: ?text_layout.FontMetrics = null,
         icon_font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
         callbacks: ComposerPromptCallbacks = .{},
+
+        pub fn setShowReasoningToggle(self: *Component, show: bool) void {
+            self.show_reasoning_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .reasoning) null else self.hovered_part;
+                self.active_menu = if (self.active_menu == .reasoning) null else self.active_menu;
+            }
+        }
+
+        pub fn showReasoningToggle(self: *const Component) bool {
+            return self.show_reasoning_toggle;
+        }
+
+        pub fn setShowFastToggle(self: *Component, show: bool) void {
+            self.show_fast_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .fast) null else self.hovered_part;
+            }
+        }
+
+        pub fn showFastToggle(self: *const Component) bool {
+            return self.show_fast_toggle;
+        }
 
         pub fn init() Component {
             return .{};
@@ -192,6 +314,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.reasoning_label_buffer.deinit(allocator);
             self.fast_label_buffer.deinit(allocator);
             self.access_label_buffer.deinit(allocator);
+            self.clearEditHistory(allocator);
+            self.undo_stack.deinit(allocator);
+            self.redo_stack.deinit(allocator);
             self.* = undefined;
         }
 
@@ -222,11 +347,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         pub fn setText(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            const sanitized = try sanitizedText(allocator, value, true);
+            defer sanitized.deinit(allocator);
             self.buffer.clearRetainingCapacity();
-            try self.buffer.appendSlice(allocator, value);
+            try self.buffer.appendSlice(allocator, sanitized.items());
             self.cursor = self.buffer.items.len;
             self.selection_anchor = null;
             self.selection_focus = null;
+            self.clearEditHistory(allocator);
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
         }
@@ -305,7 +433,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             switch (input) {
                 .text => |value| {
                     if (!self.focused) return false;
-                    try self.insertText(allocator, value);
+                    try self.insertTextInput(allocator, value);
                     return true;
                 },
                 .key => |key| return try self.handleKey(allocator, key),
@@ -369,8 +497,8 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const geometry = self.toolbarGeometry();
             if (geometry.send.contains(point)) return .send;
             if (geometry.model.contains(point)) return .model;
-            if (geometry.reasoning.contains(point)) return .reasoning;
-            if (geometry.fast.contains(point)) return .fast;
+            if (self.show_reasoning_toggle and geometry.reasoning.w > 0.0 and geometry.reasoning.contains(point)) return .reasoning;
+            if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
             if (geometry.access.contains(point)) return .access;
             return null;
         }
@@ -445,26 +573,49 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn renderToolbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const geometry = self.toolbarGeometry();
-            try self.renderPill(allocator, batch, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
+            const left_before_fast: draw.Rect = if (self.show_reasoning_toggle) geometry.reasoning else geometry.model;
+            // Draw separators under pills so divider lines cannot cover trailing chevrons in the gap.
+            if (self.show_reasoning_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(geometry.model, geometry.reasoning), geometry.toolbar);
+            }
+            if (self.show_fast_toggle) {
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.fast), geometry.toolbar);
+                try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
+            } else {
+                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.access), geometry.toolbar);
+            }
 
-            try self.renderPill(allocator, batch, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.reasoning, geometry.fast), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
-            try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
-
-            try self.renderPill(allocator, batch, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
+            try self.renderPill(allocator, batch, true, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
+            if (self.show_reasoning_toggle) {
+                try self.renderPill(allocator, batch, false, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+            }
+            if (self.show_fast_toggle) {
+                try self.renderPill(allocator, batch, true, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
+            }
+            try self.renderPill(allocator, batch, true, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
-            const send_color: draw.Color = if (send_disabled)
-                draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 }
-            else if (self.hovered_part == .send) config.send_hover_color else config.send_color;
-            try batch.panel(allocator, geometry.send, send_color, null, geometry.send.h * 0.5, 0.0);
-            try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            const send_panel_color: draw.Color = blk: {
+                if (send_disabled)
+                    break :blk draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 };
+                if (self.send_state == .stop) {
+                    if (self.hovered_part == .send) break :blk config.stop_button_hover_color;
+                    break :blk config.stop_button_color;
+                }
+                if (self.hovered_part == .send) break :blk config.send_hover_color;
+                break :blk config.send_color;
+            };
+            try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
+            if (self.send_state == .stop) {
+                try renderStopSquare(allocator, batch, geometry.send);
+            } else if (self.send_state == .pending) {
+                try self.renderCenteredIcon(allocator, batch, geometry.send, self.sendIcon(), draw.Color.white);
+            } else {
+                try renderSendArrow(allocator, batch, geometry.send);
+            }
         }
 
-        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
+        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, overlay_leading: bool, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
             try batch.panel(allocator, rect, if (hovered) config.control_hover_color else config.control_background_color, null, rect.h * 0.5, 0.0);
             const text_metrics = self.toolbarMetrics();
@@ -472,11 +623,24 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             var runs: [3]draw.TextRun = undefined;
             var count: usize = 0;
             var x = rect.x + config.pill_padding_x;
-            if (left_icon.len > 0) {
+            if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
+                x += config.pill_overlay_icon_reserve + config.pill_icon_gap;
+            } else if (left_icon.len > 0) {
                 runs[count] = iconRun(left_icon, x, rect, icon_metrics, config.icon_color);
                 x += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
                 count += 1;
             }
+            const label_area_right: f32 = if (right_icon.len > 0)
+                rect.x + rect.w - config.pill_padding_x - self.trailingChevronReserve(right_icon)
+            else
+                rect.x + rect.w - config.pill_padding_x;
+            const label_strip: draw.Rect = .{
+                .x = rect.x,
+                .y = rect.y,
+                .w = @max(label_area_right - rect.x, 0.0),
+                .h = rect.h,
+            };
+            const label_clip = clippedRect(rect, label_strip) orelse label_strip;
             runs[count] = .{
                 .text = label,
                 .byte_start = 0,
@@ -486,20 +650,24 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_size = text_metrics.font_size,
                 .line_height = text_metrics.line_height,
                 .color = config.text_color,
-                .clip = rect,
+                .clip = label_clip,
                 .font_role = config.bold_font_role,
                 .font_id = config.font_id,
             };
             count += 1;
             if (right_icon.len > 0) {
-                const icon_w = icon_metrics.measureSlice(right_icon);
-                runs[count] = iconRun(right_icon, rect.x + rect.w - config.pill_padding_x - icon_w, rect, icon_metrics, config.icon_color);
-                count += 1;
+                const reserve = self.trailingChevronReserve(right_icon);
+                const cell = reserve - config.pill_chevron_gap;
+                const cell_x = rect.x + rect.w - config.pill_padding_x - cell;
+                const cell_rect_full: draw.Rect = .{ .x = cell_x, .y = rect.y, .w = cell, .h = rect.h };
+                const cell_rect = clippedRect(rect, cell_rect_full) orelse cell_rect_full;
+                try renderDisclosureArrow(allocator, batch, cell_rect, config.icon_color);
             }
             try batch.textRuns(allocator, rect, label, runs[0..count], config.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
         }
 
         fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
+            if (icon.len == 0) return;
             const metrics = self.iconMetrics();
             const width = metrics.measureSlice(icon);
             const runs = [_]draw.TextRun{.{
@@ -516,6 +684,76 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .font_id = config.icon_font_id,
             }};
             try batch.textRuns(allocator, rect, icon, &runs, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+        }
+
+        fn sendGlyphBounds(button: draw.Rect) draw.Rect {
+            const m = @min(button.w, button.h);
+            const inset = m * 0.125;
+            return .{
+                .x = button.x + inset,
+                .y = button.y + inset,
+                .w = @max(button.w - 2.0 * inset, 1.0),
+                .h = @max(button.h - 2.0 * inset, 1.0),
+            };
+        }
+
+        fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const side = m * 0.52;
+            const cx = inner.x + inner.w * 0.5;
+            const cy = inner.y + inner.h * 0.5;
+            const cr = @max(side * 0.18, 1.5);
+            try batch.roundedRectClipped(allocator, .{
+                .x = cx - side * 0.5,
+                .y = cy - side * 0.5,
+                .w = side,
+                .h = side,
+            }, draw.Color.white, cr, button);
+        }
+
+        /// Send: wide triangular head + narrow stem (same-width stem under an equilateral head reads as a "house").
+        fn renderSendArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
+            const inner = sendGlyphBounds(button);
+            const m = @min(inner.w, inner.h);
+            const cx = inner.x + inner.w * 0.5;
+            const total_h = m * 0.56;
+            const head_h = total_h * 0.52;
+            const stem_h = total_h * 0.48;
+            const half_w_head = m * 0.175;
+            const half_w_stem = @max(m * 0.052, 1.25);
+            const y0 = inner.y + (inner.h - total_h) * 0.5;
+            // Stem under the head so the junction is a narrow shaft, not a full-width block.
+            try batch.rectClipped(allocator, .{
+                .x = cx - half_w_stem,
+                .y = y0 + head_h,
+                .w = half_w_stem * 2.0,
+                .h = stem_h,
+            }, draw.Color.white, button);
+            try batch.triangleClipped(
+                allocator,
+                .{ .x = cx, .y = y0 },
+                .{ .x = cx - half_w_head, .y = y0 + head_h },
+                .{ .x = cx + half_w_head, .y = y0 + head_h },
+                draw.Color.white,
+                button,
+            );
+        }
+
+        fn renderDisclosureArrow(allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, color: draw.Color) !void {
+            const m = @max(@min(rect.w, rect.h), 1.0);
+            const cx = rect.x + rect.w * 0.5;
+            const cy = rect.y + rect.h * 0.5;
+            const half_h = m * 0.18;
+            const half_w = m * 0.14;
+            try batch.triangleClipped(
+                allocator,
+                .{ .x = cx - half_w, .y = cy - half_h },
+                .{ .x = cx - half_w, .y = cy + half_h },
+                .{ .x = cx + half_w, .y = cy },
+                color,
+                rect,
+            );
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
@@ -543,6 +781,22 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             };
         }
 
+        fn iconRunWithClip(value: []const u8, x: f32, clip: draw.Rect, metrics: text_layout.FontMetrics, color: draw.Color) draw.TextRun {
+            return .{
+                .text = value,
+                .byte_start = 0,
+                .byte_end = value.len,
+                .x = x,
+                .y = clip.y + @max((clip.h - metrics.line_height) * 0.5, 0.0),
+                .font_size = metrics.font_size,
+                .line_height = metrics.line_height,
+                .color = color,
+                .clip = clip,
+                .font_role = config.icon_font_role,
+                .font_id = config.icon_font_id,
+            };
+        }
+
         fn renderMenu(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             const target = self.active_menu orelse return;
             const options = self.optionsFor(target);
@@ -550,15 +804,27 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const rect = self.menuRect(target);
             const previous_z = batch.setZIndex(self.z_index + 1000);
             defer batch.restoreZIndex(previous_z);
-            try batch.panel(allocator, rect, config.menu_background_color, config.menu_border_color, 10.0, 1.0);
+            const menu_corner: f32 = 14.0;
+            // Rounded shell (avoid `panel` + rectBorder sharp outer frame on top of rounded fills).
+            const inset = @max(1.0, 1.0);
+            try batch.roundedRectClipped(allocator, rect, config.menu_border_color, menu_corner, rect);
+            if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
+                try batch.roundedRectClipped(allocator, .{
+                    .x = rect.x + inset,
+                    .y = rect.y + inset,
+                    .w = rect.w - inset * 2.0,
+                    .h = rect.h - inset * 2.0,
+                }, config.menu_background_color, @max(menu_corner - inset, 0.0), rect);
+            }
             const metrics = self.toolbarMetrics();
+            const row_corner = @min(9.0, @max(4.0, metrics.line_height * 0.38));
             var index: usize = 0;
             while (index < options.count) : (index += 1) {
                 const row = self.menuRowRect(target, index);
                 if (self.selectedIndex(target) == index) {
-                    try batch.selection(allocator, row, config.menu_selected_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_selected_color, row_corner, rect);
                 } else if (self.hovered_menu_index == index) {
-                    try batch.rect(allocator, row, config.menu_hover_color);
+                    try batch.roundedRectClipped(allocator, row, config.menu_hover_color, row_corner, rect);
                 }
                 const label = options.labelFor(index) orelse continue;
                 const text_rect: draw.Rect = .{
@@ -648,6 +914,20 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     }
                     return true;
                 },
+                .v => {
+                    if (!key.primary) return false;
+                    return try self.pasteClipboard(allocator);
+                },
+                .z => {
+                    if (!key.primary) return false;
+                    if (key.shift) try self.redo(allocator) else try self.undo(allocator);
+                    return true;
+                },
+                .y => {
+                    if (!key.primary) return false;
+                    try self.redo(allocator);
+                    return true;
+                },
                 else => return false,
             }
         }
@@ -721,22 +1001,88 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             try self.replaceRange(allocator, self.cursor, self.cursor, value);
         }
 
+        fn insertTextInput(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
+            if (value.len == 0) return;
+            const sanitized = try sanitizedText(allocator, value, false);
+            defer sanitized.deinit(allocator);
+            return self.insertText(allocator, sanitized.items());
+        }
+
         fn replaceSelection(self: *Component, allocator: std.mem.Allocator, value: []const u8) !void {
             const range = self.selection() orelse return self.replaceRange(allocator, self.cursor, self.cursor, value);
             try self.replaceRange(allocator, range.start, range.end, value);
         }
 
+        fn pasteClipboard(self: *Component, allocator: std.mem.Allocator) !bool {
+            const clipboard_text = self.callbacks.clipboardProvider().read(allocator) orelse return false;
+            defer allocator.free(clipboard_text);
+            if (clipboard_text.len == 0) return false;
+            try self.replaceSelection(allocator, clipboard_text);
+            return true;
+        }
+
         fn replaceRange(self: *Component, allocator: std.mem.Allocator, start: usize, end: usize, value: []const u8) !void {
             const safe_start = @min(start, self.buffer.items.len);
             const safe_end = @min(@max(end, safe_start), self.buffer.items.len);
-            self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, value) catch |err| switch (err) {
+            const sanitized = try sanitizedText(allocator, value, true);
+            defer sanitized.deinit(allocator);
+            try self.recordUndoSnapshot(allocator);
+            self.buffer.replaceRange(allocator, safe_start, safe_end - safe_start, sanitized.items()) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
             };
-            self.cursor = safe_start + value.len;
+            self.clearRedoStack(allocator);
+            self.cursor = safe_start + sanitized.items().len;
             self.selection_anchor = null;
             self.selection_focus = null;
             self.ensureCursorVisible();
             self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn undo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.undo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.redo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn redo(self: *Component, allocator: std.mem.Allocator) !void {
+            const snapshot = self.redo_stack.pop() orelse return;
+            defer snapshot.deinit(allocator);
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            try self.restoreSnapshot(allocator, snapshot);
+        }
+
+        fn restoreSnapshot(self: *Component, allocator: std.mem.Allocator, snapshot: EditSnapshot) !void {
+            self.buffer.clearRetainingCapacity();
+            try self.buffer.appendSlice(allocator, snapshot.text);
+            self.cursor = @min(snapshot.cursor, self.buffer.items.len);
+            self.selection_anchor = snapshot.selection_anchor;
+            self.selection_focus = snapshot.selection_focus;
+            self.ensureCursorVisible();
+            self.emit(.{ .text_changed = self.buffer.items });
+        }
+
+        fn recordUndoSnapshot(self: *Component, allocator: std.mem.Allocator) !void {
+            try self.undo_stack.append(allocator, try EditSnapshot.capture(allocator, self));
+            while (self.undo_stack.items.len > MAX_EDIT_HISTORY) {
+                const dropped = self.undo_stack.orderedRemove(0);
+                dropped.deinit(allocator);
+            }
+        }
+
+        fn clearEditHistory(self: *Component, allocator: std.mem.Allocator) void {
+            self.clearUndoStack(allocator);
+            self.clearRedoStack(allocator);
+        }
+
+        fn clearUndoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.undo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.undo_stack.clearRetainingCapacity();
+        }
+
+        fn clearRedoStack(self: *Component, allocator: std.mem.Allocator) void {
+            for (self.redo_stack.items) |snapshot| snapshot.deinit(allocator);
+            self.redo_stack.clearRetainingCapacity();
         }
 
         fn moveCursor(self: *Component, next: usize, extend_selection: bool) void {
@@ -812,7 +1158,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .reasoning => self.reasoningRect(),
             };
             const options = self.optionsFor(target);
-            const height = @min(@as(f32, @floatFromInt(options.count)) * config.row_height, config.row_height * 6.0);
+            const max_rows = @max(config.menu_max_visible_rows, 1.0);
+            const height = @min(
+                @as(f32, @floatFromInt(options.count)) * config.row_height,
+                config.row_height * max_rows,
+            );
             return .{ .x = control.x, .y = control.y - height - 6.0, .w = @max(control.w, self.menuContentWidth(target)), .h = height };
         }
 
@@ -965,13 +1315,47 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.setScrollY(self.scroll_y);
         }
 
-        fn pillWidth(self: *const Component, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
+        fn trailingChevronReserve(self: *const Component, right_icon: []const u8) f32 {
+            if (right_icon.len == 0) return 0.0;
+            const icon_metrics = self.iconMetrics();
+            const measured = icon_metrics.measureSlice(right_icon);
+            // Measured advance for icon glyphs (e.g. ">") can be tighter than GPU text; reserve at least
+            // a column so labels are not clipped and the chevron does not collide with the label.
+            const min_cell = @max(icon_metrics.font_size * 0.82, 21.0);
+            return config.pill_chevron_gap + @max(measured, min_cell);
+        }
+
+        fn toolbarLabelMeasureSlack(text_metrics: text_layout.FontMetrics) f32 {
+            return @max(8.0, text_metrics.font_size * 0.28);
+        }
+
+        /// Toolbar pills render with `bold_font_role`; measurement uses `toolbarMetrics` (often regular).
+        fn pillToolbarLabelSlack(_: *const Component, text_metrics: text_layout.FontMetrics) f32 {
+            var s = toolbarLabelMeasureSlack(text_metrics);
+            if (config.bold_font_role != null and config.font_role != null and
+                config.bold_font_role.? != config.font_role.?)
+            {
+                s *= 1.28;
+            }
+            return s;
+        }
+
+        fn pillWidth(self: *const Component, overlay_leading: bool, left_icon: []const u8, label: []const u8, right_icon: []const u8, min_width: f32, max_width: f32) f32 {
             const text_metrics = self.toolbarMetrics();
             const icon_metrics = self.iconMetrics();
-            var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label);
-            if (left_icon.len > 0) width += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
-            if (right_icon.len > 0) width += icon_metrics.measureSlice(right_icon) + config.pill_chevron_gap;
+            var width = config.pill_padding_x * 2.0 + text_metrics.measureSlice(label) + self.pillToolbarLabelSlack(text_metrics) + config.pill_label_width_fudge;
+            if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
+                width += config.pill_overlay_icon_reserve + config.pill_icon_gap;
+            } else if (left_icon.len > 0) {
+                width += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
+            }
+            if (right_icon.len > 0) width += self.trailingChevronReserve(right_icon);
             return @min(@max(width, min_width), max_width);
+        }
+
+        /// Unclamped width needed for the current label/icons (ignores configured min/max caps).
+        fn pillNaturalNeedWidth(self: *const Component, overlay_leading: bool, left_icon: []const u8, label: []const u8, right_icon: []const u8) f32 {
+            return self.pillWidth(overlay_leading, left_icon, label, right_icon, 0.0, std.math.floatMax(f32));
         }
 
         fn menuContentWidth(self: *const Component, target: ComposerPromptOptionTarget) f32 {
@@ -987,6 +1371,62 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return width;
         }
 
+        fn toolbarPillsTotalWidth(self: *const Component, model_w: f32, reasoning_w: f32, fast_w: f32, access_w: f32) f32 {
+            var total = model_w + config.control_gap;
+            total += reasoning_w;
+            if (self.show_fast_toggle) {
+                total += config.control_gap + fast_w + config.control_gap;
+            } else {
+                total += config.control_gap;
+            }
+            total += access_w;
+            return total;
+        }
+
+        /// When natural pill widths exceed the toolbar budget, shrink pills proportionally down to their
+        /// configured minimums (access and fast give way before reasoning and model).
+        fn shrinkToolbarPillWidthsToFit(self: *const Component, avail: f32, model_w: *f32, reasoning_w: *f32, fast_w: *f32, access_w: *f32) void {
+            const need_m = self.pillNaturalNeedWidth(true, config.model_icon, self.modelLabel(), config.chevron_icon);
+            const need_r = if (self.show_reasoning_toggle)
+                self.pillNaturalNeedWidth(false, "", self.reasoningLabel(), config.chevron_icon)
+            else
+                0.0;
+            const need_f = if (self.show_fast_toggle)
+                self.pillNaturalNeedWidth(true, config.fast_icon, self.fastLabel(), "")
+            else
+                0.0;
+            const need_a = self.pillNaturalNeedWidth(true, config.access_icon, self.accessLabel(), "");
+
+            var iter: u32 = 0;
+            while (iter < 16) : (iter += 1) {
+                const total = self.toolbarPillsTotalWidth(model_w.*, reasoning_w.*, fast_w.*, access_w.*);
+                if (total <= avail + 0.5) return;
+                const overflow = total - avail;
+
+                const min_m = @max(config.model_min_width, @min(need_m, config.model_max_width));
+                const min_r = if (self.show_reasoning_toggle) @max(config.reasoning_min_width, @min(need_r, config.reasoning_max_width)) else 0.0;
+                const min_f = if (self.show_fast_toggle) @max(config.fast_min_width, @min(need_f, config.fast_max_width)) else 0.0;
+                const min_a = @max(config.access_min_width, @min(need_a, config.access_max_width));
+
+                const flex_m = @max(0.0, model_w.* - min_m);
+                const flex_r = @max(0.0, reasoning_w.* - min_r);
+                const flex_f = @max(0.0, fast_w.* - min_f);
+                const flex_a = @max(0.0, access_w.* - min_a);
+                const flex_sum = flex_m + flex_r + flex_f + flex_a;
+                if (flex_sum <= 0.01) return;
+
+                model_w.* -= overflow * (flex_m / flex_sum);
+                reasoning_w.* -= overflow * (flex_r / flex_sum);
+                fast_w.* -= overflow * (flex_f / flex_sum);
+                access_w.* -= overflow * (flex_a / flex_sum);
+
+                model_w.* = @max(model_w.*, min_m);
+                reasoning_w.* = @max(reasoning_w.*, min_r);
+                fast_w.* = @max(fast_w.*, min_f);
+                access_w.* = @max(access_w.*, min_a);
+            }
+        }
+
         fn toolbarGeometry(self: *const Component) struct {
             toolbar: draw.Rect,
             model: draw.Rect,
@@ -998,29 +1438,50 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const toolbar = self.toolbarRect();
             const control_h = @min(toolbar.h, 32.0);
             const y = toolbar.y + (toolbar.h - control_h) * 0.5;
-            const send_size = @min(toolbar.h, 36.0);
+            const send_size = @min(toolbar.h, 40.0);
             const send: draw.Rect = .{
                 .x = toolbar.x + toolbar.w - send_size,
                 .y = toolbar.y + (toolbar.h - send_size) * 0.5,
                 .w = send_size,
                 .h = send_size,
             };
-            const max_x = send.x - config.control_gap;
-            var x = toolbar.x;
+            // Extra air before the send control so the rightmost pill is not visually glued to the button.
+            const max_x = send.x - config.control_gap * 2.5;
+            const avail = @max(max_x - toolbar.x, 0.0);
 
-            const model_w = @min(self.pillWidth(config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width), @max(max_x - x, 0.0));
+            var model_w = self.pillWidth(true, config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
+            var reasoning_w: f32 = if (self.show_reasoning_toggle)
+                self.pillWidth(false, "", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width)
+            else
+                0.0;
+            var fast_w: f32 = if (self.show_fast_toggle)
+                self.pillWidth(true, config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width)
+            else
+                0.0;
+            var access_w = self.pillWidth(true, config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width);
+
+            self.shrinkToolbarPillWidthsToFit(avail, &model_w, &reasoning_w, &fast_w, &access_w);
+
+            var x = toolbar.x;
             const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
             x += model_w + config.control_gap;
 
-            const reasoning_w = @min(self.pillWidth("", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width), @max(max_x - x, 0.0));
             const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
-            x += reasoning_w + config.control_gap;
+            x += reasoning_w;
 
-            const fast_w = @min(self.pillWidth(config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width), @max(max_x - x, 0.0));
-            const fast: draw.Rect = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
-            x += fast_w + config.control_gap;
+            var fast: draw.Rect = undefined;
+            if (self.show_fast_toggle) {
+                x += config.control_gap;
+                fast = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
+                x += fast_w + config.control_gap;
+            } else {
+                fast = .{ .x = x, .y = y, .w = 0.0, .h = control_h };
+                x += config.control_gap;
+            }
 
-            const access_w = @min(self.pillWidth(config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width), @max(max_x - x, 0.0));
+            // If widths still exceed the budget (all pills at mins), never let the access pill run under the send control.
+            const access_max_fit = @max(0.0, max_x - x);
+            access_w = @min(access_w, access_max_fit);
             const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };
 
             return .{
@@ -1066,6 +1527,7 @@ test "composer prompt emits styled font-role commands" {
     try prompt.render(std.testing.allocator, &batch);
 
     var icon_runs: usize = 0;
+    var disclosure_arrows: usize = 0;
     var rounded_send = false;
     for (batch.commands.items) |command| {
         if (command.kind == .text) {
@@ -1073,9 +1535,11 @@ test "composer prompt emits styled font-role commands" {
                 if (run.font_role == .icon) icon_runs += 1;
             }
         }
+        if (command.kind == .triangle and command.color.a > 0.9 and command.color.r > 0.7) disclosure_arrows += 1;
         if (command.kind == .rect and command.radius >= 16.0 and command.color.g > 0.4) rounded_send = true;
     }
-    try std.testing.expect(icon_runs >= 4);
+    try std.testing.expect(icon_runs >= 3);
+    try std.testing.expect(disclosure_arrows >= 2);
     try std.testing.expect(rounded_send);
 }
 
@@ -1153,6 +1617,20 @@ test "composer prompt owns text options toggles and send input" {
     try std.testing.expectEqual(@as(usize, 1), probe.access_changed);
 }
 
+test "composer prompt drops text-input control and replacement glyphs" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.textRect().x + 2, .y = prompt.textRect().y + 2 } }));
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .text = "ab\r\n\xef\xbf\xbdcd" }));
+    try std.testing.expectEqualStrings("abcd", prompt.text());
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .key = .{ .code = .enter } }));
+    try std.testing.expectEqualStrings("abcd\n", prompt.text());
+    try prompt.setText(std.testing.allocator, "one\xef\xbf\xbd\ntwo\rthree");
+    try std.testing.expectEqualStrings("one\ntwothree", prompt.text());
+}
+
 fn proportionalAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, _: f32) text_layout.Advance {
     return .{
         .byte_len = 1,
@@ -1194,7 +1672,9 @@ test "composer prompt sizes toolbar pills from measured content" {
     });
     var prompt = Prompt.init();
     const model = prompt.modelRect();
-    const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + 3 + 6;
+    const slack = @max(8.0, 14.0 * 0.28) * 1.28;
+    const trailing = 3.0 + @max(6.0, @max(16.0 * 0.82, 21.0));
+    const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + slack + trailing;
     try std.testing.expectEqual(expected, model.w);
 }
 

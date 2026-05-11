@@ -306,8 +306,7 @@ Verde uses and distributes third-party software. The main components in the desk
 - Codicon by Microsoft for file-type glyphs in the composer file search UI. Vendored in [`packages/desktop/src/assets/fonts/Codicon.ttf`](packages/desktop/src/assets/fonts/Codicon.ttf). License: CC BY 4.0.
 - Symbols Nerd Font Mono by Nerd Fonts for language-specific file glyphs in the composer file search UI. Vendored in [`packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf`](packages/desktop/src/assets/fonts/SymbolsNerdFontMono-Regular.ttf). License: MIT.
 - `nvim-web-devicons` for the file-type icon mapping reference used by Verde's native picker. License: MIT.
-- Dear ImGui by Omar Cornut for the immediate-mode UI layer used by the native app. Pulled in through `zgui`. License: MIT.
-- `zgui` from `zig-gamedev` for Zig bindings and backend integration around Dear ImGui. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT.
+- `palette` for native UI primitives and render-batch driven desktop UI. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon).
 - `zsdl` from `zig-gamedev` for Zig bindings to SDL3. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT.
 - SDL3 from libsdl-org for windowing, input, display integration, and OpenGL context management at runtime.
 - `zqlite` by Karl Seguin for SQLite access in the desktop app. Declared in [`packages/desktop/build.zig.zon`](packages/desktop/build.zig.zon). License: MIT-style.

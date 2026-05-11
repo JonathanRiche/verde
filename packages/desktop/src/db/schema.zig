@@ -69,6 +69,7 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "projects", "terminal_height", "alter table projects add column terminal_height real");
     try ensureColumn(conn, "projects", "terminal_layout_json", "alter table projects add column terminal_layout_json text");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
+    try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
 }
 
 fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {

@@ -1,5 +1,4 @@
 const std = @import("std");
-const zgui = @import("zgui");
 
 const native_state = @import("../state.zig");
 const utils = @import("../utils.zig");
@@ -7,6 +6,9 @@ const utils = @import("../utils.zig");
 pub const AppState = native_state.AppState;
 pub const ChatImageAttachment = native_state.ChatImageAttachment;
 pub const ChatRole = native_state.ChatRole;
+pub const PaletteModalAction = native_state.PaletteModalAction;
+pub const PaletteModalHit = native_state.PaletteModalHit;
+pub const PaletteModalTextFocus = native_state.PaletteModalTextFocus;
 pub const Provider = native_state.Provider;
 
 pub const ChangedFileEntry = struct {
@@ -34,13 +36,6 @@ pub fn scaledImageSize(width: i32, height: i32, max_width: f32, max_height: f32)
     const height_f: f32 = @floatFromInt(height);
     const scale = @min(max_width / width_f, max_height / height_f);
     return .{ width_f * scale, height_f * scale };
-}
-
-pub fn textureRefFromGlId(texture_id: c_uint) zgui.TextureRef {
-    return .{
-        .tex_data = null,
-        .tex_id = @enumFromInt(@as(u64, texture_id)),
-    };
 }
 
 pub fn formatByteSize(buffer: *[32:0]u8, size: usize) [:0]const u8 {

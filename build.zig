@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
+    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu");
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK");
 
@@ -10,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .subcommand = null,
         .forward_runtime_args = false,
         .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .cef_stub_preview = cef_stub_preview,
     });
@@ -19,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .subcommand = "run",
         .forward_runtime_args = true,
         .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .cef_stub_preview = cef_stub_preview,
     });
@@ -29,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .subcommand = "test",
         .forward_runtime_args = false,
         .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .cef_stub_preview = cef_stub_preview,
     });
@@ -40,6 +44,7 @@ const DesktopCommandOptions = struct {
     subcommand: ?[]const u8,
     forward_runtime_args: bool,
     ui_debug: ?bool = null,
+    palette_renderer: ?PaletteRendererBackend = null,
     cef_sdk_path: ?[]const u8 = null,
     cef_stub_preview: ?bool = null,
 };
@@ -61,6 +66,9 @@ fn addDesktopCommand(
     }
     if (options.ui_debug) |value| {
         argv.append(b.allocator, b.fmt("-Dui-debug={}", .{value})) catch @panic("OOM");
+    }
+    if (options.palette_renderer) |value| {
+        argv.append(b.allocator, b.fmt("-Dpalette-renderer={s}", .{@tagName(value)})) catch @panic("OOM");
     }
     if (options.cef_sdk_path) |value| {
         argv.append(b.allocator, b.fmt("-Dcef-sdk-path={s}", .{value})) catch @panic("OOM");
@@ -118,3 +126,8 @@ fn appendInstallArgs(b: *std.Build, argv: *std.ArrayList([]const u8)) void {
         argv.appendSlice(b.allocator, &.{ "--prefix-include-dir", b.h_dir }) catch @panic("OOM");
     }
 }
+
+const PaletteRendererBackend = enum {
+    gl,
+    sdl_gpu,
+};
