@@ -476,7 +476,7 @@ pub const Renderer = struct {
                 .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
                 .sample_mask = 0,
                 .enable_mask = false,
-                .enable_alpha_to_coverage = false,
+                .padding1 = 0,
                 .padding2 = 0,
                 .padding3 = 0,
             },
