@@ -1688,15 +1688,15 @@ fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.C
 }
 
 fn drawOpenCodeMark(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const w = @max(rect.w * 0.62, 1.0);
-    const x = rect.x + (rect.w - w) * 0.5;
-    const top_h = @max(rect.h * 0.30, 1.0);
-    const body_h = @max(rect.h * 0.46, 1.0);
-    const top_y = rect.y + rect.h * 0.14;
-    const body_y = top_y + top_h;
-    const body_color = palette.Color{ .r = color.r * 0.78, .g = color.g * 0.78, .b = color.b * 0.78, .a = color.a };
-    queueRect(state, .{ .x = x, .y = top_y, .w = w, .h = top_h }, color);
-    queueRect(state, .{ .x = x, .y = body_y, .w = w, .h = body_h }, body_color);
+    const size = @min(rect.w, rect.h);
+    const stroke = @max(size * 0.13, 1.6);
+    const mark = palette.Rect{
+        .x = rect.x + (rect.w - size) * 0.5 + stroke * 0.5,
+        .y = rect.y + (rect.h - size) * 0.5 + stroke * 0.5,
+        .w = @max(size - stroke, 1.0),
+        .h = @max(size - stroke, 1.0),
+    };
+    queueBorder(state, mark, color, mark.w * 0.5, stroke);
 }
 
 fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
