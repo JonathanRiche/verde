@@ -87,6 +87,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
   <string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>${MACOS_MIN_VERSION}</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
