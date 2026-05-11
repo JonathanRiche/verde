@@ -777,10 +777,6 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .w = image_size,
         .h = image_size,
     };
-    if (provider == .opencode) {
-        queuePaletteOpenCodeMark(state, image_rect, paletteColor(theme.COLOR_WHITE), clip);
-        return;
-    }
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
@@ -802,18 +798,6 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .w = theme.scaledUi(14.0),
         .h = font_size * 1.25,
     }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, null);
-}
-
-fn queuePaletteOpenCodeMark(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
-    const size = @min(rect.w, rect.h);
-    const stroke = @max(size * 0.13, 1.4);
-    const mark = palette.Rect{
-        .x = rect.x + (rect.w - size) * 0.5 + stroke * 0.5,
-        .y = rect.y + (rect.h - size) * 0.5 + stroke * 0.5,
-        .w = @max(size - stroke, 1.0),
-        .h = @max(size - stroke, 1.0),
-    };
-    state.palette_overlay_batch.rectBorderClipped(state.allocator, mark, color, mark.w * 0.5, stroke, clip) catch {};
 }
 
 /// Queues a small speech bubble icon for thread rows.
