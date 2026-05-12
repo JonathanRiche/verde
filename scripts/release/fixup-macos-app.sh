@@ -149,7 +149,25 @@ normalize_sdl3_framework() {
 sign_app_bundle() {
   while IFS= read -r -d '' binary; do
     "$CODESIGN" --force --sign - "$binary" >/dev/null
-  done < <(find "$MACOS_DIR" -type f \( -perm -111 -o -name '*.dylib' \) -print0)
+  done < <(
+    find "$MACOS_DIR" -type f -print0 |
+      while IFS= read -r -d '' candidate; do
+        if file "$candidate" | grep -Eq 'Mach-O|dynamically linked shared library'; then
+          printf '%s\0' "$candidate"
+        fi
+      done
+  )
+
+  while IFS= read -r -d '' binary; do
+    "$CODESIGN" --verify --strict "$binary" >/dev/null
+  done < <(
+    find "$MACOS_DIR" -type f -print0 |
+      while IFS= read -r -d '' candidate; do
+        if file "$candidate" | grep -Eq 'Mach-O|dynamically linked shared library'; then
+          printf '%s\0' "$candidate"
+        fi
+      done
+  )
 
   "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
   if ! "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR"; then
