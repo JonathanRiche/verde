@@ -1809,16 +1809,16 @@ pub const ShaderSource = struct {
     pub fn metalPackages() PipelineShaderPackages {
         return .{
             .solid = .{
-                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib },
-                .fragment = .{ .format = ShaderFormat.metallib, .code = solid_fragment_metallib },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = solid_fragment_metallib, .entrypoint = "palette_solid_fragment" },
             },
             .text = .{
-                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib },
-                .fragment = .{ .format = ShaderFormat.metallib, .code = text_fragment_metallib },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = text_fragment_metallib, .entrypoint = "palette_text_fragment" },
             },
             .image = .{
-                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib },
-                .fragment = .{ .format = ShaderFormat.metallib, .code = image_fragment_metallib },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = image_fragment_metallib, .entrypoint = "palette_image_fragment" },
             },
         };
     }
