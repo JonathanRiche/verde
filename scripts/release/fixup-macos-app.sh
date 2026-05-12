@@ -145,12 +145,8 @@ sign_app_bundle() {
     "$CODESIGN" --force --sign - "$binary" >/dev/null
   done < <(find "$MACOS_DIR" -type f \( -perm -111 -o -name '*.dylib' \) -print0)
 
-  while IFS= read -r -d '' framework; do
-    "$CODESIGN" --force --deep --sign - "$framework" >/dev/null
-  done < <(find "$MACOS_DIR" -type d -name '*.framework' -print0)
-
-  "$CODESIGN" --force --deep --sign - "$APP_DIR" >/dev/null
-  "$CODESIGN" --verify --deep --strict --verbose=2 "$APP_DIR" >/dev/null
+  "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
+  "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR" >/dev/null
 }
 
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
