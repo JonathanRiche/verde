@@ -1268,7 +1268,7 @@ pub fn serviceTierForMode(provider: app_state.Provider, fast_mode: app_state.Fas
 }
 
 pub fn sandboxModeForMode(provider: app_state.Provider, mode: app_state.AccessMode) ?ai_harness.SandboxMode {
-    if (provider != .codex) return null;
+    if (provider != .codex and provider != .claude) return null;
     return switch (mode) {
         .full_access => .danger_full_access,
         .supervised => .workspace_write,

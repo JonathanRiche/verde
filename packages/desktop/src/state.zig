@@ -293,14 +293,21 @@ fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
-    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..], state.cursorModelOptionsSnapshot());
+    return chat_threads.modelOptions(
+        ModelOption,
+        provider,
+        state.opencodeModelOptionsSnapshot(),
+        CODEX_MODEL_OPTIONS[0..],
+        state.claudeModelOptionsSnapshot(),
+        state.cursorModelOptionsSnapshot(),
+    );
 }
 
 fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
     return switch (provider) {
         .codex => DEFAULT_CODEX_MODEL,
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
-        .claude => "claude-sonnet-4-5",
+        .claude => DEFAULT_CLAUDE_MODEL,
         .cursor => DEFAULT_CURSOR_MODEL,
     };
 }
@@ -332,6 +339,20 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             if (thread.provider == .codex) {
                 if (index >= CODEX_REASONING_OPTIONS.len) return;
                 const next = CODEX_REASONING_OPTIONS[index].value;
+                const changed = if (next) |value|
+                    thread.reasoning_effort == null or thread.reasoning_effort.? != value
+                else
+                    thread.reasoning_effort != null;
+                if (!changed) return;
+                thread.reasoning_effort = next;
+                state.markDirty();
+                return;
+            }
+            if (thread.provider == .claude) {
+                const rows = state.opencode_reasoning_menu.items;
+                if (index >= rows.len) return;
+                const row = rows[index];
+                const next = if (row.variant) |variant| parseReasoningEffort(variant) orelse return else null;
                 const changed = if (next) |value|
                     thread.reasoning_effort == null or thread.reasoning_effort.? != value
                 else
@@ -442,7 +463,7 @@ fn paletteModelCascadeRenderRowLeading(
     const tex = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
-        .claude => null,
+        .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
@@ -528,6 +549,7 @@ pub const LEGACY_STATE_FILE_NAME = "state.json";
 const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
+pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
@@ -535,6 +557,7 @@ pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModa
 pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
+pub const CLAUDE_LOGO_BYTES = @embedFile("assets/claude-logo.png");
 pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
 pub const CURSOR_LOGO_BYTES = @embedFile("assets/editor_logos/cursor.png");
 pub const EMACS_LOGO_BYTES = @embedFile("assets/editor_logos/emacs.png");
@@ -580,6 +603,7 @@ pub const ModelOption = struct {
     cursor_reasoning_param_id: ?[:0]const u8 = null,
     cursor_reasoning_values: ?[][:0]const u8 = null,
     cursor_reasoning_requires_thinking: bool = false,
+    claude_effort_values: ?[]const [:0]const u8 = null,
 };
 
 const OpencodeReasoningMenuRow = struct {
@@ -605,6 +629,21 @@ fn cursorReasoningValueLabel(value: []const u8) []const u8 {
     if (std.mem.eql(u8, value, "max")) return "Max";
     if (std.mem.eql(u8, value, "none")) return "None";
     return value;
+}
+
+fn parseReasoningEffort(value: []const u8) ?ReasoningEffort {
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    if (std.mem.eql(u8, value, "max")) return .max;
+    return null;
+}
+
+fn claudeEffortValueLabel(value: []const u8) []const u8 {
+    if (std.mem.eql(u8, value, "xhigh")) return "Xhigh";
+    if (std.mem.eql(u8, value, "max")) return "Max";
+    return cursorReasoningValueLabel(value);
 }
 
 pub const ReasoningOption = struct {
@@ -709,6 +748,16 @@ pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.4", .value = "gpt-5.4" },
     .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
     .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
+};
+
+const CLAUDE_STANDARD_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
+const CLAUDE_OPUS_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh", "max" };
+
+pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Default (Sonnet)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
+    .{ .label = "Sonnet (1M context)", .value = "sonnet[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
+    .{ .label = "Opus", .value = "opus", .reasoning_supported = true, .claude_effort_values = CLAUDE_OPUS_EFFORT_VALUES[0..] },
+    .{ .label = "Haiku", .value = "haiku", .reasoning_supported = false },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
@@ -1033,6 +1082,15 @@ const CursorModelCacheStatus = OpencodeModelCacheStatus;
 const CursorModelCacheState = struct {
     mutex: Mutex = .{},
     status: CursorModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+const ClaudeModelCacheStatus = OpencodeModelCacheStatus;
+
+const ClaudeModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: ClaudeModelCacheStatus = .idle,
     models: ?[]ai_harness.ModelInfo = null,
     worker: ?std.Thread = null,
 };
@@ -1568,12 +1626,14 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
+    claude_model_options: std.ArrayList(ModelOption),
     cursor_model_options: std.ArrayList(ModelOption),
     opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
     opencode_logo_texture: ?CachedImageTexture,
     codex_logo_texture: ?CachedImageTexture,
+    claude_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
     emacs_logo_texture: ?CachedImageTexture,
@@ -1593,6 +1653,7 @@ pub const AppState = struct {
     project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
+    claude_model_cache_state: ClaudeModelCacheState,
     cursor_model_cache_state: CursorModelCacheState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
@@ -1728,12 +1789,14 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
+            .claude_model_options = .empty,
             .cursor_model_options = .empty,
             .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
             .opencode_logo_texture = null,
             .codex_logo_texture = null,
+            .claude_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
             .emacs_logo_texture = null,
@@ -1752,6 +1815,7 @@ pub const AppState = struct {
             .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
+            .claude_model_cache_state = .{},
             .cursor_model_cache_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
@@ -1819,6 +1883,7 @@ pub const AppState = struct {
             state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
             state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
             state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
+            state.claude_logo_texture = state.loadEmbeddedTexture(CLAUDE_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
             state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
@@ -1853,6 +1918,13 @@ pub const AppState = struct {
             OPENCODE_MODEL_OPTIONS[0..];
     }
 
+    pub fn claudeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
+        return if (self.claude_model_options.items.len > 0)
+            self.claude_model_options.items
+        else
+            CLAUDE_MODEL_OPTIONS[0..];
+    }
+
     pub fn cursorModelOptionsSnapshot(self: *const AppState) []const ModelOption {
         return if (self.cursor_model_options.items.len > 0)
             self.cursor_model_options.items
@@ -1863,7 +1935,7 @@ pub const AppState = struct {
     pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
-            .claude => "claude-sonnet-4-5",
+            .claude => DEFAULT_CLAUDE_MODEL,
             .cursor => DEFAULT_CURSOR_MODEL,
             .opencode => blk: {
                 for (self.opencodeModelOptionsSnapshot()) |option| {
@@ -1880,6 +1952,10 @@ pub const AppState = struct {
 
     pub fn startCursorModelOptionsRefresh(self: *AppState) void {
         self.refreshCursorModelOptionsCacheAsync();
+    }
+
+    pub fn startClaudeModelOptionsRefresh(self: *AppState) void {
+        self.refreshClaudeModelOptionsCacheAsync();
     }
 
     fn refreshOpencodeModelOptionsCacheAsync(self: *AppState) void {
@@ -1914,7 +1990,24 @@ pub const AppState = struct {
         };
     }
 
-    fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[][:0]const u8) !?[][:0]const u8 {
+    fn refreshClaudeModelOptionsCacheAsync(self: *AppState) void {
+        self.pollClaudeModelOptionsCache();
+
+        self.claude_model_cache_state.mutex.lock();
+        defer self.claude_model_cache_state.mutex.unlock();
+        if (self.claude_model_cache_state.status == .pending) return;
+
+        self.claude_model_cache_state.status = .pending;
+        self.claude_model_cache_state.worker = std.Thread.spawn(.{}, claudeModelCacheWorker, .{
+            &self.claude_model_cache_state,
+        }) catch {
+            self.claude_model_cache_state.status = .idle;
+            log.warn("failed to spawn Claude model cache worker", .{});
+            return;
+        };
+    }
+
+    fn duplicateReasoningVariantKeys(allocator: std.mem.Allocator, src: ?[]const [:0]const u8) !?[][:0]const u8 {
         const keys = src orelse return null;
         if (keys.len == 0) return null;
         const out = try allocator.alloc([:0]const u8, keys.len);
@@ -2055,6 +2148,29 @@ pub const AppState = struct {
         }
     }
 
+    fn populateClaudeModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
+        for (models) |model| {
+            if (model.model_id.len == 0) continue;
+            const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const label = try self.allocator.dupeZ(u8, label_text);
+            errdefer self.allocator.free(label);
+            const value = try self.allocator.dupeZ(u8, model.model_id);
+            errdefer self.allocator.free(value);
+            const effort_values = try duplicateReasoningVariantKeys(self.allocator, model.claude_effort_values);
+            errdefer if (effort_values) |values| {
+                for (values) |effort_value| self.allocator.free(effort_value);
+                self.allocator.free(values);
+            };
+
+            try self.claude_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+                .reasoning_supported = model.reasoning_supported,
+                .claude_effort_values = effort_values,
+            });
+        }
+    }
+
     fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order {
         var index: usize = 0;
         const min_len = @min(a.len, b.len);
@@ -2115,6 +2231,7 @@ pub const AppState = struct {
         errdefer self.clearOpencodeReasoningMenu();
 
         if (thread.provider == .cursor) return self.refreshCursorReasoningMenu(thread);
+        if (thread.provider == .claude) return self.refreshClaudeReasoningMenu(thread);
         if (thread.provider != .opencode) return;
         const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
         if (!opt.reasoning_supported) return;
@@ -2147,9 +2264,37 @@ pub const AppState = struct {
         }
     }
 
+    fn refreshClaudeReasoningMenu(self: *AppState, thread: *const ChatThread) !void {
+        const opt = self.claudeModelOptionForRef(thread.model_ref) orelse return;
+        if (!opt.reasoning_supported) return;
+        const values = opt.claude_effort_values orelse CLAUDE_STANDARD_EFFORT_VALUES[0..];
+        if (values.len == 0) return;
+
+        const default_label = try self.allocator.dupeZ(u8, "Default");
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = default_label, .variant = null });
+
+        for (values) |value| {
+            if (parseReasoningEffort(value) == null) continue;
+            const label_text = claudeEffortValueLabel(value);
+            const label = try self.allocator.dupeZ(u8, label_text);
+            const variant_copy = try self.allocator.dupeZ(u8, value);
+            try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+        }
+    }
+
     fn cursorModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
         const ref = model_ref orelse DEFAULT_CURSOR_MODEL;
         for (self.cursorModelOptionsSnapshot()) |opt| {
+            if (opt.value) |v| {
+                if (std.mem.eql(u8, ref, v)) return opt;
+            }
+        }
+        return null;
+    }
+
+    fn claudeModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
+        const ref = model_ref orelse DEFAULT_CLAUDE_MODEL;
+        for (self.claudeModelOptionsSnapshot()) |opt| {
             if (opt.value) |v| {
                 if (std.mem.eql(u8, ref, v)) return opt;
             }
@@ -2276,6 +2421,26 @@ pub const AppState = struct {
             }
         }
         self.cursor_model_options.clearRetainingCapacity();
+    }
+
+    fn clearDynamicClaudeModelOptions(self: *AppState) void {
+        for (self.claude_model_options.items) |option| {
+            self.allocator.free(option.label);
+            if (option.value) |value| self.allocator.free(value);
+            if (option.reasoning_variant_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
+            if (option.claude_effort_values) |values| {
+                for (values) |value| self.allocator.free(value);
+                self.allocator.free(values);
+            }
+        }
+        self.claude_model_options.clearRetainingCapacity();
+    }
+
+    fn clearClaudeModelOptions(self: *AppState) void {
+        self.clearDynamicClaudeModelOptions();
     }
 
     fn clearCursorModelOptions(self: *AppState) void {
@@ -4045,6 +4210,10 @@ pub const AppState = struct {
             cached.deinit();
             self.codex_logo_texture = null;
         }
+        if (self.claude_logo_texture) |cached| {
+            cached.deinit();
+            self.claude_logo_texture = null;
+        }
         if (self.thread_edit_texture) |cached| {
             cached.deinit();
             self.thread_edit_texture = null;
@@ -5380,10 +5549,10 @@ pub const AppState = struct {
         };
         const show_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
         self.palette_composer.setShowReasoningToggle(show_reasoning);
-        const reasoning_count: usize = if (thread.provider == .codex)
-            CODEX_REASONING_OPTIONS.len
-        else
-            self.opencode_reasoning_menu.items.len;
+        const reasoning_count: usize = switch (thread.provider) {
+            .codex => CODEX_REASONING_OPTIONS.len,
+            else => self.opencode_reasoning_menu.items.len,
+        };
         self.palette_composer.setReasoningOptions(self, reasoning_count, paletteReasoningLabel);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
         self.palette_composer.reasoning_index = composerReasoningIndexForThread(self, thread);
@@ -5475,6 +5644,9 @@ pub const AppState = struct {
     pub fn openPaletteModelCascadeMenu(self: *AppState) void {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
+        }
+        if (self.claude_model_options.items.len == 0) {
+            self.refreshClaudeModelOptionsCacheAsync();
         }
         if (self.cursor_model_options.items.len == 0) {
             self.refreshCursorModelOptionsCacheAsync();
@@ -5855,8 +6027,8 @@ pub const AppState = struct {
         return if (options.len > 0) 0 else null;
     }
 
-    fn composerReasoningIndex(value: ?ReasoningEffort) ?usize {
-        for (CODEX_REASONING_OPTIONS, 0..) |option, index| {
+    fn composerReasoningIndexForOptions(options: []const ReasoningOption, value: ?ReasoningEffort) ?usize {
+        for (options, 0..) |option, index| {
             if (value == null and option.value == null) return index;
             if (value != null and option.value != null and value.? == option.value.?) return index;
         }
@@ -5865,7 +6037,19 @@ pub const AppState = struct {
 
     fn composerReasoningIndexForThread(self: *const AppState, thread: *const ChatThread) ?usize {
         if (thread.provider == .codex) {
-            return composerReasoningIndex(thread.reasoning_effort);
+            return composerReasoningIndexForOptions(CODEX_REASONING_OPTIONS[0..], thread.reasoning_effort);
+        }
+        if (thread.provider == .claude) {
+            const rows = self.opencode_reasoning_menu.items;
+            for (rows, 0..) |row, i| {
+                if (thread.reasoning_effort == null and row.variant == null) return i;
+                if (thread.reasoning_effort) |effort| {
+                    if (row.variant) |variant| {
+                        if (std.mem.eql(u8, @tagName(effort), variant)) return i;
+                    }
+                }
+            }
+            return if (rows.len > 0) 0 else null;
         }
         const rows = self.opencode_reasoning_menu.items;
         for (rows, 0..) |row, i| {
@@ -6271,6 +6455,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit picker finished", .{});
         self.finishOpencodeModelCacheThread();
         runtime_log.diagnostic("AppState.deinit opencode model cache finished", .{});
+        self.finishClaudeModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit claude model cache finished", .{});
         self.finishCursorModelCacheThread();
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishAllSendThreads();
@@ -6293,9 +6479,11 @@ pub const AppState = struct {
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         self.clearOpencodeModelOptions();
+        self.clearClaudeModelOptions();
         self.clearCursorModelOptions();
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
+        self.claude_model_options.deinit(self.allocator);
         self.cursor_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
@@ -6467,6 +6655,49 @@ pub const AppState = struct {
             },
             .failed => {
                 log.warn("failed to refresh Cursor model cache", .{});
+            },
+            else => {},
+        }
+    }
+
+    pub fn pollClaudeModelOptionsCache(self: *AppState) void {
+        var loaded_models: ?[]ai_harness.ModelInfo = null;
+        var next_status: ClaudeModelCacheStatus = .idle;
+
+        self.claude_model_cache_state.mutex.lock();
+        switch (self.claude_model_cache_state.status) {
+            .completed => {
+                loaded_models = self.claude_model_cache_state.models;
+                self.claude_model_cache_state.models = null;
+                self.claude_model_cache_state.status = .idle;
+                next_status = .completed;
+            },
+            .failed => {
+                self.claude_model_cache_state.status = .idle;
+                next_status = .failed;
+            },
+            else => {},
+        }
+        self.claude_model_cache_state.mutex.unlock();
+
+        if (next_status != .idle) {
+            self.finishClaudeModelCacheThread();
+        }
+
+        switch (next_status) {
+            .completed => {
+                const models = loaded_models orelse return;
+                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+                self.clearClaudeModelOptions();
+                if (models.len == 0) return;
+                self.populateClaudeModelOptions(models) catch |err| {
+                    log.warn("failed to cache Claude models: {s}", .{@errorName(err)});
+                    self.clearDynamicClaudeModelOptions();
+                    return;
+                };
+            },
+            .failed => {
+                log.warn("failed to refresh Claude model cache", .{});
             },
             else => {},
         }
@@ -6894,6 +7125,23 @@ pub const AppState = struct {
         }
     }
 
+    fn finishClaudeModelCacheThread(self: *AppState) void {
+        self.claude_model_cache_state.mutex.lock();
+        const maybe_worker = self.claude_model_cache_state.worker;
+        self.claude_model_cache_state.worker = null;
+        const maybe_models = self.claude_model_cache_state.models;
+        self.claude_model_cache_state.models = null;
+        self.claude_model_cache_state.status = .idle;
+        self.claude_model_cache_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+        if (maybe_models) |models| {
+            ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        }
+    }
+
     fn finishCursorModelCacheThread(self: *AppState) void {
         self.cursor_model_cache_state.mutex.lock();
         const maybe_worker = self.cursor_model_cache_state.worker;
@@ -7272,6 +7520,35 @@ fn cursorModelCacheWorker(state: *CursorModelCacheState) void {
 
         break :blk client.listModels(std.heap.page_allocator) catch |err| {
             log.warn("failed to load Cursor models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
+
+fn claudeModelCacheWorker(state: *ClaudeModelCacheState) void {
+    const provider_config = ai_harness.ProviderConfig{
+        .claude = .{},
+    };
+
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
+            log.warn("failed to connect to Claude for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load Claude models: {s}", .{@errorName(err)});
             break :blk null;
         };
     };
