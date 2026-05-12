@@ -7,7 +7,7 @@ struct FSInput {
     float4 color;
 };
 
-fragment float4 main(
+fragment float4 palette_text_fragment(
     FSInput input [[stage_in]],
     texture2d<float> font_atlas [[texture(0)]],
     sampler font_sampler [[sampler(0)]]

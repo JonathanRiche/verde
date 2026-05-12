@@ -48,6 +48,20 @@ set_macos_build_version() {
 cd "$REPO_ROOT/packages/desktop"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
 export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+
+compile_palette_metallib() {
+  local shader="$1"
+  local air="$WORK_DIR/$(basename "$shader" .msl).air"
+  local metallib="${shader%.msl}.metallib"
+  xcrun -sdk macosx metal -x metal -c "$shader" -o "$air"
+  xcrun -sdk macosx metallib "$air" -o "$metallib"
+}
+
+compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.vert.msl"
+compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.solid.frag.msl"
+compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.text.frag.msl"
+compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.image.frag.msl"
+
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
@@ -103,6 +117,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>${MACOS_MIN_VERSION}</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

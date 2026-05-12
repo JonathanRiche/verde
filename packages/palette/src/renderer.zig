@@ -1784,6 +1784,10 @@ pub const ShaderSource = struct {
     pub const solid_fragment_msl = @embedFile("shaders/ui.solid.frag.msl");
     pub const text_fragment_msl = @embedFile("shaders/ui.text.frag.msl");
     pub const image_fragment_msl = @embedFile("shaders/ui.image.frag.msl");
+    pub const vertex_metallib = @embedFile("shaders/ui.vert.metallib");
+    pub const solid_fragment_metallib = @embedFile("shaders/ui.solid.frag.metallib");
+    pub const text_fragment_metallib = @embedFile("shaders/ui.text.frag.metallib");
+    pub const image_fragment_metallib = @embedFile("shaders/ui.image.frag.metallib");
 
     pub fn vulkanPackages() PipelineShaderPackages {
         return .{
@@ -1805,16 +1809,16 @@ pub const ShaderSource = struct {
     pub fn metalPackages() PipelineShaderPackages {
         return .{
             .solid = .{
-                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
-                .fragment = .{ .format = ShaderFormat.msl, .code = solid_fragment_msl },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = solid_fragment_metallib, .entrypoint = "palette_solid_fragment" },
             },
             .text = .{
-                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
-                .fragment = .{ .format = ShaderFormat.msl, .code = text_fragment_msl },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = text_fragment_metallib, .entrypoint = "palette_text_fragment" },
             },
             .image = .{
-                .vertex = .{ .format = ShaderFormat.msl, .code = vertex_msl },
-                .fragment = .{ .format = ShaderFormat.msl, .code = image_fragment_msl },
+                .vertex = .{ .format = ShaderFormat.metallib, .code = vertex_metallib, .entrypoint = "palette_vertex" },
+                .fragment = .{ .format = ShaderFormat.metallib, .code = image_fragment_metallib, .entrypoint = "palette_image_fragment" },
             },
         };
     }
@@ -1902,6 +1906,6 @@ test "embedded Vulkan and Metal shader packages validate" {
     const metal = ShaderSource.metalPackages();
     try metal.solid.validate(ShaderFormat.metal);
     try metal.text.validate(ShaderFormat.metal);
-    try std.testing.expect(std.mem.indexOf(u8, ShaderSource.vertex_msl, "vertex") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ShaderSource.text_fragment_msl, "texture2d") != null);
+    try std.testing.expect(ShaderSource.vertex_metallib.len > 0);
+    try std.testing.expect(ShaderSource.text_fragment_metallib.len > 0);
 }
