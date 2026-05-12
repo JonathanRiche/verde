@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
-import { extname } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, extname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 async function loadSdk() {
   try {
+    const require = requireFromBundledModules();
+    if (require) {
+      return await import(require.resolve("@anthropic-ai/claude-agent-sdk"));
+    }
     return await import("@anthropic-ai/claude-agent-sdk");
   } catch (err) {
     throw new Error(
-      `Unable to load @anthropic-ai/claude-agent-sdk. Install it for the desktop package or provide it on NODE_PATH. ${err?.message ?? err}`,
+      `Unable to load @anthropic-ai/claude-agent-sdk. Install it for the desktop package or provide bundled node_modules. ${err?.message ?? err}`,
     );
   }
+}
+
+function requireFromBundledModules() {
+  const root = process.env.VERDE_NODE_MODULES;
+  if (!root) return null;
+  const normalized = root.replace(/\/+$/, "");
+  return createRequire(pathToFileURL(`${normalized}/package.json`));
 }
 
 function write(message) {
@@ -194,8 +207,34 @@ function permissionMode(approvalPolicy, sandboxMode) {
   return undefined;
 }
 
+function bundledClaudePackageName() {
+  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
+  if (!arch) return null;
+  if (process.platform === "darwin") return `@anthropic-ai/claude-agent-sdk-darwin-${arch}`;
+  if (process.platform === "linux") return `@anthropic-ai/claude-agent-sdk-linux-${arch}`;
+  if (process.platform === "win32") return `@anthropic-ai/claude-agent-sdk-win32-${arch}`;
+  return null;
+}
+
+function bundledClaudeCodeExecutable() {
+  const require = requireFromBundledModules();
+  const packageName = bundledClaudePackageName();
+  if (!require || !packageName) return undefined;
+  try {
+    const manifest = require.resolve(`${packageName}/package.json`);
+    return join(dirname(manifest), process.platform === "win32" ? "claude.exe" : "claude");
+  } catch {
+    return undefined;
+  }
+}
+
 function pathToClaudeCodeExecutable(request) {
-  return request?.claude_executable || process.env.CLAUDE_CODE_EXECUTABLE || process.env.VERDE_CLAUDE_CODE_EXECUTABLE || "claude";
+  if (request?.claude_executable && request.claude_executable !== "claude") return request.claude_executable;
+  return process.env.VERDE_CLAUDE_CODE_EXECUTABLE ||
+    bundledClaudeCodeExecutable() ||
+    process.env.CLAUDE_CODE_EXECUTABLE ||
+    request?.claude_executable ||
+    "claude";
 }
 
 function buildOptions(request) {
