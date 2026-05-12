@@ -1,6 +1,6 @@
 # verde
 
-`verde` is a desktop GUI for coding agents. It currently supports Codex, OpenCode, and Cursor.
+`verde` is a desktop GUI for coding agents. It currently supports Codex, Claude Code, OpenCode, and Cursor.
 
 The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is built with [`palette`](packages/palette), our own Zig GUI framework package for native UI primitives and render-batch driven desktop rendering.
 
@@ -11,6 +11,7 @@ The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is 
 Verde talks to provider runtimes on your machine rather than bundling its own hosted backend. Install and authenticate at least one provider before using the app:
 
 - Codex: install [Codex CLI](https://github.com/openai/codex) and run `codex login`.
+- Claude Code: install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in on your machine. Verde uses Anthropic's Claude Agent SDK to talk to the local Claude Code runtime.
 - OpenCode: install [OpenCode](https://github.com/anomalyco/opencode) and make sure `opencode` is on your `PATH`.
 - Cursor: set `CURSOR_API_KEY` in the environment used to launch Verde. The Cursor provider uses `@cursor/sdk`, which requires this API key.
 
@@ -80,6 +81,7 @@ Common tasks:
 ## Provider Notes
 
 - Codex threads use the local `codex` CLI and start `codex app-server` automatically when needed.
+- Claude Code threads use Anthropic's Claude Agent SDK and require Claude Code to be installed and logged in locally.
 - OpenCode threads use the local `opencode` CLI and can start `opencode serve` automatically when needed.
 - Cursor threads use `@cursor/sdk` and require `CURSOR_API_KEY`.
 - Providers run against the project directory you import into Verde.
@@ -146,6 +148,7 @@ Those files capture Zig panic output, provider helper stderr, and the last panic
 Main third-party components used by the desktop app:
 
 - `@cursor/sdk` for Cursor provider integration.
+- `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for fast file indexing and search, vendored in [`vendor/fff`](vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.
 - `zsdl` from `zig-gamedev` for Zig bindings to SDL3. License: MIT.

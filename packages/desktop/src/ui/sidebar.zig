@@ -53,6 +53,7 @@ const SidebarContextMenuAction = enum {
     project_rename,
     project_import_codex,
     project_import_opencode,
+    project_import_claude,
     project_archive,
     thread_sync,
     thread_archive,
@@ -259,6 +260,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .project_rename => state.beginProjectRename(pi),
                 .project_import_codex => state.beginThreadImport(pi, .codex),
                 .project_import_opencode => state.beginThreadImport(pi, .opencode),
+                .project_import_claude => state.beginThreadImport(pi, .claude),
                 .project_archive => state.archiveProjectAtIndex(pi),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
                 .thread_archive => state.archiveThreadAtIndex(pi, ti),
@@ -301,6 +303,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             appendSidebarContextMenuRow(.project_rename, true, "Rename project");
             appendSidebarContextMenuRow(.project_import_codex, true, "Import Codex thread");
             appendSidebarContextMenuRow(.project_import_opencode, true, "Import OpenCode thread");
+            appendSidebarContextMenuRow(.project_import_claude, true, "Import Claude thread");
             var busy = false;
             if (pi < state.projects.items.len) {
                 for (state.projects.items[pi].threads.items) |*th| {
@@ -780,6 +783,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
     };
     if (texture) |cached| {
@@ -791,6 +795,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     const label = switch (provider) {
         .codex => "C",
         .opencode => "O",
+        .claude => "Cl",
         .cursor => "Cu",
     };
     const font_size = theme.scaledUi(11.0);

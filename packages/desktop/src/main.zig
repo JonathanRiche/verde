@@ -272,6 +272,7 @@ fn mainInner(init: std.process.Init) !void {
         recordSpan(&frame_sample, .poll_models, struct {
             fn run(app_state: *AppState) void {
                 app_state.pollOpencodeModelOptionsCache();
+                app_state.pollClaudeModelOptionsCache();
                 app_state.pollCursorModelOptionsCache();
             }
         }.run, .{&state});
@@ -1223,4 +1224,8 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
     keyboard.* = next_keyboard;
     state.replaceAppConfig(next_app_config);
     state.setSidebarNotice("App, config, and keybinds refreshed.");
+}
+
+test {
+    _ = @import("providers/claude.zig");
 }
