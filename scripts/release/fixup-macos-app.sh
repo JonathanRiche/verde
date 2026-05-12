@@ -134,10 +134,16 @@ normalize_sdl3_framework() {
     return 0
   fi
 
-  ln -sfn A "$SDL3_FRAMEWORK/Versions/Current"
-  ln -sfn Versions/Current/SDL3 "$SDL3_FRAMEWORK/SDL3"
-  ln -sfn Versions/Current/Headers "$SDL3_FRAMEWORK/Headers"
-  ln -sfn Versions/Current/Resources "$SDL3_FRAMEWORK/Resources"
+  rm -rf \
+    "$SDL3_FRAMEWORK/Versions/Current" \
+    "$SDL3_FRAMEWORK/SDL3" \
+    "$SDL3_FRAMEWORK/Headers" \
+    "$SDL3_FRAMEWORK/Resources"
+
+  ln -s A "$SDL3_FRAMEWORK/Versions/Current"
+  ln -s Versions/Current/SDL3 "$SDL3_FRAMEWORK/SDL3"
+  ln -s Versions/Current/Headers "$SDL3_FRAMEWORK/Headers"
+  ln -s Versions/Current/Resources "$SDL3_FRAMEWORK/Resources"
 }
 
 sign_app_bundle() {
