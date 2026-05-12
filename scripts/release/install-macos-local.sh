@@ -53,7 +53,7 @@ compile_palette_metallib() {
   local shader="$1"
   local air="$WORK_DIR/$(basename "$shader" .msl).air"
   local metallib="${shader%.msl}.metallib"
-  xcrun -sdk macosx metal -c "$shader" -o "$air"
+  xcrun -sdk macosx metal -x metal -c "$shader" -o "$air"
   xcrun -sdk macosx metallib "$air" -o "$metallib"
 }
 
