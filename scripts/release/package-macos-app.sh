@@ -88,8 +88,6 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
 fi
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
-bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
-
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -126,6 +124,8 @@ EOF
 bash "$SCRIPT_DIR/create-macos-icon.sh" \
   "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" \
   "$ICON_FILE"
+
+bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/verde-${VERSION}-macos-${ARCH}.zip"
 
