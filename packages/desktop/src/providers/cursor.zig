@@ -138,9 +138,7 @@ pub const Client = struct {
         defer env_map.deinit();
         try env_map.put("VERDE_CURSOR_REQUEST", request_json);
         try addBundledNodeModulesEnv(allocator, &env_map);
-        if (self.config.api_key) |api_key| {
-            try env_map.put("CURSOR_API_KEY", api_key);
-        }
+        try ensureCursorApiKeyEnv(allocator, self.config, &env_map);
 
         const executable = try process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, self.config.executable);
         defer allocator.free(executable);
@@ -492,6 +490,88 @@ fn addBundledNodeModulesEnv(
     std.Io.Dir.cwd().access(threaded.io(), bundled, .{}) catch return;
 
     try env_map.put("VERDE_NODE_MODULES", bundled);
+}
+
+fn ensureCursorApiKeyEnv(
+    allocator: std.mem.Allocator,
+    config: Config,
+    env_map: *std.process.Environ.Map,
+) !void {
+    if (config.api_key) |api_key| {
+        if (api_key.len > 0) try env_map.put("CURSOR_API_KEY", api_key);
+        return;
+    }
+    if (env_map.get("CURSOR_API_KEY")) |api_key| {
+        if (api_key.len > 0) return;
+    }
+
+    const api_key = loadCursorApiKeyFromUserEnvFilesAlloc(allocator) catch return;
+    defer allocator.free(api_key);
+    if (api_key.len > 0) try env_map.put("CURSOR_API_KEY", api_key);
+}
+
+fn loadCursorApiKeyFromUserEnvFilesAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const home_z = std.c.getenv("HOME") orelse return error.FileNotFound;
+    const home = std.mem.sliceTo(home_z, 0);
+    const candidates = [_][]const u8{
+        ".config/verde/env",
+        ".zshenv",
+        ".zprofile",
+        ".bash_profile",
+        ".bashrc",
+        ".profile",
+    };
+
+    for (candidates) |candidate| {
+        const path = try std.fs.path.join(allocator, &.{ home, candidate });
+        defer allocator.free(path);
+        const api_key = loadCursorApiKeyFromFileAlloc(allocator, path) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.IsDir => continue,
+            else => continue,
+        };
+        if (api_key.len > 0) return api_key;
+        allocator.free(api_key);
+    }
+
+    return error.FileNotFound;
+}
+
+fn loadCursorApiKeyFromFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(256 * 1024));
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (parseCursorApiKeyLine(line)) |value| {
+            return allocator.dupe(u8, value);
+        }
+    }
+    return error.FileNotFound;
+}
+
+fn parseCursorApiKeyLine(line: []const u8) ?[]const u8 {
+    const export_prefix = "export ";
+    var rest = line;
+    if (std.mem.startsWith(u8, rest, export_prefix)) rest = std.mem.trim(u8, rest[export_prefix.len..], " \t");
+    if (!std.mem.startsWith(u8, rest, "CURSOR_API_KEY")) return null;
+    rest = rest["CURSOR_API_KEY".len..];
+    rest = std.mem.trim(u8, rest, " \t");
+    if (rest.len == 0 or rest[0] != '=') return null;
+    rest = std.mem.trim(u8, rest[1..], " \t");
+    if (rest.len == 0) return null;
+
+    if ((rest[0] == '"' or rest[0] == '\'') and rest.len >= 2) {
+        const quote = rest[0];
+        const end = std.mem.indexOfScalarPos(u8, rest, 1, quote) orelse return null;
+        return rest[1..end];
+    }
+
+    const end = std.mem.indexOfAny(u8, rest, " \t#") orelse rest.len;
+    return rest[0..end];
 }
 
 fn bundledNodeModulesPathAlloc(allocator: std.mem.Allocator) ![]u8 {
