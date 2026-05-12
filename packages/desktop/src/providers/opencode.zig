@@ -2136,6 +2136,7 @@ fn reasoningVariantName(value: ?provider_types.ReasoningEffort) ?[]const u8 {
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",
+        .max => "high",
     };
 }
 

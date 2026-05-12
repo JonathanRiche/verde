@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
-import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
-import { randomUUID } from "node:crypto";
 
 async function loadSdk() {
   try {
@@ -17,6 +15,61 @@ async function loadSdk() {
 
 function write(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+let nextApprovalRequestId = 1;
+const pendingApprovals = new Map();
+
+function handleInputLine(line) {
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (message?.type !== "approval_response" || typeof message.request_id !== "number") return;
+  const pending = pendingApprovals.get(message.request_id);
+  if (!pending) return;
+  pendingApprovals.delete(message.request_id);
+  pending.resolve(message.decision === "approve");
+}
+
+function approvalRequestBody(toolName, input, options) {
+  if (options?.description) return options.description;
+  const parts = [];
+  parts.push(`Tool: ${toolName}`);
+  if (options?.blockedPath) parts.push(`Path: ${options.blockedPath}`);
+  if (options?.decisionReason) parts.push(`Reason: ${options.decisionReason}`);
+  try {
+    parts.push(JSON.stringify(input, null, 2));
+  } catch {
+    parts.push(String(input ?? ""));
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+async function requestToolApproval(toolName, input, options) {
+  const requestId = nextApprovalRequestId++;
+  write({
+    type: "approval_request",
+    request_id: requestId,
+    call_id: options?.toolUseID ?? String(requestId),
+    title: options?.title ?? options?.displayName ?? `Claude wants to use ${toolName}`,
+    body: approvalRequestBody(toolName, input, options),
+  });
+
+  const allowed = await new Promise((resolve) => {
+    pendingApprovals.set(requestId, { resolve });
+    options?.signal?.addEventListener("abort", () => {
+      if (!pendingApprovals.has(requestId)) return;
+      pendingApprovals.delete(requestId);
+      resolve(false);
+    }, { once: true });
+  });
+
+  return allowed
+    ? { behavior: "allow", toolUseID: options?.toolUseID, decisionClassification: "user_temporary" }
+    : { behavior: "deny", message: "Denied by user", toolUseID: options?.toolUseID, decisionClassification: "user_reject" };
 }
 
 function roleFromSdkMessage(message) {
@@ -56,36 +109,22 @@ async function buildPrompt(request) {
   const images = Array.isArray(request.images) ? request.images : [];
   if (images.length === 0) return request.prompt;
 
-  const content = [];
-  if (request.prompt) content.push({ type: "text", text: request.prompt });
+  const lines = [];
+  if (request.prompt) lines.push(request.prompt);
+  lines.push("", "Attached image file(s):");
   for (const image of images) {
     const path = image?.path;
     if (typeof path !== "string" || path.length === 0) {
       throw new Error("Claude image attachment is missing a local path.");
     }
-    const mediaType = mimeTypeForPath(path);
-    if (!mediaType) {
+    if (!mimeTypeForPath(path)) {
       throw new Error(`Claude image attachment has an unsupported file type: ${path}`);
     }
-    const bytes = await readFile(path);
-    content.push({
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: mediaType,
-        data: bytes.toString("base64"),
-      },
-    });
+    lines.push(`- ${path}`);
   }
+  lines.push("", "Use the attached image file(s) as context for this request.");
 
-  return (async function* promptMessages() {
-    yield {
-      type: "user",
-      message: { role: "user", content },
-      parent_tool_use_id: null,
-      uuid: randomUUID(),
-    };
-  })();
+  return lines.join("\n");
 }
 
 function emitSdkMessage(message) {
@@ -102,14 +141,38 @@ function commandFromToolUse(item) {
   return input.command ?? input.cmd ?? null;
 }
 
-function emitToolEvents(message, commandByToolUseId) {
+function commandShouldRunInBackground(command) {
+  return /\b(bun|npm|pnpm|yarn)\s+(run\s+)?(dev|dev:[\w:-]+|start)\b/.test(command) ||
+    /\b(vite|next|astro|wrangler|alchemy)\s+(dev|start|preview|serve)\b/.test(command);
+}
+
+function scheduleBackgroundTask(query, toolUseId, command) {
+  if (!toolUseId || typeof query?.backgroundTasks !== "function") return;
+  setTimeout(async () => {
+    try {
+      const backgrounded = await query.backgroundTasks(toolUseId);
+      if (backgrounded) {
+        write({ type: "stream_event", title: "Backgrounded command", body: command });
+      }
+    } catch (err) {
+      write({ type: "stream_event", title: "Failed to background command", body: err?.message ?? String(err) });
+    }
+  }, 4000).unref?.();
+}
+
+function emitToolEvents(message, commandByToolUseId, query) {
   const content = message?.message?.content ?? message?.content;
-  if (!Array.isArray(content)) return;
+  if (!Array.isArray(content)) return false;
+  let sawBackgroundableCommand = false;
   for (const item of content) {
     const command = commandFromToolUse(item);
     if (typeof command === "string" && command.length > 0) {
       if (typeof item.id === "string") commandByToolUseId.set(item.id, command);
       write({ type: "stream_event", title: "Ran command", body: command });
+      if (commandShouldRunInBackground(command)) {
+        sawBackgroundableCommand = true;
+        scheduleBackgroundTask(query, item.id, command);
+      }
       continue;
     }
     if (item?.type === "tool_result" && item.is_error === true) {
@@ -119,12 +182,14 @@ function emitToolEvents(message, commandByToolUseId) {
       }
     }
   }
+  return sawBackgroundableCommand;
 }
 
 function permissionMode(approvalPolicy, sandboxMode) {
   if (approvalPolicy === "never" && sandboxMode === "danger_full_access") {
     return "bypassPermissions";
   }
+  if (approvalPolicy === "on_request") return "default";
   if (approvalPolicy === "never") return "dontAsk";
   return undefined;
 }
@@ -138,7 +203,7 @@ function buildOptions(request) {
     cwd: request.cwd ?? undefined,
     resume: request.thread_id ?? undefined,
     model: request.model ?? undefined,
-    maxThinkingTokens: request.reasoning_effort === "xhigh" ? 31999 : undefined,
+    effort: request.reasoning_effort ?? undefined,
     pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request),
   };
 
@@ -146,6 +211,7 @@ function buildOptions(request) {
   if (mode) {
     options.permissionMode = mode;
     if (mode === "bypassPermissions") options.allowDangerouslySkipPermissions = true;
+    if (mode === "default") options.canUseTool = requestToolApproval;
   }
 
   return Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
@@ -166,9 +232,23 @@ async function handleListModels(sdk, request) {
     type: "result",
     models: (models ?? []).map((model) => ({
       id: model.value ?? model.id ?? model.name ?? String(model),
-      name: model.displayName ?? model.name ?? model.value ?? model.id ?? String(model),
+      name: claudeModelDisplayName(model),
+      reasoning_supported: model.supportsEffort ?? false,
+      supported_effort_levels: Array.isArray(model.supportedEffortLevels) ? model.supportedEffortLevels : null,
     })),
   });
+}
+
+function claudeModelDisplayName(model) {
+  const fallback = model.displayName ?? model.name ?? model.value ?? model.id ?? String(model);
+  const description = typeof model.description === "string" ? model.description : "";
+  const version = description.match(/\b(?:Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?\b/)?.[0];
+  if (!version) return fallback;
+
+  const display = String(model.displayName ?? "");
+  if (display.includes("1M context")) return `${version} (1M context)`;
+  if (display.toLowerCase().includes("recommended")) return `Default (${version})`;
+  return version;
 }
 
 async function handleListThreads(sdk, request) {
@@ -176,7 +256,7 @@ async function handleListThreads(sdk, request) {
     write({ type: "result", threads: [] });
     return;
   }
-  const sessions = await sdk.listSessions({ cwd: request.cwd ?? undefined });
+  const sessions = await sdk.listSessions({ dir: request.cwd ?? undefined, limit: request.limit ?? 100 });
   write({
     type: "result",
     threads: (sessions ?? []).map((session) => ({
@@ -191,7 +271,7 @@ async function handleReadThread(sdk, request) {
   if (typeof sdk.getSessionMessages !== "function") {
     throw new Error("Claude Agent SDK does not expose getSessionMessages");
   }
-  const messages = await sdk.getSessionMessages(request.thread_id, { cwd: request.cwd ?? undefined });
+  const messages = await sdk.getSessionMessages(request.thread_id, { dir: request.cwd ?? undefined, limit: request.limit ?? 1000 });
   write({
     type: "result",
     thread_id: request.thread_id,
@@ -204,35 +284,58 @@ async function handleReadThread(sdk, request) {
 }
 
 async function handleSendPrompt(sdk, request) {
+  const stderrChunks = [];
+  const options = buildOptions(request);
+  options.stderr = (data) => {
+    if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
+  };
+
   const query = sdk.query({
     prompt: await buildPrompt(request),
-    options: buildOptions(request),
+    options,
   });
 
-  let sessionId = request.thread_id ?? null;
-  let reply = "";
-  const commandByToolUseId = new Map();
-  for await (const message of query) {
-    if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
-      sessionId = message.session_id;
-      write({ type: "thread_id", thread_id: sessionId });
-      continue;
+  try {
+    let sessionId = request.thread_id ?? null;
+    let reply = "";
+    const commandByToolUseId = new Map();
+    let sawBackgroundableCommand = false;
+    let closeAfterReplyTimer = null;
+    for await (const message of query) {
+      if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
+        sessionId = message.session_id;
+        write({ type: "thread_id", thread_id: sessionId });
+        continue;
+      }
+      if (message?.type === "result") {
+        sessionId = message.session_id ?? sessionId;
+        if (typeof message.result === "string") reply = message.result;
+        continue;
+      }
+      emitSdkMessage(message);
+      sawBackgroundableCommand = emitToolEvents(message, commandByToolUseId, query) || sawBackgroundableCommand;
+      const delta = textFromContent(message?.message?.content ?? message?.content);
+      if (message?.type === "assistant" && delta) {
+        reply += delta;
+        write({ type: "delta", text: delta });
+        if (sawBackgroundableCommand && typeof query?.close === "function") {
+          if (closeAfterReplyTimer) clearTimeout(closeAfterReplyTimer);
+          closeAfterReplyTimer = setTimeout(() => {
+            write({ type: "stream_event", title: "Finished reply", body: "Closed Claude stream after background dev command." });
+            query.close();
+          }, 3000);
+          closeAfterReplyTimer.unref?.();
+        }
+      }
     }
-    if (message?.type === "result") {
-      sessionId = message.session_id ?? sessionId;
-      if (typeof message.result === "string") reply = message.result;
-      continue;
-    }
-    emitSdkMessage(message);
-    emitToolEvents(message, commandByToolUseId);
-    const delta = textFromContent(message?.message?.content ?? message?.content);
-    if (message?.type === "assistant" && delta) {
-      reply += delta;
-      write({ type: "delta", text: delta });
-    }
-  }
+    if (closeAfterReplyTimer) clearTimeout(closeAfterReplyTimer);
 
-  write({ type: "result", thread_id: sessionId, reply_text: reply });
+    write({ type: "result", thread_id: sessionId, reply_text: reply });
+  } catch (err) {
+    const stderr = stderrChunks.join("").trim();
+    if (stderr) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
+    throw err;
+  }
 }
 
 async function dispatch(request) {
@@ -254,6 +357,7 @@ async function dispatch(request) {
 }
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", handleInputLine);
 rl.once("line", async (line) => {
   try {
     await dispatch(JSON.parse(line));
@@ -261,6 +365,6 @@ rl.once("line", async (line) => {
     write({ type: "error", message: err?.message ?? String(err) });
     process.exitCode = 1;
   } finally {
-    rl.close();
+    if (pendingApprovals.size === 0) rl.close();
   }
 });

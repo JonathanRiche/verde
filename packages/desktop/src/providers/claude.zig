@@ -3,6 +3,7 @@
 const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const BRIDGE_SOURCE = @embedFile("claude_bridge.mjs");
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
@@ -22,6 +23,7 @@ const Mutex = struct {
 const ActiveProcessState = struct {
     mutex: Mutex = .{},
     child: ?*std.process.Child = null,
+    process_group: ?std.posix.pid_t = null,
 };
 
 var active_process_state: ActiveProcessState = .{};
@@ -91,11 +93,19 @@ pub const Client = struct {
             if (model != .object) continue;
             const id = getOptionalObjectString(model, "id") orelse continue;
             const name = getOptionalObjectString(model, "name") orelse id;
+            const reasoning_supported = getOptionalObjectBool(model, "reasoning_supported") orelse true;
+            const effort_values = try parseStringArrayField(allocator, model, "supported_effort_levels");
+            errdefer if (effort_values) |values| {
+                for (values) |value| allocator.free(value);
+                allocator.free(values);
+            };
             try models.append(allocator, .{
                 .provider_id = try allocator.dupe(u8, "claude"),
                 .provider_name = try allocator.dupe(u8, "Claude"),
                 .model_id = try allocator.dupe(u8, id),
                 .model_name = try allocator.dupe(u8, name),
+                .reasoning_supported = reasoning_supported,
+                .claude_effort_values = effort_values,
             });
         }
         return models.toOwnedSlice(allocator);
@@ -191,8 +201,16 @@ pub const Client = struct {
         defer active_process_state.mutex.unlock();
 
         const child = active_process_state.child orelse return;
+        const process_group = active_process_state.process_group;
         var threaded = std.Io.Threaded.init_single_threaded;
-        child.kill(threaded.io());
+        if (process_group) |pgid| {
+            std.posix.kill(-pgid, std.posix.SIG.TERM) catch |err| {
+                runtime_log.diagnostic("claude.interruptThread group SIGTERM failed pgid={d}: {s}", .{ pgid, @errorName(err) });
+                child.kill(threaded.io());
+            };
+        } else {
+            child.kill(threaded.io());
+        }
     }
 
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
@@ -213,6 +231,7 @@ pub const Client = struct {
 
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
+        runtime_log.diagnostic("claude.runBridge spawning cwd={s} bridge={s}", .{ self.config.cwd orelse "(inherit)", bridge_path });
         var child = try std.process.spawn(threaded.io(), .{
             .argv = &.{ executable, bridge_path },
             .stdin = .pipe,
@@ -222,12 +241,18 @@ pub const Client = struct {
             .environ_map = &env_map,
         });
         errdefer child.kill(threaded.io());
+        if (child.id) |pid| {
+            _ = std.c.setpgid(pid, pid);
+        }
         registerActiveChild(&child);
         defer unregisterActiveChild(&child);
 
         try writeJsonLine(self.allocator, child.stdin.?, payload);
-        child.stdin.?.close(threaded.io());
-        child.stdin = null;
+        const keep_stdin_open = if (stream_request) |request| request.on_approval_request != null else false;
+        if (!keep_stdin_open) {
+            child.stdin.?.close(threaded.io());
+            child.stdin = null;
+        }
 
         var response: BridgeResponse = .{};
         errdefer response.deinit(self.allocator);
@@ -239,16 +264,24 @@ pub const Client = struct {
             if (maybe_line == null) break;
             const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
             if (line.len == 0) continue;
-            try self.handleBridgeLine(line, stream_request, &response);
+            try self.handleBridgeLine(line, stream_request, child.stdin, &response);
         }
 
         const term = try child.wait(threaded.io());
+        if (child.stdin) |stdin| {
+            stdin.close(threaded.io());
+            child.stdin = null;
+        }
         child.stdout = null;
-        if (response.error_message) |_| return error.ClaudeRequestFailed;
+        if (response.error_message) |message| {
+            runtime_log.diagnostic("claude.runBridge error: {s}", .{message});
+            return error.ClaudeRequestFailed;
+        }
         switch (term) {
             .exited => |code| if (code != 0) return error.ClaudeRequestFailed,
             else => return error.ClaudeRequestFailed,
         }
+        runtime_log.diagnostic("claude.runBridge completed", .{});
         return response;
     }
 
@@ -256,6 +289,7 @@ pub const Client = struct {
         self: *Client,
         line: []const u8,
         stream_request: ?provider_types.SendPromptRequest,
+        stdin: ?std.Io.File,
         response: *BridgeResponse,
     ) !void {
         if (line.len > MAX_BRIDGE_LINE_BYTES) return error.ClaudeMessageTooLarge;
@@ -301,6 +335,33 @@ pub const Client = struct {
             parsed.deinit();
             return;
         }
+        if (std.mem.eql(u8, kind, "approval_request")) {
+            if (stream_request) |request| {
+                if (request.on_approval_request) |on_approval_request| {
+                    const request_id = getOptionalObjectInt(parsed.value, "request_id") orelse {
+                        parsed.deinit();
+                        return;
+                    };
+                    const call_id = getOptionalObjectString(parsed.value, "call_id") orelse "claude-tool";
+                    const title = getOptionalObjectString(parsed.value, "title") orelse "Claude permission request";
+                    const body = getOptionalObjectString(parsed.value, "body") orelse "";
+                    const decision = on_approval_request(request.stream_context, .{
+                        .call_id = call_id,
+                        .title = title,
+                        .body = body,
+                    });
+                    if (stdin) |input| {
+                        try writeJsonLine(self.allocator, input, .{
+                            .type = "approval_response",
+                            .request_id = request_id,
+                            .decision = if (decision == .approve) "approve" else "deny",
+                        });
+                    }
+                }
+            }
+            parsed.deinit();
+            return;
+        }
         if (std.mem.eql(u8, kind, "result")) {
             if (response.result_tree) |*old| old.deinit();
             response.result_tree = parsed;
@@ -317,6 +378,7 @@ fn registerActiveChild(child: *std.process.Child) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     active_process_state.child = child;
+    active_process_state.process_group = child.id;
 }
 
 fn unregisterActiveChild(child: *std.process.Child) void {
@@ -324,6 +386,7 @@ fn unregisterActiveChild(child: *std.process.Child) void {
     defer active_process_state.mutex.unlock();
     if (active_process_state.child == child) {
         active_process_state.child = null;
+        active_process_state.process_group = null;
     }
 }
 
@@ -382,7 +445,9 @@ fn containsImagePath(images: []const provider_types.ImageAttachment, path: []con
 
 fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
-    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "verde-claude-agent-sdk-bridge.mjs" });
+    const cwd = try std.process.currentPathAlloc(threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const path = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "verde-claude-agent-sdk-bridge.mjs" });
     errdefer allocator.free(path);
 
     const file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
@@ -419,6 +484,37 @@ fn getOptionalObjectString(value: std.json.Value, field: []const u8) ?[]const u8
         .string => |text| text,
         else => null,
     };
+}
+
+fn getOptionalObjectBool(value: std.json.Value, field: []const u8) ?bool {
+    const field_value = getObjectField(value, field) orelse return null;
+    return switch (field_value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn getOptionalObjectInt(value: std.json.Value, field: []const u8) ?i64 {
+    const field_value = getObjectField(value, field) orelse return null;
+    return switch (field_value) {
+        .integer => |int| int,
+        else => null,
+    };
+}
+
+fn parseStringArrayField(allocator: std.mem.Allocator, value: std.json.Value, field: []const u8) !?[][:0]const u8 {
+    const field_value = getObjectField(value, field) orelse return null;
+    if (field_value != .array) return null;
+    var items: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+    for (field_value.array.items) |item| {
+        if (item != .string) continue;
+        try items.append(allocator, try allocator.dupeZ(u8, item.string));
+    }
+    return try items.toOwnedSlice(allocator);
 }
 
 fn parseRole(text: []const u8) provider_types.MessageRole {

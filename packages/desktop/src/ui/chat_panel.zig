@@ -1254,9 +1254,31 @@ fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: u
         return height;
     }
 
-    const height = transcriptMessageHeight(state, message_index, message.body, message.role, column_width, message.author, false);
+    var height = transcriptMessageHeight(state, message_index, message.body, message.role, column_width, message.author, false);
+    height += transcriptImageBlockHeight(message, column_width);
     state.putTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present, height);
     return height;
+}
+
+fn transcriptImageCount(message: app_state.ChatMessage) usize {
+    return (if (message.image != null) @as(usize, 1) else 0) + message.extra_images.len;
+}
+
+fn transcriptImageAt(message: app_state.ChatMessage, index: usize) ?app_state.ChatImageAttachment {
+    if (index == 0) return message.image;
+    const extra_index = index - 1;
+    if (extra_index >= message.extra_images.len) return null;
+    return message.extra_images[extra_index];
+}
+
+fn transcriptImageBlockHeight(message: app_state.ChatMessage, column_width: f32) f32 {
+    const count = transcriptImageCount(message);
+    if (count == 0) return 0.0;
+    const bubble_width = if (message.role == .user) column_width * 0.62 else column_width;
+    const inner_w = @max(bubble_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
+    const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
+    const gap = theme.scaledUi(10.0);
+    return gap + @as(f32, @floatFromInt(count)) * (thumb_h + gap);
 }
 
 fn transcriptMessageHeight(
@@ -1335,6 +1357,53 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
         .system => "System",
     };
     renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip, message_index);
+    renderTranscriptImages(state, column, y, height, message, clip);
+}
+
+fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect) void {
+    const count = transcriptImageCount(message);
+    if (count == 0) return;
+
+    const bubble_width = if (message.role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (message.role == .user) column.x + column.w - bubble_width else column.x;
+    const pad = theme.scaledUi(14.0);
+    const gap = theme.scaledUi(10.0);
+    const inner_w = @max(bubble_width - pad * 2.0, theme.scaledUi(80.0));
+    const thumb_h = @max(@min(inner_w * 0.56, theme.scaledUi(220.0)), theme.scaledUi(96.0));
+    var image_y = y + height - transcriptImageBlockHeight(message, column.w) + gap;
+
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const image = transcriptImageAt(message, index) orelse continue;
+        const frame = palette.Rect{
+            .x = bubble_x + pad,
+            .y = image_y,
+            .w = inner_w,
+            .h = thumb_h,
+        };
+        queueRoundedShellClipped(
+            state,
+            frame,
+            paletteColor(colors.rgba(15, 22, 24, 255)),
+            paletteColor(colors.rgba(74, 92, 99, 255)),
+            theme.scaledUi(9.0),
+            clip,
+        );
+        if (state.ensureImageTexture(image.path)) |cached| {
+            const inset = theme.scaledUi(6.0);
+            const image_rect = palette.Rect{ .x = frame.x + inset, .y = frame.y + inset, .w = frame.w - inset * 2.0, .h = frame.h - inset * 2.0 };
+            const dims = runtime.scaledImageSize(cached.width, cached.height, image_rect.w, image_rect.h);
+            queueImage(state, .{
+                .x = image_rect.x + (image_rect.w - dims[0]) * 0.5,
+                .y = image_rect.y + (image_rect.h - dims[1]) * 0.5,
+                .w = dims[0],
+                .h = dims[1],
+            }, cached, frame);
+        } else {
+            queueText(state, .{ .x = frame.x + pad, .y = frame.y + pad, .w = frame.w - pad * 2.0, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+        }
+        image_y += thumb_h + gap;
+    }
 }
 
 fn renderCommandEventRow(
@@ -1775,6 +1844,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     const provider_icon = switch (state.currentThread().provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
+        .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
     };
     if (provider_icon) |cached| {
