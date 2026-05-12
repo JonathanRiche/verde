@@ -22,9 +22,10 @@ pub const ChatRole = enum(u8) {
 };
 
 pub const Provider = enum(u8) {
-    opencode,
-    codex,
-    cursor,
+    opencode = 0,
+    codex = 1,
+    cursor = 2,
+    claude = 3,
 };
 
 pub const Harness = enum(u8) {

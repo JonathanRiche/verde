@@ -3,6 +3,7 @@
 pub const Provider = enum(u8) {
     opencode,
     codex,
+    claude,
     cursor,
 };
 
@@ -52,6 +53,7 @@ pub const ModelInfo = struct {
     cursor_reasoning_param_id: ?[]const u8 = null,
     cursor_reasoning_values: ?[][:0]const u8 = null,
     cursor_reasoning_requires_thinking: bool = false,
+    claude_effort_values: ?[]const [:0]const u8 = null,
 
     pub fn deinit(self: ModelInfo, allocator: anytype) void {
         allocator.free(self.provider_id);
@@ -64,6 +66,10 @@ pub const ModelInfo = struct {
         }
         if (self.cursor_reasoning_param_id) |param_id| allocator.free(param_id);
         if (self.cursor_reasoning_values) |values| {
+            for (values) |value| allocator.free(value);
+            allocator.free(values);
+        }
+        if (self.claude_effort_values) |values| {
             for (values) |value| allocator.free(value);
             allocator.free(values);
         }
@@ -97,6 +103,7 @@ pub const ReasoningEffort = enum(u8) {
     medium,
     high,
     xhigh,
+    max,
 };
 
 pub const ApprovalPolicy = enum(u8) {
