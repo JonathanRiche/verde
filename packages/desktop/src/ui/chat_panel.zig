@@ -9,6 +9,7 @@ const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
 const colors = @import("colors.zig");
 const composer_pickers = @import("composer_pickers.zig");
+const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
@@ -22,6 +23,8 @@ const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
 const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
 /// Draft attachment previews sit above the composer card when they overlap the dock.
 const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
+/// File mention search must sit above composer chrome and toolbar menus.
+const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
 /// Provider logo slot in the model pill.
@@ -33,6 +36,15 @@ const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 
 var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+const FileSearchHitCache = struct {
+    panel_rect: palette.Rect = .{},
+    row_count: usize = 0,
+    row_rects: [8]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 8,
+    row_indices: [8]usize = [_]usize{0} ** 8,
+};
+
+var file_search_hits: FileSearchHitCache = .{};
 
 const WorkspaceHeaderOpenMenuRow = enum {
     folder,
@@ -62,6 +74,7 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     state.invalidateComposerToolbarOverlayHitRects();
+    file_search_hits = .{};
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     if (state.projects.items.len == 0) {
         state.workspace_header_open_menu_open = false;
@@ -239,8 +252,25 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
     return false;
 }
 
-pub fn handleFileSearchPaletteMouseButton(_: *app_state.AppState, _: f32, _: f32, _: bool) bool {
-    return false;
+pub fn handleFileSearchPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    if (!down) return false;
+    if (!state.hasActiveFileSearch()) return false;
+    if (file_search_hits.row_count == 0) return false;
+    if (!rectContains(file_search_hits.panel_rect, x, y)) return false;
+
+    var index: usize = 0;
+    while (index < file_search_hits.row_count) : (index += 1) {
+        if (rectContains(file_search_hits.row_rects[index], x, y)) {
+            _ = state.selectFileSearchResult(file_search_hits.row_indices[index]);
+            return true;
+        }
+    }
+    return true;
+}
+
+pub fn handleComposerFileSearchMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    if (button != 1) return false;
+    return handleFileSearchPaletteMouseButton(state, x, y, down);
 }
 
 /// True when `(x, y)` lies inside the transcript pane last painted by `renderTranscript`.
@@ -1504,13 +1534,115 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.syncPaletteComposerFromDraft();
     state.syncPaletteComposerControls();
     state.setPaletteComposerBounds(.{ rect.x, rect.y }, .{ rect.x + rect.w, rect.y + rect.h });
+    state.updateFileSearch();
     state.palette_composer.render(state.allocator, &state.palette_overlay_batch) catch |err| {
         app_state.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
     };
+    renderComposerFileSearchResults(state);
     renderComposerDraftImage(state);
     renderComposerFollowupHint(state);
     renderComposerToolbarIcons(state);
     state.syncComposerToolbarOverlayHitRects();
+}
+
+fn renderComposerFileSearchResults(state: *app_state.AppState) void {
+    file_search_hits = .{};
+    if (!state.hasActiveFileSearch()) return;
+
+    const composer = state.palette_composer.bounds();
+    if (composer.w <= theme.scaledUi(160.0)) return;
+
+    const results = state.fileSearchResults();
+    const row_height = theme.scaledUi(42.0);
+    const max_rows: usize = @min(results.len, file_search_hits.row_rects.len);
+    const visible_rows: usize = if (results.len == 0) 1 else @max(@as(usize, 1), @min(max_rows, 6));
+    const pad = theme.scaledUi(8.0);
+    const gap = theme.scaledUi(8.0);
+    const panel_w = @min(composer.w, theme.scaledUi(720.0));
+    const panel_h = pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows));
+    const panel = palette.Rect{
+        .x = composer.x,
+        .y = @max(theme.scaledUi(8.0), composer.y - gap - panel_h),
+        .w = panel_w,
+        .h = panel_h,
+    };
+    file_search_hits.panel_rect = panel;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FILE_SEARCH_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    queueRoundedShellClipped(
+        state,
+        panel,
+        paletteColor(colors.rgba(16, 21, 23, 250)),
+        paletteColor(colors.rgba(76, 95, 101, 255)),
+        theme.scaledUi(12.0),
+        panel,
+    );
+
+    if (results.len == 0) {
+        const message = if (state.fileSearchIsScanning()) "Indexing project files..." else "No matching files";
+        queueText(state, .{
+            .x = panel.x + theme.scaledUi(14.0),
+            .y = panel.y + pad + theme.scaledUi(9.0),
+            .w = panel.w - theme.scaledUi(28.0),
+            .h = row_height,
+        }, message, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), panel);
+        return;
+    }
+
+    const mouse_ok = state.palette_mouse_in_workspace;
+    const mx = state.palette_mouse_x;
+    const my = state.palette_mouse_y;
+    const selected_index = state.fileSearchSelectedIndex();
+    const first_index = if (selected_index >= visible_rows) selected_index + 1 - visible_rows else 0;
+    const end_index = @min(first_index + visible_rows, results.len);
+
+    var visible_index: usize = 0;
+    var result_index = first_index;
+    while (result_index < end_index) : ({
+        result_index += 1;
+        visible_index += 1;
+    }) {
+        const row = palette.Rect{
+            .x = panel.x + pad,
+            .y = panel.y + pad + @as(f32, @floatFromInt(visible_index)) * row_height,
+            .w = panel.w - pad * 2.0,
+            .h = row_height,
+        };
+        file_search_hits.row_rects[visible_index] = row;
+        file_search_hits.row_indices[visible_index] = result_index;
+        file_search_hits.row_count = visible_index + 1;
+
+        const hovered = mouse_ok and rectContains(row, mx, my);
+        if (result_index == selected_index or hovered) {
+            queueRounded(state, row, paletteColor(if (result_index == selected_index) colors.rgba(42, 73, 85, 230) else colors.rgba(38, 46, 50, 230)), theme.scaledUi(8.0));
+        }
+
+        const result = results[result_index];
+        const icon = file_icons.forFile(result.file_name);
+        const icon_w = theme.scaledUi(28.0);
+        queueIconText(state, .{
+            .x = row.x + theme.scaledUi(10.0),
+            .y = row.y + theme.scaledUi(9.0),
+            .w = icon_w,
+            .h = row.h,
+        }, icon.glyph, paletteColor(icon.color), theme.scaledUi(17.0), row);
+
+        const text_x = row.x + theme.scaledUi(10.0) + icon_w;
+        queueText(state, .{
+            .x = text_x,
+            .y = row.y + theme.scaledUi(6.0),
+            .w = row.w - (text_x - row.x) - theme.scaledUi(12.0),
+            .h = theme.scaledUi(18.0),
+        }, result.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), row);
+        queueText(state, .{
+            .x = text_x,
+            .y = row.y + theme.scaledUi(24.0),
+            .w = row.w - (text_x - row.x) - theme.scaledUi(12.0),
+            .h = theme.scaledUi(16.0),
+        }, result.relative_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), row);
+    }
 }
 
 fn renderComposerDraftImage(state: *app_state.AppState) void {
@@ -1775,6 +1907,10 @@ fn queueFixedText(state: *app_state.AppState, rect: palette.Rect, value: []const
 
 fn queueFixedTextLine(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
     state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * 0.55, font_size * 1.25, false) catch {};
+}
+
+fn queueIconText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, .icon, null, clip) catch {};
 }
 
 fn paletteColor(value: [4]f32) palette.Color {

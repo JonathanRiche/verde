@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p \
   "$PREFIX/bin" \
+  "$PREFIX/share/verde" \
   "$PREFIX/share/applications" \
   "$PREFIX/share/pixmaps"
 
@@ -49,6 +50,9 @@ if [[ -d "$SCRIPT_DIR/bin/locales" ]]; then
 fi
 install -m 644 "$SCRIPT_DIR/share/applications/verde.desktop" "$PREFIX/share/applications/verde.desktop"
 install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/pixmaps/verde.png"
+if [[ -e "$SCRIPT_DIR/share/verde/VERSION" ]]; then
+  install -m 644 "$SCRIPT_DIR/share/verde/VERSION" "$PREFIX/share/verde/VERSION"
+fi
 
 echo "Installed Verde into $PREFIX"
 echo "Binary: $PREFIX/bin/verde"
