@@ -12,6 +12,7 @@ FFF_LIB="$MACOS_DIR/libfff_c.dylib"
 DESIRED_FFF_REF="@executable_path/libfff_c.dylib"
 TREE_SITTER_PATTERN='libtree-sitter[^[:space:]]*\.dylib'
 SDL3_TTF_PATTERN='libSDL3_ttf[^[:space:]]*\.dylib'
+SDL3_FRAMEWORK="$MACOS_DIR/SDL3.framework"
 
 find_cmd() {
   local primary="$1"
@@ -32,6 +33,7 @@ find_cmd() {
 
 INSTALL_NAME_TOOL="$(find_cmd install_name_tool llvm-install-name-tool || true)"
 OTOOL="$(find_cmd otool llvm-otool || true)"
+CODESIGN="$(find_cmd codesign codesign || true)"
 
 if [[ -z "$INSTALL_NAME_TOOL" ]]; then
   echo "install_name_tool or llvm-install-name-tool is required" >&2
@@ -40,6 +42,11 @@ fi
 
 if [[ -z "$OTOOL" ]]; then
   echo "otool or llvm-otool is required" >&2
+  exit 1
+fi
+
+if [[ -z "$CODESIGN" ]]; then
+  echo "codesign is required" >&2
   exit 1
 fi
 
@@ -122,6 +129,36 @@ bundle_dependency_from_existing_ref() {
   ensure_bundled_dependency "$pattern" "$bundled_path" "$desired_ref"
 }
 
+normalize_sdl3_framework() {
+  if [[ ! -d "$SDL3_FRAMEWORK/Versions/A" ]]; then
+    return 0
+  fi
+
+  rm -rf \
+    "$SDL3_FRAMEWORK/Versions/Current" \
+    "$SDL3_FRAMEWORK/SDL3" \
+    "$SDL3_FRAMEWORK/Headers" \
+    "$SDL3_FRAMEWORK/Resources"
+
+  ln -s A "$SDL3_FRAMEWORK/Versions/Current"
+  ln -s Versions/Current/SDL3 "$SDL3_FRAMEWORK/SDL3"
+  ln -s Versions/Current/Headers "$SDL3_FRAMEWORK/Headers"
+  ln -s Versions/Current/Resources "$SDL3_FRAMEWORK/Resources"
+}
+
+sign_app_bundle() {
+  while IFS= read -r -d '' binary; do
+    "$CODESIGN" --force --sign - "$binary" >/dev/null
+  done < <(find "$MACOS_DIR" -type f \( -perm -111 -o -name '*.dylib' \) -print0)
+
+  "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
+  if ! "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR"; then
+    echo "warning: ad-hoc app signature verification failed during packaging" >&2
+  fi
+}
+
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
 bundle_dependency_from_existing_ref "$TREE_SITTER_PATTERN"
 bundle_dependency_from_existing_ref "$SDL3_TTF_PATTERN"
+normalize_sdl3_framework
+sign_app_bundle

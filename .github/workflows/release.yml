@@ -39,7 +39,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             vendor/fff/target
-          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-release-build-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml', 'scripts/release/package-linux.sh', 'scripts/release/package-macos-app.sh') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-release-build-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml', 'scripts/release/package-linux.sh', 'scripts/release/package-macos-app.sh', 'scripts/release/fixup-macos-app.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-release-build-cache-
 
@@ -120,6 +120,7 @@ jobs:
         shell: bash
         run: |
           HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter sdl3_ttf
+          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'

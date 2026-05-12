@@ -25,6 +25,9 @@ case "$ARCH" in
     ;;
 esac
 
+MACOS_MIN_VERSION="${VERDE_MACOS_MIN_VERSION:-13.0}"
+MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -37,10 +40,26 @@ source "$SCRIPT_DIR/cef-common.sh"
 need_cmd zig
 need_cmake
 need_cmd bash
+need_cmd xcrun
+
+set_macos_build_version() {
+  local binary="$1"
+  local patched="$binary.patched"
+
+  xcrun vtool \
+    -set-build-version macos "$MACOS_MIN_VERSION" "$MACOS_SDK_VERSION" \
+    -replace \
+    -output "$patched" \
+    "$binary" >/dev/null
+  mv "$patched" "$binary"
+  chmod 755 "$binary"
+}
 
 mkdir -p "$OUTPUT_DIR"
 
-cd "$REPO_ROOT"
+cd "$REPO_ROOT/packages/desktop"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
+export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
@@ -67,6 +86,7 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
   ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
+set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 bash "$SCRIPT_DIR/fixup-macos-app.sh" "$APP_DIR"
 
@@ -95,6 +115,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
   <string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>${MACOS_MIN_VERSION}</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
