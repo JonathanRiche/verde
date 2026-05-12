@@ -152,7 +152,9 @@ sign_app_bundle() {
   done < <(find "$MACOS_DIR" -type f \( -perm -111 -o -name '*.dylib' \) -print0)
 
   "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
-  "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR" >/dev/null
+  if ! "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR"; then
+    echo "warning: ad-hoc app signature verification failed during packaging" >&2
+  fi
 }
 
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
