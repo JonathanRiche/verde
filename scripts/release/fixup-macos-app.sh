@@ -13,6 +13,7 @@ DESIRED_FFF_REF="@executable_path/libfff_c.dylib"
 TREE_SITTER_PATTERN='libtree-sitter[^[:space:]]*\.dylib'
 SDL3_TTF_PATTERN='libSDL3_ttf[^[:space:]]*\.dylib'
 SDL3_FRAMEWORK="$MACOS_DIR/SDL3.framework"
+DESIRED_SDL3_FRAMEWORK_REF="@rpath/SDL3.framework/Versions/A/SDL3"
 
 find_cmd() {
   local primary="$1"
@@ -81,6 +82,70 @@ rewrite_dependency_refs() {
 
     "$INSTALL_NAME_TOOL" -change "$current_ref" "$desired_ref" "$candidate"
   done < <(find "$MACOS_DIR" -maxdepth 1 -type f -print0)
+}
+
+rewrite_sdl3_dylib_refs_to_framework() {
+  if [[ ! -f "$SDL3_FRAMEWORK/Versions/A/SDL3" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r -d '' candidate; do
+    if ! "$OTOOL" -L "$candidate" >"$OTOOL_TMP" 2>/dev/null; then
+      continue
+    fi
+
+    while IFS= read -r current_ref; do
+      [[ -n "$current_ref" && "$current_ref" != "$DESIRED_SDL3_FRAMEWORK_REF" ]] || continue
+      "$INSTALL_NAME_TOOL" -change "$current_ref" "$DESIRED_SDL3_FRAMEWORK_REF" "$candidate"
+    done < <(awk '$1 ~ /(^|\/)libSDL3\.[^[:space:]]*dylib$/ { print $1 }' "$OTOOL_TMP")
+  done < <(find "$MACOS_DIR" -type f -print0)
+}
+
+bundle_external_dylib_dependencies() {
+  local changed=1
+
+  while [[ "$changed" -eq 1 ]]; do
+    changed=0
+
+    while IFS= read -r -d '' candidate; do
+      if ! "$OTOOL" -L "$candidate" >"$OTOOL_TMP" 2>/dev/null; then
+        continue
+      fi
+
+      while IFS= read -r current_ref; do
+        [[ -n "$current_ref" ]] || continue
+        case "$current_ref" in
+          "$MACOS_DIR"/*)
+            ;;
+          /opt/homebrew/*|/usr/local/*)
+            local bundled_name bundled_path desired_ref
+            bundled_name="$(basename "$current_ref")"
+            bundled_path="$MACOS_DIR/$bundled_name"
+            desired_ref="@executable_path/$bundled_name"
+
+            if [[ "$bundled_name" =~ ^libSDL3\..*dylib$ && -f "$SDL3_FRAMEWORK/Versions/A/SDL3" ]]; then
+              desired_ref="$DESIRED_SDL3_FRAMEWORK_REF"
+            else
+              if [[ ! -f "$bundled_path" ]]; then
+                if [[ ! -f "$current_ref" ]]; then
+                  echo "unable to bundle dependency from $current_ref" >&2
+                  exit 1
+                fi
+
+                install -m 755 "$current_ref" "$bundled_path"
+                "$INSTALL_NAME_TOOL" -id "$desired_ref" "$bundled_path"
+                changed=1
+              else
+                "$INSTALL_NAME_TOOL" -id "$desired_ref" "$bundled_path"
+              fi
+            fi
+
+            "$INSTALL_NAME_TOOL" -change "$current_ref" "$desired_ref" "$candidate"
+            ;;
+        esac
+      done < <(awk 'NR > 1 { print $1 }' "$OTOOL_TMP")
+    done < <(find "$MACOS_DIR" -type f -print0)
+  done
 }
 
 ensure_bundled_dependency() {
@@ -174,4 +239,6 @@ ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
 bundle_dependency_from_existing_ref "$TREE_SITTER_PATTERN"
 bundle_dependency_from_existing_ref "$SDL3_TTF_PATTERN"
 normalize_sdl3_framework
+rewrite_sdl3_dylib_refs_to_framework
+bundle_external_dylib_dependencies
 sign_app_bundle
