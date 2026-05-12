@@ -1,0 +1,16 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct FSInput {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+};
+
+fragment float4 main(
+    FSInput input [[stage_in]],
+    texture2d<float> image_texture [[texture(0)]],
+    sampler image_sampler [[sampler(0)]]
+) {
+    return image_texture.sample(image_sampler, input.uv) * input.color;
+}

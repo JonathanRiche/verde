@@ -122,7 +122,9 @@ const SharedFrame = struct {
 /// Owns the Linux browser helper process and translates its stdout into browser events plus pane frames.
 pub const Controller = struct {
     allocator: std.mem.Allocator,
-    child: ?std.process.Child = null,
+    child_pid: ?std.posix.pid_t = null,
+    child_process_group: ?std.posix.pid_t = null,
+    stdin_file: ?std.Io.File = null,
     queue: *SharedQueue,
     frame: *SharedFrame,
     frame_buffer: std.ArrayList(u8) = .empty,
@@ -153,7 +155,7 @@ pub const Controller = struct {
 
     /// Terminates the helper process and releases queued events.
     pub fn deinit(self: *Controller) void {
-        if (self.child) |_| {
+        if (self.child_pid != null) {
             self.sendCommand(.{ .kind = .quit }) catch {};
             self.closeChildStdin();
         }
@@ -161,12 +163,7 @@ pub const Controller = struct {
             thread.join();
             self.reader_thread = null;
         }
-        if (self.child) |*child| {
-            var threaded = std.Io.Threaded.init_single_threaded;
-            child.kill(threaded.io());
-            _ = child.wait(threaded.io()) catch {};
-            self.child = null;
-        }
+        self.terminateChild();
         if (self.current_url) |url| self.allocator.free(url);
         self.frame_buffer.deinit(self.allocator);
         self.queue.deinit(self.allocator);
@@ -311,16 +308,44 @@ pub const Controller = struct {
         const helper_path = try browserHelperPath(self.allocator);
         defer self.allocator.free(helper_path);
 
-        var threaded = std.Io.Threaded.init_single_threaded;
-        const child = try std.process.spawn(threaded.io(), .{
-            .argv = &.{helper_path},
-            .stdin = .pipe,
-            .stdout = .pipe,
-            .stderr = .inherit,
-        });
+        var stdin_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&stdin_pipe) != 0) return error.Unexpected;
+        errdefer {
+            _ = std.c.close(stdin_pipe[0]);
+            _ = std.c.close(stdin_pipe[1]);
+        }
+        var stdout_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&stdout_pipe) != 0) return error.Unexpected;
+        errdefer {
+            _ = std.c.close(stdout_pipe[0]);
+            _ = std.c.close(stdout_pipe[1]);
+        }
 
-        const stdout_file = child.stdout.?;
-        self.child = child;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const helper_path_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_path}, 0);
+        const helper_dir = std.fs.path.dirname(helper_path) orelse return error.BrowserUnavailable;
+        const helper_dir_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_dir}, 0);
+        const argv = try arena.allocSentinel(?[*:0]u8, 1, null);
+        argv[0] = helper_path_z.ptr;
+        const envp = std.c.environ;
+
+        const child_pid = std.c.fork();
+        if (child_pid < 0) return error.Unexpected;
+        if (child_pid == 0) {
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp, stdin_pipe, stdout_pipe);
+        }
+
+        _ = std.c.close(stdin_pipe[0]);
+        _ = std.c.close(stdout_pipe[1]);
+        const stdin_file: std.Io.File = .{ .handle = stdin_pipe[1], .flags = .{ .nonblocking = false } };
+        const stdout_file: std.Io.File = .{ .handle = stdout_pipe[0], .flags = .{ .nonblocking = false } };
+
+        self.child_pid = child_pid;
+        self.child_process_group = child_pid;
+        self.stdin_file = stdin_file;
+        _ = std.c.setpgid(child_pid, child_pid);
 
         const context = try self.allocator.create(ReaderContext);
         context.* = .{
@@ -336,8 +361,8 @@ pub const Controller = struct {
 
     // Serializes and sends one JSON-line command to the browser helper.
     fn sendCommand(self: *Controller, command: ipc.Command) !void {
-        const child = self.child orelse return error.BrowserUnavailable;
-        const stdin_file = child.stdin orelse return error.BrowserUnavailable;
+        _ = self.child_pid orelse return error.BrowserUnavailable;
+        const stdin_file = self.stdin_file orelse return error.BrowserUnavailable;
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, command, .{});
         defer self.allocator.free(encoded);
 
@@ -352,17 +377,30 @@ pub const Controller = struct {
 
     // Closes the helper stdin pipe so the helper reader thread can observe EOF and exit cleanly.
     fn closeChildStdin(self: *Controller) void {
-        const child = if (self.child) |*child| child else return;
-        const stdin_file = child.stdin orelse return;
+        const stdin_file = self.stdin_file orelse return;
         var threaded = std.Io.Threaded.init_single_threaded;
         stdin_file.close(threaded.io());
-        child.stdin = null;
+        self.stdin_file = null;
     }
 
     // Tracks the last requested URL so reopening the pane preserves browser location.
     fn setCurrentUrl(self: *Controller, url: []const u8) !void {
         if (self.current_url) |current| self.allocator.free(current);
         self.current_url = try self.allocator.dupe(u8, url);
+    }
+
+    fn terminateChild(self: *Controller) void {
+        const child_pid = self.child_pid orelse return;
+        const child_process_group = self.child_process_group orelse child_pid;
+        if (!waitForChildExit(child_pid, 250)) {
+            std.posix.kill(-child_process_group, std.posix.SIG.TERM) catch {};
+            if (!waitForChildExit(child_pid, 250)) {
+                std.posix.kill(-child_process_group, std.posix.SIG.KILL) catch {};
+                _ = waitForChildExit(child_pid, 250);
+            }
+        }
+        self.child_pid = null;
+        self.child_process_group = null;
     }
 };
 
@@ -377,6 +415,7 @@ fn browserHelperPath(allocator: std.mem.Allocator) ![]u8 {
 /// Reads JSON-line events from the helper stdout pipe and stores them in thread-safe queues.
 fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
+    defer _ = std.c.close(context.stdout_file.handle);
 
     var read_buffer: [16 * 1024]u8 = undefined;
     var threaded = std.Io.Threaded.init_single_threaded;
@@ -413,6 +452,78 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
         .frame_ready => unreachable,
     };
+}
+
+fn execHelperChild(
+    helper_dir_z: [*:0]const u8,
+    helper_path_z: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    stdin_pipe: [2]std.posix.fd_t,
+    stdout_pipe: [2]std.posix.fd_t,
+) noreturn {
+    _ = std.c.setpgid(0, 0);
+    if (std.c.dup2(stdin_pipe[0], std.c.STDIN_FILENO) < 0) std.c._exit(126);
+    if (std.c.dup2(stdout_pipe[1], std.c.STDOUT_FILENO) < 0) std.c._exit(126);
+
+    _ = std.c.close(stdin_pipe[0]);
+    _ = std.c.close(stdin_pipe[1]);
+    _ = std.c.close(stdout_pipe[0]);
+    _ = std.c.close(stdout_pipe[1]);
+    closeInheritedFileDescriptors();
+
+    var empty_signal_mask = std.posix.sigemptyset();
+    std.posix.sigprocmask(std.c.SIG.SETMASK, &empty_signal_mask, null);
+    restoreDefaultSignal(std.posix.SIG.PIPE);
+    if (std.c.chdir(helper_dir_z) != 0) std.c._exit(126);
+
+    _ = std.c.execve(helper_path_z, argv, envp);
+    std.c._exit(127);
+}
+
+fn closeInheritedFileDescriptors() void {
+    const limits = std.posix.getrlimit(.NOFILE) catch return;
+    const max_fd: usize = @intCast(@min(limits.cur, 4096));
+    var fd: usize = 3;
+    while (fd < max_fd) : (fd += 1) {
+        _ = std.c.close(@intCast(fd));
+    }
+}
+
+fn waitForChildExit(child_pid: std.posix.pid_t, timeout_ms: u16) bool {
+    var waited_ms: u16 = 0;
+    while (waited_ms <= timeout_ms) : (waited_ms += 25) {
+        var status: c_int = 0;
+        const result = std.c.waitpid(child_pid, &status, std.c.W.NOHANG);
+        if (result == child_pid) return true;
+        sleepMillis(25);
+    }
+    return false;
+}
+
+fn sleepMillis(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
+}
+
+fn restoreDefaultSignal(signal_number: std.posix.SIG) void {
+    const action: std.posix.Sigaction = if (@hasField(std.posix.Sigaction, "restorer"))
+        .{
+            .flags = 0,
+            .handler = .{ .handler = null },
+            .mask = std.posix.sigemptyset(),
+            .restorer = null,
+        }
+    else
+        .{
+            .flags = 0,
+            .handler = .{ .handler = null },
+            .mask = std.posix.sigemptyset(),
+        };
+    std.posix.sigaction(signal_number, &action, null);
 }
 
 // Maps the shared browser mouse button enum to the helper protocol integer.
