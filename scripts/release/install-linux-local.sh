@@ -8,7 +8,8 @@ mkdir -p \
   "$PREFIX/bin" \
   "$PREFIX/share/verde" \
   "$PREFIX/share/applications" \
-  "$PREFIX/share/pixmaps"
+  "$PREFIX/share/pixmaps" \
+  "$PREFIX/share/icons/hicolor/256x256/apps"
 
 copy_if_present() {
   local source_path="$1"
@@ -58,6 +59,11 @@ if [[ -d "$SCRIPT_DIR/bin/locales" ]]; then
   cp -a "$SCRIPT_DIR/bin/locales/." "$PREFIX/bin/locales/"
 fi
 install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/pixmaps/verde.png"
+if [[ -e "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" ]]; then
+  install -m 644 "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" "$PREFIX/share/icons/hicolor/256x256/apps/verde.png"
+else
+  install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/icons/hicolor/256x256/apps/verde.png"
+fi
 cat > "$PREFIX/share/applications/verde.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
@@ -78,6 +84,16 @@ if [[ -d "$SCRIPT_DIR/share/verde/node_modules" ]]; then
   rm -rf "$PREFIX/share/verde/node_modules"
   mkdir -p "$PREFIX/share/verde/node_modules"
   cp -a "$SCRIPT_DIR/share/verde/node_modules/." "$PREFIX/share/verde/node_modules/"
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q "$PREFIX/share/applications" >/dev/null 2>&1 || true
+fi
+if command -v xdg-desktop-menu >/dev/null 2>&1; then
+  xdg-desktop-menu forceupdate >/dev/null 2>&1 || true
 fi
 
 echo "Installed Verde into $PREFIX"
