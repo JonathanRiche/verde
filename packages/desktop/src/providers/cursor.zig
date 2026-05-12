@@ -8,6 +8,7 @@ const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
+const builtin = @import("builtin");
 
 const MAX_BRIDGE_STDOUT_BYTES = 16 * 1024 * 1024;
 const MAX_BRIDGE_STDERR_BYTES = 512 * 1024;
@@ -136,6 +137,7 @@ pub const Client = struct {
         var env_map = try process_env.buildAugmentedEnvMap(allocator);
         defer env_map.deinit();
         try env_map.put("VERDE_CURSOR_REQUEST", request_json);
+        try addBundledNodeModulesEnv(allocator, &env_map);
         if (self.config.api_key) |api_key| {
             try env_map.put("CURSOR_API_KEY", api_key);
         }
@@ -215,6 +217,13 @@ pub const Client = struct {
         const term: std.process.Child.Term = .{ .exited = 0 };
         runtime_log.diagnostic("cursor.streaming bridge finished reply_len={d}", .{state.reply.items.len});
         try finishBridgeResponse(term, state.saw_error);
+        if (state.response.thread_id.len == 0 and state.reply.items.len == 0) {
+            if (state.error_message) |message| {
+                runtime_log.diagnostic("cursor.streaming bridge empty response after error: {s}", .{message});
+            } else {
+                runtime_log.diagnostic("cursor.streaming bridge empty response without final event", .{});
+            }
+        }
         state.response.reply_text = try state.reply.toOwnedSlice(allocator);
         state.reply = .empty;
         const response = state.response;
@@ -274,10 +283,12 @@ const BridgeParseState = struct {
     response: BridgeResponse = .{},
     reply: std.ArrayList(u8) = .empty,
     saw_error: bool = false,
+    error_message: ?[]u8 = null,
 
     fn deinit(self: *BridgeParseState, allocator: std.mem.Allocator) void {
         self.response.deinit(allocator);
         self.reply.deinit(allocator);
+        if (self.error_message) |message| allocator.free(message);
     }
 };
 
@@ -379,6 +390,10 @@ fn processBridgeLine(
     const event_type = getOptionalObjectString(parsed.value, "type") orelse return false;
     if (std.mem.eql(u8, event_type, "error")) {
         state.saw_error = true;
+        if (getOptionalObjectString(parsed.value, "message")) |message| {
+            runtime_log.diagnostic("cursor.bridge error: {s}", .{message});
+            if (state.error_message == null) state.error_message = try allocator.dupe(u8, message);
+        }
         if (isAuthError(getOptionalObjectString(parsed.value, "message"))) return error.CursorSignedOut;
         return false;
     }
@@ -464,6 +479,56 @@ fn finishBridgeResponse(term: std.process.Child.Term, saw_error: bool) !void {
         else => return error.CursorBridgeFailed,
     }
 }
+
+fn addBundledNodeModulesEnv(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
+) !void {
+    const bundled = bundledNodeModulesPathAlloc(allocator) catch return;
+    defer allocator.free(bundled);
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().access(threaded.io(), bundled, .{}) catch return;
+
+    try env_map.put("VERDE_NODE_MODULES", bundled);
+}
+
+fn bundledNodeModulesPathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const exe_path = try selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
+
+    return switch (builtin.os.tag) {
+        .macos => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "node_modules" }),
+        else => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "node_modules" }),
+    };
+}
+
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
+            if (len < 0) return error.FileNotFound;
+            return allocator.dupe(u8, buffer[0..@intCast(len)]);
+        },
+        .macos => {
+            var size: u32 = std.fs.max_path_bytes;
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            if (_NSGetExecutablePath(&buffer, &size) != 0) {
+                const dynamic_buffer = try allocator.alloc(u8, size);
+                errdefer allocator.free(dynamic_buffer);
+                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
+                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
+            }
+            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
+        },
+        else => return error.FileNotFound,
+    }
+}
+
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 
 fn getOptionalObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
     if (value != .object) return null;
@@ -703,11 +768,19 @@ fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]prov
 }
 
 const BRIDGE_SCRIPT =
+    \\import { createRequire } from "node:module";
+    \\import { pathToFileURL } from "node:url";
     \\const fail = (message) => {
     \\  process.stdout.write(JSON.stringify({ type: "error", message }) + "\n");
     \\  process.exit(1);
     \\};
     \\const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+    \\const requireFromBundledModules = () => {
+    \\  const root = process.env.VERDE_NODE_MODULES;
+    \\  if (!root) return createRequire(import.meta.url);
+    \\  const normalized = root.replace(/\/+$/, "");
+    \\  return createRequire(pathToFileURL(`${normalized}/package.json`));
+    \\};
     \\const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
     \\  const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     \\  promise.then((value) => {
@@ -757,7 +830,10 @@ const BRIDGE_SCRIPT =
     \\}
     \\
     \\try {
-    \\  const { Agent, Cursor } = await import("@cursor/sdk");
+    \\  const require = requireFromBundledModules();
+    \\  const sdkModule = await import(require.resolve("@cursor/sdk"));
+    \\  const sdk = sdkModule.Agent ? sdkModule : (sdkModule.default || sdkModule);
+    \\  const { Agent, Cursor } = sdk;
     \\  if (input.command === "auth") {
     \\    await Cursor.me({ apiKey: process.env.CURSOR_API_KEY });
     \\    emit({ type: "ok" });

@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.12"
-  }
+  },
+  "trustedDependencies": [
+    "sqlite3"
+  ]
 }
