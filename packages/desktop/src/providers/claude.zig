@@ -1,6 +1,7 @@
 //! Claude provider harness backed by the official Claude Agent SDK.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -222,6 +223,7 @@ pub const Client = struct {
     fn runBridge(self: *Client, payload: anytype, stream_request: ?provider_types.SendPromptRequest) !BridgeResponse {
         var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
         defer env_map.deinit();
+        try addBundledNodeModulesEnv(self.allocator, &env_map);
 
         const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
         defer self.allocator.free(executable);
@@ -445,9 +447,12 @@ fn containsImagePath(images: []const provider_types.ImageAttachment, path: []con
 
 fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
-    const cwd = try std.process.currentPathAlloc(threaded.io(), allocator);
-    defer allocator.free(cwd);
-    const path = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "verde-claude-agent-sdk-bridge.mjs" });
+    const root = tempRoot();
+    const dir_path = try std.fs.path.join(allocator, &.{ root, "verde" });
+    defer allocator.free(dir_path);
+    try std.Io.Dir.cwd().createDirPath(threaded.io(), dir_path);
+
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "verde-claude-agent-sdk-bridge.mjs" });
     errdefer allocator.free(path);
 
     const file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
@@ -458,6 +463,63 @@ fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
     try writer.interface.flush();
     return path;
 }
+
+fn tempRoot() []const u8 {
+    if (std.c.getenv("TMPDIR")) |value| return std.mem.sliceTo(value, 0);
+    if (std.c.getenv("TMP")) |value| return std.mem.sliceTo(value, 0);
+    if (std.c.getenv("TEMP")) |value| return std.mem.sliceTo(value, 0);
+    return "/tmp";
+}
+
+fn addBundledNodeModulesEnv(
+    allocator: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
+) !void {
+    const bundled = bundledNodeModulesPathAlloc(allocator) catch return;
+    defer allocator.free(bundled);
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().access(threaded.io(), bundled, .{}) catch return;
+
+    try env_map.put("VERDE_NODE_MODULES", bundled);
+}
+
+fn bundledNodeModulesPathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const exe_path = try selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
+
+    return switch (builtin.os.tag) {
+        .macos => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "node_modules" }),
+        else => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "node_modules" }),
+    };
+}
+
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
+            if (len < 0) return error.FileNotFound;
+            return allocator.dupe(u8, buffer[0..@intCast(len)]);
+        },
+        .macos => {
+            var size: u32 = std.fs.max_path_bytes;
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            if (_NSGetExecutablePath(&buffer, &size) != 0) {
+                const dynamic_buffer = try allocator.alloc(u8, size);
+                errdefer allocator.free(dynamic_buffer);
+                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
+                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
+            }
+            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
+        },
+        else => return error.FileNotFound,
+    }
+}
+
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 
 fn writeJsonLine(allocator: std.mem.Allocator, file: std.Io.File, payload: anytype) !void {
     const encoded = try std.json.Stringify.valueAlloc(allocator, payload, .{});
