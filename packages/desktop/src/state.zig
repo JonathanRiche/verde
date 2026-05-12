@@ -17,8 +17,11 @@ const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const utils = @import("utils.zig");
 
+/// Arrow-key line step for transcript scroll (scaled px per key repeat).
+const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
+
 /// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
-const palette_ui_ttf = @embedFile("assets/fonts/CalSans-Regular.ttf");
+const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
 
 extern fn palette_text_gl_measure_codepoint_width(
     font_data: [*]const u8,
@@ -90,6 +93,7 @@ pub const PaletteModalTextFocus = enum {
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
@@ -97,18 +101,23 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_height = 48.0,
     .toolbar_gap = 14.0,
     .control_gap = 14.0,
-    .pill_padding_x = 16.0,
-    .pill_icon_gap = 10.0,
-    .pill_chevron_gap = 10.0,
-    .model_min_width = 138.0,
+    .pill_padding_x = 21.0,
+    .pill_icon_gap = 13.0,
+    .pill_chevron_gap = 22.0,
+    .model_min_width = 176.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 420.0,
-    .reasoning_min_width = 92.0,
-    .reasoning_max_width = 150.0,
-    .fast_min_width = 116.0,
-    .fast_max_width = 132.0,
-    .access_min_width = 172.0,
-    .access_max_width = 192.0,
+    .reasoning_min_width = 118.0,
+    .reasoning_max_width = 248.0,
+    .fast_min_width = 124.0,
+    .fast_max_width = 280.0,
+    .access_min_width = 218.0,
+    // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
+    .access_max_width = 328.0,
+    // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
+    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
+    .pill_overlay_icon_reserve = 29.0,
+    .pill_label_width_fudge = 14.0,
     .corner_radius = 28.0,
     .border_width = 1.5,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -116,6 +125,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
+    .menu_background_color = .{ .r = 0.075, .g = 0.09, .b = 0.105, .a = 1.0 },
+    .menu_border_color = .{ .r = 0.28, .g = 0.34, .b = 0.38, .a = 1.0 },
+    .menu_selected_color = .{ .r = 0.19, .g = 0.31, .b = 0.39, .a = 1.0 },
+    .menu_hover_color = .{ .r = 0.17, .g = 0.20, .b = 0.24, .a = 1.0 },
     .send_color = .{ .r = 0.25, .g = 0.45, .b = 0.31, .a = 1.0 },
     .send_hover_color = .{ .r = 0.31, .g = 0.52, .b = 0.37, .a = 1.0 },
     .stop_button_color = .{ .r = 0.80, .g = 0.58, .b = 0.10, .a = 1.0 },
@@ -128,19 +141,22 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
     .placeholder = "Ask anything, or use / to show available commands",
-    .model_icon = "    ",
-    .fast_icon = "    ",
-    .access_icon = "    ",
+    .model_icon = "",
+    .fast_icon = "",
+    .access_icon = "",
     .chevron_icon = ">",
     .send_icon = "",
     .stop_icon = "x",
+    .z_index = 120,
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 400.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 40.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 10.0;
+const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
+const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
+const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
 const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
-const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode };
+const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
+const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
+const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .claude, .cursor };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
     if (byte_offset >= text.len) return .{ .byte_len = 0, .width = 0.0 };
@@ -167,6 +183,18 @@ fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
         .context = null,
         .advance = paletteEstimatedFontAdvance,
     };
+}
+
+fn paletteComposerTextFontAdvance(context: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
+    var measured = paletteEstimatedFontAdvance(context, text, byte_offset, font_size);
+    measured.width *= PALETTE_COMPOSER_TEXT_ADVANCE_SCALE;
+    return measured;
+}
+
+fn paletteComposerTextFontMetrics(font_size: f32) palette.FontMetrics {
+    var metrics = paletteEstimatedFontMetrics(font_size);
+    metrics.advance = paletteComposerTextFontAdvance;
+    return metrics;
 }
 
 const Mutex = struct {
@@ -254,13 +282,18 @@ fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
         if (index >= CODEX_REASONING_OPTIONS.len) return "";
         return CODEX_REASONING_OPTIONS[index].label;
     }
+    if (thread.provider == .cursor) {
+        const rows = state.opencode_reasoning_menu.items;
+        if (index >= rows.len) return "";
+        return rows[index].label;
+    }
     const rows = state.opencode_reasoning_menu.items;
     if (index >= rows.len) return "";
     return rows[index].label;
 }
 
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
-    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..]);
+    return chat_threads.modelOptions(ModelOption, provider, state.opencodeModelOptionsSnapshot(), CODEX_MODEL_OPTIONS[0..], state.cursorModelOptionsSnapshot());
 }
 
 fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const u8 {
@@ -268,6 +301,7 @@ fn composerDefaultModelRef(state: *const AppState, provider: Provider) [:0]const
         .codex => DEFAULT_CODEX_MODEL,
         .opencode => state.cachedDefaultModelRefForProvider(.opencode),
         .claude => "claude-sonnet-4-5",
+        .cursor => DEFAULT_CURSOR_MODEL,
     };
 }
 
@@ -320,7 +354,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.markDirty();
         },
         .fast_changed => |enabled| {
-            if (state.currentThread().provider != .codex) return;
+            if (state.currentThread().provider != .codex and state.currentThread().provider != .cursor) return;
             const next: FastMode = if (enabled) .on else .off;
             const thread = state.currentThreadMutable();
             if (thread.fast_mode == next) return;
@@ -406,12 +440,16 @@ fn paletteModelCascadeRenderRowLeading(
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
         .claude => null,
+        .cursor => state.cursor_logo_texture,
     } orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
-    const sz = @min(leading_rect.w, leading_rect.h) * 0.68;
+    const inner = @min(leading_rect.w, leading_rect.h);
+    const sz = inner * @min(0.68 * 1.5, 0.96);
     const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
     const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
-    const r: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const slot: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
+    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, slot.x, slot.y, slot.w, slot.h));
+    const r: palette.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
     batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,
@@ -427,7 +465,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .max_depth = 2,
     .padding_x = 14.0,
     .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = 8.0,
+    .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
     .glyph_width = 10.8,
     .font_size = 20.0,
     .chevron_icon = ">",
@@ -435,9 +473,9 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .row_leading_width = 34.0,
     .row_leading_to_label_gap = 8.0,
     .render_row_leading = paletteModelCascadeRenderRowLeading,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 0.98 },
+    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 },
     .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 0.94 },
+    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 },
     .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
     .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
@@ -445,10 +483,12 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .scrollbar_width = 5.0,
     .corner_radius = 14.0,
     .border_width = 1.0,
-    .z_index = 200,
-    .submenu_z_offset = 10,
+    .z_index = 1400,
+    .submenu_z_offset = 20,
     .placement = .above,
     .submenu_placement = .right,
+    .avoid_forbidden_for_root = false,
+    .avoid_forbidden_for_submenus = true,
     .item_count = COMPOSER_PROVIDER_OPTIONS.len,
     .item_label = paletteModelCascadeLabel,
     .child_count = paletteModelCascadeChildCount,
@@ -482,8 +522,10 @@ pub const log = std.log.scoped(.native_shell);
 pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
+const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
 pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
+pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
@@ -531,6 +573,10 @@ pub const ModelOption = struct {
     reasoning_supported: bool = true,
     /// Sorted OpenCode `variants` keys; owned with the option row (freed in `clearDynamicOpencodeModelOptions`).
     reasoning_variant_keys: ?[][:0]const u8 = null,
+    cursor_fast_supported: bool = false,
+    cursor_reasoning_param_id: ?[:0]const u8 = null,
+    cursor_reasoning_values: ?[][:0]const u8 = null,
+    cursor_reasoning_requires_thinking: bool = false,
 };
 
 const OpencodeReasoningMenuRow = struct {
@@ -538,6 +584,25 @@ const OpencodeReasoningMenuRow = struct {
     /// Null selects the default (no `variant` field on the wire).
     variant: ?[:0]const u8,
 };
+
+const PersistedCursorModelOption = struct {
+    label: []const u8,
+    value: []const u8,
+    fast_supported: bool = false,
+    reasoning_param_id: ?[]const u8 = null,
+    reasoning_values: ?[]const []const u8 = null,
+    reasoning_requires_thinking: bool = false,
+};
+
+fn cursorReasoningValueLabel(value: []const u8) []const u8 {
+    if (std.mem.eql(u8, value, "low")) return "Low";
+    if (std.mem.eql(u8, value, "medium")) return "Medium";
+    if (std.mem.eql(u8, value, "high")) return "High";
+    if (std.mem.eql(u8, value, "extra-high") or std.mem.eql(u8, value, "xhigh")) return "Extra High";
+    if (std.mem.eql(u8, value, "max")) return "Max";
+    if (std.mem.eql(u8, value, "none")) return "None";
+    return value;
+}
 
 pub const ReasoningOption = struct {
     label: [:0]const u8,
@@ -567,6 +632,8 @@ const TranscriptMarkdownBody = struct {
 
 const TranscriptHeightEntry = struct {
     valid: bool = false,
+    role: ChatRole = .assistant,
+    assistant_plain_layout: bool = false,
     width: f32 = 0.0,
     body_hash: u64 = 0,
     author_hash: u64 = 0,
@@ -630,6 +697,15 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "GPT-5.3 Codex Spark", .value = "gpt-5.3-codex-spark" },
     .{ .label = "GPT-5.2 Codex", .value = "gpt-5.2-codex" },
     .{ .label = "GPT-5.2", .value = "gpt-5.2" },
+};
+
+pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "Auto", .value = "default" },
+    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL },
+    .{ .label = "GPT-5.5", .value = "gpt-5.5" },
+    .{ .label = "GPT-5.4", .value = "gpt-5.4" },
+    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
+    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
@@ -829,10 +905,14 @@ pub const ChatThread = struct {
         self.send_state.mutex.lock();
         const maybe_worker = self.send_state.worker;
         self.send_state.worker = null;
+        const status = self.send_state.status;
+        const provider = self.provider;
         self.send_state.mutex.unlock();
 
         if (maybe_worker) |worker| {
+            runtime_log.diagnostic("shutdown joining send thread provider={s} status={s}", .{ @tagName(provider), @tagName(status) });
             worker.join();
+            runtime_log.diagnostic("shutdown joined send thread provider={s}", .{@tagName(provider)});
         }
     }
 
@@ -945,6 +1025,15 @@ const OpencodeModelCacheState = struct {
     worker: ?std.Thread = null,
 };
 
+const CursorModelCacheStatus = OpencodeModelCacheStatus;
+
+const CursorModelCacheState = struct {
+    mutex: Mutex = .{},
+    status: CursorModelCacheStatus = .idle,
+    models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
 const FileSearchToken = struct {
     at_start: usize,
     query_start: usize,
@@ -1032,14 +1121,20 @@ const FileSearchState = struct {
 };
 
 extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
+pub const TextureBackend = enum {
+    gl,
+    external,
+};
+
 pub const CachedImageTexture = struct {
-    texture_id: c_uint,
-    width: i32,
-    height: i32,
-    valid: bool,
+    texture_id: c_uint = 0,
+    width: i32 = 0,
+    height: i32 = 0,
+    valid: bool = false,
+    backend: TextureBackend = .gl,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0) return;
+        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
         var textures = [_]c_uint{self.texture_id};
         glDeleteTextures(1, &textures);
     }
@@ -1394,6 +1489,12 @@ pub const SidebarThreadHover = struct {
     thread_index: usize,
 };
 
+pub const SidebarContextMenuKind = enum {
+    none,
+    project,
+    thread,
+};
+
 pub const AppState = struct {
     const DRAFT_CAPACITY = 8192;
     const SAVE_DEBOUNCE_MS: i64 = 750;
@@ -1442,6 +1543,10 @@ pub const AppState = struct {
     palette_frame_text: std.ArrayList(u8),
     palette_modal_hits: std.ArrayList(PaletteModalHit),
     palette_modal_text_focus: PaletteModalTextFocus,
+    gl_texture_uploads_enabled: bool,
+    browser_textures_enabled: bool,
+    texture_upload_context: ?*anyopaque,
+    texture_upload_fn: ?TextureUploadFn,
     project_rename_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
@@ -1460,6 +1565,7 @@ pub const AppState = struct {
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
+    cursor_model_options: std.ArrayList(ModelOption),
     opencode_reasoning_menu: std.ArrayList(OpencodeReasoningMenuRow),
     image_texture_cache: std.StringHashMap(CachedImageTexture),
     logo_texture: ?CachedImageTexture,
@@ -1477,10 +1583,14 @@ pub const AppState = struct {
     thread_import_provider: ?Provider,
     thread_import_project_index: ?usize,
     thread_import_selected_index: ?usize,
+    /// Row index in `thread_import_threads` under the cursor (import modal list).
+    thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
+    project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
+    cursor_model_cache_state: CursorModelCacheState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
     browser_launch_open_delay_frames: u8,
@@ -1494,6 +1604,14 @@ pub const AppState = struct {
     browser_address_focused: bool,
     browser_address_cursor: usize,
     browser_inspector_menu_open: bool,
+    /// Split "Open" header menu (folder / editors); palette workspace chrome only.
+    workspace_header_open_menu_open: bool,
+    sidebar_context_menu_open: bool,
+    sidebar_context_menu_kind: SidebarContextMenuKind,
+    sidebar_context_menu_project_index: usize,
+    sidebar_context_menu_thread_index: usize,
+    sidebar_context_menu_anchor_x: f32,
+    sidebar_context_menu_anchor_y: f32,
     transcript_focused: bool,
     transcript_selection_modal_requested: bool,
     transcript_project_index: ?usize,
@@ -1517,14 +1635,26 @@ pub const AppState = struct {
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_auto_follow_pending: bool,
     scroll_transcript_to_bottom_frames: u8,
-    pending_transcript_line_scroll_steps: i16,
-    pending_transcript_page_scroll_steps: i16,
+    /// Keyboard fine scroll: applied once on next transcript layout (px); cleared after paint.
+    pending_transcript_scroll_px: f32,
+    pending_transcript_page_steps: i16,
+    transcript_scroll_pending_track_p: usize,
+    transcript_scroll_pending_track_t: usize,
     dirty: bool,
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
     pending_send_count: usize,
 
-    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig) !AppState {
+    pub const InitOptions = struct {
+        gl_texture_uploads_enabled: bool = true,
+        browser_textures_enabled: bool = true,
+        texture_upload_context: ?*anyopaque = null,
+        texture_upload_fn: ?TextureUploadFn = null,
+    };
+
+    pub const TextureUploadFn = *const fn (context: ?*anyopaque, loaded: stb_image.LoadedImage) ?CachedImageTexture;
+
+    pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
         var browser_state = try browser_runtime.State.init(allocator);
         errdefer browser_state.deinit();
 
@@ -1573,6 +1703,10 @@ pub const AppState = struct {
             .palette_frame_text = .empty,
             .palette_modal_hits = .empty,
             .palette_modal_text_focus = .none,
+            .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
+            .browser_textures_enabled = options.browser_textures_enabled,
+            .texture_upload_context = options.texture_upload_context,
+            .texture_upload_fn = options.texture_upload_fn,
             .project_rename_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
@@ -1591,6 +1725,7 @@ pub const AppState = struct {
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
+            .cursor_model_options = .empty,
             .opencode_reasoning_menu = .empty,
             .image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator),
             .logo_texture = null,
@@ -1608,10 +1743,13 @@ pub const AppState = struct {
             .thread_import_provider = null,
             .thread_import_project_index = null,
             .thread_import_selected_index = null,
+            .thread_import_hover_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
+            .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
+            .cursor_model_cache_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
             .browser_launch_open_delay_frames = 0,
@@ -1624,6 +1762,13 @@ pub const AppState = struct {
             .browser_address_focused = false,
             .browser_address_cursor = 0,
             .browser_inspector_menu_open = false,
+            .workspace_header_open_menu_open = false,
+            .sidebar_context_menu_open = false,
+            .sidebar_context_menu_kind = .none,
+            .sidebar_context_menu_project_index = 0,
+            .sidebar_context_menu_thread_index = 0,
+            .sidebar_context_menu_anchor_x = 0.0,
+            .sidebar_context_menu_anchor_y = 0.0,
             .transcript_focused = false,
             .transcript_selection_modal_requested = false,
             .transcript_project_index = null,
@@ -1645,8 +1790,10 @@ pub const AppState = struct {
             .transcript_markdown_entries = .empty,
             .transcript_auto_follow_pending = true,
             .scroll_transcript_to_bottom_frames = 8,
-            .pending_transcript_line_scroll_steps = 0,
-            .pending_transcript_page_scroll_steps = 0,
+            .pending_transcript_scroll_px = 0,
+            .pending_transcript_page_steps = 0,
+            .transcript_scroll_pending_track_p = std.math.maxInt(usize),
+            .transcript_scroll_pending_track_t = std.math.maxInt(usize),
             .dirty = false,
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
@@ -1661,16 +1808,39 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
-        state.logo_texture = utils.loadEmbeddedTexture(VERDE_LOGO_BYTES);
-        state.opencode_logo_texture = utils.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
-        state.codex_logo_texture = utils.loadEmbeddedTexture(CODEX_LOGO_BYTES);
-        state.thread_edit_texture = utils.loadEmbeddedTexture(THREAD_EDIT_BYTES);
-        state.cursor_logo_texture = utils.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
-        state.emacs_logo_texture = utils.loadEmbeddedTexture(EMACS_LOGO_BYTES);
-        state.neovim_logo_texture = utils.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
-        state.vscode_logo_texture = utils.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
-        state.zed_logo_texture = utils.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        state.loadCursorModelOptionsDiskCache() catch |err| {
+            log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
+            state.clearCursorModelOptions();
+        };
+        if (options.gl_texture_uploads_enabled or options.texture_upload_fn != null) {
+            state.logo_texture = state.loadEmbeddedTexture(VERDE_LOGO_BYTES);
+            state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
+            state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
+            state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
+            state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
+            state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
+            state.neovim_logo_texture = state.loadEmbeddedTexture(NEOVIM_LOGO_BYTES);
+            state.vscode_logo_texture = state.loadEmbeddedTexture(VSCODE_LOGO_BYTES);
+            state.zed_logo_texture = state.loadEmbeddedTexture(ZED_LOGO_BYTES);
+        }
         return state;
+    }
+
+    fn loadEmbeddedTexture(self: *AppState, bytes: []const u8) ?CachedImageTexture {
+        const loaded = stb_image.loadFromMemory(bytes) catch |err| {
+            log.err("failed to decode embedded texture: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer loaded.deinit();
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    fn uploadLoadedTexture(self: *AppState, loaded: stb_image.LoadedImage) ?CachedImageTexture {
+        if (self.texture_upload_fn) |upload_fn| {
+            return upload_fn(self.texture_upload_context, loaded);
+        }
+        if (!self.gl_texture_uploads_enabled) return null;
+        return uploadTexture(loaded);
     }
 
     pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {
@@ -1680,10 +1850,18 @@ pub const AppState = struct {
             OPENCODE_MODEL_OPTIONS[0..];
     }
 
+    pub fn cursorModelOptionsSnapshot(self: *const AppState) []const ModelOption {
+        return if (self.cursor_model_options.items.len > 0)
+            self.cursor_model_options.items
+        else
+            CURSOR_MODEL_OPTIONS[0..];
+    }
+
     pub fn cachedDefaultModelRefForProvider(self: *const AppState, provider: Provider) [:0]const u8 {
         return switch (provider) {
             .codex => DEFAULT_CODEX_MODEL,
             .claude => "claude-sonnet-4-5",
+            .cursor => DEFAULT_CURSOR_MODEL,
             .opencode => blk: {
                 for (self.opencodeModelOptionsSnapshot()) |option| {
                     if (option.value) |value| break :blk value;
@@ -1695,6 +1873,10 @@ pub const AppState = struct {
 
     pub fn startOpencodeModelOptionsRefresh(self: *AppState) void {
         self.refreshOpencodeModelOptionsCacheAsync();
+    }
+
+    pub fn startCursorModelOptionsRefresh(self: *AppState) void {
+        self.refreshCursorModelOptionsCacheAsync();
     }
 
     fn refreshOpencodeModelOptionsCacheAsync(self: *AppState) void {
@@ -1709,6 +1891,22 @@ pub const AppState = struct {
             &self.opencode_model_cache_state,
         }) catch {
             self.opencode_model_cache_state.status = .idle;
+            return;
+        };
+    }
+
+    fn refreshCursorModelOptionsCacheAsync(self: *AppState) void {
+        self.pollCursorModelOptionsCache();
+
+        self.cursor_model_cache_state.mutex.lock();
+        defer self.cursor_model_cache_state.mutex.unlock();
+        if (self.cursor_model_cache_state.status == .pending) return;
+
+        self.cursor_model_cache_state.status = .pending;
+        self.cursor_model_cache_state.worker = std.Thread.spawn(.{}, cursorModelCacheWorker, .{
+            &self.cursor_model_cache_state,
+        }) catch {
+            self.cursor_model_cache_state.status = .idle;
             return;
         };
     }
@@ -1826,6 +2024,34 @@ pub const AppState = struct {
         return asciiCaseInsensitiveCompare(a.model_id, b.model_id) == .lt;
     }
 
+    fn populateCursorModelOptions(self: *AppState, models: []const ai_harness.ModelInfo) !void {
+        for (models) |model| {
+            if (model.model_id.len == 0) continue;
+            const label_text = if (model.model_name.len > 0) model.model_name else model.model_id;
+            const label = try self.allocator.dupeZ(u8, label_text);
+            errdefer self.allocator.free(label);
+            const value = try self.allocator.dupeZ(u8, model.model_id);
+            errdefer self.allocator.free(value);
+            const reasoning_param_id = if (model.cursor_reasoning_param_id) |param_id| try self.allocator.dupeZ(u8, param_id) else null;
+            errdefer if (reasoning_param_id) |param_id| self.allocator.free(param_id);
+            const cursor_reasoning_values = try duplicateReasoningVariantKeys(self.allocator, model.cursor_reasoning_values);
+            errdefer if (cursor_reasoning_values) |values| {
+                for (values) |reasoning_value| self.allocator.free(reasoning_value);
+                self.allocator.free(values);
+            };
+
+            try self.cursor_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+                .reasoning_supported = model.reasoning_supported,
+                .cursor_fast_supported = model.cursor_fast_supported,
+                .cursor_reasoning_param_id = reasoning_param_id,
+                .cursor_reasoning_values = cursor_reasoning_values,
+                .cursor_reasoning_requires_thinking = model.cursor_reasoning_requires_thinking,
+            });
+        }
+    }
+
     fn asciiCaseInsensitiveCompare(a: []const u8, b: []const u8) std.math.Order {
         var index: usize = 0;
         const min_len = @min(a.len, b.len);
@@ -1885,6 +2111,7 @@ pub const AppState = struct {
         self.clearOpencodeReasoningMenu();
         errdefer self.clearOpencodeReasoningMenu();
 
+        if (thread.provider == .cursor) return self.refreshCursorReasoningMenu(thread);
         if (thread.provider != .opencode) return;
         const opt = self.opencodeModelOptionForRef(thread.model_ref) orelse return;
         if (!opt.reasoning_supported) return;
@@ -1899,6 +2126,80 @@ pub const AppState = struct {
             const variant_copy = try self.allocator.dupeZ(u8, key);
             try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
         }
+    }
+
+    fn refreshCursorReasoningMenu(self: *AppState, thread: *const ChatThread) !void {
+        const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return;
+        const values = opt.cursor_reasoning_values orelse return;
+        if (values.len == 0) return;
+
+        const default_label = try self.allocator.dupeZ(u8, "Default");
+        try self.opencode_reasoning_menu.append(self.allocator, .{ .label = default_label, .variant = null });
+
+        for (values) |value| {
+            const label_text = cursorReasoningValueLabel(value);
+            const label = try self.allocator.dupeZ(u8, label_text);
+            const variant_copy = try self.allocator.dupeZ(u8, value);
+            try self.opencode_reasoning_menu.append(self.allocator, .{ .label = label, .variant = variant_copy });
+        }
+    }
+
+    fn cursorModelOptionForRef(self: *const AppState, model_ref: ?[:0]const u8) ?ModelOption {
+        const ref = model_ref orelse DEFAULT_CURSOR_MODEL;
+        for (self.cursorModelOptionsSnapshot()) |opt| {
+            if (opt.value) |v| {
+                if (std.mem.eql(u8, ref, v)) return opt;
+            }
+        }
+        return null;
+    }
+
+    fn cursorModelParamsJsonAlloc(self: *const AppState, allocator: std.mem.Allocator, thread: *const ChatThread) !?[]u8 {
+        if (thread.provider != .cursor) return null;
+        const opt = self.cursorModelOptionForRef(thread.model_ref) orelse return null;
+
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginArray();
+        var wrote_any = false;
+
+        if (opt.cursor_reasoning_requires_thinking and thread.opencode_reasoning_variant != null) {
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write("thinking");
+            try stringify.objectField("value");
+            try stringify.write("true");
+            try stringify.endObject();
+            wrote_any = true;
+        }
+        if (opt.cursor_reasoning_param_id) |param_id| {
+            if (thread.opencode_reasoning_variant) |value| {
+                try stringify.beginObject();
+                try stringify.objectField("id");
+                try stringify.write(std.mem.sliceTo(param_id, 0));
+                try stringify.objectField("value");
+                try stringify.write(std.mem.sliceTo(value, 0));
+                try stringify.endObject();
+                wrote_any = true;
+            }
+        }
+        if (opt.cursor_fast_supported) {
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write("fast");
+            try stringify.objectField("value");
+            try stringify.write(if (thread.fast_mode == .on) "true" else "false");
+            try stringify.endObject();
+            wrote_any = true;
+        }
+
+        try stringify.endArray();
+        if (!wrote_any) {
+            writer.deinit();
+            return null;
+        }
+        return try writer.toOwnedSlice();
     }
 
     fn normalizeOpencodeReasoningVariant(self: *AppState, thread: *ChatThread) void {
@@ -1955,6 +2256,118 @@ pub const AppState = struct {
 
     fn clearOpencodeModelOptions(self: *AppState) void {
         self.clearDynamicOpencodeModelOptions();
+    }
+
+    fn clearDynamicCursorModelOptions(self: *AppState) void {
+        for (self.cursor_model_options.items) |option| {
+            self.allocator.free(option.label);
+            if (option.value) |value| self.allocator.free(value);
+            if (option.reasoning_variant_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
+            if (option.cursor_reasoning_param_id) |param_id| self.allocator.free(param_id);
+            if (option.cursor_reasoning_values) |values| {
+                for (values) |value| self.allocator.free(value);
+                self.allocator.free(values);
+            }
+        }
+        self.cursor_model_options.clearRetainingCapacity();
+    }
+
+    fn clearCursorModelOptions(self: *AppState) void {
+        self.clearDynamicCursorModelOptions();
+    }
+
+    fn loadCursorModelOptionsDiskCache(self: *AppState) !void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), self.storage.pref_path, .{});
+        defer dir.close(threaded.io());
+
+        const bytes = dir.readFileAlloc(threaded.io(), CURSOR_MODEL_CACHE_FILE_NAME, self.allocator, .limited(512 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(bytes);
+
+        var parsed = try std.json.parseFromSlice([]PersistedCursorModelOption, self.allocator, bytes, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+
+        self.clearCursorModelOptions();
+        errdefer self.clearCursorModelOptions();
+        for (parsed.value) |option| {
+            if (option.label.len == 0 or option.value.len == 0) continue;
+            const label = try self.allocator.dupeZ(u8, option.label);
+            errdefer self.allocator.free(label);
+            const value = try self.allocator.dupeZ(u8, option.value);
+            errdefer self.allocator.free(value);
+            const reasoning_param_id = if (option.reasoning_param_id) |param_id| try self.allocator.dupeZ(u8, param_id) else null;
+            errdefer if (reasoning_param_id) |param_id| self.allocator.free(param_id);
+            const reasoning_values = if (option.reasoning_values) |values| blk: {
+                const out = try self.allocator.alloc([:0]const u8, values.len);
+                errdefer {
+                    for (out) |v| self.allocator.free(v);
+                    self.allocator.free(out);
+                }
+                for (values, 0..) |v, i| out[i] = try self.allocator.dupeZ(u8, v);
+                break :blk out;
+            } else null;
+            errdefer if (reasoning_values) |values| {
+                for (values) |v| self.allocator.free(v);
+                self.allocator.free(values);
+            };
+            try self.cursor_model_options.append(self.allocator, .{
+                .label = label,
+                .value = value,
+                .cursor_fast_supported = option.fast_supported,
+                .cursor_reasoning_param_id = reasoning_param_id,
+                .cursor_reasoning_values = reasoning_values,
+                .cursor_reasoning_requires_thinking = option.reasoning_requires_thinking,
+            });
+        }
+    }
+
+    fn saveCursorModelOptionsDiskCache(self: *AppState) !void {
+        if (self.cursor_model_options.items.len == 0) return;
+
+        var persisted: std.ArrayList(PersistedCursorModelOption) = .empty;
+        defer persisted.deinit(self.allocator);
+        for (self.cursor_model_options.items) |option| {
+            const value = option.value orelse continue;
+            try persisted.append(self.allocator, .{
+                .label = std.mem.sliceTo(option.label, 0),
+                .value = std.mem.sliceTo(value, 0),
+                .fast_supported = option.cursor_fast_supported,
+                .reasoning_param_id = if (option.cursor_reasoning_param_id) |param_id| std.mem.sliceTo(param_id, 0) else null,
+                .reasoning_values = if (option.cursor_reasoning_values) |values| blk: {
+                    const out = try self.allocator.alloc([]const u8, values.len);
+                    for (values, 0..) |v, i| out[i] = std.mem.sliceTo(v, 0);
+                    break :blk out;
+                } else null,
+                .reasoning_requires_thinking = option.cursor_reasoning_requires_thinking,
+            });
+        }
+        defer {
+            for (persisted.items) |option| {
+                if (option.reasoning_values) |values| self.allocator.free(values);
+            }
+        }
+        if (persisted.items.len == 0) return;
+
+        const json = try std.json.Stringify.valueAlloc(self.allocator, persisted.items, .{ .whitespace = .minified });
+        defer self.allocator.free(json);
+
+        const path = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, CURSOR_MODEL_CACHE_FILE_NAME });
+        defer self.allocator.free(path);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
+        defer file.close(threaded.io());
+        try file.writeStreamingAll(threaded.io(), json);
     }
 
     const AddProjectResult = enum {
@@ -2056,10 +2469,16 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        log.info("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
+            runtime_log.diagnostic("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            log.warn("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.setSidebarNotice(@errorName(err));
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory target_path={s}", .{target_path});
+        log.info("browseForProjectDirectory target_path={s}", .{target_path});
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
             self.allocator.free(target_path);
@@ -2072,6 +2491,8 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
+            runtime_log.diagnostic("browseForProjectDirectory ignored: picker already pending", .{});
+            log.info("browseForProjectDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.setSidebarNotice("Folder picker already open.");
             return;
@@ -2082,10 +2503,29 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
+            runtime_log.diagnostic("browseForProjectDirectory failed to spawn picker worker", .{});
+            log.warn("browseForProjectDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
+        runtime_log.diagnostic("browseForProjectDirectory spawned picker worker", .{});
+        log.info("browseForProjectDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
+    }
+
+    pub fn requestBrowseForProjectDirectory(self: *AppState) void {
+        runtime_log.diagnostic("requestBrowseForProjectDirectory queued", .{});
+        log.info("requestBrowseForProjectDirectory queued", .{});
+        self.project_directory_browse_requested = true;
+        self.markDirty();
+    }
+
+    pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
+        if (!self.project_directory_browse_requested) return;
+        runtime_log.diagnostic("processDeferredProjectDirectoryBrowse running", .{});
+        log.info("processDeferredProjectDirectoryBrowse running", .{});
+        self.project_directory_browse_requested = false;
+        self.browseForProjectDirectory();
     }
 
     fn renameSelectedProject(self: *AppState) void {
@@ -2159,7 +2599,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2174,6 +2614,7 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2279,7 +2720,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2294,6 +2735,7 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .cursor => return self.setThreadImportNotice(importThreadFailureMessage(provider, error.UnsupportedOperation)),
         };
 
         var client = ai_harness.connect(self.allocator, provider_config) catch |err| {
@@ -2360,7 +2802,7 @@ pub const AppState = struct {
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
                     .cwd = project.path,
-                    .launch_on_connect = false,
+                    .launch_on_connect = true,
                 },
             },
             .opencode => ai_harness.ProviderConfig{
@@ -2374,6 +2816,10 @@ pub const AppState = struct {
                 .claude = .{
                     .cwd = project.path,
                 },
+            },
+            .cursor => {
+                self.setSidebarNotice(syncThreadFailureMessage(provider, error.UnsupportedOperation));
+                return;
             },
         };
 
@@ -2610,6 +3056,7 @@ pub const AppState = struct {
             .codex => .steer,
             .opencode => .queue,
             .claude => .queue,
+            .cursor => .queue,
         };
 
         const send_state = thread.send_state;
@@ -2658,6 +3105,7 @@ pub const AppState = struct {
             .codex => "Tab to steer",
             .opencode => "Tab to queue",
             .claude => "Tab to queue",
+            .cursor => "Tab to queue",
         };
     }
 
@@ -2688,10 +3136,19 @@ pub const AppState = struct {
                     .cwd = project.path,
                 },
             },
+            .cursor => ai_harness.ProviderConfig{
+                .cursor = .{
+                    .cwd = project.path,
+                    .model = if (thread.model_ref) |model_ref| model_ref else null,
+                },
+            },
         };
 
         var client = try ai_harness.connect(self.allocator, provider_config);
         defer client.deinit();
+
+        const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(self.allocator, thread) else null;
+        defer if (cursor_model_params_json) |params| self.allocator.free(params);
 
         return client.sendPrompt(self.allocator, .{
             .thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
@@ -2700,6 +3157,7 @@ pub const AppState = struct {
             .cwd = project.path,
             .model = if (thread.model_ref) |model_ref| model_ref else null,
             .opencode_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+            .cursor_model_params_json = cursor_model_params_json,
             .reasoning_effort = if (thread.provider == .opencode and thread.opencode_reasoning_variant != null) null else thread.reasoning_effort,
             .service_tier = serviceTierForMode(thread.provider, thread.fast_mode),
             .approval_policy = approvalPolicyForMode(thread.provider, thread.access_mode),
@@ -2730,6 +3188,11 @@ pub const AppState = struct {
             },
             .claude => ai_harness.ProviderConfig{
                 .claude = .{
+                    .cwd = project_path,
+                },
+            },
+            .cursor => ai_harness.ProviderConfig{
+                .cursor = .{
                     .cwd = project_path,
                 },
             },
@@ -2797,6 +3260,7 @@ pub const AppState = struct {
                 }
                 break :blk null;
             },
+            .cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null,
             .fast_mode = thread.fast_mode,
             .access_mode = thread.access_mode,
         };
@@ -2810,6 +3274,7 @@ pub const AppState = struct {
             page_alloc.free(request.thread_title);
             if (request.model_ref) |model_ref| page_alloc.free(model_ref);
             if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
+            if (request.cursor_model_params_json) |params| page_alloc.free(params);
         }
 
         const send_state = thread.send_state;
@@ -3176,6 +3641,8 @@ pub const AppState = struct {
             return;
         }
 
+        log.info("runDefaultOpenAction invoked for project path={s}", .{self.currentProject().path});
+
         switch (self.app_config.default_open_action) {
             .folder => self.openCurrentProjectDirectory(),
             .editor => self.openCurrentProjectEditor(.configured),
@@ -3225,6 +3692,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project folder.");
             return;
         };
+        log.info("openCurrentProjectDirectory completed", .{});
         self.setSidebarNotice("Opened project folder.");
     }
 
@@ -3239,6 +3707,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to open project editor.");
             return;
         };
+        log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
         self.setSidebarNotice(projectEditorOpenedNotice(target));
     }
 
@@ -3514,6 +3983,8 @@ pub const AppState = struct {
     }
 
     pub fn ensureImageTexture(self: *AppState, path: [:0]const u8) ?CachedImageTexture {
+        if (!self.gl_texture_uploads_enabled and self.texture_upload_fn == null) return null;
+
         if (self.image_texture_cache.getPtr(path)) |cached| {
             return if (cached.valid) cached.* else null;
         }
@@ -3533,7 +4004,7 @@ pub const AppState = struct {
         };
         defer loaded.deinit();
 
-        const cached = uploadTexture(loaded) orelse {
+        const cached = self.uploadLoadedTexture(loaded) orelse {
             self.image_texture_cache.put(owned_key, .{
                 .texture_id = 0,
                 .width = 0,
@@ -3731,6 +4202,13 @@ pub const AppState = struct {
         self.composer_focused = false;
     }
 
+    pub fn closeSidebarContextMenu(self: *AppState) void {
+        if (!self.sidebar_context_menu_open) return;
+        self.sidebar_context_menu_open = false;
+        self.sidebar_context_menu_kind = .none;
+        self.markDirty();
+    }
+
     pub fn selectAllTranscriptMarkdownSelection(
         self: *AppState,
         first_message_index: usize,
@@ -3770,7 +4248,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
     ) ?f32 {
         const thread = self.currentThreadMutable();
@@ -3779,6 +4259,8 @@ pub const AppState = struct {
 
         const entry = thread.transcript_height_entries.items[message_index];
         if (!entry.valid) return null;
+        if (entry.role != role) return null;
+        if (entry.assistant_plain_layout != assistant_plain_layout) return null;
         if (@abs(entry.width - width) > 0.5) return null;
         if (entry.body_hash != std.hash.Wyhash.hash(0, body)) return null;
         if (entry.author_hash != std.hash.Wyhash.hash(0, author)) return null;
@@ -3791,7 +4273,9 @@ pub const AppState = struct {
         message_index: usize,
         width: f32,
         body: []const u8,
+        role: ChatRole,
         author: []const u8,
+        assistant_plain_layout: bool,
         image_present: bool,
         height: f32,
     ) void {
@@ -3802,6 +4286,8 @@ pub const AppState = struct {
 
         thread.transcript_height_entries.items[message_index] = .{
             .valid = true,
+            .role = role,
+            .assistant_plain_layout = assistant_plain_layout,
             .width = width,
             .body_hash = std.hash.Wyhash.hash(0, body),
             .author_hash = std.hash.Wyhash.hash(0, author),
@@ -4060,7 +4546,11 @@ pub const AppState = struct {
 
         const is_visible = dock.toggle();
         if (!is_visible) self.endTerminalResizeDrag();
-        self.terminal_focused = is_visible;
+        if (is_visible) {
+            self.requestTerminalFocus();
+        } else {
+            self.terminal_focused = false;
+        }
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
@@ -4094,6 +4584,8 @@ pub const AppState = struct {
 
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
@@ -4104,6 +4596,11 @@ pub const AppState = struct {
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) {
+            self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+            return;
+        }
+
         if (self.browser_state.controls_visible) {
             self.hideBrowser();
             return;
@@ -4379,6 +4876,8 @@ pub const AppState = struct {
 
     /// Applies queued browser runtime events back onto app-visible browser state.
     pub fn pollBrowser(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+
         if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
 
         if (self.browser_launch_open_delay_frames > 0) {
@@ -4796,6 +5295,15 @@ pub const AppState = struct {
         self.browser_pane_focused = false;
     }
 
+    pub fn requestTerminalFocus(self: *AppState) void {
+        self.terminal_focused = true;
+        self.composer_focused = false;
+        self.palette_composer.focused = false;
+        self.browser_pane_focused = false;
+        self.browser_address_focused = false;
+        self.palette_modal_text_focus = .none;
+    }
+
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
         const requested = self.composer_focus_requested;
         self.composer_focus_requested = false;
@@ -4850,13 +5358,15 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
-        self.palette_composer.setFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
+        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
         const thread = self.currentThread();
-        const show_fast_toggle = thread.provider == .codex;
+        const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
+        const show_fast_toggle = thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
         self.palette_composer.setShowFastToggle(show_fast_toggle);
-        self.palette_composer.setPlaceholder(self.allocator, if (thread.draftImageCount() == 0) "Ask anything, or use / to show available commands" else " ") catch |err| {
+        const hide_placeholder = thread.draftImageCount() > 0;
+        self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
         };
         const model_options = composerModelOptions(self, thread.provider);
@@ -4927,19 +5437,29 @@ pub const AppState = struct {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
 
+        const composer_rect: palette.Rect = if (self.composer_input_bounds_valid) .{
+            .x = self.composer_input_min[0],
+            .y = self.composer_input_min[1],
+            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
+            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
+        } else anchor;
         const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
             COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + 6.0;
+        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + COMPOSER_MODEL_CASCADE_GAP;
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
         const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
+        const viewport_top: f32 = 8.0;
+        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y + composer_rect.h);
         const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        self.palette_model_cascade.setAnchorRect(anchor);
-        self.palette_model_cascade.clearForbiddenRect();
+        var menu_anchor = anchor;
+        menu_anchor.y += COMPOSER_MODEL_CASCADE_ROOT_DROP;
+        self.palette_model_cascade.setAnchorRect(menu_anchor);
+        self.palette_model_cascade.setForbiddenRect(self.palette_composer.toolbarRect());
         self.palette_model_cascade.setViewportRect(.{
             .x = min_x,
-            .y = 8.0,
+            .y = viewport_top,
             .w = @max(max_x - min_x, total_width),
-            .h = @max(anchor.y - 16.0, root_height),
+            .h = @max(viewport_bottom - viewport_top, root_height),
         });
         self.palette_model_cascade.setBounds(.{
             .x = x,
@@ -4953,6 +5473,11 @@ pub const AppState = struct {
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
+        if (self.cursor_model_options.items.len == 0) {
+            self.refreshCursorModelOptionsCacheAsync();
+        }
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
         self.syncPaletteModelCascadeMenu();
         self.setPaletteModelCascadeBoundsFromToolbar();
         _ = self.palette_model_cascade.handleInput(.open);
@@ -4977,7 +5502,15 @@ pub const AppState = struct {
         }
     }
 
+    fn currentThreadNeedsProviderModelCascade(self: *const AppState) bool {
+        const thread = self.currentThread();
+        return thread.messages.items.len == 0 and
+            thread.provider_thread_id == null and
+            !thread.isSendPendingForUi();
+    }
+
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
@@ -4991,6 +5524,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.terminal_focused) return false;
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
         if (palette_key.primary and palette_key.code == .v) {
             runtime_log.diagnostic(
@@ -5043,7 +5577,7 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point)) {
+        if (self.composer_toolbar_model_rect.contains(point) and self.currentThreadNeedsProviderModelCascade()) {
             self.openPaletteModelCascadeMenu();
             self.palette_composer.focused = false;
             self.composer_focused = false;
@@ -5061,6 +5595,7 @@ pub const AppState = struct {
         else
             return false;
 
+        _ = self.palette_model_cascade.handleInput(.close);
         const target_point: palette.draw.Vec2 = .{
             .x = target.x + target.w * 0.5,
             .y = target.y + target.h * 0.5,
@@ -5154,7 +5689,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteEstimatedFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {
@@ -5292,6 +5827,17 @@ pub const AppState = struct {
 
         thread.model_ref = if (value) |next| self.allocator.dupeZ(u8, next) catch null else null;
         self.normalizeOpencodeReasoningVariant(thread);
+        if (thread.provider == .cursor) {
+            if (thread.opencode_reasoning_variant) |v| {
+                self.allocator.free(v);
+                thread.opencode_reasoning_variant = null;
+            }
+            if (self.cursorModelOptionForRef(thread.model_ref)) |opt| {
+                if (!opt.cursor_fast_supported) thread.fast_mode = .off;
+            } else {
+                thread.fast_mode = .off;
+            }
+        }
         self.markDirty();
     }
 
@@ -5522,11 +6068,11 @@ pub const AppState = struct {
     pub fn markDirty(self: *AppState) void {
         self.noteInteraction();
         self.dirty = true;
-        self.last_dirty_at_ms = 0;
+        self.last_dirty_at_ms = unixTimestampMs();
     }
 
     pub fn noteInteraction(self: *AppState) void {
-        self.last_interaction_at_ms = 0;
+        self.last_interaction_at_ms = unixTimestampMs();
     }
 
     pub fn requestTranscriptScrollToBottom(self: *AppState) void {
@@ -5536,6 +6082,8 @@ pub const AppState = struct {
         self.currentThreadMutable().transcript_scroll_valid = false;
         self.transcript_auto_follow_pending = true;
         self.scroll_transcript_to_bottom_frames = 8;
+        self.pending_transcript_scroll_px = 0;
+        self.pending_transcript_page_steps = 0;
     }
 
     pub fn requestTranscriptLineScroll(self: *AppState, delta: i16) void {
@@ -5543,8 +6091,8 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_line_scroll_steps) + delta;
-        self.pending_transcript_line_scroll_steps = @intCast(std.math.clamp(next, -32, 32));
+        self.pending_transcript_scroll_px += @as(f32, @floatFromInt(delta)) * theme.scaledUi(TRANSCRIPT_KEYBOARD_LINE_PX);
+        self.markDirty();
     }
 
     pub fn requestTranscriptPageScroll(self: *AppState, delta: i16) void {
@@ -5552,8 +6100,9 @@ pub const AppState = struct {
         self.noteInteraction();
         self.transcript_auto_follow_pending = false;
         self.scroll_transcript_to_bottom_frames = 0;
-        const next = @as(i32, self.pending_transcript_page_scroll_steps) + delta;
-        self.pending_transcript_page_scroll_steps = @intCast(std.math.clamp(next, -16, 16));
+        const next = @as(i32, self.pending_transcript_page_steps) + @as(i32, delta);
+        self.pending_transcript_page_steps = @intCast(std.math.clamp(next, -12, 12));
+        self.markDirty();
     }
 
     pub fn importDirectoryDraft(self: *const AppState) []const u8 {
@@ -5605,6 +6154,7 @@ pub const AppState = struct {
         @memset(&self.sidebar_notice_storage, 0);
         const len = @min(value.len, self.sidebar_notice_storage.len - 1);
         @memcpy(self.sidebar_notice_storage[0..len], value[0..len]);
+        self.markDirty();
     }
 
     fn clearThreadImportThreads(self: *AppState) void {
@@ -5613,14 +6163,25 @@ pub const AppState = struct {
         }
         self.thread_import_threads.clearRetainingCapacity();
         self.thread_import_selected_index = null;
+        self.thread_import_hover_index = null;
     }
 
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
-        if (0 - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
-        if (0 - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
+        const now = unixTimestampMs();
+        if (now - self.last_dirty_at_ms < SAVE_DEBOUNCE_MS) return;
+        if (now - self.last_interaction_at_ms < SAVE_DEBOUNCE_MS) return;
 
         self.flushDirtyNow();
+    }
+
+    fn flushDirtyBlocking(self: *AppState) void {
+        if (!self.dirty) return;
+        self.storage.save(self) catch |err| {
+            log.err("failed to save native state: {s}", .{@errorName(err)});
+            return;
+        };
+        self.dirty = false;
     }
 
     fn flushDirtyNow(self: *AppState) void {
@@ -5652,7 +6213,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
         }
-        self.flushDirtyNow();
+        self.flushDirtyBlocking();
         self.clearProjects();
 
         if (try self.storage.load(self.allocator)) |persisted_value| {
@@ -5663,6 +6224,7 @@ pub const AppState = struct {
             try self.seedDefaultState();
         }
         self.refreshOpencodeModelOptionsCacheAsync();
+        self.refreshCursorModelOptionsCacheAsync();
 
         self.setSidebarNotice("App refreshed from disk.");
         self.requestTranscriptScrollToBottom();
@@ -5699,13 +6261,23 @@ pub const AppState = struct {
     }
 
     pub fn deinit(self: *AppState) void {
+        runtime_log.diagnostic("AppState.deinit begin", .{});
         self.preparePendingSendsForShutdown();
-        ai_harness.shutdownOwnedProviderProcesses();
+        runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
+        runtime_log.diagnostic("AppState.deinit picker finished", .{});
         self.finishOpencodeModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit opencode model cache finished", .{});
+        self.finishCursorModelCacheThread();
+        runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishAllSendThreads();
+        runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         self.pollSend();
-        self.flushDirtyNow();
+        runtime_log.diagnostic("AppState.deinit sends polled", .{});
+        ai_harness.shutdownOwnedProviderProcesses();
+        runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
+        self.flushDirtyBlocking();
+        runtime_log.diagnostic("AppState.deinit dirty state flushed", .{});
         self.file_search_state.deinit(self.allocator);
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
@@ -5718,11 +6290,14 @@ pub const AppState = struct {
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
         self.clearOpencodeModelOptions();
+        self.clearCursorModelOptions();
         self.opencode_reasoning_menu.deinit(self.allocator);
         self.opencode_model_options.deinit(self.allocator);
+        self.cursor_model_options.deinit(self.allocator);
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
+        runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
     fn preparePendingSendsForShutdown(self: *AppState) void {
@@ -5773,6 +6348,8 @@ pub const AppState = struct {
         self.picker_state.mutex.unlock();
 
         if (next_status != .idle) {
+            runtime_log.diagnostic("pollPicker completed status={s}", .{@tagName(next_status)});
+            log.info("pollPicker completed status={s}", .{@tagName(next_status)});
             self.finishPickerThread();
         }
 
@@ -5841,6 +6418,52 @@ pub const AppState = struct {
             },
             .failed => {
                 log.warn("failed to refresh OpenCode model cache", .{});
+            },
+            else => {},
+        }
+    }
+
+    pub fn pollCursorModelOptionsCache(self: *AppState) void {
+        var loaded_models: ?[]ai_harness.ModelInfo = null;
+        var next_status: CursorModelCacheStatus = .idle;
+
+        self.cursor_model_cache_state.mutex.lock();
+        switch (self.cursor_model_cache_state.status) {
+            .completed => {
+                loaded_models = self.cursor_model_cache_state.models;
+                self.cursor_model_cache_state.models = null;
+                self.cursor_model_cache_state.status = .idle;
+                next_status = .completed;
+            },
+            .failed => {
+                self.cursor_model_cache_state.status = .idle;
+                next_status = .failed;
+            },
+            else => {},
+        }
+        self.cursor_model_cache_state.mutex.unlock();
+
+        if (next_status != .idle) {
+            self.finishCursorModelCacheThread();
+        }
+
+        switch (next_status) {
+            .completed => {
+                const models = loaded_models orelse return;
+                defer ai_harness.freeModelInfos(std.heap.page_allocator, models);
+                self.clearCursorModelOptions();
+                if (models.len == 0) return;
+                self.populateCursorModelOptions(models) catch |err| {
+                    log.warn("failed to cache Cursor models: {s}", .{@errorName(err)});
+                    self.clearDynamicCursorModelOptions();
+                    return;
+                };
+                self.saveCursorModelOptionsDiskCache() catch |err| {
+                    log.warn("failed to save Cursor model cache: {s}", .{@errorName(err)});
+                };
+            },
+            .failed => {
+                log.warn("failed to refresh Cursor model cache", .{});
             },
             else => {},
         }
@@ -6061,7 +6684,7 @@ pub const AppState = struct {
             else
                 null;
             if (pending_thread_id) |resolved_thread_id| {
-                if (provider == .opencode or provider == .claude or send_state.active_turn_id != null) {
+                if (provider == .opencode or send_state.active_turn_id != null) {
                     thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                     turn_id = if (send_state.active_turn_id) |active_turn_id|
                         self.allocator.dupe(u8, active_turn_id) catch null
@@ -6268,6 +6891,23 @@ pub const AppState = struct {
         }
     }
 
+    fn finishCursorModelCacheThread(self: *AppState) void {
+        self.cursor_model_cache_state.mutex.lock();
+        const maybe_worker = self.cursor_model_cache_state.worker;
+        self.cursor_model_cache_state.worker = null;
+        const maybe_models = self.cursor_model_cache_state.models;
+        self.cursor_model_cache_state.models = null;
+        self.cursor_model_cache_state.status = .idle;
+        self.cursor_model_cache_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+        if (maybe_models) |models| {
+            ai_harness.freeModelInfos(std.heap.page_allocator, models);
+        }
+    }
+
     fn finishAllSendThreads(self: *AppState) void {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
@@ -6298,6 +6938,7 @@ pub const AppState = struct {
         send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
+        runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
         send_state.mutex.unlock();
 
         self.issuePendingThreadStop(project_path, thread);
@@ -6572,6 +7213,12 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Claude thread imports are not supported by this SDK.",
             else => "Failed to load Claude threads.",
         },
+        .cursor => switch (err) {
+            error.FileNotFound => "Node was not found on PATH for Cursor.",
+            error.CursorSignedOut => "Cursor is not authenticated.",
+            error.UnsupportedOperation => "Cursor thread imports are not supported yet.",
+            else => "Failed to load Cursor threads.",
+        },
     };
 }
 
@@ -6593,6 +7240,35 @@ fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {
 
         break :blk client.listModels(std.heap.page_allocator) catch |err| {
             log.warn("failed to load OpenCode configured models: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    if (models) |loaded| {
+        state.models = loaded;
+        state.status = .completed;
+    } else {
+        state.status = .failed;
+    }
+}
+
+fn cursorModelCacheWorker(state: *CursorModelCacheState) void {
+    const provider_config = ai_harness.ProviderConfig{
+        .cursor = .{},
+    };
+
+    const models = blk: {
+        var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
+            log.warn("failed to connect to Cursor for model discovery: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer client.deinit();
+
+        break :blk client.listModels(std.heap.page_allocator) catch |err| {
+            log.warn("failed to load Cursor models: {s}", .{@errorName(err)});
             break :blk null;
         };
     };
@@ -6632,6 +7308,12 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Claude thread sync is not supported by this SDK.",
             else => "Failed to sync the Claude thread.",
         },
+        .cursor => switch (err) {
+            error.FileNotFound => "Node was not found on PATH for Cursor.",
+            error.CursorSignedOut => "Cursor is not authenticated.",
+            error.UnsupportedOperation => "Cursor thread sync is not supported yet.",
+            else => "Failed to sync the Cursor thread.",
+        },
     };
 }
 
@@ -6640,6 +7322,7 @@ fn failedToStoreThreadListNotice(provider: Provider) []const u8 {
         .codex => "Failed to store Codex thread list.",
         .opencode => "Failed to store OpenCode thread list.",
         .claude => "Failed to store Claude thread list.",
+        .cursor => "Failed to store Cursor thread list.",
     };
 }
 
@@ -6648,6 +7331,7 @@ fn noRecentThreadsNotice(provider: Provider) []const u8 {
         .codex => "No recent Codex threads found.",
         .opencode => "No recent OpenCode threads found.",
         .claude => "No recent Claude threads found.",
+        .cursor => "No recent Cursor threads found.",
     };
 }
 
@@ -6656,6 +7340,7 @@ fn selectThreadNotice(provider: Provider) []const u8 {
         .codex => "Select a Codex thread or paste a thread ID.",
         .opencode => "Select an OpenCode thread or paste a thread ID.",
         .claude => "Select a Claude thread or paste a thread ID.",
+        .cursor => "Select a Cursor thread or paste a thread ID.",
     };
 }
 
@@ -6664,6 +7349,7 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
         .codex => "Enter a Codex thread ID or select one from the list.",
         .opencode => "Enter an OpenCode thread ID or select one from the list.",
         .claude => "Enter a Claude thread ID or select one from the list.",
+        .cursor => "Enter a Cursor thread ID or select one from the list.",
     };
 }
 
@@ -6672,6 +7358,7 @@ fn duplicateThreadNotice(provider: Provider) []const u8 {
         .codex => "Codex thread already exists in this project.",
         .opencode => "OpenCode thread already exists in this project.",
         .claude => "Claude thread already exists in this project.",
+        .cursor => "Cursor thread already exists in this project.",
     };
 }
 
@@ -6680,6 +7367,7 @@ fn failedCreateImportedThreadNotice(provider: Provider) []const u8 {
         .codex => "Failed to create the imported thread.",
         .opencode => "Failed to create the imported thread.",
         .claude => "Failed to create the imported thread.",
+        .cursor => "Failed to create the imported thread.",
     };
 }
 
@@ -6688,6 +7376,7 @@ fn failedAddImportedThreadNotice(provider: Provider) []const u8 {
         .codex => "Failed to add the imported thread.",
         .opencode => "Failed to add the imported thread.",
         .claude => "Failed to add the imported thread.",
+        .cursor => "Failed to add the imported thread.",
     };
 }
 
@@ -6696,6 +7385,7 @@ fn threadImportedNotice(provider: Provider) []const u8 {
         .codex => "Codex thread imported.",
         .opencode => "OpenCode thread imported.",
         .claude => "Claude thread imported.",
+        .cursor => "Cursor thread imported.",
     };
 }
 
@@ -6704,6 +7394,7 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
         .codex => "Thread synced from Codex.",
         .opencode => "Thread synced from OpenCode.",
         .claude => "Thread synced from Claude.",
+        .cursor => "Thread synced from Cursor.",
     };
 }
 

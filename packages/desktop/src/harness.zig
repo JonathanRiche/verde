@@ -5,6 +5,8 @@ pub const types = @import("provider_types.zig");
 const opencode = @import("providers/opencode.zig");
 const codex = @import("providers/codex.zig");
 const claude = @import("providers/claude.zig");
+const cursor = @import("providers/cursor.zig");
+const runtime_log = @import("runtime_log.zig");
 
 pub const Provider = types.Provider;
 pub const HarnessKind = types.HarnessKind;
@@ -32,18 +34,21 @@ pub const ProviderConfig = union(Provider) {
     opencode: opencode.Config,
     codex: codex.Config,
     claude: claude.Config,
+    cursor: cursor.Config,
 };
 
 pub const ProviderClient = union(Provider) {
     opencode: opencode.Client,
     codex: codex.Client,
     claude: claude.Client,
+    cursor: cursor.Client,
 
     pub fn deinit(self: *ProviderClient) void {
         switch (self.*) {
             .opencode => |*client| client.deinit(),
             .codex => |*client| client.deinit(),
             .claude => |*client| client.deinit(),
+            .cursor => |*client| client.deinit(),
         }
     }
 
@@ -52,6 +57,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.authState(),
             .codex => |*client| client.authState(),
             .claude => |*client| client.authState(),
+            .cursor => |*client| client.authState(),
         };
     }
 
@@ -60,6 +66,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.listThreads(allocator),
             .codex => |*client| client.listThreads(allocator),
             .claude => |*client| client.listThreads(allocator),
+            .cursor => |*client| client.listThreads(allocator),
         };
     }
 
@@ -68,6 +75,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.listModels(allocator),
             .codex => |*client| client.listModels(allocator),
             .claude => |*client| client.listModels(allocator),
+            .cursor => |*client| client.listModels(allocator),
         };
     }
 
@@ -76,6 +84,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.readThread(allocator, thread_id),
             .codex => |*client| client.readThread(allocator, thread_id),
             .claude => |*client| client.readThread(allocator, thread_id),
+            .cursor => |*client| client.readThread(allocator, thread_id),
         };
     }
 
@@ -84,6 +93,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.sendPrompt(allocator, request),
             .codex => |*client| client.sendPrompt(allocator, request),
             .claude => |*client| client.sendPrompt(allocator, request),
+            .cursor => |*client| client.sendPrompt(allocator, request),
         };
     }
 
@@ -92,6 +102,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.interruptThread(request),
             .codex => |*client| client.interruptThread(request),
             .claude => |*client| client.interruptThread(request),
+            .cursor => |*client| client.interruptThread(request),
         };
     }
 
@@ -100,6 +111,7 @@ pub const ProviderClient = union(Provider) {
             .opencode => |*client| client.steerThread(request),
             .codex => |*client| client.steerThread(request),
             .claude => |*client| client.steerThread(request),
+            .cursor => |*client| client.steerThread(request),
         };
     }
 };
@@ -112,11 +124,21 @@ pub fn connect(
         .opencode => |config| .{ .opencode = try opencode.Client.init(allocator, config) },
         .codex => |config| .{ .codex = try codex.Client.init(allocator, config) },
         .claude => |config| .{ .claude = try claude.Client.init(allocator, config) },
+        .cursor => |config| .{ .cursor = try cursor.Client.init(allocator, config) },
     };
 }
 
 pub fn shutdownOwnedProviderProcesses() void {
+    runtime_log.diagnostic("provider shutdown begin opencode", .{});
     opencode.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done opencode", .{});
+    runtime_log.diagnostic("provider shutdown begin codex", .{});
     codex.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done codex", .{});
+    runtime_log.diagnostic("provider shutdown begin claude", .{});
     claude.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done claude", .{});
+    runtime_log.diagnostic("provider shutdown begin cursor", .{});
+    cursor.shutdownOwnedServer();
+    runtime_log.diagnostic("provider shutdown done cursor", .{});
 }

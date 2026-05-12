@@ -1,12 +1,19 @@
 //! Reusable markdown body parsing and rendering helpers for chat threads.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const colors = @import("colors.zig");
 const palette = @import("palette");
 const theme = @import("theme.zig");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
+
+/// SDL_ttf's GPU atlas advances for the bundled UI font are wider than the
+/// stb_truetype metrics used by the old GL text path. The markdown transcript
+/// lays rich text out in chunks, so under-measuring each chunk makes later words
+/// start too early and visually eat spaces.
+const SDL_GPU_TRANSCRIPT_WIDTH_SCALE: f32 = 1.17;
 
 extern fn palette_text_gl_measure_line_width(
     font_data: [*]const u8,
@@ -16,18 +23,47 @@ extern fn palette_text_gl_measure_line_width(
     font_size: f32,
 ) callconv(.c) f32;
 
-/// Same CalSans bytes as `palette_gl_renderer.zig` / `palette_text_gl_draw`.
-const gl_transcript_font = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+/// Same UI font used by the SDL_GPU palette renderer so transcript run layout
+/// matches the glyphs submitted to SDL_ttf.
+const gl_transcript_font = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Bold.ttf");
 
 fn glTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
+    if (inlineWhitespaceWidth(font_size, text)) |width| return width;
+    if (builtin.is_test) return estimatedTranscriptTextWidth(font_size, text);
     return palette_text_gl_measure_line_width(
         gl_transcript_font.ptr,
         @intCast(gl_transcript_font.len),
         text.ptr,
         @intCast(text.len),
         font_size,
-    );
+    ) * SDL_GPU_TRANSCRIPT_WIDTH_SCALE;
+}
+
+fn estimatedTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
+    var width: f32 = 0.0;
+    for (text) |byte| {
+        width += switch (byte) {
+            'i', 'l', 'I', '.', ',', ':', ';', '!' => font_size * 0.28,
+            'm', 'w', 'M', 'W' => font_size * 0.78,
+            ' ' => font_size * 0.42 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            '\t' => font_size * 0.42 * 4.0 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            else => font_size * 0.55,
+        };
+    }
+    return width;
+}
+
+fn inlineWhitespaceWidth(font_size: f32, text: []const u8) ?f32 {
+    var width: f32 = 0.0;
+    for (text) |byte| {
+        switch (byte) {
+            ' ' => width += font_size * 0.42 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            '\t' => width += font_size * 0.42 * 4.0 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            else => return null,
+        }
+    }
+    return width;
 }
 
 const Allocator = std.mem.Allocator;

@@ -11,6 +11,7 @@ MACOS_DIR="$APP_DIR/Contents/MacOS"
 FFF_LIB="$MACOS_DIR/libfff_c.dylib"
 DESIRED_FFF_REF="@executable_path/libfff_c.dylib"
 TREE_SITTER_PATTERN='libtree-sitter[^[:space:]]*\.dylib'
+SDL3_TTF_PATTERN='libSDL3_ttf[^[:space:]]*\.dylib'
 
 find_cmd() {
   local primary="$1"
@@ -123,3 +124,4 @@ bundle_dependency_from_existing_ref() {
 
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
 bundle_dependency_from_existing_ref "$TREE_SITTER_PATTERN"
+bundle_dependency_from_existing_ref "$SDL3_TTF_PATTERN"
