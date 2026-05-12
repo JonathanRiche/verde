@@ -97,6 +97,19 @@ copy_runtime_library() {
   fi
 }
 
+copy_node_runtime() {
+  local destination_dir="$1"
+  local source_dir="$REPO_ROOT/node_modules"
+
+  if [[ ! -d "$source_dir/@cursor/sdk" ]]; then
+    echo "missing Cursor SDK runtime dependencies; run bun install --production before packaging" >&2
+    exit 1
+  fi
+
+  mkdir -p "$destination_dir"
+  cp -a "$source_dir/." "$destination_dir/"
+}
+
 mkdir -p "$OUTPUT_DIR"
 need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
@@ -141,6 +154,7 @@ EOF
 chmod 755 "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
+copy_node_runtime "$PACKAGE_ROOT/share/verde/node_modules"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
 

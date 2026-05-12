@@ -74,6 +74,11 @@ EOF
 if [[ -e "$SCRIPT_DIR/share/verde/VERSION" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/VERSION" "$PREFIX/share/verde/VERSION"
 fi
+if [[ -d "$SCRIPT_DIR/share/verde/node_modules" ]]; then
+  rm -rf "$PREFIX/share/verde/node_modules"
+  mkdir -p "$PREFIX/share/verde/node_modules"
+  cp -a "$SCRIPT_DIR/share/verde/node_modules/." "$PREFIX/share/verde/node_modules/"
+fi
 
 echo "Installed Verde into $PREFIX"
 echo "Binary: $PREFIX/bin/verde"

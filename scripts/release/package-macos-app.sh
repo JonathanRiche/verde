@@ -55,6 +55,19 @@ set_macos_build_version() {
   chmod 755 "$binary"
 }
 
+copy_node_runtime() {
+  local destination_dir="$1"
+  local source_dir="$REPO_ROOT/node_modules"
+
+  if [[ ! -d "$source_dir/@cursor/sdk" ]]; then
+    echo "missing Cursor SDK runtime dependencies; run bun install --production before packaging" >&2
+    exit 1
+  fi
+
+  mkdir -p "$destination_dir"
+  cp -a "$source_dir/." "$destination_dir/"
+}
+
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO_ROOT/packages/desktop"
@@ -100,6 +113,7 @@ if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
   ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
     "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
 fi
+copy_node_runtime "$APP_DIR/Contents/Resources/node_modules"
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
