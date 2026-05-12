@@ -129,6 +129,16 @@ install -m 644 "$PREFIX_DIR/bin/chrome_200_percent.pak" "$PACKAGE_ROOT/bin/chrom
 install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
 install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
 cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
+cat > "$PACKAGE_ROOT/bin/verde-launch" <<'EOF'
+#!/usr/bin/env sh
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$script_dir/verde" >/dev/null 2>&1 &
+else
+  "$script_dir/verde" >/dev/null 2>&1 &
+fi
+EOF
+chmod 755 "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
@@ -158,11 +168,11 @@ Version=1.0
 Type=Application
 Name=Verde
 Comment=Desktop chat app for Codex and OpenCode
-Exec=verde
+Exec=verde-launch
 Icon=verde
 Terminal=false
 Categories=Development;
-StartupNotify=true
+StartupNotify=false
 StartupWMClass=com.verde.native
 EOF
 

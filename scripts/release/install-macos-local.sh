@@ -48,7 +48,7 @@ set_macos_build_version() {
 cd "$REPO_ROOT/packages/desktop"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
 export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
+BUILD_ARGS=(zig build --release=safe -Dpalette-renderer=gl -p "$PREFIX_DIR")
 if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
   BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")

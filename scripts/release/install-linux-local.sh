@@ -27,6 +27,15 @@ copy_glob_if_present() {
 }
 
 install -m 755 "$SCRIPT_DIR/bin/verde" "$PREFIX/bin/verde"
+cat > "$PREFIX/bin/verde-launch" <<EOF
+#!/usr/bin/env sh
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$PREFIX/bin/verde" >/dev/null 2>&1 &
+else
+  "$PREFIX/bin/verde" >/dev/null 2>&1 &
+fi
+EOF
+chmod 755 "$PREFIX/bin/verde-launch"
 install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
 copy_if_present "$SCRIPT_DIR/bin/libSDL3.so" "$PREFIX/bin/libSDL3.so"
 copy_glob_if_present "$SCRIPT_DIR/bin/libSDL3_ttf.so*" "$PREFIX/bin"
@@ -48,8 +57,20 @@ if [[ -d "$SCRIPT_DIR/bin/locales" ]]; then
   mkdir -p "$PREFIX/bin/locales"
   cp -a "$SCRIPT_DIR/bin/locales/." "$PREFIX/bin/locales/"
 fi
-install -m 644 "$SCRIPT_DIR/share/applications/verde.desktop" "$PREFIX/share/applications/verde.desktop"
 install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/pixmaps/verde.png"
+cat > "$PREFIX/share/applications/verde.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Verde
+Comment=Desktop chat app for Codex and OpenCode
+Exec=$PREFIX/bin/verde-launch
+Icon=verde
+Terminal=false
+Categories=Development;
+StartupNotify=false
+StartupWMClass=com.verde.native
+EOF
 if [[ -e "$SCRIPT_DIR/share/verde/VERSION" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/VERSION" "$PREFIX/share/verde/VERSION"
 fi
