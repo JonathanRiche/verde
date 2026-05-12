@@ -67,8 +67,6 @@ const PALETTE_GPU_ICON_FONT_PATHS = [_][:0]const u8{
 const PALETTE_GPU_MONO_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
     "packages/desktop/src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
 };
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
