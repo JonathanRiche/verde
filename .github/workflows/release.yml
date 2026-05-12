@@ -115,6 +115,10 @@ jobs:
           echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
           bun --version
 
+      - name: Install Node runtime dependencies
+        shell: bash
+        run: bun install --frozen-lockfile --production
+
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         shell: bash

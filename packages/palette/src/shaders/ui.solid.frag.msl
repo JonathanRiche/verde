@@ -7,6 +7,6 @@ struct FSInput {
     float4 color;
 };
 
-fragment float4 main(FSInput input [[stage_in]]) {
+fragment float4 palette_solid_fragment(FSInput input [[stage_in]]) {
     return input.color;
 }

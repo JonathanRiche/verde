@@ -90,7 +90,15 @@ const WindowFrame = struct {
     h: c_int,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainInner(init) catch |err| {
+        runtime_log.diagnostic("fatal startup error: {s}", .{@errorName(err)});
+        std.debug.print("fatal startup error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
+fn mainInner(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer {
         if (builtin.mode == .Debug) _ = debug_allocator.deinit();
@@ -168,11 +176,29 @@ pub fn main(init: std.process.Init) !void {
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
         loaded_app_config.font_size,
     );
-    const palette_gpu_font_path = try paletteGpuFontPath(allocator);
+    const palette_gpu_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSans-Bold.ttf",
+        NOTO_SANS_BOLD_BYTES[0..],
+        &PALETTE_GPU_FONT_PATHS,
+    );
     defer allocator.free(palette_gpu_font_path);
-    const palette_gpu_mono_font_path = try paletteGpuMonoFontPath(allocator);
+    const palette_gpu_mono_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "JetBrainsMonoNerdFont-Regular.ttf",
+        @embedFile("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf")[0..],
+        &PALETTE_GPU_MONO_FONT_PATHS,
+    );
     defer allocator.free(palette_gpu_mono_font_path);
-    const palette_gpu_icon_font_path = try paletteGpuIconFontPath(allocator);
+    const palette_gpu_icon_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "SymbolsNerdFontMono-Regular.ttf",
+        NERD_SYMBOLS_BYTES[0..],
+        &PALETTE_GPU_ICON_FONT_PATHS,
+    );
     defer allocator.free(palette_gpu_icon_font_path);
     var palette_renderer = try palette_frame_renderer.Renderer.init(.{
         .requested_backend = requested_renderer_backend,
@@ -359,28 +385,42 @@ fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
     };
 }
 
-fn paletteGpuFontPath(allocator: std.mem.Allocator) ![:0]u8 {
-    for (PALETTE_GPU_FONT_PATHS) |candidate| {
+fn paletteGpuFontPath(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    file_name: []const u8,
+    bytes: []const u8,
+    dev_candidates: []const [:0]const u8,
+) ![:0]u8 {
+    for (dev_candidates) |candidate| {
         if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
         return try allocator.dupeZ(u8, candidate);
     }
-    return try allocator.dupeZ(u8, PALETTE_GPU_FONT_PATHS[0]);
+
+    return try installBundledFont(allocator, pref_path, file_name, bytes);
 }
 
-fn paletteGpuIconFontPath(allocator: std.mem.Allocator) ![:0]u8 {
-    for (PALETTE_GPU_ICON_FONT_PATHS) |candidate| {
-        if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
-        return try allocator.dupeZ(u8, candidate);
-    }
-    return try allocator.dupeZ(u8, PALETTE_GPU_ICON_FONT_PATHS[0]);
-}
+fn installBundledFont(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    file_name: []const u8,
+    bytes: []const u8,
+) ![:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
 
-fn paletteGpuMonoFontPath(allocator: std.mem.Allocator) ![:0]u8 {
-    for (PALETTE_GPU_MONO_FONT_PATHS) |candidate| {
-        if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
-        return try allocator.dupeZ(u8, candidate);
-    }
-    return try allocator.dupeZ(u8, PALETTE_GPU_MONO_FONT_PATHS[0]);
+    var pref_dir = try std.Io.Dir.openDirAbsolute(threaded.io(), pref_path, .{});
+    defer pref_dir.close(threaded.io());
+    try pref_dir.createDirPath(threaded.io(), "fonts");
+
+    const path = try std.fs.path.join(allocator, &.{ pref_path, "fonts", file_name });
+    defer allocator.free(path);
+
+    var file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
+    defer file.close(threaded.io());
+    try file.writeStreamingAll(threaded.io(), bytes);
+
+    return try allocator.dupeZ(u8, path);
 }
 
 const EventFlags = struct {

@@ -97,6 +97,19 @@ copy_runtime_library() {
   fi
 }
 
+copy_node_runtime() {
+  local destination_dir="$1"
+  local source_dir="$REPO_ROOT/node_modules"
+
+  if [[ ! -d "$source_dir/@cursor/sdk" ]]; then
+    echo "missing Cursor SDK runtime dependencies; run bun install --production before packaging" >&2
+    exit 1
+  fi
+
+  mkdir -p "$destination_dir"
+  cp -a "$source_dir/." "$destination_dir/"
+}
+
 mkdir -p "$OUTPUT_DIR"
 need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
@@ -108,7 +121,8 @@ mkdir -p \
   "$PACKAGE_ROOT/bin" \
   "$PACKAGE_ROOT/share/verde" \
   "$PACKAGE_ROOT/share/applications" \
-  "$PACKAGE_ROOT/share/pixmaps"
+  "$PACKAGE_ROOT/share/pixmaps" \
+  "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
@@ -129,8 +143,20 @@ install -m 644 "$PREFIX_DIR/bin/chrome_200_percent.pak" "$PACKAGE_ROOT/bin/chrom
 install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
 install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
 cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
+cat > "$PACKAGE_ROOT/bin/verde-launch" <<'EOF'
+#!/usr/bin/env sh
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$script_dir/verde" >/dev/null 2>&1 &
+else
+  "$script_dir/verde" >/dev/null 2>&1 &
+fi
+EOF
+chmod 755 "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
+install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
+copy_node_runtime "$PACKAGE_ROOT/share/verde/node_modules"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
 install -m 644 "$REPO_ROOT/README.md" "$PACKAGE_ROOT/README.md"
 
@@ -158,11 +184,12 @@ Version=1.0
 Type=Application
 Name=Verde
 Comment=Desktop chat app for Codex and OpenCode
-Exec=verde
+Exec=verde-launch
 Icon=verde
 Terminal=false
 Categories=Development;
-StartupNotify=true
+StartupNotify=false
+StartupWMClass=com.verde.native
 EOF
 
 tar -C "$WORK_DIR" -czf "$OUTPUT_DIR/verde-${VERSION}-linux-${ARCH}.tar.gz" "$(basename "$PACKAGE_ROOT")"
