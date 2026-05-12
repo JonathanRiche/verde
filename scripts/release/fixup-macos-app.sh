@@ -149,7 +149,7 @@ normalize_sdl3_framework() {
 sign_app_bundle() {
   while IFS= read -r -d '' binary; do
     "$CODESIGN" --force --sign - "$binary" >/dev/null
-  done < <(find "$MACOS_DIR" -maxdepth 3 -type f \( -perm -111 -o -name '*.dylib' \) -print0)
+  done < <(find "$MACOS_DIR" -type f \( -perm -111 -o -name '*.dylib' \) -print0)
 
   "$CODESIGN" --force --sign - "$APP_DIR" >/dev/null
   "$CODESIGN" --verify --strict --verbose=2 "$APP_DIR" >/dev/null
