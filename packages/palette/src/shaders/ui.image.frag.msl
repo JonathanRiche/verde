@@ -7,7 +7,7 @@ struct FSInput {
     float4 color;
 };
 
-fragment float4 main(
+fragment float4 palette_image_fragment(
     FSInput input [[stage_in]],
     texture2d<float> image_texture [[texture(0)]],
     sampler image_sampler [[sampler(0)]]

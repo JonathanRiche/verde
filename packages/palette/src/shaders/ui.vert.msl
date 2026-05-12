@@ -18,7 +18,7 @@ struct PaletteUniforms {
     float2 padding;
 };
 
-vertex VSOutput main(VSInput input [[stage_in]], constant PaletteUniforms& uniforms [[buffer(0)]]) {
+vertex VSOutput palette_vertex(VSInput input [[stage_in]], constant PaletteUniforms& uniforms [[buffer(0)]]) {
     VSOutput output;
     float2 ndc = (input.position / uniforms.viewport_size) * float2(2.0, -2.0) + float2(-1.0, 1.0);
     output.position = float4(ndc, 0.0, 1.0);
