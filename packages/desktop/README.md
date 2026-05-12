@@ -9,6 +9,7 @@ This package contains Verde's standalone Zig desktop app. It uses SDL3, OpenGL, 
 - SDL3 development files for your platform
 - Provider setup for the providers you want to use:
   - Codex: `codex` on your `PATH` and `codex login`
+  - Claude Code: Claude Code installed and logged in locally; Verde talks to it through Anthropic's Claude Agent SDK
   - OpenCode: `opencode` on your `PATH`
   - Cursor: `CURSOR_API_KEY` set in the environment used to launch Verde
 
@@ -58,6 +59,7 @@ Use `mise run debug` when you need the diagnostics window for focus, input-routi
 The desktop app talks to local provider runtimes rather than a hosted Verde backend.
 
 - Codex uses the local `codex` CLI and starts `codex app-server` automatically when needed.
+- Claude Code uses Anthropic's Claude Agent SDK and requires Claude Code to be installed and logged in on your machine.
 - OpenCode uses the local `opencode` CLI and can start `opencode serve` automatically when needed.
 - Cursor uses `@cursor/sdk` and requires `CURSOR_API_KEY`.
 
@@ -127,6 +129,7 @@ Custom actions run through `sh -lc` with the selected project as the working dir
 - [`src/harness.zig`](src/harness.zig): provider-neutral interface
 - [`src/providers/codex.zig`](src/providers/codex.zig): Codex integration
 - [`src/providers/opencode.zig`](src/providers/opencode.zig): OpenCode integration
+- [`src/providers/claude.zig`](src/providers/claude.zig): Claude Code integration
 - [`src/providers/cursor.zig`](src/providers/cursor.zig): Cursor integration
 - [`src/config.zig`](src/config.zig): user config loading
 - [`src/keybinds.zig`](src/keybinds.zig): keyboard shortcut parsing and overrides
@@ -142,13 +145,14 @@ Third-party Zig dependencies are declared in [`build.zig.zon`](build.zig.zon):
 - `zig_markdown`
 - `ghostty`
 
-The repo also uses `@cursor/sdk` from the root npm package for Cursor provider integration.
+The repo also uses `@anthropic-ai/claude-agent-sdk` and `@cursor/sdk` from the root npm package for Claude Code and Cursor provider integration.
 
 ## Third-Party Attribution
 
 Main upstream components used by the desktop app:
 
 - `@cursor/sdk` for Cursor provider integration.
+- `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for project-scoped file indexing and composer file search, vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.
 - `zsdl` from `zig-gamedev` for Zig bindings to SDL3. License: MIT.
