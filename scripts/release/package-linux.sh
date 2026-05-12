@@ -163,6 +163,7 @@ Icon=verde
 Terminal=false
 Categories=Development;
 StartupNotify=true
+StartupWMClass=com.verde.native
 EOF
 
 tar -C "$WORK_DIR" -czf "$OUTPUT_DIR/verde-${VERSION}-linux-${ARCH}.tar.gz" "$(basename "$PACKAGE_ROOT")"
