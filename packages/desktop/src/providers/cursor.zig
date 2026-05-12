@@ -88,8 +88,6 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        if (hasPromptAttachments(request)) return error.CursorAttachmentsUnsupported;
-
         const bridge_response = try self.runBridge(.send_prompt, allocator, .{
             .request = request,
         });
@@ -210,9 +208,7 @@ pub const Client = struct {
             }
         }
 
-        _ = child.kill(io);
-        child.id = null;
-        const term: std.process.Child.Term = .{ .exited = 0 };
+        const term = if (child.id != null) try child.wait(io) else std.process.Child.Term{ .exited = 1 };
         runtime_log.diagnostic("cursor.streaming bridge finished reply_len={d}", .{state.reply.items.len});
         try finishBridgeResponse(term, state.saw_error);
         if (state.response.thread_id.len == 0 and state.reply.items.len == 0) {
@@ -231,10 +227,6 @@ pub const Client = struct {
 };
 
 pub fn shutdownOwnedServer() void {}
-
-fn hasPromptAttachments(request: provider_types.SendPromptRequest) bool {
-    return request.image != null or request.images.len > 0;
-}
 
 fn resolveBridgeCwdAlloc(allocator: std.mem.Allocator, configured_cwd: ?[]const u8) !?[]u8 {
     if (configured_cwd) |cwd| {
@@ -342,11 +334,38 @@ fn makeBridgeRequestJsonAlloc(
     try stringify.write(if (input.request) |request| request.thread_title else null);
     try stringify.objectField("prompt");
     try stringify.write(if (input.request) |request| request.prompt else null);
+    try stringify.objectField("images");
+    if (input.request) |request| {
+        try writePromptImages(&stringify, request);
+    } else {
+        try stringify.write(null);
+    }
     try stringify.objectField("limit");
     try stringify.write(IMPORT_MESSAGE_LIMIT);
     try stringify.endObject();
 
     return writer.toOwnedSlice();
+}
+
+fn writePromptImages(stringify: *std.json.Stringify, request: provider_types.SendPromptRequest) !void {
+    try stringify.beginArray();
+    if (request.image) |image| {
+        try writePromptImage(stringify, image);
+    }
+    for (request.images) |image| {
+        if (request.image) |legacy| {
+            if (std.mem.eql(u8, legacy.path, image.path)) continue;
+        }
+        try writePromptImage(stringify, image);
+    }
+    try stringify.endArray();
+}
+
+fn writePromptImage(stringify: *std.json.Stringify, image: provider_types.ImageAttachment) !void {
+    try stringify.beginObject();
+    try stringify.objectField("path");
+    try stringify.write(image.path);
+    try stringify.endObject();
 }
 
 fn parseBridgeEventsAlloc(
@@ -469,9 +488,9 @@ fn processBridgeLine(
 }
 
 fn finishBridgeResponse(term: std.process.Child.Term, saw_error: bool) !void {
+    if (saw_error) return error.CursorBridgeFailed;
     switch (term) {
         .exited => |code| if (code != 0) {
-            if (saw_error) return error.CursorBridgeFailed;
             return error.CursorBridgeFailed;
         },
         else => return error.CursorBridgeFailed,
@@ -849,6 +868,7 @@ fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]prov
 
 const BRIDGE_SCRIPT =
     \\import { createRequire } from "node:module";
+    \\import { readFile } from "node:fs/promises";
     \\import { pathToFileURL } from "node:url";
     \\const fail = (message) => {
     \\  process.stdout.write(JSON.stringify({ type: "error", message }) + "\n");
@@ -872,6 +892,23 @@ const BRIDGE_SCRIPT =
     \\  });
     \\});
     \\const modelSelection = (id, params) => id ? { id, ...(Array.isArray(params) && params.length ? { params } : {}) } : undefined;
+    \\const mimeTypeForPath = (path) => {
+    \\  const lower = String(path || "").toLowerCase();
+    \\  if (lower.endsWith(".png")) return "image/png";
+    \\  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+    \\  if (lower.endsWith(".webp")) return "image/webp";
+    \\  if (lower.endsWith(".gif")) return "image/gif";
+    \\  return "application/octet-stream";
+    \\};
+    \\const userMessageForInput = async () => {
+    \\  const images = [];
+    \\  for (const image of Array.isArray(input.images) ? input.images : []) {
+    \\    if (!image?.path) continue;
+    \\    const data = await readFile(image.path, { encoding: "base64" });
+    \\    images.push({ data, mimeType: mimeTypeForPath(image.path) });
+    \\  }
+    \\  return images.length ? { text: input.prompt || "", images } : (input.prompt || "");
+    \\};
     \\const agentOptions = () => ({
     \\  apiKey: process.env.CURSOR_API_KEY,
     \\  model: modelSelection(input.model || "composer-2", input.modelParams),
@@ -939,7 +976,7 @@ const BRIDGE_SCRIPT =
     \\    ? await Agent.resume(input.threadId, agentOptions())
     \\    : await Agent.create(agentOptions());
     \\  emit({ type: "thread", threadId: agentId(agent), title: input.title || agentId(agent) });
-    \\  const run = await agent.send(input.prompt || "", { model: modelSelection(input.model || "composer-2", input.modelParams) });
+    \\  const run = await agent.send(await userMessageForInput(), { model: modelSelection(input.model || "composer-2", input.modelParams), local: { force: true } });
     \\  emit({ type: "turn", runId: run.id });
     \\  let deltaCount = 0;
     \\  for await (const event of run.stream()) {
@@ -967,7 +1004,7 @@ const BRIDGE_SCRIPT =
     \\  }
     \\  const result = await run.wait();
     \\  emit({ type: "debug", name: "deltaCount", value: deltaCount });
-    \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: result?.result || "" });
+    \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: "" });
     \\  } else {
     \\    fail(`unsupported command: ${input.command}`);
     \\  }
@@ -992,6 +1029,22 @@ test "parseBridgeEventsAlloc reads cursor ids and reply" {
     try std.testing.expectEqualStrings("done", parsed.reply_text);
 }
 
+test "parseBridgeEventsAlloc keeps streamed reply when final reply is empty" {
+    const payload =
+        \\{"type":"thread","threadId":"agent_123"}
+        \\{"type":"turn","runId":"run_456"}
+        \\{"type":"delta","text":"streamed"}
+        \\{"type":"final","threadId":"agent_123","runId":"run_456","replyText":""}
+        \\
+    ;
+    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null);
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("agent_123", parsed.thread_id);
+    try std.testing.expectEqualStrings("run_456", parsed.run_id.?);
+    try std.testing.expectEqualStrings("streamed", parsed.reply_text);
+}
+
 test "makeBridgeRequestJsonAlloc keeps cursor model and cwd" {
     const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
         .request = .{
@@ -1011,21 +1064,69 @@ test "makeBridgeRequestJsonAlloc keeps cursor model and cwd" {
     try std.testing.expectEqualStrings("send_prompt", getOptionalObjectString(parsed.value, "command").?);
 }
 
-test "hasPromptAttachments rejects legacy and multi image requests" {
-    try std.testing.expect(!hasPromptAttachments(.{ .prompt = "text only" }));
-    try std.testing.expect(hasPromptAttachments(.{
-        .prompt = "legacy",
-        .image = .{ .path = "/tmp/one.png" },
-    }));
-
+test "makeBridgeRequestJsonAlloc maps legacy and multi image requests" {
     const images = [_]provider_types.ImageAttachment{
         .{ .path = "/tmp/one.png" },
         .{ .path = "/tmp/two.png" },
     };
-    try std.testing.expect(hasPromptAttachments(.{
-        .prompt = "multi",
-        .images = images[0..],
-    }));
+
+    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
+        .request = .{
+            .prompt = "see attached",
+            .image = .{ .path = "/tmp/legacy.png" },
+            .images = images[0..],
+        },
+    });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const image_values = getObjectField(parsed.value, "images").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), image_values.len);
+    try std.testing.expectEqualStrings("/tmp/legacy.png", getOptionalObjectString(image_values[0], "path").?);
+    try std.testing.expectEqualStrings("/tmp/one.png", getOptionalObjectString(image_values[1], "path").?);
+    try std.testing.expectEqualStrings("/tmp/two.png", getOptionalObjectString(image_values[2], "path").?);
+}
+
+test "makeBridgeRequestJsonAlloc does not duplicate legacy image already in images" {
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/one.png" },
+        .{ .path = "/tmp/two.png" },
+    };
+
+    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
+        .request = .{
+            .prompt = "see attached",
+            .image = .{ .path = "/tmp/one.png" },
+            .images = images[0..],
+        },
+    });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const image_values = getObjectField(parsed.value, "images").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), image_values.len);
+    try std.testing.expectEqualStrings("/tmp/one.png", getOptionalObjectString(image_values[0], "path").?);
+    try std.testing.expectEqualStrings("/tmp/two.png", getOptionalObjectString(image_values[1], "path").?);
+}
+
+test "makeBridgeRequestJsonAlloc preserves text-only prompts with empty images" {
+    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
+        .request = .{
+            .prompt = "text only",
+            .cwd = "/tmp/project",
+        },
+    });
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("text only", getOptionalObjectString(parsed.value, "prompt").?);
+    try std.testing.expectEqual(@as(usize, 0), getObjectField(parsed.value, "images").?.array.items.len);
 }
 
 test "parseBridgeEventsAlloc maps command events to stream events" {
@@ -1060,4 +1161,15 @@ test "parseBridgeEventsAlloc maps command events to stream events" {
 
     try std.testing.expectEqualStrings("Command failed", ctx.title);
     try std.testing.expectEqualStrings("bash -lc zig build test", ctx.body);
+}
+
+test "parseBridgeEventsAlloc fails when bridge emits an error" {
+    const payload =
+        \\{"type":"error","message":"UnknownAgentError: already has active run"}
+        \\
+    ;
+    try std.testing.expectError(
+        error.CursorBridgeFailed,
+        parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null),
+    );
 }
