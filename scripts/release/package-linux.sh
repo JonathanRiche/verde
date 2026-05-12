@@ -121,7 +121,8 @@ mkdir -p \
   "$PACKAGE_ROOT/bin" \
   "$PACKAGE_ROOT/share/verde" \
   "$PACKAGE_ROOT/share/applications" \
-  "$PACKAGE_ROOT/share/pixmaps"
+  "$PACKAGE_ROOT/share/pixmaps" \
+  "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps"
 
 install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
@@ -153,6 +154,7 @@ fi
 EOF
 chmod 755 "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
+install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
 copy_node_runtime "$PACKAGE_ROOT/share/verde/node_modules"
 install -m 755 "$REPO_ROOT/scripts/release/install-linux-local.sh" "$PACKAGE_ROOT/install-local.sh"
