@@ -90,7 +90,15 @@ const WindowFrame = struct {
     h: c_int,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainInner(init) catch |err| {
+        runtime_log.diagnostic("fatal startup error: {s}", .{@errorName(err)});
+        std.debug.print("fatal startup error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
+fn mainInner(init: std.process.Init) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer {
         if (builtin.mode == .Debug) _ = debug_allocator.deinit();

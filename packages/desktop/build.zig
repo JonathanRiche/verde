@@ -255,6 +255,7 @@ pub fn build(b: *std.Build) void {
             \\Terminal=false
             \\Categories=Development;
             \\StartupNotify=true
+            \\StartupWMClass=com.verde.native
             \\
         , .{
             b.getInstallPath(.bin, "verde"),
