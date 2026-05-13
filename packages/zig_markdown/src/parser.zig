@@ -718,6 +718,16 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                     continue;
                 }
             },
+            '~' => {
+                // GFM strikethrough: `~~text~~`. Single `~` is plain text.
+                if (try parseStrikethrough(allocator, source, index)) |result| {
+                    try appendTextInline(allocator, &inlines, source[text_start..index]);
+                    try inlines.append(allocator, result.value);
+                    index = result.next_index;
+                    text_start = index;
+                    continue;
+                }
+            },
             'h' => {
                 // Bare URL autolink: turn `http(s)://…` runs into links so the
                 // renderer can color/underline them without requiring `[…](…)`.
@@ -875,6 +885,22 @@ fn parseDelimitedInline(
         else
             .{ .emphasis = .{ .children = children } },
         .next_index = end + delimiter_length,
+    };
+}
+
+fn parseStrikethrough(
+    allocator: Allocator,
+    source: []const u8,
+    start: usize,
+) Allocator.Error!?InlineParseResult {
+    const run = countRun(source, start);
+    if (run < 2) return null; // single ~ is plain text
+    const end = findClosingDelimiter(source, start + 2, '~', 2) orelse return null;
+    if (end == start + 2) return null;
+    const children = try parseInlines(allocator, source[start + 2 .. end]);
+    return .{
+        .value = .{ .strikethrough = .{ .children = children } },
+        .next_index = end + 2,
     };
 }
 

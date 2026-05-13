@@ -118,6 +118,7 @@ pub const TextStyle = enum {
 pub const InlineStyle = struct {
     strong: bool = false,
     emphasis: bool = false,
+    strike: bool = false,
     code: bool = false,
     link: bool = false,
 };
@@ -735,6 +736,19 @@ fn buildTableView(
     };
 }
 
+/// GFM task-list detection. Returns the checkbox glyph + the rest of the
+/// text when `text` starts with `[ ] `, `[x] `, or `[X] `. The bracket
+/// prefix is stripped from the rendered content so the body reads naturally.
+fn detectTaskMarker(text: []const u8) ?struct { marker: []const u8, rest_offset: usize } {
+    if (text.len < 4) return null;
+    if (text[0] != '[' or text[2] != ']' or text[3] != ' ') return null;
+    return switch (text[1]) {
+        ' ' => .{ .marker = "☐  ", .rest_offset = 4 },
+        'x', 'X' => .{ .marker = "☑  ", .rest_offset = 4 },
+        else => null,
+    };
+}
+
 fn appendListBlock(
     allocator: Allocator,
     blocks: *std.ArrayListUnmanaged(BlockView),
@@ -742,7 +756,7 @@ fn appendListBlock(
     context: FlattenContext,
 ) Allocator.Error!void {
     for (list.items, 0..) |item, item_index| {
-        const marker = try listItemMarker(allocator, list.kind, list.start_number + item_index);
+        var marker = try listItemMarker(allocator, list.kind, list.start_number + item_index);
         defer allocator.free(marker);
 
         if (item.blocks.len == 0) {
@@ -763,6 +777,18 @@ fn appendListBlock(
             .paragraph => |paragraph| {
                 var base = try buildTextContent(allocator, paragraph.inlines);
                 defer base.deinit(allocator);
+
+                // Task-list detection: swap the bullet for a checkbox and trim
+                // the `[ ] ` prefix from the body content. Only unordered lists
+                // can host task markers per GFM.
+                if (list.kind == .unordered) {
+                    if (detectTaskMarker(base.text)) |task| {
+                        allocator.free(marker);
+                        marker = try allocator.dupe(u8, task.marker);
+                        try trimContentPrefix(allocator, &base, task.rest_offset);
+                    }
+                }
+
                 var prefixed = try prefixTextContent(allocator, marker, base);
                 errdefer prefixed.deinit(allocator);
                 try appendOwnedTextBlock(allocator, blocks, .{
@@ -836,6 +862,27 @@ fn buildTextContent(
         .text = try text_builder.toOwnedSlice(allocator),
         .runs = try runs.toOwnedSlice(allocator),
     };
+}
+
+/// Trim `prefix_len` leading bytes from a `TextContent`. The owned text is
+/// reallocated to the smaller size and every text run's start/end is shifted
+/// (clamping to 0) so layout reads the stripped slice consistently. Used by
+/// the task-list path to remove the `[ ] ` marker once it's been replaced
+/// with the checkbox glyph.
+fn trimContentPrefix(allocator: Allocator, content: *TextContent, prefix_len: usize) Allocator.Error!void {
+    if (prefix_len == 0 or prefix_len > content.text.len) return;
+    const new_text = try allocator.dupe(u8, content.text[prefix_len..]);
+    allocator.free(content.text);
+    content.text = new_text;
+    for (content.runs) |*run| {
+        switch (run.*) {
+            .text => |*text_run| {
+                text_run.start = if (text_run.start > prefix_len) text_run.start - prefix_len else 0;
+                text_run.end = if (text_run.end > prefix_len) text_run.end - prefix_len else 0;
+            },
+            else => {},
+        }
+    }
 }
 
 fn buildPlainTextContent(
@@ -914,6 +961,13 @@ fn appendInlineRuns(
                 container.children,
                 mergeInlineStyle(style, .{ .strong = true }),
             ),
+            .strikethrough => |container| try appendInlineRuns(
+                allocator,
+                text_builder,
+                runs,
+                container.children,
+                mergeInlineStyle(style, .{ .strike = true }),
+            ),
             .code => |code| try appendStyledText(
                 allocator,
                 text_builder,
@@ -972,6 +1026,7 @@ fn mergeInlineStyle(base: InlineStyle, extra: InlineStyle) InlineStyle {
     return .{
         .strong = base.strong or extra.strong,
         .emphasis = base.emphasis or extra.emphasis,
+        .strike = base.strike or extra.strike,
         .code = base.code or extra.code,
         .link = base.link or extra.link,
     };
@@ -1112,6 +1167,34 @@ fn renderPaletteTextBlock(context: *PaletteRenderContext, block: TextBlockView, 
     const indent = indentWidth(block.indent);
     const start = .{ context.cursor.x + indent, context.cursor.y };
     const width = @max(available_width - indent, 1.0);
+
+    // Blockquote chrome: left accent bar + slight bg tint. Drawn behind text
+    // by queuing rects before the layout pass appends its text runs.
+    if (block.style == .quote) {
+        const bar_width: f32 = @max(theme.scaledUi(3.0), 2.0);
+        const left_pad = quoteChromeLeftPad(options);
+        const right_pad = quoteChromeRightPad(options);
+        const v_pad = quoteChromeVerticalPad(options);
+        const measured = measureTextBlockHeight(block, available_width, options);
+        queuePaletteRect(context, .{
+            .x = start[0],
+            .y = start[1],
+            .w = width,
+            .h = measured,
+        }, paletteColor(colors.rgba(38, 41, 48, 140)));
+        queuePaletteRect(context, .{
+            .x = start[0],
+            .y = start[1],
+            .w = bar_width,
+            .h = measured,
+        }, paletteColor(colors.rgb(0x7A, 0xCA, 0xFF)));
+        const inner_x = start[0] + left_pad;
+        const inner_width = @max(width - left_pad - right_pad, 1.0);
+        _ = renderPaletteTextBlockLayout(context, .{ inner_x, start[1] + v_pad * 0.5 }, block, inner_width, options);
+        advancePaletteCursor(context, measured);
+        return;
+    }
+
     const height = renderPaletteTextBlockLayout(context, .{ start[0], start[1] }, block, width, options);
 
     advancePaletteCursor(context, height);
@@ -1523,6 +1606,20 @@ fn renderPaletteTextBlockLayout(
                         .h = underline_h,
                     },
                     .color = underline_color,
+                }) catch return;
+            }
+
+            if (step.inline_style.strike) {
+                // Horizontal rule through the x-height of the chunk. ~55% of
+                // line height roughly hits the middle of lowercase glyphs.
+                ctx.underlines.append(ctx.palette_context.allocator, .{
+                    .rect = .{
+                        .x = px,
+                        .y = py + step.line_height * 0.55,
+                        .w = step.width,
+                        .h = @max(step.line_height * 0.06, 1.0),
+                    },
+                    .color = color,
                 }) catch return;
             }
         }
@@ -2555,6 +2652,15 @@ fn renderPaletteStyledChunk(
             .h = if (inline_style.link) 1.5 else 1.0,
         }, underline_color);
     }
+
+    if (inline_style.strike) {
+        queuePaletteRect(context, .{
+            .x = position[0],
+            .y = position[1] + line_height * 0.55,
+            .w = width,
+            .h = @max(line_height * 0.06, 1.0),
+        }, paletteColor(color));
+    }
 }
 
 fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) void {
@@ -2581,9 +2687,33 @@ const CodeLineLayout = struct {
     max_x: f32,
 };
 
+// Per-side horizontal padding around blockquote chrome (left accent bar + bg
+// tint). Kept here so both the renderer and the height measurement agree on
+// the inset they apply before laying out body text.
+fn quoteChromeLeftPad(_: RenderOptions) f32 {
+    const bar = @max(theme.scaledUi(3.0), 2.0);
+    const gap = @max(theme.scaledUi(8.0), 6.0);
+    return bar + gap;
+}
+
+fn quoteChromeRightPad(_: RenderOptions) f32 {
+    return @max(theme.scaledUi(8.0), 6.0);
+}
+
+fn quoteChromeVerticalPad(_: RenderOptions) f32 {
+    return @max(theme.scaledUi(8.0), 6.0);
+}
+
 fn measureTextBlockHeight(block: TextBlockView, available_width: f32, options: RenderOptions) f32 {
-    const width = @max(available_width - indentWidth(block.indent), 1.0);
-    return measureTextBlockLayout(block, width, options);
+    var width = @max(available_width - indentWidth(block.indent), 1.0);
+    if (block.style == .quote) {
+        width = @max(width - quoteChromeLeftPad(options) - quoteChromeRightPad(options), 1.0);
+    }
+    const body = measureTextBlockLayout(block, width, options);
+    if (block.style == .quote) {
+        return body + quoteChromeVerticalPad(options);
+    }
+    return body;
 }
 
 fn measureFencedCodeHeight(block: FencedCodeView, available_width: f32, options: RenderOptions) f32 {

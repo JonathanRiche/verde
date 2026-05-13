@@ -29,6 +29,7 @@ pub const TableBlock = model.TableBlock;
 pub const TableCell = model.TableCell;
 pub const TableRow = model.TableRow;
 pub const TextInline = model.TextInline;
+pub const Strikethrough = model.ContainerInline;
 
 pub fn parse(allocator: Allocator, source: []const u8) !Document {
     return parser.parseDocument(allocator, source);
