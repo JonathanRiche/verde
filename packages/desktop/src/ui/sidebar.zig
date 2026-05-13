@@ -12,14 +12,14 @@ const Provider = native_state.Provider;
 const log = std.log.scoped(.native_ui_sidebar);
 
 /// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
-const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0 * 1.5;
+const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0;
 /// Thread row height must fit `SIDEBAR_THREAD_PROVIDER_GLYPH_CSS` with a little vertical air.
-const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 36.0;
+const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 38.0;
 /// Vertical advance per thread row (row + gap).
-const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 40.0;
-const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 8.0;
+const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 42.0;
+const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 10.0;
 /// Horizontal gap between the icon slot and the title.
-const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 6.0;
+const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 /// Relative-time label starts this far from the row's right edge.
 const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
@@ -534,9 +534,9 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
             paletteColor(theme.lighten(colors.DARK_BLUE, 0.09))
         else
             paletteColor(colors.DARK_BLUE);
-        queuePaletteRoundedRect(state, rect, bg, theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, snapRect(rect), bg, theme.scaledUi(7.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.GREEN_600, 0.10)), theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(colors.rgba(36, 49, 45, 210)), theme.scaledUi(7.0));
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
@@ -550,20 +550,20 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
 
     const title_emphasis = selected or hovered;
-    const title_font = theme.scaledUi(14.0);
-    const title_line = title_font * 1.25;
-    const title_y = rect.y + (rect.h - title_line) * 0.5;
+    const title_font = theme.scaledUi(13.5);
+    const title_line = title_font * 1.30;
+    const title_y = @round(rect.y + (rect.h - title_line) * 0.5);
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(title_left_css),
         .y = title_y,
         .w = rect.w - theme.scaledUi(title_area_right_css),
-        .h = rect.h,
+        .h = title_line,
     }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
         .y = title_y,
         .w = theme.scaledUi(58.0),
-        .h = rect.h,
+        .h = title_line,
     }, relative_time, paletteColor(colors.TIME_LABEL), title_font, clip);
 }
 
@@ -587,13 +587,13 @@ fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
 }
 
 fn queuePaletteRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
-    state.palette_overlay_batch.roundedRect(state.allocator, rect, color, radius) catch |err| {
+    state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), color, radius) catch |err| {
         log.warn("failed to queue sidebar palette rounded rect: {s}", .{@errorName(err)});
     };
 }
 
 fn queuePaletteBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
-    state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
+    state.palette_overlay_batch.rectBorder(state.allocator, snapRect(rect), color, radius, width) catch |err| {
         log.warn("failed to queue sidebar palette border: {s}", .{@errorName(err)});
     };
 }
@@ -691,7 +691,7 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
     };
     state.palette_overlay_batch.fixedText(
         state.allocator,
-        rect,
+        snapRect(rect),
         stable_value,
         color,
         font_size,
@@ -719,7 +719,7 @@ fn queuePaletteImage(state: *runtime.AppState, rect: palette.Rect, cached: nativ
     if (!cached.valid or cached.texture_id == 0 or rect.w <= 0.0 or rect.h <= 0.0) return false;
     state.palette_overlay_batch.image(
         state.allocator,
-        rect,
+        snapRect(rect),
         palette.TextureId.init(cached.texture_id),
         .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
         tint,
@@ -729,6 +729,15 @@ fn queuePaletteImage(state: *runtime.AppState, rect: palette.Rect, cached: nativ
         return false;
     };
     return true;
+}
+
+fn snapRect(rect: palette.Rect) palette.Rect {
+    return .{
+        .x = @round(rect.x),
+        .y = @round(rect.y),
+        .w = @round(rect.w),
+        .h = @round(rect.h),
+    };
 }
 
 /// Truncates a thread title for narrow sidebar rows.
@@ -788,7 +797,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
-        const draw: palette.Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        const draw = snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
         if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
     }
 

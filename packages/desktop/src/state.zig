@@ -90,17 +90,17 @@ pub const PaletteModalTextFocus = enum {
     project_import,
 };
 
-const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
-const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
-const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 22.0;
+const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 24.0;
+const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 28.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .padding_x = 24.0,
     .padding_y = 20.0,
-    .toolbar_height = 48.0,
-    .toolbar_gap = 14.0,
-    .control_gap = 14.0,
+    .toolbar_height = 46.0,
+    .toolbar_gap = 16.0,
+    .control_gap = 10.0,
     .pill_padding_x = 21.0,
     .pill_icon_gap = 13.0,
     .pill_chevron_gap = 22.0,
@@ -118,8 +118,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
     .pill_overlay_icon_reserve = 29.0,
     .pill_label_width_fudge = 14.0,
-    .corner_radius = 28.0,
-    .border_width = 1.5,
+    .corner_radius = 24.0,
+    .border_width = 1.0,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
     .border_color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
@@ -136,7 +136,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .text_color = .{ .r = 0.94, .g = 0.96, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
-    .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
+    .placeholder_color = .{ .r = 0.38, .g = 0.40, .b = 0.46, .a = 1.0 },
     .font_size = PALETTE_COMPOSER_FONT_SIZE,
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,

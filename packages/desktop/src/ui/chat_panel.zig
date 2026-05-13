@@ -28,8 +28,8 @@ const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
 /// Provider logo slot in the model pill.
-const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 22.0;
-const TRANSCRIPT_MAX_WIDTH: f32 = 960.0;
+const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 20.0;
+const TRANSCRIPT_MAX_WIDTH: f32 = 900.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
@@ -1039,8 +1039,9 @@ fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
 
 fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     transcript_rect = rect;
-    const column_width = @min(rect.w - theme.scaledUi(48.0), theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
-    const column = palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) };
+    const gutter = theme.scaledUi(if (rect.w < theme.scaledUi(760.0)) 32.0 else 64.0);
+    const column_width = @min(rect.w - gutter, theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
+    const column = snapRect(palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) });
     // Clip to full transcript body (same x/w as layout rect) so GL text and bubbles
     // stay below the workspace header when scrolled.
     const clip = rect;
@@ -1107,11 +1108,11 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     renderPendingTranscriptStream(state, thread, column, content_y, clip, thread.messages.items.len);
 
     if (max_scroll > 1.0) {
-        const track = palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(8.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h };
+        const track = snapRect(palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(12.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h });
         const thumb_h = @max(theme.scaledUi(32.0), column.h * (column.h / content_height));
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll);
         queueRounded(state, track, paletteColor(colors.rgba(35, 42, 46, 160)), theme.scaledUi(2.0));
-        queueRounded(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
+        queueRounded(state, snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }), paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
     }
 }
 
@@ -1294,7 +1295,7 @@ fn transcriptMessageHeight(
         return transcriptCommandEventHeight(message_author, body_raw, column_width);
     }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
-    const font_size = theme.scaledUi(16.0);
+    const font_size = theme.scaledUi(15.5);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
     const body_inner_width = @max(body_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
     if (role == .assistant and !assistant_plain_layout) {
@@ -1309,15 +1310,15 @@ fn transcriptMessageHeight(
         var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
             const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
             const line_count = wrappedLineCount(body, chars_per_line);
-            return theme.scaledUi(44.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
+            return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
         };
         defer view.deinit(std.heap.page_allocator);
         const measured = chat_markdown.measureBodyHeight(view, body_inner_width, markdownOptions(font_size));
-        return theme.scaledUi(44.0) + measured;
+        return theme.scaledUi(46.0) + measured;
     }
     const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
     const line_count = wrappedLineCount(body, chars_per_line);
-    return theme.scaledUi(44.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
+    return theme.scaledUi(46.0) + @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
 }
 
 /// Corner radius for transcript bubbles (user / assistant / system) and shell command rows.
@@ -1461,7 +1462,7 @@ fn renderTranscriptBubbleFromParts(
 ) void {
     const bubble_width = if (role == .user) column.w * 0.62 else column.w;
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
-    const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
+    const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
     const bg = switch (role) {
         .user => colors.rgba(31, 48, 46, 255),
         .assistant => colors.rgba(22, 30, 32, 242),
@@ -1469,28 +1470,28 @@ fn renderTranscriptBubbleFromParts(
     };
     const rr = transcriptBubbleCornerRadius();
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(theme.COLOR_PANEL_MUTED), rr, clip);
-    queueText(state, .{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(8.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }, role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
+    queueText(state, snapRect(.{ .x = bubble.x + theme.scaledUi(14.0), .y = bubble.y + theme.scaledUi(9.0), .w = bubble.w - theme.scaledUi(28.0), .h = theme.scaledUi(20.0) }), role_label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), clip);
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
-        .y = bubble.y + theme.scaledUi(32.0),
+        .y = bubble.y + theme.scaledUi(34.0),
         .w = bubble.w - theme.scaledUi(28.0),
-        .h = bubble.h - theme.scaledUi(38.0),
+        .h = bubble.h - theme.scaledUi(42.0),
     };
     const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
     const body_color = if (muted_body) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
     if (role == .assistant and !muted_body and !assistant_plain_layout) {
         renderMarkdownBody(state, message_index, body_rect, body_text, clip);
     } else {
-        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(16.0), clip);
+        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(15.5), clip);
     }
 }
 
 fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
     return .{
         .base_font_size = font_size,
-        .line_height = font_size * 1.32,
-        .glyph_width = font_size * 0.55,
-        .code_font_size = font_size * 0.92,
+        .line_height = font_size * 1.43,
+        .glyph_width = font_size * 0.53,
+        .code_font_size = font_size * 0.88,
     };
 }
 
@@ -1510,7 +1511,7 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
 }
 
 fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect: palette.Rect, view: chat_markdown.BodyView, clip: palette.Rect) void {
-    const font_size = theme.scaledUi(16.0);
+    const font_size = theme.scaledUi(15.5);
     const md_opts = markdownOptions(font_size);
     const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {
         break :blk chat_markdown.localMarkdownSelectionRangeForMessage(
@@ -1938,7 +1939,7 @@ fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
 }
 
 fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    state.palette_overlay_batch.rect(state.allocator, rect, color) catch {};
+    state.palette_overlay_batch.rect(state.allocator, snapRect(rect), color) catch {};
 }
 
 fn queueRounded(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
@@ -1959,7 +1960,7 @@ fn queueRoundedClipped(state: *app_state.AppState, rect: palette.Rect, color: pa
 
 fn queueImage(state: *app_state.AppState, rect: palette.Rect, texture: app_state.CachedImageTexture, clip: ?palette.Rect) void {
     if (!texture.valid or texture.texture_id == 0) return;
-    state.palette_overlay_batch.image(state.allocator, rect, palette.TextureId.init(texture.texture_id), .{
+    state.palette_overlay_batch.image(state.allocator, snapRect(rect), palette.TextureId.init(texture.texture_id), .{
         .x = 0.0,
         .y = 0.0,
         .w = 1.0,
@@ -1989,4 +1990,13 @@ fn paletteColor(value: [4]f32) palette.Color {
 
 fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
+}
+
+fn snapRect(rect: palette.Rect) palette.Rect {
+    return .{
+        .x = @round(rect.x),
+        .y = @round(rect.y),
+        .w = @round(rect.w),
+        .h = @round(rect.h),
+    };
 }

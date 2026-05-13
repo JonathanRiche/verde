@@ -32,6 +32,18 @@ Common tasks:
 - `mise run build`: creates a local release-style build for the current platform.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
 
+### Hyprland UI Polish Checks
+
+For chat UI readability or DPI polish work, run Verde from the repo root and capture comparison screenshots into `goal_samples/`:
+
+```bash
+mise run dev
+hyprctl clients -j
+grim -g "$(slurp)" goal_samples/chat-after.png
+```
+
+Use the same approximate window size for before/after captures. For fractional-scale checks, adjust your Hyprland monitor scale, restart `mise run dev`, then capture another image such as `goal_samples/chat-after-1-25x.png`.
+
 ## CEF Browser Pane
 
 The in-app browser pane uses CEF when a CEF SDK is available. The `mise` tasks and release install scripts use the repo's CEF helper scripts so developers do not need to pass CEF build flags manually.
