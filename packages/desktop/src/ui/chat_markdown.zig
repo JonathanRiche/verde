@@ -19,11 +19,10 @@ fn transcriptTextWidthForRole(font_size: f32, role: palette.FontRole, text: []co
     return text_measure.textWidth(role, font_size, text);
 }
 
-// NotoSans-Bold's space advance is ~0.29em; the SDL_GPU width scale was calibrated
-// for glyph runs (kerning + atlas inflation) and should NOT be applied to lone
-// whitespace, otherwise the layout reserves ~67% more space than the renderer
-// actually draws, producing visible "rivers" between words.
-const TRANSCRIPT_SPACE_EM: f32 = 0.30;
+// NotoSans-Bold's space advance is ~0.29em before Palette's SDL_GPU atlas text
+// scale. Keep manual whitespace measurement aligned with rendered glyphs so
+// markdown chunk positions do not create visible rivers between words.
+const TRANSCRIPT_SPACE_EM: f32 = 0.26;
 
 fn estimatedTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
     var width: f32 = 0.0;

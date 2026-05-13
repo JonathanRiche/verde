@@ -14,6 +14,11 @@ const RoleFonts = struct {
 
 var fonts: ?RoleFonts = null;
 
+// Palette's SDL_GPU text path renders TTF text through the atlas engine at this
+// scale. Keep layout measurement on the same scale so markdown chunk positions
+// match the glyphs that are actually drawn.
+const GPU_TEXT_FONT_SCALE: f32 = 0.86;
+
 pub fn configure(role_fonts: RoleFonts) void {
     fonts = role_fonts;
 }
@@ -24,10 +29,11 @@ pub fn clear() void {
 
 pub fn textWidth(role: palette.FontRole, font_size: f32, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
+    const render_size = font_size * GPU_TEXT_FONT_SCALE;
     if (fonts) |configured| {
-        return palette.sdl.ttfMeasureText(fontForRole(configured, role), text, font_size) catch estimatedTextWidth(font_size, text);
+        return palette.sdl.ttfMeasureText(fontForRole(configured, role), text, render_size) catch estimatedTextWidth(render_size, text);
     }
-    return estimatedTextWidth(font_size, text);
+    return estimatedTextWidth(render_size, text);
 }
 
 pub fn textPrefixWidth(role: palette.FontRole, text: []const u8, font_size: f32, end: usize) f32 {
