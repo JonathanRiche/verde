@@ -1207,7 +1207,9 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
     const line_height = codeLineHeight(options);
     const pad_x = codeBlockPaddingX(options);
     const pad_y = codeBlockPaddingY(options);
-    const height = codeBlockHeight(block, line_height, pad_y);
+    const text_width = @max(width - pad_x * 2.0, 1.0);
+    const char_width = codeCharWidth(options);
+    const height = codeBlockHeight(block, line_height, pad_y, text_width, char_width);
     const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
     queuePaletteRoundedShell(
         context,
@@ -1219,12 +1221,12 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
 
     var y = start[1] + pad_y;
     for (block.lines) |line| {
-        renderPaletteCodeLine(context, line, .{
+        const rows = renderPaletteCodeLine(context, line, .{
             .x = start[0] + pad_x,
             .y = y,
             .max_x = start[0] + width - pad_x,
         }, options, rect);
-        y += line_height;
+        y += line_height * @as(f32, @floatFromInt(rows));
     }
 
     advancePaletteCursor(context, height);
@@ -1716,6 +1718,12 @@ const SelectableCodeLineChunk = struct {
     token_kind: zig_dif.TokenKind,
     font_spec: FontSpec,
     x: f32,
+    // Vertical offset *within* the source line. Non-zero when the line
+    // soft-wraps and this chunk sits on a continuation row. Selection +
+    // hit-testing still treat each source line as a single logical line — the
+    // column->x mapping isn't aware of wrap rows yet, so clicking on a
+    // continuation row resolves an approximate column.
+    y_offset: f32 = 0.0,
     width: f32,
     start_column: usize,
     end_column: usize,
@@ -1922,10 +1930,13 @@ pub fn hitTestSelectablePaletteBody(
                 const line_height = codeLineHeight(options);
                 const pad_x = codeBlockPaddingX(options);
                 const pad_y = codeBlockPaddingY(options);
-                const height = codeBlockHeight(code_block, line_height, pad_y);
+                const block_w = @max(width - indent, minimumCodeBlockWidth(options));
+                const tw = @max(block_w - pad_x * 2.0, 1.0);
+                const cw = codeCharWidth(options);
+                const height = codeBlockHeight(code_block, line_height, pad_y, tw, cw);
                 const content_start = .{ start[0] + pad_x, start[1] + pad_y };
 
-                const lines = try buildSelectableCodeLines(allocator, code_block, options);
+                const lines = try buildSelectableCodeLinesWithWrap(allocator, code_block, options, tw);
                 defer deinitSelectableCodeLines(allocator, lines);
 
                 for (lines, 0..) |line, index| {
@@ -2416,43 +2427,82 @@ fn buildSelectableCodeLines(
     block: FencedCodeView,
     options: RenderOptions,
 ) ![]SelectableCodeLine {
+    return buildSelectableCodeLinesWithWrap(allocator, block, options, null);
+}
+
+fn buildSelectableCodeLinesWithWrap(
+    allocator: Allocator,
+    block: FencedCodeView,
+    options: RenderOptions,
+    /// Inner code-area width in pixels. When non-null, lines whose natural
+    /// width exceeds this value are split into multiple visual rows via
+    /// `y_offset` on subsequent chunks. Selection state stays per-source-line.
+    text_width: ?f32,
+) ![]SelectableCodeLine {
     const line_height = codeLineHeight(options);
+    const char_width = codeCharWidth(options);
+    const max_chars: usize = if (text_width) |w| blk: {
+        const f = @floor(w / char_width);
+        break :blk if (f >= 1.0) @intFromFloat(f) else std.math.maxInt(usize);
+    } else std.math.maxInt(usize);
+
     var lines = std.ArrayList(SelectableCodeLine).empty;
     errdefer {
         for (lines.items) |line| allocator.free(line.chunks);
         lines.deinit(allocator);
     }
 
-    for (block.lines, 0..) |line, index| {
+    var y_cursor: f32 = 0.0;
+    for (block.lines) |line| {
         var chunks = std.ArrayList(SelectableCodeLineChunk).empty;
         errdefer chunks.deinit(allocator);
 
         var cursor_x: f32 = 0.0;
         var cursor_column: usize = 0;
+        var col_on_row: usize = 0;
+        var row_offset: f32 = 0.0;
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
-            const token_columns = countColumns(token.text);
-            const token_width = transcriptTextWidthForRole(codeFontSize(options), .mono, token.text);
-            try chunks.append(allocator, .{
-                .text = token.text,
-                .token_kind = token.kind,
-                .font_spec = .{ .size = options.code_font_size },
-                .x = cursor_x,
-                .width = token_width,
-                .start_column = cursor_column,
-                .end_column = cursor_column + token_columns,
-            });
-            cursor_x += token_width;
-            cursor_column += token_columns;
+            var remaining = token.text;
+            while (remaining.len > 0) {
+                const room = if (col_on_row >= max_chars) 0 else max_chars - col_on_row;
+                if (room == 0) {
+                    row_offset += line_height;
+                    cursor_x = 0.0;
+                    col_on_row = 0;
+                    continue;
+                }
+                const take = @min(remaining.len, room);
+                const slice = remaining[0..take];
+                const slice_cols = countColumns(slice);
+                const slice_width = transcriptTextWidthForRole(codeFontSize(options), .mono, slice);
+                try chunks.append(allocator, .{
+                    .text = slice,
+                    .token_kind = token.kind,
+                    .font_spec = .{ .size = options.code_font_size },
+                    .x = cursor_x,
+                    .y_offset = row_offset,
+                    .width = slice_width,
+                    .start_column = cursor_column,
+                    .end_column = cursor_column + slice_cols,
+                });
+                cursor_x += slice_width;
+                cursor_column += slice_cols;
+                col_on_row += take;
+                remaining = remaining[take..];
+            }
         }
 
+        const row_count_f = (row_offset / line_height) + 1.0;
+        const line_total_height = line_height * row_count_f;
         try lines.append(allocator, .{
             .text = line.text,
-            .y = line_height * @as(f32, @floatFromInt(index)),
-            .height = line_height,
+            .y = y_cursor,
+            .height = line_total_height,
             .total_columns = countColumns(line.text),
             .chunks = try chunks.toOwnedSlice(allocator),
         });
+        y_cursor += line_total_height;
     }
 
     if (lines.items.len == 0) {
@@ -2520,6 +2570,8 @@ fn renderSelectableCodeLine(
         };
     }
 
+    const lh = codeLineHeight(options);
+
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
@@ -2532,7 +2584,8 @@ fn renderSelectableCodeLine(
                     const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
                     const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
-                        queuePaletteRoundedRect(context, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }, selection_col, 2.0);
+                        const chunk_top = top + chunk.y_offset;
+                        queuePaletteRoundedRect(context, .{ .x = x0, .y = chunk_top, .w = x1 - x0, .h = lh }, selection_col, 2.0);
                     }
                 }
             }
@@ -2556,9 +2609,9 @@ fn renderSelectableCodeLine(
     for (line.chunks) |chunk| {
         queuePaletteRoleText(context, .{
             .x = start[0] + chunk.x,
-            .y = top,
+            .y = top + chunk.y_offset,
             .w = @max(clip.x + clip.w - (start[0] + chunk.x), 1.0),
-            .h = codeLineHeight(options),
+            .h = lh,
         }, chunk.text, paletteColor(codeTokenColor(chunk.token_kind)), codeFontSize(options), .mono, clip);
     }
 }
@@ -2584,7 +2637,9 @@ fn renderSelectablePaletteCodeBlock(
     const line_height = codeLineHeight(options);
     const pad_x = codeBlockPaddingX(options);
     const pad_y = codeBlockPaddingY(options);
-    const height = codeBlockHeight(block, line_height, pad_y);
+    const text_width_sel = @max(width - pad_x * 2.0, 1.0);
+    const char_width_sel = codeCharWidth(options);
+    const height = codeBlockHeight(block, line_height, pad_y, text_width_sel, char_width_sel);
     const rect: palette.Rect = .{ .x = start[0], .y = start[1], .w = width, .h = height };
     queuePaletteRoundedShell(
         context,
@@ -2594,7 +2649,7 @@ fn renderSelectablePaletteCodeBlock(
         codeBlockRounding(options),
     );
 
-    const lines = try buildSelectableCodeLines(allocator, block, options);
+    const lines = try buildSelectableCodeLinesWithWrap(allocator, block, options, text_width_sel);
     defer deinitSelectableCodeLines(allocator, lines);
 
     const content_start = .{ start[0] + pad_x, start[1] + pad_y };
@@ -2663,22 +2718,54 @@ fn renderPaletteStyledChunk(
     }
 }
 
-fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) void {
-    var cursor_x = layout.x;
+/// Soft-wraps a code line so long tokens don't bleed past `layout.max_x`.
+/// Returns the number of visual rows the line ended up occupying (>=1) so the
+/// caller can advance Y by `rows * line_height`. Splits within a token at the
+/// character that overflows — fine for mono since glyph advance is uniform.
+fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, layout: CodeLineLayout, options: RenderOptions, clip: palette.Rect) usize {
     const code_fs = codeFontSize(options);
+    const lh = codeLineHeight(options);
+    const char_w = codeCharWidth(options);
+    const usable = @max(layout.max_x - layout.x, 1.0);
+    const max_chars_f = @floor(usable / char_w);
+    const max_chars: usize = if (max_chars_f >= 1.0) @intFromFloat(max_chars_f) else 1;
+
+    var cursor_x: f32 = layout.x;
+    var cursor_y: f32 = layout.y;
+    var col_on_row: usize = 0;
+    var rows: usize = 1;
+
     for (line.tokens) |token| {
         if (token.text.len == 0) continue;
-        if (cursor_x >= layout.max_x) break;
 
-        const width = transcriptTextWidthForRole(code_fs, .mono, token.text);
-        queuePaletteRoleText(context, .{
-            .x = cursor_x,
-            .y = layout.y,
-            .w = @min(width, @max(layout.max_x - cursor_x, 1.0)),
-            .h = codeLineHeight(options),
-        }, token.text, paletteColor(codeTokenColor(token.kind)), codeFontSize(options), .mono, clip);
-        cursor_x += width;
+        var remaining = token.text;
+        const color = paletteColor(codeTokenColor(token.kind));
+        while (remaining.len > 0) {
+            const room = if (col_on_row >= max_chars) 0 else max_chars - col_on_row;
+            if (room == 0) {
+                // Wrap to next visual row.
+                cursor_y += lh;
+                cursor_x = layout.x;
+                col_on_row = 0;
+                rows += 1;
+                continue;
+            }
+            const take = @min(remaining.len, room);
+            const slice = remaining[0..take];
+            const slice_width = transcriptTextWidthForRole(code_fs, .mono, slice);
+            queuePaletteRoleText(context, .{
+                .x = cursor_x,
+                .y = cursor_y,
+                .w = @max(layout.max_x - cursor_x, 1.0),
+                .h = lh,
+            }, slice, color, code_fs, .mono, clip);
+            cursor_x += slice_width;
+            col_on_row += take;
+            remaining = remaining[take..];
+        }
     }
+
+    return rows;
 }
 
 const CodeLineLayout = struct {
@@ -2717,8 +2804,10 @@ fn measureTextBlockHeight(block: TextBlockView, available_width: f32, options: R
 }
 
 fn measureFencedCodeHeight(block: FencedCodeView, available_width: f32, options: RenderOptions) f32 {
-    _ = available_width;
-    return codeBlockHeight(block, codeLineHeight(options), codeBlockPaddingY(options));
+    const indent = indentWidth(block.indent);
+    const block_w = @max(available_width - indent, minimumCodeBlockWidth(options));
+    const text_w = @max(block_w - codeBlockPaddingX(options) * 2.0, 1.0);
+    return codeBlockHeight(block, codeLineHeight(options), codeBlockPaddingY(options), text_w, codeCharWidth(options));
 }
 
 fn measureThematicBreakHeight(rule: ThematicBreakView) f32 {
@@ -2880,8 +2969,39 @@ fn codeBlockRounding(options: RenderOptions) f32 {
     return @max(defaultLineHeight(options) * 0.42, 10.0);
 }
 
-fn codeBlockHeight(block: FencedCodeView, line_height: f32, pad_y: f32) f32 {
-    return pad_y * 2.0 + line_height * @as(f32, @floatFromInt(@max(block.lines.len, 1)));
+/// Inner width available to code text after `pad_x` on each side.
+fn codeBlockTextWidth(available_width: f32, options: RenderOptions) f32 {
+    const indent_w = 0.0; // caller already subtracts indent before passing
+    const usable = @max(available_width - indent_w, minimumCodeBlockWidth(options));
+    return @max(usable - codeBlockPaddingX(options) * 2.0, 1.0);
+}
+
+/// Mono char width at the current code font size. JetBrainsMono is monospaced
+/// so a single 'M' advance is representative.
+fn codeCharWidth(options: RenderOptions) f32 {
+    return text_measure.textWidth(.mono, codeFontSize(options), "M");
+}
+
+/// Number of visual rows a single logical code line occupies after soft-wrap.
+/// Uses byte count as a proxy for char count — fine for ASCII/UTF-8 code;
+/// breaks slightly for multi-byte glyphs in code but those are rare.
+fn codeLineVisualRows(text: []const u8, text_width: f32, char_width: f32) usize {
+    if (text.len == 0) return 1;
+    if (text_width <= 0.0 or char_width <= 0.0) return 1;
+    const chars_per_row_f = @floor(text_width / char_width);
+    if (chars_per_row_f < 1.0) return text.len;
+    const chars_per_row: usize = @intFromFloat(chars_per_row_f);
+    return @max(1, (text.len + chars_per_row - 1) / chars_per_row);
+}
+
+fn codeBlockTotalRows(block: FencedCodeView, text_width: f32, char_width: f32) usize {
+    var rows: usize = 0;
+    for (block.lines) |line| rows += codeLineVisualRows(line.text, text_width, char_width);
+    return @max(rows, 1);
+}
+
+fn codeBlockHeight(block: FencedCodeView, line_height: f32, pad_y: f32, text_width: f32, char_width: f32) f32 {
+    return pad_y * 2.0 + line_height * @as(f32, @floatFromInt(codeBlockTotalRows(block, text_width, char_width)));
 }
 
 fn advancePaletteCursor(context: *PaletteRenderContext, height: f32) void {
