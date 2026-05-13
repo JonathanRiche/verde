@@ -62,6 +62,7 @@ pub const RendererConfig = struct {
 const PipelineKind = enum { solid, text, image };
 const TEXT_CACHE_MAX_ENTRIES = 4096;
 const GPU_TEXT_FONT_SCALE: f32 = 0.86;
+const RETIRED_BUFFER_FRAME_DELAY = 3;
 
 const ViewportUniform = extern struct {
     viewport_size: [2]f32,
@@ -129,6 +130,13 @@ pub const Renderer = struct {
     text_index_capacity: usize = 0,
     image_vertex_capacity: usize = 0,
     image_index_capacity: usize = 0,
+    vertex_transfer_bytes: usize = 0,
+    index_transfer_bytes: usize = 0,
+    text_vertex_transfer_bytes: usize = 0,
+    text_index_transfer_bytes: usize = 0,
+    image_vertex_transfer_bytes: usize = 0,
+    image_index_transfer_bytes: usize = 0,
+    retired_buffers: std.ArrayList(RetiredBuffer) = .empty,
     textures: std.AutoHashMap(u32, GpuTexture) = std.AutoHashMap(u32, GpuTexture).init(std.heap.smp_allocator),
     text_cache: std.AutoHashMap(TextCacheKey, TextCacheEntry) = std.AutoHashMap(TextCacheKey, TextCacheEntry).init(std.heap.smp_allocator),
     command_counts: CommandCounts = .{},
@@ -174,6 +182,8 @@ pub const Renderer = struct {
             if (self.text_index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.image_vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             if (self.image_index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+            for (self.retired_buffers.items) |*retired| retired.release(device);
+            self.retired_buffers.deinit(std.heap.smp_allocator);
             var iterator = self.textures.iterator();
             while (iterator.next()) |entry| entry.value_ptr.deinit(device);
             self.textures.deinit();
@@ -288,10 +298,10 @@ pub const Renderer = struct {
         self.unsupported_text_commands = if (self.supportsGpuText()) 0 else self.command_counts.text;
         self.unsupported_image_commands = 0;
         if (mesh.vertices.items.len > 0 and mesh.indices.items.len > 0) {
-            try self.ensureBuffers(.solid, mesh.vertices.items.len, mesh.indices.items.len);
+            try self.ensureBuffers(allocator, .solid, mesh.vertices.items.len, mesh.indices.items.len);
             const upload_start = nowNs();
-            try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, std.mem.sliceAsBytes(mesh.vertices.items));
-            try self.uploadBuffer(command_buffer, self.index_transfer.?, self.index_buffer.?, std.mem.sliceAsBytes(mesh.indices.items));
+            try self.uploadBuffer(command_buffer, self.vertex_transfer.?, self.vertex_buffer.?, self.vertex_transfer_bytes, std.mem.sliceAsBytes(mesh.vertices.items));
+            try self.uploadBuffer(command_buffer, self.index_transfer.?, self.index_buffer.?, self.index_transfer_bytes, std.mem.sliceAsBytes(mesh.indices.items));
             stats.solid_upload_ns +|= elapsedNs(upload_start);
         }
     }
@@ -354,6 +364,7 @@ pub const Renderer = struct {
         const submit_start = nowNs();
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) return error.SdlGpuSubmitFailed;
         stats.submit_present_ns +|= elapsedNs(submit_start);
+        self.releaseRetiredBuffers(device);
         self.last_frame_stats = stats;
     }
 
@@ -498,7 +509,7 @@ pub const Renderer = struct {
         }
     }
 
-    fn ensureBuffers(self: *Renderer, kind: PipelineKind, vertex_count: usize, index_count: usize) !void {
+    fn ensureBuffers(self: *Renderer, allocator: std.mem.Allocator, kind: PipelineKind, vertex_count: usize, index_count: usize) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         const vertex_buffer = switch (kind) {
             .solid => &self.vertex_buffer,
@@ -530,26 +541,80 @@ pub const Renderer = struct {
             .text => &self.text_index_capacity,
             .image => &self.image_index_capacity,
         };
-        if (vertex_count > vertex_capacity.*) {
+        const vertex_transfer_bytes = switch (kind) {
+            .solid => &self.vertex_transfer_bytes,
+            .text => &self.text_vertex_transfer_bytes,
+            .image => &self.image_vertex_transfer_bytes,
+        };
+        const index_transfer_bytes = switch (kind) {
+            .solid => &self.index_transfer_bytes,
+            .text => &self.text_index_transfer_bytes,
+            .image => &self.image_index_transfer_bytes,
+        };
+        const growing_vertex = vertex_count > vertex_capacity.*;
+        const growing_index = index_count > index_capacity.*;
+        if ((growing_vertex and (vertex_buffer.* != null or vertex_transfer.* != null)) or
+            (growing_index and (index_buffer.* != null or index_transfer.* != null)))
+        {
+            try self.retireBuffers(allocator, vertex_buffer.*, vertex_transfer.*, index_buffer.*, index_transfer.*);
+            vertex_buffer.* = null;
+            vertex_transfer.* = null;
+            index_buffer.* = null;
+            index_transfer.* = null;
+        }
+        if (growing_vertex or vertex_buffer.* == null) {
             if (vertex_buffer.*) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (vertex_transfer.*) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             vertex_capacity.* = growCapacity(vertex_count);
             const byte_size: u32 = @intCast(vertex_capacity.* * @sizeOf(draw.Vertex));
             vertex_buffer.* = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
             vertex_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
+            vertex_transfer_bytes.* = byte_size;
         }
-        if (index_count > index_capacity.*) {
+        if (growing_index or index_buffer.* == null) {
             if (index_buffer.*) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (index_transfer.*) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
             index_capacity.* = growCapacity(index_count);
             const byte_size: u32 = @intCast(index_capacity.* * @sizeOf(u32));
             index_buffer.* = c.SDL_CreateGPUBuffer(device, &.{ .usage = c.SDL_GPU_BUFFERUSAGE_INDEX, .size = byte_size, .props = 0 }) orelse return error.SdlGpuBufferFailed;
             index_transfer.* = c.SDL_CreateGPUTransferBuffer(device, &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = byte_size, .props = 0 }) orelse return error.SdlGpuTransferBufferFailed;
+            index_transfer_bytes.* = byte_size;
         }
     }
 
-    fn uploadBuffer(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, transfer: *c.SDL_GPUTransferBuffer, buffer: *c.SDL_GPUBuffer, bytes: []const u8) !void {
+    fn retireBuffers(
+        self: *Renderer,
+        allocator: std.mem.Allocator,
+        vertex_buffer: ?*c.SDL_GPUBuffer,
+        vertex_transfer: ?*c.SDL_GPUTransferBuffer,
+        index_buffer: ?*c.SDL_GPUBuffer,
+        index_transfer: ?*c.SDL_GPUTransferBuffer,
+    ) !void {
+        if (vertex_buffer == null and vertex_transfer == null and index_buffer == null and index_transfer == null) return;
+        try self.retired_buffers.append(allocator, .{
+            .vertex_buffer = vertex_buffer,
+            .vertex_transfer = vertex_transfer,
+            .index_buffer = index_buffer,
+            .index_transfer = index_transfer,
+        });
+    }
+
+    fn releaseRetiredBuffers(self: *Renderer, device: *c.SDL_GPUDevice) void {
+        var index: usize = 0;
+        while (index < self.retired_buffers.items.len) {
+            if (self.retired_buffers.items[index].frames_remaining > 1) {
+                self.retired_buffers.items[index].frames_remaining -= 1;
+                index += 1;
+                continue;
+            }
+            var retired = self.retired_buffers.orderedRemove(index);
+            retired.release(device);
+        }
+    }
+
+    fn uploadBuffer(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, transfer: *c.SDL_GPUTransferBuffer, buffer: *c.SDL_GPUBuffer, transfer_capacity: usize, bytes: []const u8) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
+        if (bytes.len > transfer_capacity) return error.SdlGpuTransferBufferTooSmall;
         const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, true) orelse return error.SdlGpuMapFailed;
         @memcpy(@as([*]u8, @ptrCast(mapped))[0..bytes.len], bytes);
         c.SDL_UnmapGPUTransferBuffer(device, transfer);
@@ -736,10 +801,10 @@ pub const Renderer = struct {
         stats.image_prepare_ns +|= elapsedNs(prepare_start);
 
         if (frame.mesh.vertices.items.len > 0 and frame.mesh.indices.items.len > 0) {
-            try self.ensureBuffers(.image, frame.mesh.vertices.items.len, frame.mesh.indices.items.len);
+            try self.ensureBuffers(allocator, .image, frame.mesh.vertices.items.len, frame.mesh.indices.items.len);
             const upload_start = nowNs();
-            try self.uploadBuffer(command_buffer, self.image_vertex_transfer.?, self.image_vertex_buffer.?, std.mem.sliceAsBytes(frame.mesh.vertices.items));
-            try self.uploadBuffer(command_buffer, self.image_index_transfer.?, self.image_index_buffer.?, std.mem.sliceAsBytes(frame.mesh.indices.items));
+            try self.uploadBuffer(command_buffer, self.image_vertex_transfer.?, self.image_vertex_buffer.?, self.image_vertex_transfer_bytes, std.mem.sliceAsBytes(frame.mesh.vertices.items));
+            try self.uploadBuffer(command_buffer, self.image_index_transfer.?, self.image_index_buffer.?, self.image_index_transfer_bytes, std.mem.sliceAsBytes(frame.mesh.indices.items));
             stats.image_upload_ns +|= elapsedNs(upload_start);
         }
         return frame;
@@ -762,10 +827,10 @@ pub const Renderer = struct {
         }
         stats.text_prepare_ns +|= elapsedNs(prepare_start);
         if (frame.vertices.items.len > 0 and frame.indices.items.len > 0) {
-            try self.ensureBuffers(.text, frame.vertices.items.len, frame.indices.items.len);
+            try self.ensureBuffers(allocator, .text, frame.vertices.items.len, frame.indices.items.len);
             const upload_start = nowNs();
-            try self.uploadBuffer(command_buffer, self.text_vertex_transfer.?, self.text_vertex_buffer.?, std.mem.sliceAsBytes(frame.vertices.items));
-            try self.uploadBuffer(command_buffer, self.text_index_transfer.?, self.text_index_buffer.?, std.mem.sliceAsBytes(frame.indices.items));
+            try self.uploadBuffer(command_buffer, self.text_vertex_transfer.?, self.text_vertex_buffer.?, self.text_vertex_transfer_bytes, std.mem.sliceAsBytes(frame.vertices.items));
+            try self.uploadBuffer(command_buffer, self.text_index_transfer.?, self.text_index_buffer.?, self.text_index_transfer_bytes, std.mem.sliceAsBytes(frame.indices.items));
             stats.text_upload_ns +|= elapsedNs(upload_start);
         }
         return frame;
@@ -1025,6 +1090,22 @@ const GpuTexture = struct {
         c.SDL_ReleaseGPUTexture(device, self.texture);
         c.SDL_ReleaseGPUTransferBuffer(device, self.transfer);
         self.* = undefined;
+    }
+};
+
+const RetiredBuffer = struct {
+    vertex_buffer: ?*c.SDL_GPUBuffer = null,
+    vertex_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    index_buffer: ?*c.SDL_GPUBuffer = null,
+    index_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    frames_remaining: u8 = RETIRED_BUFFER_FRAME_DELAY,
+
+    fn release(self: *RetiredBuffer, device: *c.SDL_GPUDevice) void {
+        if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+        if (self.vertex_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+        if (self.index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
+        if (self.index_transfer) |buffer| c.SDL_ReleaseGPUTransferBuffer(device, buffer);
+        self.* = .{};
     }
 };
 
