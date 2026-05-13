@@ -9,7 +9,7 @@ const browser_queue = @import("../queue.zig");
 const browser_session = @import("../session.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
-const browser_helper = if (builtin.os.tag == .linux) @import("linux_helper.zig") else struct {
+const browser_helper = if (builtin.os.tag == .linux or builtin.os.tag == .macos) @import("linux_helper.zig") else struct {
     pub const Controller = struct {
         pub fn init(_: std.mem.Allocator, _: []const u8) !Controller {
             return error.BrowserUnavailable;
@@ -248,7 +248,7 @@ pub const Backend = struct {
 
     // Reports whether this build should use the real helper runtime instead of the synthetic preview.
     fn usingNativeRuntime(self: *const Backend) bool {
-        return builtin.os.tag == .linux and self.sdkConfigured() and !self.stubPreview();
+        return (builtin.os.tag == .linux or builtin.os.tag == .macos) and self.sdkConfigured() and !self.stubPreview();
     }
 
     // Warms the runtime once so the browser cost is paid on first open instead of app launch.
