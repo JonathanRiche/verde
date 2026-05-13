@@ -2,7 +2,6 @@
 
 const std = @import("std");
 
-const colors = @import("colors.zig");
 const palette = @import("palette");
 const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
@@ -53,7 +52,43 @@ fn inlineWhitespaceWidth(font_size: f32, text: []const u8) ?f32 {
 const Allocator = std.mem.Allocator;
 
 /// Opaque fill: translucent alpha looked muddy over dark transcript bubbles under GL blending.
-const markdown_selection_fill_rgba = colors.rgba(88, 166, 255, 255);
+const markdown_selection_fill_rgba = theme.md.selection_fill;
+
+/// Central spacing table for markdown rendering. Helpers below scale these
+/// against `defaultLineHeight(options)` (a function of `base_font_size`), so
+/// every spacing decision is reducible to one of: a line-height ratio, a
+/// palette-px floor, or both. Tweak here when retuning whitespace.
+pub const MarkdownMetrics = struct {
+    // Line-height ratios (multiplied by `defaultLineHeight`).
+    pub const blank_block_ratio: f32 = 0.65;
+    pub const block_gap_ratio: f32 = 0.95;
+    pub const compact_block_gap_ratio: f32 = 0.20;
+    pub const thematic_break_ratio: f32 = 0.70;
+    pub const min_code_block_width_ratio: f32 = 10.0;
+    pub const code_block_pad_x_ratio: f32 = 0.75;
+    pub const code_block_pad_y_ratio: f32 = 0.50;
+    pub const code_block_rounding_ratio: f32 = 0.42;
+    pub const table_cell_pad_x_ratio: f32 = 0.45;
+    pub const table_cell_pad_y_ratio: f32 = 0.20;
+
+    // Hard palette-px floors so spacing never collapses at tiny font sizes.
+    pub const blank_block_min: f32 = 1.0;
+    pub const block_gap_min: f32 = 1.0;
+    pub const compact_block_gap_min: f32 = 2.0;
+    pub const thematic_break_min: f32 = 10.0;
+    pub const min_code_block_width_floor: f32 = 240.0;
+    pub const code_block_pad_x_min: f32 = 10.0;
+    pub const code_block_pad_y_min: f32 = 8.0;
+    pub const code_block_rounding_min: f32 = 10.0;
+    pub const table_cell_pad_x_min: f32 = 8.0;
+    pub const table_cell_pad_y_min: f32 = 4.0;
+
+    // Quote chrome — bar thickness + inset (palette-px before DPI scaling).
+    pub const quote_bar_thickness: f32 = 3.0;
+    pub const quote_bar_thickness_min: f32 = 2.0;
+    pub const quote_inset: f32 = 8.0;
+    pub const quote_inset_min: f32 = 6.0;
+};
 
 pub const RenderOptions = struct {
     base_font_size: f32 = 24.0,
@@ -68,6 +103,20 @@ pub const RenderOptions = struct {
     code_font_size: ?f32 = null,
 };
 
+pub const CodeCopyButtonSink = struct {
+    rect: palette.Rect,
+    payload_offset: usize,
+    payload_len: usize,
+    identity: u64,
+};
+
+pub const CodeCopyButtonRecorder = struct {
+    context: *anyopaque,
+    push_fn: *const fn (context: *anyopaque, hit: CodeCopyButtonSink) void,
+    recent_identity: u64 = 0,
+    recent_active: bool = false,
+};
+
 pub const PaletteRenderContext = struct {
     allocator: Allocator,
     batch: *palette.RenderBatch,
@@ -77,6 +126,7 @@ pub const PaletteRenderContext = struct {
     mouse_pos: [2]f32 = .{ -1.0, -1.0 },
     hovered: bool = false,
     clip: ?palette.Rect = null,
+    code_copy_recorder: ?CodeCopyButtonRecorder = null,
 };
 
 pub const SelectionPoint = struct {
@@ -336,7 +386,21 @@ const Chunk = struct {
 
 /// Parses markdown into a reusable body view with flattened text, rule, and code blocks.
 pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
-    var document = try zig_markdown.parse(allocator, source);
+    return buildBodyViewImpl(allocator, source, false);
+}
+
+/// Same as `buildBodyView` but enables `parseStreaming` so unclosed `**`/`*`/
+/// `` ` ``/`~~` at the buffer tail render optimistically. Use only for the
+/// streaming-reply body — committed messages should use `buildBodyView`.
+pub fn buildBodyViewStreaming(allocator: Allocator, source: []const u8) !BodyView {
+    return buildBodyViewImpl(allocator, source, true);
+}
+
+fn buildBodyViewImpl(allocator: Allocator, source: []const u8, streaming: bool) !BodyView {
+    var document = if (streaming)
+        try zig_markdown.parseStreaming(allocator, source)
+    else
+        try zig_markdown.parse(allocator, source);
     errdefer document.deinit(allocator);
 
     var blocks: std.ArrayListUnmanaged(BlockView) = .empty;
@@ -1167,7 +1231,7 @@ fn renderPaletteTextBlock(context: *PaletteRenderContext, block: TextBlockView, 
     // Blockquote chrome: left accent bar + slight bg tint. Drawn behind text
     // by queuing rects before the layout pass appends its text runs.
     if (block.style == .quote) {
-        const bar_width: f32 = @max(theme.scaledUi(3.0), 2.0);
+        const bar_width: f32 = @max(theme.scaledUi(MarkdownMetrics.quote_bar_thickness), MarkdownMetrics.quote_bar_thickness_min);
         const left_pad = quoteChromeLeftPad(options);
         const right_pad = quoteChromeRightPad(options);
         const v_pad = quoteChromeVerticalPad(options);
@@ -1177,13 +1241,13 @@ fn renderPaletteTextBlock(context: *PaletteRenderContext, block: TextBlockView, 
             .y = start[1],
             .w = width,
             .h = measured,
-        }, paletteColor(colors.rgba(38, 41, 48, 140)));
+        }, paletteColor(theme.md.quote_bg));
         queuePaletteRect(context, .{
             .x = start[0],
             .y = start[1],
             .w = bar_width,
             .h = measured,
-        }, paletteColor(colors.rgb(0x7A, 0xCA, 0xFF)));
+        }, paletteColor(theme.md.quote_accent));
         const inner_x = start[0] + left_pad;
         const inner_width = @max(width - left_pad - right_pad, 1.0);
         _ = renderPaletteTextBlockLayout(context, .{ inner_x, start[1] + v_pad * 0.5 }, block, inner_width, options);
@@ -1210,10 +1274,11 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
     queuePaletteRoundedShell(
         context,
         rect,
-        paletteColor(colors.rgba(24, 24, 28, 255)),
-        paletteColor(colors.rgba(52, 54, 62, 255)),
+        paletteColor(theme.md.code_bg),
+        paletteColor(theme.md.code_border),
         codeBlockRounding(options),
     );
+    queueCodeCopyButton(context, block, rect, options);
 
     var y = start[1] + pad_y;
     for (block.lines) |line| {
@@ -1234,49 +1299,217 @@ fn renderPaletteThematicBreakBlock(context: *PaletteRenderContext, rule: Themati
     const width = @max(available_width - indent, 24.0);
     const height = thematicBreakHeight(options);
     const y = start[1] + height * 0.5;
-    queuePaletteRect(context, .{ .x = start[0], .y = y, .w = width, .h = 1.0 }, paletteColor(colors.rgba(68, 72, 82, 255)));
+    queuePaletteRect(context, .{ .x = start[0], .y = y, .w = width, .h = 1.0 }, paletteColor(theme.md.rule));
     advancePaletteCursor(context, height);
 }
 
-/// Per-row height for a single-line table cell, including vertical padding.
+/// Single-line row height (used as the floor; rows with wrapped cells grow
+/// from this baseline by adding extra `line_height`s).
 fn tableRowHeight(options: RenderOptions) f32 {
     return defaultLineHeight(options) + tableCellPaddingY(options) * 2.0;
 }
 
+/// Row height for a row whose tallest cell wraps to `lines` rows of text.
+fn tableRowHeightForLines(options: RenderOptions, lines: usize) f32 {
+    const line_h = defaultLineHeight(options);
+    const visible_lines: f32 = @floatFromInt(@max(lines, 1));
+    return line_h * visible_lines + tableCellPaddingY(options) * 2.0;
+}
+
 fn tableCellPaddingX(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.45, 8.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.table_cell_pad_x_ratio, MarkdownMetrics.table_cell_pad_x_min);
 }
 
 fn tableCellPaddingY(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.20, 4.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.table_cell_pad_y_ratio, MarkdownMetrics.table_cell_pad_y_min);
+}
+
+/// Byte range into the original cell text for a single wrapped line. Stored
+/// instead of owned slices so a row layout never duplicates source bytes.
+const CellLineRange = struct { start: usize, end: usize };
+
+/// Greedy word wrap: walks word boundaries in `text`, packing words into the
+/// current line until adding the next would exceed `max_w`. A single word
+/// wider than `max_w` is force-included on its own line (still clipped at
+/// render time by the cell scissor). Whitespace runs collapse to a single
+/// soft break between words. Returns owned slice of byte ranges — caller
+/// frees with `allocator.free`.
+fn wrapCellLines(
+    allocator: Allocator,
+    text: []const u8,
+    role: palette.FontRole,
+    font_size: f32,
+    max_w: f32,
+) ![]CellLineRange {
+    var lines: std.ArrayListUnmanaged(CellLineRange) = .empty;
+    errdefer lines.deinit(allocator);
+
+    if (text.len == 0) {
+        try lines.append(allocator, .{ .start = 0, .end = 0 });
+        return lines.toOwnedSlice(allocator);
+    }
+
+    var line_start: usize = 0;
+    var line_end: usize = 0;
+    var i: usize = 0;
+
+    while (i < text.len) {
+        if (line_start == line_end) {
+            while (i < text.len and isCellWrapSpace(text[i])) : (i += 1) {}
+            line_start = i;
+            line_end = i;
+            if (i >= text.len) break;
+        }
+
+        const word_start = i;
+        while (i < text.len and !isCellWrapSpace(text[i])) : (i += 1) {}
+        const word_end = i;
+
+        const candidate_w = text_measure.textWidth(role, font_size, text[line_start..word_end]);
+        if (candidate_w <= max_w or line_start == word_start) {
+            line_end = word_end;
+        } else {
+            try lines.append(allocator, .{ .start = line_start, .end = line_end });
+            line_start = word_start;
+            line_end = word_end;
+        }
+
+        while (i < text.len and isCellWrapSpace(text[i])) : (i += 1) {}
+    }
+
+    if (line_end > line_start or lines.items.len == 0) {
+        try lines.append(allocator, .{ .start = line_start, .end = line_end });
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+/// Allocation-free counterpart to `wrapCellLines` — same wrap rules, returns
+/// just the line count. Used from measure paths that don't have an allocator
+/// (`measureBodyHeight`, hit-test) so row heights match the renderer.
+fn wrapCellLineCount(
+    text: []const u8,
+    role: palette.FontRole,
+    font_size: f32,
+    max_w: f32,
+) usize {
+    if (text.len == 0) return 1;
+    var lines: usize = 0;
+    var line_start: usize = 0;
+    var line_end: usize = 0;
+    var i: usize = 0;
+
+    while (i < text.len) {
+        if (line_start == line_end) {
+            while (i < text.len and isCellWrapSpace(text[i])) : (i += 1) {}
+            line_start = i;
+            line_end = i;
+            if (i >= text.len) break;
+        }
+
+        const word_start = i;
+        while (i < text.len and !isCellWrapSpace(text[i])) : (i += 1) {}
+        const word_end = i;
+
+        const candidate_w = text_measure.textWidth(role, font_size, text[line_start..word_end]);
+        if (candidate_w <= max_w or line_start == word_start) {
+            line_end = word_end;
+        } else {
+            lines += 1;
+            line_start = word_start;
+            line_end = word_end;
+        }
+
+        while (i < text.len and isCellWrapSpace(text[i])) : (i += 1) {}
+    }
+
+    if (line_end > line_start or lines == 0) lines += 1;
+    return @max(lines, 1);
+}
+
+fn isCellWrapSpace(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
+/// Number of wrapped lines for a single row given the final column widths.
+fn tableRowLineCount(
+    row: TableRowView,
+    column_widths: []const f32,
+    pad_x: f32,
+    role: palette.FontRole,
+    font_size: f32,
+) usize {
+    var max_lines: usize = 1;
+    for (row.cells, 0..) |cell, col| {
+        if (col >= column_widths.len) break;
+        const content_w = @max(column_widths[col] - pad_x * 2.0, 1.0);
+        const lines = wrapCellLineCount(cell.text, role, font_size, content_w);
+        if (lines > max_lines) max_lines = lines;
+    }
+    return max_lines;
 }
 
 fn measureTableHeight(table: TableView, available_width: f32, options: RenderOptions) f32 {
-    _ = available_width;
-    const rows: f32 = 1.0 + @as(f32, @floatFromInt(table.rows.len));
-    return tableRowHeight(options) * rows;
+    // Compute the same column widths the renderer will end up with, then walk
+    // each row counting wrapped lines so heights match exactly. Up to 16
+    // columns get a stack buffer; wider tables (rare in chat) fall back to a
+    // single-line height to avoid heap-allocating in this path.
+    var widths_buf: [16]f32 = undefined;
+    const column_count = table.header.cells.len;
+    if (column_count == 0 or column_count > widths_buf.len) {
+        const rows: f32 = 1.0 + @as(f32, @floatFromInt(table.rows.len));
+        return tableRowHeight(options) * rows;
+    }
+    const widths = widths_buf[0..column_count];
+    computeTableColumnWidths(widths, table, options, available_width);
+
+    const pad_x = tableCellPaddingX(options);
+
+    var total: f32 = tableRowHeightForLines(options, tableRowLineCount(table.header, widths, pad_x, .prose_bold, options.base_font_size));
+    for (table.rows) |row| {
+        total += tableRowHeightForLines(options, tableRowLineCount(row, widths, pad_x, .prose, options.base_font_size));
+    }
+    return total;
 }
 
-/// Sum of per-column natural widths and the available width, used to decide
-/// whether columns need to be scaled down to fit.
+/// Final per-column allocation in palette px. Already includes cell padding,
+/// already capped so no single column hogs the bubble, and already laid out
+/// to sum exactly to `available_width` so borders line up cleanly.
 const TableColumnMetrics = struct {
     widths: []f32,
-    total_natural: f32,
 };
 
 fn buildTableColumnMetrics(
     allocator: Allocator,
     table: TableView,
     options: RenderOptions,
+    available_width: f32,
 ) !TableColumnMetrics {
     const column_count = table.header.cells.len;
     const widths = try allocator.alloc(f32, column_count);
+    computeTableColumnWidths(widths, table, options, available_width);
+    return .{ .widths = widths };
+}
+
+/// Fills `widths` (already sized to header column count) with final per-column
+/// allocations: natural cell width plus padding, capped per-column at ~55% of
+/// the body, then scaled so the row sums exactly to `available_width`. Shared
+/// between the renderer's heap-allocated metrics and `measureTableHeight`'s
+/// stack-buffer variant so layout and measurement agree on column widths.
+fn computeTableColumnWidths(
+    widths: []f32,
+    table: TableView,
+    options: RenderOptions,
+    available_width: f32,
+) void {
     @memset(widths, 0.0);
+    const column_count = widths.len;
+    if (column_count == 0) return;
 
     const base_size = options.base_font_size;
+    const pad_x = tableCellPaddingX(options);
 
-    // Header drives the bold-weight width; body rows use prose weight.
     for (table.header.cells, 0..) |cell, col| {
+        if (col >= column_count) break;
         const w = text_measure.textWidth(.prose_bold, base_size, cell.text);
         if (w > widths[col]) widths[col] = w;
     }
@@ -1287,14 +1520,22 @@ fn buildTableColumnMetrics(
             if (w > widths[col]) widths[col] = w;
         }
     }
+    for (widths) |*w| w.* += pad_x * 2.0;
 
-    const pad_x = tableCellPaddingX(options);
-    var total: f32 = 0.0;
+    const max_single = @max(available_width * 0.55, defaultLineHeight(options) * 6.0);
+    var natural_total: f32 = 0.0;
     for (widths) |*w| {
-        w.* += pad_x * 2.0;
-        total += w.*;
+        if (w.* > max_single) w.* = max_single;
+        natural_total += w.*;
     }
-    return .{ .widths = widths, .total_natural = total };
+
+    if (natural_total > 0.0) {
+        const ratio = available_width / natural_total;
+        for (widths) |*w| w.* *= ratio;
+    } else {
+        const equal: f32 = available_width / @as(f32, @floatFromInt(column_count));
+        for (widths) |*w| w.* = equal;
+    }
 }
 
 fn renderPaletteTableBlock(
@@ -1309,48 +1550,55 @@ fn renderPaletteTableBlock(
     const start = .{ context.cursor.x + indent, context.cursor.y };
     const width = @max(available_width - indent, 1.0);
 
-    const metrics = buildTableColumnMetrics(context.allocator, table, options) catch return;
+    const metrics = buildTableColumnMetrics(context.allocator, table, options, width) catch return;
     defer context.allocator.free(metrics.widths);
 
-    // Scale columns proportionally so the table fills exactly `width`. This
-    // both shrinks overflow and pads narrow tables to span the body column.
-    const scale: f32 = if (metrics.total_natural > 0.0) width / metrics.total_natural else 1.0;
-
-    const row_h = tableRowHeight(options);
     const pad_x = tableCellPaddingX(options);
     const pad_y = tableCellPaddingY(options);
-    const border_color = paletteColor(colors.rgba(68, 72, 82, 255));
-    const header_bg = paletteColor(colors.rgba(38, 41, 48, 200));
+    const border_color = paletteColor(theme.md.table_border);
+    const header_bg = paletteColor(theme.md.table_header_bg);
 
-    // Header background tint + bottom border.
-    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = row_h }, header_bg);
+    // Precompute per-row line counts (= max wrapped lines across the row's
+    // cells) so we know each row's height before we start drawing.
+    const total_rows = 1 + table.rows.len;
+    var row_heights = context.allocator.alloc(f32, total_rows) catch return;
+    defer context.allocator.free(row_heights);
 
-    // Draw all row content first, then borders on top so they read clearly.
-    var row_index: usize = 0;
-    var y_cursor: f32 = start[1];
-    drawTableRow(context, table.header, metrics.widths, table.alignments, scale, start[0], y_cursor, pad_x, pad_y, row_h, options, true);
-    y_cursor += row_h;
-    while (row_index < table.rows.len) : (row_index += 1) {
-        drawTableRow(context, table.rows[row_index], metrics.widths, table.alignments, scale, start[0], y_cursor, pad_x, pad_y, row_h, options, false);
-        y_cursor += row_h;
+    const base_size = options.base_font_size;
+    row_heights[0] = tableRowHeightForLines(options, tableRowLineCount(table.header, metrics.widths, pad_x, .prose_bold, base_size));
+    for (table.rows, 0..) |row, idx| {
+        row_heights[idx + 1] = tableRowHeightForLines(options, tableRowLineCount(row, metrics.widths, pad_x, .prose, base_size));
     }
 
-    const total_h = row_h * (1.0 + @as(f32, @floatFromInt(table.rows.len)));
+    // Header background tint spans the full header row height.
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = row_heights[0] }, header_bg);
+
+    // Draw rows first, borders on top so they read clearly.
+    var y_cursor: f32 = start[1];
+    drawTableRow(context, table.header, metrics.widths, table.alignments, start[0], y_cursor, pad_x, pad_y, row_heights[0], options, true);
+    y_cursor += row_heights[0];
+    for (table.rows, 0..) |row, idx| {
+        drawTableRow(context, row, metrics.widths, table.alignments, start[0], y_cursor, pad_x, pad_y, row_heights[idx + 1], options, false);
+        y_cursor += row_heights[idx + 1];
+    }
+
+    var total_h: f32 = 0.0;
+    for (row_heights) |h| total_h += h;
 
     // Horizontal rules between rows + outer top/bottom.
     queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = 1.0 }, border_color);
     queuePaletteRect(context, .{ .x = start[0], .y = start[1] + total_h - 1.0, .w = width, .h = 1.0 }, border_color);
-    var rb: usize = 0;
-    while (rb <= table.rows.len) : (rb += 1) {
-        const yy = start[1] + row_h * @as(f32, @floatFromInt(rb));
-        queuePaletteRect(context, .{ .x = start[0], .y = yy, .w = width, .h = 1.0 }, border_color);
+    var rule_y: f32 = start[1];
+    for (row_heights[0 .. row_heights.len - 1]) |h| {
+        rule_y += h;
+        queuePaletteRect(context, .{ .x = start[0], .y = rule_y, .w = width, .h = 1.0 }, border_color);
     }
 
     // Vertical rules between columns + outer left/right.
     var x_cursor: f32 = start[0];
     queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
     for (metrics.widths) |w| {
-        x_cursor += w * scale;
+        x_cursor += w;
         queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
     }
 
@@ -1362,7 +1610,6 @@ fn drawTableRow(
     row: TableRowView,
     column_widths: []f32,
     alignments: []zig_markdown.TableAlignment,
-    scale: f32,
     x0: f32,
     y0: f32,
     pad_x: f32,
@@ -1373,34 +1620,69 @@ fn drawTableRow(
 ) void {
     const font_size = options.base_font_size;
     const role: palette.FontRole = if (is_header) .prose_bold else .prose;
-    const color = paletteColor(if (is_header) colors.rgb(0xF2, 0xE6, 0x8D) else colors.rgb(0xE2, 0xE4, 0xE9));
+    const color = paletteColor(if (is_header) theme.md.text_h2 else theme.md.text_body);
     const line_height = defaultLineHeight(options);
-    const text_y = y0 + pad_y + (row_h - pad_y * 2.0 - line_height) * 0.5;
 
     var x_cursor: f32 = x0;
     for (row.cells, 0..) |cell, col| {
         if (col >= column_widths.len) break;
-        const cell_w = column_widths[col] * scale;
+        const cell_w = column_widths[col];
         const content_w = @max(cell_w - pad_x * 2.0, 1.0);
-        const text_w = text_measure.textWidth(role, font_size, cell.text);
+
+        const lines = wrapCellLines(context.allocator, cell.text, role, font_size, content_w) catch {
+            x_cursor += cell_w;
+            continue;
+        };
+        defer context.allocator.free(lines);
+
+        const cell_rect: palette.Rect = .{
+            .x = x_cursor,
+            .y = y0,
+            .w = cell_w,
+            .h = row_h,
+        };
+        const cell_clip = intersectClipRect(context.clip, cell_rect);
 
         const alignment: zig_markdown.TableAlignment = if (col < alignments.len) alignments[col] else .default;
-        const align_offset: f32 = switch (alignment) {
-            .center => @max((content_w - text_w) * 0.5, 0.0),
-            .right => @max(content_w - text_w, 0.0),
-            else => 0.0,
-        };
 
-        queuePaletteRoleText(context, .{
-            .x = x_cursor + pad_x + align_offset,
-            .y = text_y,
-            .w = content_w,
-            .h = line_height,
-        }, cell.text, color, font_size, role, context.clip);
+        var line_y = y0 + pad_y;
+        for (lines) |range| {
+            const line_text = cell.text[range.start..range.end];
+            const text_w = text_measure.textWidth(role, font_size, line_text);
+            const align_offset: f32 = switch (alignment) {
+                .center => @max((content_w - text_w) * 0.5, 0.0),
+                .right => @max(content_w - text_w, 0.0),
+                else => 0.0,
+            };
+            queuePaletteRoleText(context, .{
+                .x = x_cursor + pad_x + align_offset,
+                .y = line_y,
+                .w = content_w,
+                .h = line_height,
+            }, line_text, color, font_size, role, cell_clip);
+            line_y += line_height;
+        }
 
         x_cursor += cell_w;
     }
 }
+
+/// Intersect an existing clip with a sub-rect so nested clips don't paint
+/// outside their parent.
+fn intersectClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
+    const p = parent orelse return child;
+    const x = @max(p.x, child.x);
+    const y = @max(p.y, child.y);
+    const right = @min(p.x + p.w, child.x + child.w);
+    const bottom = @min(p.y + p.h, child.y + child.h);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(right - x, 0.0),
+        .h = @max(bottom - y, 0.0),
+    };
+}
+
 
 const TextBlockLayoutState = struct {
     base_line_height: f32,
@@ -1592,7 +1874,7 @@ fn renderPaletteTextBlockLayout(
 
             if (step.inline_style.link or step.inline_style.emphasis) {
                 const underline_color = if (step.inline_style.link)
-                    paletteColor(colors.rgb(0x7A, 0xCA, 0xFF))
+                    paletteColor(theme.md.link)
                 else
                     color;
                 const underline_h: f32 = if (step.inline_style.link) 1.5 else 1.0;
@@ -1635,7 +1917,7 @@ fn renderPaletteTextBlockLayout(
 
     // Queue pill backgrounds before the text batch so they render behind the glyphs.
     if (code_pills.items.len > 0) {
-        const pill_color = paletteColor(colors.rgba(38, 41, 48, 235));
+        const pill_color = paletteColor(theme.md.inline_code_pill);
         const pill_radius = @max(theme.scaledUi(3.0), 2.0);
         for (code_pills.items) |rect| {
             queuePaletteRoundedRect(context, rect, pill_color, pill_radius);
@@ -2640,10 +2922,11 @@ fn renderSelectablePaletteCodeBlock(
     queuePaletteRoundedShell(
         context,
         rect,
-        paletteColor(colors.rgba(24, 24, 28, 255)),
-        paletteColor(colors.rgba(52, 54, 62, 255)),
+        paletteColor(theme.md.code_bg),
+        paletteColor(theme.md.code_border),
         codeBlockRounding(options),
     );
+    queueCodeCopyButton(context, block, rect, options);
 
     const lines = try buildSelectableCodeLinesWithWrap(allocator, block, options, text_width_sel);
     defer deinitSelectableCodeLines(allocator, lines);
@@ -2695,7 +2978,7 @@ fn renderPaletteStyledChunk(
     }, text, paletteColor(color), draw_font_size, role, context.clip);
 
     if (inline_style.link or inline_style.emphasis) {
-        const underline_color = if (inline_style.link) paletteColor(colors.rgb(0x7A, 0xCA, 0xFF)) else paletteColor(color);
+        const underline_color = if (inline_style.link) paletteColor(theme.md.link) else paletteColor(color);
         queuePaletteRect(context, .{
             .x = position[0],
             .y = position[1] + line_height - 2.0,
@@ -2774,17 +3057,17 @@ const CodeLineLayout = struct {
 // tint). Kept here so both the renderer and the height measurement agree on
 // the inset they apply before laying out body text.
 fn quoteChromeLeftPad(_: RenderOptions) f32 {
-    const bar = @max(theme.scaledUi(3.0), 2.0);
-    const gap = @max(theme.scaledUi(8.0), 6.0);
+    const bar = @max(theme.scaledUi(MarkdownMetrics.quote_bar_thickness), MarkdownMetrics.quote_bar_thickness_min);
+    const gap = @max(theme.scaledUi(MarkdownMetrics.quote_inset), MarkdownMetrics.quote_inset_min);
     return bar + gap;
 }
 
 fn quoteChromeRightPad(_: RenderOptions) f32 {
-    return @max(theme.scaledUi(8.0), 6.0);
+    return @max(theme.scaledUi(MarkdownMetrics.quote_inset), MarkdownMetrics.quote_inset_min);
 }
 
 fn quoteChromeVerticalPad(_: RenderOptions) f32 {
-    return @max(theme.scaledUi(8.0), 6.0);
+    return @max(theme.scaledUi(MarkdownMetrics.quote_inset), MarkdownMetrics.quote_inset_min);
 }
 
 fn measureTextBlockHeight(block: TextBlockView, available_width: f32, options: RenderOptions) f32 {
@@ -2908,8 +3191,8 @@ fn markdownFontRole(block_style: TextStyle, inline_style: InlineStyle) palette.F
 
 fn inlineTextColor(base_color: [4]f32, style: InlineStyle) [4]f32 {
     var color = base_color;
-    if (style.code) color = colors.rgb(0xF5, 0xD0, 0x7A);
-    if (style.link) color = colors.rgb(0x7A, 0xCA, 0xFF);
+    if (style.code) color = theme.md.inline_code;
+    if (style.link) color = theme.md.link;
     if (style.emphasis and !style.code) color = lighten(color, 0.08);
     if (style.strong and !style.code) color = lighten(color, 0.12);
     return color;
@@ -2917,12 +3200,12 @@ fn inlineTextColor(base_color: [4]f32, style: InlineStyle) [4]f32 {
 
 fn textBlockColor(style: TextStyle) [4]f32 {
     return switch (style) {
-        .paragraph => colors.rgb(0xE2, 0xE4, 0xE9),
-        .heading_1 => colors.rgb(0xFF, 0xF2, 0xA8),
-        .heading_2 => colors.rgb(0xF2, 0xE6, 0x8D),
-        .heading_3 => colors.rgb(0xDE, 0xE8, 0xFF),
-        .heading_4, .heading_5, .heading_6 => colors.rgb(0xCF, 0xD7, 0xE5),
-        .quote => colors.rgb(0xB3, 0xBE, 0xD4),
+        .paragraph => theme.md.text_body,
+        .heading_1 => theme.md.text_h1,
+        .heading_2 => theme.md.text_h2,
+        .heading_3 => theme.md.text_h3,
+        .heading_4, .heading_5, .heading_6 => theme.md.text_h4_h6,
+        .quote => theme.md.text_quote,
     };
 }
 
@@ -2931,38 +3214,112 @@ fn indentWidth(level: usize) f32 {
 }
 
 fn blankBlockHeight(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.65, 1.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.blank_block_ratio, MarkdownMetrics.blank_block_min);
 }
 
 fn blockGap(options: RenderOptions) f32 {
     // Paragraph↔heading, paragraph↔list-loose, paragraph↔code-fence transitions.
     // Tight list items still use compactBlockGap; bumping this only affects
     // breathing room around real section breaks.
-    return @max(defaultLineHeight(options) * 0.95, 1.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.block_gap_ratio, MarkdownMetrics.block_gap_min);
 }
 
 fn compactBlockGap(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.2, 2.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.compact_block_gap_ratio, MarkdownMetrics.compact_block_gap_min);
 }
 
 fn thematicBreakHeight(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.7, 10.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.thematic_break_ratio, MarkdownMetrics.thematic_break_min);
 }
 
 fn minimumCodeBlockWidth(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 10.0, 240.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.min_code_block_width_ratio, MarkdownMetrics.min_code_block_width_floor);
 }
 
 fn codeBlockPaddingX(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.75, 10.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.code_block_pad_x_ratio, MarkdownMetrics.code_block_pad_x_min);
 }
 
 fn codeBlockPaddingY(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.5, 8.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.code_block_pad_y_ratio, MarkdownMetrics.code_block_pad_y_min);
 }
 
 fn codeBlockRounding(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.42, 10.0);
+    return @max(defaultLineHeight(options) * MarkdownMetrics.code_block_rounding_ratio, MarkdownMetrics.code_block_rounding_min);
+}
+
+/// Stable identity for a fenced code block across frames so we can show a
+/// transient "Copied" label on the most recently clicked block while the
+/// transcript re-renders at 60 Hz.
+fn codeCopySourceIdentity(block: FencedCodeView) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (block.lines, 0..) |line, i| {
+        if (i > 0) hasher.update("\n");
+        hasher.update(line.text);
+    }
+    return hasher.final();
+}
+
+fn queueCodeCopyButton(
+    context: *PaletteRenderContext,
+    block: FencedCodeView,
+    block_rect: palette.Rect,
+    options: RenderOptions,
+) void {
+    const recorder = context.code_copy_recorder orelse return;
+
+    const identity = codeCopySourceIdentity(block);
+    const is_recent = recorder.recent_active and recorder.recent_identity == identity;
+
+    // Nerd Font Symbols glyphs: codicon-copy (U+EBCC) and codicon-check (U+EAB2).
+    const glyph: []const u8 = if (is_recent) "\u{eab2}" else "\u{ebcc}";
+    const icon_size = options.base_font_size * 0.95;
+    const pad: f32 = @max(icon_size * 0.30, 5.0);
+    const btn_size = icon_size + pad * 2.0;
+    const margin = @max(codeBlockPaddingY(options) * 0.5, 5.0);
+    const btn_x = block_rect.x + block_rect.w - btn_size - margin;
+    const btn_y = block_rect.y + margin;
+    const btn_rect: palette.Rect = .{ .x = btn_x, .y = btn_y, .w = btn_size, .h = btn_size };
+
+    const mx = context.mouse_pos[0];
+    const my = context.mouse_pos[1];
+    const hovered = mx >= btn_rect.x and mx <= btn_rect.x + btn_rect.w and
+        my >= btn_rect.y and my <= btn_rect.y + btn_rect.h;
+
+    const bg_color = if (is_recent)
+        paletteColor(theme.md.copy_bg_recent)
+    else if (hovered)
+        paletteColor(theme.md.copy_bg_hover)
+    else
+        paletteColor(theme.md.copy_bg_idle);
+    queuePaletteRoundedRect(context, btn_rect, bg_color, @max(icon_size * 0.32, 4.0));
+
+    const glyph_color = if (is_recent)
+        paletteColor(theme.md.copy_glyph_recent)
+    else if (hovered)
+        paletteColor(theme.md.copy_glyph_hover)
+    else
+        paletteColor(theme.md.copy_glyph_idle);
+    queuePaletteRoleText(context, .{
+        .x = btn_x + pad,
+        .y = btn_y + pad - icon_size * 0.05,
+        .w = icon_size,
+        .h = icon_size + icon_size * 0.1,
+    }, glyph, glyph_color, icon_size, .icon, context.clip);
+
+    const payload_start = context.frame_text.items.len;
+    for (block.lines, 0..) |line, i| {
+        if (i > 0) context.frame_text.append(context.allocator, '\n') catch return;
+        context.frame_text.appendSlice(context.allocator, line.text) catch return;
+    }
+    const payload_len = context.frame_text.items.len - payload_start;
+
+    recorder.push_fn(recorder.context, .{
+        .rect = btn_rect,
+        .payload_offset = payload_start,
+        .payload_len = payload_len,
+        .identity = identity,
+    });
 }
 
 /// Inner width available to code text after `pad_x` on each side.
@@ -3116,17 +3473,17 @@ fn glyphWidthForSpec(spec: FontSpec, options: RenderOptions) f32 {
 
 fn codeTokenColor(kind: zig_dif.TokenKind) [4]f32 {
     return switch (kind) {
-        .plain => colors.rgb(0xE2, 0xE4, 0xE9),
-        .comment => colors.rgb(0x8A, 0x91, 0xA0),
-        .string => colors.rgb(0x66, 0xDC, 0xAA),
-        .number => colors.rgb(0xF5, 0xB4, 0x78),
-        .keyword => colors.rgb(0xFF, 0xD6, 0x66),
-        .type_name => colors.rgb(0x7A, 0xCA, 0xFF),
-        .function_name => colors.rgb(0x60, 0xDB, 0xDB),
-        .property_name => colors.rgb(0x6B, 0xA8, 0xFF),
-        .variable_name => colors.rgb(0xE2, 0xE4, 0xE9),
-        .constant_name => colors.rgb(0xF1, 0xC4, 0x6B),
-        .operator, .punctuation => colors.rgb(0xB6, 0xBB, 0xC5),
+        .plain => theme.md.tok_plain,
+        .comment => theme.md.tok_comment,
+        .string => theme.md.tok_string,
+        .number => theme.md.tok_number,
+        .keyword => theme.md.tok_keyword,
+        .type_name => theme.md.tok_type,
+        .function_name => theme.md.tok_function,
+        .property_name => theme.md.tok_property,
+        .variable_name => theme.md.tok_variable,
+        .constant_name => theme.md.tok_constant,
+        .operator, .punctuation => theme.md.tok_punct,
     };
 }
 

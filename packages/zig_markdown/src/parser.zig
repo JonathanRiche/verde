@@ -43,6 +43,25 @@ const ListMarker = struct {
     content: []const u8,
 };
 
+/// While true, `parseInlines` treats end-of-source as a closer for unfinished
+/// `**`, `*`, `_`, `` ` ``, and `~~` runs in the OUTER paragraph context. Off by
+/// default; flipped on by `parseDocumentStreaming` and back off automatically.
+/// Recursive parseInlines calls for children of already-closed inlines (link
+/// labels, emphasis bodies, strike bodies) reset it to false via
+/// `parseInlineChildren` so a closed `**foo**` with literal `*` inside doesn't
+/// get a synthetic closer.
+threadlocal var streaming_mode_active: bool = false;
+
+/// Drop-in streaming variant of `parseDocument`. Mid-stream replies often end
+/// with unclosed `**`, `*`, `` ` ``, etc. — this returns inlines that render
+/// optimistically rather than as literal punctuation.
+pub fn parseDocumentStreaming(allocator: Allocator, source: []const u8) Allocator.Error!model.Document {
+    const prev = streaming_mode_active;
+    streaming_mode_active = true;
+    defer streaming_mode_active = prev;
+    return parseDocument(allocator, source);
+}
+
 pub fn parseDocument(allocator: Allocator, source: []const u8) Allocator.Error!model.Document {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -681,9 +700,9 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                 continue;
             },
             '`' => {
+                const ticks = countRun(source, index);
                 if (findCodeSpanEnd(source, index)) |end| {
                     try appendTextInline(allocator, &inlines, source[text_start..index]);
-                    const ticks = countRun(source, index);
                     try inlines.append(allocator, .{
                         .code = .{
                             .text = source[index + ticks .. end],
@@ -692,6 +711,19 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                     index = end + ticks;
                     text_start = index;
                     continue;
+                } else if (streaming_mode_active and index + ticks < source.len) {
+                    // Streaming fallback: unclosed `` `foo `` at the buffer tail
+                    // renders as an inline code span up to end-of-source so the
+                    // word doesn't briefly appear with a literal backtick.
+                    try appendTextInline(allocator, &inlines, source[text_start..index]);
+                    try inlines.append(allocator, .{
+                        .code = .{
+                            .text = source[index + ticks ..],
+                        },
+                    });
+                    text_start = source.len;
+                    index = source.len;
+                    break;
                 }
             },
             '[' => {
@@ -855,7 +887,7 @@ fn parseInlineLink(
     const label_end = close_bracket;
     const destination_start = close_bracket + 2;
     const destination_end = close_paren;
-    const children = try parseInlines(allocator, source[label_start..label_end]);
+    const children = try parseInlineChildren(allocator, source[label_start..label_end]);
 
     return .{
         .label_start = label_start,
@@ -875,16 +907,29 @@ fn parseDelimitedInline(
     const marker = source[start];
     const run = countRun(source, start);
     const delimiter_length: usize = if (run >= 2) 2 else 1;
-    const end = findClosingDelimiter(source, start + delimiter_length, marker, delimiter_length) orelse return null;
+    const end_opt = findClosingDelimiter(source, start + delimiter_length, marker, delimiter_length);
+    // Streaming fallback: an unclosed `**…` or `*…` at the tail of the buffer
+    // renders optimistically as if the closer were at end-of-source. This is
+    // what stops words from snapping into bold the moment the closer arrives
+    // mid-stream.
+    const synthesized_close = end_opt == null and streaming_mode_active and start + delimiter_length < source.len;
+    const end: usize = end_opt orelse if (synthesized_close) source.len else return null;
     if (end == start + delimiter_length) return null;
 
-    const children = try parseInlines(allocator, source[start + delimiter_length .. end]);
+    const children_source = source[start + delimiter_length .. end];
+    // The synthesized branch knows there's no real closer, so children are
+    // parsed in streaming mode too (a trailing `**foo *bar` snapshot should
+    // bold-italicize `bar`).
+    const children = if (synthesized_close)
+        try parseInlines(allocator, children_source)
+    else
+        try parseInlineChildren(allocator, children_source);
     return .{
         .value = if (delimiter_length == 2)
             .{ .strong = .{ .children = children } }
         else
             .{ .emphasis = .{ .children = children } },
-        .next_index = end + delimiter_length,
+        .next_index = if (synthesized_close) source.len else end + delimiter_length,
     };
 }
 
@@ -895,12 +940,18 @@ fn parseStrikethrough(
 ) Allocator.Error!?InlineParseResult {
     const run = countRun(source, start);
     if (run < 2) return null; // single ~ is plain text
-    const end = findClosingDelimiter(source, start + 2, '~', 2) orelse return null;
+    const end_opt = findClosingDelimiter(source, start + 2, '~', 2);
+    const synthesized_close = end_opt == null and streaming_mode_active and start + 2 < source.len;
+    const end: usize = end_opt orelse if (synthesized_close) source.len else return null;
     if (end == start + 2) return null;
-    const children = try parseInlines(allocator, source[start + 2 .. end]);
+    const children_source = source[start + 2 .. end];
+    const children = if (synthesized_close)
+        try parseInlines(allocator, children_source)
+    else
+        try parseInlineChildren(allocator, children_source);
     return .{
         .value = .{ .strikethrough = .{ .children = children } },
-        .next_index = end + 2,
+        .next_index = if (synthesized_close) source.len else end + 2,
     };
 }
 
@@ -918,4 +969,14 @@ fn findClosingDelimiter(source: []const u8, start: usize, marker: u8, length: us
         if (matches) return index;
     }
     return null;
+}
+
+/// Like `parseInlines` but with `streaming_mode_active` forced off — used for
+/// the children of an inline whose closer the parent already located, so we
+/// don't synthesize phantom closers inside e.g. a closed `**[link](url)**`.
+fn parseInlineChildren(allocator: Allocator, source: []const u8) Allocator.Error![]model.Inline {
+    const prev = streaming_mode_active;
+    streaming_mode_active = false;
+    defer streaming_mode_active = prev;
+    return parseInlines(allocator, source);
 }

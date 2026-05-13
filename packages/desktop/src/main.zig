@@ -366,6 +366,7 @@ fn mainInner(init: std.process.Init) !void {
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
+        state.code_copy_buttons.clearRetainingCapacity();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {

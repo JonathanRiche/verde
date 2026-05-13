@@ -1,6 +1,7 @@
 const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
+const profiler = @import("profiler.zig");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
@@ -56,6 +57,11 @@ pub const PaletteModalHit = struct {
     action: PaletteModalAction,
     index: usize = 0,
 };
+
+/// Per-frame hit-test entry for a fenced code block's "Copy" button. The
+/// payload bytes live in `palette_frame_text` (cleared each frame), so the
+/// offset/length pair is only valid until the next frame's text-buffer reset.
+pub const CodeCopyButtonHit = chat_markdown.CodeCopyButtonSink;
 
 pub const PaletteModalTextFocus = enum {
     none,
@@ -1568,6 +1574,9 @@ pub const AppState = struct {
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
     palette_modal_hits: std.ArrayList(PaletteModalHit),
+    code_copy_buttons: std.ArrayList(CodeCopyButtonHit),
+    code_copy_recent_identity: u64,
+    code_copy_recent_until_ms: i64,
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -1731,6 +1740,9 @@ pub const AppState = struct {
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
             .palette_modal_hits = .empty,
+            .code_copy_buttons = .empty,
+            .code_copy_recent_identity = 0,
+            .code_copy_recent_until_ms = 0,
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -6437,6 +6449,7 @@ pub const AppState = struct {
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
         self.palette_modal_hits.deinit(self.allocator);
+        self.code_copy_buttons.deinit(self.allocator);
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
@@ -7402,6 +7415,51 @@ pub const AppState = struct {
 
         const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return self.allocator.dupe(u8, "."), 0);
         return self.allocator.dupe(u8, home);
+    }
+
+    fn pushCodeCopyButtonTrampoline(context: *anyopaque, hit: chat_markdown.CodeCopyButtonSink) void {
+        const self: *AppState = @ptrCast(@alignCast(context));
+        self.code_copy_buttons.append(self.allocator, hit) catch |err| {
+            log.warn("failed to retain code copy button hit: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Returns a recorder the markdown renderer can use to register per-frame
+    /// code-block copy buttons. The "recent" feedback window (~1.2s) shows a
+    /// transient "Copied" label after a click.
+    pub fn codeCopyButtonRecorder(self: *AppState) chat_markdown.CodeCopyButtonRecorder {
+        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+        const active = self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+        return .{
+            .context = @ptrCast(self),
+            .push_fn = pushCodeCopyButtonTrampoline,
+            .recent_identity = if (active) self.code_copy_recent_identity else 0,
+            .recent_active = active,
+        };
+    }
+
+    /// Hit-tests the most recent frame's code-block copy buttons. On hit,
+    /// writes the source text to the system clipboard, sets the "recent"
+    /// feedback window, and returns true.
+    pub fn consumeCodeCopyButtonClick(self: *AppState, x: f32, y: f32) bool {
+        for (self.code_copy_buttons.items) |hit| {
+            if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
+            if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+
+            const payload = self.palette_frame_text.items[hit.payload_offset .. hit.payload_offset + hit.payload_len];
+            const z = self.allocator.dupeZ(u8, payload) catch return true;
+            defer self.allocator.free(z);
+            sdl.setClipboardText(z) catch |err| {
+                log.warn("failed to copy code block to clipboard: {s}", .{@errorName(err)});
+                return true;
+            };
+            self.code_copy_recent_identity = hit.identity;
+            const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+            self.code_copy_recent_until_ms = now_ms + 1200;
+            self.markDirty();
+            return true;
+        }
+        return false;
     }
 };
 
