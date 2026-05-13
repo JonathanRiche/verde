@@ -61,7 +61,15 @@ extern fn palette_text_gl_draw(
     viewport_h: f32,
 ) void;
 
-const ui_font_bytes = @embedFile("../assets/fonts/NotoSans-Bold.ttf");
+// Chrome (sidebar, composer, buttons, headers) renders in CalSans — a display
+// sans that gives the desktop UI a distinct brand voice. NotoSans-Bold is kept
+// around for the `ui_bold` legacy emphasis role and for chat-transcript strong
+// inlines (`prose_bold`).
+const ui_font_bytes = @embedFile("../assets/fonts/CalSans-Regular.ttf");
+const ui_bold_font_bytes = @embedFile("../assets/fonts/NotoSans-Bold.ttf");
+const prose_font_bytes = @embedFile("../assets/fonts/NotoSans-Regular.ttf");
+const prose_italic_font_bytes = @embedFile("../assets/fonts/NotoSans-Italic.ttf");
+const prose_bold_italic_font_bytes = @embedFile("../assets/fonts/NotoSans-BoldItalic.ttf");
 const mono_font_bytes = @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
 const icon_font_bytes = @embedFile("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
@@ -646,7 +654,12 @@ fn drawTextSlice(text: []const u8, x: f32, y: f32, font_size: f32, color: palett
     const font_bytes = switch (font_role orelse .ui) {
         .mono => mono_font_bytes,
         .icon => icon_font_bytes,
-        else => ui_font_bytes,
+        .ui_bold => ui_bold_font_bytes,
+        .prose => prose_font_bytes,
+        .prose_bold => ui_bold_font_bytes,
+        .prose_italic => prose_italic_font_bytes,
+        .prose_bold_italic => prose_bold_italic_font_bytes,
+        .ui => ui_font_bytes,
     };
     palette_text_gl_draw(
         font_bytes.ptr,

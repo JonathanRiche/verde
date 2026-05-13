@@ -188,10 +188,20 @@ static PaletteTextAtlas *atlas_for_size(const unsigned char *font_data, int font
 
 static stbtt_fontinfo g_measure_font;
 static int g_measure_font_ready;
+static const unsigned char *g_measure_font_data;
 
+/// Re-parses the font tables whenever a different font pointer is supplied.
+/// The previous single-global cache silently reused the first font ever loaded
+/// for every subsequent measurement call, so per-face width routing (Regular,
+/// Bold, Italic, Mono, CalSans) all collapsed to a single face — producing
+/// "substituteSKUs"-style collisions for non-body chunks. stbtt_InitFont only
+/// reads header tables (no glyph rasterization), so re-init per face change is
+/// cheap.
 static void ensure_measure_font(const unsigned char *font_data) {
-    if (g_measure_font_ready) return;
+    if (g_measure_font_ready && g_measure_font_data == font_data) return;
+    g_measure_font_ready = 0;
     if (!stbtt_InitFont(&g_measure_font, font_data, stbtt_GetFontOffsetForIndex(font_data, 0))) return;
+    g_measure_font_data = font_data;
     g_measure_font_ready = 1;
 }
 

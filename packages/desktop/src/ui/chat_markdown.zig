@@ -23,22 +23,84 @@ extern fn palette_text_gl_measure_line_width(
     font_size: f32,
 ) callconv(.c) f32;
 
-/// Same UI font used by the SDL_GPU palette renderer so transcript run layout
-/// matches the glyphs submitted to SDL_ttf.
-const gl_transcript_font = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Bold.ttf");
+/// Measurement fonts — one per face used in the transcript. Layout must
+/// measure each chunk against the SAME face the renderer will draw it with;
+/// otherwise bold/mono/italic chunks under-reserve width and bleed into the
+/// next chunk (visible as `"Inventory" + "policy" → "Inventorypolicy"`).
+const gl_transcript_font_regular = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Regular.ttf");
+const gl_transcript_font_bold = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Bold.ttf");
+const gl_transcript_font_italic = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Italic.ttf");
+const gl_transcript_font_bold_italic = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-BoldItalic.ttf");
+const gl_transcript_font_mono = if (builtin.is_test) "" else @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
+const gl_transcript_font_calsans = if (builtin.is_test) "" else @embedFile("../assets/fonts/CalSans-Regular.ttf");
+
+/// Default fall-back: body prose face. Used by call sites that don't know the
+/// role (whitespace shortcut, generic helpers). Same face the body draws with.
+const gl_transcript_font = gl_transcript_font_regular;
+
+fn transcriptMeasurementFont(role: palette.FontRole) []const u8 {
+    // SDL_GPU's palette renderer currently only dispatches `.mono` and `.icon`
+    // to dedicated faces (palette/src/renderer.zig:953 fontForRole). Every other
+    // role falls through to the single default font, which main.zig wires to
+    // NotoSans-Bold. So measure against Bold for non-mono/icon text — measuring
+    // Regular here while the renderer draws Bold creates ~10% width under-shoot
+    // per chunk and causes "currentlyon"/"architecturediagrams" collisions.
+    return switch (role) {
+        .mono => gl_transcript_font_mono,
+        .icon => gl_transcript_font_regular,
+        else => gl_transcript_font_bold,
+    };
+}
 
 fn glTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
+    return glTranscriptTextWidthForRole(font_size, .prose, text);
+}
+
+fn glTranscriptTextWidthForRole(font_size: f32, role: palette.FontRole, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
-    if (inlineWhitespaceWidth(font_size, text)) |width| return width;
+    // Tests don't link the C FFI; fall back to the byte-estimate.
     if (builtin.is_test) return estimatedTranscriptTextWidth(font_size, text);
-    return palette_text_gl_measure_line_width(
-        gl_transcript_font.ptr,
-        @intCast(gl_transcript_font.len),
+    // Whitespace gets a constant per-em estimate.
+    if (inlineWhitespaceWidth(font_size, text)) |width| return width;
+    const font_bytes = transcriptMeasurementFont(role);
+    const ascii_width = palette_text_gl_measure_line_width(
+        font_bytes.ptr,
+        @intCast(font_bytes.len),
         text.ptr,
         @intCast(text.len),
         font_size,
     ) * SDL_GPU_TRANSCRIPT_WIDTH_SCALE;
+    // The C FFI skips bytes outside ASCII 32–126, so em-dash, en-dash, smart
+    // quotes, etc. all measure as 0 width even though SDL_GPU draws them at
+    // full glyph width. That causes a glyph like — to overlap the next chunk
+    // (visible as a "strikethrough" through the following words). Estimate one
+    // em-width per non-ASCII codepoint so layout reserves space for them.
+    return ascii_width + nonAsciiCodepointWidth(font_size, text);
 }
+
+fn nonAsciiCodepointWidth(font_size: f32, text: []const u8) f32 {
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const b = text[i];
+        if (b < 0x80) {
+            i += 1;
+        } else {
+            count += 1;
+            i += if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
+        }
+    }
+    // Conservative single-em estimate per codepoint covers em-dash (1em),
+    // smart quotes (~0.3em), arrows (~1em). Slight over-reserve is preferable
+    // to under-reserve since the renderer draws the full glyph regardless.
+    return @as(f32, @floatFromInt(count)) * font_size * 0.6;
+}
+
+// NotoSans-Bold's space advance is ~0.29em; the SDL_GPU width scale was calibrated
+// for glyph runs (kerning + atlas inflation) and should NOT be applied to lone
+// whitespace, otherwise the layout reserves ~67% more space than the renderer
+// actually draws, producing visible "rivers" between words.
+const TRANSCRIPT_SPACE_EM: f32 = 0.30;
 
 fn estimatedTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
     var width: f32 = 0.0;
@@ -46,8 +108,8 @@ fn estimatedTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
         width += switch (byte) {
             'i', 'l', 'I', '.', ',', ':', ';', '!' => font_size * 0.28,
             'm', 'w', 'M', 'W' => font_size * 0.78,
-            ' ' => font_size * 0.42 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
-            '\t' => font_size * 0.42 * 4.0 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            ' ' => font_size * TRANSCRIPT_SPACE_EM,
+            '\t' => font_size * TRANSCRIPT_SPACE_EM * 4.0,
             else => font_size * 0.55,
         };
     }
@@ -58,8 +120,8 @@ fn inlineWhitespaceWidth(font_size: f32, text: []const u8) ?f32 {
     var width: f32 = 0.0;
     for (text) |byte| {
         switch (byte) {
-            ' ' => width += font_size * 0.42 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
-            '\t' => width += font_size * 0.42 * 4.0 * SDL_GPU_TRANSCRIPT_WIDTH_SCALE,
+            ' ' => width += font_size * TRANSCRIPT_SPACE_EM,
+            '\t' => width += font_size * TRANSCRIPT_SPACE_EM * 4.0,
             else => return null,
         }
     }
@@ -1105,9 +1167,10 @@ fn walkTextBlockLayout(
                 const chunk_line_height = lineHeightForSpec(spec, options);
                 const slice = block.text[text_run.start..text_run.end];
                 const layout_font_size = fontSizeForSpecWithOptions(spec, options);
+                const measure_role = markdownFontRole(block.style, text_run.style);
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = glTranscriptTextWidth(layout_font_size, chunk.text);
+                    const chunk_width = glTranscriptTextWidthForRole(layout_font_size, measure_role, chunk.text);
 
                     if (chunk.is_whitespace and state.line_start) {
                         continue;
@@ -1170,6 +1233,8 @@ fn renderPaletteTextBlockLayout(
 ) f32 {
     var underlines: std.ArrayList(MarkdownUnderlineSpec) = .empty;
     defer underlines.deinit(context.allocator);
+    var code_pills: std.ArrayList(palette.Rect) = .empty;
+    defer code_pills.deinit(context.allocator);
     var text_runs: std.ArrayList(palette.TextRun) = .empty;
     defer text_runs.deinit(context.allocator);
 
@@ -1180,16 +1245,43 @@ fn renderPaletteTextBlockLayout(
         block_text: []const u8,
         text_runs: *std.ArrayList(palette.TextRun),
         underlines: *std.ArrayList(MarkdownUnderlineSpec),
+        code_pills: *std.ArrayList(palette.Rect),
 
         fn onStep(ctx: @This(), step: TextBlockLayoutStep) void {
             const px = ctx.start[0] + step.x;
-            const py = ctx.start[1] + step.y;
 
             const draw_font_size = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
+            const block_font = textBlockFontSpecWithOptions(step.block_style, ctx.options);
+            const block_line_height = lineHeightForSpec(block_font, ctx.options);
+            // Bottom-align small chunks (inline code) so their baseline sits on
+            // the surrounding prose baseline instead of floating mid-line. The
+            // text run is top-positioned, so shifting `py` by the line-height
+            // delta brings the smaller box down to share the larger box's
+            // bottom edge.
+            const py_offset: f32 = if (step.line_height < block_line_height)
+                (block_line_height - step.line_height)
+            else
+                0.0;
+            const py = ctx.start[1] + step.y + py_offset;
+
             const color = paletteColor(inlineTextColor(textBlockColor(step.block_style), step.inline_style));
             const clip = ctx.palette_context.clip;
             const byte_start = subsliceByteOffset(ctx.block_text, step.text);
             const byte_end = byte_start + step.text.len;
+            const role = markdownFontRole(step.block_style, step.inline_style);
+
+            // Inline-code pill: collect a per-chunk rect; adjacent code chunks
+            // (including whitespace inside the span) tile edge-to-edge and read
+            // as one continuous pill behind the text.
+            if (step.inline_style.code) {
+                const pill_inset_y: f32 = @max(step.line_height * 0.08, 1.0);
+                ctx.code_pills.append(ctx.palette_context.allocator, .{
+                    .x = px,
+                    .y = py + pill_inset_y,
+                    .w = step.width,
+                    .h = step.line_height - pill_inset_y * 2.0,
+                }) catch {};
+            }
 
             ctx.text_runs.append(ctx.palette_context.allocator, .{
                 .text = step.text,
@@ -1201,21 +1293,8 @@ fn renderPaletteTextBlockLayout(
                 .line_height = step.line_height,
                 .color = color,
                 .clip = clip,
+                .font_role = role,
             }) catch return;
-
-            if (step.inline_style.strong) {
-                ctx.text_runs.append(ctx.palette_context.allocator, .{
-                    .text = step.text,
-                    .byte_start = byte_start,
-                    .byte_end = byte_end,
-                    .x = px + 0.75,
-                    .y = py,
-                    .font_size = draw_font_size,
-                    .line_height = step.line_height,
-                    .color = color,
-                    .clip = clip,
-                }) catch return;
-            }
 
             if (step.inline_style.link or step.inline_style.emphasis) {
                 const underline_color = if (step.inline_style.link)
@@ -1243,7 +1322,17 @@ fn renderPaletteTextBlockLayout(
         .block_text = block.text,
         .text_runs = &text_runs,
         .underlines = &underlines,
+        .code_pills = &code_pills,
     }, RenderContext.onStep);
+
+    // Queue pill backgrounds before the text batch so they render behind the glyphs.
+    if (code_pills.items.len > 0) {
+        const pill_color = paletteColor(colors.rgba(38, 41, 48, 235));
+        const pill_radius = @max(theme.scaledUi(3.0), 2.0);
+        for (code_pills.items) |rect| {
+            queuePaletteRoundedRect(context, rect, pill_color, pill_radius);
+        }
+    }
 
     if (text_runs.items.len > 0) {
         // `block.text` is freed when the BodyView is deinit'd after this frame's layout
@@ -2015,7 +2104,7 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = glTranscriptTextWidth(codeFontSize(options), token.text);
+            const token_width = glTranscriptTextWidthForRole(codeFontSize(options), .mono, token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
@@ -2137,12 +2226,12 @@ fn renderSelectableCodeLine(
     }
 
     for (line.chunks) |chunk| {
-        queuePaletteText(context, .{
+        queuePaletteRoleText(context, .{
             .x = start[0] + chunk.x,
             .y = top,
             .w = @max(clip.x + clip.w - (start[0] + chunk.x), 1.0),
             .h = codeLineHeight(options),
-        }, chunk.text, paletteColor(codeTokenColor(chunk.token_kind)), codeFontSize(options), clip);
+        }, chunk.text, paletteColor(codeTokenColor(chunk.token_kind)), codeFontSize(options), .mono, clip);
     }
 }
 
@@ -2217,21 +2306,14 @@ fn renderPaletteStyledChunk(
 ) void {
     const color = inlineTextColor(textBlockColor(block_style), inline_style);
     const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
+    const role = markdownFontRole(block_style, inline_style);
 
-    queuePaletteText(context, .{
+    queuePaletteRoleText(context, .{
         .x = position[0],
         .y = position[1],
         .w = width,
         .h = line_height,
-    }, text, paletteColor(color), draw_font_size, context.clip);
-    if (inline_style.strong) {
-        queuePaletteText(context, .{
-            .x = position[0] + 0.75,
-            .y = position[1],
-            .w = width,
-            .h = line_height,
-        }, text, paletteColor(color), draw_font_size, context.clip);
-    }
+    }, text, paletteColor(color), draw_font_size, role, context.clip);
 
     if (inline_style.link or inline_style.emphasis) {
         const underline_color = if (inline_style.link) paletteColor(colors.rgb(0x7A, 0xCA, 0xFF)) else paletteColor(color);
@@ -2251,13 +2333,13 @@ fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, lay
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = glTranscriptTextWidth(code_fs, token.text);
-        queuePaletteText(context, .{
+        const width = glTranscriptTextWidthForRole(code_fs, .mono, token.text);
+        queuePaletteRoleText(context, .{
             .x = cursor_x,
             .y = layout.y,
             .w = @min(width, @max(layout.max_x - cursor_x, 1.0)),
             .h = codeLineHeight(options),
-        }, token.text, paletteColor(codeTokenColor(token.kind)), codeFontSize(options), clip);
+        }, token.text, paletteColor(codeTokenColor(token.kind)), codeFontSize(options), .mono, clip);
         cursor_x += width;
     }
 }
@@ -2366,6 +2448,23 @@ fn isInlineWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t';
 }
 
+/// Map a markdown block + inline style to the Palette FontRole that should
+/// render it. Chat headings stay on the default UI face (CalSans) so they read
+/// as part of the same design language as the surrounding chrome. Body prose
+/// drops to NotoSans-Regular; strong/italic emphasis selects the matching Noto
+/// weight; inline code switches to mono.
+fn markdownFontRole(block_style: TextStyle, inline_style: InlineStyle) palette.FontRole {
+    if (inline_style.code) return .mono;
+    switch (block_style) {
+        .heading_1, .heading_2, .heading_3, .heading_4, .heading_5, .heading_6 => return .ui,
+        else => {},
+    }
+    if (inline_style.strong and inline_style.emphasis) return .prose_bold_italic;
+    if (inline_style.strong) return .prose_bold;
+    if (inline_style.emphasis) return .prose_italic;
+    return .prose;
+}
+
 fn inlineTextColor(base_color: [4]f32, style: InlineStyle) [4]f32 {
     var color = base_color;
     if (style.code) color = colors.rgb(0xF5, 0xD0, 0x7A);
@@ -2395,7 +2494,10 @@ fn blankBlockHeight(options: RenderOptions) f32 {
 }
 
 fn blockGap(options: RenderOptions) f32 {
-    return @max(defaultLineHeight(options) * 0.65, 1.0);
+    // Paragraph↔heading, paragraph↔list-loose, paragraph↔code-fence transitions.
+    // Tight list items still use compactBlockGap; bumping this only affects
+    // breathing room around real section breaks.
+    return @max(defaultLineHeight(options) * 0.95, 1.0);
 }
 
 fn compactBlockGap(options: RenderOptions) f32 {
@@ -2485,6 +2587,28 @@ fn queuePaletteText(context: *PaletteRenderContext, rect: palette.Rect, value: [
         font_size * 0.55,
         font_size * 1.25,
         false,
+    ) catch {};
+}
+
+fn queuePaletteRoleText(
+    context: *PaletteRenderContext,
+    rect: palette.Rect,
+    value: []const u8,
+    color: palette.Color,
+    font_size: f32,
+    font_role: palette.FontRole,
+    clip: ?palette.Rect,
+) void {
+    const stable = stablePaletteText(context, value) catch return;
+    context.batch.roleText(
+        context.allocator,
+        rect,
+        stable,
+        color,
+        font_size,
+        font_role,
+        null,
+        clip,
     ) catch {};
 }
 

@@ -1816,6 +1816,10 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .ui_bold => 2,
         .icon => 3,
         .mono => 4,
+        .prose => 5,
+        .prose_bold => 6,
+        .prose_italic => 7,
+        .prose_bold_italic => 8,
     } else 0;
 }
 

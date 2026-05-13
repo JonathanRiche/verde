@@ -603,6 +603,33 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                     continue;
                 }
             },
+            'h' => {
+                // Bare URL autolink: turn `http(s)://…` runs into links so the
+                // renderer can color/underline them without requiring `[…](…)`.
+                // Only triggers at a word boundary so we don't grab `ahttp://`.
+                const at_boundary = index == 0 or isAutolinkBoundary(source[index - 1]);
+                if (at_boundary) {
+                    if (autolinkLength(source, index)) |url_len| {
+                        try appendTextInline(allocator, &inlines, source[text_start..index]);
+                        const url = source[index .. index + url_len];
+                        // Do NOT recurse via parseInlines here — the URL itself
+                        // starts with 'h' and would re-enter this branch (stack
+                        // overflow). The label text is the URL verbatim.
+                        const children = try allocator.alloc(model.Inline, 1);
+                        children[0] = .{ .text = .{ .text = url } };
+                        try inlines.append(allocator, .{
+                            .link = .{
+                                .label = url,
+                                .destination = url,
+                                .children = children,
+                            },
+                        });
+                        index += url_len;
+                        text_start = index;
+                        continue;
+                    }
+                }
+            },
             else => {},
         }
 
@@ -611,6 +638,38 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
 
     try appendTextInline(allocator, &inlines, source[text_start..]);
     return try inlines.toOwnedSlice(allocator);
+}
+
+fn isAutolinkBoundary(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r', '(', '[', '<', '"', '\'' => true,
+        else => false,
+    };
+}
+
+fn autolinkLength(source: []const u8, start: usize) ?usize {
+    const remaining = source[start..];
+    const scheme_len: usize =
+        if (std.mem.startsWith(u8, remaining, "https://")) 8
+        else if (std.mem.startsWith(u8, remaining, "http://")) 7
+        else return null;
+    var end = start + scheme_len;
+    while (end < source.len) : (end += 1) {
+        switch (source[end]) {
+            ' ', '\t', '\n', '\r', '<', '>', '"', '\'' => break,
+            else => {},
+        }
+    }
+    // Trim trailing punctuation that's almost always sentence-final, not part
+    // of the URL (e.g. `see https://x.com/.` shouldn't capture the dot).
+    while (end > start + scheme_len) {
+        const c = source[end - 1];
+        if (c == '.' or c == ',' or c == ';' or c == ':' or c == ')' or c == ']' or c == '!' or c == '?') {
+            end -= 1;
+        } else break;
+    }
+    if (end == start + scheme_len) return null;
+    return end - start;
 }
 
 const InlineParseResult = struct {

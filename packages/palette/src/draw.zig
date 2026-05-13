@@ -68,6 +68,12 @@ pub const FontRole = enum {
     ui_bold,
     icon,
     mono,
+    // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
+    // (display sans) can differ from the body face (humanist sans regular).
+    prose,
+    prose_bold,
+    prose_italic,
+    prose_bold_italic,
 };
 
 pub const TextRun = struct {
