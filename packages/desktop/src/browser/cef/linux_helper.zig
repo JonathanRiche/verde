@@ -591,7 +591,7 @@ fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_S
         frame_file.handle = -1;
         errdefer _ = std.c.close(frame_fds[index]);
 
-        if (std.c.ftruncate64(frame_fds[index], FRAME_BYTES_MAX) != 0) return error.Unexpected;
+        if (std.c.ftruncate(frame_fds[index], FRAME_BYTES_MAX) != 0) return error.Unexpected;
         frame.slots[index] = try std.posix.mmap(
             null,
             FRAME_BYTES_MAX,
