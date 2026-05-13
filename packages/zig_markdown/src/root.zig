@@ -24,6 +24,10 @@ pub const ListKind = model.ListKind;
 pub const Paragraph = model.Paragraph;
 pub const Parser = parser.Parser;
 pub const Span = model.Span;
+pub const TableAlignment = model.TableAlignment;
+pub const TableBlock = model.TableBlock;
+pub const TableCell = model.TableCell;
+pub const TableRow = model.TableRow;
 pub const TextInline = model.TextInline;
 
 pub fn parse(allocator: Allocator, source: []const u8) !Document {

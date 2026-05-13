@@ -187,11 +187,50 @@ pub const ThematicBreakView = struct {
     compact: bool = false,
 };
 
+pub const TableCellView = struct {
+    text: []const u8,
+    runs: []InlineRunView,
+
+    pub fn deinit(self: *TableCellView, allocator: Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.runs);
+        self.* = undefined;
+    }
+};
+
+pub const TableRowView = struct {
+    cells: []TableCellView,
+
+    pub fn deinit(self: *TableRowView, allocator: Allocator) void {
+        for (self.cells) |*cell| cell.deinit(allocator);
+        allocator.free(self.cells);
+        self.* = undefined;
+    }
+};
+
+pub const TableView = struct {
+    span: zig_markdown.Span,
+    alignments: []zig_markdown.TableAlignment,
+    header: TableRowView,
+    rows: []TableRowView,
+    indent: usize = 0,
+    compact: bool = false,
+
+    pub fn deinit(self: *TableView, allocator: Allocator) void {
+        self.header.deinit(allocator);
+        for (self.rows) |*row| row.deinit(allocator);
+        allocator.free(self.rows);
+        allocator.free(self.alignments);
+        self.* = undefined;
+    }
+};
+
 pub const BlockKind = enum {
     blank,
     text,
     fenced_code,
     thematic_break,
+    table,
 };
 
 pub const BlockView = union(enum) {
@@ -199,6 +238,7 @@ pub const BlockView = union(enum) {
     text: TextBlockView,
     fenced_code: FencedCodeView,
     thematic_break: ThematicBreakView,
+    table: TableView,
 
     pub fn kind(self: BlockView) BlockKind {
         return switch (self) {
@@ -206,6 +246,7 @@ pub const BlockView = union(enum) {
             .text => .text,
             .fenced_code => .fenced_code,
             .thematic_break => .thematic_break,
+            .table => .table,
         };
     }
 
@@ -215,6 +256,7 @@ pub const BlockView = union(enum) {
             .text => |text| text.span,
             .fenced_code => |code| code.span,
             .thematic_break => |rule| rule.span,
+            .table => |t| t.span,
         };
     }
 
@@ -224,6 +266,7 @@ pub const BlockView = union(enum) {
             .text => |text| text.compact,
             .fenced_code => |code| code.compact,
             .thematic_break => |rule| rule.compact,
+            .table => |t| t.compact,
         };
     }
 };
@@ -333,6 +376,7 @@ pub fn renderPaletteBody(context: *PaletteRenderContext, view: BodyView, options
             .text => |text| renderPaletteTextBlock(context, text, available_width, options),
             .fenced_code => |code| renderPaletteFencedCodeBlock(context, code, available_width, options),
             .thematic_break => |rule| renderPaletteThematicBreakBlock(context, rule, available_width, options),
+            .table => |table| renderPaletteTableBlock(context, table, available_width, options),
         }
 
         previous = block;
@@ -409,6 +453,13 @@ pub fn selectionRangeForClickCount(
                 }
             },
             .thematic_break => {},
+            .table => {
+                // Tables aren't selectable line-by-line yet; treat each rendered
+                // row as one logical line so global_line_index advances and
+                // subsequent block lookups stay aligned.
+                const row_count = 1 + block.table.rows.len;
+                global_line_index += row_count;
+            },
         }
 
         previous = block;
@@ -435,6 +486,7 @@ pub fn measureBodyHeight(view: BodyView, available_width: f32, options: RenderOp
             .text => |text| measureTextBlockHeight(text, width, options),
             .fenced_code => |code| measureFencedCodeHeight(code, width, options),
             .thematic_break => |rule| measureThematicBreakHeight(rule),
+            .table => |table| measureTableHeight(table, width, options),
         };
 
         previous = block;
@@ -555,6 +607,13 @@ pub fn renderSelectablePaletteBody(
             .thematic_break => |rule| {
                 renderPaletteThematicBreakBlock(context, rule, available_width, options);
             },
+            .table => |table_block| {
+                // Tables don't participate in line-level selection yet; render
+                // the block and bump global_line_index past its rows so the
+                // caller's selection coordinates stay in sync.
+                renderPaletteTableBlock(context, table_block, available_width, options);
+                global_line_index += 1 + table_block.rows.len;
+            },
         }
 
         previous = block;
@@ -612,8 +671,68 @@ fn appendMarkdownBlocks(
             }),
             .block_quote => |quote| try appendMarkdownBlocks(allocator, blocks, quote.blocks, context.quoted()),
             .list => |list| try appendListBlock(allocator, blocks, list, context),
+            .table => |table| try blocks.append(allocator, .{
+                .table = try buildTableView(allocator, table, context),
+            }),
         }
     }
+}
+
+fn buildTableCellView(
+    allocator: Allocator,
+    cell: zig_markdown.TableCell,
+) Allocator.Error!TableCellView {
+    var content = try buildTextContent(allocator, cell.inlines);
+    errdefer content.deinit(allocator);
+    return .{
+        .text = content.text,
+        .runs = content.runs,
+    };
+}
+
+fn buildTableRowView(
+    allocator: Allocator,
+    row: zig_markdown.TableRow,
+) Allocator.Error!TableRowView {
+    const cells = try allocator.alloc(TableCellView, row.cells.len);
+    errdefer {
+        for (cells) |*cell| cell.deinit(allocator);
+        allocator.free(cells);
+    }
+    for (row.cells, 0..) |cell, i| {
+        cells[i] = try buildTableCellView(allocator, cell);
+    }
+    return .{ .cells = cells };
+}
+
+fn buildTableView(
+    allocator: Allocator,
+    table: zig_markdown.TableBlock,
+    context: FlattenContext,
+) Allocator.Error!TableView {
+    const alignments = try allocator.dupe(zig_markdown.TableAlignment, table.alignments);
+    errdefer allocator.free(alignments);
+
+    var header = try buildTableRowView(allocator, table.header);
+    errdefer header.deinit(allocator);
+
+    const rows = try allocator.alloc(TableRowView, table.rows.len);
+    errdefer {
+        for (rows) |*row| row.deinit(allocator);
+        allocator.free(rows);
+    }
+    for (table.rows, 0..) |row, i| {
+        rows[i] = try buildTableRowView(allocator, row);
+    }
+
+    return .{
+        .span = table.span,
+        .alignments = alignments,
+        .header = header,
+        .rows = rows,
+        .indent = context.indent,
+        .compact = context.compact,
+    };
 }
 
 fn appendListBlock(
@@ -906,7 +1025,11 @@ fn listItemMarker(
     number: usize,
 ) Allocator.Error![]const u8 {
     return switch (kind) {
-        .unordered => allocator.dupe(u8, "- "),
+        // U+2022 bullet (`•`) reads as a real list mark instead of a literal
+        // hyphen. The trailing space gives breathing room before the item text;
+        // hanging-indent for wrapped continuation lines is handled separately
+        // via the `indent` field on the flattened TextBlockView.
+        .unordered => allocator.dupe(u8, "•  "),
         .ordered => std.fmt.allocPrint(allocator, "{d}. ", .{number}),
     };
 }
@@ -921,6 +1044,10 @@ fn deinitBlockViews(allocator: Allocator, blocks: []BlockView) void {
             .fenced_code => |code| {
                 var code_copy = code;
                 code_copy.deinit(allocator);
+            },
+            .table => |table| {
+                var owned = table;
+                owned.deinit(allocator);
             },
             else => {},
         }
@@ -1028,6 +1155,170 @@ fn renderPaletteThematicBreakBlock(context: *PaletteRenderContext, rule: Themati
     const y = start[1] + height * 0.5;
     queuePaletteRect(context, .{ .x = start[0], .y = y, .w = width, .h = 1.0 }, paletteColor(colors.rgba(68, 72, 82, 255)));
     advancePaletteCursor(context, height);
+}
+
+/// Per-row height for a single-line table cell, including vertical padding.
+fn tableRowHeight(options: RenderOptions) f32 {
+    return defaultLineHeight(options) + tableCellPaddingY(options) * 2.0;
+}
+
+fn tableCellPaddingX(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.45, 8.0);
+}
+
+fn tableCellPaddingY(options: RenderOptions) f32 {
+    return @max(defaultLineHeight(options) * 0.20, 4.0);
+}
+
+fn measureTableHeight(table: TableView, available_width: f32, options: RenderOptions) f32 {
+    _ = available_width;
+    const rows: f32 = 1.0 + @as(f32, @floatFromInt(table.rows.len));
+    return tableRowHeight(options) * rows;
+}
+
+/// Sum of per-column natural widths and the available width, used to decide
+/// whether columns need to be scaled down to fit.
+const TableColumnMetrics = struct {
+    widths: []f32,
+    total_natural: f32,
+};
+
+fn buildTableColumnMetrics(
+    allocator: Allocator,
+    table: TableView,
+    options: RenderOptions,
+) !TableColumnMetrics {
+    const column_count = table.header.cells.len;
+    const widths = try allocator.alloc(f32, column_count);
+    @memset(widths, 0.0);
+
+    const base_size = options.base_font_size;
+
+    // Header drives the bold-weight width; body rows use prose weight.
+    for (table.header.cells, 0..) |cell, col| {
+        const w = text_measure.textWidth(.prose_bold, base_size, cell.text);
+        if (w > widths[col]) widths[col] = w;
+    }
+    for (table.rows) |row| {
+        for (row.cells, 0..) |cell, col| {
+            if (col >= column_count) break;
+            const w = text_measure.textWidth(.prose, base_size, cell.text);
+            if (w > widths[col]) widths[col] = w;
+        }
+    }
+
+    const pad_x = tableCellPaddingX(options);
+    var total: f32 = 0.0;
+    for (widths) |*w| {
+        w.* += pad_x * 2.0;
+        total += w.*;
+    }
+    return .{ .widths = widths, .total_natural = total };
+}
+
+fn renderPaletteTableBlock(
+    context: *PaletteRenderContext,
+    table: TableView,
+    available_width: f32,
+    options: RenderOptions,
+) void {
+    if (table.header.cells.len == 0) return;
+
+    const indent = indentWidth(table.indent);
+    const start = .{ context.cursor.x + indent, context.cursor.y };
+    const width = @max(available_width - indent, 1.0);
+
+    const metrics = buildTableColumnMetrics(context.allocator, table, options) catch return;
+    defer context.allocator.free(metrics.widths);
+
+    // Scale columns proportionally so the table fills exactly `width`. This
+    // both shrinks overflow and pads narrow tables to span the body column.
+    const scale: f32 = if (metrics.total_natural > 0.0) width / metrics.total_natural else 1.0;
+
+    const row_h = tableRowHeight(options);
+    const pad_x = tableCellPaddingX(options);
+    const pad_y = tableCellPaddingY(options);
+    const border_color = paletteColor(colors.rgba(68, 72, 82, 255));
+    const header_bg = paletteColor(colors.rgba(38, 41, 48, 200));
+
+    // Header background tint + bottom border.
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = row_h }, header_bg);
+
+    // Draw all row content first, then borders on top so they read clearly.
+    var row_index: usize = 0;
+    var y_cursor: f32 = start[1];
+    drawTableRow(context, table.header, metrics.widths, table.alignments, scale, start[0], y_cursor, pad_x, pad_y, row_h, options, true);
+    y_cursor += row_h;
+    while (row_index < table.rows.len) : (row_index += 1) {
+        drawTableRow(context, table.rows[row_index], metrics.widths, table.alignments, scale, start[0], y_cursor, pad_x, pad_y, row_h, options, false);
+        y_cursor += row_h;
+    }
+
+    const total_h = row_h * (1.0 + @as(f32, @floatFromInt(table.rows.len)));
+
+    // Horizontal rules between rows + outer top/bottom.
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = 1.0 }, border_color);
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1] + total_h - 1.0, .w = width, .h = 1.0 }, border_color);
+    var rb: usize = 0;
+    while (rb <= table.rows.len) : (rb += 1) {
+        const yy = start[1] + row_h * @as(f32, @floatFromInt(rb));
+        queuePaletteRect(context, .{ .x = start[0], .y = yy, .w = width, .h = 1.0 }, border_color);
+    }
+
+    // Vertical rules between columns + outer left/right.
+    var x_cursor: f32 = start[0];
+    queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
+    for (metrics.widths) |w| {
+        x_cursor += w * scale;
+        queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
+    }
+
+    advancePaletteCursor(context, total_h);
+}
+
+fn drawTableRow(
+    context: *PaletteRenderContext,
+    row: TableRowView,
+    column_widths: []f32,
+    alignments: []zig_markdown.TableAlignment,
+    scale: f32,
+    x0: f32,
+    y0: f32,
+    pad_x: f32,
+    pad_y: f32,
+    row_h: f32,
+    options: RenderOptions,
+    is_header: bool,
+) void {
+    const font_size = options.base_font_size;
+    const role: palette.FontRole = if (is_header) .prose_bold else .prose;
+    const color = paletteColor(if (is_header) colors.rgb(0xF2, 0xE6, 0x8D) else colors.rgb(0xE2, 0xE4, 0xE9));
+    const line_height = defaultLineHeight(options);
+    const text_y = y0 + pad_y + (row_h - pad_y * 2.0 - line_height) * 0.5;
+
+    var x_cursor: f32 = x0;
+    for (row.cells, 0..) |cell, col| {
+        if (col >= column_widths.len) break;
+        const cell_w = column_widths[col] * scale;
+        const content_w = @max(cell_w - pad_x * 2.0, 1.0);
+        const text_w = text_measure.textWidth(role, font_size, cell.text);
+
+        const alignment: zig_markdown.TableAlignment = if (col < alignments.len) alignments[col] else .default;
+        const align_offset: f32 = switch (alignment) {
+            .center => @max((content_w - text_w) * 0.5, 0.0),
+            .right => @max(content_w - text_w, 0.0),
+            else => 0.0,
+        };
+
+        queuePaletteRoleText(context, .{
+            .x = x_cursor + pad_x + align_offset,
+            .y = text_y,
+            .w = content_w,
+            .h = line_height,
+        }, cell.text, color, font_size, role, context.clip);
+
+        x_cursor += cell_w;
+    }
 }
 
 const TextBlockLayoutState = struct {
@@ -1419,6 +1710,13 @@ pub fn lastSelectablePointInBody(
                 }
             },
             .thematic_break => {},
+            .table => |table_block| {
+                // One logical line per row (header + body). No per-cell column
+                // resolution yet — selection inside tables is a future task.
+                const row_count = 1 + table_block.rows.len;
+                last = .{ .line_index = global_line_index + row_count - 1, .column = 0 };
+                global_line_index += row_count;
+            },
         }
 
         previous = block;
@@ -1552,6 +1850,17 @@ pub fn hitTestSelectablePaletteBody(
                 _ = indent;
                 context_cursor.y += height;
                 context_cursor.h = @max(context_cursor.h, height);
+            },
+            .table => |table_block| {
+                const height = measureTableHeight(table_block, width, options);
+                const top = context_cursor.y;
+                const bottom = top + height;
+                if (mouse[1] >= top and mouse[1] <= bottom and mouse[0] >= body_rect.x and mouse[0] <= body_rect.x + body_rect.w) {
+                    return .{ .line_index = global_line_index, .column = 0 };
+                }
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+                global_line_index += 1 + table_block.rows.len;
             },
         }
 
@@ -2287,39 +2596,34 @@ fn measureThematicBreakHeight(rule: ThematicBreakView) f32 {
     return thematicBreakHeight(.{});
 }
 
-fn textBlockFontSpec(style: TextStyle, options: RenderOptions) FontSpec {
-    const base_size = options.base_font_size;
-    const heading_size = base_size;
+// Monotonic descending heading scale relative to the body font size. The
+// previous scale was buggy: H3 (1.20) exceeded H2 (1.08), and H4–H6 all
+// ended up *larger* than H3 via the `@max(base*X, heading*Y)` fallback. The
+// new scale is a clean h1 > h2 > h3 > h4 > h5 > h6 > body curve with enough
+// separation between adjacent levels to read as real hierarchy.
+fn headingScale(style: TextStyle) f32 {
+    return switch (style) {
+        .heading_1 => 1.50,
+        .heading_2 => 1.30,
+        .heading_3 => 1.15,
+        .heading_4 => 1.05,
+        .heading_5 => 0.98,
+        .heading_6 => 0.92,
+        else => 1.0,
+    };
+}
 
+fn textBlockFontSpec(style: TextStyle, options: RenderOptions) FontSpec {
     return switch (style) {
         .paragraph, .quote => .{},
-        .heading_1 => .{ .size = heading_size * 1.18 },
-        .heading_2 => .{ .size = heading_size * 1.08 },
-        .heading_3 => .{ .size = @max(base_size * 1.20, heading_size * 0.94) },
-        .heading_4 => .{ .size = @max(base_size * 1.12, heading_size * 0.86) },
-        .heading_5 => .{ .size = @max(base_size * 1.06, heading_size * 0.8) },
-        .heading_6 => .{ .size = @max(base_size * 1.02, heading_size * 0.76) },
+        else => .{ .size = options.base_font_size * headingScale(style) },
     };
 }
 
 fn textBlockFontSpecWithOptions(style: TextStyle, options: RenderOptions) FontSpec {
-    const base = textBlockFontSpec(style, options);
-    if (style == .paragraph or style == .quote) return base;
-
-    return .{
-        .size = if (options.heading_font_size) |heading_size|
-            switch (style) {
-                .heading_1 => heading_size * 1.18,
-                .heading_2 => heading_size * 1.08,
-                .heading_3 => @max(options.base_font_size * 1.20, heading_size * 0.94),
-                .heading_4 => @max(options.base_font_size * 1.12, heading_size * 0.86),
-                .heading_5 => @max(options.base_font_size * 1.06, heading_size * 0.8),
-                .heading_6 => @max(options.base_font_size * 1.02, heading_size * 0.76),
-                else => base.size,
-            }
-        else
-            base.size,
-    };
+    if (style == .paragraph or style == .quote) return .{};
+    const reference = options.heading_font_size orelse options.base_font_size;
+    return .{ .size = reference * headingScale(style) };
 }
 
 fn inlineFontSpec(block_style: TextStyle, inline_style: InlineStyle, options: RenderOptions) FontSpec {

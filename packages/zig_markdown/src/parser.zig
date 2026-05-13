@@ -103,11 +103,126 @@ fn parseBlocks(
             continue;
         }
 
+        if (try parseTableBlock(allocator, lines, index)) |result| {
+            try blocks.append(allocator, result.block);
+            continue;
+        }
+
         const result = try parseParagraphBlock(allocator, source, lines, index);
         try blocks.append(allocator, result.block);
     }
 
     return try blocks.toOwnedSlice(allocator);
+}
+
+/// GFM pipe-table parser. Requires:
+///   line N:   `| header | header |`  (any line containing `|` that yields ≥2 cells)
+///   line N+1: `| --- | --- |`        (each cell matches `:?-+:?` after trimming)
+///   line N+2…: data rows (same pattern, padded to header width or truncated).
+/// Pipes at line edges are optional in GFM but expected here for clarity.
+fn parseTableBlock(
+    allocator: Allocator,
+    lines: []const Line,
+    index: *usize,
+) Allocator.Error!?ParseResult {
+    if (index.* + 1 >= lines.len) return null;
+
+    const header_line = lines[index.*];
+    const delim_line = lines[index.* + 1];
+
+    const header_cells_str = (try splitTableCells(allocator, header_line.text)) orelse return null;
+    if (header_cells_str.len < 1) return null;
+
+    const alignments = (try parseTableDelimiterRow(allocator, delim_line.text)) orelse return null;
+    if (alignments.len != header_cells_str.len) return null;
+
+    var header_cells = try allocator.alloc(model.TableCell, header_cells_str.len);
+    for (header_cells_str, 0..) |cell_text, i| {
+        header_cells[i] = .{ .inlines = try parseInlines(allocator, std.mem.trim(u8, cell_text, " \t")) };
+    }
+
+    var rows: std.ArrayListUnmanaged(model.TableRow) = .empty;
+    var scan: usize = index.* + 2;
+    var last_line = delim_line;
+    while (scan < lines.len) : (scan += 1) {
+        const line = lines[scan];
+        const cells_str = (try splitTableCells(allocator, line.text)) orelse break;
+        var row_cells = try allocator.alloc(model.TableCell, header_cells_str.len);
+        for (0..header_cells_str.len) |i| {
+            const text = if (i < cells_str.len) std.mem.trim(u8, cells_str[i], " \t") else "";
+            row_cells[i] = .{ .inlines = try parseInlines(allocator, text) };
+        }
+        try rows.append(allocator, .{ .cells = row_cells });
+        last_line = line;
+    }
+
+    index.* = scan;
+    return .{
+        .block = .{
+            .table = .{
+                .span = makeSpan(header_line.number, last_line.number, header_line.start, last_line.end),
+                .alignments = alignments,
+                .header = .{ .cells = header_cells },
+                .rows = try rows.toOwnedSlice(allocator),
+            },
+        },
+        .next_index = scan,
+    };
+}
+
+/// Split a `| a | b | c |` line into `["a", "b", "c"]`. Returns null if the
+/// line isn't table-shaped (no pipes, or fewer than 2 cells).
+fn splitTableCells(allocator: Allocator, raw: []const u8) Allocator.Error!?[][]const u8 {
+    var trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '|') == null) return null;
+    if (trimmed[0] == '|') trimmed = trimmed[1..];
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '|') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (trimmed.len == 0) return null;
+
+    var cells: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer cells.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        // `\|` is the GFM escape for a literal pipe inside a cell.
+        if (trimmed[i] == '\\' and i + 1 < trimmed.len and trimmed[i + 1] == '|') {
+            i += 1;
+            continue;
+        }
+        if (trimmed[i] == '|') {
+            try cells.append(allocator, trimmed[start..i]);
+            start = i + 1;
+        }
+    }
+    try cells.append(allocator, trimmed[start..]);
+    if (cells.items.len < 2) {
+        cells.deinit(allocator);
+        return null;
+    }
+    return try cells.toOwnedSlice(allocator);
+}
+
+/// Parse `| --- | :---: | ---: |` into alignment markers. Each cell must
+/// match `:?-+:?`. Returns null on any non-matching cell.
+fn parseTableDelimiterRow(allocator: Allocator, raw: []const u8) Allocator.Error!?[]model.TableAlignment {
+    const cells = (try splitTableCells(allocator, raw)) orelse return null;
+    const alignments = try allocator.alloc(model.TableAlignment, cells.len);
+    for (cells, 0..) |cell, i| {
+        const trimmed = std.mem.trim(u8, cell, " \t");
+        if (trimmed.len == 0) return null;
+        const left = trimmed[0] == ':';
+        const right = trimmed[trimmed.len - 1] == ':';
+        const dash_start: usize = if (left) 1 else 0;
+        const dash_end: usize = if (right) trimmed.len - 1 else trimmed.len;
+        if (dash_end <= dash_start) return null;
+        for (trimmed[dash_start..dash_end]) |b| {
+            if (b != '-') return null;
+        }
+        alignments[i] = if (left and right) .center else if (right) .right else if (left) .left else .default;
+    }
+    return alignments;
 }
 
 fn parseFencedCodeBlock(source: []const u8, lines: []const Line, index: *usize) ?ParseResult {
