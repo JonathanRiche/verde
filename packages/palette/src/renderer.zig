@@ -110,6 +110,10 @@ pub const Renderer = struct {
     sampler: ?*c.SDL_GPUSampler = null,
     text_engine: ?*c.TTF_TextEngine = null,
     font: ?*c.TTF_Font = null,
+    ui_font: ?*c.TTF_Font = null,
+    prose_font: ?*c.TTF_Font = null,
+    prose_italic_font: ?*c.TTF_Font = null,
+    prose_bold_italic_font: ?*c.TTF_Font = null,
     mono_font: ?*c.TTF_Font = null,
     icon_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -381,10 +385,38 @@ pub const Renderer = struct {
     }
 
     pub fn configureGpuTextWithRoleFonts(self: *Renderer, font: *sdl.Font, mono_font: ?*sdl.Font, icon_font: ?*sdl.Font) !void {
+        try self.configureGpuTextWithAllRoleFonts(.{
+            .ui = font,
+            .ui_bold = font,
+            .prose = font,
+            .prose_bold = font,
+            .prose_italic = font,
+            .prose_bold_italic = font,
+            .mono = mono_font,
+            .icon = icon_font,
+        });
+    }
+
+    pub const RoleFonts = struct {
+        ui: *sdl.Font,
+        ui_bold: *sdl.Font,
+        prose: *sdl.Font,
+        prose_bold: *sdl.Font,
+        prose_italic: *sdl.Font,
+        prose_bold_italic: *sdl.Font,
+        mono: ?*sdl.Font,
+        icon: ?*sdl.Font,
+    };
+
+    pub fn configureGpuTextWithAllRoleFonts(self: *Renderer, role_fonts: RoleFonts) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
-        self.font = @ptrCast(font);
-        self.mono_font = if (mono_font) |fallback| @ptrCast(fallback) else null;
-        self.icon_font = if (icon_font) |fallback| @ptrCast(fallback) else null;
+        self.font = @ptrCast(role_fonts.prose_bold);
+        self.ui_font = @ptrCast(role_fonts.ui);
+        self.prose_font = @ptrCast(role_fonts.prose);
+        self.prose_italic_font = @ptrCast(role_fonts.prose_italic);
+        self.prose_bold_italic_font = @ptrCast(role_fonts.prose_bold_italic);
+        self.mono_font = if (role_fonts.mono) |fallback| @ptrCast(fallback) else null;
+        self.icon_font = if (role_fonts.icon) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
@@ -951,12 +983,15 @@ pub const Renderer = struct {
     }
 
     fn fontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
-        if (role == .mono) {
-            if (self.mono_font) |font_value| return font_value;
-        }
-        if (role == .icon) {
-            if (self.icon_font) |font_value| return font_value;
-        }
+        if (role) |font_role| switch (font_role) {
+            .ui => if (self.ui_font) |font_value| return font_value,
+            .ui_bold, .prose_bold => {},
+            .prose => if (self.prose_font) |font_value| return font_value,
+            .prose_italic => if (self.prose_italic_font) |font_value| return font_value,
+            .prose_bold_italic => if (self.prose_bold_italic_font) |font_value| return font_value,
+            .mono => if (self.mono_font) |font_value| return font_value,
+            .icon => if (self.icon_font) |font_value| return font_value,
+        };
         return self.font.?;
     }
 

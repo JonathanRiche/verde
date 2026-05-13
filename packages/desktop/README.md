@@ -1,11 +1,10 @@
 # `verde` Desktop
 
-This package contains Verde's standalone Zig desktop app. It uses SDL3, OpenGL, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
+This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
 
 ## Prerequisites
 
 - Zig `0.16.0` through the repo-root [`mise.toml`](../../mise.toml)
-- OpenGL development libraries for your platform
 - SDL3 development files for your platform
 - Provider setup for the providers you want to use:
   - Codex: `codex` on your `PATH` and `codex login`

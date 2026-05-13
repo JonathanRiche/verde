@@ -279,11 +279,11 @@ advances unless a backend supplies tighter font metrics. Full complex shaping
 such as RTL reordering, ligatures, and combining mark positioning is out of
 scope for this stack.
 
-Migration note for custom GL text: delete app-local text measurement and font
-baking code such as `palette_text_gl.c`. Keep submitting `RenderBatch` commands,
+Migration note for custom text renderers: delete app-local text measurement and
+font baking code. Keep submitting `RenderBatch` commands,
 or call `palette.TextStack.appendTextToBatch()` for manual text. In the renderer,
-draw `command.text_runs` exactly as positioned by Palette. A GL backend can keep
-its shader/texture upload code, but the canonical source of UTF-8 decoding,
+draw `command.text_runs` exactly as positioned by Palette. Custom backends can keep
+their shader/texture upload code, but the canonical source of UTF-8 decoding,
 wrapping, line height, and advances is `palette.TextStack`; do not re-wrap or
 re-measure in the app renderer. `zig build run-text-lab` prints a wrapped UTF-8
 batch that renderer implementations can use as a minimal reference.

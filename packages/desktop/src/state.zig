@@ -15,40 +15,14 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
+const text_measure = @import("ui/text_measure.zig");
 const utils = @import("utils.zig");
 
 /// Arrow-key line step for transcript scroll (scaled px per key repeat).
 const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 
-/// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
-const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
-
-extern fn palette_text_gl_measure_codepoint_width(
-    font_data: [*]const u8,
-    font_len: i32,
-    codepoint: i32,
-    font_size: f32,
-) callconv(.c) f32;
-
-extern fn palette_text_gl_measure_line_width(
-    font_data: [*]const u8,
-    font_len: i32,
-    text: [*]const u8,
-    text_len: i32,
-    font_size: f32,
-) callconv(.c) f32;
-
-/// Width of `text[0..end]` in pixels using the same rules as GL UI text (`palette_text_gl_draw`).
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
-    const n = @min(end, text.len);
-    if (n == 0) return 0.0;
-    return palette_text_gl_measure_line_width(
-        palette_ui_ttf.ptr,
-        @intCast(palette_ui_ttf.len),
-        text.ptr,
-        @intCast(n),
-        font_size,
-    );
+    return text_measure.textPrefixWidth(.ui, text, font_size, end);
 }
 
 pub const ReasoningEffort = db_types.ReasoningEffort;
@@ -166,12 +140,7 @@ fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: us
     const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
         return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
-    const w = palette_text_gl_measure_codepoint_width(
-        palette_ui_ttf.ptr,
-        @intCast(palette_ui_ttf.len),
-        @intCast(cp),
-        font_size,
-    );
+    const w = text_measure.codepointWidth(.ui, cp, font_size);
     return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
 
@@ -1181,9 +1150,7 @@ const FileSearchState = struct {
     }
 };
 
-extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
 pub const TextureBackend = enum {
-    gl,
     external,
 };
 
@@ -1192,12 +1159,10 @@ pub const CachedImageTexture = struct {
     width: i32 = 0,
     height: i32 = 0,
     valid: bool = false,
-    backend: TextureBackend = .gl,
+    backend: TextureBackend = .external,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
-        var textures = [_]c_uint{self.texture_id};
-        glDeleteTextures(1, &textures);
+        _ = self;
     }
 };
 

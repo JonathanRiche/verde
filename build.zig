@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
-    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu");
+    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK");
 
@@ -128,6 +128,5 @@ fn appendInstallArgs(b: *std.Build, argv: *std.ArrayList([]const u8)) void {
 }
 
 const PaletteRendererBackend = enum {
-    gl,
     sdl_gpu,
 };

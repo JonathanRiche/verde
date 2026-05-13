@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
-    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: gl or sdl_gpu") orelse .sdl_gpu;
+    const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
@@ -119,10 +119,6 @@ pub fn build(b: *std.Build) void {
         .file = b.path("../../vendor/stb_image_impl.c"),
         .flags = &.{},
     });
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("src/ui/palette_text_gl.c"),
-        .flags = &.{"-DGL_GLEXT_PROTOTYPES"},
-    });
     switch (target.result.os.tag) {
         .linux => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
@@ -130,13 +126,11 @@ pub fn build(b: *std.Build) void {
             }
             exe.root_module.linkSystemLibrary("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            exe.root_module.linkSystemLibrary("GL", .{});
             exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
             exe.root_module.linkSystemLibrary("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            exe.root_module.linkSystemLibrary("opengl32", .{});
         },
         .macos => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
@@ -157,7 +151,6 @@ pub fn build(b: *std.Build) void {
             }
             exe.root_module.linkFramework("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            exe.root_module.linkFramework("OpenGL", .{});
             exe.root_module.linkFramework("AppKit", .{});
         },
         else => {},
@@ -297,16 +290,11 @@ pub fn build(b: *std.Build) void {
     });
     chat_markdown_tests.root_module.link_libc = true;
     chat_markdown_tests.root_module.addIncludePath(b.path("../../vendor"));
-    chat_markdown_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/ui/palette_text_gl.c"),
-        .flags = &.{"-DGL_GLEXT_PROTOTYPES"},
-    });
     if (target.result.os.tag == .linux) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
             chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
         chat_markdown_tests.root_module.linkSystemLibrary("SDL3", .{});
-        chat_markdown_tests.root_module.linkSystemLibrary("GL", .{});
         chat_markdown_tests.root_module.linkSystemLibrary("util", .{});
     }
     test_step.dependOn(&b.addRunArtifact(chat_markdown_tests).step);
@@ -353,7 +341,6 @@ pub fn build(b: *std.Build) void {
             .flags = &.{},
         });
         exe_tests.root_module.linkFramework("SDL3", .{});
-        exe_tests.root_module.linkFramework("OpenGL", .{});
         exe_tests.root_module.linkFramework("AppKit", .{});
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
@@ -363,7 +350,6 @@ pub fn build(b: *std.Build) void {
 }
 
 const PaletteRendererBackend = enum {
-    gl,
     sdl_gpu,
 };
 

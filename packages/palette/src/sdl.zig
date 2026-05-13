@@ -401,6 +401,15 @@ pub fn ttfSetFontSize(font: *Font, point_size: f32) Error!void {
     if (!TTF_SetFontSize(font, point_size)) return error.SdlError;
 }
 
+pub fn ttfMeasureText(font: *Font, text: []const u8, point_size: f32) Error!f32 {
+    if (text.len == 0) return 0.0;
+    try ttfSetFontSize(font, point_size);
+    var width: c_int = 0;
+    var height: c_int = 0;
+    if (!TTF_GetStringSize(font, text.ptr, text.len, &width, &height)) return error.SdlError;
+    return @floatFromInt(width);
+}
+
 pub fn ttfRenderTextBlended(font: *Font, text: []const u8, color: Color) Error!*Surface {
     const value = if (text.len == 0) " " else text;
     return TTF_RenderText_Blended(font, value.ptr, value.len, color) orelse error.SdlError;
@@ -446,6 +455,7 @@ extern fn TTF_Quit() void;
 extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
 extern fn TTF_CloseFont(font: *Font) void;
 extern fn TTF_SetFontSize(font: *Font, ptsize: f32) bool;
+extern fn TTF_GetStringSize(font: *Font, text: [*]const u8, length: usize, w: *c_int, h: *c_int) bool;
 extern fn TTF_RenderText_Blended(font: *Font, text: [*]const u8, length: usize, fg: Color) ?*Surface;
 extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
 extern fn SDL_GetClipboardText() ?[*:0]u8;

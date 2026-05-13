@@ -43,9 +43,6 @@ pub const std_options: std.Options = .{
 
 pub const panic = std.debug.FullPanic(runtime_log.panicFn);
 
-const GL_COLOR_BUFFER_BIT: u32 = 0x0000_4000;
-const GL_MULTISAMPLE: u32 = 0x809D;
-
 const DEFAULT_FONT_SIZE: f32 = ui_theme.DEFAULT_FONT_SIZE;
 const DEFAULT_WINDOW_WIDTH: c_int = 1360;
 const DEFAULT_WINDOW_HEIGHT: c_int = 860;
@@ -56,9 +53,29 @@ const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
-const PALETTE_GPU_FONT_PATHS = [_][:0]const u8{
+const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/CalSans-Regular.ttf",
+    "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
+};
+const PALETTE_GPU_UI_BOLD_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/NotoSans-Bold.ttf",
     "packages/desktop/src/assets/fonts/NotoSans-Bold.ttf",
+};
+const PALETTE_GPU_PROSE_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSans-Regular.ttf",
+    "packages/desktop/src/assets/fonts/NotoSans-Regular.ttf",
+};
+const PALETTE_GPU_PROSE_BOLD_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSans-Bold.ttf",
+    "packages/desktop/src/assets/fonts/NotoSans-Bold.ttf",
+};
+const PALETTE_GPU_PROSE_ITALIC_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSans-Italic.ttf",
+    "packages/desktop/src/assets/fonts/NotoSans-Italic.ttf",
+};
+const PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSans-BoldItalic.ttf",
+    "packages/desktop/src/assets/fonts/NotoSans-BoldItalic.ttf",
 };
 const PALETTE_GPU_ICON_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/SymbolsNerdFontMono-Regular.ttf",
@@ -70,16 +87,12 @@ const PALETTE_GPU_MONO_FONT_PATHS = [_][:0]const u8{
 };
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
+const NOTO_SANS_REGULAR_BYTES = @embedFile("assets/fonts/NotoSans-Regular.ttf");
 const NOTO_SANS_BOLD_BYTES = @embedFile("assets/fonts/NotoSans-Bold.ttf");
 const NOTO_SANS_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-Italic.ttf");
 const NOTO_SANS_BOLD_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-BoldItalic.ttf");
 const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
-
-extern fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) void;
-extern fn glClear(mask: u32) void;
-extern fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int) void;
-extern fn glEnable(cap: u32) void;
 
 const WindowFrame = struct {
     x: c_int,
@@ -120,18 +133,6 @@ fn mainInner(init: std.process.Init) !void {
     }
 
     const requested_renderer_backend = configuredPaletteRendererBackend();
-    if (requested_renderer_backend == .gl) {
-        try sdl.gl.setAttribute(.context_major_version, 3);
-        try sdl.gl.setAttribute(.context_minor_version, 3);
-        try sdl.gl.setAttribute(.doublebuffer, 1);
-        // Default framebuffer MSAA: smooths vector edges (composer send/stop, rounded UI).
-        try sdl.gl.setAttribute(.multisamplebuffers, 1);
-        try sdl.gl.setAttribute(.multisamplesamples, 4);
-        switch (@import("builtin").os.tag) {
-            .macos => try sdl.gl.setAttribute(.context_profile_mask, @intFromEnum(sdl.gl.Profile.core)),
-            else => {},
-        }
-    }
 
     const initial_window_frame = initialWindowFrame();
     const window = try sdl.Window.create(
@@ -141,7 +142,6 @@ fn mainInner(init: std.process.Init) !void {
         .{
             .resizable = true,
             .high_pixel_density = true,
-            .opengl = requested_renderer_backend == .gl,
         },
     );
     defer window.destroy();
@@ -149,15 +149,6 @@ fn mainInner(init: std.process.Init) !void {
     sdl.startTextInput(window) catch {};
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
-
-    var gl_context: ?sdl.gl.Context = null;
-    defer if (gl_context) |context| sdl.gl.destroyContext(context);
-    if (requested_renderer_backend == .gl) {
-        gl_context = try sdl.gl.createContext(window);
-        try sdl.gl.makeCurrent(window, gl_context.?);
-        glEnable(GL_MULTISAMPLE);
-        try sdl.gl.setSwapInterval(1);
-    }
 
     const loaded_app_config = app_config.loadAppConfig(allocator) catch |err| blk: {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
@@ -174,14 +165,54 @@ fn mainInner(init: std.process.Init) !void {
         NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
         loaded_app_config.font_size,
     );
-    const palette_gpu_font_path = try paletteGpuFontPath(
+    const palette_gpu_ui_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "CalSans-Regular.ttf",
+        CAL_SANS_BYTES[0..],
+        &PALETTE_GPU_UI_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_ui_font_path);
+    const palette_gpu_ui_bold_font_path = try paletteGpuFontPath(
         allocator,
         storage.pref_path,
         "NotoSans-Bold.ttf",
         NOTO_SANS_BOLD_BYTES[0..],
-        &PALETTE_GPU_FONT_PATHS,
+        &PALETTE_GPU_UI_BOLD_FONT_PATHS,
     );
-    defer allocator.free(palette_gpu_font_path);
+    defer allocator.free(palette_gpu_ui_bold_font_path);
+    const palette_gpu_prose_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSans-Regular.ttf",
+        NOTO_SANS_REGULAR_BYTES[0..],
+        &PALETTE_GPU_PROSE_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_prose_font_path);
+    const palette_gpu_prose_bold_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSans-Bold.ttf",
+        NOTO_SANS_BOLD_BYTES[0..],
+        &PALETTE_GPU_PROSE_BOLD_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_prose_bold_font_path);
+    const palette_gpu_prose_italic_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSans-Italic.ttf",
+        NOTO_SANS_ITALIC_BYTES[0..],
+        &PALETTE_GPU_PROSE_ITALIC_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_prose_italic_font_path);
+    const palette_gpu_prose_bold_italic_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSans-BoldItalic.ttf",
+        NOTO_SANS_BOLD_ITALIC_BYTES[0..],
+        &PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_prose_bold_italic_font_path);
     const palette_gpu_mono_font_path = try paletteGpuFontPath(
         allocator,
         storage.pref_path,
@@ -201,7 +232,12 @@ fn mainInner(init: std.process.Init) !void {
     var palette_renderer = try palette_frame_renderer.Renderer.init(.{
         .requested_backend = requested_renderer_backend,
         .window = window,
-        .font_path = palette_gpu_font_path,
+        .ui_font_path = palette_gpu_ui_font_path,
+        .ui_bold_font_path = palette_gpu_ui_bold_font_path,
+        .prose_font_path = palette_gpu_prose_font_path,
+        .prose_bold_font_path = palette_gpu_prose_bold_font_path,
+        .prose_italic_font_path = palette_gpu_prose_italic_font_path,
+        .prose_bold_italic_font_path = palette_gpu_prose_bold_italic_font_path,
         .mono_font_path = palette_gpu_mono_font_path,
         .icon_font_path = palette_gpu_icon_font_path,
     });
@@ -224,8 +260,8 @@ fn mainInner(init: std.process.Init) !void {
     ui_theme.applyTheme(ui_scale);
 
     var state = try AppState.init(allocator, &storage, loaded_app_config, .{
-        .gl_texture_uploads_enabled = palette_renderer.usesOpenGl(),
-        .browser_textures_enabled = palette_renderer.usesOpenGl() or palette_renderer.activeBackend() == .sdl_gpu,
+        .gl_texture_uploads_enabled = false,
+        .browser_textures_enabled = palette_renderer.activeBackend() == .sdl_gpu,
         .texture_upload_context = if (palette_renderer.activeBackend() == .sdl_gpu) &palette_renderer else null,
         .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
     });
@@ -328,9 +364,6 @@ fn mainInner(init: std.process.Init) !void {
                 }
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
-        if (palette_renderer.usesOpenGl()) {
-            glViewport(0, 0, fb_width, fb_height);
-        }
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
 
@@ -345,10 +378,6 @@ fn mainInner(init: std.process.Init) !void {
             }
         }.run, .{&state});
 
-        if (palette_renderer.usesOpenGl()) {
-            glClearColor(ui_theme.COLOR_BLACK[0], ui_theme.COLOR_BLACK[1], ui_theme.COLOR_BLACK[2], 1.0);
-            glClear(GL_COLOR_BUFFER_BIT);
-        }
         recordSpan(&frame_sample, .draw_backend, struct {
             fn run(
                 palette_command_renderer: *palette_frame_renderer.Renderer,
@@ -366,9 +395,6 @@ fn mainInner(init: std.process.Init) !void {
             }
         }.run, .{ &palette_renderer, &state, allocator, fb_width, fb_height });
         const swap_start = profiler.nowNs();
-        if (palette_renderer.usesOpenGl()) {
-            try sdl.gl.swapWindow(window);
-        }
         frame_sample.add(.swap_window, profiler.elapsedNs(swap_start));
         frame_sample.rendered = true;
         profiler.recordFrame(frame_sample);
@@ -378,7 +404,6 @@ fn mainInner(init: std.process.Init) !void {
 
 fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
     return switch (build_options.palette_renderer) {
-        .gl => .gl,
         .sdl_gpu => .sdl_gpu,
     };
 }

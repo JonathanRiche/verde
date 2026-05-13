@@ -1,99 +1,22 @@
 //! Reusable markdown body parsing and rendering helpers for chat threads.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const colors = @import("colors.zig");
 const palette = @import("palette");
+const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 const zig_dif = @import("zig_dif");
 const zig_markdown = @import("zig_markdown");
 
-/// SDL_ttf's GPU atlas advances for the bundled UI font are wider than the
-/// stb_truetype metrics used by the old GL text path. The markdown transcript
-/// lays rich text out in chunks, so under-measuring each chunk makes later words
-/// start too early and visually eat spaces.
-const SDL_GPU_TRANSCRIPT_WIDTH_SCALE: f32 = 1.17;
-
-extern fn palette_text_gl_measure_line_width(
-    font_data: [*]const u8,
-    font_len: i32,
-    text: [*]const u8,
-    text_len: i32,
-    font_size: f32,
-) callconv(.c) f32;
-
-/// Measurement fonts — one per face used in the transcript. Layout must
-/// measure each chunk against the SAME face the renderer will draw it with;
-/// otherwise bold/mono/italic chunks under-reserve width and bleed into the
-/// next chunk (visible as `"Inventory" + "policy" → "Inventorypolicy"`).
-const gl_transcript_font_regular = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Regular.ttf");
-const gl_transcript_font_bold = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Bold.ttf");
-const gl_transcript_font_italic = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-Italic.ttf");
-const gl_transcript_font_bold_italic = if (builtin.is_test) "" else @embedFile("../assets/fonts/NotoSans-BoldItalic.ttf");
-const gl_transcript_font_mono = if (builtin.is_test) "" else @embedFile("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
-const gl_transcript_font_calsans = if (builtin.is_test) "" else @embedFile("../assets/fonts/CalSans-Regular.ttf");
-
-/// Default fall-back: body prose face. Used by call sites that don't know the
-/// role (whitespace shortcut, generic helpers). Same face the body draws with.
-const gl_transcript_font = gl_transcript_font_regular;
-
-fn transcriptMeasurementFont(role: palette.FontRole) []const u8 {
-    // SDL_GPU's palette renderer currently only dispatches `.mono` and `.icon`
-    // to dedicated faces (palette/src/renderer.zig:953 fontForRole). Every other
-    // role falls through to the single default font, which main.zig wires to
-    // NotoSans-Bold. So measure against Bold for non-mono/icon text — measuring
-    // Regular here while the renderer draws Bold creates ~10% width under-shoot
-    // per chunk and causes "currentlyon"/"architecturediagrams" collisions.
-    return switch (role) {
-        .mono => gl_transcript_font_mono,
-        .icon => gl_transcript_font_regular,
-        else => gl_transcript_font_bold,
-    };
+fn transcriptTextWidth(font_size: f32, text: []const u8) f32 {
+    return transcriptTextWidthForRole(font_size, .prose, text);
 }
 
-fn glTranscriptTextWidth(font_size: f32, text: []const u8) f32 {
-    return glTranscriptTextWidthForRole(font_size, .prose, text);
-}
-
-fn glTranscriptTextWidthForRole(font_size: f32, role: palette.FontRole, text: []const u8) f32 {
+fn transcriptTextWidthForRole(font_size: f32, role: palette.FontRole, text: []const u8) f32 {
     if (text.len == 0) return 0.0;
-    // Tests don't link the C FFI; fall back to the byte-estimate.
-    if (builtin.is_test) return estimatedTranscriptTextWidth(font_size, text);
-    // Whitespace gets a constant per-em estimate.
     if (inlineWhitespaceWidth(font_size, text)) |width| return width;
-    const font_bytes = transcriptMeasurementFont(role);
-    const ascii_width = palette_text_gl_measure_line_width(
-        font_bytes.ptr,
-        @intCast(font_bytes.len),
-        text.ptr,
-        @intCast(text.len),
-        font_size,
-    ) * SDL_GPU_TRANSCRIPT_WIDTH_SCALE;
-    // The C FFI skips bytes outside ASCII 32–126, so em-dash, en-dash, smart
-    // quotes, etc. all measure as 0 width even though SDL_GPU draws them at
-    // full glyph width. That causes a glyph like — to overlap the next chunk
-    // (visible as a "strikethrough" through the following words). Estimate one
-    // em-width per non-ASCII codepoint so layout reserves space for them.
-    return ascii_width + nonAsciiCodepointWidth(font_size, text);
-}
-
-fn nonAsciiCodepointWidth(font_size: f32, text: []const u8) f32 {
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const b = text[i];
-        if (b < 0x80) {
-            i += 1;
-        } else {
-            count += 1;
-            i += if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
-        }
-    }
-    // Conservative single-em estimate per codepoint covers em-dash (1em),
-    // smart quotes (~0.3em), arrows (~1em). Slight over-reserve is preferable
-    // to under-reserve since the renderer draws the full glyph regardless.
-    return @as(f32, @floatFromInt(count)) * font_size * 0.6;
+    return text_measure.textWidth(role, font_size, text);
 }
 
 // NotoSans-Bold's space advance is ~0.29em; the SDL_GPU width scale was calibrated
@@ -1170,7 +1093,7 @@ fn walkTextBlockLayout(
                 const measure_role = markdownFontRole(block.style, text_run.style);
                 var chunk_start: usize = 0;
                 while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = glTranscriptTextWidthForRole(layout_font_size, measure_role, chunk.text);
+                    const chunk_width = transcriptTextWidthForRole(layout_font_size, measure_role, chunk.text);
 
                     if (chunk.is_whitespace and state.line_start) {
                         continue;
@@ -2104,7 +2027,7 @@ fn buildSelectableCodeLines(
         for (line.tokens) |token| {
             if (token.text.len == 0) continue;
             const token_columns = countColumns(token.text);
-            const token_width = glTranscriptTextWidthForRole(codeFontSize(options), .mono, token.text);
+            const token_width = transcriptTextWidthForRole(codeFontSize(options), .mono, token.text);
             try chunks.append(allocator, .{
                 .text = token.text,
                 .token_kind = token.kind,
@@ -2333,7 +2256,7 @@ fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, lay
         if (token.text.len == 0) continue;
         if (cursor_x >= layout.max_x) break;
 
-        const width = glTranscriptTextWidthForRole(code_fs, .mono, token.text);
+        const width = transcriptTextWidthForRole(code_fs, .mono, token.text);
         queuePaletteRoleText(context, .{
             .x = cursor_x,
             .y = layout.y,
@@ -2780,7 +2703,7 @@ test "maps markdown fence tags to syntax languages" {
 }
 
 test "transcript layout width tracks GL text metrics for ASCII" {
-    const w = glTranscriptTextWidth(16.0, "Hello");
+    const w = transcriptTextWidth(16.0, "Hello");
     try std.testing.expect(w > 10.0 and w < 90.0);
 }
 
