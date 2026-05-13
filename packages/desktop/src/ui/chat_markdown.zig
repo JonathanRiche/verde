@@ -1136,15 +1136,11 @@ fn collectCodeLineSlices(allocator: Allocator, code: []const u8) ![]const []cons
 }
 
 fn tokenizeCodeLine(allocator: Allocator, language: zig_dif.Language, line: []const u8) ![]const zig_dif.Token {
-    _ = language;
     if (line.len == 0) return &[_]zig_dif.Token{};
-
-    const tokens = try allocator.alloc(zig_dif.Token, 1);
-    tokens[0] = .{
-        .kind = .plain,
-        .text = line,
-    };
-    return tokens;
+    // zig_dif.syntax.tokenizeLine handles zig / ts / tsx / js / jsx / json /
+    // markdown via tree-sitter (when configured) and falls back to a
+    // heuristic tokenizer. Plain code falls through unchanged.
+    return zig_dif.syntax.tokenizeLine(allocator, language, line);
 }
 
 fn codeLanguageForTag(language: ?[]const u8) zig_dif.Language {
