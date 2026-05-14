@@ -14,6 +14,13 @@ pub const AuthState = types.AuthState;
 pub const MessageRole = types.MessageRole;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatThreadSummary = types.ChatThreadSummary;
+pub const ProviderRuntime = types.ProviderRuntime;
+pub const RepositoryInfo = types.RepositoryInfo;
+pub const ArtifactInfo = types.ArtifactInfo;
+pub const DownloadArtifactResult = types.DownloadArtifactResult;
+pub const RunSummary = types.RunSummary;
+pub const AgentOperation = types.AgentOperation;
+pub const AgentOperationRequest = types.AgentOperationRequest;
 pub const ModelInfo = types.ModelInfo;
 pub const ReadThreadResult = types.ReadThreadResult;
 pub const ReasoningEffort = types.ReasoningEffort;
@@ -29,6 +36,10 @@ pub const SendPromptResult = types.SendPromptResult;
 pub const InterruptThreadRequest = types.InterruptThreadRequest;
 pub const SteerThreadRequest = types.SteerThreadRequest;
 pub const freeModelInfos = types.freeModelInfos;
+pub const freeChatThreadSummaries = types.freeChatThreadSummaries;
+pub const freeRepositoryInfos = types.freeRepositoryInfos;
+pub const freeArtifactInfos = types.freeArtifactInfos;
+pub const freeRunSummaries = types.freeRunSummaries;
 
 pub const ProviderConfig = union(Provider) {
     opencode: opencode.Config,
@@ -76,6 +87,41 @@ pub const ProviderClient = union(Provider) {
             .codex => |*client| client.listModels(allocator),
             .claude => |*client| client.listModels(allocator),
             .cursor => |*client| client.listModels(allocator),
+        };
+    }
+
+    pub fn listRepositories(self: *ProviderClient, allocator: std.mem.Allocator) ![]RepositoryInfo {
+        return switch (self.*) {
+            .cursor => |*client| client.listRepositories(allocator),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn listRuns(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8) ![]RunSummary {
+        return switch (self.*) {
+            .cursor => |*client| client.listRuns(allocator, thread_id),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn listArtifacts(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8) ![]ArtifactInfo {
+        return switch (self.*) {
+            .cursor => |*client| client.listArtifacts(allocator, thread_id),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn downloadArtifact(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8, artifact_path: []const u8) !DownloadArtifactResult {
+        return switch (self.*) {
+            .cursor => |*client| client.downloadArtifact(allocator, thread_id, artifact_path),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn operateAgent(self: *ProviderClient, request: AgentOperationRequest) !void {
+        return switch (self.*) {
+            .cursor => |*client| client.operateAgent(request),
+            else => error.UnsupportedOperation,
         };
     }
 

@@ -6,13 +6,16 @@
       "name": "verde",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "^0.2.132",
-        "@cursor/sdk": "^1.0.12",
+        "@cursor/sdk": "^1.0.13",
       },
       "devDependencies": {
         "@redwoodjs/agent-ci": "^0.6.0",
       },
     },
   },
+  "trustedDependencies": [
+    "sqlite3",
+  ],
   "packages": {
     "@actions/expressions": ["@actions/expressions@0.3.51", "", {}, "sha512-cnFC8OkfMUpb8qYOKKJW7j+8WnkcA8Nz3cGTnezX6K2B0UBvAWDF6rjDFDCcLcYhcK3+TNJsQsxkMDHRBHdUmw=="],
 
@@ -50,17 +53,17 @@
 
     "@connectrpc/connect-node": ["@connectrpc/connect-node@1.7.0", "", { "dependencies": { "undici": "^5.28.4" }, "peerDependencies": { "@bufbuild/protobuf": "^1.10.0", "@connectrpc/connect": "1.7.0" } }, "sha512-6vaPIkG/NyhxlYgytLoR9KYbPhczEboFB2OYWkA9qvUz1K7efXfeGrlRxoLtpa+r8VxyIOw73w5ktNe743nD+A=="],
 
-    "@cursor/sdk": ["@cursor/sdk@1.0.12", "", { "dependencies": { "@bufbuild/protobuf": "1.10.0", "@connectrpc/connect": "^1.6.1", "@connectrpc/connect-node": "^1.6.1", "@statsig/js-client": "3.31.0", "sqlite3": "^5.1.7", "zod": "^3.25.0" }, "optionalDependencies": { "@cursor/sdk-darwin-arm64": "1.0.12", "@cursor/sdk-darwin-x64": "1.0.12", "@cursor/sdk-linux-arm64": "1.0.12", "@cursor/sdk-linux-x64": "1.0.12", "@cursor/sdk-win32-x64": "1.0.12" } }, "sha512-jGx0wFY1N9uIdIKr303CfM6m/dLXmRCUnU/0yNP/oiOpkBXqgqaThGbgYbcOeVrYonMZc/DZJ9EydXOEPJLcbg=="],
+    "@cursor/sdk": ["@cursor/sdk@1.0.13", "", { "dependencies": { "@bufbuild/protobuf": "1.10.0", "@connectrpc/connect": "^1.6.1", "@connectrpc/connect-node": "^1.6.1", "@statsig/js-client": "3.31.0", "sqlite3": "^5.1.7", "zod": "^3.25.0" }, "optionalDependencies": { "@cursor/sdk-darwin-arm64": "1.0.13", "@cursor/sdk-darwin-x64": "1.0.13", "@cursor/sdk-linux-arm64": "1.0.13", "@cursor/sdk-linux-x64": "1.0.13", "@cursor/sdk-win32-x64": "1.0.13" } }, "sha512-w6MWkgOTL6yb6GV/4Odx7QcamQgqhzX/CzcMBkqiiOPTPuEWItWrgA0qdivchm5YJXTt+LZkFSEQ/Ti44hVbfg=="],
 
-    "@cursor/sdk-darwin-arm64": ["@cursor/sdk-darwin-arm64@1.0.12", "", { "os": "darwin", "cpu": "arm64" }, "sha512-AOFx+aX+4SntAeC66YncHACXk5duxp+HzDrxxF4Tl93N6nLjHaHEKSAXbt87ivL34MCHop4v/3c70QzBhamB2g=="],
+    "@cursor/sdk-darwin-arm64": ["@cursor/sdk-darwin-arm64@1.0.13", "", { "os": "darwin", "cpu": "arm64" }, "sha512-zHRTNtVRHw4KSAEFmtO0Av7jv9D60DrB+pygVNWGyKtRR44fcwtRHuLAJmO4HThxQw7MMvUJuAaNmCQxzHtPDQ=="],
 
-    "@cursor/sdk-darwin-x64": ["@cursor/sdk-darwin-x64@1.0.12", "", { "os": "darwin", "cpu": "x64" }, "sha512-/ZDAYFUrnPd8hAGRky9ZGcROqZSZ2b5W+aEjTdINzLhJ8x5ZNXtjaz0ZYSHabOn2BeErjXgTcq+4bX2/To4C1A=="],
+    "@cursor/sdk-darwin-x64": ["@cursor/sdk-darwin-x64@1.0.13", "", { "os": "darwin", "cpu": "x64" }, "sha512-7XsIkMKp6h/4W9zBx02Py1euJLAJVxlkwmm9GSoUjc+3hfFvHY/R/WTbX2TFgF4g1vOAq/HM7GmXBXq+e4M4+w=="],
 
-    "@cursor/sdk-linux-arm64": ["@cursor/sdk-linux-arm64@1.0.12", "", { "os": "linux", "cpu": "arm64" }, "sha512-kAxNqiB3dPtlW9fVjjIZEdbIGEGLA9moOM3zYwsXh8J1Qw942nJYMGDGR4o8x0zglwZ24a1JpovvZamrCaC3Yw=="],
+    "@cursor/sdk-linux-arm64": ["@cursor/sdk-linux-arm64@1.0.13", "", { "os": "linux", "cpu": "arm64" }, "sha512-bDgfPPgc84gUn3k+Iiq5OLZozzM0UYZdKbQ821pbZy1OPWTFaSkjXsoAB6xqf9wALWyW1eQxOC4RprPBLoy+yA=="],
 
-    "@cursor/sdk-linux-x64": ["@cursor/sdk-linux-x64@1.0.12", "", { "os": "linux", "cpu": "x64" }, "sha512-RmBiBCPKMZC5McDerGk2Rk4P47xz2A+uzRoRgH6sMoOjklc33ry11iAZC0D5F5xH85chgY878086A/Q8+XrAuA=="],
+    "@cursor/sdk-linux-x64": ["@cursor/sdk-linux-x64@1.0.13", "", { "os": "linux", "cpu": "x64" }, "sha512-BTccnB5hVqK8Y0778oql6gbk7kIIlzQrBqt5QNLJpwBidjjde/mlvAajVB9hB3a29jelOwm0gJjMsLfqTkEPdw=="],
 
-    "@cursor/sdk-win32-x64": ["@cursor/sdk-win32-x64@1.0.12", "", { "os": "win32", "cpu": "x64" }, "sha512-uH4shdHrKOdtNLapy1uuScJ9lL2Pc8zc9I9ZKC6b6bx+0UX6xLAqjPP7dqVPfO6D9u61yLq1Hs86XOLs5ZVkPA=="],
+    "@cursor/sdk-win32-x64": ["@cursor/sdk-win32-x64@1.0.13", "", { "os": "win32", "cpu": "x64" }, "sha512-GxWlwj4G513EfGmvPVBa4y+vNn9B5Cj+npu8fVcJ0P+U9sruhgo4pvqGbWxkn5EIKbpGoraLq9QB4nFeoT1uRQ=="],
 
     "@fastify/busboy": ["@fastify/busboy@2.1.1", "", {}, "sha512-vBZP4NlzfOlerQTnba4aqZoMhE/a9HY7HRqoOPaETQcSQuWEIyZMHGfVu6w9wGtGK5fED5qRs2DteVCjOH60sA=="],
 

@@ -2760,13 +2760,7 @@ pub const AppState = struct {
             self.setThreadImportNotice(importThreadFailureMessage(provider, err));
             return;
         };
-        defer {
-            for (provider_threads) |thread| {
-                self.allocator.free(thread.id);
-                self.allocator.free(thread.title);
-            }
-            self.allocator.free(provider_threads);
-        }
+        defer ai_harness.freeChatThreadSummaries(self.allocator, provider_threads);
 
         for (provider_threads) |thread| {
             const owned_id = self.allocator.dupeZ(u8, thread.id) catch {

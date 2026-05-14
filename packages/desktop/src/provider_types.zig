@@ -29,6 +29,17 @@ pub const ChatMessage = struct {
     role: MessageRole,
     author: []const u8,
     body: []const u8,
+    id: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    metadata_json: ?[]const u8 = null,
+
+    pub fn deinit(self: ChatMessage, allocator: anytype) void {
+        allocator.free(self.author);
+        allocator.free(self.body);
+        if (self.id) |id| allocator.free(id);
+        if (self.kind) |kind| allocator.free(kind);
+        if (self.metadata_json) |metadata_json| allocator.free(metadata_json);
+    }
 };
 
 pub const ImageAttachment = struct {
@@ -38,6 +49,102 @@ pub const ImageAttachment = struct {
 pub const ChatThreadSummary = struct {
     id: []const u8,
     title: []const u8,
+    runtime: ProviderRuntime = .local,
+    status: ?[]const u8 = null,
+    updated_at: ?i64 = null,
+    metadata_json: ?[]const u8 = null,
+
+    pub fn deinit(self: ChatThreadSummary, allocator: anytype) void {
+        allocator.free(self.id);
+        allocator.free(self.title);
+        if (self.status) |status| allocator.free(status);
+        if (self.metadata_json) |metadata_json| allocator.free(metadata_json);
+    }
+};
+
+pub fn freeChatThreadSummaries(allocator: anytype, threads: []const ChatThreadSummary) void {
+    for (threads) |thread| thread.deinit(allocator);
+    allocator.free(threads);
+}
+
+pub const ProviderRuntime = enum(u8) {
+    local,
+    cloud,
+};
+
+pub const RepositoryInfo = struct {
+    url: []const u8,
+
+    pub fn deinit(self: RepositoryInfo, allocator: anytype) void {
+        allocator.free(self.url);
+    }
+};
+
+pub fn freeRepositoryInfos(allocator: anytype, repositories: []const RepositoryInfo) void {
+    for (repositories) |repository| repository.deinit(allocator);
+    allocator.free(repositories);
+}
+
+pub const ArtifactInfo = struct {
+    path: []const u8,
+    size_bytes: i64 = 0,
+    updated_at: ?[]const u8 = null,
+
+    pub fn deinit(self: ArtifactInfo, allocator: anytype) void {
+        allocator.free(self.path);
+        if (self.updated_at) |updated_at| allocator.free(updated_at);
+    }
+};
+
+pub fn freeArtifactInfos(allocator: anytype, artifacts: []const ArtifactInfo) void {
+    for (artifacts) |artifact| artifact.deinit(allocator);
+    allocator.free(artifacts);
+}
+
+pub const DownloadArtifactResult = struct {
+    path: []const u8,
+    data: []const u8,
+
+    pub fn deinit(self: DownloadArtifactResult, allocator: anytype) void {
+        allocator.free(self.path);
+        allocator.free(self.data);
+    }
+};
+
+pub const RunSummary = struct {
+    id: []const u8,
+    agent_id: []const u8,
+    status: ?[]const u8 = null,
+    result: ?[]const u8 = null,
+    model_json: ?[]const u8 = null,
+    git_json: ?[]const u8 = null,
+    duration_ms: ?i64 = null,
+    created_at: ?i64 = null,
+
+    pub fn deinit(self: RunSummary, allocator: anytype) void {
+        allocator.free(self.id);
+        allocator.free(self.agent_id);
+        if (self.status) |status| allocator.free(status);
+        if (self.result) |result| allocator.free(result);
+        if (self.model_json) |model_json| allocator.free(model_json);
+        if (self.git_json) |git_json| allocator.free(git_json);
+    }
+};
+
+pub fn freeRunSummaries(allocator: anytype, runs: []const RunSummary) void {
+    for (runs) |run| run.deinit(allocator);
+    allocator.free(runs);
+}
+
+pub const AgentOperation = enum(u8) {
+    archive,
+    unarchive,
+    delete,
+};
+
+pub const AgentOperationRequest = struct {
+    thread_id: []const u8,
+    operation: AgentOperation,
 };
 
 pub const ModelInfo = struct {
@@ -91,8 +198,7 @@ pub const ReadThreadResult = struct {
         allocator.free(self.thread_id);
         allocator.free(self.title);
         for (self.messages) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
+            message.deinit(allocator);
         }
         allocator.free(self.messages);
     }

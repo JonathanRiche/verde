@@ -20,6 +20,13 @@ pub const Config = struct {
     cwd: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = DEFAULT_MODEL,
+    runtime: provider_types.ProviderRuntime = .local,
+    cloud_repos_json: ?[]const u8 = null,
+    cloud_env_json: ?[]const u8 = null,
+    cloud_env_vars_json: ?[]const u8 = null,
+    cloud_work_on_current_branch: bool = false,
+    cloud_auto_create_pr: bool = false,
+    cloud_skip_reviewer_request: bool = false,
 };
 
 pub const Client = struct {
@@ -61,6 +68,49 @@ pub const Client = struct {
         };
         defer response.deinit(allocator);
         return parseModelsAlloc(allocator, response.items orelse "[]") catch staticModelsAlloc(allocator);
+    }
+
+    pub fn listRepositories(self: *Client, allocator: std.mem.Allocator) ![]provider_types.RepositoryInfo {
+        const response = try self.runBridge(.list_repositories, allocator, .{});
+        defer response.deinit(allocator);
+        return parseRepositoriesAlloc(allocator, response.items orelse "[]");
+    }
+
+    pub fn listRuns(self: *Client, allocator: std.mem.Allocator, thread_id: []const u8) ![]provider_types.RunSummary {
+        const response = try self.runBridge(.list_runs, allocator, .{ .thread_id = thread_id });
+        defer response.deinit(allocator);
+        return parseRunsAlloc(allocator, response.items orelse "[]");
+    }
+
+    pub fn listArtifacts(self: *Client, allocator: std.mem.Allocator, thread_id: []const u8) ![]provider_types.ArtifactInfo {
+        const response = try self.runBridge(.list_artifacts, allocator, .{ .thread_id = thread_id });
+        defer response.deinit(allocator);
+        return parseArtifactsAlloc(allocator, response.items orelse "[]");
+    }
+
+    pub fn downloadArtifact(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+        artifact_path: []const u8,
+    ) !provider_types.DownloadArtifactResult {
+        const response = try self.runBridge(.download_artifact, allocator, .{
+            .thread_id = thread_id,
+            .artifact_path = artifact_path,
+        });
+        defer response.deinit(allocator);
+        return .{
+            .path = try allocator.dupe(u8, artifact_path),
+            .data = try allocator.dupe(u8, response.items orelse ""),
+        };
+    }
+
+    pub fn operateAgent(self: *Client, request: provider_types.AgentOperationRequest) !void {
+        const response = try self.runBridge(.operate_agent, self.allocator, .{
+            .thread_id = request.thread_id,
+            .operation = request.operation,
+        });
+        response.deinit(self.allocator);
     }
 
     pub fn readThread(
@@ -286,6 +336,11 @@ const BridgeCommand = enum {
     auth,
     list_threads,
     list_models,
+    list_repositories,
+    list_runs,
+    list_artifacts,
+    download_artifact,
+    operate_agent,
     read_thread,
     send_prompt,
     interrupt_thread,
@@ -295,6 +350,8 @@ const BridgeInput = struct {
     request: ?provider_types.SendPromptRequest = null,
     thread_id: ?[]const u8 = null,
     turn_id: ?[]const u8 = null,
+    artifact_path: ?[]const u8 = null,
+    operation: ?provider_types.AgentOperation = null,
 };
 
 fn makeBridgeRequestJsonAlloc(
@@ -312,6 +369,8 @@ fn makeBridgeRequestJsonAlloc(
     try stringify.write(@tagName(command));
     try stringify.objectField("cwd");
     try stringify.write(if (input.request) |request| request.cwd orelse config.cwd else config.cwd);
+    try stringify.objectField("runtime");
+    try stringify.write(@tagName(config.runtime));
     try stringify.objectField("model");
     try stringify.write(if (input.request) |request| request.model orelse config.model orelse DEFAULT_MODEL else config.model orelse DEFAULT_MODEL);
     try stringify.objectField("modelParams");
@@ -330,6 +389,12 @@ fn makeBridgeRequestJsonAlloc(
     try stringify.write(input.thread_id orelse if (input.request) |request| request.thread_id else null);
     try stringify.objectField("turnId");
     try stringify.write(input.turn_id);
+    try stringify.objectField("artifactPath");
+    try stringify.write(input.artifact_path);
+    try stringify.objectField("operation");
+    try stringify.write(if (input.operation) |operation| @tagName(operation) else null);
+    try stringify.objectField("cloud");
+    try writeCloudOptions(&stringify, allocator, config);
     try stringify.objectField("title");
     try stringify.write(if (input.request) |request| request.thread_title else null);
     try stringify.objectField("prompt");
@@ -345,6 +410,33 @@ fn makeBridgeRequestJsonAlloc(
     try stringify.endObject();
 
     return writer.toOwnedSlice();
+}
+
+fn writeCloudOptions(stringify: *std.json.Stringify, allocator: std.mem.Allocator, config: Config) !void {
+    try stringify.beginObject();
+    try stringify.objectField("repos");
+    try writeRawJsonOrNull(stringify, allocator, config.cloud_repos_json);
+    try stringify.objectField("env");
+    try writeRawJsonOrNull(stringify, allocator, config.cloud_env_json);
+    try stringify.objectField("envVars");
+    try writeRawJsonOrNull(stringify, allocator, config.cloud_env_vars_json);
+    try stringify.objectField("workOnCurrentBranch");
+    try stringify.write(config.cloud_work_on_current_branch);
+    try stringify.objectField("autoCreatePR");
+    try stringify.write(config.cloud_auto_create_pr);
+    try stringify.objectField("skipReviewerRequest");
+    try stringify.write(config.cloud_skip_reviewer_request);
+    try stringify.endObject();
+}
+
+fn writeRawJsonOrNull(stringify: *std.json.Stringify, allocator: std.mem.Allocator, raw_json: ?[]const u8) !void {
+    const raw = raw_json orelse {
+        try stringify.write(null);
+        return;
+    };
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    try stringify.write(parsed.value);
 }
 
 fn writePromptImages(stringify: *std.json.Stringify, request: provider_types.SendPromptRequest) !void {
@@ -411,7 +503,10 @@ fn processBridgeLine(
             runtime_log.diagnostic("cursor.bridge error: {s}", .{message});
             if (state.error_message == null) state.error_message = try allocator.dupe(u8, message);
         }
-        if (isAuthError(getOptionalObjectString(parsed.value, "message"))) return error.CursorSignedOut;
+        if (isAuthError(parsed.value)) return error.CursorSignedOut;
+        if (getOptionalObjectString(parsed.value, "errorName")) |name| runtime_log.diagnostic("cursor.bridge errorName={s}", .{name});
+        if (getOptionalObjectString(parsed.value, "code")) |code| runtime_log.diagnostic("cursor.bridge error code={s}", .{code});
+        if (getOptionalObjectInteger(parsed.value, "status")) |status| runtime_log.diagnostic("cursor.bridge error status={d}", .{status});
         return false;
     }
     if (std.mem.eql(u8, event_type, "thread")) {
@@ -445,11 +540,28 @@ fn processBridgeLine(
     if (std.mem.eql(u8, event_type, "command")) {
         const body = getOptionalObjectString(parsed.value, "command") orelse getOptionalObjectString(parsed.value, "body") orelse return false;
         const failed = getOptionalObjectBool(parsed.value, "failed") orelse false;
+        const title = getOptionalObjectString(parsed.value, "title") orelse if (failed) "Command failed" else "Ran command";
         if (request) |send_request| {
             if (send_request.on_stream_event) |on_stream_event| {
                 on_stream_event(send_request.stream_context, .{
                     .message = .{
-                        .title = if (failed) "Command failed" else "Ran command",
+                        .title = title,
+                        .body = body,
+                    },
+                });
+            }
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, event_type, "message")) {
+        const title = getOptionalObjectString(parsed.value, "title") orelse return false;
+        const body = getOptionalObjectString(parsed.value, "body") orelse "";
+        if (body.len == 0) return false;
+        if (request) |send_request| {
+            if (send_request.on_stream_event) |on_stream_event| {
+                on_stream_event(send_request.stream_context, .{
+                    .message = .{
+                        .title = title,
                         .body = body,
                     },
                 });
@@ -659,11 +771,26 @@ fn getOptionalObjectBool(value: std.json.Value, key: []const u8) ?bool {
     };
 }
 
-fn isAuthError(message: ?[]const u8) bool {
-    const text = message orelse return false;
+fn isAuthError(value: std.json.Value) bool {
+    const error_name = getOptionalObjectString(value, "errorName");
+    if (stringEqualsAny(error_name, &.{ "AuthenticationError", "AuthError" })) return true;
+    if (getOptionalObjectInteger(value, "status")) |status| {
+        if (status == 401 or status == 403) return true;
+    }
+    const code = getOptionalObjectString(value, "code");
+    if (stringEqualsAny(code, &.{ "unauthenticated", "permission_denied", "authentication_failed" })) return true;
+    const text = getOptionalObjectString(value, "message") orelse return false;
     return std.mem.indexOf(u8, text, "API key") != null or
         std.mem.indexOf(u8, text, "unauthorized") != null or
         std.mem.indexOf(u8, text, "Authentication") != null;
+}
+
+fn stringEqualsAny(value: ?[]const u8, comptime candidates: anytype) bool {
+    const text = value orelse return false;
+    inline for (candidates) |candidate| {
+        if (std.ascii.eqlIgnoreCase(text, candidate)) return true;
+    }
+    return false;
 }
 
 fn parseThreadSummariesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ChatThreadSummary {
@@ -673,10 +800,7 @@ fn parseThreadSummariesAlloc(allocator: std.mem.Allocator, payload: []const u8) 
 
     var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
     errdefer {
-        for (threads.items) |thread| {
-            allocator.free(thread.id);
-            allocator.free(thread.title);
-        }
+        for (threads.items) |thread| thread.deinit(allocator);
         threads.deinit(allocator);
     }
 
@@ -686,13 +810,99 @@ fn parseThreadSummariesAlloc(allocator: std.mem.Allocator, payload: []const u8) 
         const title = getOptionalObjectString(item, "name") orelse
             getOptionalObjectString(item, "summary") orelse
             id;
+        const runtime = parseRuntime(getOptionalObjectString(item, "runtime"));
         try threads.append(allocator, .{
             .id = try allocator.dupe(u8, id),
             .title = try allocator.dupe(u8, title),
+            .runtime = runtime,
+            .status = if (getOptionalObjectString(item, "status")) |status| try allocator.dupe(u8, status) else null,
+            .updated_at = getOptionalObjectInteger(item, "lastModified") orelse getOptionalObjectInteger(item, "updatedAt"),
+            .metadata_json = try std.json.Stringify.valueAlloc(allocator, item, .{ .whitespace = .minified }),
         });
     }
 
     return threads.toOwnedSlice(allocator);
+}
+
+fn parseRuntime(text: ?[]const u8) provider_types.ProviderRuntime {
+    if (text) |runtime| {
+        if (std.mem.eql(u8, runtime, "cloud")) return .cloud;
+    }
+    return .local;
+}
+
+fn parseRepositoriesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.RepositoryInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return allocator.alloc(provider_types.RepositoryInfo, 0);
+
+    var repositories: std.ArrayList(provider_types.RepositoryInfo) = .empty;
+    errdefer {
+        for (repositories.items) |repository| repository.deinit(allocator);
+        repositories.deinit(allocator);
+    }
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const url = getOptionalObjectString(item, "url") orelse continue;
+        try repositories.append(allocator, .{ .url = try allocator.dupe(u8, url) });
+    }
+
+    return repositories.toOwnedSlice(allocator);
+}
+
+fn parseArtifactsAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ArtifactInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return allocator.alloc(provider_types.ArtifactInfo, 0);
+
+    var artifacts: std.ArrayList(provider_types.ArtifactInfo) = .empty;
+    errdefer {
+        for (artifacts.items) |artifact| artifact.deinit(allocator);
+        artifacts.deinit(allocator);
+    }
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const path = getOptionalObjectString(item, "path") orelse continue;
+        try artifacts.append(allocator, .{
+            .path = try allocator.dupe(u8, path),
+            .size_bytes = getOptionalObjectInteger(item, "sizeBytes") orelse 0,
+            .updated_at = if (getOptionalObjectString(item, "updatedAt")) |updated_at| try allocator.dupe(u8, updated_at) else null,
+        });
+    }
+
+    return artifacts.toOwnedSlice(allocator);
+}
+
+fn parseRunsAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.RunSummary {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return allocator.alloc(provider_types.RunSummary, 0);
+
+    var runs: std.ArrayList(provider_types.RunSummary) = .empty;
+    errdefer {
+        for (runs.items) |run| run.deinit(allocator);
+        runs.deinit(allocator);
+    }
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const id = getOptionalObjectString(item, "id") orelse continue;
+        const agent_id = getOptionalObjectString(item, "agentId") orelse getOptionalObjectString(item, "agent_id") orelse "";
+        try runs.append(allocator, .{
+            .id = try allocator.dupe(u8, id),
+            .agent_id = try allocator.dupe(u8, agent_id),
+            .status = if (getOptionalObjectString(item, "status")) |status| try allocator.dupe(u8, status) else null,
+            .result = if (getOptionalObjectString(item, "result")) |result| try allocator.dupe(u8, result) else null,
+            .model_json = if (getObjectField(item, "model")) |model| try std.json.Stringify.valueAlloc(allocator, model, .{ .whitespace = .minified }) else null,
+            .git_json = if (getObjectField(item, "git")) |git| try std.json.Stringify.valueAlloc(allocator, git, .{ .whitespace = .minified }) else null,
+            .duration_ms = getOptionalObjectInteger(item, "durationMs"),
+            .created_at = getOptionalObjectInteger(item, "createdAt"),
+        });
+    }
+
+    return runs.toOwnedSlice(allocator);
 }
 
 fn parseModelsAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ModelInfo {
@@ -833,10 +1043,7 @@ fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]prov
 
     var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
     errdefer {
-        for (messages.items) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
-        }
+        for (messages.items) |message| message.deinit(allocator);
         messages.deinit(allocator);
     }
 
@@ -860,6 +1067,9 @@ fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]prov
                 .system => "System",
             }),
             .body = try allocator.dupe(u8, trimmed),
+            .id = if (getOptionalObjectString(item, "uuid")) |uuid| try allocator.dupe(u8, uuid) else null,
+            .kind = if (getOptionalObjectString(item, "kind")) |kind| try allocator.dupe(u8, kind) else null,
+            .metadata_json = if (getObjectField(item, "metadata")) |metadata| try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .minified }) else null,
         });
     }
 
@@ -870,11 +1080,18 @@ const BRIDGE_SCRIPT =
     \\import { createRequire } from "node:module";
     \\import { readFile } from "node:fs/promises";
     \\import { pathToFileURL } from "node:url";
-    \\const fail = (message) => {
-    \\  process.stdout.write(JSON.stringify({ type: "error", message }) + "\n");
+    \\const fail = (message, details = {}) => {
+    \\  process.stdout.write(JSON.stringify({ type: "error", message, ...details }) + "\n");
     \\  process.exit(1);
     \\};
     \\const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+    \\const errorDetails = (error) => ({
+    \\  errorName: error?.name || error?.constructor?.name || undefined,
+    \\  code: typeof error?.code === "string" ? error.code : undefined,
+    \\  status: Number.isInteger(error?.status) ? error.status : undefined,
+    \\  isRetryable: typeof error?.isRetryable === "boolean" ? error.isRetryable : undefined,
+    \\  requestId: typeof error?.requestId === "string" ? error.requestId : undefined,
+    \\});
     \\const requireFromBundledModules = () => {
     \\  const root = process.env.VERDE_NODE_MODULES;
     \\  if (!root) return createRequire(import.meta.url);
@@ -909,16 +1126,75 @@ const BRIDGE_SCRIPT =
     \\  }
     \\  return images.length ? { text: input.prompt || "", images } : (input.prompt || "");
     \\};
+    \\const runtime = () => input.runtime === "cloud" ? "cloud" : "local";
+    \\const localOptions = () => ({ cwd: input.cwd || process.cwd() });
+    \\const cloudOptions = () => {
+    \\  const cloud = input.cloud || {};
+    \\  const out = {};
+    \\  if (cloud.env) out.env = cloud.env;
+    \\  if (Array.isArray(cloud.repos)) out.repos = cloud.repos;
+    \\  if (cloud.workOnCurrentBranch) out.workOnCurrentBranch = true;
+    \\  if (cloud.autoCreatePR) out.autoCreatePR = true;
+    \\  if (cloud.skipReviewerRequest) out.skipReviewerRequest = true;
+    \\  if (cloud.envVars && typeof cloud.envVars === "object") out.envVars = cloud.envVars;
+    \\  return out;
+    \\};
+    \\const runtimeListOptions = () => runtime() === "cloud"
+    \\  ? { runtime: "cloud", apiKey: process.env.CURSOR_API_KEY, limit: input.limit || 100 }
+    \\  : { runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 100 };
+    \\const runtimeRunOptions = () => runtime() === "cloud"
+    \\  ? { runtime: "cloud", apiKey: process.env.CURSOR_API_KEY }
+    \\  : { runtime: "local", cwd: input.cwd || process.cwd() };
+    \\const runtimeGetRunOptions = (agentId) => runtime() === "cloud"
+    \\  ? { runtime: "cloud", agentId, apiKey: process.env.CURSOR_API_KEY }
+    \\  : { runtime: "local", cwd: input.cwd || process.cwd(), agentId };
     \\const agentOptions = () => ({
     \\  apiKey: process.env.CURSOR_API_KEY,
     \\  model: modelSelection(input.model || "composer-2", input.modelParams),
     \\  name: input.title || undefined,
-    \\  local: { cwd: input.cwd || process.cwd() },
+    \\  ...(runtime() === "cloud" ? { cloud: cloudOptions() } : { local: localOptions() }),
     \\});
     \\const textFromContent = (content) =>
     \\  Array.isArray(content)
     \\    ? content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
     \\    : "";
+    \\const jsonSummary = (value) => {
+    \\  if (value == null) return "";
+    \\  if (typeof value === "string") return value;
+    \\  try {
+    \\    const json = JSON.stringify(value);
+    \\    return json && json.length > 2000 ? `${json.slice(0, 2000)}...` : (json || "");
+    \\  } catch {
+    \\    return String(value);
+    \\  }
+    \\};
+    \\const toolBody = (event) => {
+    \\  const args = jsonSummary(event.args);
+    \\  const result = jsonSummary(event.result);
+    \\  if (args && result) return `${event.name} ${args}\n\n${result}`;
+    \\  if (args) return `${event.name} ${args}`;
+    \\  if (result) return `${event.name}\n\n${result}`;
+    \\  return event.name || "tool";
+    \\};
+    \\const toolTitle = (event) => {
+    \\  if (event.status === "error") return "Tool failed";
+    \\  if (event.status === "completed") return "Tool completed";
+    \\  return "Tool running";
+    \\};
+    \\const emitRunResultMetadata = (result) => {
+    \\  if (!result) return;
+    \\  if (result.status && result.status !== "finished") {
+    \\    emit({ type: "message", title: "Run status", body: result.status });
+    \\  }
+    \\  if (result.result && result.result !== result.status) {
+    \\    emit({ type: "message", title: "Run result", body: result.result });
+    \\  }
+    \\  const branches = Array.isArray(result.git?.branches) ? result.git.branches : [];
+    \\  for (const branch of branches) {
+    \\    const parts = [branch.repoUrl, branch.branch, branch.prUrl].filter(Boolean);
+    \\    if (parts.length) emit({ type: "message", title: "Git branch", body: parts.join("\n") });
+    \\  }
+    \\};
     \\const messageText = (message) => {
     \\  if (typeof message?.text === "string") return message.text;
     \\  if (typeof message?.content === "string") return message.content;
@@ -931,13 +1207,41 @@ const BRIDGE_SCRIPT =
     \\};
     \\const normalizeMessage = (item) => {
     \\  const message = item?.message ?? item;
-    \\  const role = messageRole(message);
-    \\  const text = messageText(message);
+    \\  const role = messageRole(message) || (message?.type === "system" ? "system" : "assistant");
+    \\  const text = messageText(message) || jsonSummary(message);
     \\  if (!role || !text) return null;
-    \\  return { role, text };
+    \\  return { role, text, uuid: item?.uuid || message?.uuid, kind: message?.type || item?.type, metadata: message };
+    \\};
+    \\const textFromConversationTurn = (turn) => {
+    \\  if (typeof turn?.text === "string") return turn.text;
+    \\  if (typeof turn?.message?.text === "string") return turn.message.text;
+    \\  return textFromContent(turn?.message?.content || turn?.content);
+    \\};
+    \\const roleFromConversationTurn = (turn) => {
+    \\  const type = turn?.type || turn?.message?.role || turn?.role;
+    \\  if (type === "user" || type === "assistant") return type;
+    \\  if (type === "system") return "system";
+    \\  if (type === "thinking" || type === "shell" || type === "agent") return "assistant";
+    \\  return "assistant";
+    \\};
+    \\const normalizeConversationTurn = (turn) => {
+    \\  const role = roleFromConversationTurn(turn);
+    \\  const text = textFromConversationTurn(turn) || jsonSummary(turn);
+    \\  if (!role || !text) return null;
+    \\  return { role, text, uuid: turn?.uuid || turn?.id, kind: turn?.type, metadata: turn };
     \\};
     \\const agentId = (agent) => agent?.agentId || agent?.id;
     \\const titleOf = (item) => item?.name || item?.summary || item?.agentId || item?.id || "";
+    \\const runSummary = (run) => ({
+    \\  id: run?.id,
+    \\  agentId: run?.agentId,
+    \\  status: run?.status,
+    \\  result: run?.result,
+    \\  model: run?.model,
+    \\  durationMs: run?.durationMs,
+    \\  git: run?.git,
+    \\  createdAt: run?.createdAt,
+    \\});
     \\
     \\let input;
     \\try {
@@ -957,18 +1261,52 @@ const BRIDGE_SCRIPT =
     \\  } else if (input.command === "list_models") {
     \\    const models = await withTimeout(Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }), 5000, "Cursor model discovery");
     \\    emit({ type: "items", items: models });
+    \\  } else if (input.command === "list_repositories") {
+    \\    const repositories = await withTimeout(Cursor.repositories.list({ apiKey: process.env.CURSOR_API_KEY }), 5000, "Cursor repository discovery");
+    \\    emit({ type: "items", items: repositories });
     \\  } else if (input.command === "list_threads") {
-    \\    const result = await Agent.list({ runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 100 });
+    \\    const result = await Agent.list(runtimeListOptions());
     \\    emit({ type: "items", items: result.items });
+    \\  } else if (input.command === "list_runs") {
+    \\    if (!input.threadId) fail("threadId is required");
+    \\    const result = await Agent.listRuns(input.threadId, runtimeRunOptions());
+    \\    emit({ type: "items", items: (result.items || []).map(runSummary).filter((run) => run.id) });
+    \\  } else if (input.command === "list_artifacts") {
+    \\    if (!input.threadId) fail("threadId is required");
+    \\    const agent = await Agent.resume(input.threadId, agentOptions());
+    \\    emit({ type: "items", items: await agent.listArtifacts() });
+    \\  } else if (input.command === "download_artifact") {
+    \\    if (!input.threadId || !input.artifactPath) fail("threadId and artifactPath are required");
+    \\    const agent = await Agent.resume(input.threadId, agentOptions());
+    \\    const data = await agent.downloadArtifact(input.artifactPath);
+    \\    emit({ type: "items", items: Buffer.from(data).toString("base64") });
+    \\  } else if (input.command === "operate_agent") {
+    \\    if (!input.threadId || !input.operation) fail("threadId and operation are required");
+    \\    if (input.operation === "archive") await Agent.archive(input.threadId, { apiKey: process.env.CURSOR_API_KEY, cwd: input.cwd || process.cwd() });
+    \\    else if (input.operation === "unarchive") await Agent.unarchive(input.threadId, { apiKey: process.env.CURSOR_API_KEY, cwd: input.cwd || process.cwd() });
+    \\    else if (input.operation === "delete") await Agent.delete(input.threadId, { apiKey: process.env.CURSOR_API_KEY, cwd: input.cwd || process.cwd() });
+    \\    else fail(`unsupported operation: ${input.operation}`);
+    \\    emit({ type: "ok" });
     \\  } else if (input.command === "read_thread") {
     \\    if (!input.threadId) fail("threadId is required");
     \\    const info = await Agent.get(input.threadId, { cwd: input.cwd || process.cwd(), apiKey: process.env.CURSOR_API_KEY });
     \\    emit({ type: "thread", threadId: input.threadId, title: titleOf(info), updatedAt: info?.lastModified || null });
-    \\    const messages = await Agent.messages.list(input.threadId, { runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 1000 });
-    \\    emit({ type: "items", items: (Array.isArray(messages) ? messages : messages?.items || []).map(normalizeMessage).filter(Boolean) });
+    \\    if (runtime() === "cloud") {
+    \\      const runs = await Agent.listRuns(input.threadId, runtimeRunOptions());
+    \\      const latest = (runs.items || [])[0];
+    \\      if (latest?.supports?.("conversation")) {
+    \\        const conversation = await latest.conversation();
+    \\        emit({ type: "items", items: (conversation || []).map(normalizeConversationTurn).filter(Boolean) });
+    \\      } else {
+    \\        emit({ type: "items", items: [] });
+    \\      }
+    \\    } else {
+    \\      const messages = await Agent.messages.list(input.threadId, { runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 1000 });
+    \\      emit({ type: "items", items: (Array.isArray(messages) ? messages : messages?.items || []).map(normalizeMessage).filter(Boolean) });
+    \\    }
     \\  } else if (input.command === "interrupt_thread") {
     \\    if (!input.threadId || !input.turnId) fail("threadId and turnId are required");
-    \\    const run = await Agent.getRun(input.turnId, { runtime: "local", cwd: input.cwd || process.cwd(), agentId: input.threadId, apiKey: process.env.CURSOR_API_KEY });
+    \\    const run = await Agent.getRun(input.turnId, runtimeGetRunOptions(input.threadId));
     \\    await run.cancel();
     \\    emit({ type: "ok" });
     \\  } else if (input.command === "send_prompt") {
@@ -976,7 +1314,7 @@ const BRIDGE_SCRIPT =
     \\    ? await Agent.resume(input.threadId, agentOptions())
     \\    : await Agent.create(agentOptions());
     \\  emit({ type: "thread", threadId: agentId(agent), title: input.title || agentId(agent) });
-    \\  const run = await agent.send(await userMessageForInput(), { model: modelSelection(input.model || "composer-2", input.modelParams), local: { force: true } });
+    \\  const run = await agent.send(await userMessageForInput(), { model: modelSelection(input.model || "composer-2", input.modelParams), ...(runtime() === "cloud" ? {} : { local: { force: true } }) });
     \\  emit({ type: "turn", runId: run.id });
     \\  let deltaCount = 0;
     \\  for await (const event of run.stream()) {
@@ -999,17 +1337,37 @@ const BRIDGE_SCRIPT =
     \\      continue;
     \\    }
     \\    if (event?.type === "tool_call" && event.name) {
-    \\      emit({ type: "command", command: `${event.name} ${JSON.stringify(event.args ?? {})}`, failed: event.status === "error" });
+    \\      emit({ type: "command", title: toolTitle(event), command: toolBody(event), failed: event.status === "error" });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "thinking" && typeof event.text === "string" && event.text) {
+    \\      emit({ type: "message", title: "Thinking", body: event.text });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "status") {
+    \\      const body = [event.status, event.message].filter(Boolean).join(": ");
+    \\      if (body) emit({ type: "message", title: "Status", body });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "task") {
+    \\      const body = [event.status, event.text].filter(Boolean).join(": ");
+    \\      if (body) emit({ type: "message", title: "Task", body });
+    \\      continue;
+    \\    }
+    \\    if (event?.type === "request" && event.request_id) {
+    \\      emit({ type: "message", title: "Request", body: event.request_id });
+    \\      continue;
     \\    }
     \\  }
     \\  const result = await run.wait();
+    \\  emitRunResultMetadata(result);
     \\  emit({ type: "debug", name: "deltaCount", value: deltaCount });
     \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: "" });
     \\  } else {
     \\    fail(`unsupported command: ${input.command}`);
     \\  }
     \\} catch (error) {
-    \\  fail(error?.stack || error?.message || String(error));
+    \\  fail(error?.stack || error?.message || String(error), errorDetails(error));
     \\}
 ;
 
@@ -1149,7 +1507,7 @@ test "parseBridgeEventsAlloc maps command events to stream events" {
     var ctx: Context = .{};
     const payload =
         \\{"type":"thread","threadId":"agent_123"}
-        \\{"type":"command","command":"bash -lc zig build test","failed":true}
+        \\{"type":"command","title":"Tool failed","command":"bash -lc zig build test","failed":true}
         \\
     ;
     const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, .{
@@ -1159,8 +1517,42 @@ test "parseBridgeEventsAlloc maps command events to stream events" {
     });
     defer parsed.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("Command failed", ctx.title);
+    try std.testing.expectEqualStrings("Tool failed", ctx.title);
     try std.testing.expectEqualStrings("bash -lc zig build test", ctx.body);
+}
+
+test "parseBridgeEventsAlloc maps sdk status messages to stream events" {
+    const Context = struct {
+        title: []const u8 = "",
+        body: []const u8 = "",
+
+        fn onEvent(raw: ?*anyopaque, event: provider_types.StreamEvent) void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw orelse return));
+            switch (event) {
+                .message => |message| {
+                    ctx.title = message.title;
+                    ctx.body = message.body;
+                },
+                .diff => {},
+            }
+        }
+    };
+
+    var ctx: Context = .{};
+    const payload =
+        \\{"type":"thread","threadId":"agent_123"}
+        \\{"type":"message","title":"Status","body":"RUNNING: applying changes"}
+        \\
+    ;
+    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, .{
+        .prompt = "hello",
+        .stream_context = &ctx,
+        .on_stream_event = Context.onEvent,
+    });
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Status", ctx.title);
+    try std.testing.expectEqualStrings("RUNNING: applying changes", ctx.body);
 }
 
 test "parseBridgeEventsAlloc fails when bridge emits an error" {
@@ -1170,6 +1562,17 @@ test "parseBridgeEventsAlloc fails when bridge emits an error" {
     ;
     try std.testing.expectError(
         error.CursorBridgeFailed,
+        parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null),
+    );
+}
+
+test "parseBridgeEventsAlloc maps structured auth errors to signed out" {
+    const payload =
+        \\{"type":"error","message":"bad key","errorName":"AuthenticationError","status":401}
+        \\
+    ;
+    try std.testing.expectError(
+        error.CursorSignedOut,
         parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null),
     );
 }
