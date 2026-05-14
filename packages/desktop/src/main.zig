@@ -383,6 +383,7 @@ fn mainInner(init: std.process.Init) !void {
         state.palette_frame_text.clearRetainingCapacity();
         _ = state.palette_frame_text_arena.reset(.retain_capacity);
         state.code_copy_buttons.clearRetainingCapacity();
+        state.card_toggle_hits.clearRetainingCapacity();
 
         recordSpan(&frame_sample, .render_root, struct {
             fn run(app_state: *AppState, framebuffer_width: c_int, framebuffer_height: c_int) void {

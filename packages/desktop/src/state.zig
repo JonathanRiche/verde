@@ -63,6 +63,21 @@ pub const PaletteModalHit = struct {
 /// offset/length pair is only valid until the next frame's text-buffer reset.
 pub const CodeCopyButtonHit = chat_markdown.CodeCopyButtonSink;
 
+/// Kinds of expand/collapse cards that share the same per-frame hit list.
+pub const CardToggleKind = enum(u8) {
+    command_card,
+    diff_file,
+};
+
+/// Per-frame hit-test entry for a collapsible card header (command bubble,
+/// diff file row). The `key` identifies the card across frames and is also the
+/// lookup into `expanded_cards`.
+pub const CardToggleHit = struct {
+    rect: palette.Rect,
+    key: u64,
+    kind: CardToggleKind,
+};
+
 pub const PaletteModalTextFocus = enum {
     none,
     project_rename,
@@ -1578,6 +1593,8 @@ pub const AppState = struct {
     code_copy_buttons: std.ArrayList(CodeCopyButtonHit),
     code_copy_recent_identity: u64,
     code_copy_recent_until_ms: i64,
+    card_toggle_hits: std.ArrayList(CardToggleHit),
+    expanded_cards: std.AutoHashMap(u64, void),
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -1745,6 +1762,8 @@ pub const AppState = struct {
             .code_copy_buttons = .empty,
             .code_copy_recent_identity = 0,
             .code_copy_recent_until_ms = 0,
+            .card_toggle_hits = .empty,
+            .expanded_cards = std.AutoHashMap(u64, void).init(allocator),
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -6453,6 +6472,8 @@ pub const AppState = struct {
         self.palette_frame_text_arena.deinit();
         self.palette_modal_hits.deinit(self.allocator);
         self.code_copy_buttons.deinit(self.allocator);
+        self.card_toggle_hits.deinit(self.allocator);
+        self.expanded_cards.deinit();
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
@@ -7439,6 +7460,37 @@ pub const AppState = struct {
             .recent_identity = if (active) self.code_copy_recent_identity else 0,
             .recent_active = active,
         };
+    }
+
+    /// Records a collapsible card header hit-rect for the current frame.
+    /// Use `isCardExpanded` to read the persistent state during rendering and
+    /// `consumeCardToggleClick` from the click handler.
+    pub fn recordCardToggleHit(self: *AppState, hit: CardToggleHit) void {
+        self.card_toggle_hits.append(self.allocator, hit) catch |err| {
+            log.warn("failed to retain card toggle hit: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Returns true when the given card key was previously toggled to expanded.
+    pub fn isCardExpanded(self: *AppState, key: u64) bool {
+        return self.expanded_cards.contains(key);
+    }
+
+    /// Hit-tests the most recent frame's card-toggle headers. On hit, flips
+    /// the expanded state for that key and returns true.
+    pub fn consumeCardToggleClick(self: *AppState, x: f32, y: f32) bool {
+        for (self.card_toggle_hits.items) |hit| {
+            if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
+            if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+            if (self.expanded_cards.fetchRemove(hit.key) == null) {
+                self.expanded_cards.put(hit.key, {}) catch |err| {
+                    log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+                };
+            }
+            self.markDirty();
+            return true;
+        }
+        return false;
     }
 
     /// Hit-tests the most recent frame's code-block copy buttons. On hit,

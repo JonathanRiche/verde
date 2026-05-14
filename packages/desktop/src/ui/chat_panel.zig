@@ -4,6 +4,7 @@ const std = @import("std");
 const palette = @import("palette");
 
 const app_state = @import("../state.zig");
+const profiler = @import("../profiler.zig");
 const utils = @import("../utils.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
@@ -432,6 +433,9 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
 
     state.transcript_focused = true;
     if (clicks <= 1 and state.consumeCodeCopyButtonClick(x, y)) {
+        return true;
+    }
+    if (clicks <= 1 and state.consumeCardToggleClick(x, y)) {
         return true;
     }
     if (transcriptMarkdownBubbleHit(state, x, y)) |hit| {
@@ -1132,19 +1136,21 @@ fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f
     for (thread.messages.items, 0..) |message, message_index| {
         total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
     }
-    total += transcriptPendingStreamHeight(thread, width);
+    total += transcriptPendingStreamHeight(state, thread, width);
     return total;
 }
 
-fn transcriptPendingStreamHeight(thread: *const app_state.ChatThread, column_width: f32) f32 {
+fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_state.ChatThread, column_width: f32) f32 {
     const send_state = thread.send_state;
     send_state.mutex.lock();
     defer send_state.mutex.unlock();
     if (send_state.status != .pending) return 0;
 
+    const base = thread.messages.items.len;
     var total: f32 = 0;
-    for (send_state.pending_events.items) |event| {
-        total += transcriptMessageHeight(null, null, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
+    for (send_state.pending_events.items, 0..) |event, pi| {
+        const msg_idx = base + pi;
+        total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
     }
     const stream_text: []const u8 = send_state.partial_text.items;
     const body_for_height = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
@@ -1160,12 +1166,18 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     if (send_state.status != .pending) return;
 
     var y = content_y;
+    const pending_count = send_state.pending_events.items.len;
     for (send_state.pending_events.items, 0..) |event, pi| {
         const msg_idx = base_message_index + pi;
-        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
+            const is_last = pi + 1 == pending_count;
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last);
+            }
+        } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
+            if (y + item_h >= column.y and y <= column.y + column.h) {
+                renderDiffSummaryCard(state, column, y, item_h, event.body, clip, msg_idx);
             }
         } else {
             const role_label: []const u8 = switch (event.role) {
@@ -1242,33 +1254,50 @@ fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const
     return original_author;
 }
 
-fn transcriptCommandEventHeight(original_author: []const u8, body_raw: []const u8, column_width: f32) f32 {
-    const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
+fn transcriptCommandEventHeight(
+    state: ?*app_state.AppState,
+    message_index: ?usize,
+    body_raw: []const u8,
+    column_width: f32,
+) f32 {
     const pad_x = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
-    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(15.0);
+    const line_h = font_size * 1.28;
+    const header_h = line_h + pad_y * 2.0;
+
+    const expanded = blk: {
+        const app = state orelse break :blk false;
+        const idx = message_index orelse break :blk false;
+        break :blk app.isCardExpanded(commandCardKey(idx));
+    };
+    if (!expanded) return header_h;
+
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const inner_w = @max(column_width - pad_x * 2.0, theme.scaledUi(80.0));
     const chars_per_line = @max(@as(usize, @intFromFloat(inner_w / (font_size * 0.52))), 1);
-
-    const combined = std.fmt.allocPrint(std.heap.page_allocator, ">_ {s} - {s}", .{ label, body }) catch {
-        const line_count = wrappedLineCount(body, chars_per_line);
-        return pad_y * 2.0 + @as(f32, @floatFromInt(1 + line_count)) * font_size * 1.28;
-    };
-    defer std.heap.page_allocator.free(combined);
-    const line_count = wrappedLineCount(combined, chars_per_line);
-    return pad_y * 2.0 + @as(f32, @floatFromInt(line_count)) * font_size * 1.28;
+    const line_count = wrappedLineCount(body, chars_per_line);
+    return header_h + @as(f32, @floatFromInt(line_count)) * line_h + pad_y;
 }
 
 fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: usize, message: app_state.ChatMessage, column_width: f32) f32 {
     const image_present = message.image != null or message.extra_images.len > 0;
-    if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
-        return height;
+    // Command rows and diff cards have per-frame expand/collapse state that the
+    // height cache key does not include — bypass the cache so toggles take
+    // effect immediately.
+    const has_dynamic_collapse = message.role == .system and
+        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body));
+    if (!has_dynamic_collapse) {
+        if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
+            return height;
+        }
     }
 
     var height = transcriptMessageHeight(state, message_index, message.body, message.role, column_width, message.author, false);
     height += transcriptImageBlockHeight(message, column_width);
-    state.putTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present, height);
+    if (!has_dynamic_collapse) {
+        state.putTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present, height);
+    }
     return height;
 }
 
@@ -1316,7 +1345,10 @@ fn transcriptMessageHeightStream(
     streaming: bool,
 ) f32 {
     if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
-        return transcriptCommandEventHeight(message_author, body_raw, column_width);
+        return transcriptCommandEventHeight(state, message_index, body_raw, column_width);
+    }
+    if (role == .system and isDiffSummaryMessage(message_author, body_raw)) {
+        return diffSummaryHeight(state, message_index, body_raw, column_width);
     }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(15.5);
@@ -1378,7 +1410,11 @@ fn queueRoundedShellClipped(
 
 fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, false);
+        return;
+    }
+    if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
+        renderDiffSummaryCard(state, column, y, height, message.body, clip, message_index);
         return;
     }
     const role_label = switch (message.role) {
@@ -1436,6 +1472,272 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
     }
 }
 
+// ----- Diff summary card -----
+
+const DiffFileEntry = struct {
+    path: []const u8,
+    additions: i64,
+    deletions: i64,
+    patch: []const u8,
+};
+
+/// True when this system message was emitted by `appendPendingDiffSummaryEvent`
+/// (author "Changed files", body framed with PERSISTED_DIFF_MARKER).
+fn isDiffSummaryMessage(author: []const u8, body_raw: []const u8) bool {
+    if (!std.mem.eql(u8, author, "Changed files")) return false;
+    return std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER);
+}
+
+/// Iterator over diff file entries packed in the persisted body. Returns null
+/// when the body does not start with `PERSISTED_DIFF_MARKER`.
+fn parseDiffSummary(allocator: std.mem.Allocator, body_raw: []const u8) ?[]DiffFileEntry {
+    if (!std.mem.startsWith(u8, body_raw, utils.PERSISTED_DIFF_MARKER)) return null;
+    var rest = body_raw[utils.PERSISTED_DIFF_MARKER.len..];
+
+    var files: std.ArrayList(DiffFileEntry) = .empty;
+    errdefer files.deinit(allocator);
+
+    while (rest.len > 0) {
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse break;
+        const header_line = rest[0..line_end];
+        rest = rest[line_end + 1 ..];
+        if (header_line.len == 0) continue;
+        if (!std.mem.startsWith(u8, header_line, "FILE\t")) continue;
+        var it = std.mem.splitScalar(u8, header_line["FILE\t".len..], '\t');
+        const path = it.next() orelse continue;
+        const additions = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
+        const deletions = std.fmt.parseInt(i64, it.next() orelse "0", 10) catch 0;
+        const patch_len = std.fmt.parseInt(usize, it.next() orelse "0", 10) catch 0;
+        if (patch_len > rest.len) break;
+        const patch = rest[0..patch_len];
+        rest = rest[patch_len..];
+        // Skip the trailing newline that separates entries.
+        if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
+        files.append(allocator, .{
+            .path = path,
+            .additions = additions,
+            .deletions = deletions,
+            .patch = patch,
+        }) catch break;
+    }
+    return files.toOwnedSlice(allocator) catch null;
+}
+
+fn diffFileCardKey(message_index: usize, file_path: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0xD1FFD1FFD1FFD1FF);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update(file_path);
+    return hasher.final();
+}
+
+fn diffSummaryHeight(state: ?*app_state.AppState, message_index: ?usize, body_raw: []const u8, column_width: f32) f32 {
+    const files = parseDiffSummary(std.heap.page_allocator, body_raw) orelse return 0.0;
+    defer std.heap.page_allocator.free(files);
+    return diffSummaryHeightForFiles(state, message_index, files, column_width);
+}
+
+fn diffSummaryHeightForFiles(state: ?*app_state.AppState, message_index: ?usize, files: []const DiffFileEntry, column_width: f32) f32 {
+    const pad_y = theme.scaledUi(10.0);
+    const header_h = theme.scaledUi(34.0);
+    const row_h = theme.scaledUi(30.0);
+    var total: f32 = pad_y + header_h + pad_y;
+    const inner_w = @max(column_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
+    const code_font = theme.scaledUi(13.0);
+    const code_line_h = code_font * 1.32;
+    const code_char_w = code_font * 0.6;
+    const code_inner_w = @max(inner_w - theme.scaledUi(20.0), theme.scaledUi(40.0));
+    const code_cols = @max(@as(usize, @intFromFloat(code_inner_w / code_char_w)), 1);
+    for (files, 0..) |file, idx| {
+        total += row_h;
+        const expanded = blk: {
+            const app = state orelse break :blk false;
+            const mi = message_index orelse break :blk false;
+            _ = idx;
+            break :blk app.isCardExpanded(diffFileCardKey(mi, file.path));
+        };
+        if (expanded) {
+            const line_count = wrappedLineCount(file.patch, code_cols);
+            total += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(12.0);
+        }
+    }
+    total += pad_y;
+    return total;
+}
+
+fn renderDiffSummaryCard(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    body_raw: []const u8,
+    clip: palette.Rect,
+    message_index: usize,
+) void {
+    const files = parseDiffSummary(state.allocator, body_raw) orelse return;
+    defer state.allocator.free(files);
+
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    const rr = transcriptBubbleCornerRadius();
+    const bg = colors.rgba(24, 26, 32, 255);
+    const border = colors.rgba(56, 64, 78, 255);
+    queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border), rr, clip);
+
+    const pad_x = theme.scaledUi(14.0);
+    const pad_y = theme.scaledUi(10.0);
+    const header_h = theme.scaledUi(34.0);
+    const row_h = theme.scaledUi(30.0);
+
+    // Header: "Changed files - N file(s) +A -D"
+    var total_add: i64 = 0;
+    var total_del: i64 = 0;
+    for (files) |f| {
+        total_add += f.additions;
+        total_del += f.deletions;
+    }
+    const header_label = std.fmt.allocPrint(state.allocator, "Changed files — {d} file{s}", .{ files.len, if (files.len == 1) "" else "s" }) catch null;
+    defer if (header_label) |t| state.allocator.free(t);
+    const header_y = bubble.y + pad_y;
+    queueFixedTextLine(state, snapRect(.{
+        .x = bubble.x + pad_x,
+        .y = header_y + theme.scaledUi(6.0),
+        .w = bubble.w - pad_x * 2.0 - theme.scaledUi(120.0),
+        .h = theme.scaledUi(20.0),
+    }), header_label orelse "Changed files", paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), clip);
+
+    const counts = std.fmt.allocPrint(state.allocator, "+{d}  -{d}", .{ total_add, total_del }) catch null;
+    defer if (counts) |t| state.allocator.free(t);
+    queueFixedTextLine(state, snapRect(.{
+        .x = bubble.x + bubble.w - pad_x - theme.scaledUi(110.0),
+        .y = header_y + theme.scaledUi(6.0),
+        .w = theme.scaledUi(110.0),
+        .h = theme.scaledUi(20.0),
+    }), counts orelse "", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), clip);
+
+    // Separator below header
+    queueRect(state, snapRect(.{
+        .x = bubble.x + pad_x,
+        .y = header_y + header_h - 1.0,
+        .w = bubble.w - pad_x * 2.0,
+        .h = 1.0,
+    }), paletteColor(colors.rgba(46, 52, 64, 255)));
+
+    var row_y = bubble.y + pad_y + header_h;
+    const file_font = theme.scaledUi(13.5);
+    const code_font = theme.scaledUi(13.0);
+    const code_line_h = code_font * 1.32;
+    const code_char_w = code_font * 0.6;
+
+    for (files) |file| {
+        const key = diffFileCardKey(message_index, file.path);
+        const expanded = state.isCardExpanded(key);
+
+        const row_rect = palette.Rect{ .x = bubble.x, .y = row_y, .w = bubble.w, .h = row_h };
+
+        // Hover background (very subtle) — skip for simplicity; just record hit.
+        state.recordCardToggleHit(.{ .rect = row_rect, .key = key, .kind = .diff_file });
+
+        // Chevron at left
+        const chev_x = bubble.x + pad_x + theme.scaledUi(6.0);
+        const chev_y = row_y + row_h * 0.5;
+        queueCardChevron(state, chev_x, chev_y, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+
+        // Path
+        const path_x = chev_x + theme.scaledUi(14.0);
+        const counts_w = theme.scaledUi(110.0);
+        const path_w = @max(bubble.w - pad_x * 2.0 - (path_x - bubble.x) - counts_w, theme.scaledUi(40.0));
+        const path_display = truncateMonoToWidth(state.allocator, file.path, path_w, file_font);
+        defer if (path_display.allocated) state.allocator.free(path_display.text);
+        queueFixedTextLine(state, snapRect(.{
+            .x = path_x,
+            .y = row_y + (row_h - file_font * 1.25) * 0.5,
+            .w = path_w,
+            .h = file_font * 1.25,
+        }), path_display.text, paletteColor(theme.COLOR_WHITE), file_font, clip);
+
+        // Counts on right (green +N, red -M)
+        const adds_text = std.fmt.allocPrint(state.allocator, "+{d}", .{file.additions}) catch null;
+        defer if (adds_text) |t| state.allocator.free(t);
+        const dels_text = std.fmt.allocPrint(state.allocator, "-{d}", .{file.deletions}) catch null;
+        defer if (dels_text) |t| state.allocator.free(t);
+        const counts_right = bubble.x + bubble.w - pad_x;
+        const dels_w = theme.scaledUi(46.0);
+        const adds_w = theme.scaledUi(46.0);
+        queueFixedTextLine(state, snapRect(.{
+            .x = counts_right - dels_w,
+            .y = row_y + (row_h - file_font * 1.25) * 0.5,
+            .w = dels_w,
+            .h = file_font * 1.25,
+        }), dels_text orelse "-0", paletteColor(theme.COLOR_DIFF_REMOVE), file_font, clip);
+        queueFixedTextLine(state, snapRect(.{
+            .x = counts_right - dels_w - adds_w,
+            .y = row_y + (row_h - file_font * 1.25) * 0.5,
+            .w = adds_w,
+            .h = file_font * 1.25,
+        }), adds_text orelse "+0", paletteColor(theme.COLOR_DIFF_ADD), file_font, clip);
+
+        row_y += row_h;
+
+        if (expanded and file.patch.len > 0) {
+            const patch_inset_x = bubble.x + pad_x + theme.scaledUi(20.0);
+            const patch_w = bubble.w - pad_x * 2.0 - theme.scaledUi(20.0);
+            const cols = @max(@as(usize, @intFromFloat(patch_w / code_char_w)), 1);
+            renderDiffPatchLines(state, .{ .x = patch_inset_x, .y = row_y + theme.scaledUi(4.0), .w = patch_w, .h = bubble.y + bubble.h - row_y }, file.patch, cols, code_font, code_line_h, clip);
+            const line_count = wrappedLineCount(file.patch, cols);
+            row_y += @as(f32, @floatFromInt(line_count)) * code_line_h + theme.scaledUi(12.0);
+        }
+    }
+}
+
+fn renderDiffPatchLines(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    patch: []const u8,
+    cols: usize,
+    font_size: f32,
+    line_h: f32,
+    clip: palette.Rect,
+) void {
+    var y = rect.y;
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= patch.len and y < clip.y + clip.h) : (i += 1) {
+        if (i != patch.len and patch[i] != '\n') continue;
+        const line_end = i;
+        if (line_start == line_end) {
+            y += line_h;
+            line_start = i + 1;
+            continue;
+        }
+        const line = patch[line_start..line_end];
+        const color: [4]f32 = switch (line[0]) {
+            '+' => if (std.mem.startsWith(u8, line, "+++")) [4]f32{ 200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 1.0 } else theme.COLOR_DIFF_ADD,
+            '-' => if (std.mem.startsWith(u8, line, "---")) [4]f32{ 200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 1.0 } else theme.COLOR_DIFF_REMOVE,
+            '@' => [4]f32{ 122.0 / 255.0, 202.0 / 255.0, 255.0 / 255.0, 1.0 },
+            else => theme.COLOR_TEXT_MUTED,
+        };
+        var chunk_start: usize = 0;
+        while (chunk_start < line.len and y < clip.y + clip.h) {
+            const remaining = line.len - chunk_start;
+            const chunk_len = @min(remaining, cols);
+            const chunk = line[chunk_start .. chunk_start + chunk_len];
+            if (y + line_h >= clip.y) {
+                queueFixedTextLine(state, snapRect(.{ .x = rect.x, .y = y, .w = rect.w, .h = line_h }), chunk, paletteColor(color), font_size, clip);
+            }
+            y += line_h;
+            chunk_start += chunk_len;
+        }
+        line_start = i + 1;
+    }
+}
+
+/// Stable key for the command-row expand/collapse state per message index.
+fn commandCardKey(message_index: usize) u64 {
+    var hasher = std.hash.Wyhash.init(0xC0DEC0DEC0DEC0DE);
+    hasher.update(std.mem.asBytes(&message_index));
+    hasher.update("command_card");
+    return hasher.final();
+}
+
 fn renderCommandEventRow(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -1444,36 +1746,114 @@ fn renderCommandEventRow(
     original_author: []const u8,
     body_raw: []const u8,
     clip: palette.Rect,
+    message_index: usize,
+    running: bool,
 ) void {
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
     const rr = transcriptBubbleCornerRadius();
+    const failed = std.mem.eql(u8, original_author, "Command failed");
     queueRoundedShellClipped(
         state,
         bubble,
         paletteColor(colors.rgba(28, 29, 34, 255)),
-        paletteColor(colors.DARK_BLUE),
+        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else colors.DARK_BLUE),
         rr,
         clip,
     );
 
-    const pad = theme.scaledUi(14.0);
+    const pad_x = theme.scaledUi(14.0);
     const pad_y = theme.scaledUi(9.0);
-    const inner = palette.Rect{
-        .x = bubble.x + pad,
-        .y = bubble.y + pad_y,
-        .w = @max(bubble.w - pad * 2.0, theme.scaledUi(40.0)),
-        .h = @max(bubble.h - pad_y * 2.0, theme.scaledUi(1.0)),
-    };
+    const font_size = theme.scaledUi(15.0);
+    const line_h = font_size * 1.28;
+    const header_h = line_h + pad_y * 2.0;
+
+    const key = commandCardKey(message_index);
+    const expanded = state.isCardExpanded(key);
+
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const label = paletteCommandRowDisplayAuthor(original_author, body_raw);
-    const combined = std.fmt.allocPrint(state.allocator, ">_ {s} - {s}", .{ label, body }) catch {
-        renderWrappedBody(state, inner, body, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
-        return;
+
+    const status_dia = theme.scaledUi(8.0);
+    const status_cx = bubble.x + pad_x + status_dia * 0.5;
+    const status_cy = bubble.y + pad_y + line_h * 0.5;
+    const status_color: [4]f32 = blk: {
+        if (failed) break :blk theme.COLOR_DIFF_REMOVE;
+        if (running) {
+            const t_ns: i128 = profiler.nowNs();
+            const period_ns: i128 = 1_400_000_000;
+            const phase = @as(f32, @floatFromInt(@mod(t_ns, period_ns))) / @as(f32, @floatFromInt(period_ns));
+            const sin_t = std.math.sin(phase * std.math.tau);
+            const alpha = 0.45 + 0.55 * (sin_t * 0.5 + 0.5);
+            break :blk [4]f32{ 122.0 / 255.0, 202.0 / 255.0, 255.0 / 255.0, alpha };
+        }
+        break :blk [4]f32{ 100.0 / 255.0, 170.0 / 255.0, 130.0 / 255.0, 1.0 };
     };
-    defer state.allocator.free(combined);
-    const failed = std.mem.eql(u8, original_author, "Command failed");
-    const color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
-    renderWrappedBody(state, inner, combined, color, theme.scaledUi(15.0), clip);
+    queueRounded(state, .{
+        .x = status_cx - status_dia * 0.5,
+        .y = status_cy - status_dia * 0.5,
+        .w = status_dia,
+        .h = status_dia,
+    }, paletteColor(status_color), status_dia * 0.5);
+
+    const chev_box_w = theme.scaledUi(18.0);
+    const chev_cx = bubble.x + bubble.w - pad_x - chev_box_w * 0.5;
+    const chev_cy = status_cy;
+    queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
+
+    const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
+    const text_w = @max((bubble.x + bubble.w - pad_x - chev_box_w - theme.scaledUi(6.0)) - text_x, theme.scaledUi(40.0));
+    const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
+
+    const header_text = std.fmt.allocPrint(state.allocator, ">_ {s} - {s}", .{ label, body }) catch null;
+    defer if (header_text) |t| state.allocator.free(t);
+
+    const display_text = truncateMonoToWidth(state.allocator, header_text orelse body, text_w, font_size);
+    defer if (display_text.allocated) state.allocator.free(display_text.text);
+
+    queueFixedTextLine(state, snapRect(.{
+        .x = text_x,
+        .y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5,
+        .w = text_w,
+        .h = font_size * 1.25,
+    }), display_text.text, text_color, font_size, clip);
+
+    state.recordCardToggleHit(.{
+        .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
+        .key = key,
+        .kind = .command_card,
+    });
+
+    if (expanded) {
+        const inner = palette.Rect{
+            .x = bubble.x + pad_x,
+            .y = bubble.y + header_h,
+            .w = @max(bubble.w - pad_x * 2.0, theme.scaledUi(40.0)),
+            .h = @max(bubble.h - header_h - pad_y, theme.scaledUi(1.0)),
+        };
+        renderWrappedBody(state, inner, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
+    }
+}
+
+/// Right-pointing triangle when collapsed, down-pointing when expanded.
+fn queueCardChevron(state: *app_state.AppState, cx: f32, cy: f32, expanded: bool, color: palette.Color) void {
+    const half = theme.scaledUi(4.0);
+    if (expanded) {
+        queueTriangle(
+            state,
+            .{ .x = cx - half, .y = cy - half * 0.5 },
+            .{ .x = cx + half, .y = cy - half * 0.5 },
+            .{ .x = cx, .y = cy + half * 0.7 },
+            color,
+        );
+    } else {
+        queueTriangle(
+            state,
+            .{ .x = cx - half * 0.5, .y = cy - half },
+            .{ .x = cx + half * 0.7, .y = cy },
+            .{ .x = cx - half * 0.5, .y = cy + half },
+            color,
+        );
+    }
 }
 
 fn renderTranscriptBubbleFromParts(
@@ -1589,6 +1969,27 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
         false,
     );
     defer sel_out.deinit(state.allocator);
+}
+
+const TruncatedText = struct {
+    text: []const u8,
+    allocated: bool,
+};
+
+/// Truncates `text` so it fits in `max_width` pixels at `font_size` using the
+/// fixed-mono advance (~0.55em). Appends "…" when truncated. Returns a borrowed
+/// slice when no truncation was needed.
+fn truncateMonoToWidth(allocator: std.mem.Allocator, text: []const u8, max_width: f32, font_size: f32) TruncatedText {
+    const char_w = font_size * 0.55;
+    if (char_w <= 0.0 or max_width <= 0.0) return .{ .text = text, .allocated = false };
+    const fits: usize = @intFromFloat(@max(max_width / char_w, 0.0));
+    if (text.len <= fits) return .{ .text = text, .allocated = false };
+    if (fits <= 1) return .{ .text = "…", .allocated = false };
+    const keep = fits - 1;
+    const buf = allocator.alloc(u8, keep + "…".len) catch return .{ .text = text[0..@min(text.len, fits)], .allocated = false };
+    @memcpy(buf[0..keep], text[0..keep]);
+    @memcpy(buf[keep..], "…");
+    return .{ .text = buf, .allocated = true };
 }
 
 fn wrappedLineCount(body: []const u8, chars_per_line: usize) usize {
