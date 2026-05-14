@@ -85,7 +85,7 @@ pub const PaletteModalTextFocus = enum {
     project_import,
 };
 
-const PALETTE_COMPOSER_FONT_SIZE: f32 = 16.0;
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 22.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
@@ -5558,9 +5558,13 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
-        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE));
-        self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE));
-        self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(PALETTE_COMPOSER_ICON_FONT_SIZE));
+        // Composer font sizes are CSS units in the comptime config but the
+        // runtime metrics need to be the actual pixel size, otherwise the
+        // placeholder + selectors render at fixed pixel sizes while everything
+        // else in the UI scales with the display — looks tiny on HiDPI.
+        self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE)));
+        self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE)));
+        self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_ICON_FONT_SIZE)));
         const thread = self.currentThread();
         const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
         const show_fast_toggle = thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
