@@ -27,7 +27,7 @@ const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
-const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
+const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 13.0;
 /// Provider logo slot in the model pill.
 const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 900.0;
@@ -842,12 +842,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
         icon_x + icon_slot + theme.scaledUi(10.0)
     else
         open_main_rect.x + theme.scaledUi(14.0);
-    queueFixedTextLine(state, .{
+    queueChromeLabel(state, .{
         .x = text_x,
         .y = open_main_rect.y + (button_h - label_font * 1.25) * 0.5,
         .w = open_main_w - (text_x - open_main_rect.x) - theme.scaledUi(8.0),
         .h = label_font * 1.25,
-    }, stableText(state, open_label), text_color_open, label_font, rect);
+    }, open_label, text_color_open, label_font, rect);
 
     const chev_cx = chevron_rect.x + chevron_rect.w * 0.5 + theme.scaledUi(2.0);
     const chev_cy = chevron_rect.y + chevron_rect.h * 0.5;
@@ -871,12 +871,12 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
     const browser_start_x = browser_rect.x + (browser_rect.w - browser_content_w) * 0.5;
     const browser_cy = browser_rect.y + browser_rect.h * 0.5;
     queueWorkspaceHeaderGlobe(state, browser_start_x + globe_size * 0.5, browser_cy, globe_size, paletteColor(theme.COLOR_TEXT_MUTED));
-    queueFixedTextLine(state, .{
+    queueChromeLabel(state, .{
         .x = browser_start_x + globe_size + icon_gap,
         .y = browser_rect.y + (browser_rect.h - label_font * 1.25) * 0.5,
         .w = browser_text_w + theme.scaledUi(4.0),
         .h = label_font * 1.25,
-    }, stableText(state, browser_label), paletteColor(theme.COLOR_WHITE), label_font, rect);
+    }, browser_label, paletteColor(theme.COLOR_WHITE), label_font, rect);
 
     if (!state.workspace_header_open_menu_open) return;
 
@@ -2409,6 +2409,22 @@ fn queueFixedText(state: *app_state.AppState, rect: palette.Rect, value: []const
 
 fn queueFixedTextLine(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
     state.palette_overlay_batch.fixedText(state.allocator, rect, stableText(state, value), color, font_size, clip, .{}, font_size * 0.55, font_size * 1.25, false) catch {};
+}
+
+/// Chrome label rendered through the `.ui` font role (CalSans-Regular). Use
+/// this for workspace header buttons / sidebar labels so they share the same
+/// typeface as the composer prompt and selector pills.
+fn queueChromeLabel(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        snapRect(rect),
+        stableText(state, value),
+        color,
+        font_size,
+        .ui,
+        null,
+        clip,
+    ) catch {};
 }
 
 fn queueIconText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {

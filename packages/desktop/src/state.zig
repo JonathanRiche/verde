@@ -85,35 +85,42 @@ pub const PaletteModalTextFocus = enum {
     project_import,
 };
 
-const PALETTE_COMPOSER_FONT_SIZE: f32 = 22.0;
-const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 24.0;
-const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 28.0;
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 16.0;
+const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
+const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
-    .padding_x = 24.0,
-    .padding_y = 20.0,
-    .toolbar_height = 46.0,
-    .toolbar_gap = 16.0,
-    .control_gap = 10.0,
-    .pill_padding_x = 21.0,
-    .pill_icon_gap = 13.0,
-    .pill_chevron_gap = 22.0,
-    .model_min_width = 176.0,
+    // Geometry retuned for the 15pt toolbar / 16pt body fonts. Earlier numbers
+    // assumed ~24pt pills and looked over-padded after the type-scale change.
+    .padding_x = 16.0,
+    .padding_y = 14.0,
+    .toolbar_height = 32.0,
+    .toolbar_gap = 10.0,
+    .control_gap = 6.0,
+    .pill_padding_x = 13.0,
+    // `pill_overlay_icon_reserve + pill_icon_gap` must clear the host-drawn
+    // toolbar icon AND leave breathing room at 1× display scale. Provider
+    // PNG is 26 CSS px, fast/access codicons 22 CSS px. Sum kept ≥ 38 so the
+    // label doesn't kiss the glyph on a laptop screen at 1×.
+    .pill_icon_gap = 12.0,
+    .pill_chevron_gap = 14.0,
+    .model_min_width = 112.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
-    .model_max_width = 420.0,
-    .reasoning_min_width = 118.0,
-    .reasoning_max_width = 248.0,
-    .fast_min_width = 124.0,
-    .fast_max_width = 280.0,
-    .access_min_width = 218.0,
+    .model_max_width = 270.0,
+    .reasoning_min_width = 74.0,
+    .reasoning_max_width = 160.0,
+    .fast_min_width = 80.0,
+    .fast_max_width = 180.0,
+    .access_min_width = 138.0,
     // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
-    .access_max_width = 328.0,
-    // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
-    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
-    .pill_overlay_icon_reserve = 29.0,
-    .pill_label_width_fudge = 14.0,
-    .corner_radius = 24.0,
+    .access_max_width = 212.0,
+    // Space after `pill_padding_x` until label: ~scaled toolbar icon width
+    // minus `pill_icon_gap`. Provider PNG slot is 26 CSS px; reserve + gap
+    // gives label-start at icon-end + ~12 CSS px on the smallest screens.
+    .pill_overlay_icon_reserve = 26.0,
+    .pill_label_width_fudge = 8.0,
+    .corner_radius = 18.0,
     .border_width = 1.0,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
     .border_color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
@@ -122,6 +129,11 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // make the state change unambiguous.
     .focus_border_color = .{ .r = 0.314, .g = 0.784, .b = 0.471, .a = 1.0 },
     .focus_border_width = 1.5,
+    // Force the bold pill labels (GPT-5.5, Medium, Fast, Full access) onto the
+    // .ui role too so they share CalSans-Regular with the placeholder and the
+    // workspace header buttons. The default `.ui_bold` falls through to the
+    // renderer's heavy NotoSans-Bold, which reads as a different typeface.
+    .bold_font_role = .ui,
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
@@ -1663,6 +1675,8 @@ pub const AppState = struct {
     browser_pane_hovered: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
+    sidebar_project_hover: ?usize,
+    sidebar_new_thread_hover: ?usize,
     browser_pane_focused: bool,
     browser_address_focused: bool,
     browser_address_cursor: usize,
@@ -1835,6 +1849,8 @@ pub const AppState = struct {
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .sidebar_thread_hover = null,
+            .sidebar_project_hover = null,
+            .sidebar_new_thread_hover = null,
             .browser_pane_focused = false,
             .browser_address_focused = false,
             .browser_address_cursor = 0,
