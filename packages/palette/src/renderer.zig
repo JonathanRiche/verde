@@ -497,6 +497,10 @@ pub const Renderer = struct {
             .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "pos") },
             .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "uv") },
             .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = @offsetOf(draw.Vertex, "color") },
+            .{ .location = 3, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_min") },
+            .{ .location = 4, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_size") },
+            .{ .location = 5, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_radius") },
+            .{ .location = 6, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = @offsetOf(draw.Vertex, "sdf_border") },
         };
         var color_targets = [_]c.SDL_GPUColorTargetDescription{.{
             .format = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
@@ -1549,22 +1553,88 @@ fn appendCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Comman
         try appendTriangle(allocator, mesh, command.p0, command.p1, command.p2, command.color, command.clip);
         return;
     }
-    if (command.border_color) |border| {
-        if (command.border_width > 0.0 and border.a > 0.0) {
-            const border_width = @max(command.border_width, 1.0);
-            if (command.color.a > 0.0) {
-                try appendRoundedRect(allocator, mesh, command.rect, border, command.radius, command.clip);
-            } else {
-                try appendRoundedBorder(allocator, mesh, command.rect, border, command.radius, border_width, command.clip);
-            }
-        }
-    }
-    if (command.color.a <= 0.0) return;
-    const rect = if (command.border_color != null and command.border_width > 0.0)
-        insetRect(command.rect, command.border_width)
+    // Rect commands all go through the SDF path. The fragment shader treats
+    // sdf_size == 0 as "plain quad" and skips the SDF math, so plain rects
+    // pay no shader cost.
+    try appendSdfRectCommand(allocator, mesh, command);
+}
+
+/// Emits a single quad per rect command (fill, fill+border, or border-only).
+/// SDF parameters carried on the vertices drive analytic edge AA in the solid
+/// fragment shader. Geometry is expanded by `SDF_HALO` pixels around the rect
+/// so the outward AA fringe has fragments to rasterize.
+const SDF_HALO: f32 = 1.0;
+
+fn appendSdfRectCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Command) !void {
+    const rect = command.rect;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+
+    const border_color: draw.Color = if (command.border_color) |bc|
+        if (command.border_width > 0.0 and bc.a > 0.0) bc else .{ .a = 0.0 }
     else
-        command.rect;
-    try appendRoundedRect(allocator, mesh, rect, command.color, @max(command.radius - command.border_width, 0.0), command.clip);
+        .{ .a = 0.0 };
+    const border_width: f32 = if (border_color.a > 0.0) @max(command.border_width, 1.0) else 0.0;
+    const fill_color: draw.Color = if (command.color.a > 0.0) command.color else .{ .a = 0.0 };
+    if (fill_color.a <= 0.0 and border_color.a <= 0.0) return;
+
+    const radius = clampedRadius(rect, command.radius);
+    const needs_sdf = radius > 0.5 or border_color.a > 0.0;
+    if (!needs_sdf) {
+        try appendRect(allocator, mesh, rect, fill_color, command.clip);
+        return;
+    }
+
+    const geom = draw.Rect{
+        .x = rect.x - SDF_HALO,
+        .y = rect.y - SDF_HALO,
+        .w = rect.w + SDF_HALO * 2.0,
+        .h = rect.h + SDF_HALO * 2.0,
+    };
+    const clipped = if (command.clip) |clip_rect| clippedRect(geom, clip_rect) orelse return else geom;
+    try appendSdfQuad(mesh, allocator, clipped, fill_color, .{
+        .min = .{ .x = rect.x, .y = rect.y },
+        .size = .{ .x = rect.w, .y = rect.h },
+        .radius = radius,
+        .border_width = border_width,
+        .border = border_color,
+    });
+}
+
+const SdfParams = struct {
+    min: draw.Vec2,
+    size: draw.Vec2,
+    radius: f32,
+    border_width: f32,
+    border: draw.Color,
+};
+
+fn appendSdfQuad(mesh: *Mesh, allocator: std.mem.Allocator, rect: draw.Rect, color: draw.Color, sdf: SdfParams) !void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const base: u32 = @intCast(mesh.vertices.items.len);
+    const x0 = rect.x;
+    const y0 = rect.y;
+    const x1 = rect.x + rect.w;
+    const y1 = rect.y + rect.h;
+    const vertex = draw.Vertex{
+        .pos = .{},
+        .uv = .{},
+        .color = color,
+        .sdf_min = sdf.min,
+        .sdf_size = sdf.size,
+        .sdf_radius = sdf.radius,
+        .sdf_border_width = sdf.border_width,
+        .sdf_border = sdf.border,
+    };
+    var v0 = vertex;
+    var v1 = vertex;
+    var v2 = vertex;
+    var v3 = vertex;
+    v0.pos = .{ .x = x0, .y = y0 };
+    v1.pos = .{ .x = x1, .y = y0 };
+    v2.pos = .{ .x = x1, .y = y1 };
+    v3.pos = .{ .x = x0, .y = y1 };
+    try mesh.vertices.appendSlice(allocator, &.{ v0, v1, v2, v3 });
+    try mesh.indices.appendSlice(allocator, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
 }
 
 fn appendQuad(mesh: *Mesh, allocator: std.mem.Allocator, rect: draw.Rect, uv: draw.Rect, color: draw.Color) !void {
