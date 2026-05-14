@@ -8,6 +8,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_c = .off,
     });
     configureModule(b, module);
 
@@ -30,6 +31,7 @@ fn createRootModule(
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .sanitize_c = .off,
     });
     configureModule(b, module);
     return module;
