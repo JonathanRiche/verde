@@ -175,19 +175,186 @@ fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8
     const text = if (value.len > 0) value else hint;
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
     const font_size = theme.scaledUi(14.0);
-    queuePaletteText(state, .{ .x = rect.x + theme.scaledUi(10.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(20.0), .h = theme.scaledUi(20.0) }, text, paletteColor(color), font_size, rect);
+    const text_x = rect.x + theme.scaledUi(10.0);
+    const text_y = rect.y + theme.scaledUi(8.0);
+    const text_w = rect.w - theme.scaledUi(20.0);
+
+    if (focused) {
+        // Cache the input geometry so the mouse/keyboard handlers can
+        // hit-test and convert click-x to text offset without re-running
+        // the modal layout.
+        state.modal_text_input_rect = rect;
+        state.modal_text_input_font_size = font_size;
+        if (modalSelectionRange(state, value)) |sel| {
+            const x0 = text_x + runtime.paletteUiTextPrefixWidth(value, font_size, sel.start);
+            const x1 = text_x + runtime.paletteUiTextPrefixWidth(value, font_size, sel.end);
+            const clamped_x0 = @max(x0, text_x);
+            const clamped_x1 = @min(x1, text_x + text_w);
+            if (clamped_x1 > clamped_x0) {
+                state.palette_overlay_batch.rect(
+                    state.allocator,
+                    .{ .x = clamped_x0, .y = text_y, .w = clamped_x1 - clamped_x0, .h = theme.scaledUi(20.0) },
+                    paletteColor(colors.rgba(36, 92, 124, 200)),
+                ) catch {};
+            }
+        }
+    }
+
+    const stable_value = stablePaletteText(state, text) catch return;
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        .{ .x = text_x, .y = text_y, .w = text_w, .h = theme.scaledUi(20.0) },
+        stable_value,
+        paletteColor(color),
+        font_size,
+        .ui,
+        null,
+        rect,
+    ) catch {};
     if (focused) {
         const clamped_cursor = @min(cursor, value.len);
-        const cursor_x = rect.x + theme.scaledUi(10.0) + @as(f32, @floatFromInt(clamped_cursor)) * font_size * 0.55;
-        state.palette_overlay_batch.rect(state.allocator, .{ .x = cursor_x, .y = rect.y + theme.scaledUi(8.0), .w = theme.scaledUi(1.0), .h = rect.h - theme.scaledUi(16.0) }, paletteColor(theme.COLOR_WHITE)) catch {};
+        const prefix_w = runtime.paletteUiTextPrefixWidth(value, font_size, clamped_cursor);
+        const cursor_x = text_x + prefix_w;
+        state.palette_overlay_batch.rect(state.allocator, .{ .x = cursor_x, .y = text_y, .w = theme.scaledUi(1.0), .h = rect.h - theme.scaledUi(16.0) }, paletteColor(theme.COLOR_WHITE)) catch {};
     }
+}
+
+const ModalSelectionRange = struct { start: usize, end: usize };
+
+fn modalSelectionRange(state: *runtime.AppState, value: []const u8) ?ModalSelectionRange {
+    const anchor = state.modal_text_selection_anchor orelse return null;
+    const cursor = focusedCursorReadOnly(state);
+    const a = @min(anchor, value.len);
+    const c = @min(cursor, value.len);
+    if (a == c) return null;
+    return .{ .start = @min(a, c), .end = @max(a, c) };
+}
+
+fn focusedCursorReadOnly(state: *runtime.AppState) usize {
+    return switch (state.palette_modal_text_focus) {
+        .project_rename => state.project_rename_cursor,
+        .thread_import => state.thread_import_cursor,
+        .project_import => state.project_import_cursor,
+        .none => 0,
+    };
+}
+
+fn clearModalSelection(state: *runtime.AppState) void {
+    state.modal_text_selection_anchor = null;
+}
+
+fn modalOffsetForClickX(value: []const u8, font_size: f32, rel: f32) usize {
+    if (value.len == 0 or rel <= 0.0) return 0;
+    const total = runtime.paletteUiTextPrefixWidth(value, font_size, value.len);
+    if (rel >= total) return value.len;
+    var i: usize = 0;
+    while (i < value.len) {
+        const step = std.unicode.utf8ByteSequenceLength(value[i]) catch 1;
+        const next = @min(i + step, value.len);
+        const w_before = runtime.paletteUiTextPrefixWidth(value, font_size, i);
+        const w_after = runtime.paletteUiTextPrefixWidth(value, font_size, next);
+        if (w_after > rel) {
+            return if (rel - w_before <= w_after - rel) i else next;
+        }
+        i = next;
+    }
+    return value.len;
+}
+
+fn isModalWordChar(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b == '-' or b == '.';
+}
+
+fn modalWordBoundsAt(value: []const u8, offset: usize) ModalSelectionRange {
+    if (value.len == 0) return .{ .start = 0, .end = 0 };
+    var start = @min(offset, value.len);
+    var end = start;
+    while (start > 0 and isModalWordChar(value[start - 1])) start -= 1;
+    while (end < value.len and isModalWordChar(value[end])) end += 1;
+    if (start == end and end < value.len) end += 1;
+    return .{ .start = start, .end = end };
+}
+
+fn focusedValue(state: *runtime.AppState) []const u8 {
+    return switch (state.palette_modal_text_focus) {
+        .project_rename => state.renameInputPublic(),
+        .thread_import => state.threadImportThreadId(),
+        .project_import => state.importDirectoryDraft(),
+        .none => &[_]u8{},
+    };
+}
+
+/// Removes the active selection from the focused modal buffer, returning true
+/// if any bytes were deleted. Cursor is left at the selection's start and the
+/// anchor is cleared.
+fn deleteModalSelection(state: *runtime.AppState) bool {
+    const value = focusedValue(state);
+    const sel = modalSelectionRange(state, value) orelse return false;
+    const buf = focusedBuffer(state) orelse return false;
+    const cursor = focusedCursor(state) orelse return false;
+    const current_len = std.mem.sliceTo(buf, 0).len;
+    const removed = sel.end - sel.start;
+    std.mem.copyForwards(u8, buf[sel.start .. current_len - removed], buf[sel.end..current_len]);
+    buf[current_len - removed] = 0;
+    cursor.* = sel.start;
+    clearModalSelection(state);
+    return true;
+}
+
+fn copyModalSelection(state: *runtime.AppState) void {
+    const value = focusedValue(state);
+    const sel = modalSelectionRange(state, value) orelse return;
+    const slice = value[sel.start..sel.end];
+    if (slice.len == 0) return;
+    const z = state.allocator.dupeZ(u8, slice) catch return;
+    defer state.allocator.free(z);
+    sdl.setClipboardText(z) catch |err| {
+        runtime.log.warn("failed to copy modal selection: {s}", .{@errorName(err)});
+    };
+}
+
+fn pasteIntoModal(state: *runtime.AppState) bool {
+    const text = state.readClipboardTextForPaste() orelse return false;
+    defer state.allocator.free(text);
+    if (text.len == 0) return false;
+    _ = deleteModalSelection(state);
+    // Modal inputs are single-line; strip control chars from pasted text.
+    var sanitized: [4096]u8 = undefined;
+    var n: usize = 0;
+    for (text) |b| {
+        if (b == '\n' or b == '\r' or b == '\t') continue;
+        if (n >= sanitized.len) break;
+        sanitized[n] = b;
+        n += 1;
+    }
+    if (n == 0) return false;
+    const buf = focusedBuffer(state) orelse return false;
+    const cursor = focusedCursor(state) orelse return false;
+    _ = insertIntoZBuffer(buf, cursor, sanitized[0..n]);
+    return true;
+}
+
+fn moveModalCursorWithShift(state: *runtime.AppState, target: usize, shift: bool) bool {
+    const cursor = focusedCursor(state) orelse return false;
+    if (shift) {
+        if (state.modal_text_selection_anchor == null) {
+            state.modal_text_selection_anchor = cursor.*;
+        }
+    } else {
+        clearModalSelection(state);
+    }
+    cursor.* = target;
+    return true;
 }
 
 fn pointInRect(x: f32, y: f32, rect: palette.Rect) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
 
-pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
+pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+    if (!down) {
+        if (state.modal_text_drag_active) state.modal_text_drag_active = false;
+    }
     if (state.palette_modal_hits.items.len == 0) return false;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
@@ -219,25 +386,63 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .project_import_cancel => state.cancelProjectImport(),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => state.palette_modal_text_focus = .none,
-            .project_rename_input => {
-                state.palette_modal_text_focus = .project_rename;
-                state.project_rename_cursor = state.renameInputPublic().len;
-            },
-            .thread_import_input => {
-                state.palette_modal_text_focus = .thread_import;
-                state.thread_import_cursor = state.threadImportThreadId().len;
-            },
-            .project_import_input => {
-                state.palette_modal_text_focus = .project_import;
-                state.project_import_cursor = state.importDirectoryDraft().len;
-            },
+            .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
+            .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
+            .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
         }
         return true;
     }
     return true;
 }
 
+/// Click into a modal text field: place the cursor at the click x, set the
+/// selection anchor, and prime a drag. Double-click selects the word under
+/// the pointer; triple-click selects all.
+fn focusModalInput(state: *runtime.AppState, focus: runtime.PaletteModalTextFocus, rect: palette.Rect, x: f32, clicks: u8) void {
+    if (state.palette_modal_text_focus != focus) {
+        state.palette_modal_text_focus = focus;
+        clearModalSelection(state);
+    }
+    const value = focusedValue(state);
+    const font_size = theme.scaledUi(14.0);
+    const text_x = rect.x + theme.scaledUi(10.0);
+    const rel = @max(x - text_x, 0.0);
+    const offset = modalOffsetForClickX(value, font_size, rel);
+    const cursor = focusedCursor(state) orelse return;
+    if (clicks >= 3) {
+        state.modal_text_selection_anchor = 0;
+        cursor.* = value.len;
+        state.modal_text_drag_active = false;
+    } else if (clicks == 2) {
+        const bounds = modalWordBoundsAt(value, offset);
+        state.modal_text_selection_anchor = bounds.start;
+        cursor.* = bounds.end;
+        state.modal_text_drag_active = false;
+    } else {
+        cursor.* = offset;
+        state.modal_text_selection_anchor = offset;
+        state.modal_text_drag_active = true;
+    }
+}
+
+/// Routed from main when the mouse moves while a modal input is dragged.
+/// Updates the cursor to the new x, extending the selection from the anchor.
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, _: f32) void {
+    if (!state.modal_text_drag_active) return;
+    if (state.palette_modal_text_focus == .none) return;
+    const value = focusedValue(state);
+    const rect = state.modal_text_input_rect;
+    if (rect.w <= 0.0) return;
+    const text_x = rect.x + theme.scaledUi(10.0);
+    const rel = @max(x - text_x, 0.0);
+    const offset = modalOffsetForClickX(value, state.modal_text_input_font_size, rel);
+    const cursor = focusedCursor(state) orelse return;
+    cursor.* = offset;
+}
+
 pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
+    if (state.palette_modal_text_focus == .none) return false;
+    _ = deleteModalSelection(state);
     return switch (state.palette_modal_text_focus) {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
@@ -248,6 +453,8 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
     if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator) return false;
+    const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
+    const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {
         .escape => {
             dismissTopModal(state);
@@ -271,15 +478,48 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             }
             return false;
         },
-        .left => return moveModalCursor(state, -1),
-        .right => return moveModalCursor(state, 1),
-        .home => return moveModalCursorToEdge(state, true),
-        .end => return moveModalCursorToEdge(state, false),
-        .backspace => return deleteModalText(state, true),
-        .delete => return deleteModalText(state, false),
+        .left => {
+            if (state.palette_modal_text_focus == .none) return true;
+            const cursor = focusedCursor(state) orelse return true;
+            return moveModalCursorWithShift(state, cursor.* -| 1, shift);
+        },
+        .right => {
+            if (state.palette_modal_text_focus == .none) return true;
+            const cursor = focusedCursor(state) orelse return true;
+            return moveModalCursorWithShift(state, @min(cursor.* + 1, focusedTextLen(state)), shift);
+        },
+        .home => {
+            if (state.palette_modal_text_focus == .none) return true;
+            return moveModalCursorWithShift(state, 0, shift);
+        },
+        .end => {
+            if (state.palette_modal_text_focus == .none) return true;
+            return moveModalCursorWithShift(state, focusedTextLen(state), shift);
+        },
+        .backspace => {
+            if (state.palette_modal_text_focus != .none and deleteModalSelection(state)) return true;
+            return deleteModalText(state, true);
+        },
+        .delete => {
+            if (state.palette_modal_text_focus != .none and deleteModalSelection(state)) return true;
+            return deleteModalText(state, false);
+        },
+        .a => {
+            if (primary and state.palette_modal_text_focus != .none) {
+                const cursor = focusedCursor(state) orelse return true;
+                state.modal_text_selection_anchor = 0;
+                cursor.* = focusedTextLen(state);
+                return true;
+            }
+            return true;
+        },
         .c => {
+            if (primary and state.palette_modal_text_focus != .none) {
+                copyModalSelection(state);
+                return true;
+            }
             if (state.transcriptSelectionBuffer()) |text| {
-                if ((keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0) {
+                if (primary) {
                     const clipboard_text = state.allocator.dupeZ(u8, text) catch return true;
                     defer state.allocator.free(clipboard_text);
                     sdl.setClipboardText(clipboard_text) catch |err| {
@@ -289,6 +529,21 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                 }
             }
             return false;
+        },
+        .x => {
+            if (primary and state.palette_modal_text_focus != .none) {
+                copyModalSelection(state);
+                _ = deleteModalSelection(state);
+                return true;
+            }
+            return true;
+        },
+        .v => {
+            if (primary and state.palette_modal_text_focus != .none) {
+                _ = pasteIntoModal(state);
+                return true;
+            }
+            return true;
         },
         else => return true,
     }

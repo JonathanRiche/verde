@@ -345,6 +345,34 @@ Runtime diagnostics are written to:
 For clipboard/input bugs, prefer length-only diagnostics and never log clipboard contents.
 - allow content regions to own width rather than subtracting arbitrary constants
 
+## Text Inputs Must Behave Like Real Text Inputs
+
+Any text input we ship — composer prompt, browser URL bar, project-rename
+modal, project-import modal, thread-import modal, etc. — has to support the
+full editing affordance set, not just keystroke insertion + backspace. When
+you add a new input, wire all of these:
+
+- Caret rendered on focus regardless of buffer length, aligned to the same
+  font role / metrics used for rendering (use `roleText` with the chosen
+  font role and `paletteUiTextPrefixWidth` for the caret x, never raw
+  `byte_count * font_size * 0.55`).
+- Mouse: click sets the caret + selection anchor; drag extends the
+  selection; double-click selects the word under the pointer; triple-click
+  selects the whole field (or line for multi-line).
+- Keyboard navigation: Left / Right / Home / End move the caret;
+  Shift+(Left|Right|Home|End) extends the selection.
+- Clipboard: `Ctrl/Cmd+A` selects all, `+C` copies the selection, `+X`
+  cuts, `+V` pastes (strip control chars for single-line inputs).
+- Backspace and Delete remove the active selection first if any, otherwise
+  fall back to the one-char delete.
+- Any text-input insertion deletes the active selection before inserting.
+- On blur, clear the selection + drag flags so a fresh focus doesn't
+  inherit stale state.
+
+Existing reference implementations to mirror: `packages/desktop/src/ui/browser.zig`
+(URL bar) and `packages/desktop/src/ui/layout.zig` (`drawTextField` +
+`handlePaletteMouseButton` / `handlePaletteKeyDown` for modals).
+
 ## Editing Policy For Palette UI
 
 Before editing:

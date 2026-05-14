@@ -745,10 +745,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
             if (paste_shortcut) {
-                // Browser URL bar handles its own paste a few branches below;
-                // skip the composer routes so the text doesn't end up in the
-                // wrong field.
-                if (!state.browser_address_focused) {
+                // Browser URL bar + modal text inputs handle their own paste
+                // further down the chain. Don't intercept here when one of
+                // them owns focus.
+                if (!state.browser_address_focused and state.palette_modal_text_focus == .none) {
                     if (state.attachClipboardImageToCurrentDraft()) return true;
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 }
@@ -852,6 +852,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
+            ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
@@ -860,7 +861,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
-            if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
