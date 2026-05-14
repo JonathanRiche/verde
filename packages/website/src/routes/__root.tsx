@@ -11,7 +11,10 @@ import { Suspense } from 'solid-js'
 
 import Header from '../components/Header'
 
-import styleCss from '../styles.css?url'
+// Side-effect import (not `?url`): TanStack Start dev SSR skips `?url` CSS when
+// building `/@tanstack-start/styles.css`, and `?url` hrefs point at prod asset
+// names that 404 under `vite dev`.
+import '../styles.css'
 
 const siteUrl = 'https://openverde.ai'
 const title = 'Verde | Desktop workspace for coding agents'
@@ -48,7 +51,6 @@ export const Route = createRootRouteWithContext()({
       { rel: 'icon', type: 'image/png', href: '/verde-logo.png' },
       { rel: 'apple-touch-icon', href: '/verde-logo.png' },
       { rel: 'manifest', href: '/manifest.json' },
-      { rel: 'stylesheet', href: styleCss },
     ],
   }),
   shellComponent: RootComponent,
@@ -59,9 +61,9 @@ function RootComponent() {
     <html lang="en">
       <head>
         <HydrationScript />
-        <HeadContent />
       </head>
       <body>
+        <HeadContent />
         <Suspense>
           <Header />
           <Outlet />

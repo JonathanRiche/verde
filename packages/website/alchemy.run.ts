@@ -19,7 +19,7 @@ export const worker = await TanStackStart('website', {
   assets: 'dist/client',
   noBundle: false,
   adopt: true,
-  dev: 'bun vite dev --port 3000',
+  dev: 'rm -rf node_modules/.vite && bun vite dev --port 3000',
   domains: [
     { domainName: 'openverde.ai', adopt: true },
     { domainName: 'open-verde.com', adopt: true },
