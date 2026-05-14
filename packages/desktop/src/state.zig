@@ -139,9 +139,11 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .model_icon = "",
     .fast_icon = "",
     .access_icon = "",
-    .chevron_icon = ">",
+    // codicon-chevron-right (Nerd Font Symbols) — crisp at any size.
+    .chevron_icon = "\u{EAB6}",
     .send_icon = "",
-    .stop_icon = "x",
+    // codicon-debug-stop
+    .stop_icon = "\u{EAD7}",
     .z_index = 120,
 });
 
@@ -482,7 +484,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
     .glyph_width = 10.8,
     .font_size = 20.0,
-    .chevron_icon = ">",
+    .chevron_icon = "\u{EAB6}",
     .icon_gap = 12.0,
     .row_leading_width = 34.0,
     .row_leading_to_label_gap = 8.0,

@@ -29,7 +29,7 @@ const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
 const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 21.0;
 /// Provider logo slot in the model pill.
-const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 20.0;
+const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 900.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
@@ -2315,61 +2315,47 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
     }), icon_color);
 }
 
+// Nerd Font Symbols glyphs used for composer-toolbar icons. Rendering them
+// through SDL_ttf gets us crisp, antialiased shapes at any DPI — much nicer
+// than the hand-drawn triangles we used while the icon font was being wired
+// up. Codepoints verified against SymbolsNerdFontMono-Regular.ttf's cmap.
+const NF_FA_FLASH = "\u{F0E7}"; // lightning bolt
+const NF_COD_LOCK = "\u{EA75}";
+const NF_COD_UNLOCK = "\u{EB74}";
+const NF_COD_CIRCLE = "\u{EABC}"; // hollow circle — reads as "inactive / default" next to the bolt
+
+/// Renders a single codicon glyph centered inside `rect` using the icon font.
+/// SDL_ttf rasterizes the glyph with proper antialiasing at the requested
+/// pixel size so it stays crisp on HiDPI displays.
+fn queueComposerIcon(state: *app_state.AppState, rect: palette.Rect, glyph: []const u8, color: palette.Color) void {
+    // Glyph cell rendered slightly under the full rect height to leave the
+    // codicon's drawn extent visually balanced with adjacent label text.
+    const font_size = rect.h * 0.96;
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        snapRect(rect),
+        stableText(state, glyph),
+        color,
+        font_size,
+        .icon,
+        null,
+        null,
+    ) catch {};
+}
+
 fn drawBoltIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const p = [_]palette.draw.Vec2{
-        .{ .x = rect.x + rect.w * 0.58, .y = rect.y + rect.h * 0.06 },
-        .{ .x = rect.x + rect.w * 0.24, .y = rect.y + rect.h * 0.54 },
-        .{ .x = rect.x + rect.w * 0.47, .y = rect.y + rect.h * 0.54 },
-        .{ .x = rect.x + rect.w * 0.35, .y = rect.y + rect.h * 0.94 },
-        .{ .x = rect.x + rect.w * 0.76, .y = rect.y + rect.h * 0.42 },
-        .{ .x = rect.x + rect.w * 0.51, .y = rect.y + rect.h * 0.42 },
-    };
-    queueTriangle(state, p[0], p[1], p[2], color);
-    queueTriangle(state, p[0], p[2], p[5], color);
-    queueTriangle(state, p[5], p[3], p[4], color);
-    queueTriangle(state, p[5], p[2], p[3], color);
+    queueComposerIcon(state, rect, NF_FA_FLASH, color);
 }
 
 fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const stroke = @max(rect.w * 0.11, 1.5);
-    queueBorder(state, .{
-        .x = rect.x + rect.w * 0.18,
-        .y = rect.y + rect.h * 0.18,
-        .w = rect.w * 0.64,
-        .h = rect.h * 0.64,
-    }, color, rect.w * 0.32, stroke);
-    queueRect(state, .{
-        .x = rect.x + rect.w * 0.48,
-        .y = rect.y + rect.h * 0.30,
-        .w = stroke,
-        .h = rect.h * 0.24,
-    }, color);
-    queueRect(state, .{
-        .x = rect.x + rect.w * 0.48,
-        .y = rect.y + rect.h * 0.48,
-        .w = rect.w * 0.20,
-        .h = stroke,
-    }, color);
+    // Default mode: hollow circle — reads as "off / standard" against the
+    // filled lightning bolt that marks Fast.
+    queueComposerIcon(state, rect, NF_COD_CIRCLE, color);
 }
 
 fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const stroke = @max(rect.w * 0.12, 1.5);
-    const body = palette.Rect{
-        .x = rect.x + rect.w * 0.18,
-        .y = rect.y + rect.h * 0.42,
-        .w = rect.w * 0.64,
-        .h = rect.h * 0.42,
-    };
-    queueBorder(state, body, color, theme.scaledUi(3.0), stroke);
-    if (state.currentThread().access_mode == .full_access) {
-        queueRect(state, .{ .x = rect.x + rect.w * 0.70, .y = rect.y + rect.h * 0.30, .w = stroke, .h = rect.h * 0.16 }, color);
-        queueRect(state, .{ .x = rect.x + rect.w * 0.44, .y = rect.y + rect.h * 0.22, .w = rect.w * 0.28, .h = stroke }, color);
-        queueRect(state, .{ .x = rect.x + rect.w * 0.44, .y = rect.y + rect.h * 0.22, .w = stroke, .h = rect.h * 0.16 }, color);
-    } else {
-        queueRect(state, .{ .x = rect.x + rect.w * 0.28, .y = rect.y + rect.h * 0.30, .w = stroke, .h = rect.h * 0.23 }, color);
-        queueRect(state, .{ .x = rect.x + rect.w * 0.28, .y = rect.y + rect.h * 0.22, .w = rect.w * 0.44, .h = stroke }, color);
-        queueRect(state, .{ .x = rect.x + rect.w * 0.72 - stroke, .y = rect.y + rect.h * 0.30, .w = stroke, .h = rect.h * 0.23 }, color);
-    }
+    const glyph = if (state.currentThread().access_mode == .full_access) NF_COD_UNLOCK else NF_COD_LOCK;
+    queueComposerIcon(state, rect, glyph, color);
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {

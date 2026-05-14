@@ -431,7 +431,10 @@ pub const Renderer = struct {
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
             .min_filter = c.SDL_GPU_FILTER_LINEAR,
             .mag_filter = c.SDL_GPU_FILTER_LINEAR,
-            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            // Trilinear: blend between the two mip levels whose downsampled
+            // detail best matches the current screen-space derivative. Without
+            // this large logos point-sample the base level and alias badly.
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
             .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -439,7 +442,10 @@ pub const Renderer = struct {
             .max_anisotropy = 8,
             .compare_op = c.SDL_GPU_COMPAREOP_INVALID,
             .min_lod = 0,
-            .max_lod = 0,
+            // SDL clamps to the texture's actual num_levels; large value here
+            // just means "let the sampler descend to the smallest mip when
+            // appropriate."
+            .max_lod = 1000.0,
             .enable_anisotropy = true,
             .enable_compare = false,
             .padding1 = 0,
@@ -718,14 +724,26 @@ pub const Renderer = struct {
             _ = self.textures.remove(id);
         }
 
+        // Full mip chain so that aggressive downscales (e.g. 2884×2884 provider
+        // logos sampled into ~22 px toolbar slots) use trilinear filtering
+        // against a pre-filtered lower-res level instead of point-sampling the
+        // base level. COLOR_TARGET usage is required by SDL_GPU's mipmap
+        // generator.
+        const max_dim = @max(width, height);
+        const num_levels = blk: {
+            var n: u32 = 1;
+            var d = max_dim;
+            while (d > 1) : (n += 1) d >>= 1;
+            break :blk n;
+        };
         const texture = c.SDL_CreateGPUTexture(device, &.{
             .type = c.SDL_GPU_TEXTURETYPE_2D,
             .format = format.toSdl(),
-            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER | c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
             .width = width,
             .height = height,
             .layer_count_or_depth = 1,
-            .num_levels = 1,
+            .num_levels = num_levels,
             .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
             .props = 0,
         }) orelse return error.SdlGpuTextureFailed;
@@ -745,6 +763,7 @@ pub const Renderer = struct {
             .transfer_size = byte_len,
             .width = width,
             .height = height,
+            .num_levels = num_levels,
             .format = format,
             .dirty = false,
             .dirty_kind = .image,
@@ -768,45 +787,59 @@ pub const Renderer = struct {
 
     fn flushPendingTextureUploads(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, stats: *FrameStats) !void {
         var copy_pass: ?*c.SDL_GPUCopyPass = null;
-        defer if (copy_pass) |pass| c.SDL_EndGPUCopyPass(pass);
+        // Textures whose mip chain needs to be rebuilt after the copy pass
+        // closes. `SDL_GenerateMipmapsForGPUTexture` must run outside any pass.
+        var mipgen_buf: [64]*c.SDL_GPUTexture = undefined;
+        var mipgen_len: usize = 0;
 
-        var iterator = self.textures.iterator();
-        while (iterator.next()) |entry| {
-            if (!entry.value_ptr.dirty) continue;
-            const pass = copy_pass orelse blk: {
-                const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
-                copy_pass = created;
-                break :blk created;
-            };
-            const texture_entry = entry.value_ptr;
-            const upload_start = nowNs();
-            c.SDL_UploadToGPUTexture(
-                pass,
-                &.{
-                    .transfer_buffer = texture_entry.transfer,
-                    .offset = 0,
-                    .pixels_per_row = texture_entry.width,
-                    .rows_per_layer = texture_entry.height,
-                },
-                &.{
-                    .texture = texture_entry.texture,
-                    .mip_level = 0,
-                    .layer = 0,
-                    .x = 0,
-                    .y = 0,
-                    .z = 0,
-                    .w = texture_entry.width,
-                    .h = texture_entry.height,
-                    .d = 1,
-                },
-                true,
-            );
-            const elapsed = elapsedNs(upload_start);
-            switch (texture_entry.dirty_kind) {
-                .image => stats.image_upload_ns +|= elapsed,
-                .browser => stats.browser_upload_ns +|= elapsed,
+        {
+            defer if (copy_pass) |pass| c.SDL_EndGPUCopyPass(pass);
+            var iterator = self.textures.iterator();
+            while (iterator.next()) |entry| {
+                if (!entry.value_ptr.dirty) continue;
+                const pass = copy_pass orelse blk: {
+                    const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
+                    copy_pass = created;
+                    break :blk created;
+                };
+                const texture_entry = entry.value_ptr;
+                const upload_start = nowNs();
+                c.SDL_UploadToGPUTexture(
+                    pass,
+                    &.{
+                        .transfer_buffer = texture_entry.transfer,
+                        .offset = 0,
+                        .pixels_per_row = texture_entry.width,
+                        .rows_per_layer = texture_entry.height,
+                    },
+                    &.{
+                        .texture = texture_entry.texture,
+                        .mip_level = 0,
+                        .layer = 0,
+                        .x = 0,
+                        .y = 0,
+                        .z = 0,
+                        .w = texture_entry.width,
+                        .h = texture_entry.height,
+                        .d = 1,
+                    },
+                    true,
+                );
+                const elapsed = elapsedNs(upload_start);
+                switch (texture_entry.dirty_kind) {
+                    .image => stats.image_upload_ns +|= elapsed,
+                    .browser => stats.browser_upload_ns +|= elapsed,
+                }
+                if (texture_entry.num_levels > 1 and mipgen_len < mipgen_buf.len) {
+                    mipgen_buf[mipgen_len] = texture_entry.texture;
+                    mipgen_len += 1;
+                }
+                texture_entry.dirty = false;
             }
-            texture_entry.dirty = false;
+        }
+
+        for (mipgen_buf[0..mipgen_len]) |tex| {
+            c.SDL_GenerateMipmapsForGPUTexture(command_buffer, tex);
         }
     }
 
@@ -1151,6 +1184,7 @@ const GpuTexture = struct {
     transfer_size: usize,
     width: u32,
     height: u32,
+    num_levels: u32,
     format: Renderer.TextureFormat,
     dirty: bool = false,
     dirty_kind: TextureUploadKind = .image,
