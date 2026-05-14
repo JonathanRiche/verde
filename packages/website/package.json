@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "alchemy dev",
-    "dev:vite": "vite dev --port 3000",
+    "dev:vite": "rm -rf node_modules/.vite && vite dev --port 3000",
     "build": "vite build",
     "deploy": "alchemy deploy",
     "destroy": "alchemy destroy",

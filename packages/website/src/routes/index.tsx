@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/solid-router'
-import { For } from 'solid-js'
+import { For, createSignal, onCleanup } from 'solid-js'
 
 import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
 import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png'
@@ -10,6 +10,123 @@ import zedLogo from '../../../desktop/src/assets/editor_logos/zed.png'
 import appScreenshot from '../../../../assets/app_screenshot.png'
 
 export const Route = createFileRoute('/')({ component: App })
+
+const DEFAULT_INSTALL_COMMAND =
+  'curl -fsSL https://openverde.ai/install.sh | sh'
+
+function ClipboardGlyph() {
+  return (
+    <svg
+      class="hero-install-copy-svg"
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+    >
+      <path
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m4 0v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7h16Z"
+      />
+    </svg>
+  )
+}
+
+function CheckGlyph() {
+  return (
+    <svg
+      class="hero-install-copy-svg"
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+    >
+      <path
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        d="M5 13l4 4L19 7"
+      />
+    </svg>
+  )
+}
+
+function InstallCopyButton(props: { command: string }) {
+  const [copied, setCopied] = createSignal(false)
+  let copyTimer: ReturnType<typeof setTimeout> | undefined
+  let sourceInput: HTMLInputElement | undefined
+
+  onCleanup(() => {
+    if (copyTimer !== undefined) {
+      clearTimeout(copyTimer)
+    }
+  })
+
+  function showCopied() {
+    setCopied(true)
+    if (copyTimer !== undefined) {
+      clearTimeout(copyTimer)
+    }
+    copyTimer = setTimeout(() => setCopied(false), 2000)
+  }
+
+  /** Clipboard APIs must run in the same synchronous turn as the click where possible. */
+  function handleCopy(ev: MouseEvent) {
+    ev.preventDefault()
+    ev.stopPropagation()
+
+    const el = sourceInput
+    if (el) {
+      el.focus()
+      el.select()
+      el.setSelectionRange(0, el.value.length)
+      try {
+        if (document.execCommand('copy')) {
+          showCopied()
+          return
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(props.command).then(
+        () => showCopied(),
+        () => {},
+      )
+    }
+  }
+
+  return (
+    <span class="hero-install-copy-wrap">
+      <input
+        ref={(el) => {
+          sourceInput = el
+        }}
+        type="text"
+        class="hero-install-copy-source"
+        readOnly
+        tabIndex={-1}
+        aria-hidden="true"
+        value={props.command}
+      />
+      <button
+        type="button"
+        class={`hero-install-copy${copied() ? ' hero-install-copy--done' : ''}`}
+        onClick={handleCopy}
+        aria-label={
+          copied()
+            ? 'Copied install command to clipboard'
+            : 'Copy install command to clipboard'
+        }
+      >
+        {copied() ? <CheckGlyph /> : <ClipboardGlyph />}
+      </button>
+    </span>
+  )
+}
 
 const features = [
   {
@@ -98,9 +215,12 @@ function App() {
                 <span>Linux / macOS</span>
               </div>
               <div class="hero-install-lines">
-                <p>
-                  <span class="prompt">$</span> curl -fsSL https://openverde.ai/install.sh | sh
-                </p>
+                <div class="hero-install-cmd-row">
+                  <p class="hero-install-cmd">
+                    <span class="prompt">$</span> {DEFAULT_INSTALL_COMMAND}
+                  </p>
+                  <InstallCopyButton command={DEFAULT_INSTALL_COMMAND} />
+                </div>
                 <p>
                   <span class="prompt">#</span> downloads the latest GitHub release
                 </p>
@@ -296,7 +416,7 @@ function App() {
                 <strong>Install from latest release</strong>
               </div>
               <pre>
-                <code>curl -fsSL https://openverde.ai/install.sh | sh</code>
+                <code>{DEFAULT_INSTALL_COMMAND}</code>
               </pre>
               <p>
                 Linux installs into <code>~/.local</code> by default. macOS
