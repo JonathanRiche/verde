@@ -1622,6 +1622,18 @@ pub const AppState = struct {
     project_rename_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
+    /// Selection anchor for whichever modal text field currently owns focus.
+    /// `null` means no active selection. Cleared on focus change.
+    modal_text_selection_anchor: ?usize,
+    /// True while the user is dragging to extend the modal text selection.
+    modal_text_drag_active: bool,
+    /// Last-painted rect of the focused modal input. Set by `drawTextField`
+    /// so the modal mouse handlers can hit-test + convert cursor x→offset
+    /// without re-running the modal layout.
+    modal_text_input_rect: palette.Rect,
+    /// Font size used to paint the focused modal input, matched for caret
+    /// hit-testing on the same `.ui` font role.
+    modal_text_input_font_size: f32,
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
@@ -1798,6 +1810,10 @@ pub const AppState = struct {
             .project_rename_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
+            .modal_text_selection_anchor = null,
+            .modal_text_drag_active = false,
+            .modal_text_input_rect = .{},
+            .modal_text_input_font_size = 0.0,
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
