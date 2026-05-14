@@ -33,6 +33,7 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
 
@@ -119,6 +120,7 @@ fn mainInner(init: std.process.Init) !void {
     else
         std.heap.smp_allocator;
 
+    _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
     defer sdl.quit();
@@ -331,6 +333,19 @@ fn mainInner(init: std.process.Init) !void {
         getWindowSizeInPixels(window, &observed_fb_width, &observed_fb_height);
         const framebuffer_size_changed = observed_fb_width != last_framebuffer_width or observed_fb_height != last_framebuffer_height;
         if (framebuffer_size_changed) {
+            const observed_scale = currentWindowDisplayScale(window);
+            var logical_w: c_int = 0;
+            var logical_h: c_int = 0;
+            window.getSize(&logical_w, &logical_h) catch {};
+            runtime_log.diagnostic("framebuffer size changed: pixel {d}x{d} logical {d}x{d} scale {d:.3} (prev pixel {d}x{d})", .{
+                observed_fb_width,
+                observed_fb_height,
+                logical_w,
+                logical_h,
+                observed_scale,
+                last_framebuffer_width,
+                last_framebuffer_height,
+            });
             last_framebuffer_width = observed_fb_width;
             last_framebuffer_height = observed_fb_height;
         }
@@ -366,6 +381,7 @@ fn mainInner(init: std.process.Init) !void {
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
+        _ = state.palette_frame_text_arena.reset(.retain_capacity);
         state.code_copy_buttons.clearRetainingCapacity();
 
         recordSpan(&frame_sample, .render_root, struct {

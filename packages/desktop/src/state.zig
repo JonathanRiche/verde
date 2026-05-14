@@ -1573,6 +1573,7 @@ pub const AppState = struct {
     palette_model_cascade: PaletteModelCascadeMenu,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
+    palette_frame_text_arena: std.heap.ArenaAllocator,
     palette_modal_hits: std.ArrayList(PaletteModalHit),
     code_copy_buttons: std.ArrayList(CodeCopyButtonHit),
     code_copy_recent_identity: u64,
@@ -1739,6 +1740,7 @@ pub const AppState = struct {
             .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
+            .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
             .palette_modal_hits = .empty,
             .code_copy_buttons = .empty,
             .code_copy_recent_identity = 0,
@@ -6448,6 +6450,7 @@ pub const AppState = struct {
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
+        self.palette_frame_text_arena.deinit();
         self.palette_modal_hits.deinit(self.allocator);
         self.code_copy_buttons.deinit(self.allocator);
         self.closeTranscriptSelectionModal();

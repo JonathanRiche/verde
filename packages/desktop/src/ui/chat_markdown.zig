@@ -121,6 +121,7 @@ pub const PaletteRenderContext = struct {
     allocator: Allocator,
     batch: *palette.RenderBatch,
     frame_text: *std.ArrayList(u8),
+    text_arena: *std.heap.ArenaAllocator,
     cursor: palette.Rect,
     available_width: f32,
     mouse_pos: [2]f32 = .{ -1.0, -1.0 },
@@ -1725,7 +1726,6 @@ fn intersectClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
         .h = @max(bottom - y, 0.0),
     };
 }
-
 
 const TextBlockLayoutState = struct {
     base_line_height: f32,
@@ -3614,9 +3614,7 @@ fn queuePaletteRoleText(
 }
 
 fn stablePaletteText(context: *PaletteRenderContext, value: []const u8) ![]const u8 {
-    const start = context.frame_text.items.len;
-    try context.frame_text.appendSlice(context.allocator, value);
-    return context.frame_text.items[start .. start + value.len];
+    return try context.text_arena.allocator().dupe(u8, value);
 }
 
 fn paletteColor(value: [4]f32) palette.Color {

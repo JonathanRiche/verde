@@ -201,9 +201,7 @@ fn queuePaletteText(state: *app_state.AppState, rect: palette.Rect, value: []con
 }
 
 fn stablePaletteText(state: *app_state.AppState, value: []const u8) ![]const u8 {
-    const start = state.palette_frame_text.items.len;
-    try state.palette_frame_text.appendSlice(state.allocator, value);
-    return state.palette_frame_text.items[start .. start + value.len];
+    return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
 fn renderPaletteToolbarButton(

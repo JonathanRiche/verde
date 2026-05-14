@@ -283,7 +283,7 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
     state.transcript_focused = true;
     const current = state.currentTranscriptScrollY() orelse state.transcript_palette_scroll_y;
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
-    state.rememberCurrentTranscriptScroll(@max(0.0, current + delta));
+    state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(current + delta, null));
     state.transcript_auto_follow_pending = false;
     state.scroll_transcript_to_bottom_frames = 0;
     state.markDirty();
@@ -582,11 +582,14 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
         defer scratch_batch.deinit(state.allocator);
         var scratch_text = std.ArrayList(u8).empty;
         defer scratch_text.deinit(state.allocator);
+        var scratch_text_arena = std.heap.ArenaAllocator.init(state.allocator);
+        defer scratch_text_arena.deinit();
 
         var ctx = chat_markdown.PaletteRenderContext{
             .allocator = state.allocator,
             .batch = &scratch_batch,
             .frame_text = &scratch_text,
+            .text_arena = &scratch_text_arena,
             .cursor = .{ .x = 0.0, .y = 0.0, .w = snap.body_inner_w, .h = 100000.0 },
             .available_width = snap.body_inner_w,
         };
@@ -1064,7 +1067,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     const max_scroll = @max(0.0, content_height - column.h);
     const has_pending_stream = state.hasPendingStream();
 
-    var scroll_y = std.math.clamp(state.currentTranscriptScrollY() orelse max_scroll, 0.0, max_scroll);
+    var scroll_y = snapTranscriptScrollY(state.currentTranscriptScrollY() orelse max_scroll, max_scroll);
 
     const pi = state.selected_project_index;
     const ti = state.currentProject().selected_thread_index;
@@ -1076,12 +1079,12 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     }
 
     if (state.pending_transcript_scroll_px != 0.0) {
-        scroll_y = std.math.clamp(scroll_y + state.pending_transcript_scroll_px, 0.0, max_scroll);
+        scroll_y = snapTranscriptScrollY(scroll_y + state.pending_transcript_scroll_px, max_scroll);
         state.pending_transcript_scroll_px = 0.0;
     }
     if (state.pending_transcript_page_steps != 0) {
         const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
-        scroll_y = std.math.clamp(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_steps)) * page_h, 0.0, max_scroll);
+        scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_steps)) * page_h, max_scroll);
         state.pending_transcript_page_steps = 0;
     }
 
@@ -1117,6 +1120,11 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         queueRounded(state, track, paletteColor(colors.rgba(35, 42, 46, 160)), theme.scaledUi(2.0));
         queueRounded(state, snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }), paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
     }
+}
+
+fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
+    const upper = max_scroll orelse std.math.floatMax(f32);
+    return std.math.clamp(@round(@max(value, 0.0)), 0.0, upper);
 }
 
 fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32) f32 {
@@ -1564,6 +1572,7 @@ fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect
         .allocator = state.allocator,
         .batch = &state.palette_overlay_batch,
         .frame_text = &state.palette_frame_text,
+        .text_arena = &state.palette_frame_text_arena,
         .cursor = rect,
         .available_width = rect.w,
         .mouse_pos = if (state.palette_mouse_in_workspace) .{ mx, my } else .{ -1.0, -1.0 },
@@ -1963,9 +1972,7 @@ fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
-    const start = state.palette_frame_text.items.len;
-    state.palette_frame_text.appendSlice(state.allocator, value) catch return "";
-    return state.palette_frame_text.items[start .. start + value.len];
+    return state.palette_frame_text_arena.allocator().dupe(u8, value) catch "";
 }
 
 fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
