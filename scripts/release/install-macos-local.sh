@@ -36,11 +36,20 @@ set_macos_build_version() {
   local binary="$1"
   local patched="$binary.patched"
 
-  xcrun vtool \
+  # See packages/release/package-macos-app.sh for the rationale: Zig's
+  # MACOSX_DEPLOYMENT_TARGET already bakes the build-version load command,
+  # but `vtool -replace` can fail on x86_64 binaries that lack header
+  # padding. Treat the patch as best-effort.
+  if ! xcrun vtool \
     -set-build-version macos "$MACOS_MIN_VERSION" "$MACOS_SDK_VERSION" \
     -replace \
     -output "$patched" \
-    "$binary" >/dev/null
+    "$binary" >/dev/null 2>&1; then
+    echo "warning: vtool -replace could not patch $binary; keeping linker-emitted build-version" >&2
+    rm -f "$patched"
+    chmod 755 "$binary"
+    return 0
+  fi
   mv "$patched" "$binary"
   chmod 755 "$binary"
 }
