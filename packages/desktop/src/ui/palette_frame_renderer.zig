@@ -5,11 +5,10 @@ const sdl = @import("zsdl3");
 
 const app_state = @import("../state.zig");
 const browser_texture = @import("../browser/texture.zig");
-const palette_gl_renderer = @import("palette_gl_renderer.zig");
 const stb_image = @import("../stb_image.zig");
+const text_measure = @import("text_measure.zig");
 
 pub const Backend = enum {
-    gl,
     sdl_gpu,
 };
 
@@ -17,9 +16,13 @@ pub const Renderer = struct {
     requested_backend: Backend,
     active_backend: Backend,
     window: ?*sdl.Window = null,
-    gl: ?palette_gl_renderer.Renderer = null,
     gpu: ?palette.renderer.Renderer = null,
-    gpu_font: ?*palette.sdl.Font = null,
+    gpu_ui_font: ?*palette.sdl.Font = null,
+    gpu_ui_bold_font: ?*palette.sdl.Font = null,
+    gpu_prose_font: ?*palette.sdl.Font = null,
+    gpu_prose_bold_font: ?*palette.sdl.Font = null,
+    gpu_prose_italic_font: ?*palette.sdl.Font = null,
+    gpu_prose_bold_italic_font: ?*palette.sdl.Font = null,
     gpu_mono_font: ?*palette.sdl.Font = null,
     gpu_icon_font: ?*palette.sdl.Font = null,
     gpu_ttf_initialized: bool = false,
@@ -28,21 +31,18 @@ pub const Renderer = struct {
     pub const InitOptions = struct {
         requested_backend: Backend,
         window: *sdl.Window,
-        font_path: [:0]const u8,
+        ui_font_path: [:0]const u8,
+        ui_bold_font_path: [:0]const u8,
+        prose_font_path: [:0]const u8,
+        prose_bold_font_path: [:0]const u8,
+        prose_italic_font_path: [:0]const u8,
+        prose_bold_italic_font_path: [:0]const u8,
         mono_font_path: [:0]const u8,
         icon_font_path: [:0]const u8,
     };
 
     pub fn init(options: InitOptions) !Renderer {
-        return switch (options.requested_backend) {
-            .gl => .{
-                .requested_backend = .gl,
-                .active_backend = .gl,
-                .window = options.window,
-                .gl = palette_gl_renderer.Renderer.init(),
-            },
-            .sdl_gpu => try initSdlGpu(options),
-        };
+        return try initSdlGpu(options);
     }
 
     fn initSdlGpu(options: InitOptions) !Renderer {
@@ -55,7 +55,12 @@ pub const Renderer = struct {
 
         try palette.sdl.ttfInit();
         result.gpu_ttf_initialized = true;
-        result.gpu_font = try palette.sdl.ttfOpenFont(options.font_path, 16.0);
+        result.gpu_ui_font = try palette.sdl.ttfOpenFont(options.ui_font_path, 16.0);
+        result.gpu_ui_bold_font = try palette.sdl.ttfOpenFont(options.ui_bold_font_path, 16.0);
+        result.gpu_prose_font = try palette.sdl.ttfOpenFont(options.prose_font_path, 16.0);
+        result.gpu_prose_bold_font = try palette.sdl.ttfOpenFont(options.prose_bold_font_path, 16.0);
+        result.gpu_prose_italic_font = try palette.sdl.ttfOpenFont(options.prose_italic_font_path, 16.0);
+        result.gpu_prose_bold_italic_font = try palette.sdl.ttfOpenFont(options.prose_bold_italic_font_path, 16.0);
         result.gpu_mono_font = try palette.sdl.ttfOpenFont(options.mono_font_path, 16.0);
         result.gpu_icon_font = try palette.sdl.ttfOpenFont(options.icon_font_path, 16.0);
         result.gpu = try palette.renderer.Renderer.init(.{
@@ -63,12 +68,32 @@ pub const Renderer = struct {
             .shader_formats = palette.renderer.ShaderFormat.defaultForTarget(builtin.os.tag),
             .shader_packages = palette.renderer.ShaderSource.packagesForTarget(builtin.os.tag),
         });
-        try result.gpu.?.configureGpuTextWithRoleFonts(result.gpu_font.?, result.gpu_mono_font, result.gpu_icon_font);
+        try result.gpu.?.configureGpuTextWithAllRoleFonts(.{
+            .ui = result.gpu_ui_font.?,
+            .ui_bold = result.gpu_ui_bold_font.?,
+            .prose = result.gpu_prose_font.?,
+            .prose_bold = result.gpu_prose_bold_font.?,
+            .prose_italic = result.gpu_prose_italic_font.?,
+            .prose_bold_italic = result.gpu_prose_bold_italic_font.?,
+            .mono = result.gpu_mono_font,
+            .icon = result.gpu_icon_font,
+        });
+        text_measure.configure(.{
+            .ui = result.gpu_ui_font.?,
+            .ui_bold = result.gpu_ui_bold_font.?,
+            .prose = result.gpu_prose_font.?,
+            .prose_bold = result.gpu_prose_bold_font.?,
+            .prose_italic = result.gpu_prose_italic_font.?,
+            .prose_bold_italic = result.gpu_prose_bold_italic_font.?,
+            .mono = result.gpu_mono_font.?,
+            .icon = result.gpu_icon_font.?,
+        });
         try result.gpu.?.claimWindow(@ptrCast(options.window));
         return result;
     }
 
     pub fn deinit(self: *Renderer, allocator: std.mem.Allocator) void {
+        _ = allocator;
         if (self.active_backend == .sdl_gpu) {
             // SDL_GPU teardown can block indefinitely on some Linux/NVIDIA/Wayland
             // close paths. The process is exiting, so prefer prompt shutdown and let
@@ -76,15 +101,20 @@ pub const Renderer = struct {
             self.* = undefined;
             return;
         }
+        text_measure.clear();
         if (self.gpu) |*gpu| {
             if (self.window) |window| gpu.releaseWindow(@ptrCast(window));
             gpu.deinit();
         }
         if (self.gpu_icon_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_mono_font) |font| palette.sdl.ttfCloseFont(font);
-        if (self.gpu_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_prose_bold_italic_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_prose_italic_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_prose_bold_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_prose_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_ui_bold_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_ui_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_ttf_initialized) palette.sdl.ttfQuit();
-        if (self.gl) |*gl| gl.deinit(allocator);
         self.* = undefined;
     }
 
@@ -94,10 +124,6 @@ pub const Renderer = struct {
 
     pub fn activeBackend(self: *const Renderer) Backend {
         return self.active_backend;
-    }
-
-    pub fn usesOpenGl(self: *const Renderer) bool {
-        return self.active_backend == .gl;
     }
 
     pub fn uploadLoadedTextureCallback(context: ?*anyopaque, loaded: stb_image.LoadedImage) ?app_state.CachedImageTexture {
@@ -153,10 +179,9 @@ pub const Renderer = struct {
         framebuffer_width: f32,
         framebuffer_height: f32,
     ) !void {
-        switch (self.active_backend) {
-            .gl => try self.gl.?.renderBatch(allocator, batch, framebuffer_width, framebuffer_height),
-            .sdl_gpu => try self.renderSdlGpuBatch(allocator, batch),
-        }
+        _ = framebuffer_width;
+        _ = framebuffer_height;
+        try self.renderSdlGpuBatch(allocator, batch);
     }
 
     fn renderSdlGpuBatch(self: *Renderer, allocator: std.mem.Allocator, batch: *const palette.RenderBatch) !void {

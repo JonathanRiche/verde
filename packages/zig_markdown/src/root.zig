@@ -24,10 +24,22 @@ pub const ListKind = model.ListKind;
 pub const Paragraph = model.Paragraph;
 pub const Parser = parser.Parser;
 pub const Span = model.Span;
+pub const TableAlignment = model.TableAlignment;
+pub const TableBlock = model.TableBlock;
+pub const TableCell = model.TableCell;
+pub const TableRow = model.TableRow;
 pub const TextInline = model.TextInline;
+pub const Strikethrough = model.ContainerInline;
 
 pub fn parse(allocator: Allocator, source: []const u8) !Document {
     return parser.parseDocument(allocator, source);
+}
+
+/// Streaming-tolerant variant: end-of-source closes any unclosed `**`, `*`,
+/// `_`, `` ` ``, and `~~` at the outer paragraph level so chat replies
+/// rendering mid-stream don't briefly show literal markdown punctuation.
+pub fn parseStreaming(allocator: Allocator, source: []const u8) !Document {
+    return parser.parseDocumentStreaming(allocator, source);
 }
 
 pub fn fenceLanguage(info: []const u8) ?[]const u8 {

@@ -38,6 +38,7 @@ pub const InlineKind = enum {
     text,
     emphasis,
     strong,
+    strikethrough,
     code,
     link,
     line_break,
@@ -47,6 +48,7 @@ pub const Inline = union(enum) {
     text: TextInline,
     emphasis: ContainerInline,
     strong: ContainerInline,
+    strikethrough: ContainerInline,
     code: CodeInline,
     link: LinkInline,
     line_break: LineBreakKind,
@@ -56,6 +58,7 @@ pub const Inline = union(enum) {
             .text => .text,
             .emphasis => .emphasis,
             .strong => .strong,
+            .strikethrough => .strikethrough,
             .code => .code,
             .link => .link,
             .line_break => .line_break,
@@ -112,6 +115,28 @@ pub const ListBlock = struct {
     loose: bool,
 };
 
+pub const TableAlignment = enum {
+    default,
+    left,
+    center,
+    right,
+};
+
+pub const TableCell = struct {
+    inlines: []Inline,
+};
+
+pub const TableRow = struct {
+    cells: []TableCell,
+};
+
+pub const TableBlock = struct {
+    span: Span,
+    alignments: []TableAlignment,
+    header: TableRow,
+    rows: []TableRow,
+};
+
 pub const BlockKind = enum {
     blank,
     paragraph,
@@ -120,6 +145,7 @@ pub const BlockKind = enum {
     block_quote,
     list,
     thematic_break,
+    table,
 };
 
 pub const Block = union(enum) {
@@ -130,6 +156,7 @@ pub const Block = union(enum) {
     block_quote: BlockQuote,
     list: ListBlock,
     thematic_break: Span,
+    table: TableBlock,
 
     pub fn kind(self: Block) BlockKind {
         return switch (self) {
@@ -140,6 +167,7 @@ pub const Block = union(enum) {
             .block_quote => .block_quote,
             .list => .list,
             .thematic_break => .thematic_break,
+            .table => .table,
         };
     }
 
@@ -152,6 +180,7 @@ pub const Block = union(enum) {
             .block_quote => |value| value.span,
             .list => |value| value.span,
             .thematic_break => |value| value,
+            .table => |value| value.span,
         };
     }
 };

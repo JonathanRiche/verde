@@ -1,11 +1,10 @@
 # `verde` Desktop
 
-This package contains Verde's standalone Zig desktop app. It uses SDL3, OpenGL, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
+This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU, and [`palette`](../palette), Verde's in-repo Zig GUI framework.
 
 ## Prerequisites
 
 - Zig `0.16.0` through the repo-root [`mise.toml`](../../mise.toml)
-- OpenGL development libraries for your platform
 - SDL3 development files for your platform
 - Provider setup for the providers you want to use:
   - Codex: `codex` on your `PATH` and `codex login`
@@ -31,6 +30,18 @@ Common tasks:
 - `mise run debug`: launches Verde with the in-app diagnostics window enabled.
 - `mise run build`: creates a local release-style build for the current platform.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
+
+### Hyprland UI Polish Checks
+
+For chat UI readability or DPI polish work, run Verde from the repo root and capture comparison screenshots into `goal_samples/`:
+
+```bash
+mise run dev
+hyprctl clients -j
+grim -g "$(slurp)" goal_samples/chat-after.png
+```
+
+Use the same approximate window size for before/after captures. For fractional-scale checks, adjust your Hyprland monitor scale, restart `mise run dev`, then capture another image such as `goal_samples/chat-after-1-25x.png`.
 
 ## CEF Browser Pane
 

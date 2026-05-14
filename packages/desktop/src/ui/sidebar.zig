@@ -12,14 +12,14 @@ const Provider = native_state.Provider;
 const log = std.log.scoped(.native_ui_sidebar);
 
 /// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
-const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0 * 1.5;
+const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0;
 /// Thread row height must fit `SIDEBAR_THREAD_PROVIDER_GLYPH_CSS` with a little vertical air.
-const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 36.0;
+const SIDEBAR_THREAD_ROW_HEIGHT_CSS: f32 = 38.0;
 /// Vertical advance per thread row (row + gap).
-const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 40.0;
-const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 8.0;
+const SIDEBAR_THREAD_ROW_STEP_CSS: f32 = 42.0;
+const SIDEBAR_THREAD_ICON_LEADING_PAD_CSS: f32 = 10.0;
 /// Horizontal gap between the icon slot and the title.
-const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 6.0;
+const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 /// Relative-time label starts this far from the row's right edge.
 const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
@@ -94,33 +94,49 @@ pub fn pointerOverSidebar(x: f32, y: f32) bool {
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
-    var new_hover: ?native_state.SidebarThreadHover = null;
+    var new_thread_hover: ?native_state.SidebarThreadHover = null;
+    var new_project_hover: ?usize = null;
+    var new_new_thread_hover: ?usize = null;
     if (!state.isSidebarCollapsed() and rectContainsPoint(palette_sidebar_rect, x, y)) {
+        // Walk hits in reverse so later (visually-topmost) rows win when
+        // overlapping during scroll edge cases.
         var index = palette_hit_count;
         while (index > 0) {
             index -= 1;
             const hit = palette_hits[index];
-            if (hit.kind != .thread_row) continue;
             if (!rectContainsPoint(hit.rect, x, y)) continue;
-            new_hover = .{ .project_index = hit.project_index, .thread_index = hit.thread_index };
-            break;
+            switch (hit.kind) {
+                .thread_row => {
+                    if (new_thread_hover == null) {
+                        new_thread_hover = .{ .project_index = hit.project_index, .thread_index = hit.thread_index };
+                    }
+                },
+                .project_row => {
+                    if (new_project_hover == null) new_project_hover = hit.project_index;
+                },
+                .new_thread => {
+                    if (new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
+                },
+                else => {},
+            }
         }
     }
 
-    if (state.sidebar_thread_hover == null and new_hover == null) return;
+    const thread_changed = !threadHoverEq(state.sidebar_thread_hover, new_thread_hover);
+    const project_changed = state.sidebar_project_hover != new_project_hover;
+    const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
+    if (!thread_changed and !project_changed and !new_thread_changed) return;
 
-    var changed = false;
-    if (state.sidebar_thread_hover) |ho| {
-        if (new_hover) |nw| {
-            changed = ho.project_index != nw.project_index or ho.thread_index != nw.thread_index;
-        } else changed = true;
-    } else {
-        changed = new_hover != null;
-    }
-    if (!changed) return;
-
-    state.sidebar_thread_hover = new_hover;
+    state.sidebar_thread_hover = new_thread_hover;
+    state.sidebar_project_hover = new_project_hover;
+    state.sidebar_new_thread_hover = new_new_thread_hover;
     state.markDirty();
+}
+
+fn threadHoverEq(a: ?native_state.SidebarThreadHover, b: ?native_state.SidebarThreadHover) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.project_index == b.?.project_index and a.?.thread_index == b.?.thread_index;
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
@@ -389,23 +405,19 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
 fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
     const pad_x = theme.scaledUi(25.0);
     const rail_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(140.0));
-    var y = rect.y + theme.scaledUi(31.0) - sidebar_scroll_y;
     const x = rect.x + pad_x;
-    const clip = rect;
 
-    queuePaletteLogoMark(state, .{ .x = x, .y = y, .w = theme.scaledUi(42.0), .h = theme.scaledUi(42.0) });
-    queuePaletteText(state, .{ .x = x + theme.scaledUi(54.0), .y = y + theme.scaledUi(4.0), .w = theme.scaledUi(130.0), .h = theme.scaledUi(38.0) }, "verde", paletteColor(theme.COLOR_WHITE), theme.heading_font_size, clip);
-
-    const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = y + theme.scaledUi(6.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
-    queuePaletteButton(state, toggle_rect, "<", false);
-    addPaletteHit(toggle_rect, .collapse, 0, 0);
-
-    y += theme.scaledUi(92.0);
-    queuePaletteText(state, .{ .x = x, .y = y, .w = theme.scaledUi(130.0), .h = theme.scaledUi(24.0) }, "PROJECTS", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), clip);
-    const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
-    queuePaletteButton(state, add_rect, "+", true);
-    addPaletteHit(add_rect, .add_project, 0, 0);
-    y += theme.scaledUi(38.0);
+    // The logo, sidebar-collapse toggle, "PROJECTS" label, and add-project
+    // button stay pinned at the top of the rail; only the project list
+    // scrolls beneath them. The header is rendered AFTER the list (with a
+    // background strip first) so any list rows scrolled into the header band
+    // are visually overwritten — no z-index plumbing required.
+    const header_top = rect.y + theme.scaledUi(31.0);
+    const projects_label_y = header_top + theme.scaledUi(92.0);
+    const list_top = projects_label_y + theme.scaledUi(38.0);
+    const list_clip: palette.Rect = .{ .x = rect.x, .y = list_top, .w = rect.w, .h = @max(rect.y + rect.h - list_top, 0.0) };
+    const clip = list_clip;
+    var y = list_top - sidebar_scroll_y;
 
     var project_index: usize = 0;
     while (project_index < state.projects.items.len) : (project_index += 1) {
@@ -415,21 +427,47 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const row_h = theme.scaledUi(28.0);
         const action_w = theme.scaledUi(32.0);
         const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w - action_w - theme.scaledUi(6.0), .h = row_h };
-        const project_visible = rowVisible(row_rect, rect);
-        if (project_visible and selected) queuePaletteRoundedRect(state, row_rect, paletteColor(colors.CHAT_BLACK), theme.scaledUi(6.0));
+        const project_visible = rowVisible(row_rect, list_clip);
+        const project_hovered = state.sidebar_project_hover == project_index;
+        if (project_visible) {
+            if (selected) {
+                // Darker than the sidebar panel itself (matches the chat
+                // transcript's CHAT_BLACK) plus a muted border so the active
+                // project reads as a recessed card.
+                state.palette_overlay_batch.panel(
+                    state.allocator,
+                    snapRect(row_rect),
+                    paletteColor(colors.CHAT_BLACK),
+                    paletteColor(theme.COLOR_PANEL_MUTED),
+                    theme.scaledUi(6.0),
+                    theme.scaledUi(1.0),
+                ) catch {};
+            } else if (project_hovered) {
+                queuePaletteRoundedRect(state, row_rect, paletteColor(colors.rgba(36, 49, 45, 180)), theme.scaledUi(6.0));
+            }
+        }
         if (project_visible) addPaletteHit(row_rect, .project_row, project_index, 0);
 
         const cy = y + row_h * 0.5;
-        var tx = x + theme.scaledUi(2.0);
-        if (project_visible) queuePaletteChevron(state, tx, cy, theme.COLOR_TEXT_SUBTLE, collapsed);
-        tx += theme.scaledUi(10.0);
-        if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else theme.COLOR_TEXT_SUBTLE, selected);
+        // Inset the chevron from the bordered row's left edge so the chevron
+        // visually centers within the card rather than hugging the border.
+        var tx = x + theme.scaledUi(14.0);
+        const chevron_color: [4]f32 = if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
+        if (project_visible) queuePaletteChevron(state, tx, cy, chevron_color, collapsed);
+        // Chevron renders into a ~14px wide cell — leave room before the
+        // folder icon so the arrow doesn't crowd the project title.
+        tx += theme.scaledUi(18.0);
+        if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
-        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
 
         const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
+        const new_hovered = state.sidebar_new_thread_hover == project_index;
         if (project_visible) {
-            queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, theme.COLOR_TEXT_MUTED);
+            if (new_hovered) {
+                queuePaletteRoundedRect(state, new_rect, paletteColor(colors.rgba(36, 49, 45, 200)), theme.scaledUi(6.0));
+            }
+            queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, if (new_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
             addPaletteHit(new_rect, .new_thread, project_index, 0);
         }
         y += row_h + theme.scaledUi(4.0);
@@ -438,7 +476,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             var saved_buf: [32]u8 = undefined;
             const saved = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCountCached(state.allocator)}) catch "saved chats";
             const saved_rect: palette.Rect = .{ .x = x + theme.scaledUi(24.0), .y = y, .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(22.0) };
-            if (rowVisible(saved_rect, rect)) queuePaletteText(state, saved_rect, saved, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(14.0), clip);
+            if (rowVisible(saved_rect, list_clip)) queuePaletteText(state, saved_rect, saved, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(14.0), clip);
             y += theme.scaledUi(24.0);
 
             const sorted_indices = project.sortedCommittedThreadIndices(state.allocator);
@@ -453,12 +491,12 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                     .w = rail_w - theme.scaledUi(42.0),
                     .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
                 };
-                if (rowVisible(thread_rect, rect)) renderPaletteThreadRow(state, project_index, thread_index, thread, thread_rect, clip);
+                if (rowVisible(thread_rect, list_clip)) renderPaletteThreadRow(state, project_index, thread_index, thread, thread_rect, clip);
                 y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
             }
             if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
                 const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) };
-                if (rowVisible(show_rect, rect)) {
+                if (rowVisible(show_rect, list_clip)) {
                     queuePaletteRoundedRect(state, show_rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(8.0));
                     const label = if (project.thread_list_expanded) "Show less" else "Show more";
                     const show_pad_x = theme.scaledUi(14.0);
@@ -477,15 +515,32 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         y += theme.scaledUi(8.0);
     }
 
-    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - rect.y - rect.h + theme.scaledUi(24.0));
+    // Scrollbar must clip to the list area so the thumb never extends behind
+    // the pinned header strip drawn below.
+    sidebar_max_scroll_y = @max(0.0, y + sidebar_scroll_y - (list_clip.y + list_clip.h) + theme.scaledUi(8.0));
     sidebar_scroll_y = theme.clampf(sidebar_scroll_y, 0.0, sidebar_max_scroll_y);
-    if (sidebar_max_scroll_y > 1.0) {
-        const track: palette.Rect = .{ .x = rect.x + rect.w - theme.scaledUi(4.0), .y = rect.y + theme.scaledUi(12.0), .w = theme.scaledUi(3.0), .h = rect.h - theme.scaledUi(24.0) };
+    if (sidebar_max_scroll_y > 1.0 and list_clip.h > theme.scaledUi(32.0)) {
+        const track: palette.Rect = .{ .x = rect.x + rect.w - theme.scaledUi(4.0), .y = list_clip.y + theme.scaledUi(4.0), .w = theme.scaledUi(3.0), .h = list_clip.h - theme.scaledUi(8.0) };
         const thumb_h = @max(theme.scaledUi(34.0), track.h * (track.h / (track.h + sidebar_max_scroll_y)));
         const thumb_y = track.y + (track.h - thumb_h) * (sidebar_scroll_y / sidebar_max_scroll_y);
         queuePaletteRoundedRect(state, track, paletteColor(colors.rgba(35, 42, 46, 120)), theme.scaledUi(2.0));
         queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(colors.rgba(145, 163, 170, 200)), theme.scaledUi(2.0));
     }
+
+    // Pinned header — painted last so any scrolled rows in the header band
+    // are covered by the panel-colored strip before the chrome paints on top.
+    queuePaletteRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w - theme.scaledUi(1.0), .h = list_top - rect.y }, paletteColor(theme.COLOR_PANEL));
+    queuePaletteLogoMark(state, .{ .x = x, .y = header_top, .w = theme.scaledUi(42.0), .h = theme.scaledUi(42.0) });
+    queuePaletteText(state, .{ .x = x + theme.scaledUi(54.0), .y = header_top + theme.scaledUi(4.0), .w = theme.scaledUi(130.0), .h = theme.scaledUi(38.0) }, "verde", paletteColor(theme.COLOR_WHITE), theme.heading_font_size, rect);
+
+    const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = header_top + theme.scaledUi(6.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
+    queuePaletteButton(state, toggle_rect, "<", false);
+    addPaletteHit(toggle_rect, .collapse, 0, 0);
+
+    queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(130.0), .h = theme.scaledUi(24.0) }, "PROJECTS", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
+    const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
+    queuePaletteButton(state, add_rect, "+", true);
+    addPaletteHit(add_rect, .add_project, 0, 0);
 }
 
 fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
@@ -534,9 +589,9 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
             paletteColor(theme.lighten(colors.DARK_BLUE, 0.09))
         else
             paletteColor(colors.DARK_BLUE);
-        queuePaletteRoundedRect(state, rect, bg, theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, snapRect(rect), bg, theme.scaledUi(7.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, rect, paletteColor(theme.lighten(colors.GREEN_600, 0.10)), theme.scaledUi(4.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(colors.rgba(36, 49, 45, 210)), theme.scaledUi(7.0));
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
@@ -550,20 +605,20 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
 
     const title_emphasis = selected or hovered;
-    const title_font = theme.scaledUi(14.0);
-    const title_line = title_font * 1.25;
-    const title_y = rect.y + (rect.h - title_line) * 0.5;
+    const title_font = theme.scaledUi(13.5);
+    const title_line = title_font * 1.30;
+    const title_y = @round(rect.y + (rect.h - title_line) * 0.5);
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(title_left_css),
         .y = title_y,
         .w = rect.w - theme.scaledUi(title_area_right_css),
-        .h = rect.h,
+        .h = title_line,
     }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
         .y = title_y,
         .w = theme.scaledUi(58.0),
-        .h = rect.h,
+        .h = title_line,
     }, relative_time, paletteColor(colors.TIME_LABEL), title_font, clip);
 }
 
@@ -587,13 +642,13 @@ fn rectContainsPoint(rect: palette.Rect, x: f32, y: f32) bool {
 }
 
 fn queuePaletteRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32) void {
-    state.palette_overlay_batch.roundedRect(state.allocator, rect, color, radius) catch |err| {
+    state.palette_overlay_batch.roundedRect(state.allocator, snapRect(rect), color, radius) catch |err| {
         log.warn("failed to queue sidebar palette rounded rect: {s}", .{@errorName(err)});
     };
 }
 
 fn queuePaletteBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
-    state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
+    state.palette_overlay_batch.rectBorder(state.allocator, snapRect(rect), color, radius, width) catch |err| {
         log.warn("failed to queue sidebar palette border: {s}", .{@errorName(err)});
     };
 }
@@ -620,38 +675,52 @@ fn queuePaletteFolderIcon(state: *runtime.AppState, x: f32, center_y: f32, width
     }
 }
 
+// Nerd Font Symbols codicon glyphs used throughout the sidebar. Codepoints
+// confirmed against SymbolsNerdFontMono-Regular.ttf's cmap.
+const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_EDIT = "\u{EA73}";
+
+/// Renders a centered codicon glyph through the icon font. Replaces the
+/// hand-drawn shapes / PNGs we used before.
+fn queuePaletteIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, font_size: f32, color: palette.Color, clip: ?palette.Rect) void {
+    const stable_value = stablePaletteText(state, glyph) catch |err| {
+        log.warn("failed to retain sidebar icon: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        snapRect(rect),
+        stable_value,
+        color,
+        font_size,
+        .icon,
+        null,
+        clip,
+    ) catch |err| {
+        log.warn("failed to queue sidebar icon: {s}", .{@errorName(err)});
+    };
+}
+
 fn queuePaletteChevron(state: *runtime.AppState, x: f32, center_y: f32, color: [4]f32, collapsed: bool) void {
-    const font_size = theme.scaledUi(12.0);
-    const glyph = if (collapsed) ">" else "v";
-    queuePaletteText(state, .{
+    const font_size = theme.scaledUi(13.0);
+    const glyph = if (collapsed) NF_COD_CHEVRON_RIGHT else NF_COD_CHEVRON_DOWN;
+    queuePaletteIcon(state, .{
         .x = x - theme.scaledUi(4.0),
-        .y = center_y - font_size * 0.58,
-        .w = theme.scaledUi(12.0),
-        .h = font_size * 1.25,
-    }, glyph, paletteColor(color), font_size, null);
+        .y = center_y - font_size * 0.5,
+        .w = theme.scaledUi(14.0),
+        .h = font_size,
+    }, glyph, font_size, paletteColor(color), null);
 }
 
 fn queuePaletteEditGlyph(state: *runtime.AppState, start: [2]f32, width: f32, height: f32, color: [4]f32) void {
-    if (state.thread_edit_texture) |cached| {
-        const size = @min(width, height) * 0.68;
-        const rect: palette.Rect = .{
-            .x = start[0] + (width - size) * 0.5,
-            .y = start[1] + (height - size) * 0.5,
-            .w = size,
-            .h = size,
-        };
-        if (queuePaletteImage(state, rect, cached, paletteColor(color), null)) return;
-    }
-
-    const font_size = theme.scaledUi(18.0);
-    const label = "+";
-    const text_width = font_size * 0.5;
-    queuePaletteText(state, .{
-        .x = start[0] + (width - text_width) * 0.5,
+    const font_size = @min(width, height) * 0.5;
+    queuePaletteIcon(state, .{
+        .x = start[0] + (width - font_size) * 0.5,
         .y = start[1] + (height - font_size) * 0.5,
-        .w = text_width,
-        .h = font_size * 1.25,
-    }, label, paletteColor(color), font_size, null);
+        .w = font_size,
+        .h = font_size,
+    }, NF_COD_EDIT, font_size, paletteColor(color), null);
 }
 
 fn queuePaletteLogoMark(state: *runtime.AppState, rect: palette.Rect) void {
@@ -691,7 +760,7 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
     };
     state.palette_overlay_batch.fixedText(
         state.allocator,
-        rect,
+        snapRect(rect),
         stable_value,
         color,
         font_size,
@@ -706,9 +775,7 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
 }
 
 fn stablePaletteText(state: *runtime.AppState, value: []const u8) ![]const u8 {
-    const start = state.palette_frame_text.items.len;
-    try state.palette_frame_text.appendSlice(state.allocator, value);
-    return state.palette_frame_text.items[start .. start + value.len];
+    return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
 fn paletteColor(value: [4]f32) palette.Color {
@@ -719,7 +786,7 @@ fn queuePaletteImage(state: *runtime.AppState, rect: palette.Rect, cached: nativ
     if (!cached.valid or cached.texture_id == 0 or rect.w <= 0.0 or rect.h <= 0.0) return false;
     state.palette_overlay_batch.image(
         state.allocator,
-        rect,
+        snapRect(rect),
         palette.TextureId.init(cached.texture_id),
         .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
         tint,
@@ -729,6 +796,15 @@ fn queuePaletteImage(state: *runtime.AppState, rect: palette.Rect, cached: nativ
         return false;
     };
     return true;
+}
+
+fn snapRect(rect: palette.Rect) palette.Rect {
+    return .{
+        .x = @round(rect.x),
+        .y = @round(rect.y),
+        .w = @round(rect.w),
+        .h = @round(rect.h),
+    };
 }
 
 /// Truncates a thread title for narrow sidebar rows.
@@ -788,7 +864,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
-        const draw: palette.Rect = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        const draw = snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
         if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
     }
 

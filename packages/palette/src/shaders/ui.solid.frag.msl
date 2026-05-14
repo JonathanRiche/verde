@@ -5,8 +5,44 @@ struct FSInput {
     float4 position [[position]];
     float2 uv;
     float4 color;
+    float2 pixel_pos;
+    float2 sdf_min;
+    float2 sdf_size;
+    float2 sdf_radius_border;
+    float4 sdf_border;
 };
 
+// Signed distance to an axis-aligned rounded rectangle centered at the origin
+// with half-extents `b` and corner radius `r`. (Inigo Quilez "rounded box" SDF.)
+static inline float sdfRoundedRect(float2 p, float2 b, float r) {
+    float2 d = abs(p) - b + float2(r);
+    return length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+}
+
 fragment float4 palette_solid_fragment(FSInput input [[stage_in]]) {
-    return input.color;
+    // Fast path for triangles and plain (non-rounded, non-bordered) rects.
+    if (input.sdf_size.x <= 0.0 || input.sdf_size.y <= 0.0) {
+        return input.color;
+    }
+
+    float2 center = input.sdf_min + input.sdf_size * 0.5;
+    float2 half_size = input.sdf_size * 0.5;
+    float2 p = input.pixel_pos - center;
+    float radius = input.sdf_radius_border.x;
+    float border_w = input.sdf_radius_border.y;
+    float dist = sdfRoundedRect(p, half_size, radius);
+
+    if (border_w > 0.0 && input.sdf_border.a > 0.0) {
+        float outer_alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
+        float inner_alpha = 1.0 - smoothstep(-0.5, 0.5, dist + border_w);
+        float border_alpha = max(outer_alpha - inner_alpha, 0.0);
+        float fill_alpha = inner_alpha;
+        float4 fill = float4(input.color.rgb, input.color.a * fill_alpha);
+        float b_a = input.sdf_border.a * border_alpha;
+        float3 rgb = input.sdf_border.rgb * b_a + fill.rgb * (1.0 - b_a);
+        float a = b_a + fill.a * (1.0 - b_a);
+        return float4(rgb, a);
+    }
+    float alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
+    return float4(input.color.rgb, input.color.a * alpha);
 }

@@ -51,6 +51,21 @@ pub const Vertex = extern struct {
     pos: Vec2,
     uv: Vec2,
     color: Color,
+    /// Top-left corner of the SDF rounded-rect, in framebuffer pixels. Used by
+    /// the solid pipeline's fragment shader to apply analytic anti-aliasing.
+    /// All four vertices of a quad share the same SDF parameters.
+    sdf_min: Vec2 = .{},
+    /// Size of the SDF rect in pixels. Zero size signals "no SDF AA" — the
+    /// fragment shader falls back to the flat-color path used for triangles
+    /// and plain (non-rounded, non-bordered) rects.
+    sdf_size: Vec2 = .{},
+    /// Corner radius and border thickness (in pixels), packed into a vec2
+    /// attribute on the GPU. Border thickness 0 means "fill only".
+    sdf_radius: f32 = 0.0,
+    sdf_border_width: f32 = 0.0,
+    /// Border color (alpha 0 disables border drawing). The fill color uses the
+    /// existing `color` field.
+    sdf_border: Color = .{ .a = 0.0 },
 };
 
 pub const CommandKind = enum {
@@ -68,6 +83,12 @@ pub const FontRole = enum {
     ui_bold,
     icon,
     mono,
+    // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
+    // (display sans) can differ from the body face (humanist sans regular).
+    prose,
+    prose_bold,
+    prose_italic,
+    prose_bold_italic,
 };
 
 pub const TextRun = struct {

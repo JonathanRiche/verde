@@ -27,6 +27,62 @@ pub const TRANSCRIPT_BUBBLE_PADDING_X: f32 = 18.0;
 pub const TRANSCRIPT_BUBBLE_PADDING_Y: f32 = 14.0;
 pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
 
+/// Markdown rendering palette. Grouped here so a future light theme can swap
+/// the whole table in one place. All values are RGBA [4]f32 in 0..1 space.
+pub const md = struct {
+    // Prose body and headings.
+    pub const text_body = rgb(0xE2, 0xE4, 0xE9);
+    pub const text_h1 = rgb(0xFF, 0xF2, 0xA8);
+    pub const text_h2 = rgb(0xF2, 0xE6, 0x8D);
+    pub const text_h3 = rgb(0xDE, 0xE8, 0xFF);
+    pub const text_h4_h6 = rgb(0xCF, 0xD7, 0xE5);
+    pub const text_quote = rgb(0xB3, 0xBE, 0xD4);
+
+    // Inline-style overrides.
+    pub const inline_code = rgb(0xF5, 0xD0, 0x7A);
+    pub const link = rgb(0x7A, 0xCA, 0xFF);
+
+    // Selection / chrome.
+    pub const selection_fill = rgba(88, 166, 255, 255);
+
+    // Blockquote chrome.
+    pub const quote_bg = rgba(38, 41, 48, 140);
+    pub const quote_accent = link;
+
+    // Fenced code block frame.
+    pub const code_bg = rgba(24, 24, 28, 255);
+    pub const code_border = rgba(52, 54, 62, 255);
+    pub const inline_code_pill = rgba(38, 41, 48, 235);
+
+    // Thematic rule (`---`).
+    pub const rule = rgba(68, 72, 82, 255);
+
+    // GFM tables.
+    pub const table_border = rgba(68, 72, 82, 255);
+    pub const table_header_bg = rgba(38, 41, 48, 200);
+
+    // Syntax tokens.
+    pub const tok_plain = text_body;
+    pub const tok_comment = rgb(0x8A, 0x91, 0xA0);
+    pub const tok_string = rgb(0x66, 0xDC, 0xAA);
+    pub const tok_number = rgb(0xF5, 0xB4, 0x78);
+    pub const tok_keyword = rgb(0xFF, 0xD6, 0x66);
+    pub const tok_type = rgb(0x7A, 0xCA, 0xFF);
+    pub const tok_function = rgb(0x60, 0xDB, 0xDB);
+    pub const tok_property = rgb(0x6B, 0xA8, 0xFF);
+    pub const tok_variable = text_body;
+    pub const tok_constant = rgb(0xF1, 0xC4, 0x6B);
+    pub const tok_punct = rgb(0xB6, 0xBB, 0xC5);
+
+    // Copy-button states (idle / hover / recently-clicked).
+    pub const copy_bg_idle = rgba(38, 41, 48, 200);
+    pub const copy_bg_hover = rgba(64, 70, 82, 235);
+    pub const copy_bg_recent = rgba(46, 110, 70, 230);
+    pub const copy_glyph_idle = rgba(190, 195, 205, 255);
+    pub const copy_glyph_hover = rgba(245, 245, 250, 255);
+    pub const copy_glyph_recent = rgba(220, 246, 200, 255);
+};
+
 pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
 pub var terminal_font_size: f32 = DEFAULT_FONT_SIZE * 0.86;
 var current_ui_scale: f32 = 1.0;

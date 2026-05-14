@@ -43,6 +43,25 @@ const ListMarker = struct {
     content: []const u8,
 };
 
+/// While true, `parseInlines` treats end-of-source as a closer for unfinished
+/// `**`, `*`, `_`, `` ` ``, and `~~` runs in the OUTER paragraph context. Off by
+/// default; flipped on by `parseDocumentStreaming` and back off automatically.
+/// Recursive parseInlines calls for children of already-closed inlines (link
+/// labels, emphasis bodies, strike bodies) reset it to false via
+/// `parseInlineChildren` so a closed `**foo**` with literal `*` inside doesn't
+/// get a synthetic closer.
+threadlocal var streaming_mode_active: bool = false;
+
+/// Drop-in streaming variant of `parseDocument`. Mid-stream replies often end
+/// with unclosed `**`, `*`, `` ` ``, etc. — this returns inlines that render
+/// optimistically rather than as literal punctuation.
+pub fn parseDocumentStreaming(allocator: Allocator, source: []const u8) Allocator.Error!model.Document {
+    const prev = streaming_mode_active;
+    streaming_mode_active = true;
+    defer streaming_mode_active = prev;
+    return parseDocument(allocator, source);
+}
+
 pub fn parseDocument(allocator: Allocator, source: []const u8) Allocator.Error!model.Document {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -103,11 +122,126 @@ fn parseBlocks(
             continue;
         }
 
+        if (try parseTableBlock(allocator, lines, index)) |result| {
+            try blocks.append(allocator, result.block);
+            continue;
+        }
+
         const result = try parseParagraphBlock(allocator, source, lines, index);
         try blocks.append(allocator, result.block);
     }
 
     return try blocks.toOwnedSlice(allocator);
+}
+
+/// GFM pipe-table parser. Requires:
+///   line N:   `| header | header |`  (any line containing `|` that yields ≥2 cells)
+///   line N+1: `| --- | --- |`        (each cell matches `:?-+:?` after trimming)
+///   line N+2…: data rows (same pattern, padded to header width or truncated).
+/// Pipes at line edges are optional in GFM but expected here for clarity.
+fn parseTableBlock(
+    allocator: Allocator,
+    lines: []const Line,
+    index: *usize,
+) Allocator.Error!?ParseResult {
+    if (index.* + 1 >= lines.len) return null;
+
+    const header_line = lines[index.*];
+    const delim_line = lines[index.* + 1];
+
+    const header_cells_str = (try splitTableCells(allocator, header_line.text)) orelse return null;
+    if (header_cells_str.len < 1) return null;
+
+    const alignments = (try parseTableDelimiterRow(allocator, delim_line.text)) orelse return null;
+    if (alignments.len != header_cells_str.len) return null;
+
+    var header_cells = try allocator.alloc(model.TableCell, header_cells_str.len);
+    for (header_cells_str, 0..) |cell_text, i| {
+        header_cells[i] = .{ .inlines = try parseInlines(allocator, std.mem.trim(u8, cell_text, " \t")) };
+    }
+
+    var rows: std.ArrayListUnmanaged(model.TableRow) = .empty;
+    var scan: usize = index.* + 2;
+    var last_line = delim_line;
+    while (scan < lines.len) : (scan += 1) {
+        const line = lines[scan];
+        const cells_str = (try splitTableCells(allocator, line.text)) orelse break;
+        var row_cells = try allocator.alloc(model.TableCell, header_cells_str.len);
+        for (0..header_cells_str.len) |i| {
+            const text = if (i < cells_str.len) std.mem.trim(u8, cells_str[i], " \t") else "";
+            row_cells[i] = .{ .inlines = try parseInlines(allocator, text) };
+        }
+        try rows.append(allocator, .{ .cells = row_cells });
+        last_line = line;
+    }
+
+    index.* = scan;
+    return .{
+        .block = .{
+            .table = .{
+                .span = makeSpan(header_line.number, last_line.number, header_line.start, last_line.end),
+                .alignments = alignments,
+                .header = .{ .cells = header_cells },
+                .rows = try rows.toOwnedSlice(allocator),
+            },
+        },
+        .next_index = scan,
+    };
+}
+
+/// Split a `| a | b | c |` line into `["a", "b", "c"]`. Returns null if the
+/// line isn't table-shaped (no pipes, or fewer than 2 cells).
+fn splitTableCells(allocator: Allocator, raw: []const u8) Allocator.Error!?[][]const u8 {
+    var trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '|') == null) return null;
+    if (trimmed[0] == '|') trimmed = trimmed[1..];
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == '|') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (trimmed.len == 0) return null;
+
+    var cells: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer cells.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        // `\|` is the GFM escape for a literal pipe inside a cell.
+        if (trimmed[i] == '\\' and i + 1 < trimmed.len and trimmed[i + 1] == '|') {
+            i += 1;
+            continue;
+        }
+        if (trimmed[i] == '|') {
+            try cells.append(allocator, trimmed[start..i]);
+            start = i + 1;
+        }
+    }
+    try cells.append(allocator, trimmed[start..]);
+    if (cells.items.len < 2) {
+        cells.deinit(allocator);
+        return null;
+    }
+    return try cells.toOwnedSlice(allocator);
+}
+
+/// Parse `| --- | :---: | ---: |` into alignment markers. Each cell must
+/// match `:?-+:?`. Returns null on any non-matching cell.
+fn parseTableDelimiterRow(allocator: Allocator, raw: []const u8) Allocator.Error!?[]model.TableAlignment {
+    const cells = (try splitTableCells(allocator, raw)) orelse return null;
+    const alignments = try allocator.alloc(model.TableAlignment, cells.len);
+    for (cells, 0..) |cell, i| {
+        const trimmed = std.mem.trim(u8, cell, " \t");
+        if (trimmed.len == 0) return null;
+        const left = trimmed[0] == ':';
+        const right = trimmed[trimmed.len - 1] == ':';
+        const dash_start: usize = if (left) 1 else 0;
+        const dash_end: usize = if (right) trimmed.len - 1 else trimmed.len;
+        if (dash_end <= dash_start) return null;
+        for (trimmed[dash_start..dash_end]) |b| {
+            if (b != '-') return null;
+        }
+        alignments[i] = if (left and right) .center else if (right) .right else if (left) .left else .default;
+    }
+    return alignments;
 }
 
 fn parseFencedCodeBlock(source: []const u8, lines: []const Line, index: *usize) ?ParseResult {
@@ -566,9 +700,9 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                 continue;
             },
             '`' => {
+                const ticks = countRun(source, index);
                 if (findCodeSpanEnd(source, index)) |end| {
                     try appendTextInline(allocator, &inlines, source[text_start..index]);
-                    const ticks = countRun(source, index);
                     try inlines.append(allocator, .{
                         .code = .{
                             .text = source[index + ticks .. end],
@@ -577,6 +711,19 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                     index = end + ticks;
                     text_start = index;
                     continue;
+                } else if (streaming_mode_active and index + ticks < source.len) {
+                    // Streaming fallback: unclosed `` `foo `` at the buffer tail
+                    // renders as an inline code span up to end-of-source so the
+                    // word doesn't briefly appear with a literal backtick.
+                    try appendTextInline(allocator, &inlines, source[text_start..index]);
+                    try inlines.append(allocator, .{
+                        .code = .{
+                            .text = source[index + ticks ..],
+                        },
+                    });
+                    text_start = source.len;
+                    index = source.len;
+                    break;
                 }
             },
             '[' => {
@@ -603,6 +750,43 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
                     continue;
                 }
             },
+            '~' => {
+                // GFM strikethrough: `~~text~~`. Single `~` is plain text.
+                if (try parseStrikethrough(allocator, source, index)) |result| {
+                    try appendTextInline(allocator, &inlines, source[text_start..index]);
+                    try inlines.append(allocator, result.value);
+                    index = result.next_index;
+                    text_start = index;
+                    continue;
+                }
+            },
+            'h' => {
+                // Bare URL autolink: turn `http(s)://…` runs into links so the
+                // renderer can color/underline them without requiring `[…](…)`.
+                // Only triggers at a word boundary so we don't grab `ahttp://`.
+                const at_boundary = index == 0 or isAutolinkBoundary(source[index - 1]);
+                if (at_boundary) {
+                    if (autolinkLength(source, index)) |url_len| {
+                        try appendTextInline(allocator, &inlines, source[text_start..index]);
+                        const url = source[index .. index + url_len];
+                        // Do NOT recurse via parseInlines here — the URL itself
+                        // starts with 'h' and would re-enter this branch (stack
+                        // overflow). The label text is the URL verbatim.
+                        const children = try allocator.alloc(model.Inline, 1);
+                        children[0] = .{ .text = .{ .text = url } };
+                        try inlines.append(allocator, .{
+                            .link = .{
+                                .label = url,
+                                .destination = url,
+                                .children = children,
+                            },
+                        });
+                        index += url_len;
+                        text_start = index;
+                        continue;
+                    }
+                }
+            },
             else => {},
         }
 
@@ -611,6 +795,38 @@ fn parseInlines(allocator: Allocator, source: []const u8) Allocator.Error![]mode
 
     try appendTextInline(allocator, &inlines, source[text_start..]);
     return try inlines.toOwnedSlice(allocator);
+}
+
+fn isAutolinkBoundary(byte: u8) bool {
+    return switch (byte) {
+        ' ', '\t', '\n', '\r', '(', '[', '<', '"', '\'' => true,
+        else => false,
+    };
+}
+
+fn autolinkLength(source: []const u8, start: usize) ?usize {
+    const remaining = source[start..];
+    const scheme_len: usize =
+        if (std.mem.startsWith(u8, remaining, "https://")) 8
+        else if (std.mem.startsWith(u8, remaining, "http://")) 7
+        else return null;
+    var end = start + scheme_len;
+    while (end < source.len) : (end += 1) {
+        switch (source[end]) {
+            ' ', '\t', '\n', '\r', '<', '>', '"', '\'' => break,
+            else => {},
+        }
+    }
+    // Trim trailing punctuation that's almost always sentence-final, not part
+    // of the URL (e.g. `see https://x.com/.` shouldn't capture the dot).
+    while (end > start + scheme_len) {
+        const c = source[end - 1];
+        if (c == '.' or c == ',' or c == ';' or c == ':' or c == ')' or c == ']' or c == '!' or c == '?') {
+            end -= 1;
+        } else break;
+    }
+    if (end == start + scheme_len) return null;
+    return end - start;
 }
 
 const InlineParseResult = struct {
@@ -671,7 +887,7 @@ fn parseInlineLink(
     const label_end = close_bracket;
     const destination_start = close_bracket + 2;
     const destination_end = close_paren;
-    const children = try parseInlines(allocator, source[label_start..label_end]);
+    const children = try parseInlineChildren(allocator, source[label_start..label_end]);
 
     return .{
         .label_start = label_start,
@@ -691,16 +907,51 @@ fn parseDelimitedInline(
     const marker = source[start];
     const run = countRun(source, start);
     const delimiter_length: usize = if (run >= 2) 2 else 1;
-    const end = findClosingDelimiter(source, start + delimiter_length, marker, delimiter_length) orelse return null;
+    const end_opt = findClosingDelimiter(source, start + delimiter_length, marker, delimiter_length);
+    // Streaming fallback: an unclosed `**…` or `*…` at the tail of the buffer
+    // renders optimistically as if the closer were at end-of-source. This is
+    // what stops words from snapping into bold the moment the closer arrives
+    // mid-stream.
+    const synthesized_close = end_opt == null and streaming_mode_active and start + delimiter_length < source.len;
+    const end: usize = end_opt orelse if (synthesized_close) source.len else return null;
     if (end == start + delimiter_length) return null;
 
-    const children = try parseInlines(allocator, source[start + delimiter_length .. end]);
+    const children_source = source[start + delimiter_length .. end];
+    // The synthesized branch knows there's no real closer, so children are
+    // parsed in streaming mode too (a trailing `**foo *bar` snapshot should
+    // bold-italicize `bar`).
+    const children = if (synthesized_close)
+        try parseInlines(allocator, children_source)
+    else
+        try parseInlineChildren(allocator, children_source);
     return .{
         .value = if (delimiter_length == 2)
             .{ .strong = .{ .children = children } }
         else
             .{ .emphasis = .{ .children = children } },
-        .next_index = end + delimiter_length,
+        .next_index = if (synthesized_close) source.len else end + delimiter_length,
+    };
+}
+
+fn parseStrikethrough(
+    allocator: Allocator,
+    source: []const u8,
+    start: usize,
+) Allocator.Error!?InlineParseResult {
+    const run = countRun(source, start);
+    if (run < 2) return null; // single ~ is plain text
+    const end_opt = findClosingDelimiter(source, start + 2, '~', 2);
+    const synthesized_close = end_opt == null and streaming_mode_active and start + 2 < source.len;
+    const end: usize = end_opt orelse if (synthesized_close) source.len else return null;
+    if (end == start + 2) return null;
+    const children_source = source[start + 2 .. end];
+    const children = if (synthesized_close)
+        try parseInlines(allocator, children_source)
+    else
+        try parseInlineChildren(allocator, children_source);
+    return .{
+        .value = .{ .strikethrough = .{ .children = children } },
+        .next_index = if (synthesized_close) source.len else end + 2,
     };
 }
 
@@ -718,4 +969,14 @@ fn findClosingDelimiter(source: []const u8, start: usize, marker: u8, length: us
         if (matches) return index;
     }
     return null;
+}
+
+/// Like `parseInlines` but with `streaming_mode_active` forced off — used for
+/// the children of an inline whose closer the parent already located, so we
+/// don't synthesize phantom closers inside e.g. a closed `**[link](url)**`.
+fn parseInlineChildren(allocator: Allocator, source: []const u8) Allocator.Error![]model.Inline {
+    const prev = streaming_mode_active;
+    streaming_mode_active = false;
+    defer streaming_mode_active = prev;
+    return parseInlines(allocator, source);
 }
