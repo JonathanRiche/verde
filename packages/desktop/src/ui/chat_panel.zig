@@ -861,8 +861,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
     const browser_base = theme.COLOR_PANEL_ALT;
     const browser_bg = if (browser_hover) theme.lighten(browser_base, 0.08) else browser_base;
     const browser_radius = theme.scaledUi(6.0);
-    queueRounded(state, browser_rect, paletteColor(browser_bg), browser_radius);
-    queueBorder(state, browser_rect, paletteColor(theme.lighten(browser_bg, 0.06)), browser_radius, theme.scaledUi(1.0));
+    queuePanel(state, browser_rect, paletteColor(browser_bg), paletteColor(theme.lighten(browser_bg, 0.06)), browser_radius, theme.scaledUi(1.0));
 
     const browser_label = "Browser";
     const globe_size = theme.scaledUi(14.0);
@@ -2376,6 +2375,14 @@ fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.
 
 fn queueBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
+}
+
+/// Single-pass fill + border via the SDF panel command. Avoids the double-AA
+/// fringe artifacts you get from drawing a filled rounded rect and an
+/// overlapping `rectBorder` separately — the shader computes both regions
+/// from one signed-distance evaluation per fragment.
+fn queuePanel(state: *app_state.AppState, rect: palette.Rect, fill: palette.Color, border: palette.Color, radius: f32, border_width: f32) void {
+    state.palette_overlay_batch.panel(state.allocator, snapRect(rect), fill, border, radius, border_width) catch {};
 }
 
 fn queueRoundedClipped(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, clip: palette.Rect) void {

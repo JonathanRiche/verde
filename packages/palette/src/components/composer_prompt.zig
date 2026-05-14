@@ -25,6 +25,11 @@ pub const ComposerPromptConfig = struct {
     border_width: f32 = 1.0,
     background_color: draw.Color = .{ .r = 0.10, .g = 0.13, .b = 0.14, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    /// Border color when the composer is focused. Falls back to `border_color`
+    /// when null. Host wires this to the app's brand color so the prompt box
+    /// glows in the brand hue while the user is typing.
+    focus_border_color: ?draw.Color = null,
+    focus_border_width: ?f32 = null,
     control_background_color: draw.Color = .{ .r = 0.07, .g = 0.09, .b = 0.10, .a = 0.0 },
     control_hover_color: draw.Color = .{ .r = 0.18, .g = 0.22, .b = 0.24, .a = 0.62 },
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
@@ -555,7 +560,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const previous_z = batch.setZIndex(self.z_index);
             defer batch.restoreZIndex(previous_z);
 
-            try batch.panel(allocator, self.bounds(), config.background_color, config.border_color, config.corner_radius, config.border_width);
+            const active_border_color = if (self.focused) (config.focus_border_color orelse config.border_color) else config.border_color;
+            const active_border_width = if (self.focused) (config.focus_border_width orelse config.border_width) else config.border_width;
+            try batch.panel(allocator, self.bounds(), config.background_color, active_border_color, config.corner_radius, active_border_width);
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
             try self.renderMenu(allocator, batch);
@@ -577,7 +584,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
-            if (self.focused and self.buffer.items.len > 0) {
+            if (self.focused) {
+                // Render cursor on focus regardless of buffer state so users
+                // get immediate visual feedback after clicking into the prompt.
                 const cursor = self.cursorRect();
                 if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
             }

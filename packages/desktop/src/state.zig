@@ -117,6 +117,11 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .border_width = 1.0,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
     .border_color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    // Verde brand green (#50c878) glows on focus so the composer flags itself
+    // when keystrokes are live. Slightly thicker than the resting border to
+    // make the state change unambiguous.
+    .focus_border_color = .{ .r = 0.314, .g = 0.784, .b = 0.471, .a = 1.0 },
+    .focus_border_width = 1.5,
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
