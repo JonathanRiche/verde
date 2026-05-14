@@ -9,18 +9,6 @@ const builtin = @import("builtin");
 
 const log = std.log.scoped(.native_utils);
 
-const GL_TEXTURE_2D = 0x0DE1;
-const GL_RGBA = 0x1908;
-const GL_UNSIGNED_BYTE = 0x1401;
-const GL_LINEAR = 0x2601;
-const GL_TEXTURE_MIN_FILTER = 0x2801;
-const GL_TEXTURE_MAG_FILTER = 0x2800;
-const GL_TEXTURE_WRAP_S = 0x2802;
-const GL_TEXTURE_WRAP_T = 0x2803;
-const GL_CLAMP_TO_EDGE = 0x812F;
-const GL_UNPACK_ALIGNMENT = 0x0CF5;
-const GL_LINEAR_MIPMAP_LINEAR = 0x2703;
-
 // Shared runtime constants live here so state and the UI shell can import them
 // without creating a cycle back through `main.zig`.
 pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -55,45 +43,9 @@ pub fn loadEmbeddedTexture(bytes: []const u8) ?app_state.CachedImageTexture {
     return uploadTexture(loaded);
 }
 
-extern fn glGenTextures(n: c_int, textures: [*]c_uint) void;
-extern fn glBindTexture(target: c_uint, texture: c_uint) void;
-extern fn glPixelStorei(pname: c_uint, param: c_int) void;
-extern fn glTexParameteri(target: c_uint, pname: c_uint, param: c_int) void;
-extern fn glTexImage2D(target: c_uint, level: c_int, internalformat: c_int, width: c_int, height: c_int, border: c_int, format: c_uint, type_: c_uint, pixels: ?*const anyopaque) void;
-extern fn glGenerateMipmap(target: c_uint) void;
-
 pub fn uploadTexture(loaded: stb_image.LoadedImage) ?app_state.CachedImageTexture {
-    var textures = [_]c_uint{0};
-    glGenTextures(1, &textures);
-    const texture_id = textures[0];
-    if (texture_id == 0) return null;
-
-    glBindTexture(GL_TEXTURE_2D, texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA,
-        @intCast(loaded.width),
-        @intCast(loaded.height),
-        0,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        loaded.pixels,
-    );
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    return .{
-        .texture_id = texture_id,
-        .width = loaded.width,
-        .height = loaded.height,
-        .valid = true,
-    };
+    _ = loaded;
+    return null;
 }
 
 /// Normalized device / layout rectangle for bitmap draws (avoids anonymous-struct mismatch).

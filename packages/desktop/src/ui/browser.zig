@@ -48,15 +48,33 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     renderToolbar(state, rect);
 }
 
-pub fn handlePaletteMouseMotion(x: f32, y: f32) void {
+pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
     palette_mouse_pos = .{ x, y };
+    // Drag-to-extend the URL-bar selection. We re-find the address hit rect
+    // each frame (the toolbar may have re-laid out) so the cursor stays
+    // accurate even if the field moves under the pointer.
+    if (state.browser_address_drag_active and state.browser_address_focused) {
+        if (findHit(.address)) |hit| {
+            state.browser_address_cursor = cursorForAddressPoint(state, hit.rect, x);
+        }
+    }
 }
 
-pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+fn findHit(kind: BrowserHitKind) ?BrowserHit {
+    var index = palette_hit_count;
+    while (index > 0) {
+        index -= 1;
+        if (palette_hits[index].kind == kind) return palette_hits[index];
+    }
+    return null;
+}
+
+pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
 
     if (!down) {
+        state.browser_address_drag_active = false;
         return rectContainsPoint(palette_toolbar_rect, x, y) or
             (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y));
     }
@@ -70,7 +88,24 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
         switch (hit.kind) {
             .address => {
                 focusAddress(state);
-                state.browser_address_cursor = cursorForAddressPoint(state, hit.rect, x);
+                const address = state.browserState().addressInput();
+                const offset = cursorForAddressPoint(state, hit.rect, x);
+                if (clicks >= 3) {
+                    // Triple-click: select the whole URL — single-line field,
+                    // no need for a line scan.
+                    state.browser_address_cursor = address.len;
+                    state.browser_address_selection_anchor = 0;
+                    state.browser_address_drag_active = false;
+                } else if (clicks == 2) {
+                    const bounds = wordBoundsAt(address, offset);
+                    state.browser_address_selection_anchor = bounds.start;
+                    state.browser_address_cursor = bounds.end;
+                    state.browser_address_drag_active = false;
+                } else {
+                    state.browser_address_cursor = offset;
+                    state.browser_address_selection_anchor = offset;
+                    state.browser_address_drag_active = true;
+                }
             },
             .navigate => {
                 blurAddress(state);
@@ -118,6 +153,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
 
 pub fn handlePaletteTextInput(state: *app_state.AppState, text: []const u8) bool {
     if (!state.browser_address_focused) return false;
+    _ = deleteAddressSelection(state);
     insertAddressText(state, text);
     state.noteInteraction();
     return true;
@@ -128,27 +164,98 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
     if (!event.down) return true;
 
     const primary = isPrimaryModifierPressed(event.mod);
+    const shift = isShiftPressed(event.mod);
+    const address_len = state.browserState().addressInput().len;
     switch (event.key) {
         .@"return", .kp_enter => {
             blurAddress(state);
             state.navigateBrowserFromAddress();
         },
         .escape => blurAddress(state),
-        .left => state.browser_address_cursor -|= 1,
-        .right => state.browser_address_cursor = @min(state.browser_address_cursor + 1, state.browserState().addressInput().len),
-        .home => state.browser_address_cursor = 0,
-        .end => state.browser_address_cursor = state.browserState().addressInput().len,
-        .backspace, .kp_backspace => deleteAddressBackward(state),
-        .delete => deleteAddressForward(state),
+        .left => {
+            const target = state.browser_address_cursor -| 1;
+            moveAddressCursor(state, target, shift);
+        },
+        .right => {
+            const target = @min(state.browser_address_cursor + 1, address_len);
+            moveAddressCursor(state, target, shift);
+        },
+        .home => moveAddressCursor(state, 0, shift),
+        .end => moveAddressCursor(state, address_len, shift),
+        .backspace, .kp_backspace => {
+            if (!deleteAddressSelection(state)) deleteAddressBackward(state);
+        },
+        .delete => {
+            if (!deleteAddressSelection(state)) deleteAddressForward(state);
+        },
         .a => {
             if (primary) {
-                state.browser_address_cursor = state.browserState().addressInput().len;
+                state.browser_address_selection_anchor = 0;
+                state.browser_address_cursor = address_len;
             }
+        },
+        .c => {
+            if (primary) copyAddressSelection(state);
+        },
+        .x => {
+            if (primary) {
+                copyAddressSelection(state);
+                _ = deleteAddressSelection(state);
+            }
+        },
+        .v => {
+            if (primary) pasteIntoAddress(state);
         },
         else => return true,
     }
     state.noteInteraction();
     return true;
+}
+
+fn moveAddressCursor(state: *app_state.AppState, target: usize, shift: bool) void {
+    if (shift) {
+        if (state.browser_address_selection_anchor == null) {
+            state.browser_address_selection_anchor = state.browser_address_cursor;
+        }
+    } else {
+        clearAddressSelection(state);
+    }
+    state.browser_address_cursor = target;
+}
+
+fn copyAddressSelection(state: *app_state.AppState) void {
+    const address = state.browserState().addressInput();
+    const sel = addressSelectionRange(state, address) orelse return;
+    const slice = address[sel.start..sel.end];
+    if (slice.len == 0) return;
+    const z = state.allocator.dupeZ(u8, slice) catch return;
+    defer state.allocator.free(z);
+    sdl.setClipboardText(z) catch |err| {
+        app_state.log.warn("failed to copy URL bar selection: {s}", .{@errorName(err)});
+    };
+}
+
+fn pasteIntoAddress(state: *app_state.AppState) void {
+    const text = state.readClipboardTextForPaste() orelse return;
+    defer state.allocator.free(text);
+    if (text.len == 0) return;
+    _ = deleteAddressSelection(state);
+    // Strip control chars (newlines from multi-line clipboard contents); the
+    // URL field is single-line.
+    var sanitized: [4096]u8 = undefined;
+    var n: usize = 0;
+    for (text) |b| {
+        if (b == '\n' or b == '\r' or b == '\t') continue;
+        if (n >= sanitized.len) break;
+        sanitized[n] = b;
+        n += 1;
+    }
+    insertAddressText(state, sanitized[0..n]);
+}
+
+fn isShiftPressed(modifier_state: sdl.Keymod) bool {
+    const bits = @as(*const u16, @ptrCast(&modifier_state)).*;
+    return (bits & sdl.Keymod.shift) != 0;
 }
 
 fn paletteColor(value: [4]f32) palette.Color {
@@ -184,26 +291,27 @@ fn queuePaletteText(state: *app_state.AppState, rect: palette.Rect, value: []con
         app_state.log.warn("failed to retain browser palette text: {s}", .{@errorName(err)});
         return;
     };
-    state.palette_overlay_batch.fixedText(
+    // Variable-width rendering on the `.ui` font role. Caret math goes
+    // through `paletteUiTextPrefixWidth` which measures with the same role,
+    // so glyph positions and the caret align to the same pixel. Plain
+    // `batch.text()` would fall back to the renderer's default font and
+    // re-introduce the drift.
+    state.palette_overlay_batch.roleText(
         state.allocator,
         rect,
         stable_value,
         color,
         font_size,
+        .ui,
+        null,
         clip,
-        .{},
-        font_size * 0.55,
-        font_size * 1.25,
-        false,
     ) catch |err| {
         app_state.log.warn("failed to queue browser palette text: {s}", .{@errorName(err)});
     };
 }
 
 fn stablePaletteText(state: *app_state.AppState, value: []const u8) ![]const u8 {
-    const start = state.palette_frame_text.items.len;
-    try state.palette_frame_text.appendSlice(state.allocator, value);
-    return state.palette_frame_text.items[start .. start + value.len];
+    return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
 fn renderPaletteToolbarButton(
@@ -432,6 +540,25 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
         theme.scaledUi(8.0),
         theme.scaledUi(1.0),
     );
+
+    // Draw selection highlight underneath the text so glyphs read over it.
+    if (focused) {
+        if (addressSelectionRange(state, address)) |sel| {
+            const x0 = text_rect.x + app_state.paletteUiTextPrefixWidth(address, font_size, sel.start);
+            const x1 = text_rect.x + app_state.paletteUiTextPrefixWidth(address, font_size, sel.end);
+            const clamped_x0 = @max(x0, text_rect.x);
+            const clamped_x1 = @min(x1, text_rect.x + text_rect.w);
+            if (clamped_x1 > clamped_x0) {
+                queuePaletteRect(state, .{
+                    .x = clamped_x0,
+                    .y = text_rect.y,
+                    .w = clamped_x1 - clamped_x0,
+                    .h = text_rect.h,
+                }, paletteColor(colors.rgba(36, 92, 124, 200)));
+            }
+        }
+    }
+
     queuePaletteText(
         state,
         text_rect,
@@ -452,6 +579,53 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
             .h = text_rect.h - theme.scaledUi(2.0),
         }, paletteColor(theme.COLOR_WHITE));
     }
+}
+
+const SelectionRange = struct { start: usize, end: usize };
+
+/// Returns the normalized selection range if the URL bar has a non-empty
+/// selection. The anchor + cursor form the unordered endpoints; this returns
+/// them in order so callers don't have to worry about direction.
+fn addressSelectionRange(state: *app_state.AppState, address: []const u8) ?SelectionRange {
+    const anchor = state.browser_address_selection_anchor orelse return null;
+    const cursor = @min(state.browser_address_cursor, address.len);
+    const a = @min(anchor, address.len);
+    if (a == cursor) return null;
+    return .{ .start = @min(a, cursor), .end = @max(a, cursor) };
+}
+
+fn clearAddressSelection(state: *app_state.AppState) void {
+    state.browser_address_selection_anchor = null;
+}
+
+fn deleteAddressSelection(state: *app_state.AppState) bool {
+    const browser_state = state.browserState();
+    const address = browser_state.addressInput();
+    const sel = addressSelectionRange(state, address) orelse return false;
+    const buffer = browser_state.addressBuffer();
+    const current_len = address.len;
+    std.mem.copyForwards(u8, buffer[sel.start..current_len - (sel.end - sel.start)], buffer[sel.end..current_len]);
+    buffer[current_len - (sel.end - sel.start)] = 0;
+    state.browser_address_cursor = sel.start;
+    clearAddressSelection(state);
+    return true;
+}
+
+fn isWordChar(b: u8) bool {
+    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b == '-';
+}
+
+fn wordBoundsAt(address: []const u8, offset: usize) SelectionRange {
+    if (address.len == 0) return .{ .start = 0, .end = 0 };
+    var start = @min(offset, address.len);
+    var end = start;
+    while (start > 0 and isWordChar(address[start - 1])) start -= 1;
+    while (end < address.len and isWordChar(address[end])) end += 1;
+    // Empty run (clicked on a non-word boundary) — fall back to selecting the
+    // single byte under the cursor so a double-click still produces a visible
+    // selection.
+    if (start == end and end < address.len) end += 1;
+    return .{ .start = start, .end = end };
 }
 
 fn addPaletteHit(rect: palette.Rect, kind: BrowserHitKind) void {
@@ -480,6 +654,8 @@ fn focusAddress(state: *app_state.AppState) void {
 fn blurAddress(state: *app_state.AppState) void {
     state.browser_address_focused = false;
     state.browser_address_cursor = @min(state.browser_address_cursor, state.browserState().addressInput().len);
+    state.browser_address_drag_active = false;
+    clearAddressSelection(state);
 }
 
 fn selectInspectorMode(state: *app_state.AppState, mode: browser_runtime.InspectorMode) void {

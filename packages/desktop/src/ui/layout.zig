@@ -129,9 +129,7 @@ fn queuePaletteText(state: *runtime.AppState, rect: palette.Rect, value: []const
 }
 
 fn stablePaletteText(state: *runtime.AppState, value: []const u8) ![]const u8 {
-    const start = state.palette_frame_text.items.len;
-    try state.palette_frame_text.appendSlice(state.allocator, value);
-    return state.palette_frame_text.items[start .. start + value.len];
+    return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
 fn paletteColor(value: [4]f32) palette.Color {

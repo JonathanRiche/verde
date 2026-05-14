@@ -48,7 +48,7 @@ The npm package is intended for macOS Apple Silicon, macOS Intel, and Linux x86_
 
 ## Source Builds
 
-Source builds require Zig `0.16.0`, SDL3 development files, and OpenGL development libraries for your platform.
+Source builds require Zig `0.16.0` and SDL3 development files for your platform.
 
 For release-style local installs, use the packaged install scripts:
 

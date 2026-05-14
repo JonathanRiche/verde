@@ -131,14 +131,14 @@ Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/do
 ## Native UI Stack
 
 `packages/desktop` is a native desktop app built on:
-- `SDL3` via `zsdl3` for window creation, events, display/usable-bounds queries, and OpenGL context setup
-- `OpenGL` for final rendering
+- `SDL3` via `zsdl3` for window creation, events, and display/usable-bounds queries
+- `SDL_GPU` for final rendering
 - `palette` for application UI primitives, layout surfaces, retained hit regions, and render-batch commands
 
 In practice:
 - `SDL3` owns the real window size, drawable pixel size, monitor/display scale, and event loop
 - `main.zig` is responsible for choosing the correct size space for layout and for routing SDL events into Palette-owned UI state
-- `palette_gl_renderer.zig` is responsible for drawing Palette batches through OpenGL
+- `palette_frame_renderer.zig` owns the SDL_GPU Palette renderer and role-keyed SDL_ttf font handles
 
 When editing UI in `packages/desktop`, assume this is a native Palette app first, not a web/CSS layout.
 

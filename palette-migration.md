@@ -7,8 +7,8 @@ The desktop app now builds its active UI path through Palette render-batch comma
 Key entry points:
 
 - Root layout: `packages/desktop/src/ui/layout.zig`
-- SDL/OpenGL frame loop: `packages/desktop/src/main.zig`
-- Palette GL renderer: `packages/desktop/src/ui/palette_gl_renderer.zig`
+- SDL frame loop: `packages/desktop/src/main.zig`
+- Palette SDL_GPU renderer: `packages/desktop/src/ui/palette_frame_renderer.zig`
 - Sidebar: `packages/desktop/src/ui/sidebar.zig`
 - Chat workspace: `packages/desktop/src/ui/chat_panel.zig`
 - Terminal dock shell: `packages/desktop/src/ui/terminal_panel.zig`
@@ -23,7 +23,7 @@ Key entry points:
 - Replaced chat workspace rendering with Palette rect/text commands.
 - Replaced terminal dock rendering with a Palette-owned shell.
 - Replaced theme ownership with Palette-oriented color and font metric helpers.
-- Moved desktop text rendering to `palette_text_gl.c` backed by vendored `stb_truetype.h`.
+- Moved desktop text rendering to Palette SDL_GPU text backed by SDL_ttf.
 - Updated desktop docs to describe Palette as the active UI stack.
 
 ## Follow-Up Refinement
@@ -32,7 +32,7 @@ Key entry points:
 - Replace placeholder terminal shell with the full terminal viewport using Palette-owned glyph clipping, cursor inversion, split panes, tab rename input, and context menus.
 - Finish browser pane fidelity by routing the live browser texture and URL editing through Palette-owned input and image APIs.
 - Add Palette-owned scroll regions, text selection, clipboard paste, IME display, and accurate caret placement for modal/input-heavy paths.
-- Add a Palette texture registry so components can request images without depending on pre-existing OpenGL texture ids.
+- Add a Palette texture registry so components can request images without depending on pre-existing renderer texture ids.
 
 ## Verification
 

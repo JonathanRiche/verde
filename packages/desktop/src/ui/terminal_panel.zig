@@ -558,9 +558,7 @@ fn terminalFontSizeForCell(cell_w: f32, cell_h: f32) f32 {
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
-    const start = state.palette_frame_text.items.len;
-    state.palette_frame_text.appendSlice(state.allocator, value) catch return "";
-    return state.palette_frame_text.items[start .. start + value.len];
+    return state.palette_frame_text_arena.allocator().dupe(u8, value) catch "";
 }
 
 fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {

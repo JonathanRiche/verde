@@ -25,6 +25,11 @@ pub const ComposerPromptConfig = struct {
     border_width: f32 = 1.0,
     background_color: draw.Color = .{ .r = 0.10, .g = 0.13, .b = 0.14, .a = 1.0 },
     border_color: draw.Color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    /// Border color when the composer is focused. Falls back to `border_color`
+    /// when null. Host wires this to the app's brand color so the prompt box
+    /// glows in the brand hue while the user is typing.
+    focus_border_color: ?draw.Color = null,
+    focus_border_width: ?f32 = null,
     control_background_color: draw.Color = .{ .r = 0.07, .g = 0.09, .b = 0.10, .a = 0.0 },
     control_hover_color: draw.Color = .{ .r = 0.18, .g = 0.22, .b = 0.24, .a = 0.62 },
     separator_color: draw.Color = .{ .r = 0.48, .g = 0.52, .b = 0.58, .a = 0.35 },
@@ -513,22 +518,22 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn textRect(self: *const Component) draw.Rect {
             const bounds_rect = self.bounds();
-            return .{
+            return snapRect(.{
                 .x = bounds_rect.x + config.padding_x,
                 .y = bounds_rect.y + config.padding_y,
                 .w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0),
                 .h = @max(bounds_rect.h - config.padding_y * 2.0 - config.toolbar_height - config.toolbar_gap, 0.0),
-            };
+            });
         }
 
         pub fn toolbarRect(self: *const Component) draw.Rect {
             const bounds_rect = self.bounds();
-            return .{
+            return snapRect(.{
                 .x = bounds_rect.x + config.padding_x,
                 .y = bounds_rect.y + bounds_rect.h - config.padding_y - config.toolbar_height,
                 .w = @max(bounds_rect.w - config.padding_x * 2.0, 0.0),
                 .h = config.toolbar_height,
-            };
+            });
         }
 
         pub fn sendButtonRect(self: *const Component) draw.Rect {
@@ -555,7 +560,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const previous_z = batch.setZIndex(self.z_index);
             defer batch.restoreZIndex(previous_z);
 
-            try batch.panel(allocator, self.bounds(), config.background_color, config.border_color, config.corner_radius, config.border_width);
+            const active_border_color = if (self.focused) (config.focus_border_color orelse config.border_color) else config.border_color;
+            const active_border_width = if (self.focused) (config.focus_border_width orelse config.border_width) else config.border_width;
+            try batch.panel(allocator, self.bounds(), config.background_color, active_border_color, config.corner_radius, active_border_width);
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
             try self.renderMenu(allocator, batch);
@@ -577,7 +584,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             try batch.textRuns(allocator, rect, value, runs.items, color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
-            if (self.focused and self.buffer.items.len > 0) {
+            if (self.focused) {
+                // Render cursor on focus regardless of buffer state so users
+                // get immediate visual feedback after clicking into the prompt.
                 const cursor = self.cursorRect();
                 if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
             }
@@ -731,12 +740,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn sendGlyphBounds(button: draw.Rect) draw.Rect {
             const m = @min(button.w, button.h);
             const inset = m * 0.125;
-            return .{
+            return snapRect(.{
                 .x = button.x + inset,
                 .y = button.y + inset,
                 .w = @max(button.w - 2.0 * inset, 1.0),
                 .h = @max(button.h - 2.0 * inset, 1.0),
-            };
+            });
         }
 
         fn renderStopSquare(allocator: std.mem.Allocator, batch: *draw.RenderBatch, button: draw.Rect) !void {
@@ -766,17 +775,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const half_w_stem = @max(m * 0.052, 1.25);
             const y0 = inner.y + (inner.h - total_h) * 0.5;
             // Stem under the head so the junction is a narrow shaft, not a full-width block.
-            try batch.rectClipped(allocator, .{
+            try batch.rectClipped(allocator, snapRect(.{
                 .x = cx - half_w_stem,
                 .y = y0 + head_h,
                 .w = half_w_stem * 2.0,
                 .h = stem_h,
-            }, draw.Color.white, button);
+            }), draw.Color.white, button);
             try batch.triangleClipped(
                 allocator,
-                .{ .x = cx, .y = y0 },
-                .{ .x = cx - half_w_head, .y = y0 + head_h },
-                .{ .x = cx + half_w_head, .y = y0 + head_h },
+                snapPoint(.{ .x = cx, .y = y0 }),
+                snapPoint(.{ .x = cx - half_w_head, .y = y0 + head_h }),
+                snapPoint(.{ .x = cx + half_w_head, .y = y0 + head_h }),
                 draw.Color.white,
                 button,
             );
@@ -799,11 +808,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         }
 
         fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
+            const sx = @round(x);
             try batch.rect(allocator, .{
-                .x = x - config.separator_width * 0.5,
-                .y = toolbar.y + 9.0,
+                .x = sx - config.separator_width * 0.5,
+                .y = @round(toolbar.y + 9.0),
                 .w = config.separator_width,
-                .h = @max(toolbar.h - 18.0, 0.0),
+                .h = @round(@max(toolbar.h - 18.0, 0.0)),
             }, config.separator_color);
         }
 
@@ -1532,17 +1542,17 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             send: draw.Rect,
         } {
             const toolbar = self.toolbarRect();
-            const control_h = @min(toolbar.h, 32.0);
-            const y = toolbar.y + (toolbar.h - control_h) * 0.5;
-            const send_size = @min(toolbar.h, 40.0);
-            const send: draw.Rect = .{
-                .x = toolbar.x + toolbar.w - send_size,
+            const control_h = @round(@min(toolbar.h, 34.0));
+            const y = @round(toolbar.y + (toolbar.h - control_h) * 0.5);
+            const send_size = @round(@min(toolbar.h, 38.0));
+            const send: draw.Rect = snapRect(.{
+                .x = toolbar.x + toolbar.w - send_size - 2.0,
                 .y = toolbar.y + (toolbar.h - send_size) * 0.5,
                 .w = send_size,
                 .h = send_size,
-            };
+            });
             // Extra air before the send control so the rightmost pill is not visually glued to the button.
-            const max_x = send.x - config.control_gap * 2.5;
+            const max_x = send.x - config.control_gap * 2.0;
             const avail = @max(max_x - toolbar.x, 0.0);
 
             var model_w = self.pillWidth(true, config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
@@ -1559,26 +1569,26 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             self.shrinkToolbarPillWidthsToFit(avail, &model_w, &reasoning_w, &fast_w, &access_w);
 
             var x = toolbar.x;
-            const model: draw.Rect = .{ .x = x, .y = y, .w = model_w, .h = control_h };
+            const model: draw.Rect = snapRect(.{ .x = x, .y = y, .w = model_w, .h = control_h });
             x += model_w + config.control_gap;
 
-            const reasoning: draw.Rect = .{ .x = x, .y = y, .w = reasoning_w, .h = control_h };
+            const reasoning: draw.Rect = snapRect(.{ .x = x, .y = y, .w = reasoning_w, .h = control_h });
             x += reasoning_w;
 
             var fast: draw.Rect = undefined;
             if (self.show_fast_toggle) {
                 x += config.control_gap;
-                fast = .{ .x = x, .y = y, .w = fast_w, .h = control_h };
+                fast = snapRect(.{ .x = x, .y = y, .w = fast_w, .h = control_h });
                 x += fast_w + config.control_gap;
             } else {
-                fast = .{ .x = x, .y = y, .w = 0.0, .h = control_h };
+                fast = snapRect(.{ .x = x, .y = y, .w = 0.0, .h = control_h });
                 x += config.control_gap;
             }
 
             // If widths still exceed the budget (all pills at mins), never let the access pill run under the send control.
             const access_max_fit = @max(0.0, max_x - x);
             access_w = @min(access_w, access_max_fit);
-            const access: draw.Rect = .{ .x = x, .y = y, .w = access_w, .h = control_h };
+            const access: draw.Rect = snapRect(.{ .x = x, .y = y, .w = access_w, .h = control_h });
 
             return .{
                 .toolbar = toolbar,
@@ -1592,6 +1602,19 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn separatorX(left: draw.Rect, right: draw.Rect) f32 {
             return (left.x + left.w + right.x) * 0.5;
+        }
+
+        fn snapPoint(point: draw.Vec2) draw.Vec2 {
+            return .{ .x = @round(point.x), .y = @round(point.y) };
+        }
+
+        fn snapRect(rect: draw.Rect) draw.Rect {
+            return .{
+                .x = @round(rect.x),
+                .y = @round(rect.y),
+                .w = @round(rect.w),
+                .h = @round(rect.h),
+            };
         }
     };
 }

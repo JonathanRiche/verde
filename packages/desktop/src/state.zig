@@ -1,6 +1,7 @@
 const std = @import("std");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
+const profiler = @import("profiler.zig");
 const chat_markdown = @import("ui/chat_markdown.zig");
 const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
@@ -15,40 +16,14 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
+const text_measure = @import("ui/text_measure.zig");
 const utils = @import("utils.zig");
 
 /// Arrow-key line step for transcript scroll (scaled px per key repeat).
 const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 
-/// Same UI font as `main.zig` / `palette_text_gl_draw` (stbtt metrics for layout).
-const palette_ui_ttf = @embedFile("assets/fonts/NotoSans-Bold.ttf");
-
-extern fn palette_text_gl_measure_codepoint_width(
-    font_data: [*]const u8,
-    font_len: i32,
-    codepoint: i32,
-    font_size: f32,
-) callconv(.c) f32;
-
-extern fn palette_text_gl_measure_line_width(
-    font_data: [*]const u8,
-    font_len: i32,
-    text: [*]const u8,
-    text_len: i32,
-    font_size: f32,
-) callconv(.c) f32;
-
-/// Width of `text[0..end]` in pixels using the same rules as GL UI text (`palette_text_gl_draw`).
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
-    const n = @min(end, text.len);
-    if (n == 0) return 0.0;
-    return palette_text_gl_measure_line_width(
-        palette_ui_ttf.ptr,
-        @intCast(palette_ui_ttf.len),
-        text.ptr,
-        @intCast(n),
-        font_size,
-    );
+    return text_measure.textPrefixWidth(.ui, text, font_size, end);
 }
 
 pub const ReasoningEffort = db_types.ReasoningEffort;
@@ -83,6 +58,26 @@ pub const PaletteModalHit = struct {
     index: usize = 0,
 };
 
+/// Per-frame hit-test entry for a fenced code block's "Copy" button. The
+/// payload bytes live in `palette_frame_text` (cleared each frame), so the
+/// offset/length pair is only valid until the next frame's text-buffer reset.
+pub const CodeCopyButtonHit = chat_markdown.CodeCopyButtonSink;
+
+/// Kinds of expand/collapse cards that share the same per-frame hit list.
+pub const CardToggleKind = enum(u8) {
+    command_card,
+    diff_file,
+};
+
+/// Per-frame hit-test entry for a collapsible card header (command bubble,
+/// diff file row). The `key` identifies the card across frames and is also the
+/// lookup into `expanded_cards`.
+pub const CardToggleHit = struct {
+    rect: palette.Rect,
+    key: u64,
+    kind: CardToggleKind,
+};
+
 pub const PaletteModalTextFocus = enum {
     none,
     project_rename,
@@ -90,38 +85,55 @@ pub const PaletteModalTextFocus = enum {
     project_import,
 };
 
-const PALETTE_COMPOSER_FONT_SIZE: f32 = 32.0;
-const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 26.0;
-const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 30.0;
+const PALETTE_COMPOSER_FONT_SIZE: f32 = 16.0;
+const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
+const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
-    .padding_x = 24.0,
-    .padding_y = 20.0,
-    .toolbar_height = 48.0,
-    .toolbar_gap = 14.0,
-    .control_gap = 14.0,
-    .pill_padding_x = 21.0,
-    .pill_icon_gap = 13.0,
-    .pill_chevron_gap = 22.0,
-    .model_min_width = 176.0,
+    // Geometry retuned for the 15pt toolbar / 16pt body fonts. Earlier numbers
+    // assumed ~24pt pills and looked over-padded after the type-scale change.
+    .padding_x = 16.0,
+    .padding_y = 14.0,
+    .toolbar_height = 32.0,
+    .toolbar_gap = 10.0,
+    .control_gap = 6.0,
+    .pill_padding_x = 13.0,
+    // `pill_overlay_icon_reserve + pill_icon_gap` must clear the host-drawn
+    // toolbar icon AND leave breathing room at 1× display scale. Provider
+    // PNG is 26 CSS px, fast/access codicons 22 CSS px. Sum kept ≥ 38 so the
+    // label doesn't kiss the glyph on a laptop screen at 1×.
+    .pill_icon_gap = 12.0,
+    .pill_chevron_gap = 14.0,
+    .model_min_width = 112.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
-    .model_max_width = 420.0,
-    .reasoning_min_width = 118.0,
-    .reasoning_max_width = 248.0,
-    .fast_min_width = 124.0,
-    .fast_max_width = 280.0,
-    .access_min_width = 218.0,
+    .model_max_width = 270.0,
+    .reasoning_min_width = 74.0,
+    .reasoning_max_width = 160.0,
+    .fast_min_width = 80.0,
+    .fast_max_width = 180.0,
+    .access_min_width = 138.0,
     // Toolbar label + lock icon + padding; keep above natural measured width for "Full access".
-    .access_max_width = 328.0,
-    // Space after `pill_padding_x` until label: ~scaled toolbar icon width minus `pill_icon_gap`, not the old four-space measure.
-    // Room for larger provider bitmap (`contain` in ~33px slot at 1× UI scale).
-    .pill_overlay_icon_reserve = 29.0,
-    .pill_label_width_fudge = 14.0,
-    .corner_radius = 28.0,
-    .border_width = 1.5,
+    .access_max_width = 212.0,
+    // Space after `pill_padding_x` until label: ~scaled toolbar icon width
+    // minus `pill_icon_gap`. Provider PNG slot is 26 CSS px; reserve + gap
+    // gives label-start at icon-end + ~12 CSS px on the smallest screens.
+    .pill_overlay_icon_reserve = 26.0,
+    .pill_label_width_fudge = 8.0,
+    .corner_radius = 18.0,
+    .border_width = 1.0,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
     .border_color = .{ .r = 0.25, .g = 0.31, .b = 0.34, .a = 1.0 },
+    // Verde brand green (#50c878) glows on focus so the composer flags itself
+    // when keystrokes are live. Slightly thicker than the resting border to
+    // make the state change unambiguous.
+    .focus_border_color = .{ .r = 0.314, .g = 0.784, .b = 0.471, .a = 1.0 },
+    .focus_border_width = 1.5,
+    // Force the bold pill labels (GPT-5.5, Medium, Fast, Full access) onto the
+    // .ui role too so they share CalSans-Regular with the placeholder and the
+    // workspace header buttons. The default `.ui_bold` falls through to the
+    // renderer's heavy NotoSans-Bold, which reads as a different typeface.
+    .bold_font_role = .ui,
     .control_background_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 0.34 },
     .control_hover_color = .{ .r = 0.16, .g = 0.18, .b = 0.22, .a = 0.78 },
     .separator_color = .{ .r = 0.47, .g = 0.50, .b = 0.56, .a = 0.35 },
@@ -136,7 +148,7 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .text_color = .{ .r = 0.94, .g = 0.96, .b = 0.98, .a = 1.0 },
     .icon_color = .{ .r = 0.70, .g = 0.73, .b = 0.80, .a = 1.0 },
     .selection_color = .{ .r = 0.18, .g = 0.42, .b = 0.72, .a = 0.55 },
-    .placeholder_color = .{ .r = 0.39, .g = 0.40, .b = 0.45, .a = 1.0 },
+    .placeholder_color = .{ .r = 0.38, .g = 0.40, .b = 0.46, .a = 1.0 },
     .font_size = PALETTE_COMPOSER_FONT_SIZE,
     .toolbar_font_size = PALETTE_COMPOSER_TOOLBAR_FONT_SIZE,
     .icon_font_size = PALETTE_COMPOSER_ICON_FONT_SIZE,
@@ -144,9 +156,11 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .model_icon = "",
     .fast_icon = "",
     .access_icon = "",
-    .chevron_icon = ">",
+    // codicon-chevron-right (Nerd Font Symbols) — crisp at any size.
+    .chevron_icon = "\u{EAB6}",
     .send_icon = "",
-    .stop_icon = "x",
+    // codicon-debug-stop
+    .stop_icon = "\u{EAD7}",
     .z_index = 120,
 });
 
@@ -166,12 +180,7 @@ fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: us
     const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
         return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
-    const w = palette_text_gl_measure_codepoint_width(
-        palette_ui_ttf.ptr,
-        @intCast(palette_ui_ttf.len),
-        @intCast(cp),
-        font_size,
-    );
+    const w = text_measure.codepointWidth(.ui, cp, font_size);
     return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
 
@@ -492,7 +501,7 @@ pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
     .glyph_width = 10.8,
     .font_size = 20.0,
-    .chevron_icon = ">",
+    .chevron_icon = "\u{EAB6}",
     .icon_gap = 12.0,
     .row_leading_width = 34.0,
     .row_leading_to_label_gap = 8.0,
@@ -1181,9 +1190,7 @@ const FileSearchState = struct {
     }
 };
 
-extern fn glDeleteTextures(n: c_int, textures: [*]const c_uint) void;
 pub const TextureBackend = enum {
-    gl,
     external,
 };
 
@@ -1192,12 +1199,10 @@ pub const CachedImageTexture = struct {
     width: i32 = 0,
     height: i32 = 0,
     valid: bool = false,
-    backend: TextureBackend = .gl,
+    backend: TextureBackend = .external,
 
     fn deinit(self: CachedImageTexture) void {
-        if (!self.valid or self.texture_id == 0 or self.backend != .gl) return;
-        var textures = [_]c_uint{self.texture_id};
-        glDeleteTextures(1, &textures);
+        _ = self;
     }
 };
 
@@ -1602,7 +1607,13 @@ pub const AppState = struct {
     palette_model_cascade: PaletteModelCascadeMenu,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
+    palette_frame_text_arena: std.heap.ArenaAllocator,
     palette_modal_hits: std.ArrayList(PaletteModalHit),
+    code_copy_buttons: std.ArrayList(CodeCopyButtonHit),
+    code_copy_recent_identity: u64,
+    code_copy_recent_until_ms: i64,
+    card_toggle_hits: std.ArrayList(CardToggleHit),
+    expanded_cards: std.AutoHashMap(u64, void),
     palette_modal_text_focus: PaletteModalTextFocus,
     gl_texture_uploads_enabled: bool,
     browser_textures_enabled: bool,
@@ -1664,9 +1675,16 @@ pub const AppState = struct {
     browser_pane_hovered: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
+    sidebar_project_hover: ?usize,
+    sidebar_new_thread_hover: ?usize,
     browser_pane_focused: bool,
     browser_address_focused: bool,
     browser_address_cursor: usize,
+    /// Selection anchor for the URL bar. When equal to `browser_address_cursor`
+    /// (or null) there is no active selection.
+    browser_address_selection_anchor: ?usize,
+    /// True while the user is dragging to extend the URL-bar selection.
+    browser_address_drag_active: bool,
     browser_inspector_menu_open: bool,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
@@ -1765,7 +1783,13 @@ pub const AppState = struct {
             .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
+            .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
             .palette_modal_hits = .empty,
+            .code_copy_buttons = .empty,
+            .code_copy_recent_identity = 0,
+            .code_copy_recent_until_ms = 0,
+            .card_toggle_hits = .empty,
+            .expanded_cards = std.AutoHashMap(u64, void).init(allocator),
             .palette_modal_text_focus = .none,
             .gl_texture_uploads_enabled = options.gl_texture_uploads_enabled,
             .browser_textures_enabled = options.browser_textures_enabled,
@@ -1825,9 +1849,13 @@ pub const AppState = struct {
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
             .sidebar_thread_hover = null,
+            .sidebar_project_hover = null,
+            .sidebar_new_thread_hover = null,
             .browser_pane_focused = false,
             .browser_address_focused = false,
             .browser_address_cursor = 0,
+            .browser_address_selection_anchor = null,
+            .browser_address_drag_active = false,
             .browser_inspector_menu_open = false,
             .workspace_header_open_menu_open = false,
             .sidebar_context_menu_open = false,
@@ -3960,7 +3988,7 @@ pub const AppState = struct {
         return handled;
     }
 
-    fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
+    pub fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
         const clipboard_text = sdl.getClipboardText() catch |err| {
             log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
             runtime_log.diagnostic("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
@@ -6471,7 +6499,11 @@ pub const AppState = struct {
         self.palette_composer.deinit(self.allocator);
         self.palette_overlay_batch.deinit(self.allocator);
         self.palette_frame_text.deinit(self.allocator);
+        self.palette_frame_text_arena.deinit();
         self.palette_modal_hits.deinit(self.allocator);
+        self.code_copy_buttons.deinit(self.allocator);
+        self.card_toggle_hits.deinit(self.allocator);
+        self.expanded_cards.deinit();
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
@@ -7437,6 +7469,82 @@ pub const AppState = struct {
 
         const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return self.allocator.dupe(u8, "."), 0);
         return self.allocator.dupe(u8, home);
+    }
+
+    fn pushCodeCopyButtonTrampoline(context: *anyopaque, hit: chat_markdown.CodeCopyButtonSink) void {
+        const self: *AppState = @ptrCast(@alignCast(context));
+        self.code_copy_buttons.append(self.allocator, hit) catch |err| {
+            log.warn("failed to retain code copy button hit: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Returns a recorder the markdown renderer can use to register per-frame
+    /// code-block copy buttons. The "recent" feedback window (~1.2s) shows a
+    /// transient "Copied" label after a click.
+    pub fn codeCopyButtonRecorder(self: *AppState) chat_markdown.CodeCopyButtonRecorder {
+        const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+        const active = self.code_copy_recent_until_ms != 0 and now_ms < self.code_copy_recent_until_ms;
+        return .{
+            .context = @ptrCast(self),
+            .push_fn = pushCodeCopyButtonTrampoline,
+            .recent_identity = if (active) self.code_copy_recent_identity else 0,
+            .recent_active = active,
+        };
+    }
+
+    /// Records a collapsible card header hit-rect for the current frame.
+    /// Use `isCardExpanded` to read the persistent state during rendering and
+    /// `consumeCardToggleClick` from the click handler.
+    pub fn recordCardToggleHit(self: *AppState, hit: CardToggleHit) void {
+        self.card_toggle_hits.append(self.allocator, hit) catch |err| {
+            log.warn("failed to retain card toggle hit: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Returns true when the given card key was previously toggled to expanded.
+    pub fn isCardExpanded(self: *AppState, key: u64) bool {
+        return self.expanded_cards.contains(key);
+    }
+
+    /// Hit-tests the most recent frame's card-toggle headers. On hit, flips
+    /// the expanded state for that key and returns true.
+    pub fn consumeCardToggleClick(self: *AppState, x: f32, y: f32) bool {
+        for (self.card_toggle_hits.items) |hit| {
+            if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
+            if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+            if (self.expanded_cards.fetchRemove(hit.key) == null) {
+                self.expanded_cards.put(hit.key, {}) catch |err| {
+                    log.warn("failed to store expanded card: {s}", .{@errorName(err)});
+                };
+            }
+            self.markDirty();
+            return true;
+        }
+        return false;
+    }
+
+    /// Hit-tests the most recent frame's code-block copy buttons. On hit,
+    /// writes the source text to the system clipboard, sets the "recent"
+    /// feedback window, and returns true.
+    pub fn consumeCodeCopyButtonClick(self: *AppState, x: f32, y: f32) bool {
+        for (self.code_copy_buttons.items) |hit| {
+            if (x < hit.rect.x or x > hit.rect.x + hit.rect.w) continue;
+            if (y < hit.rect.y or y > hit.rect.y + hit.rect.h) continue;
+
+            const payload = self.palette_frame_text.items[hit.payload_offset .. hit.payload_offset + hit.payload_len];
+            const z = self.allocator.dupeZ(u8, payload) catch return true;
+            defer self.allocator.free(z);
+            sdl.setClipboardText(z) catch |err| {
+                log.warn("failed to copy code block to clipboard: {s}", .{@errorName(err)});
+                return true;
+            };
+            self.code_copy_recent_identity = hit.identity;
+            const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+            self.code_copy_recent_until_ms = now_ms + 1200;
+            self.markDirty();
+            return true;
+        }
+        return false;
     }
 };
 

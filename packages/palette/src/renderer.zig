@@ -60,7 +60,7 @@ pub const RendererConfig = struct {
 };
 
 const PipelineKind = enum { solid, text, image };
-const TEXT_CACHE_MAX_ENTRIES = 4096;
+const TEXT_CACHE_MAX_ENTRIES = 16384;
 const GPU_TEXT_FONT_SCALE: f32 = 0.86;
 const RETIRED_BUFFER_FRAME_DELAY = 3;
 
@@ -110,6 +110,10 @@ pub const Renderer = struct {
     sampler: ?*c.SDL_GPUSampler = null,
     text_engine: ?*c.TTF_TextEngine = null,
     font: ?*c.TTF_Font = null,
+    ui_font: ?*c.TTF_Font = null,
+    prose_font: ?*c.TTF_Font = null,
+    prose_italic_font: ?*c.TTF_Font = null,
+    prose_bold_italic_font: ?*c.TTF_Font = null,
     mono_font: ?*c.TTF_Font = null,
     icon_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -139,6 +143,8 @@ pub const Renderer = struct {
     retired_buffers: std.ArrayList(RetiredBuffer) = .empty,
     textures: std.AutoHashMap(u32, GpuTexture) = std.AutoHashMap(u32, GpuTexture).init(std.heap.smp_allocator),
     text_cache: std.AutoHashMap(TextCacheKey, TextCacheEntry) = std.AutoHashMap(TextCacheKey, TextCacheEntry).init(std.heap.smp_allocator),
+    font_cache: std.AutoHashMap(FontCacheKey, *c.TTF_Font) = std.AutoHashMap(FontCacheKey, *c.TTF_Font).init(std.heap.smp_allocator),
+    text_cache_eviction_pending: bool = false,
     command_counts: CommandCounts = .{},
     solid_index_count: u32 = 0,
     unsupported_text_commands: usize = 0,
@@ -169,6 +175,8 @@ pub const Renderer = struct {
             if (self.text_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
             if (self.image_pipeline) |pipeline| c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
             if (self.sampler) |sampler| c.SDL_ReleaseGPUSampler(device, sampler);
+            self.clearTextCache();
+            self.clearFontCache();
             if (self.text_engine) |engine| c.TTF_DestroyGPUTextEngine(engine);
             if (self.vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
             if (self.index_buffer) |buffer| c.SDL_ReleaseGPUBuffer(device, buffer);
@@ -187,8 +195,8 @@ pub const Renderer = struct {
             var iterator = self.textures.iterator();
             while (iterator.next()) |entry| entry.value_ptr.deinit(device);
             self.textures.deinit();
-            self.clearTextCache();
             self.text_cache.deinit();
+            self.font_cache.deinit();
             c.SDL_DestroyGPUDevice(device);
         }
         self.* = undefined;
@@ -310,6 +318,11 @@ pub const Renderer = struct {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.pipeline == null) return error.MissingGpuPipeline;
         if (CommandCounts.fromBatch(batch).text > 0 and !self.supportsGpuText()) return error.GpuTextAtlasNotConfigured;
+        if (self.text_cache_eviction_pending) {
+            if (!c.SDL_WaitForGPUIdle(device)) return error.SdlGpuSubmitFailed;
+            self.clearTextCache();
+            self.text_cache_eviction_pending = false;
+        }
 
         var stats = self.beginFrameStats();
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuCommandBufferFailed;
@@ -381,16 +394,47 @@ pub const Renderer = struct {
     }
 
     pub fn configureGpuTextWithRoleFonts(self: *Renderer, font: *sdl.Font, mono_font: ?*sdl.Font, icon_font: ?*sdl.Font) !void {
+        try self.configureGpuTextWithAllRoleFonts(.{
+            .ui = font,
+            .ui_bold = font,
+            .prose = font,
+            .prose_bold = font,
+            .prose_italic = font,
+            .prose_bold_italic = font,
+            .mono = mono_font,
+            .icon = icon_font,
+        });
+    }
+
+    pub const RoleFonts = struct {
+        ui: *sdl.Font,
+        ui_bold: *sdl.Font,
+        prose: *sdl.Font,
+        prose_bold: *sdl.Font,
+        prose_italic: *sdl.Font,
+        prose_bold_italic: *sdl.Font,
+        mono: ?*sdl.Font,
+        icon: ?*sdl.Font,
+    };
+
+    pub fn configureGpuTextWithAllRoleFonts(self: *Renderer, role_fonts: RoleFonts) !void {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
-        self.font = @ptrCast(font);
-        self.mono_font = if (mono_font) |fallback| @ptrCast(fallback) else null;
-        self.icon_font = if (icon_font) |fallback| @ptrCast(fallback) else null;
+        self.font = @ptrCast(role_fonts.prose_bold);
+        self.ui_font = @ptrCast(role_fonts.ui);
+        self.prose_font = @ptrCast(role_fonts.prose);
+        self.prose_italic_font = @ptrCast(role_fonts.prose_italic);
+        self.prose_bold_italic_font = @ptrCast(role_fonts.prose_bold_italic);
+        self.mono_font = if (role_fonts.mono) |fallback| @ptrCast(fallback) else null;
+        self.icon_font = if (role_fonts.icon) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
             .min_filter = c.SDL_GPU_FILTER_LINEAR,
             .mag_filter = c.SDL_GPU_FILTER_LINEAR,
-            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            // Trilinear: blend between the two mip levels whose downsampled
+            // detail best matches the current screen-space derivative. Without
+            // this large logos point-sample the base level and alias badly.
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
             .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -398,7 +442,10 @@ pub const Renderer = struct {
             .max_anisotropy = 8,
             .compare_op = c.SDL_GPU_COMPAREOP_INVALID,
             .min_lod = 0,
-            .max_lod = 0,
+            // SDL clamps to the texture's actual num_levels; large value here
+            // just means "let the sampler descend to the smallest mip when
+            // appropriate."
+            .max_lod = 1000.0,
             .enable_anisotropy = true,
             .enable_compare = false,
             .padding1 = 0,
@@ -456,6 +503,10 @@ pub const Renderer = struct {
             .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "pos") },
             .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "uv") },
             .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = @offsetOf(draw.Vertex, "color") },
+            .{ .location = 3, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_min") },
+            .{ .location = 4, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_size") },
+            .{ .location = 5, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = @offsetOf(draw.Vertex, "sdf_radius") },
+            .{ .location = 6, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = @offsetOf(draw.Vertex, "sdf_border") },
         };
         var color_targets = [_]c.SDL_GPUColorTargetDescription{.{
             .format = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
@@ -673,14 +724,26 @@ pub const Renderer = struct {
             _ = self.textures.remove(id);
         }
 
+        // Full mip chain so that aggressive downscales (e.g. 2884×2884 provider
+        // logos sampled into ~22 px toolbar slots) use trilinear filtering
+        // against a pre-filtered lower-res level instead of point-sampling the
+        // base level. COLOR_TARGET usage is required by SDL_GPU's mipmap
+        // generator.
+        const max_dim = @max(width, height);
+        const num_levels = blk: {
+            var n: u32 = 1;
+            var d = max_dim;
+            while (d > 1) : (n += 1) d >>= 1;
+            break :blk n;
+        };
         const texture = c.SDL_CreateGPUTexture(device, &.{
             .type = c.SDL_GPU_TEXTURETYPE_2D,
             .format = format.toSdl(),
-            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER | c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
             .width = width,
             .height = height,
             .layer_count_or_depth = 1,
-            .num_levels = 1,
+            .num_levels = num_levels,
             .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
             .props = 0,
         }) orelse return error.SdlGpuTextureFailed;
@@ -700,6 +763,7 @@ pub const Renderer = struct {
             .transfer_size = byte_len,
             .width = width,
             .height = height,
+            .num_levels = num_levels,
             .format = format,
             .dirty = false,
             .dirty_kind = .image,
@@ -723,45 +787,59 @@ pub const Renderer = struct {
 
     fn flushPendingTextureUploads(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer, stats: *FrameStats) !void {
         var copy_pass: ?*c.SDL_GPUCopyPass = null;
-        defer if (copy_pass) |pass| c.SDL_EndGPUCopyPass(pass);
+        // Textures whose mip chain needs to be rebuilt after the copy pass
+        // closes. `SDL_GenerateMipmapsForGPUTexture` must run outside any pass.
+        var mipgen_buf: [64]*c.SDL_GPUTexture = undefined;
+        var mipgen_len: usize = 0;
 
-        var iterator = self.textures.iterator();
-        while (iterator.next()) |entry| {
-            if (!entry.value_ptr.dirty) continue;
-            const pass = copy_pass orelse blk: {
-                const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
-                copy_pass = created;
-                break :blk created;
-            };
-            const texture_entry = entry.value_ptr;
-            const upload_start = nowNs();
-            c.SDL_UploadToGPUTexture(
-                pass,
-                &.{
-                    .transfer_buffer = texture_entry.transfer,
-                    .offset = 0,
-                    .pixels_per_row = texture_entry.width,
-                    .rows_per_layer = texture_entry.height,
-                },
-                &.{
-                    .texture = texture_entry.texture,
-                    .mip_level = 0,
-                    .layer = 0,
-                    .x = 0,
-                    .y = 0,
-                    .z = 0,
-                    .w = texture_entry.width,
-                    .h = texture_entry.height,
-                    .d = 1,
-                },
-                true,
-            );
-            const elapsed = elapsedNs(upload_start);
-            switch (texture_entry.dirty_kind) {
-                .image => stats.image_upload_ns +|= elapsed,
-                .browser => stats.browser_upload_ns +|= elapsed,
+        {
+            defer if (copy_pass) |pass| c.SDL_EndGPUCopyPass(pass);
+            var iterator = self.textures.iterator();
+            while (iterator.next()) |entry| {
+                if (!entry.value_ptr.dirty) continue;
+                const pass = copy_pass orelse blk: {
+                    const created = c.SDL_BeginGPUCopyPass(command_buffer) orelse return error.SdlGpuCopyPassFailed;
+                    copy_pass = created;
+                    break :blk created;
+                };
+                const texture_entry = entry.value_ptr;
+                const upload_start = nowNs();
+                c.SDL_UploadToGPUTexture(
+                    pass,
+                    &.{
+                        .transfer_buffer = texture_entry.transfer,
+                        .offset = 0,
+                        .pixels_per_row = texture_entry.width,
+                        .rows_per_layer = texture_entry.height,
+                    },
+                    &.{
+                        .texture = texture_entry.texture,
+                        .mip_level = 0,
+                        .layer = 0,
+                        .x = 0,
+                        .y = 0,
+                        .z = 0,
+                        .w = texture_entry.width,
+                        .h = texture_entry.height,
+                        .d = 1,
+                    },
+                    true,
+                );
+                const elapsed = elapsedNs(upload_start);
+                switch (texture_entry.dirty_kind) {
+                    .image => stats.image_upload_ns +|= elapsed,
+                    .browser => stats.browser_upload_ns +|= elapsed,
+                }
+                if (texture_entry.num_levels > 1 and mipgen_len < mipgen_buf.len) {
+                    mipgen_buf[mipgen_len] = texture_entry.texture;
+                    mipgen_len += 1;
+                }
+                texture_entry.dirty = false;
             }
-            texture_entry.dirty = false;
+        }
+
+        for (mipgen_buf[0..mipgen_len]) |tex| {
+            c.SDL_GenerateMipmapsForGPUTexture(command_buffer, tex);
         }
     }
 
@@ -848,17 +926,18 @@ pub const Renderer = struct {
 
     fn appendNaturalTextSlice(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, wrap_width: ?f32, target_width: ?f32, font_role: ?draw.FontRole) !void {
         if (value.len == 0 or color_value.a <= 0.0) return;
-        const font = self.fontForRole(font_role);
+        const snapped_x = @round(x);
+        const snapped_y = @round(y);
         const key = textCacheKey(value, font_size, wrap_width, font_role);
         if (self.text_cache.getPtr(key)) |entry| {
-            try appendCachedText(allocator, frame, entry, x, y, color_value, clip, target_width);
+            try appendCachedText(allocator, frame, entry, snapped_x, snapped_y, color_value, clip, target_width);
             return;
         }
 
-        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
-        var cache_entry = try self.createTextCacheEntry(font, value, font_size, wrap_width);
+        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.text_cache_eviction_pending = true;
+        var cache_entry = try self.createTextCacheEntry(value, font_size, wrap_width, font_role);
         errdefer cache_entry.deinit();
-        try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, target_width);
+        try appendCachedText(allocator, frame, &cache_entry, snapped_x, snapped_y, color_value, clip, target_width);
         try self.text_cache.put(key, cache_entry);
     }
 
@@ -891,25 +970,24 @@ pub const Renderer = struct {
     }
 
     fn appendTextGlyph(self: *Renderer, allocator: std.mem.Allocator, frame: *TextFrame, value: []const u8, x: f32, y: f32, color_value: draw.Color, font_size: f32, clip: ?draw.Rect, font_role: ?draw.FontRole) !void {
-        const font = self.fontForRole(font_role);
         const key = textCacheKey(value, font_size, null, font_role);
         if (self.text_cache.getPtr(key)) |entry| {
-            try appendCachedText(allocator, frame, entry, x, y, color_value, clip, null);
+            try appendCachedText(allocator, frame, entry, @round(x), @round(y), color_value, clip, null);
             return;
         }
 
-        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.clearTextCache();
-        var cache_entry = try self.createTextCacheEntry(font, value, font_size, null);
+        if (self.text_cache.count() >= TEXT_CACHE_MAX_ENTRIES) self.text_cache_eviction_pending = true;
+        var cache_entry = try self.createTextCacheEntry(value, font_size, null, font_role);
         errdefer cache_entry.deinit();
-        try appendCachedText(allocator, frame, &cache_entry, x, y, color_value, clip, null);
+        try appendCachedText(allocator, frame, &cache_entry, @round(x), @round(y), color_value, clip, null);
         try self.text_cache.put(key, cache_entry);
     }
 
-    fn createTextCacheEntry(self: *Renderer, font: *c.TTF_Font, value: []const u8, font_size: f32, wrap_width: ?f32) !TextCacheEntry {
+    fn createTextCacheEntry(self: *Renderer, value: []const u8, font_size: f32, wrap_width: ?f32, font_role: ?draw.FontRole) !TextCacheEntry {
         var entry: TextCacheEntry = .{};
         errdefer entry.deinit();
 
-        if (!c.TTF_SetFontSize(font, font_size * GPU_TEXT_FONT_SCALE)) return error.SdlTtfTextFailed;
+        const font = try self.fontForRoleAndSize(font_size, font_role);
         const text = c.TTF_CreateText(self.text_engine.?, font, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
         errdefer c.TTF_DestroyText(text);
         if (wrap_width) |width| {
@@ -945,18 +1023,36 @@ pub const Renderer = struct {
                 .index_count = @intCast(seq.num_indices),
             });
         }
-        if (!c.TTF_SetTextFont(text, null)) return error.SdlTtfTextFailed;
         entry.text = text;
         return entry;
     }
 
-    fn fontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
-        if (role == .mono) {
-            if (self.mono_font) |font_value| return font_value;
-        }
-        if (role == .icon) {
-            if (self.icon_font) |font_value| return font_value;
-        }
+    fn fontForRoleAndSize(self: *Renderer, font_size: f32, role: ?draw.FontRole) !*c.TTF_Font {
+        const render_size = font_size * GPU_TEXT_FONT_SCALE;
+        const key: FontCacheKey = .{
+            .font_size_bits = @bitCast(render_size),
+            .font_role = fontRoleCacheValue(role),
+        };
+        if (self.font_cache.get(key)) |font| return font;
+
+        const base_font = self.baseFontForRole(role);
+        const font = c.TTF_CopyFont(base_font) orelse return error.SdlTtfTextFailed;
+        errdefer c.TTF_CloseFont(font);
+        if (!c.TTF_SetFontSize(font, render_size)) return error.SdlTtfTextFailed;
+        try self.font_cache.put(key, font);
+        return font;
+    }
+
+    fn baseFontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
+        if (role) |font_role| switch (font_role) {
+            .ui => if (self.ui_font) |font_value| return font_value,
+            .ui_bold, .prose_bold => {},
+            .prose => if (self.prose_font) |font_value| return font_value,
+            .prose_italic => if (self.prose_italic_font) |font_value| return font_value,
+            .prose_bold_italic => if (self.prose_bold_italic_font) |font_value| return font_value,
+            .mono => if (self.mono_font) |font_value| return font_value,
+            .icon => if (self.icon_font) |font_value| return font_value,
+        };
         return self.font.?;
     }
 
@@ -964,6 +1060,12 @@ pub const Renderer = struct {
         var iterator = self.text_cache.iterator();
         while (iterator.next()) |entry| entry.value_ptr.deinit();
         self.text_cache.clearRetainingCapacity();
+    }
+
+    fn clearFontCache(self: *Renderer) void {
+        var iterator = self.font_cache.iterator();
+        while (iterator.next()) |entry| c.TTF_CloseFont(entry.value_ptr.*);
+        self.font_cache.clearRetainingCapacity();
     }
 
     fn renderImageFrame(self: *Renderer, pass: *c.SDL_GPURenderPass, frame: *const ImageFrame, target_height: f32) void {
@@ -1082,6 +1184,7 @@ const GpuTexture = struct {
     transfer_size: usize,
     width: u32,
     height: u32,
+    num_levels: u32,
     format: Renderer.TextureFormat,
     dirty: bool = false,
     dirty_kind: TextureUploadKind = .image,
@@ -1151,6 +1254,11 @@ const TextCacheKey = struct {
     text_len: usize,
     font_size_bits: u32,
     wrap_width_bits: u32,
+    font_role: u8,
+};
+
+const FontCacheKey = struct {
+    font_size_bits: u32,
     font_role: u8,
 };
 
@@ -1479,22 +1587,88 @@ fn appendCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Comman
         try appendTriangle(allocator, mesh, command.p0, command.p1, command.p2, command.color, command.clip);
         return;
     }
-    if (command.border_color) |border| {
-        if (command.border_width > 0.0 and border.a > 0.0) {
-            const border_width = @max(command.border_width, 1.0);
-            if (command.color.a > 0.0) {
-                try appendRoundedRect(allocator, mesh, command.rect, border, command.radius, command.clip);
-            } else {
-                try appendRoundedBorder(allocator, mesh, command.rect, border, command.radius, border_width, command.clip);
-            }
-        }
-    }
-    if (command.color.a <= 0.0) return;
-    const rect = if (command.border_color != null and command.border_width > 0.0)
-        insetRect(command.rect, command.border_width)
+    // Rect commands all go through the SDF path. The fragment shader treats
+    // sdf_size == 0 as "plain quad" and skips the SDF math, so plain rects
+    // pay no shader cost.
+    try appendSdfRectCommand(allocator, mesh, command);
+}
+
+/// Emits a single quad per rect command (fill, fill+border, or border-only).
+/// SDF parameters carried on the vertices drive analytic edge AA in the solid
+/// fragment shader. Geometry is expanded by `SDF_HALO` pixels around the rect
+/// so the outward AA fringe has fragments to rasterize.
+const SDF_HALO: f32 = 1.0;
+
+fn appendSdfRectCommand(allocator: std.mem.Allocator, mesh: *Mesh, command: draw.Command) !void {
+    const rect = command.rect;
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+
+    const border_color: draw.Color = if (command.border_color) |bc|
+        if (command.border_width > 0.0 and bc.a > 0.0) bc else .{ .a = 0.0 }
     else
-        command.rect;
-    try appendRoundedRect(allocator, mesh, rect, command.color, @max(command.radius - command.border_width, 0.0), command.clip);
+        .{ .a = 0.0 };
+    const border_width: f32 = if (border_color.a > 0.0) @max(command.border_width, 1.0) else 0.0;
+    const fill_color: draw.Color = if (command.color.a > 0.0) command.color else .{ .a = 0.0 };
+    if (fill_color.a <= 0.0 and border_color.a <= 0.0) return;
+
+    const radius = clampedRadius(rect, command.radius);
+    const needs_sdf = radius > 0.5 or border_color.a > 0.0;
+    if (!needs_sdf) {
+        try appendRect(allocator, mesh, rect, fill_color, command.clip);
+        return;
+    }
+
+    const geom = draw.Rect{
+        .x = rect.x - SDF_HALO,
+        .y = rect.y - SDF_HALO,
+        .w = rect.w + SDF_HALO * 2.0,
+        .h = rect.h + SDF_HALO * 2.0,
+    };
+    const clipped = if (command.clip) |clip_rect| clippedRect(geom, clip_rect) orelse return else geom;
+    try appendSdfQuad(mesh, allocator, clipped, fill_color, .{
+        .min = .{ .x = rect.x, .y = rect.y },
+        .size = .{ .x = rect.w, .y = rect.h },
+        .radius = radius,
+        .border_width = border_width,
+        .border = border_color,
+    });
+}
+
+const SdfParams = struct {
+    min: draw.Vec2,
+    size: draw.Vec2,
+    radius: f32,
+    border_width: f32,
+    border: draw.Color,
+};
+
+fn appendSdfQuad(mesh: *Mesh, allocator: std.mem.Allocator, rect: draw.Rect, color: draw.Color, sdf: SdfParams) !void {
+    if (rect.w <= 0.0 or rect.h <= 0.0) return;
+    const base: u32 = @intCast(mesh.vertices.items.len);
+    const x0 = rect.x;
+    const y0 = rect.y;
+    const x1 = rect.x + rect.w;
+    const y1 = rect.y + rect.h;
+    const vertex = draw.Vertex{
+        .pos = .{},
+        .uv = .{},
+        .color = color,
+        .sdf_min = sdf.min,
+        .sdf_size = sdf.size,
+        .sdf_radius = sdf.radius,
+        .sdf_border_width = sdf.border_width,
+        .sdf_border = sdf.border,
+    };
+    var v0 = vertex;
+    var v1 = vertex;
+    var v2 = vertex;
+    var v3 = vertex;
+    v0.pos = .{ .x = x0, .y = y0 };
+    v1.pos = .{ .x = x1, .y = y0 };
+    v2.pos = .{ .x = x1, .y = y1 };
+    v3.pos = .{ .x = x0, .y = y1 };
+    try mesh.vertices.appendSlice(allocator, &.{ v0, v1, v2, v3 });
+    try mesh.indices.appendSlice(allocator, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
 }
 
 fn appendQuad(mesh: *Mesh, allocator: std.mem.Allocator, rect: draw.Rect, uv: draw.Rect, color: draw.Color) !void {
@@ -1816,6 +1990,10 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .ui_bold => 2,
         .icon => 3,
         .mono => 4,
+        .prose => 5,
+        .prose_bold => 6,
+        .prose_italic => 7,
+        .prose_bold_italic => 8,
     } else 0;
 }
 

@@ -5,6 +5,11 @@ struct FSInput {
     float4 position [[position]];
     float2 uv;
     float4 color;
+    float2 pixel_pos;
+    float2 sdf_min;
+    float2 sdf_size;
+    float2 sdf_radius_border;
+    float4 sdf_border;
 };
 
 fragment float4 palette_text_fragment(

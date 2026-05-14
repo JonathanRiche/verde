@@ -5,3 +5,4 @@ vendor/imgui.ini
 .codex
 node_modules/
 .agent-ci/
+.claude/
