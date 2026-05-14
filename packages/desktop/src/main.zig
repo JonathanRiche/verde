@@ -745,8 +745,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
             if (paste_shortcut) {
-                if (state.attachClipboardImageToCurrentDraft()) return true;
-                if (state.pasteClipboardTextIntoPaletteComposer()) return true;
+                // Browser URL bar handles its own paste a few branches below;
+                // skip the composer routes so the text doesn't end up in the
+                // wrong field.
+                if (!state.browser_address_focused) {
+                    if (state.attachClipboardImageToCurrentDraft()) return true;
+                    if (state.pasteClipboardTextIntoPaletteComposer()) return true;
+                }
             }
             if (ui_layout.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);
@@ -847,7 +852,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
-            browser_ui.handlePaletteMouseMotion(event.motion.x, event.motion.y);
+            browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
                 return true;
@@ -876,7 +881,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     },
                 );
             }
-            if (event.button.button == 1 and browser_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+            if (event.button.button == 1 and browser_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }

@@ -1666,6 +1666,11 @@ pub const AppState = struct {
     browser_pane_focused: bool,
     browser_address_focused: bool,
     browser_address_cursor: usize,
+    /// Selection anchor for the URL bar. When equal to `browser_address_cursor`
+    /// (or null) there is no active selection.
+    browser_address_selection_anchor: ?usize,
+    /// True while the user is dragging to extend the URL-bar selection.
+    browser_address_drag_active: bool,
     browser_inspector_menu_open: bool,
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
@@ -1833,6 +1838,8 @@ pub const AppState = struct {
             .browser_pane_focused = false,
             .browser_address_focused = false,
             .browser_address_cursor = 0,
+            .browser_address_selection_anchor = null,
+            .browser_address_drag_active = false,
             .browser_inspector_menu_open = false,
             .workspace_header_open_menu_open = false,
             .sidebar_context_menu_open = false,
@@ -3965,7 +3972,7 @@ pub const AppState = struct {
         return handled;
     }
 
-    fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
+    pub fn readClipboardTextForPaste(self: *AppState) ?[]u8 {
         const clipboard_text = sdl.getClipboardText() catch |err| {
             log.warn("failed to read clipboard text: {s}", .{@errorName(err)});
             runtime_log.diagnostic("palette paste SDL clipboard read failed: {s}", .{@errorName(err)});
