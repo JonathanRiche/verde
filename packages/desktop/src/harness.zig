@@ -28,7 +28,12 @@ pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
 pub const InterruptThreadRequest = types.InterruptThreadRequest;
 pub const SteerThreadRequest = types.SteerThreadRequest;
+pub const ThreadAction = types.ThreadAction;
+pub const ThreadActionRequest = types.ThreadActionRequest;
+pub const ThreadActionResult = types.ThreadActionResult;
+pub const ThreadTodo = types.ThreadTodo;
 pub const freeModelInfos = types.freeModelInfos;
+pub const freeThreadTodos = types.freeThreadTodos;
 
 pub const ProviderConfig = union(Provider) {
     opencode: opencode.Config,
@@ -112,6 +117,27 @@ pub const ProviderClient = union(Provider) {
             .codex => |*client| client.steerThread(request),
             .claude => |*client| client.steerThread(request),
             .cursor => |*client| client.steerThread(request),
+        };
+    }
+
+    pub fn listThreadChildren(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8) ![]ChatThreadSummary {
+        return switch (self.*) {
+            .opencode => |*client| client.listThreadChildren(allocator, thread_id),
+            .codex, .claude, .cursor => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn listThreadTodos(self: *ProviderClient, allocator: std.mem.Allocator, thread_id: []const u8) ![]ThreadTodo {
+        return switch (self.*) {
+            .opencode => |*client| client.listThreadTodos(allocator, thread_id),
+            .codex, .claude, .cursor => error.UnsupportedOperation,
+        };
+    }
+
+    pub fn threadAction(self: *ProviderClient, allocator: std.mem.Allocator, request: ThreadActionRequest) !ThreadActionResult {
+        return switch (self.*) {
+            .opencode => |*client| client.threadAction(allocator, request),
+            .codex, .claude, .cursor => error.UnsupportedOperation,
         };
     }
 };

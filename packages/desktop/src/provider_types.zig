@@ -123,6 +123,7 @@ pub const ServiceTier = enum(u8) {
 
 pub const ApprovalDecision = enum(u8) {
     approve,
+    approve_always,
     deny,
 };
 
@@ -188,3 +189,48 @@ pub const SteerThreadRequest = struct {
     turn_id: []const u8,
     prompt: []const u8,
 };
+
+pub const ThreadAction = enum(u8) {
+    fork,
+    summarize,
+    revert,
+    unrevert,
+    share,
+    unshare,
+    delete,
+};
+
+pub const ThreadActionRequest = struct {
+    thread_id: []const u8,
+    action: ThreadAction,
+    message_id: ?[]const u8 = null,
+    part_id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+};
+
+pub const ThreadActionResult = struct {
+    thread_id: ?[]const u8 = null,
+    share_url: ?[]const u8 = null,
+
+    pub fn deinit(self: ThreadActionResult, allocator: anytype) void {
+        if (self.thread_id) |thread_id| allocator.free(thread_id);
+        if (self.share_url) |share_url| allocator.free(share_url);
+    }
+};
+
+pub const ThreadTodo = struct {
+    id: []const u8,
+    title: []const u8,
+    status: []const u8,
+
+    pub fn deinit(self: ThreadTodo, allocator: anytype) void {
+        allocator.free(self.id);
+        allocator.free(self.title);
+        allocator.free(self.status);
+    }
+};
+
+pub fn freeThreadTodos(allocator: anytype, todos: []const ThreadTodo) void {
+    for (todos) |todo| todo.deinit(allocator);
+    allocator.free(todos);
+}

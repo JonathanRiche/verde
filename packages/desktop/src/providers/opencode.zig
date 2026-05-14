@@ -286,6 +286,103 @@ pub const Client = struct {
         return error.UnsupportedOperation;
     }
 
+    pub fn listThreadChildren(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+    ) ![]provider_types.ChatThreadSummary {
+        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/children", .{thread_id});
+        defer self.allocator.free(path);
+
+        const response = try self.requestJson(.GET, path, null);
+        defer self.allocator.free(response.body);
+        if (response.status != .ok) return error.OpencodeRequestFailed;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
+        defer parsed.deinit();
+
+        return parseSessionSummariesAlloc(allocator, parsed.value);
+    }
+
+    pub fn listThreadTodos(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+    ) ![]provider_types.ThreadTodo {
+        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}/todo", .{thread_id});
+        defer self.allocator.free(path);
+
+        const response = try self.requestJson(.GET, path, null);
+        defer self.allocator.free(response.body);
+        if (response.status != .ok) return error.OpencodeRequestFailed;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
+        defer parsed.deinit();
+
+        return parseThreadTodosAlloc(allocator, parsed.value);
+    }
+
+    pub fn threadAction(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.ThreadActionRequest,
+    ) !provider_types.ThreadActionResult {
+        const method: std.http.Method, const suffix: []const u8, const payload = try self.buildThreadActionCall(request);
+        defer if (payload) |body| self.allocator.free(body);
+
+        const path = try std.fmt.allocPrint(self.allocator, "/session/{s}{s}", .{ request.thread_id, suffix });
+        defer self.allocator.free(path);
+
+        const response = try self.requestJson(method, path, payload);
+        defer self.allocator.free(response.body);
+
+        if (response.status != .ok and response.status != .no_content) {
+            return error.OpencodeRequestFailed;
+        }
+
+        return parseThreadActionResultAlloc(allocator, request, response.body);
+    }
+
+    fn buildThreadActionCall(
+        self: *Client,
+        request: provider_types.ThreadActionRequest,
+    ) !struct { std.http.Method, []const u8, ?[]u8 } {
+        return switch (request.action) {
+            .fork => .{
+                .POST,
+                "/fork",
+                try stringifyAlloc(self.allocator, .{ .messageID = request.message_id }),
+            },
+            .summarize => blk: {
+                const model_ref = request.model orelse return error.MissingModel;
+                const provider_id, const model_id = parseModelRef(model_ref);
+                break :blk .{
+                    .POST,
+                    "/summarize",
+                    try stringifyAlloc(self.allocator, .{
+                        .providerID = provider_id,
+                        .modelID = model_id,
+                    }),
+                };
+            },
+            .revert => blk: {
+                const message_id = request.message_id orelse return error.MissingMessageId;
+                break :blk .{
+                    .POST,
+                    "/revert",
+                    try stringifyAlloc(self.allocator, .{
+                        .messageID = message_id,
+                        .partID = request.part_id,
+                    }),
+                };
+            },
+            .unrevert => .{ .POST, "/unrevert", try self.allocator.dupe(u8, "{}") },
+            .share => .{ .POST, "/share", try self.allocator.dupe(u8, "{}") },
+            .unshare => .{ .DELETE, "/share", null },
+            .delete => .{ .DELETE, "", null },
+        };
+    }
+
     fn ensureServer(self: *Client) !void {
         if (self.checkHealth()) {
             return;
@@ -764,11 +861,15 @@ pub const Client = struct {
     ) !void {
         const reply = switch (decision) {
             .approve => "once",
+            .approve_always => "always",
             .deny => "reject",
         };
+        const remember = decision == .approve_always;
 
         const body = try stringifyAlloc(self.allocator, .{
             .reply = reply,
+            .response = reply,
+            .remember = remember,
         });
         defer self.allocator.free(body);
 
@@ -782,6 +883,7 @@ pub const Client = struct {
 
         const legacy_body = try stringifyAlloc(self.allocator, .{
             .response = reply,
+            .remember = remember,
         });
         defer self.allocator.free(legacy_body);
 
@@ -844,21 +946,7 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response.body, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .object) return .idle;
-        const status_value = parsed.value.object.get(session_id) orelse return .idle;
-        if (status_value != .object) return .idle;
-
-        const type_name = getOptionalObjectString(status_value, "type") orelse return .busy;
-        if (std.mem.eql(u8, type_name, "idle")) return .idle;
-        if (std.mem.eql(u8, type_name, "busy")) return .busy;
-        if (std.mem.eql(u8, type_name, "retry")) {
-            return .{ .retry = .{
-                .attempt = jsonInteger(getObjectField(status_value, "attempt")) orelse 0,
-                .message = getOptionalObjectString(status_value, "message") orelse "OpenCode is retrying the request.",
-            } };
-        }
-
-        return .busy;
+        return parseSessionStatusValue(parsed.value, session_id);
     }
 
     fn requestJson(
@@ -1059,6 +1147,106 @@ fn getOptionalObjectString(value: std.json.Value, field: []const u8) ?[]const u8
         .string => |text| text,
         else => null,
     };
+}
+
+fn parseSessionSummariesAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ChatThreadSummary {
+    if (value != .array) return allocator.alloc(provider_types.ChatThreadSummary, 0);
+
+    var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
+    errdefer {
+        for (threads.items) |thread| {
+            allocator.free(thread.id);
+            allocator.free(thread.title);
+        }
+        threads.deinit(allocator);
+    }
+
+    for (value.array.items) |session_value| {
+        if (session_value != .object) continue;
+        const id = getOptionalObjectString(session_value, "id") orelse continue;
+        const title = getOptionalObjectString(session_value, "title") orelse id;
+        try threads.append(allocator, .{
+            .id = try allocator.dupe(u8, id),
+            .title = try allocator.dupe(u8, title),
+        });
+    }
+
+    return threads.toOwnedSlice(allocator);
+}
+
+fn parseThreadTodosAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ThreadTodo {
+    if (value != .array) return allocator.alloc(provider_types.ThreadTodo, 0);
+
+    var todos: std.ArrayList(provider_types.ThreadTodo) = .empty;
+    errdefer {
+        for (todos.items) |todo| todo.deinit(allocator);
+        todos.deinit(allocator);
+    }
+
+    for (value.array.items, 0..) |todo_value, index| {
+        if (todo_value != .object) continue;
+        const fallback_id = try std.fmt.allocPrint(allocator, "{d}", .{index});
+        defer allocator.free(fallback_id);
+        const id = getOptionalObjectString(todo_value, "id") orelse fallback_id;
+        const title = getOptionalObjectString(todo_value, "title") orelse
+            getOptionalObjectString(todo_value, "content") orelse
+            getOptionalObjectString(todo_value, "text") orelse id;
+        const status = getOptionalObjectString(todo_value, "status") orelse
+            getOptionalObjectString(todo_value, "state") orelse "unknown";
+
+        try todos.append(allocator, .{
+            .id = try allocator.dupe(u8, id),
+            .title = try allocator.dupe(u8, title),
+            .status = try allocator.dupe(u8, status),
+        });
+    }
+
+    return todos.toOwnedSlice(allocator);
+}
+
+fn parseThreadActionResultAlloc(
+    allocator: std.mem.Allocator,
+    request: provider_types.ThreadActionRequest,
+    body: []const u8,
+) !provider_types.ThreadActionResult {
+    if (std.mem.trim(u8, body, &std.ascii.whitespace).len == 0) return .{};
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return .{};
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return .{};
+
+    const response_id = getOptionalObjectString(parsed.value, "id");
+    const share_url = getOptionalObjectString(parsed.value, "share") orelse
+        getOptionalObjectString(parsed.value, "shareURL") orelse
+        getOptionalObjectString(parsed.value, "shareUrl") orelse
+        getOptionalObjectString(parsed.value, "url");
+
+    return .{
+        .thread_id = if (request.action == .fork)
+            if (response_id) |id| try allocator.dupe(u8, id) else null
+        else
+            null,
+        .share_url = if (share_url) |url| try allocator.dupe(u8, url) else null,
+    };
+}
+
+fn parseSessionStatusValue(value: std.json.Value, session_id: []const u8) SessionStatus {
+    if (value != .object) return .idle;
+    const status_value = value.object.get(session_id) orelse return .idle;
+    if (status_value != .object) return .idle;
+
+    const type_name = getOptionalObjectString(status_value, "type") orelse return .busy;
+    if (std.mem.eql(u8, type_name, "idle")) return .idle;
+    if (std.mem.eql(u8, type_name, "busy")) return .busy;
+    if (std.mem.eql(u8, type_name, "retry")) {
+        return .{ .retry = .{
+            .attempt = jsonInteger(getObjectField(status_value, "attempt")) orelse 0,
+            .message = getOptionalObjectString(status_value, "message") orelse "OpenCode is retrying the request.",
+        } };
+    }
+
+    return .busy;
 }
 
 fn parseImportedApiMessagesAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]provider_types.ChatMessage {
@@ -2285,4 +2473,319 @@ test "buildPromptBody prefers explicit opencode variant over reasoning effort" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"variant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "minimal") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "high") == null);
+}
+
+test "buildPromptBody includes provider model text and file parts" {
+    const allocator = std.testing.allocator;
+    const images = [_]provider_types.ImageAttachment{
+        .{ .path = "/tmp/a.png" },
+        .{ .path = "/workspace/b.jpg" },
+    };
+    const body = try buildPromptBody(allocator, .{
+        .prompt = "describe these",
+        .model = "anthropic/claude-sonnet",
+        .reasoning_effort = .medium,
+        .images = images[0..],
+    });
+    defer allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const model = getObjectField(parsed.value, "model") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("anthropic", getOptionalObjectString(model, "providerID").?);
+    try std.testing.expectEqualStrings("claude-sonnet", getOptionalObjectString(model, "modelID").?);
+    try std.testing.expectEqualStrings("medium", getOptionalObjectString(parsed.value, "variant").?);
+
+    const parts = getObjectField(parsed.value, "parts") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(usize, 3), parts.array.items.len);
+    try std.testing.expectEqualStrings("text", getOptionalObjectString(parts.array.items[0], "type").?);
+    try std.testing.expectEqualStrings("describe these", getOptionalObjectString(parts.array.items[0], "text").?);
+    try std.testing.expectEqualStrings("file", getOptionalObjectString(parts.array.items[1], "type").?);
+    try std.testing.expectEqualStrings("a.png", getOptionalObjectString(parts.array.items[1], "filename").?);
+    try std.testing.expectEqualStrings("/tmp/a.png", getOptionalObjectString(getObjectField(parts.array.items[1], "source").?, "path").?);
+    try std.testing.expectEqualStrings("b.jpg", getOptionalObjectString(parts.array.items[2], "filename").?);
+}
+
+test "buildThreadActionCall maps OpenCode session action endpoints and payloads" {
+    const allocator = std.testing.allocator;
+    var client: Client = .{
+        .allocator = allocator,
+        .config = .{ .allocator = allocator },
+    };
+
+    {
+        const method, const suffix, const payload = try client.buildThreadActionCall(.{
+            .thread_id = "ses_parent",
+            .action = .fork,
+            .message_id = "msg_1",
+        });
+        defer allocator.free(payload.?);
+        try std.testing.expectEqual(std.http.Method.POST, method);
+        try std.testing.expectEqualStrings("/fork", suffix);
+        try expectJsonStringField(payload.?, "messageID", "msg_1");
+    }
+
+    {
+        const method, const suffix, const payload = try client.buildThreadActionCall(.{
+            .thread_id = "ses_parent",
+            .action = .summarize,
+            .model = "openai/gpt-5.4",
+        });
+        defer allocator.free(payload.?);
+        try std.testing.expectEqual(std.http.Method.POST, method);
+        try std.testing.expectEqualStrings("/summarize", suffix);
+        try expectJsonStringField(payload.?, "providerID", "openai");
+        try expectJsonStringField(payload.?, "modelID", "gpt-5.4");
+    }
+
+    {
+        const method, const suffix, const payload = try client.buildThreadActionCall(.{
+            .thread_id = "ses_parent",
+            .action = .revert,
+            .message_id = "msg_2",
+            .part_id = "part_1",
+        });
+        defer allocator.free(payload.?);
+        try std.testing.expectEqual(std.http.Method.POST, method);
+        try std.testing.expectEqualStrings("/revert", suffix);
+        try expectJsonStringField(payload.?, "messageID", "msg_2");
+        try expectJsonStringField(payload.?, "partID", "part_1");
+    }
+
+    const delete_method, const delete_suffix, const delete_payload = try client.buildThreadActionCall(.{
+        .thread_id = "ses_parent",
+        .action = .delete,
+    });
+    try std.testing.expectEqual(std.http.Method.DELETE, delete_method);
+    try std.testing.expectEqualStrings("", delete_suffix);
+    try std.testing.expect(delete_payload == null);
+}
+
+test "buildThreadActionCall validates required action fields" {
+    const allocator = std.testing.allocator;
+    var client: Client = .{
+        .allocator = allocator,
+        .config = .{ .allocator = allocator },
+    };
+
+    try std.testing.expectError(error.MissingModel, client.buildThreadActionCall(.{
+        .thread_id = "ses_parent",
+        .action = .summarize,
+    }));
+    try std.testing.expectError(error.MissingMessageId, client.buildThreadActionCall(.{
+        .thread_id = "ses_parent",
+        .action = .revert,
+    }));
+}
+
+test "makeAuthorizationHeaderAlloc uses default and explicit basic auth usernames" {
+    const allocator = std.testing.allocator;
+
+    const default_header = (try makeAuthorizationHeaderAlloc(allocator, .{
+        .allocator = allocator,
+        .password = "secret",
+    })).?;
+    defer allocator.free(default_header.value);
+    try std.testing.expectEqualStrings("authorization", default_header.name);
+    try std.testing.expectEqualStrings("Basic b3BlbmNvZGU6c2VjcmV0", default_header.value);
+
+    const explicit_header = (try makeAuthorizationHeaderAlloc(allocator, .{
+        .allocator = allocator,
+        .username = "verde",
+        .password = "secret",
+    })).?;
+    defer allocator.free(explicit_header.value);
+    try std.testing.expectEqualStrings("Basic dmVyZGU6c2VjcmV0", explicit_header.value);
+
+    try std.testing.expect((try makeAuthorizationHeaderAlloc(allocator, .{ .allocator = allocator })) == null);
+}
+
+test "parseImportedApiMessagesAlloc imports text and file parts while skipping synthetic text" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"info":{"role":"system"},"parts":[{"type":"text","text":"system note"}]},
+        \\  {"info":{"role":"user"},"parts":[{"type":"text","text":"hello"},{"type":"file","filename":"a.txt","source":{"type":"path","path":"/tmp/a.txt"}}]},
+        \\  {"info":{"role":"assistant"},"parts":[{"type":"text","synthetic":true,"text":"hidden"},{"type":"text","text":"visible"}]},
+        \\  {"info":{"role":"unknown"},"parts":[{"type":"text","text":"ignored"}]}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const messages = try parseImportedApiMessagesAlloc(allocator, parsed.value);
+    defer {
+        for (messages) |message| {
+            allocator.free(message.author);
+            allocator.free(message.body);
+        }
+        allocator.free(messages);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqual(provider_types.MessageRole.system, messages[0].role);
+    try std.testing.expectEqualStrings("System", messages[0].author);
+    try std.testing.expectEqualStrings("system note", messages[0].body);
+    try std.testing.expectEqual(provider_types.MessageRole.user, messages[1].role);
+    try std.testing.expectEqualStrings("hello\n\n/tmp/a.txt", messages[1].body);
+    try std.testing.expectEqual(provider_types.MessageRole.assistant, messages[2].role);
+    try std.testing.expectEqualStrings("visible", messages[2].body);
+}
+
+test "extractSessionUpdatedAt reads legacy and nested session timestamps" {
+    const allocator = std.testing.allocator;
+    var legacy = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"ses_1","time_updated":1710000000123}
+    , .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(?i64, 1710000000), extractSessionUpdatedAt(legacy.value));
+
+    var nested = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"ses_1","time":{"updated":1710000001,"created":1700000000}}
+    , .{});
+    defer nested.deinit();
+    try std.testing.expectEqual(@as(?i64, 1710000001), extractSessionUpdatedAt(nested.value));
+}
+
+test "sessionMatchesWorkingDirectory filters descendants but not siblings" {
+    const root = "/workspace/app";
+    try std.testing.expect(sessionMatchesWorkingDirectory(root, "/workspace/app"));
+    try std.testing.expect(sessionMatchesWorkingDirectory(root, "/workspace/app/packages/desktop"));
+    try std.testing.expect(!sessionMatchesWorkingDirectory(root, "/workspace/application"));
+    try std.testing.expect(sessionMatchesWorkingDirectory(null, "/anywhere"));
+    try std.testing.expect(sessionMatchesWorkingDirectory(root, null));
+}
+
+test "parseSessionSummariesAlloc reads children summaries" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"id":"child_1","title":"Child one"},
+        \\  {"id":"child_2"}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const threads = try parseSessionSummariesAlloc(allocator, parsed.value);
+    defer {
+        for (threads) |thread| {
+            allocator.free(thread.id);
+            allocator.free(thread.title);
+        }
+        allocator.free(threads);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), threads.len);
+    try std.testing.expectEqualStrings("child_1", threads[0].id);
+    try std.testing.expectEqualStrings("Child one", threads[0].title);
+    try std.testing.expectEqualStrings("child_2", threads[1].id);
+    try std.testing.expectEqualStrings("child_2", threads[1].title);
+}
+
+test "parseThreadTodosAlloc accepts common todo shapes" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[
+        \\  {"id":"a","content":"Write tests","status":"pending"},
+        \\  {"title":"Run build","state":"completed"}
+        \\]
+    , .{});
+    defer parsed.deinit();
+
+    const todos = try parseThreadTodosAlloc(allocator, parsed.value);
+    defer provider_types.freeThreadTodos(allocator, todos);
+
+    try std.testing.expectEqual(@as(usize, 2), todos.len);
+    try std.testing.expectEqualStrings("a", todos[0].id);
+    try std.testing.expectEqualStrings("Write tests", todos[0].title);
+    try std.testing.expectEqualStrings("pending", todos[0].status);
+    try std.testing.expectEqualStrings("1", todos[1].id);
+    try std.testing.expectEqualStrings("Run build", todos[1].title);
+    try std.testing.expectEqualStrings("completed", todos[1].status);
+}
+
+test "parseThreadActionResultAlloc returns fork id and share url" {
+    const allocator = std.testing.allocator;
+    const result = try parseThreadActionResultAlloc(allocator, .{
+        .thread_id = "parent",
+        .action = .fork,
+    }, "{\"id\":\"child\",\"shareUrl\":\"https://opncd.ai/s/abc\"}");
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("child", result.thread_id.?);
+    try std.testing.expectEqualStrings("https://opncd.ai/s/abc", result.share_url.?);
+}
+
+test "parseEventEnvelope accepts bus payload root and SSE event name shapes" {
+    const allocator = std.testing.allocator;
+    var bus = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"payload":{"type":"message.part.delta","properties":{"sessionID":"ses_1","delta":"hi"}}}
+    , .{});
+    defer bus.deinit();
+
+    const bus_envelope = parseEventEnvelope(bus.value, "") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("message.part.delta", bus_envelope.event_type);
+    try std.testing.expectEqualStrings("ses_1", getOptionalObjectString(bus_envelope.properties, "sessionID").?);
+
+    var raw = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"sessionID":"ses_1"}
+    , .{});
+    defer raw.deinit();
+
+    const raw_envelope = parseEventEnvelope(raw.value, "session.idle") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("session.idle", raw_envelope.event_type);
+    try std.testing.expectEqualStrings("ses_1", getOptionalObjectString(raw_envelope.properties, "sessionID").?);
+}
+
+test "eventTargetsSession requires exact session match" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"sessionID":"ses_1"}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(eventTargetsSession(parsed.value, "ses_1"));
+    try std.testing.expect(!eventTargetsSession(parsed.value, "ses_2"));
+}
+
+test "fetchSessionStatus parsing classifies idle busy and retry payloads" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{
+        \\  "idle_session": {"type":"idle"},
+        \\  "busy_session": {"type":"busy"},
+        \\  "retry_session": {"type":"retry","attempt":3,"message":"rate limited"},
+        \\  "unknown_session": {"type":"something-new"}
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(SessionStatus.idle, parseSessionStatusValue(parsed.value, "idle_session"));
+    try std.testing.expectEqual(SessionStatus.busy, parseSessionStatusValue(parsed.value, "busy_session"));
+    const retry = parseSessionStatusValue(parsed.value, "retry_session").retry;
+    try std.testing.expectEqual(@as(i64, 3), retry.attempt);
+    try std.testing.expectEqualStrings("rate limited", retry.message);
+    try std.testing.expectEqual(SessionStatus.busy, parseSessionStatusValue(parsed.value, "unknown_session"));
+    try std.testing.expectEqual(SessionStatus.idle, parseSessionStatusValue(parsed.value, "missing_session"));
+}
+
+test "buildPermissionBody includes permission patterns and tool identifiers" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"permission":"edit","patterns":["*.zig","build.zig"],"tool":{"callID":"call_1","messageID":"msg_1"}}
+    , .{});
+    defer parsed.deinit();
+
+    const body = try buildPermissionBody(allocator, parsed.value);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Permission: edit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "- *.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "- call: call_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "- message: msg_1") != null);
+}
+
+fn expectJsonStringField(body: []const u8, field: []const u8, expected: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, getOptionalObjectString(parsed.value, field).?);
 }

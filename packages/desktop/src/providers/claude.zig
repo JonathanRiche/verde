@@ -356,7 +356,7 @@ pub const Client = struct {
                         try writeJsonLine(self.allocator, input, .{
                             .type = "approval_response",
                             .request_id = request_id,
-                            .decision = if (decision == .approve) "approve" else "deny",
+                            .decision = if (decision == .deny) "deny" else "approve",
                         });
                     }
                 }

@@ -1992,6 +1992,7 @@ fn sandboxModeString(value: provider_types.SandboxMode) []const u8 {
 fn approvalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
     return switch (value) {
         .approve => "accept",
+        .approve_always => "accept",
         .deny => "decline",
     };
 }
