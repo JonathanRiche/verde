@@ -46,11 +46,23 @@ set_macos_build_version() {
   local binary="$1"
   local patched="$binary.patched"
 
-  xcrun vtool \
+  # Zig 0.16 emits LC_BUILD_VERSION when MACOSX_DEPLOYMENT_TARGET is set
+  # (which we export above), so the binary already advertises the right
+  # platform/SDK at link time. `vtool -replace` requires extra Mach-O
+  # header padding that Zig does not always reserve — notably on x86_64
+  # macOS — and fails with "not enough space to hold load commands".
+  # Treat the rewrite as best-effort: if it fails we keep Zig's own
+  # build-version, which is correct.
+  if ! xcrun vtool \
     -set-build-version macos "$MACOS_MIN_VERSION" "$MACOS_SDK_VERSION" \
     -replace \
     -output "$patched" \
-    "$binary" >/dev/null
+    "$binary" >/dev/null 2>&1; then
+    echo "warning: vtool -replace could not patch $binary; keeping linker-emitted build-version" >&2
+    rm -f "$patched"
+    chmod 755 "$binary"
+    return 0
+  fi
   mv "$patched" "$binary"
   chmod 755 "$binary"
 }
