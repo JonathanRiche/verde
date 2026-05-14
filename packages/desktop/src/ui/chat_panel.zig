@@ -38,6 +38,18 @@ const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 
 var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
+/// Geometry of the transcript scrollbar from the last paint. Captured during
+/// render so the mouse handlers can do hit-testing without rebuilding the
+/// layout themselves. `track` is empty when the column is short enough that
+/// no scrollbar is shown.
+var transcript_scrollbar_track: palette.Rect = .{};
+var transcript_scrollbar_thumb: palette.Rect = .{};
+var transcript_scrollbar_max_scroll: f32 = 0.0;
+/// Distance from the thumb's top edge to the click point at drag start; held
+/// constant while dragging so the thumb tracks the cursor without jumping.
+var transcript_scrollbar_drag_grab_offset: f32 = 0.0;
+var transcript_scrollbar_drag_active: bool = false;
+
 const FileSearchHitCache = struct {
     panel_rect: palette.Rect = .{},
     row_count: usize = 0,
@@ -391,6 +403,20 @@ fn transcriptMarkdownBubbleHit(
 }
 
 pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
+    if (transcript_scrollbar_drag_active and transcript_scrollbar_max_scroll > 1.0 and transcript_scrollbar_track.h > 0.0) {
+        const target = scrollFromThumbY(
+            transcript_scrollbar_track,
+            transcript_scrollbar_thumb.h,
+            transcript_scrollbar_max_scroll,
+            state.palette_mouse_y,
+            transcript_scrollbar_drag_grab_offset,
+        );
+        state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
+        state.transcript_auto_follow_pending = false;
+        state.scroll_transcript_to_bottom_frames = 0;
+        state.markDirty();
+        return;
+    }
     if (!state.transcriptMarkdownSelectionDragging()) return;
     const hit = transcriptMarkdownBubbleHit(state, state.palette_mouse_x, state.palette_mouse_y) orelse return;
     state.updateTranscriptMarkdownSelection(hit.message_index, hit.point);
@@ -423,6 +449,9 @@ fn applyTranscriptMarkdownMulticlick(state: *app_state.AppState, hit: Transcript
 
 pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!down) {
+        if (transcript_scrollbar_drag_active) {
+            transcript_scrollbar_drag_active = false;
+        }
         if (state.transcriptMarkdownSelectionDragging()) {
             state.endTranscriptMarkdownSelection();
         }
@@ -432,6 +461,32 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     if (!rectContains(transcript_rect, x, y)) return false;
 
     state.transcript_focused = true;
+
+    // Scrollbar drag: thumb click starts a drag; track click (above/below
+    // thumb) page-jumps toward the cursor by one viewport.
+    if (transcript_scrollbar_max_scroll > 1.0 and transcript_scrollbar_track.h > 0.0) {
+        const track_hit = expandedScrollbarHit(transcript_scrollbar_track);
+        if (rectContains(track_hit, x, y)) {
+            if (rectContains(expandedScrollbarHit(transcript_scrollbar_thumb), x, y)) {
+                transcript_scrollbar_drag_active = true;
+                transcript_scrollbar_drag_grab_offset = y - transcript_scrollbar_thumb.y;
+            } else {
+                const target = scrollFromThumbY(
+                    transcript_scrollbar_track,
+                    transcript_scrollbar_thumb.h,
+                    transcript_scrollbar_max_scroll,
+                    y,
+                    transcript_scrollbar_thumb.h * 0.5,
+                );
+                state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
+                state.transcript_auto_follow_pending = false;
+                state.scroll_transcript_to_bottom_frames = 0;
+                state.markDirty();
+            }
+            return true;
+        }
+    }
+
     if (clicks <= 1 and state.consumeCodeCopyButtonClick(x, y)) {
         return true;
     }
@@ -1120,9 +1175,36 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         const track = snapRect(palette.Rect{ .x = rect.x + rect.w - theme.scaledUi(12.0), .y = column.y, .w = theme.scaledUi(4.0), .h = column.h });
         const thumb_h = @max(theme.scaledUi(32.0), column.h * (column.h / content_height));
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll);
+        const thumb_rect = snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h });
         queueRounded(state, track, paletteColor(colors.rgba(35, 42, 46, 160)), theme.scaledUi(2.0));
-        queueRounded(state, snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }), paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
+        queueRounded(state, thumb_rect, paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
+        transcript_scrollbar_track = track;
+        transcript_scrollbar_thumb = thumb_rect;
+        transcript_scrollbar_max_scroll = max_scroll;
+    } else {
+        transcript_scrollbar_track = .{};
+        transcript_scrollbar_thumb = .{};
+        transcript_scrollbar_max_scroll = 0.0;
     }
+}
+
+/// Scrollbar hit-area widened by `SCROLLBAR_HIT_PADDING` CSS px on each side
+/// so the thin track (4px) is comfortable to grab with a cursor.
+const SCROLLBAR_HIT_PADDING_CSS: f32 = 6.0;
+
+fn expandedScrollbarHit(rect: palette.Rect) palette.Rect {
+    const pad = theme.scaledUi(SCROLLBAR_HIT_PADDING_CSS);
+    return .{ .x = rect.x - pad, .y = rect.y, .w = rect.w + pad * 2.0, .h = rect.h };
+}
+
+/// Maps a y-coordinate on the scrollbar track to a scroll position. The
+/// `grab_offset` argument is the distance from the thumb's top to the
+/// pointer at drag start, so dragging keeps the thumb aligned with the
+/// cursor instead of snapping its top to the pointer.
+fn scrollFromThumbY(track: palette.Rect, thumb_h: f32, max_scroll: f32, y: f32, grab_offset: f32) f32 {
+    const usable = @max(track.h - thumb_h, 1.0);
+    const desired_thumb_y = std.math.clamp(y - track.y - grab_offset, 0.0, usable);
+    return (desired_thumb_y / usable) * max_scroll;
 }
 
 fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
