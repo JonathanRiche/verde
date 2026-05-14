@@ -518,11 +518,15 @@ pub fn selectionRangeForClickCount(
                 }
             },
             .thematic_break => {},
-            .table => {
-                // Tables aren't selectable line-by-line yet; treat each rendered
-                // row as one logical line so global_line_index advances and
-                // subsequent block lookups stay aligned.
-                const row_count = 1 + block.table.rows.len;
+            .table => |table_block| {
+                // Double/triple-click on a table row selects the whole row.
+                const row_count = 1 + table_block.rows.len;
+                if (point.line_index >= global_line_index and point.line_index < global_line_index + row_count) {
+                    return .{
+                        .anchor = .{ .line_index = point.line_index, .column = 0 },
+                        .focus = .{ .line_index = point.line_index, .column = 1 },
+                    };
+                }
                 global_line_index += row_count;
             },
         }
@@ -673,11 +677,21 @@ pub fn renderSelectablePaletteBody(
                 renderPaletteThematicBreakBlock(context, rule, available_width, options);
             },
             .table => |table_block| {
-                // Tables don't participate in line-level selection yet; render
-                // the block and bump global_line_index past its rows so the
-                // caller's selection coordinates stay in sync.
-                renderPaletteTableBlock(context, table_block, available_width, options);
-                global_line_index += 1 + table_block.rows.len;
+                renderSelectableTableBlock(
+                    allocator,
+                    &output,
+                    ordered_selection,
+                    copy_selection,
+                    &copy_builder,
+                    &copied_any_line,
+                    mouse_pos,
+                    hovered,
+                    context,
+                    &global_line_index,
+                    table_block,
+                    available_width,
+                    options,
+                ) catch renderPaletteTableBlock(context, table_block, available_width, options);
             },
         }
 
@@ -1448,6 +1462,35 @@ fn tableRowLineCount(
     return max_lines;
 }
 
+/// Returns which row (0 = header, 1..N = body) contains `y_in_table` measured
+/// from the table's top edge, or null if the table is degenerately wide.
+fn tableRowOffsetForY(
+    table: TableView,
+    available_width: f32,
+    options: RenderOptions,
+    y_in_table: f32,
+) ?usize {
+    var widths_buf: [16]f32 = undefined;
+    const column_count = table.header.cells.len;
+    if (column_count == 0 or column_count > widths_buf.len) return null;
+    const widths = widths_buf[0..column_count];
+    computeTableColumnWidths(widths, table, options, available_width);
+
+    const pad_x = tableCellPaddingX(options);
+    const base_size = options.base_font_size;
+
+    var y_offset: f32 = 0.0;
+    const header_h = tableRowHeightForLines(options, tableRowLineCount(table.header, widths, pad_x, .prose_bold, base_size));
+    if (y_in_table < y_offset + header_h) return 0;
+    y_offset += header_h;
+    for (table.rows, 0..) |row, idx| {
+        const row_h = tableRowHeightForLines(options, tableRowLineCount(row, widths, pad_x, .prose, base_size));
+        if (y_in_table < y_offset + row_h) return idx + 1;
+        y_offset += row_h;
+    }
+    return table.rows.len; // past the last row → clamp to last
+}
+
 fn measureTableHeight(table: TableView, available_width: f32, options: RenderOptions) f32 {
     // Compute the same column widths the renderer will end up with, then walk
     // each row counting wrapped lines so heights match exactly. Up to 16
@@ -2094,10 +2137,11 @@ pub fn lastSelectablePointInBody(
             },
             .thematic_break => {},
             .table => |table_block| {
-                // One logical line per row (header + body). No per-cell column
-                // resolution yet — selection inside tables is a future task.
+                // One logical line per row (header + body). End-column is 1
+                // (the whole-row selection token) so "select to end of table"
+                // includes the last row's full width.
                 const row_count = 1 + table_block.rows.len;
-                last = .{ .line_index = global_line_index + row_count - 1, .column = 0 };
+                last = .{ .line_index = global_line_index + row_count - 1, .column = 1 };
                 global_line_index += row_count;
             },
         }
@@ -2242,6 +2286,11 @@ pub fn hitTestSelectablePaletteBody(
                 const top = context_cursor.y;
                 const bottom = top + height;
                 if (mouse[1] >= top and mouse[1] <= bottom and mouse[0] >= body_rect.x and mouse[0] <= body_rect.x + body_rect.w) {
+                    // Walk per-row heights to figure out which row contains
+                    // mouse_y so click+drag selects the actual hit row.
+                    if (tableRowOffsetForY(table_block, width, options, mouse[1] - top)) |row_offset| {
+                        return .{ .line_index = global_line_index + row_offset, .column = 0 };
+                    }
                     return .{ .line_index = global_line_index, .column = 0 };
                 }
                 context_cursor.y += height;
@@ -2953,6 +3002,129 @@ fn renderSelectablePaletteCodeBlock(
 
     advancePaletteCursor(context, height);
     global_line_index.* += lines.len;
+}
+
+/// Selectable table renderer. Each table row (header + body) consumes one
+/// entry in the global line-index space, so dragging across multiple rows
+/// highlights and copies them whole. Per-cell-character selection is not
+/// supported yet — the smallest selection unit inside a table is a row.
+fn renderSelectableTableBlock(
+    allocator: Allocator,
+    output: *SelectionRenderOutput,
+    selection: ?OrderedSelection,
+    copy_selection: bool,
+    copy_builder: *std.ArrayList(u8),
+    copied_any_line: *bool,
+    mouse_pos: [2]f32,
+    hovered: bool,
+    context: *PaletteRenderContext,
+    global_line_index: *usize,
+    table: TableView,
+    available_width: f32,
+    options: RenderOptions,
+) !void {
+    if (table.header.cells.len == 0) {
+        renderPaletteTableBlock(context, table, available_width, options);
+        global_line_index.* += 1 + table.rows.len;
+        return;
+    }
+
+    const indent = indentWidth(table.indent);
+    const start = .{ context.cursor.x + indent, context.cursor.y };
+    const width = @max(available_width - indent, 1.0);
+
+    const metrics = try buildTableColumnMetrics(allocator, table, options, width);
+    defer allocator.free(metrics.widths);
+
+    const pad_x = tableCellPaddingX(options);
+    const pad_y = tableCellPaddingY(options);
+    const border_color = paletteColor(theme.md.table_border);
+    const header_bg = paletteColor(theme.md.table_header_bg);
+
+    const total_rows = 1 + table.rows.len;
+    var row_heights = try allocator.alloc(f32, total_rows);
+    defer allocator.free(row_heights);
+
+    const base_size = options.base_font_size;
+    row_heights[0] = tableRowHeightForLines(options, tableRowLineCount(table.header, metrics.widths, pad_x, .prose_bold, base_size));
+    for (table.rows, 0..) |row, idx| {
+        row_heights[idx + 1] = tableRowHeightForLines(options, tableRowLineCount(row, metrics.widths, pad_x, .prose, base_size));
+    }
+
+    // Header background tint.
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = row_heights[0] }, header_bg);
+
+    // Per-row selection highlight + content + hover + copy.
+    var y_cursor: f32 = start[1];
+    var row_idx: usize = 0;
+    while (row_idx < total_rows) : (row_idx += 1) {
+        const line_idx = global_line_index.* + row_idx;
+        const row = if (row_idx == 0) table.header else table.rows[row_idx - 1];
+        const row_h = row_heights[row_idx];
+
+        const row_top = y_cursor;
+        const row_bottom = y_cursor + row_h;
+
+        noteSelectableLineBounds(output, line_idx, 1);
+
+        if (selection) |ordered| {
+            if (selectionColumnsForLine(ordered, line_idx, 1) != null) {
+                queuePaletteRect(context, .{
+                    .x = start[0],
+                    .y = row_top,
+                    .w = width,
+                    .h = row_h,
+                }, paletteColor(markdown_selection_fill_rgba));
+            }
+        }
+
+        drawTableRow(context, row, metrics.widths, table.alignments, start[0], y_cursor, pad_x, pad_y, row_h, options, row_idx == 0);
+
+        if (hovered and output.hovered_point == null and mouse_pos[1] >= row_top and mouse_pos[1] <= row_bottom) {
+            output.hovered_point = .{ .line_index = line_idx, .column = 0 };
+        }
+
+        if (copy_selection) {
+            if (selection) |ordered| {
+                if (selectionColumnsForLine(ordered, line_idx, 1) != null) {
+                    if (copied_any_line.*) {
+                        copy_builder.append(allocator, '\n') catch {};
+                    } else {
+                        copied_any_line.* = true;
+                    }
+                    for (row.cells, 0..) |cell, ci| {
+                        if (ci > 0) copy_builder.append(allocator, '\t') catch {};
+                        copy_builder.appendSlice(allocator, cell.text) catch {};
+                    }
+                }
+            }
+        }
+
+        y_cursor += row_h;
+    }
+
+    var total_h: f32 = 0.0;
+    for (row_heights) |h| total_h += h;
+
+    // Borders rendered on top of cell text so they read cleanly even when the
+    // row is selection-tinted.
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1], .w = width, .h = 1.0 }, border_color);
+    queuePaletteRect(context, .{ .x = start[0], .y = start[1] + total_h - 1.0, .w = width, .h = 1.0 }, border_color);
+    var rule_y: f32 = start[1];
+    for (row_heights[0 .. row_heights.len - 1]) |h| {
+        rule_y += h;
+        queuePaletteRect(context, .{ .x = start[0], .y = rule_y, .w = width, .h = 1.0 }, border_color);
+    }
+
+    var x_cursor: f32 = start[0];
+    queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
+    for (metrics.widths) |w| {
+        x_cursor += w;
+        queuePaletteRect(context, .{ .x = x_cursor, .y = start[1], .w = 1.0, .h = total_h }, border_color);
+    }
+
+    advancePaletteCursor(context, total_h);
+    global_line_index.* += total_rows;
 }
 
 fn renderPaletteStyledChunk(
