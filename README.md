@@ -90,10 +90,13 @@ If prompt sending fails, first check that the selected provider is installed, av
 
 ## Embedded Terminal
 
-Verde includes a project-scoped embedded terminal dock powered by Ghostty's `libghostty-vt` terminal engine.
+Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` terminal engine.
 
-- Toggle it with `CommandOrControl+J`.
-- It starts in the selected project's working directory.
+- Toggle the terminal with `CommandOrControl+J`. The terminal opens as a workspace pane and starts in the selected project's working directory.
+- Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), maximize or restore a pane, minimize it into the restore strip, or close it.
+- Drag the divider between workspace panes to resize the split.
+- Right-click inside a terminal pane to create normal shell tabs or launch-profile tabs for Claude, OpenCode, Codex, and Cursor.
+- Terminal-internal tabs and splits remain separate from workspace splits. The terminal keybinds below operate inside the focused terminal pane.
 - Per-terminal zoom works with `Ctrl+-` and `Ctrl+=` while the terminal is focused.
 
 ## Config And State
@@ -108,10 +111,26 @@ Example config:
   "ui": {
     "font_size": 20
   },
+  "terminal": {
+    "profiles": [
+      {
+        "label": "Local Agent",
+        "command": ["my-agent", "--interactive"]
+      }
+    ]
+  },
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
     "sidebar": "CommandOrControl+S",
     "browser": "Ctrl+B",
+    "workspace": {
+      "split_chat_vertical": "CommandOrControl+Alt+C",
+      "split_chat_horizontal": "CommandOrControl+Alt+Shift+C",
+      "split_terminal_vertical": "CommandOrControl+Alt+J",
+      "split_terminal_horizontal": "CommandOrControl+Alt+Shift+J",
+      "toggle_maximize": "CommandOrControl+Alt+M",
+      "minimize": "CommandOrControl+Alt+Minus"
+    },
     "terminal": {
       "toggle": "CommandOrControl+J",
       "new_tab": "CommandOrControl+Shift+T",

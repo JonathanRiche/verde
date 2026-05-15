@@ -10,6 +10,10 @@ pub const PaletteModalAction = native_state.PaletteModalAction;
 pub const PaletteModalHit = native_state.PaletteModalHit;
 pub const PaletteModalTextFocus = native_state.PaletteModalTextFocus;
 pub const Provider = native_state.Provider;
+pub const WorkspaceNode = native_state.WorkspaceNode;
+pub const WorkspacePaneId = native_state.WorkspacePaneId;
+pub const WorkspacePaneKind = native_state.WorkspacePaneKind;
+pub const WorkspaceSplitAxis = native_state.WorkspaceSplitAxis;
 
 pub const ChangedFileEntry = struct {
     path: []const u8,

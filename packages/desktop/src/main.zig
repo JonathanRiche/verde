@@ -17,6 +17,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
@@ -853,6 +854,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+                return true;
+            }
             browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
@@ -912,6 +916,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 event.button.y,
                 event.button.down,
             )) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1212,6 +1220,13 @@ fn handleKeyboardAction(
         .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
             state.requestTranscriptPageScroll(1);
         },
+        .workspace_split_chat_vertical => _ = state.splitFocusedWorkspacePaneWithChatAxis(.vertical),
+        .workspace_split_chat_horizontal => _ = state.splitFocusedWorkspacePaneWithChatAxis(.horizontal),
+        .workspace_split_terminal_vertical => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.vertical),
+        .workspace_split_terminal_horizontal => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.horizontal),
+        .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
+        .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
+        .workspace_close => _ = state.closeFocusedWorkspacePane(),
     }
 }
 

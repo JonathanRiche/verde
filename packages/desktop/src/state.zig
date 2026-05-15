@@ -1206,6 +1206,651 @@ pub const CachedImageTexture = struct {
     }
 };
 
+pub const WorkspacePaneId = u32;
+
+pub const WorkspacePaneKind = enum {
+    chat,
+    terminal,
+};
+
+pub const WorkspacePaneRef = union(WorkspacePaneKind) {
+    chat: ChatPaneRef,
+    terminal: TerminalPaneRef,
+};
+
+pub const ChatPaneRef = struct {
+    thread_index: usize = 0,
+    transcript_scroll_valid: bool = false,
+    transcript_scroll_y: f32 = 0.0,
+};
+
+pub const TerminalPaneRef = struct {
+    dock_id: u32 = 0,
+};
+
+pub const WorkspacePane = struct {
+    id: WorkspacePaneId,
+    ref: WorkspacePaneRef,
+    minimized: bool = false,
+};
+
+pub const WorkspaceMinimizedPane = struct {
+    id: WorkspacePaneId,
+    kind: WorkspacePaneKind,
+};
+
+pub const TerminalDockEntry = struct {
+    id: u32,
+    dock: terminal.Dock,
+
+    fn deinit(self: *TerminalDockEntry, allocator: std.mem.Allocator) void {
+        self.dock.deinit(allocator);
+    }
+};
+
+pub const WorkspaceSplitAxis = enum {
+    horizontal,
+    vertical,
+};
+
+pub const WorkspaceNode = union(enum) {
+    leaf: WorkspacePaneId,
+    split: struct {
+        axis: WorkspaceSplitAxis,
+        ratio: f32,
+        first: *WorkspaceNode,
+        second: *WorkspaceNode,
+    },
+};
+
+pub const WorkspaceLayout = struct {
+    next_pane_id: WorkspacePaneId = 1,
+    root: ?*WorkspaceNode = null,
+    panes: std.ArrayList(WorkspacePane) = .empty,
+    focused_pane_id: ?WorkspacePaneId = null,
+    maximized_pane_id: ?WorkspacePaneId = null,
+
+    fn initDefaultChat(allocator: std.mem.Allocator) !WorkspaceLayout {
+        var layout: WorkspaceLayout = .{};
+        errdefer layout.deinit(allocator);
+        const pane_id = layout.next_pane_id;
+        layout.next_pane_id += 1;
+        try layout.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .chat = .{ .thread_index = 0 } },
+        });
+        layout.root = try createLeafNode(allocator, pane_id);
+        layout.focused_pane_id = pane_id;
+        return layout;
+    }
+
+    fn deinit(self: *WorkspaceLayout, allocator: std.mem.Allocator) void {
+        if (self.root) |root| destroyNode(allocator, root);
+        self.panes.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureDefaultChat(self: *WorkspaceLayout, allocator: std.mem.Allocator) !void {
+        if (self.root != null and self.panes.items.len > 0) {
+            if (self.focused_pane_id == null) {
+                self.focused_pane_id = self.firstVisiblePaneId();
+            }
+            return;
+        }
+
+        self.deinit(allocator);
+        self.* = try WorkspaceLayout.initDefaultChat(allocator);
+    }
+
+    fn firstVisiblePaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (!pane.minimized) return pane.id;
+        }
+        return null;
+    }
+
+    fn paneById(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?*const WorkspacePane {
+        for (self.panes.items) |*pane| {
+            if (pane.id == pane_id) return pane;
+        }
+        return null;
+    }
+
+    fn paneByIdMutable(self: *WorkspaceLayout, pane_id: WorkspacePaneId) ?*WorkspacePane {
+        for (self.panes.items) |*pane| {
+            if (pane.id == pane_id) return pane;
+        }
+        return null;
+    }
+
+    fn rootContainsPane(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) bool {
+        const root_node = self.root orelse return false;
+        return nodeContainsPane(root_node, pane_id);
+    }
+
+    fn replaceRootWithLeaf(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) !void {
+        if (self.root) |root_node| destroyNode(allocator, root_node);
+        self.root = try createLeafNode(allocator, pane_id);
+        self.focused_pane_id = pane_id;
+    }
+
+    fn focusedPane(self: *const WorkspaceLayout) ?*const WorkspacePane {
+        const pane_id = self.focused_pane_id orelse return null;
+        return self.paneById(pane_id);
+    }
+
+    fn visiblePaneCount(self: *const WorkspaceLayout) usize {
+        var count: usize = 0;
+        for (self.panes.items) |pane| {
+            if (!pane.minimized) count += 1;
+        }
+        return count;
+    }
+
+    fn paneIndexById(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?usize {
+        for (self.panes.items, 0..) |pane, index| {
+            if (pane.id == pane_id) return index;
+        }
+        return null;
+    }
+
+    fn hasVisiblePaneKind(self: *const WorkspaceLayout, kind: WorkspacePaneKind) bool {
+        for (self.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => if (kind == .chat) return true,
+                .terminal => if (kind == .terminal) return true,
+            }
+        }
+        return false;
+    }
+
+    fn hasTerminalDockPane(self: *const WorkspaceLayout, dock_id: u32) bool {
+        for (self.panes.items) |pane| {
+            switch (pane.ref) {
+                .terminal => |ref| if (ref.dock_id == dock_id) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn maxTerminalDockId(self: *const WorkspaceLayout) u32 {
+        var max_id: u32 = 0;
+        for (self.panes.items) |pane| {
+            switch (pane.ref) {
+                .terminal => |ref| max_id = @max(max_id, ref.dock_id),
+                else => {},
+            }
+        }
+        return max_id;
+    }
+
+    fn ensureTerminalPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32) !WorkspacePaneId {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .terminal => |ref| if (ref.dock_id == dock_id) {
+                    pane.minimized = false;
+                    self.focused_pane_id = pane.id;
+                    try self.ensurePaneInRootSplit(allocator, pane.id, .horizontal, 0.64);
+                    return pane.id;
+                },
+                else => {},
+            }
+        }
+
+        const pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .terminal = .{ .dock_id = dock_id } },
+        });
+        self.focused_pane_id = pane_id;
+        try self.ensurePaneInRootSplit(allocator, pane_id, .horizontal, 0.64);
+        return pane_id;
+    }
+
+    fn createTerminalPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32) !WorkspacePaneId {
+        const pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .terminal = .{ .dock_id = dock_id } },
+        });
+        return pane_id;
+    }
+
+    fn createChatPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, thread_index: usize) !WorkspacePaneId {
+        const pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .chat = .{ .thread_index = thread_index } },
+        });
+        return pane_id;
+    }
+
+    fn splitPaneWithLeaf(
+        self: *WorkspaceLayout,
+        allocator: std.mem.Allocator,
+        target_pane_id: WorkspacePaneId,
+        new_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) !void {
+        if (self.root) |root_node| {
+            if (try splitNodeWithLeaf(allocator, root_node, target_pane_id, new_pane_id, axis, new_after)) {
+                self.focused_pane_id = new_pane_id;
+                return;
+            }
+        }
+        try self.ensurePaneInRootSplit(allocator, new_pane_id, axis, 0.5);
+        self.focused_pane_id = new_pane_id;
+    }
+
+    fn minimizePaneKind(self: *WorkspaceLayout, allocator: std.mem.Allocator, kind: WorkspacePaneKind) bool {
+        var changed = false;
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .chat => if (kind == .chat and !pane.minimized) {
+                    pane.minimized = true;
+                    changed = true;
+                },
+                .terminal => if (kind == .terminal and !pane.minimized) {
+                    pane.minimized = true;
+                    changed = true;
+                },
+            }
+        }
+        if (changed) {
+            if (self.firstVisiblePaneId()) |pane_id| {
+                self.replaceRootWithLeaf(allocator, pane_id) catch {
+                    self.focused_pane_id = pane_id;
+                };
+            } else {
+                self.focused_pane_id = null;
+            }
+        }
+        return changed;
+    }
+
+    fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
+        const pane_index = self.paneIndexById(pane_id) orelse return null;
+        const removed_ref = self.panes.items[pane_index].ref;
+        if (self.root) |root_node| {
+            self.root = removePaneFromTree(allocator, root_node, pane_id);
+        }
+        _ = self.panes.orderedRemove(pane_index);
+        if (self.focused_pane_id == pane_id) self.focused_pane_id = self.firstVisiblePaneId();
+        if (self.maximized_pane_id == pane_id) self.maximized_pane_id = null;
+        return removed_ref;
+    }
+
+    fn resizeSplit(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, ratio: f32) bool {
+        const root_node = self.root orelse return false;
+        return resizeNodeSplit(root_node, first_pane_id, second_pane_id, axis, @max(0.18, @min(0.82, ratio)));
+    }
+
+    fn persistedWorkspaceJson(self: *const WorkspaceLayout, allocator: std.mem.Allocator) ![]u8 {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+
+        try stringify.beginObject();
+        try stringify.objectField("v");
+        try stringify.write(2);
+        try stringify.objectField("next");
+        try stringify.write(self.next_pane_id);
+        try stringify.objectField("focused");
+        if (self.focused_pane_id) |pane_id| {
+            try stringify.write(pane_id);
+        } else {
+            try stringify.write(null);
+        }
+        try stringify.objectField("maximized");
+        if (self.maximized_pane_id) |pane_id| {
+            try stringify.write(pane_id);
+        } else {
+            try stringify.write(null);
+        }
+
+        try stringify.objectField("panes");
+        try stringify.beginArray();
+        for (self.panes.items) |pane| {
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write(pane.id);
+            try stringify.objectField("minimized");
+            try stringify.write(pane.minimized);
+            switch (pane.ref) {
+                .chat => |ref| {
+                    try stringify.objectField("kind");
+                    try stringify.write("chat");
+                    try stringify.objectField("thread");
+                    try stringify.write(ref.thread_index);
+                },
+                .terminal => |ref| {
+                    try stringify.objectField("kind");
+                    try stringify.write("terminal");
+                    try stringify.objectField("dock");
+                    try stringify.write(ref.dock_id);
+                },
+            }
+            try stringify.endObject();
+        }
+        try stringify.endArray();
+
+        try stringify.objectField("root");
+        if (self.root) |root_node| {
+            try writeWorkspaceNodeJson(&stringify, root_node);
+        } else {
+            try stringify.write(null);
+        }
+        try stringify.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn applyPersistedWorkspaceJson(self: *WorkspaceLayout, allocator: std.mem.Allocator, json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const root_value = parsed.value;
+        if (root_value != .object) return;
+        const version = jsonInt(root_value.object.get("v") orelse .null) orelse 1;
+        if (version < 2) {
+            try self.applyLegacyPersistedWorkspaceJson(allocator, json);
+            return;
+        }
+
+        const panes_value = root_value.object.get("panes") orelse return;
+        if (panes_value != .array) return;
+
+        var next_layout: WorkspaceLayout = .{};
+        errdefer next_layout.deinit(allocator);
+        next_layout.next_pane_id = @intCast(jsonInt(root_value.object.get("next") orelse .null) orelse 1);
+        next_layout.focused_pane_id = if (jsonInt(root_value.object.get("focused") orelse .null)) |id| @intCast(id) else null;
+        next_layout.maximized_pane_id = if (jsonInt(root_value.object.get("maximized") orelse .null)) |id| @intCast(id) else null;
+
+        for (panes_value.array.items) |pane_value| {
+            if (pane_value != .object) continue;
+            const pane_id: WorkspacePaneId = @intCast(jsonInt(pane_value.object.get("id") orelse .null) orelse continue);
+            const kind = jsonString(pane_value.object.get("kind") orelse .null) orelse continue;
+            const minimized = jsonBool(pane_value.object.get("minimized") orelse .null) orelse false;
+            if (std.mem.eql(u8, kind, "chat")) {
+                const thread_index: usize = @intCast(jsonInt(pane_value.object.get("thread") orelse .null) orelse 0);
+                try next_layout.panes.append(allocator, .{
+                    .id = pane_id,
+                    .ref = .{ .chat = .{ .thread_index = thread_index } },
+                    .minimized = minimized,
+                });
+            } else if (std.mem.eql(u8, kind, "terminal")) {
+                const dock_id: u32 = @intCast(jsonInt(pane_value.object.get("dock") orelse .null) orelse 0);
+                try next_layout.panes.append(allocator, .{
+                    .id = pane_id,
+                    .ref = .{ .terminal = .{ .dock_id = dock_id } },
+                    .minimized = minimized,
+                });
+            }
+            if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
+        }
+
+        if (root_value.object.get("root")) |node_value| {
+            next_layout.root = try parseWorkspaceNodeJson(allocator, node_value);
+        }
+        if (next_layout.root == null) {
+            if (next_layout.firstVisiblePaneId()) |pane_id| {
+                next_layout.root = try createLeafNode(allocator, pane_id);
+            }
+        }
+        if (next_layout.panes.items.len == 0 or next_layout.root == null) return;
+        if (next_layout.focused_pane_id) |pane_id| {
+            const pane = next_layout.paneById(pane_id);
+            if (pane == null or pane.?.minimized) next_layout.focused_pane_id = next_layout.firstVisiblePaneId();
+        } else {
+            next_layout.focused_pane_id = next_layout.firstVisiblePaneId();
+        }
+        if (next_layout.maximized_pane_id) |pane_id| {
+            const pane = next_layout.paneById(pane_id);
+            if (pane == null or pane.?.minimized) next_layout.maximized_pane_id = null;
+        }
+
+        self.deinit(allocator);
+        self.* = next_layout;
+    }
+
+    fn applyLegacyPersistedWorkspaceJson(self: *WorkspaceLayout, allocator: std.mem.Allocator, json: []const u8) !void {
+        try self.ensureDefaultChat(allocator);
+        if (std.mem.indexOf(u8, json, "\"terminal_visible\":true") != null) {
+            _ = try self.ensureTerminalPane(allocator, 0);
+        }
+        if (std.mem.indexOf(u8, json, "\"focused\":\"chat\"") != null) {
+            self.focusFirstVisiblePaneKind(.chat);
+        } else if (std.mem.indexOf(u8, json, "\"focused\":\"terminal\"") != null) {
+            self.focusFirstVisiblePaneKind(.terminal);
+        }
+    }
+
+    fn focusFirstVisiblePaneKind(self: *WorkspaceLayout, kind: WorkspacePaneKind) void {
+        for (self.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => if (kind == .chat) {
+                    self.focused_pane_id = pane.id;
+                    return;
+                },
+                .terminal => if (kind == .terminal) {
+                    self.focused_pane_id = pane.id;
+                    return;
+                },
+            }
+        }
+    }
+
+    fn ensurePaneInRootSplit(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, ratio: f32) !void {
+        if (self.root) |root_node| {
+            if (nodeContainsPane(root_node, pane_id)) return;
+            const new_leaf = try createLeafNode(allocator, pane_id);
+            errdefer destroyNode(allocator, new_leaf);
+            const split = try allocator.create(WorkspaceNode);
+            split.* = .{ .split = .{
+                .axis = axis,
+                .ratio = ratio,
+                .first = root_node,
+                .second = new_leaf,
+            } };
+            self.root = split;
+            return;
+        }
+
+        self.root = try createLeafNode(allocator, pane_id);
+    }
+
+    fn createLeafNode(allocator: std.mem.Allocator, pane_id: WorkspacePaneId) !*WorkspaceNode {
+        const node = try allocator.create(WorkspaceNode);
+        node.* = .{ .leaf = pane_id };
+        return node;
+    }
+
+    fn destroyNode(allocator: std.mem.Allocator, node: *WorkspaceNode) void {
+        switch (node.*) {
+            .leaf => {},
+            .split => |split| {
+                destroyNode(allocator, split.first);
+                destroyNode(allocator, split.second);
+            },
+        }
+        allocator.destroy(node);
+    }
+
+    fn nodeContainsPane(node: *const WorkspaceNode, pane_id: WorkspacePaneId) bool {
+        return switch (node.*) {
+            .leaf => |leaf_id| leaf_id == pane_id,
+            .split => |split| nodeContainsPane(split.first, pane_id) or nodeContainsPane(split.second, pane_id),
+        };
+    }
+
+    fn resizeNodeSplit(node: *WorkspaceNode, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, ratio: f32) bool {
+        switch (node.*) {
+            .leaf => return false,
+            .split => |*split| {
+                if (split.axis == axis and
+                    nodeContainsPane(split.first, first_pane_id) and
+                    nodeContainsPane(split.second, second_pane_id))
+                {
+                    split.ratio = ratio;
+                    return true;
+                }
+                if (resizeNodeSplit(split.first, first_pane_id, second_pane_id, axis, ratio)) return true;
+                return resizeNodeSplit(split.second, first_pane_id, second_pane_id, axis, ratio);
+            },
+        }
+    }
+
+    fn removePaneFromTree(allocator: std.mem.Allocator, node: *WorkspaceNode, pane_id: WorkspacePaneId) ?*WorkspaceNode {
+        switch (node.*) {
+            .leaf => |leaf_id| {
+                if (leaf_id != pane_id) return node;
+                allocator.destroy(node);
+                return null;
+            },
+            .split => |split| {
+                const first = removePaneFromTree(allocator, split.first, pane_id);
+                const second = removePaneFromTree(allocator, split.second, pane_id);
+                if (first) |first_node| {
+                    if (second) |second_node| {
+                        node.* = .{ .split = .{
+                            .axis = split.axis,
+                            .ratio = split.ratio,
+                            .first = first_node,
+                            .second = second_node,
+                        } };
+                        return node;
+                    }
+                    allocator.destroy(node);
+                    return first_node;
+                }
+                if (second) |second_node| {
+                    allocator.destroy(node);
+                    return second_node;
+                }
+                allocator.destroy(node);
+                return null;
+            },
+        }
+    }
+
+    fn splitNodeWithLeaf(
+        allocator: std.mem.Allocator,
+        node: *WorkspaceNode,
+        target_pane_id: WorkspacePaneId,
+        new_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) !bool {
+        switch (node.*) {
+            .leaf => |leaf_id| {
+                if (leaf_id != target_pane_id) return false;
+                const old_leaf = try createLeafNode(allocator, leaf_id);
+                errdefer destroyNode(allocator, old_leaf);
+                const new_leaf = try createLeafNode(allocator, new_pane_id);
+                errdefer destroyNode(allocator, new_leaf);
+                node.* = .{ .split = .{
+                    .axis = axis,
+                    .ratio = 0.5,
+                    .first = if (new_after) old_leaf else new_leaf,
+                    .second = if (new_after) new_leaf else old_leaf,
+                } };
+                return true;
+            },
+            .split => |split| {
+                if (try splitNodeWithLeaf(allocator, split.first, target_pane_id, new_pane_id, axis, new_after)) return true;
+                return try splitNodeWithLeaf(allocator, split.second, target_pane_id, new_pane_id, axis, new_after);
+            },
+        }
+    }
+
+    fn writeWorkspaceNodeJson(stringify: *std.json.Stringify, node: *const WorkspaceNode) !void {
+        try stringify.beginObject();
+        switch (node.*) {
+            .leaf => |pane_id| {
+                try stringify.objectField("leaf");
+                try stringify.write(pane_id);
+            },
+            .split => |split| {
+                try stringify.objectField("split");
+                try stringify.beginObject();
+                try stringify.objectField("axis");
+                try stringify.write(switch (split.axis) {
+                    .horizontal => "horizontal",
+                    .vertical => "vertical",
+                });
+                try stringify.objectField("ratio");
+                try stringify.write(split.ratio);
+                try stringify.objectField("first");
+                try writeWorkspaceNodeJson(stringify, split.first);
+                try stringify.objectField("second");
+                try writeWorkspaceNodeJson(stringify, split.second);
+                try stringify.endObject();
+            },
+        }
+        try stringify.endObject();
+    }
+
+    fn parseWorkspaceNodeJson(allocator: std.mem.Allocator, value: std.json.Value) !?*WorkspaceNode {
+        if (value != .object) return null;
+        if (value.object.get("leaf")) |leaf_value| {
+            const pane_id: WorkspacePaneId = @intCast(jsonInt(leaf_value) orelse return null);
+            return try createLeafNode(allocator, pane_id);
+        }
+        const split_value = value.object.get("split") orelse return null;
+        if (split_value != .object) return null;
+        const first_value = split_value.object.get("first") orelse return null;
+        const second_value = split_value.object.get("second") orelse return null;
+        const first_node = (try parseWorkspaceNodeJson(allocator, first_value)) orelse return null;
+        errdefer destroyNode(allocator, first_node);
+        const second_node = (try parseWorkspaceNodeJson(allocator, second_value)) orelse return null;
+        errdefer destroyNode(allocator, second_node);
+        const axis_label = jsonString(split_value.object.get("axis") orelse .null) orelse "horizontal";
+        const node = try allocator.create(WorkspaceNode);
+        node.* = .{ .split = .{
+            .axis = if (std.mem.eql(u8, axis_label, "vertical")) .vertical else .horizontal,
+            .ratio = jsonFloat(split_value.object.get("ratio") orelse .null) orelse 0.5,
+            .first = first_node,
+            .second = second_node,
+        } };
+        return node;
+    }
+
+    fn jsonString(value: std.json.Value) ?[]const u8 {
+        return switch (value) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    fn jsonBool(value: std.json.Value) ?bool {
+        return switch (value) {
+            .bool => |b| b,
+            else => null,
+        };
+    }
+
+    fn jsonInt(value: std.json.Value) ?i64 {
+        return switch (value) {
+            .integer => |i| i,
+            .float => |f| @intFromFloat(f),
+            else => null,
+        };
+    }
+
+    fn jsonFloat(value: std.json.Value) ?f32 {
+        return switch (value) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| @floatCast(f),
+            else => null,
+        };
+    }
+};
+
 pub const Project = struct {
     id: [:0]const u8,
     label: [:0]const u8,
@@ -1215,6 +1860,9 @@ pub const Project = struct {
     collapsed: bool = false,
     thread_list_expanded: bool = false,
     terminal_dock: terminal.Dock,
+    terminal_docks: std.ArrayList(TerminalDockEntry) = .empty,
+    next_terminal_dock_id: u32 = 1,
+    workspace_layout: WorkspaceLayout,
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
@@ -1234,6 +1882,9 @@ pub const Project = struct {
             .collapsed = false,
             .thread_list_expanded = false,
             .terminal_dock = terminal_dock,
+            .terminal_docks = .empty,
+            .next_terminal_dock_id = 1,
+            .workspace_layout = try WorkspaceLayout.initDefaultChat(allocator),
             .threads = .empty,
             .archived_threads = .empty,
             .selected_thread_index = 0,
@@ -1241,7 +1892,7 @@ pub const Project = struct {
             .sidebar_committed_thread_count = 0,
             .sidebar_thread_cache_dirty = true,
         };
-        try project.addThread(allocator);
+        _ = try project.addThread(allocator);
         return project;
     }
 
@@ -1292,16 +1943,17 @@ pub const Project = struct {
         self.currentThreadMutable().clearDraft();
     }
 
-    fn addThread(self: *Project, allocator: std.mem.Allocator) !void {
+    fn addThread(self: *Project, allocator: std.mem.Allocator) !usize {
         var thread = try ChatThread.init(allocator, "New thread");
         errdefer thread.deinit(allocator);
         try self.threads.append(allocator, thread);
         self.selected_thread_index = self.threads.items.len - 1;
+        return self.selected_thread_index;
     }
 
     fn normalize(self: *Project, allocator: std.mem.Allocator) !void {
         if (!self.archived and self.threads.items.len == 0) {
-            try self.addThread(allocator);
+            _ = try self.addThread(allocator);
         }
         if (self.threads.items.len == 0) {
             self.selected_thread_index = 0;
@@ -1322,6 +1974,36 @@ pub const Project = struct {
                 chat_threads.sanitizeEnum(ChatRole, &message.role, .user);
             }
         }
+        try self.ensureTerminalDocksForWorkspace(allocator);
+    }
+
+    fn ensureTerminalDocksForWorkspace(self: *Project, allocator: std.mem.Allocator) !void {
+        const max_dock_id = self.workspace_layout.maxTerminalDockId();
+        var dock_id: u32 = 1;
+        while (dock_id <= max_dock_id) : (dock_id += 1) {
+            if (self.terminalDockEntryById(dock_id) != null) continue;
+            var dock = try terminal.Dock.init(allocator);
+            errdefer dock.deinit(allocator);
+            try self.terminal_docks.append(allocator, .{ .id = dock_id, .dock = dock });
+        }
+        if (self.next_terminal_dock_id <= max_dock_id) self.next_terminal_dock_id = max_dock_id + 1;
+    }
+
+    fn terminalDockEntryById(self: *Project, dock_id: u32) ?*TerminalDockEntry {
+        for (self.terminal_docks.items) |*entry| {
+            if (entry.id == dock_id) return entry;
+        }
+        return null;
+    }
+
+    fn removeTerminalDockById(self: *Project, allocator: std.mem.Allocator, dock_id: u32) bool {
+        for (self.terminal_docks.items, 0..) |*entry, index| {
+            if (entry.id != dock_id) continue;
+            entry.deinit(allocator);
+            _ = self.terminal_docks.orderedRemove(index);
+            return true;
+        }
+        return false;
     }
 
     pub fn committedThreadCount(self: *const Project) usize {
@@ -1337,6 +2019,9 @@ pub const Project = struct {
         allocator.free(self.label);
         allocator.free(self.path);
         self.terminal_dock.deinit(allocator);
+        for (self.terminal_docks.items) |*entry| entry.deinit(allocator);
+        self.terminal_docks.deinit(allocator);
+        self.workspace_layout.deinit(allocator);
         for (self.threads.items) |*thread| {
             thread.deinit(allocator);
         }
@@ -1646,6 +2331,7 @@ pub const AppState = struct {
     debug_last_terminal_text_handled: bool,
     debug_last_terminal_scancode: ?sdl.Scancode,
     debug_last_terminal_text: [32:0]u8,
+    debug_workspace_visible_pane_count: usize,
     composer_picker_provider: ?Provider,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
@@ -1826,6 +2512,7 @@ pub const AppState = struct {
             .debug_last_terminal_text_handled = false,
             .debug_last_terminal_scancode = null,
             .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
+            .debug_workspace_visible_pane_count = 0,
             .composer_picker_provider = null,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
@@ -2595,7 +3282,7 @@ pub const AppState = struct {
             restored.archived = false;
             restored.unread_count = unread_count;
             if (restored.threads.items.len == 0) {
-                try restored.addThread(self.allocator);
+                _ = try restored.addThread(self.allocator);
             }
             try restored.normalize(self.allocator);
             try self.projects.append(self.allocator, restored);
@@ -3162,7 +3849,7 @@ pub const AppState = struct {
         project.invalidateSidebarThreadCache();
 
         if (project.threads.items.len == 0) {
-            project.addThread(self.allocator) catch {
+            _ = project.addThread(self.allocator) catch {
                 self.setSidebarNotice("Archived the thread, but failed to create a new draft.");
                 self.markDirty();
                 return;
@@ -3183,7 +3870,7 @@ pub const AppState = struct {
     pub fn createThreadForProject(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
         var project = &self.projects.items[index];
-        project.addThread(self.allocator) catch {
+        _ = project.addThread(self.allocator) catch {
             self.setSidebarNotice("Failed to create a new thread.");
             return;
         };
@@ -3555,6 +4242,16 @@ pub const AppState = struct {
                     log.warn("failed to restore terminal layout: {s}", .{@errorName(err)});
                 };
             }
+            if (project.workspace_layout_json) |layout_json| {
+                loaded.workspace_layout.applyPersistedWorkspaceJson(self.allocator, layout_json) catch |err| {
+                    log.warn("failed to restore workspace layout: {s}", .{@errorName(err)});
+                };
+            }
+            if (project.terminal_docks_json) |docks_json| {
+                self.applyPersistedTerminalDocksJson(&loaded, docks_json) catch |err| {
+                    log.warn("failed to restore terminal docks: {s}", .{@errorName(err)});
+                };
+            }
             for (loaded.threads.items) |*thread| {
                 thread.deinit(self.allocator);
             }
@@ -3612,7 +4309,7 @@ pub const AppState = struct {
                     }
                 }
                 if (!loaded.archived and loaded.threads.items.len == 0) {
-                    try loaded.addThread(self.allocator);
+                    _ = try loaded.addThread(self.allocator);
                 }
                 if (loaded.threads.items.len == 0) {
                     loaded.selected_thread_index = 0;
@@ -3712,6 +4409,10 @@ pub const AppState = struct {
         defer threads.deinit(allocator);
         const terminal_layout_json = try project.terminal_dock.persistedLayoutJson(allocator);
         errdefer if (terminal_layout_json) |value| allocator.free(value);
+        const terminal_docks_json = try self.persistedTerminalDocksJson(allocator, project);
+        errdefer if (terminal_docks_json) |value| allocator.free(value);
+        const workspace_layout_json = try project.workspace_layout.persistedWorkspaceJson(allocator);
+        errdefer allocator.free(workspace_layout_json);
 
         for (project.threads.items) |thread| {
             if (!project.archived and !thread.committed) continue;
@@ -3731,8 +4432,77 @@ pub const AppState = struct {
             .thread_list_expanded = project.thread_list_expanded,
             .terminal_height = project.terminal_dock.preferred_height,
             .terminal_layout_json = terminal_layout_json,
+            .terminal_docks_json = terminal_docks_json,
+            .workspace_layout_json = workspace_layout_json,
             .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
             .threads = try threads.toOwnedSlice(allocator),
+        };
+    }
+
+    fn persistedTerminalDocksJson(self: *const AppState, allocator: std.mem.Allocator, project: *const Project) !?[]u8 {
+        _ = self;
+        if (project.terminal_docks.items.len == 0) return null;
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginArray();
+        for (project.terminal_docks.items) |*entry| {
+            const layout_json = try entry.dock.persistedLayoutJson(allocator);
+            defer if (layout_json) |value| allocator.free(value);
+            if (layout_json == null and !entry.dock.hasRunningSession()) continue;
+            try stringify.beginObject();
+            try stringify.objectField("id");
+            try stringify.write(entry.id);
+            try stringify.objectField("layout");
+            if (layout_json) |value| {
+                try stringify.write(value);
+            } else {
+                try stringify.write(null);
+            }
+            try stringify.endObject();
+        }
+        try stringify.endArray();
+        return try writer.toOwnedSlice();
+    }
+
+    fn applyPersistedTerminalDocksJson(self: *AppState, project: *Project, json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |entry_value| {
+            if (entry_value != .object) continue;
+            const dock_id: u32 = @intCast(appJsonInt(entry_value.object.get("id") orelse .null) orelse continue);
+            if (dock_id == 0) continue;
+            var entry = project.terminalDockEntryById(dock_id);
+            if (entry == null) {
+                var dock = try terminal.Dock.init(self.allocator);
+                errdefer dock.deinit(self.allocator);
+                try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
+                entry = &project.terminal_docks.items[project.terminal_docks.items.len - 1];
+            }
+            if (entry_value.object.get("layout")) |layout_value| {
+                if (appJsonString(layout_value)) |layout_json| {
+                    entry.?.dock.applyPersistedLayoutJson(self.allocator, layout_json) catch |err| {
+                        log.warn("failed to restore terminal dock {d} layout: {s}", .{ dock_id, @errorName(err) });
+                    };
+                }
+            }
+            if (project.next_terminal_dock_id <= dock_id) project.next_terminal_dock_id = dock_id + 1;
+        }
+    }
+
+    fn appJsonString(value: std.json.Value) ?[]const u8 {
+        return switch (value) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    fn appJsonInt(value: std.json.Value) ?i64 {
+        return switch (value) {
+            .integer => |i| i,
+            .float => |f| @intFromFloat(f),
+            else => null,
         };
     }
 
@@ -3868,6 +4638,25 @@ pub const AppState = struct {
     pub fn replaceAppConfig(self: *AppState, next_config: app_config.AppConfig) void {
         self.app_config.deinit(self.allocator);
         self.app_config = next_config;
+    }
+
+    pub fn hasCustomTerminalLaunchProfile(self: *const AppState) bool {
+        return self.app_config.terminal_launch_profiles.len > 0;
+    }
+
+    pub fn customTerminalLaunchProfileLabel(self: *const AppState) []const u8 {
+        if (self.app_config.terminal_launch_profiles.len == 0) return "Custom";
+        return self.app_config.terminal_launch_profiles[0].label;
+    }
+
+    pub fn firstCustomTerminalLaunchProfile(self: *const AppState) ?terminal.TerminalLaunchProfile {
+        if (self.app_config.terminal_launch_profiles.len == 0) return null;
+        const profile = self.app_config.terminal_launch_profiles[0];
+        return .{
+            .kind = .custom,
+            .label = profile.label,
+            .command = profile.command,
+        };
     }
 
     pub fn configuredEditorLogoTexture(self: *const AppState) ?CachedImageTexture {
@@ -4690,15 +5479,71 @@ pub const AppState = struct {
     }
 
     pub fn currentProjectTerminal(self: *const AppState) *const terminal.Dock {
+        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+            if (self.currentProjectTerminalDock(dock_id)) |dock| return dock;
+        }
         return &self.currentProject().terminal_dock;
     }
 
     pub fn currentProjectTerminalMutable(self: *AppState) *terminal.Dock {
+        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+            if (self.currentProjectTerminalDockMutable(dock_id)) |dock| return dock;
+        }
         return &self.currentProjectMutable().terminal_dock;
     }
 
+    pub fn currentProjectTerminalDock(self: *const AppState, dock_id: u32) ?*const terminal.Dock {
+        if (self.projects.items.len == 0) return null;
+        const project = self.currentProject();
+        if (dock_id == 0) return &project.terminal_dock;
+        for (project.terminal_docks.items) |*entry| {
+            if (entry.id == dock_id) return &entry.dock;
+        }
+        return null;
+    }
+
+    pub fn currentProjectTerminalDockMutable(self: *AppState, dock_id: u32) ?*terminal.Dock {
+        if (self.projects.items.len == 0) return null;
+        var project = self.currentProjectMutable();
+        if (dock_id == 0) return &project.terminal_dock;
+        for (project.terminal_docks.items) |*entry| {
+            if (entry.id == dock_id) return &entry.dock;
+        }
+        return null;
+    }
+
+    pub fn focusedWorkspaceTerminalDockId(self: *const AppState) ?u32 {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.focusedPane() orelse return null;
+        if (pane.minimized) return null;
+        return switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => null,
+        };
+    }
+
+    fn createCurrentProjectTerminalDock(self: *AppState) !u32 {
+        if (self.projects.items.len == 0) return error.NoProjectSelected;
+        var project = self.currentProjectMutable();
+        const dock_id = project.next_terminal_dock_id;
+        project.next_terminal_dock_id += 1;
+        var dock = try terminal.Dock.init(self.allocator);
+        errdefer dock.deinit(self.allocator);
+        try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
+        return dock_id;
+    }
+
     pub fn isTerminalVisible(self: *const AppState) bool {
-        return self.projects.items.len > 0 and self.currentProjectTerminal().visible;
+        if (self.projects.items.len == 0) return false;
+        const project = self.currentProject();
+        return project.terminal_dock.visible or project.workspace_layout.hasVisiblePaneKind(.terminal);
+    }
+
+    pub fn shouldRenderLegacyTerminalDockInChat(self: *const AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const project = self.currentProject();
+        return project.terminal_dock.visible and !project.workspace_layout.hasVisiblePaneKind(.terminal);
     }
 
     pub fn isSidebarCollapsed(self: *const AppState) bool {
@@ -4750,6 +5595,50 @@ pub const AppState = struct {
             return;
         }
 
+        self.ensureCurrentProjectWorkspace();
+        var dock = self.currentProjectTerminalMutable();
+        const project_path = self.currentProject().path;
+        if (!dock.hasRunningSession()) {
+            dock.ensureSession(self.allocator, project_path) catch |err| {
+                log.err("failed to start terminal dock: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to start terminal.");
+                return;
+            };
+        }
+
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const focused_kind = if (layout.focusedPane()) |pane| switch (pane.ref) {
+            .chat => WorkspacePaneKind.chat,
+            .terminal => WorkspacePaneKind.terminal,
+        } else null;
+        const terminal_visible = layout.hasVisiblePaneKind(.terminal);
+        if (terminal_visible and focused_kind == .terminal) {
+            _ = layout.minimizePaneKind(self.allocator, .terminal);
+            dock.visible = false;
+            self.endTerminalResizeDrag();
+            self.terminal_focused = false;
+            self.setSidebarNotice("Terminal hidden.");
+            self.markDirty();
+            return;
+        }
+
+        _ = layout.ensureTerminalPane(self.allocator, 0) catch |err| {
+            log.err("failed to open terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open terminal pane.");
+            return;
+        };
+        dock.visible = false;
+        self.requestTerminalFocus();
+        self.setSidebarNotice("Terminal opened.");
+        self.markDirty();
+    }
+
+    pub fn toggleCurrentProjectTerminalLegacy(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No project selected.");
+            return;
+        }
+
         var dock = self.currentProjectTerminalMutable();
         if (!dock.visible) {
             const project_path = self.currentProject().path;
@@ -4772,19 +5661,36 @@ pub const AppState = struct {
 
     pub fn pollTerminals(self: *AppState) void {
         for (self.projects.items, 0..) |*project, project_index| {
-            if (!project.terminal_dock.visible and !project.terminal_dock.hasRunningSession()) continue;
-            project.terminal_dock.poll(self.allocator) catch |err| {
-                log.err("failed to poll terminal session: {s}", .{@errorName(err)});
-                if (project_index == self.selected_project_index and project.terminal_dock.visible) {
-                    self.setSidebarNotice("Terminal session failed.");
-                }
-            };
+            if (project.terminal_dock.visible or project.terminal_dock.hasRunningSession()) {
+                project.terminal_dock.poll(self.allocator) catch |err| {
+                    log.err("failed to poll terminal session: {s}", .{@errorName(err)});
+                    if (project_index == self.selected_project_index and project.terminal_dock.visible) {
+                        self.setSidebarNotice("Terminal session failed.");
+                    }
+                };
+            }
+            for (project.terminal_docks.items) |*entry| {
+                if (!entry.dock.visible and !entry.dock.hasRunningSession()) continue;
+                entry.dock.poll(self.allocator) catch |err| {
+                    log.err("failed to poll terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
+                    if (project_index == self.selected_project_index and entry.dock.visible) {
+                        self.setSidebarNotice("Terminal session failed.");
+                    }
+                };
+            }
         }
         for (self.archived_projects.items) |*project| {
-            if (!project.terminal_dock.visible and !project.terminal_dock.hasRunningSession()) continue;
-            project.terminal_dock.poll(self.allocator) catch |err| {
-                log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
-            };
+            if (project.terminal_dock.visible or project.terminal_dock.hasRunningSession()) {
+                project.terminal_dock.poll(self.allocator) catch |err| {
+                    log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
+                };
+            }
+            for (project.terminal_docks.items) |*entry| {
+                if (!entry.dock.visible and !entry.dock.hasRunningSession()) continue;
+                entry.dock.poll(self.allocator) catch |err| {
+                    log.err("failed to poll archived terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
+                };
+            }
         }
     }
 
@@ -5430,7 +6336,12 @@ pub const AppState = struct {
 
     pub fn hasVisibleTerminalSessions(self: *const AppState) bool {
         for (self.projects.items) |*project| {
-            if (project.terminal_dock.visible and project.terminal_dock.hasRunningSession()) return true;
+            if ((project.terminal_dock.visible or project.workspace_layout.hasVisiblePaneKind(.terminal)) and project.terminal_dock.hasRunningSession()) return true;
+            if (project.workspace_layout.hasVisiblePaneKind(.terminal)) {
+                for (project.terminal_docks.items) |*entry| {
+                    if (entry.dock.hasRunningSession()) return true;
+                }
+            }
         }
         return false;
     }
@@ -5440,7 +6351,7 @@ pub const AppState = struct {
         keyboard: *const keybinds.NativeKeyboardConfig,
         event: *const sdl.KeyboardEvent,
     ) bool {
-        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
+        if (!self.canRouteTerminalInput()) return false;
         var dock = self.currentProjectTerminalMutable();
         const handled = dock.handleKeyDown(self.allocator, keyboard, event);
         if (dock.consumeWorkspaceChange()) self.markDirty();
@@ -5448,8 +6359,400 @@ pub const AppState = struct {
     }
 
     pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
-        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
+        if (!self.canRouteTerminalInput()) return false;
         return self.currentProjectTerminalMutable().handleTextInput(std.mem.sliceTo(text, 0));
+    }
+
+    fn canRouteTerminalInput(self: *const AppState) bool {
+        if (!self.terminal_focused or !self.isTerminalVisible()) return false;
+        if (self.shouldRenderLegacyTerminalDockInChat()) return true;
+        return self.focusedWorkspacePaneKind() == .terminal;
+    }
+
+    pub fn ensureCurrentProjectWorkspace(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        self.projects.items[self.selected_project_index].workspace_layout.ensureDefaultChat(self.allocator) catch |err| {
+            log.err("failed to initialize workspace panes: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn focusedWorkspacePaneKind(self: *const AppState) ?WorkspacePaneKind {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.focusedPane() orelse return null;
+        return switch (pane.ref) {
+            .chat => .chat,
+            .terminal => .terminal,
+        };
+    }
+
+    pub fn currentProjectHasVisibleWorkspaceTerminalPane(self: *const AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        return self.projects.items[self.selected_project_index].workspace_layout.hasVisiblePaneKind(.terminal);
+    }
+
+    pub fn currentProjectWorkspaceRoot(self: *const AppState) ?*const WorkspaceNode {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.maximized_pane_id) |pane_id| {
+            if (layout.paneById(pane_id)) |pane| {
+                if (!pane.minimized) return layout.root;
+            }
+        }
+        return layout.root;
+    }
+
+    pub fn currentProjectWorkspaceMaximizedPaneId(self: *const AppState) ?WorkspacePaneId {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane_id = layout.maximized_pane_id orelse return null;
+        const pane = layout.paneById(pane_id) orelse return null;
+        if (pane.minimized) return null;
+        return pane_id;
+    }
+
+    pub fn workspacePaneKindById(self: *const AppState, pane_id: WorkspacePaneId) ?WorkspacePaneKind {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneById(pane_id) orelse return null;
+        if (pane.minimized) return null;
+        return switch (pane.ref) {
+            .chat => .chat,
+            .terminal => .terminal,
+        };
+    }
+
+    pub fn workspaceTerminalDockIdByPane(self: *const AppState, pane_id: WorkspacePaneId) ?u32 {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneById(pane_id) orelse return null;
+        if (pane.minimized) return null;
+        return switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => null,
+        };
+    }
+
+    pub fn workspaceChatThreadIndexByPane(self: *const AppState, pane_id: WorkspacePaneId) ?usize {
+        if (self.projects.items.len == 0) return null;
+        const project = &self.projects.items[self.selected_project_index];
+        const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+        if (pane.minimized) return null;
+        return switch (pane.ref) {
+            .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
+            else => null,
+        };
+    }
+
+    pub fn isCurrentProjectWorkspacePaneFocused(self: *const AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        return self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id == pane_id;
+    }
+
+    pub fn isCurrentProjectWorkspacePaneMaximized(self: *const AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        return self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id == pane_id;
+    }
+
+    pub fn focusCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneById(pane_id) orelse return false;
+        if (pane.minimized) return false;
+        layout.focused_pane_id = pane_id;
+        switch (pane.ref) {
+            .chat => |ref| {
+                var project = &self.projects.items[self.selected_project_index];
+                if (ref.thread_index < project.threads.items.len) {
+                    project.selected_thread_index = ref.thread_index;
+                }
+                self.terminal_focused = false;
+            },
+            .terminal => {
+                self.requestTerminalFocus();
+            },
+        }
+        self.markDirty();
+        return true;
+    }
+
+    pub fn toggleCurrentProjectWorkspacePaneMaximized(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneById(pane_id) orelse return false;
+        if (pane.minimized) return false;
+        layout.maximized_pane_id = if (layout.maximized_pane_id == pane_id) null else pane_id;
+        layout.focused_pane_id = pane_id;
+        switch (pane.ref) {
+            .chat => |ref| {
+                var project = &self.projects.items[self.selected_project_index];
+                if (ref.thread_index < project.threads.items.len) {
+                    project.selected_thread_index = ref.thread_index;
+                }
+                self.terminal_focused = false;
+            },
+            .terminal => self.requestTerminalFocus(),
+        }
+        self.markDirty();
+        return true;
+    }
+
+    pub fn closeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var project = &self.projects.items[self.selected_project_index];
+        var layout = &project.workspace_layout;
+        if (layout.visiblePaneCount() <= 1) {
+            self.setSidebarNotice("Cannot close the last workspace pane.");
+            return false;
+        }
+        const removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+        switch (removed_ref) {
+            .chat => self.setSidebarNotice("Chat pane closed."),
+            .terminal => |ref| {
+                if (ref.dock_id != 0 and !layout.hasTerminalDockPane(ref.dock_id)) {
+                    _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
+                }
+                if (!layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
+                self.setSidebarNotice("Terminal pane closed.");
+            },
+        }
+        if (layout.root == null) {
+            if (layout.firstVisiblePaneId()) |next_id| {
+                layout.replaceRootWithLeaf(self.allocator, next_id) catch {
+                    layout.focused_pane_id = next_id;
+                };
+            }
+        }
+        self.markDirty();
+        return true;
+    }
+
+    pub fn closeFocusedWorkspacePane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.closeCurrentProjectWorkspacePane(pane_id);
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithChat(self: *AppState, pane_id: WorkspacePaneId) bool {
+        return self.splitCurrentProjectWorkspacePaneWithChatAxis(pane_id, .vertical);
+    }
+
+    pub fn splitFocusedWorkspacePaneWithChatAxis(self: *AppState, axis: WorkspaceSplitAxis) bool {
+        if (self.projects.items.len == 0) return false;
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.splitCurrentProjectWorkspacePaneWithChatAxis(pane_id, axis);
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithChatAxis(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const target = layout.paneById(pane_id) orelse return false;
+        if (target.minimized) return false;
+        const thread_index = self.projects.items[self.selected_project_index].addThread(self.allocator) catch |err| {
+            log.err("failed to create chat thread for workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create a new thread.");
+            return false;
+        };
+        const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
+            log.err("failed to create chat workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create chat pane.");
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, true) catch |err| {
+            log.err("failed to split chat workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return false;
+        };
+        self.terminal_focused = false;
+        self.requestComposerFocus();
+        self.syncRenameBuffer();
+        self.setSidebarNotice("New chat pane ready.");
+        self.markDirty();
+        return true;
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithTerminal(self: *AppState, pane_id: WorkspacePaneId) bool {
+        return self.splitCurrentProjectWorkspacePaneWithTerminalAxis(pane_id, .horizontal);
+    }
+
+    pub fn splitFocusedWorkspacePaneWithTerminalAxis(self: *AppState, axis: WorkspaceSplitAxis) bool {
+        if (self.projects.items.len == 0) return false;
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.splitCurrentProjectWorkspacePaneWithTerminalAxis(pane_id, axis);
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const target = layout.paneById(pane_id) orelse return false;
+        if (target.minimized) return false;
+
+        const dock_id = self.createCurrentProjectTerminalDock() catch |err| {
+            log.err("failed to allocate terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create terminal dock.");
+            return false;
+        };
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
+        const project_path = self.currentProject().path;
+        dock.ensureSession(self.allocator, project_path) catch |err| {
+            log.err("failed to start terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start terminal.");
+            return false;
+        };
+
+        const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create terminal pane.");
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, true) catch |err| {
+            log.err("failed to split terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return false;
+        };
+        dock.visible = false;
+        self.requestTerminalFocus();
+        self.setSidebarNotice("Terminal pane created.");
+        self.markDirty();
+        return true;
+    }
+
+    pub fn minimizeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.visiblePaneCount() <= 1) {
+            self.setSidebarNotice("Cannot minimize the last workspace pane.");
+            return false;
+        }
+
+        for (layout.panes.items) |*pane| {
+            if (pane.id != pane_id or pane.minimized) continue;
+            pane.minimized = true;
+            if (layout.maximized_pane_id == pane_id) layout.maximized_pane_id = null;
+            if (layout.firstVisiblePaneId()) |next_id| {
+                layout.replaceRootWithLeaf(self.allocator, next_id) catch {
+                    layout.focused_pane_id = next_id;
+                };
+            }
+            if (self.focusedWorkspacePaneKind() != .terminal) self.terminal_focused = false;
+            self.setSidebarNotice("Workspace pane minimized.");
+            self.markDirty();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn minimizeFocusedWorkspacePane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.minimizeCurrentProjectWorkspacePane(pane_id);
+    }
+
+    pub fn toggleFocusedWorkspacePaneMaximized(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
+    }
+
+    pub fn restoreCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        for (layout.panes.items) |*pane| {
+            if (pane.id != pane_id or !pane.minimized) continue;
+            pane.minimized = false;
+            layout.focused_pane_id = pane_id;
+            layout.ensurePaneInRootSplit(self.allocator, pane_id, .horizontal, 0.64) catch |err| {
+                log.err("failed to restore workspace pane: {s}", .{@errorName(err)});
+                return false;
+            };
+            switch (pane.ref) {
+                .chat => self.terminal_focused = false,
+                .terminal => self.requestTerminalFocus(),
+            }
+            self.setSidebarNotice("Workspace pane restored.");
+            self.markDirty();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn resizeCurrentProjectWorkspaceSplit(
+        self: *AppState,
+        first_pane_id: WorkspacePaneId,
+        second_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        ratio: f32,
+    ) void {
+        if (self.projects.items.len == 0) return;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) {
+            self.markDirty();
+        }
+    }
+
+    pub fn focusCurrentProjectWorkspaceTerminalPane(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        for (layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .terminal => {
+                    layout.focused_pane_id = pane.id;
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    pub fn focusCurrentProjectWorkspaceTerminalDock(self: *AppState, dock_id: u32) void {
+        if (self.projects.items.len == 0) return;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        for (layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .terminal => |ref| if (ref.dock_id == dock_id) {
+                    layout.focused_pane_id = pane.id;
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    pub fn currentProjectWorkspaceVisiblePaneCount(self: *const AppState) usize {
+        if (self.projects.items.len == 0) return 0;
+        return self.projects.items[self.selected_project_index].workspace_layout.visiblePaneCount();
+    }
+
+    pub fn currentProjectWorkspaceMinimizedPaneCount(self: *const AppState) usize {
+        if (self.projects.items.len == 0) return 0;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        var count: usize = 0;
+        for (layout.panes.items) |pane| {
+            if (pane.minimized) count += 1;
+        }
+        return count;
+    }
+
+    pub fn currentProjectWorkspaceMinimizedPaneAt(self: *const AppState, index: usize) ?WorkspaceMinimizedPane {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        var current: usize = 0;
+        for (layout.panes.items) |pane| {
+            if (!pane.minimized) continue;
+            if (current == index) {
+                return .{
+                    .id = pane.id,
+                    .kind = switch (pane.ref) {
+                        .chat => .chat,
+                        .terminal => .terminal,
+                    },
+                };
+            }
+            current += 1;
+        }
+        return null;
     }
 
     pub fn resetUiDebugFrame(self: *AppState) void {
@@ -5460,6 +6763,7 @@ pub const AppState = struct {
         self.debug_terminal_focus_requested = false;
         self.browser_pane_hovered = false;
         self.transcript_focused = false;
+        self.debug_workspace_visible_pane_count = 0;
     }
 
     pub fn noteTerminalViewportDebug(
@@ -5499,10 +6803,33 @@ pub const AppState = struct {
         thread.transcript_scroll_y = @max(scroll_y, 0.0);
     }
 
+    pub fn rememberWorkspaceChatTranscriptScroll(self: *AppState, pane_id: WorkspacePaneId, scroll_y: f32) void {
+        if (self.projects.items.len == 0) return;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneByIdMutable(pane_id) orelse return;
+        switch (pane.ref) {
+            .chat => |*ref| {
+                ref.transcript_scroll_valid = true;
+                ref.transcript_scroll_y = @max(scroll_y, 0.0);
+            },
+            else => {},
+        }
+    }
+
     pub fn currentTranscriptScrollY(self: *const AppState) ?f32 {
         const thread = self.currentThread();
         if (!thread.transcript_scroll_valid) return null;
         return thread.transcript_scroll_y;
+    }
+
+    pub fn workspaceChatTranscriptScrollY(self: *const AppState, pane_id: WorkspacePaneId) ?f32 {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane = layout.paneById(pane_id) orelse return null;
+        return switch (pane.ref) {
+            .chat => |ref| if (ref.transcript_scroll_valid) ref.transcript_scroll_y else null,
+            else => null,
+        };
     }
 
     pub fn requestComposerFocus(self: *AppState) void {
@@ -5512,6 +6839,16 @@ pub const AppState = struct {
     }
 
     pub fn requestTerminalFocus(self: *AppState) void {
+        self.focusCurrentProjectWorkspaceTerminalPane();
+        self.finishTerminalFocusRequest();
+    }
+
+    pub fn requestTerminalDockFocus(self: *AppState, dock_id: u32) void {
+        self.focusCurrentProjectWorkspaceTerminalDock(dock_id);
+        self.finishTerminalFocusRequest();
+    }
+
+    fn finishTerminalFocusRequest(self: *AppState) void {
         self.terminal_focused = true;
         self.composer_focused = false;
         self.palette_composer.focused = false;
