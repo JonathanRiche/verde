@@ -278,7 +278,7 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             const cell_rect = terminalCellRect(rect, cell_w, cell_h, x, y, span);
             const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
-            var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette });
+            var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
 
             if (selection) |range| {
                 if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
@@ -303,10 +303,10 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
             const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
             if (glyph_kind == .powerline) {
-                queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, 1.0), rect);
+                queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
                 continue;
             }
-            if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, 1.0), rect)) {
+            if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect)) {
                 continue;
             }
             const text_rect = terminalTextRect(cell_rect, text_y_offset, glyph_kind);
@@ -316,7 +316,7 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
                 .y = text_rect.y,
                 .w = text_rect.w,
                 .h = text_rect.h,
-            }, text, rgbPaletteColor(fg, 1.0), draw_font_size, if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, glyph_kind);
+            }, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, glyph_kind);
         }
     }
 }
@@ -570,6 +570,10 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
     };
 }
 
+fn foregroundAlpha(style: ghostty_vt.Style) f32 {
+    return if (style.flags.faint) 0.55 else 1.0;
+}
+
 fn rgbEql(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b;
 }
@@ -629,9 +633,9 @@ fn terminalTextFontSize(font_size: f32, glyph_kind: TerminalGlyphKind) f32 {
 }
 
 fn terminalFontSizeForCell(cell_w: f32, cell_h: f32) f32 {
-    const by_height = cell_h * 0.72;
-    const by_width = cell_w * 1.48;
-    return theme.clampf(@min(by_height, by_width), 8.0, cell_h * 0.82);
+    const by_height = cell_h * 0.95;
+    const by_width = cell_w * 1.9;
+    return theme.clampf(@min(by_height, by_width), 8.0, cell_h * 1.05);
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
@@ -727,6 +731,7 @@ fn queueTerminalCellGeometry(state: *app_state.AppState, rect: palette.Rect, cp:
     if (queueBlockElement(state, rect, cp, color, clip)) return true;
     if (queueBoxDrawing(state, rect, cp, color, clip)) return true;
     if (queueBraillePattern(state, rect, cp, color, clip)) return true;
+    if (queueMiscSymbol(state, rect, cp, color, clip)) return true;
     return false;
 }
 
@@ -878,6 +883,36 @@ fn queueBraillePattern(state: *app_state.AppState, rect: palette.Rect, cp: u21, 
     return true;
 }
 
+fn queueMiscSymbol(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
+    const inset_x = rect.w * 0.12;
+    const inset_y = rect.h * 0.20;
+    const left = rect.x + inset_x;
+    const right = rect.x + rect.w - inset_x;
+    const top = rect.y + inset_y;
+    const bottom = rect.y + rect.h - inset_y;
+    const mid_y = rect.y + rect.h * 0.5;
+    switch (cp) {
+        0x23f5 => queueTriangle(
+            state,
+            .{ .x = left, .y = top },
+            .{ .x = left, .y = bottom },
+            .{ .x = right, .y = mid_y },
+            color,
+            clip,
+        ),
+        0x23f4 => queueTriangle(
+            state,
+            .{ .x = right, .y = top },
+            .{ .x = right, .y = bottom },
+            .{ .x = left, .y = mid_y },
+            color,
+            clip,
+        ),
+        else => return false,
+    }
+    return true;
+}
+
 fn paletteColor(color: [4]f32) palette.Color {
     return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
 }
@@ -899,22 +934,6 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
         0xe0d4,
         0xe0d6...0xe0d7,
         => .powerline,
-        0x23fb...0x23fe,
-        0x2630,
-        0x2665,
-        0x26a1,
-        0x276c...0x2771,
-        0x2b58,
-        0xe000...0xe00a,
-        0xe0a0...0xe0af,
-        0xe200...0xe2a9,
-        0xe300...0xe3e3,
-        0xe5fa...0xe8ef,
-        0xea60...0xec1e,
-        0xed00...0xefce,
-        0xf000...0xf533,
-        0xf0001...0xf1af0,
-        => .icon,
         else => .text,
     };
 }

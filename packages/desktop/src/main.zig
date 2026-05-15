@@ -216,7 +216,7 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_prose_bold_italic_font_path);
-    const palette_gpu_mono_font_path = try paletteGpuFontPath(
+    const palette_gpu_mono_font_path = try ghosttyMonoFontPath(allocator) orelse try paletteGpuFontPath(
         allocator,
         storage.pref_path,
         "JetBrainsMonoNerdFont-Regular.ttf",
@@ -440,6 +440,83 @@ fn paletteGpuFontPath(
     }
 
     return try installBundledFont(allocator, pref_path, file_name, bytes);
+}
+
+fn ghosttyMonoFontPath(allocator: std.mem.Allocator) !?[:0]u8 {
+    const family = try ghosttyFontFamily(allocator) orelse return null;
+    defer allocator.free(family);
+    return try fontPathForFamily(allocator, family);
+}
+
+fn ghosttyFontFamily(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.c.getenv("HOME") orelse return null;
+    const config_path = try std.fs.path.join(allocator, &.{ std.mem.span(home), ".config", "ghostty", "config" });
+    defer allocator.free(config_path);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), config_path, allocator, .limited(128 * 1024)) catch return null;
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |index| raw_line[0..index] else raw_line;
+        const line = std.mem.trim(u8, no_comment, " \t\r");
+        if (line.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..equals], " \t\r");
+        if (!std.mem.eql(u8, key, "font-family")) continue;
+        return try allocator.dupe(u8, unquoteGhosttyValue(line[equals + 1 ..]));
+    }
+    return null;
+}
+
+fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 {
+    var compact = std.ArrayList(u8).empty;
+    defer compact.deinit(allocator);
+    for (family) |byte| {
+        if (byte == ' ' or byte == '\t' or byte == '-' or byte == '_') continue;
+        try compact.append(allocator, byte);
+    }
+
+    const compact_name = compact.items;
+    const candidates = [_][]const u8{
+        "/usr/share/fonts/TTF",
+        "/usr/local/share/fonts",
+    };
+    for (candidates) |dir| {
+        const path = try allocFontCandidatePath(allocator, dir, compact_name);
+        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
+        allocator.free(path);
+    }
+
+    const home = std.c.getenv("HOME") orelse return null;
+    const home_slice = std.mem.span(home);
+    const local_candidates = [_][]const u8{
+        ".local/share/fonts",
+        ".fonts",
+    };
+    for (local_candidates) |dir| {
+        const parent = try std.fs.path.join(allocator, &.{ home_slice, dir });
+        defer allocator.free(parent);
+        const path = try allocFontCandidatePath(allocator, parent, compact_name);
+        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
+        allocator.free(path);
+    }
+    return null;
+}
+
+fn allocFontCandidatePath(allocator: std.mem.Allocator, dir: []const u8, compact_name: []const u8) ![:0]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}-Regular.ttf", .{ dir, compact_name });
+    defer allocator.free(path);
+    return try allocator.dupeZ(u8, path);
+}
+
+fn unquoteGhosttyValue(raw_value: []const u8) []const u8 {
+    var value = std.mem.trim(u8, raw_value, " \t\r");
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+    if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') value = value[1 .. value.len - 1];
+    return value;
 }
 
 fn installBundledFont(

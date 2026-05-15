@@ -979,7 +979,7 @@ pub const Renderer = struct {
                 cursor_y += line_height;
             }
             if (!isTextSpace(slice)) {
-                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip, font_role);
+                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip, self.fallbackFontRoleForGlyph(slice, font_size, font_role));
             }
             cursor_x += advance;
             index += len;
@@ -998,6 +998,17 @@ pub const Renderer = struct {
         errdefer cache_entry.deinit();
         try appendCachedText(allocator, frame, &cache_entry, @round(x), @round(y), color_value, clip, null);
         try self.text_cache.put(key, cache_entry);
+    }
+
+    fn fallbackFontRoleForGlyph(self: *Renderer, value: []const u8, font_size: f32, font_role: ?draw.FontRole) ?draw.FontRole {
+        if (font_role != .mono or self.icon_font == null) return font_role;
+        if (value.len == 0 or value[0] < 0x80) return font_role;
+        const codepoint = std.unicode.utf8Decode(value) catch return font_role;
+        const mono = self.fontForRoleAndSize(font_size, .mono) catch return font_role;
+        if (c.TTF_FontHasGlyph(mono, codepoint)) return font_role;
+        const icon = self.fontForRoleAndSize(font_size, .icon) catch return font_role;
+        if (c.TTF_FontHasGlyph(icon, codepoint)) return .icon;
+        return font_role;
     }
 
     fn createTextCacheEntry(self: *Renderer, value: []const u8, font_size: f32, wrap_width: ?f32, font_role: ?draw.FontRole) !TextCacheEntry {

@@ -39,6 +39,7 @@ const ColorScheme = std.meta.Child(
     ).@"fn".return_type.?,
 );
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const MIN_SPLIT_RATIO: f32 = 0.12;
@@ -1078,7 +1079,7 @@ const UnixSession = struct {
             .rows = options.rows,
         });
         errdefer terminal.deinit(allocator);
-        configureTerminalTheme(&terminal);
+        configureTerminalTheme(allocator, &terminal);
         try terminal.setPwd(options.cwd);
 
         const launch_label = try launchLabel(allocator, options.profile);
@@ -1351,10 +1352,134 @@ const UnixSession = struct {
         return .dark;
     }
 
-    fn configureTerminalTheme(terminal: *ghostty_vt.Terminal) void {
-        terminal.colors.background = ghostty_vt.color.DynamicRGB.init(.{ .r = 0x00, .g = 0x00, .b = 0x00 });
-        terminal.colors.foreground = ghostty_vt.color.DynamicRGB.init(.{ .r = 0xd8, .g = 0xde, .b = 0xe9 });
-        terminal.colors.cursor = ghostty_vt.color.DynamicRGB.init(.{ .r = 0xd8, .g = 0xde, .b = 0xe9 });
+    const TerminalTheme = struct {
+        background: ghostty_vt.color.RGB = terminalRgb(0x2c, 0x25, 0x25),
+        foreground: ghostty_vt.color.RGB = terminalRgb(0xe6, 0xd9, 0xdb),
+        cursor: ghostty_vt.color.RGB = terminalRgb(0xc3, 0xb7, 0xb8),
+        palette: [256]ghostty_vt.color.RGB = defaultTerminalPalette(),
+    };
+
+    fn configureTerminalTheme(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal) void {
+        var terminal_theme = TerminalTheme{};
+        loadGhosttyTheme(allocator, &terminal_theme) catch |err| {
+            log.debug("using built-in terminal theme fallback: {s}", .{@errorName(err)});
+        };
+
+        terminal.colors.background = ghostty_vt.color.DynamicRGB.init(terminal_theme.background);
+        terminal.colors.foreground = ghostty_vt.color.DynamicRGB.init(terminal_theme.foreground);
+        terminal.colors.cursor = ghostty_vt.color.DynamicRGB.init(terminal_theme.cursor);
+        terminal.colors.palette.changeDefault(terminal_theme.palette);
+    }
+
+    fn defaultTerminalPalette() [256]ghostty_vt.color.RGB {
+        var palette = ghostty_vt.color.default;
+        const ansi = [_]ghostty_vt.color.RGB{
+            terminalRgb(0x72, 0x69, 0x6a),
+            terminalRgb(0xfd, 0x68, 0x83),
+            terminalRgb(0xad, 0xda, 0x78),
+            terminalRgb(0xf9, 0xcc, 0x6c),
+            terminalRgb(0xf3, 0x8d, 0x70),
+            terminalRgb(0xa8, 0xa9, 0xeb),
+            terminalRgb(0x85, 0xda, 0xcc),
+            terminalRgb(0xe6, 0xd9, 0xdb),
+            terminalRgb(0x94, 0x8a, 0x8b),
+            terminalRgb(0xff, 0x82, 0x97),
+            terminalRgb(0xc8, 0xe2, 0x92),
+            terminalRgb(0xfc, 0xd6, 0x75),
+            terminalRgb(0xf8, 0xa7, 0x88),
+            terminalRgb(0xbe, 0xbf, 0xfd),
+            terminalRgb(0x9b, 0xf1, 0xe1),
+            terminalRgb(0xf1, 0xe5, 0xe7),
+        };
+        @memcpy(palette[0..ansi.len], &ansi);
+        return palette;
+    }
+
+    fn loadGhosttyTheme(allocator: std.mem.Allocator, terminal_theme: *TerminalTheme) !void {
+        const home = std.c.getenv("HOME") orelse return error.HomeUnset;
+        const home_slice = std.mem.span(home);
+        const config_path = try std.fs.path.join(allocator, &.{ home_slice, ".config", "ghostty", "config" });
+        defer allocator.free(config_path);
+
+        try parseGhosttyThemeFile(allocator, config_path, terminal_theme, true);
+    }
+
+    fn parseGhosttyThemeFile(allocator: std.mem.Allocator, path: []const u8, terminal_theme: *TerminalTheme, follow_includes: bool) !void {
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const content = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(64 * 1024));
+        defer allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw_line| {
+            const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |index| raw_line[0..index] else raw_line;
+            const line = std.mem.trim(u8, no_comment, " \t\r");
+            if (line.len == 0) continue;
+            const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trim(u8, line[0..equals], " \t\r");
+            const value = std.mem.trim(u8, line[equals + 1 ..], " \t\r");
+
+            if (std.mem.eql(u8, key, "background")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.background = rgb;
+            } else if (std.mem.eql(u8, key, "foreground")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.foreground = rgb;
+            } else if (std.mem.eql(u8, key, "cursor-color")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.cursor = rgb;
+            } else if (std.mem.eql(u8, key, "palette")) {
+                parseGhosttyPalette(value, terminal_theme);
+            } else if (follow_includes and std.mem.eql(u8, key, "config-file")) {
+                const include_path = try resolveGhosttyPath(allocator, path, value);
+                defer allocator.free(include_path);
+                parseGhosttyThemeFile(allocator, include_path, terminal_theme, false) catch |err| {
+                    log.debug("failed to load ghostty theme include {s}: {s}", .{ include_path, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    fn parseGhosttyPalette(value: []const u8, terminal_theme: *TerminalTheme) void {
+        const equals = std.mem.indexOfScalar(u8, value, '=') orelse return;
+        const index_text = std.mem.trim(u8, value[0..equals], " \t\r");
+        const color_text = std.mem.trim(u8, value[equals + 1 ..], " \t\r");
+        const index = std.fmt.parseInt(usize, index_text, 10) catch return;
+        if (index >= terminal_theme.palette.len) return;
+        terminal_theme.palette[index] = parseHexRgb(color_text) orelse return;
+    }
+
+    fn resolveGhosttyPath(allocator: std.mem.Allocator, base_path: []const u8, raw_value: []const u8) ![]u8 {
+        var value = std.mem.trim(u8, rawValueWithoutOptionalPrefix(raw_value), " \t\r");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+        if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') value = value[1 .. value.len - 1];
+
+        if (std.mem.startsWith(u8, value, "~/")) {
+            const home = std.c.getenv("HOME") orelse return error.HomeUnset;
+            return std.fs.path.join(allocator, &.{ std.mem.span(home), value[2..] });
+        }
+        if (std.fs.path.isAbsolute(value)) return allocator.dupe(u8, value);
+
+        const base_dir = std.fs.path.dirname(base_path) orelse ".";
+        return std.fs.path.join(allocator, &.{ base_dir, value });
+    }
+
+    fn rawValueWithoutOptionalPrefix(value: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, value, " \t\r");
+        if (trimmed.len > 0 and trimmed[0] == '?') return std.mem.trim(u8, trimmed[1..], " \t\r");
+        return trimmed;
+    }
+
+    fn parseHexRgb(raw_value: []const u8) ?ghostty_vt.color.RGB {
+        var value = std.mem.trim(u8, raw_value, " \t\r");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+        if (value.len != 7 or value[0] != '#') return null;
+        return terminalRgb(
+            std.fmt.parseInt(u8, value[1..3], 16) catch return null,
+            std.fmt.parseInt(u8, value[3..5], 16) catch return null,
+            std.fmt.parseInt(u8, value[5..7], 16) catch return null,
+        );
+    }
+
+    fn terminalRgb(r: u8, g: u8, b: u8) ghostty_vt.color.RGB {
+        return .{ .r = r, .g = g, .b = b };
     }
 
     fn captureExitStatus(self: *UnixSession) bool {
@@ -1417,9 +1542,14 @@ const UnixSession = struct {
             std.c._exit(127);
         }
 
-        _ = setenv("TERM", "xterm-256color", 1);
+        _ = setenv("TERM", "xterm-ghostty", 1);
         _ = setenv("COLORTERM", "truecolor", 1);
-        _ = setenv("TERM_PROGRAM", "Verde", 1);
+        _ = setenv("TERM_PROGRAM", "ghostty", 1);
+        _ = setenv("TERM_PROGRAM_VERSION", "1.1.0", 1);
+        _ = setenv("CLICOLOR", "1", 1);
+        _ = setenv("CLICOLOR_FORCE", "1", 0);
+        _ = setenv("FORCE_COLOR", "3", 0);
+        _ = unsetenv("NO_COLOR");
         if (std.c.getenv("LANG") == null) {
             _ = setenv("LANG", "C.UTF-8", 1);
         }
