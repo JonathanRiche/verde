@@ -1894,6 +1894,7 @@ pub const Project = struct {
 
     fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8, path: []const u8, unread_count: u8) !Project {
         var terminal_dock = try terminal.Dock.init(allocator);
+        terminal_dock.setDefaultFontSize(app_config.DEFAULT_TERMINAL_FONT_SIZE);
         errdefer terminal_dock.deinit(allocator);
         var project: Project = .{
             .id = try allocator.dupeZ(u8, id),
@@ -1973,7 +1974,7 @@ pub const Project = struct {
         return self.selected_thread_index;
     }
 
-    fn normalize(self: *Project, allocator: std.mem.Allocator) !void {
+    fn normalize(self: *Project, allocator: std.mem.Allocator, default_terminal_font_size: f32) !void {
         if (!self.archived and self.threads.items.len == 0) {
             _ = try self.addThread(allocator);
         }
@@ -1996,19 +1997,27 @@ pub const Project = struct {
                 chat_threads.sanitizeEnum(ChatRole, &message.role, .user);
             }
         }
-        try self.ensureTerminalDocksForWorkspace(allocator);
+        try self.ensureTerminalDocksForWorkspace(allocator, default_terminal_font_size);
     }
 
-    fn ensureTerminalDocksForWorkspace(self: *Project, allocator: std.mem.Allocator) !void {
+    fn ensureTerminalDocksForWorkspace(self: *Project, allocator: std.mem.Allocator, default_terminal_font_size: f32) !void {
         const max_dock_id = self.workspace_layout.maxTerminalDockId();
         var dock_id: u32 = 1;
         while (dock_id <= max_dock_id) : (dock_id += 1) {
             if (self.terminalDockEntryById(dock_id) != null) continue;
             var dock = try terminal.Dock.init(allocator);
+            dock.setDefaultFontSize(default_terminal_font_size);
             errdefer dock.deinit(allocator);
             try self.terminal_docks.append(allocator, .{ .id = dock_id, .dock = dock });
         }
         if (self.next_terminal_dock_id <= max_dock_id) self.next_terminal_dock_id = max_dock_id + 1;
+    }
+
+    fn applyDefaultTerminalFontSize(self: *Project, font_size: f32) void {
+        self.terminal_dock.setDefaultFontSize(font_size);
+        for (self.terminal_docks.items) |*entry| {
+            entry.dock.setDefaultFontSize(font_size);
+        }
     }
 
     fn terminalDockEntryById(self: *Project, dock_id: u32) ?*TerminalDockEntry {
@@ -3306,12 +3315,14 @@ pub const AppState = struct {
             if (restored.threads.items.len == 0) {
                 _ = try restored.addThread(self.allocator);
             }
-            try restored.normalize(self.allocator);
+            try restored.normalize(self.allocator, self.app_config.terminal_font_size);
             try self.projects.append(self.allocator, restored);
             self.markDirty();
             return .restored;
         }
-        try self.projects.append(self.allocator, try Project.init(self.allocator, id, label, path, unread_count));
+        var project = try Project.init(self.allocator, id, label, path, unread_count);
+        project.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
+        try self.projects.append(self.allocator, project);
         self.markDirty();
         return .created;
     }
@@ -4259,6 +4270,7 @@ pub const AppState = struct {
             if (project.terminal_height) |height| {
                 loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
             }
+            loaded.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
             if (project.terminal_layout_json) |layout_json| {
                 loaded.terminal_dock.applyPersistedLayoutJson(self.allocator, layout_json) catch |err| {
                     log.warn("failed to restore terminal layout: {s}", .{@errorName(err)});
@@ -4383,7 +4395,7 @@ pub const AppState = struct {
                 }
             }
 
-            try loaded.normalize(self.allocator);
+            try loaded.normalize(self.allocator, self.app_config.terminal_font_size);
 
             if (loaded.archived) {
                 try self.archived_projects.append(self.allocator, loaded);
@@ -4498,6 +4510,7 @@ pub const AppState = struct {
             var entry = project.terminalDockEntryById(dock_id);
             if (entry == null) {
                 var dock = try terminal.Dock.init(self.allocator);
+                dock.setDefaultFontSize(self.app_config.terminal_font_size);
                 errdefer dock.deinit(self.allocator);
                 try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
                 entry = &project.terminal_docks.items[project.terminal_docks.items.len - 1];
@@ -5551,6 +5564,7 @@ pub const AppState = struct {
         const dock_id = project.next_terminal_dock_id;
         project.next_terminal_dock_id += 1;
         var dock = try terminal.Dock.init(self.allocator);
+        dock.setDefaultFontSize(self.app_config.terminal_font_size);
         errdefer dock.deinit(self.allocator);
         try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
         return dock_id;

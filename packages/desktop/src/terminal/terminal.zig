@@ -25,6 +25,7 @@ const MAX_FONT_SCALE: f32 = 2.0;
 const FONT_SCALE_STEP: f32 = 0.125;
 const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
+pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
@@ -82,6 +83,7 @@ const SessionCreateOptions = struct {
 
 pub const PersistedWorkspace = struct {
     active_tab_index: usize = 0,
+    font_scale: ?f32 = null,
     tabs: []const PersistedTab = &.{},
 };
 
@@ -166,6 +168,10 @@ pub const Dock = struct {
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
+    }
+
+    pub fn setDefaultFontSize(self: *Dock, font_size: f32) void {
+        self.font_scale = fontScaleForFontSize(font_size);
     }
 
     pub fn deinit(self: *Dock, allocator: std.mem.Allocator) void {
@@ -300,6 +306,7 @@ pub const Dock = struct {
     ) bool {
         if (terminalZoomDelta(event)) |delta| {
             self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
+            self.workspace_changed = true;
             return true;
         }
 
@@ -540,6 +547,7 @@ pub const Dock = struct {
 
         return try std.json.Stringify.valueAlloc(allocator, PersistedWorkspace{
             .active_tab_index = self.active_tab_index,
+            .font_scale = self.font_scale,
             .tabs = try persisted_tabs.toOwnedSlice(arena_allocator),
         }, .{});
     }
@@ -547,6 +555,10 @@ pub const Dock = struct {
     pub fn applyPersistedLayoutJson(self: *Dock, allocator: std.mem.Allocator, json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(PersistedWorkspace, allocator, json, .{});
         defer parsed.deinit();
+
+        if (parsed.value.font_scale) |font_scale| {
+            self.font_scale = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
+        }
 
         self.clearTabs(allocator);
 
@@ -2115,6 +2127,10 @@ fn scaledCellPixelWidth(font_scale: f32) u32 {
 
 fn scaledCellPixelHeight(font_scale: f32) u32 {
     return scaledCellPixels(CELL_PIXEL_HEIGHT, font_scale);
+}
+
+fn fontScaleForFontSize(font_size: f32) f32 {
+    return clampf(font_size / DEFAULT_FONT_SIZE, MIN_FONT_SCALE, MAX_FONT_SCALE);
 }
 
 fn scaledCellPixels(base: u32, font_scale: f32) u32 {
