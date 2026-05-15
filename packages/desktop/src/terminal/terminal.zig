@@ -24,6 +24,7 @@ const MIN_FONT_SCALE: f32 = 0.75;
 const MAX_FONT_SCALE: f32 = 2.0;
 const FONT_SCALE_STEP: f32 = 0.125;
 const WHEEL_SCROLL_LINES: f32 = 3.0;
+const KEY_SCROLL_LINES: isize = 3;
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
@@ -311,11 +312,37 @@ pub const Dock = struct {
 
         if (self.activePane()) |pane| {
             if (pane.session) |session| {
+                if (self.handleTerminalShortcut(allocator, session, event)) return true;
                 return session.handleKeyDown(event) catch |err| {
                     log.warn("terminal key input failed: {s}", .{@errorName(err)});
                     return false;
                 };
             }
+        }
+        return false;
+    }
+
+    fn handleTerminalShortcut(_: *Dock, allocator: std.mem.Allocator, session: *Session, event: *const sdl.KeyboardEvent) bool {
+        if (!event.down) return false;
+        if (terminalScrollShortcut(event, session.visibleRows())) |scroll| {
+            session.scrollViewport(allocator, scroll) catch |err| {
+                log.warn("terminal keyboard scroll failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            return true;
+        }
+        if (event.repeat) return false;
+        if (terminalPasteShortcut(event)) {
+            return session.pasteClipboard(allocator) catch |err| {
+                log.warn("terminal paste failed: {s}", .{@errorName(err)});
+                return true;
+            };
+        }
+        if (terminalCopyShortcut(event)) {
+            return session.copyScreenToClipboard(allocator) catch |err| {
+                log.warn("terminal copy failed: {s}", .{@errorName(err)});
+                return true;
+            };
         }
         return false;
     }
@@ -1053,6 +1080,26 @@ const UnsupportedSession = struct {
     pub fn handleKeyDown(_: *UnsupportedSession, _: *const sdl.KeyboardEvent) !bool {
         return false;
     }
+
+    pub fn scrollViewport(_: *UnsupportedSession, _: std.mem.Allocator, _: TerminalScroll) !void {}
+
+    pub fn pasteClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
+        return false;
+    }
+
+    pub fn copyScreenToClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
+        return false;
+    }
+
+    pub fn visibleRows(_: *const UnsupportedSession) u16 {
+        return INITIAL_ROWS;
+    }
+};
+
+const TerminalScroll = union(enum) {
+    delta: isize,
+    top,
+    bottom,
 };
 
 const UnixSession = struct {
@@ -1258,9 +1305,43 @@ const UnixSession = struct {
         if (wheel_y == 0.0) return false;
         const line_count_float = @max(@round(@abs(wheel_y) * WHEEL_SCROLL_LINES), 1.0);
         const line_count: isize = @intFromFloat(line_count_float);
-        self.terminal.scrollViewport(.{ .delta = if (wheel_y > 0.0) -line_count else line_count });
-        try self.refreshRenderState(allocator);
+        try self.scrollViewport(allocator, .{ .delta = if (wheel_y > 0.0) -line_count else line_count });
         return true;
+    }
+
+    pub fn scrollViewport(self: *UnixSession, allocator: std.mem.Allocator, scroll: TerminalScroll) !void {
+        self.terminal.scrollViewport(switch (scroll) {
+            .delta => |delta| .{ .delta = delta },
+            .top => .top,
+            .bottom => .bottom,
+        });
+        try self.refreshRenderState(allocator);
+    }
+
+    pub fn pasteClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        if (!self.running) return false;
+        const clipboard_ptr = sdl.getClipboardText() catch return false;
+        defer sdl.free(clipboard_ptr);
+        const clipboard_text = std.mem.sliceTo(clipboard_ptr, 0);
+        if (clipboard_text.len == 0) return false;
+
+        try writeTerminalPaste(allocator, self.master_fd, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+        return true;
+    }
+
+    pub fn copyScreenToClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        const screen_text = try copyableRenderStateText(allocator, &self.render_state);
+        defer allocator.free(screen_text);
+        if (std.mem.trim(u8, screen_text, " \t\r\n").len == 0) return false;
+
+        const clipboard_text = try allocator.dupeZ(u8, screen_text);
+        defer allocator.free(clipboard_text);
+        try sdl.setClipboardText(clipboard_text);
+        return true;
+    }
+
+    pub fn visibleRows(self: *const UnixSession) u16 {
+        return self.rows;
     }
 
     fn refreshRenderState(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -1605,6 +1686,82 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
     }
 }
 
+fn writeTerminalPaste(allocator: std.mem.Allocator, fd: std.posix.fd_t, text: []const u8, bracketed: bool) !void {
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(allocator);
+
+    if (bracketed) try encoded.appendSlice(allocator, "\x1b[200~");
+    for (text) |byte| {
+        try encoded.append(allocator, if (terminalPasteUnsafeByte(byte))
+            ' '
+        else if (!bracketed and byte == '\n')
+            '\r'
+        else
+            byte);
+    }
+    if (bracketed) try encoded.appendSlice(allocator, "\x1b[201~");
+    try writeAll(fd, encoded.items);
+}
+
+fn copyableRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    for (row_cells, 0..) |cells, row_index| {
+        const cells_slice = cells.slice();
+        const raw_cells = cells_slice.items(.raw);
+        const row_graphemes = cells_slice.items(.grapheme);
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(allocator);
+
+        for (raw_cells, 0..) |raw_cell, cell_index| {
+            if (raw_cell.wide == .spacer_tail) continue;
+            if (!raw_cell.hasText()) {
+                try row.append(allocator, ' ');
+                continue;
+            }
+
+            var text_buf: [128]u8 = undefined;
+            const text = terminalCellText(raw_cell, terminalGraphemesForCell(raw_cell, row_graphemes, cell_index), &text_buf) orelse " ";
+            try row.appendSlice(allocator, text);
+            if (raw_cell.wide == .wide) try row.append(allocator, ' ');
+        }
+
+        const trimmed = std.mem.trimEnd(u8, row.items, " \t");
+        try output.appendSlice(allocator, trimmed);
+        if (row_index + 1 < row_cells.len) try output.append(allocator, '\n');
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn terminalGraphemesForCell(cell: ghostty_vt.Cell, graphemes: []const []const u21, index: usize) []const u21 {
+    return if (cell.hasGrapheme()) graphemes[index] else &.{};
+}
+
+fn terminalCellText(raw_cell: ghostty_vt.Cell, graphemes: []const u21, buffer: []u8) ?[]const u8 {
+    if (!raw_cell.hasText()) return null;
+    var index: usize = 0;
+    index += std.unicode.utf8Encode(raw_cell.codepoint(), buffer[index..]) catch return null;
+    if (raw_cell.hasGrapheme()) {
+        for (graphemes) |cp| {
+            if (index >= buffer.len) break;
+            index += std.unicode.utf8Encode(cp, buffer[index..]) catch break;
+        }
+    }
+    return buffer[0..index];
+}
+
+fn terminalPasteUnsafeByte(byte: u8) bool {
+    return switch (byte) {
+        0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F, 0x03, 0x1C, 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F => true,
+        else => false,
+    };
+}
+
 fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
     if (modifierPressed(event.mod, sdl.Keymod.ctrl)) return false;
     if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
@@ -1739,6 +1896,41 @@ fn modsFromKeyboardEvent(event: *const sdl.KeyboardEvent) ghostty_vt.input.KeyMo
 fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
     const state_bits = @as(*const u16, @ptrCast(&state)).*;
     return (state_bits & mask) != 0;
+}
+
+fn terminalScrollShortcut(event: *const sdl.KeyboardEvent, rows: u16) ?TerminalScroll {
+    if (modifierPressed(event.mod, sdl.Keymod.alt) or modifierPressed(event.mod, sdl.Keymod.gui)) return null;
+    const shift = modifierPressed(event.mod, sdl.Keymod.shift);
+    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+    return switch (event.scancode) {
+        .pageup => if (shift and !ctrl) .{ .delta = -terminalPageScrollLines(rows) } else null,
+        .pagedown => if (shift and !ctrl) .{ .delta = terminalPageScrollLines(rows) } else null,
+        .up => if (shift and ctrl) .{ .delta = -KEY_SCROLL_LINES } else null,
+        .down => if (shift and ctrl) .{ .delta = KEY_SCROLL_LINES } else null,
+        .home => if (shift and ctrl) .top else null,
+        .end => if (shift and ctrl) .bottom else null,
+        else => null,
+    };
+}
+
+fn terminalPageScrollLines(rows: u16) isize {
+    return @max(@as(isize, @intCast(rows)) - 1, KEY_SCROLL_LINES);
+}
+
+fn terminalPasteShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .v) return false;
+    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
+        modifierPressed(event.mod, sdl.Keymod.shift) and
+        !modifierPressed(event.mod, sdl.Keymod.alt) and
+        !modifierPressed(event.mod, sdl.Keymod.gui);
+}
+
+fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .c) return false;
+    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
+        modifierPressed(event.mod, sdl.Keymod.shift) and
+        !modifierPressed(event.mod, sdl.Keymod.alt) and
+        !modifierPressed(event.mod, sdl.Keymod.gui);
 }
 
 fn mapScancodeToGhostty(scancode: sdl.Scancode) ?ghostty_vt.input.Key {
