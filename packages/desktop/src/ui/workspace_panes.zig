@@ -72,6 +72,161 @@ pub fn isFocusAnimating() bool {
     return (nowMs() - focus_anim_start_ms) < FOCUS_ANIM_DURATION_MS;
 }
 
+pub const FocusDirection = enum { left, right, up, down };
+
+pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
+    if (pane_rect_count == 0) return false;
+    if (state.projects.items.len == 0) return false;
+    const current_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+
+    var current_rect: ?palette.Rect = null;
+    var i: usize = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        if (pane_rects[i].pane_id == current_id) {
+            current_rect = pane_rects[i].rect;
+            break;
+        }
+    }
+    const cur = current_rect orelse return false;
+    const cx = cur.x + cur.w * 0.5;
+    const cy = cur.y + cur.h * 0.5;
+
+    var best_id: ?runtime.WorkspacePaneId = null;
+    var best_score: f32 = std.math.inf(f32);
+
+    i = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        const entry = pane_rects[i];
+        if (entry.pane_id == current_id) continue;
+        const ex = entry.rect.x + entry.rect.w * 0.5;
+        const ey = entry.rect.y + entry.rect.h * 0.5;
+        const dx = ex - cx;
+        const dy = ey - cy;
+        const passes = switch (dir) {
+            .left => dx < -1.0 and rangesOverlap(cur.y, cur.y + cur.h, entry.rect.y, entry.rect.y + entry.rect.h),
+            .right => dx > 1.0 and rangesOverlap(cur.y, cur.y + cur.h, entry.rect.y, entry.rect.y + entry.rect.h),
+            .up => dy < -1.0 and rangesOverlap(cur.x, cur.x + cur.w, entry.rect.x, entry.rect.x + entry.rect.w),
+            .down => dy > 1.0 and rangesOverlap(cur.x, cur.x + cur.w, entry.rect.x, entry.rect.x + entry.rect.w),
+        };
+        if (!passes) continue;
+        const primary = switch (dir) {
+            .left, .right => @abs(dx),
+            .up, .down => @abs(dy),
+        };
+        // Tie-break by perpendicular distance so a side-by-side candidate beats
+        // a diagonal one that happens to share a single-pixel overlap.
+        const perpendicular = switch (dir) {
+            .left, .right => @abs(dy),
+            .up, .down => @abs(dx),
+        };
+        const score = primary + perpendicular * 0.1;
+        if (score < best_score) {
+            best_score = score;
+            best_id = entry.pane_id;
+        }
+    }
+
+    const target = best_id orelse return false;
+    _ = state.focusCurrentProjectWorkspacePane(target);
+    state.markDirty();
+    return true;
+}
+
+fn rangesOverlap(a0: f32, a1: f32, b0: f32, b1: f32) bool {
+    return a0 < b1 and b0 < a1;
+}
+
+const GROW_RATIO_STEP: f32 = 0.05;
+
+fn oppositeDirection(dir: FocusDirection) FocusDirection {
+    return switch (dir) {
+        .left => .right,
+        .right => .left,
+        .up => .down,
+        .down => .up,
+    };
+}
+
+fn findNeighborId(current_id: runtime.WorkspacePaneId, cur: palette.Rect, dir: FocusDirection) ?runtime.WorkspacePaneId {
+    const cx = cur.x + cur.w * 0.5;
+    const cy = cur.y + cur.h * 0.5;
+    var best_id: ?runtime.WorkspacePaneId = null;
+    var best_score: f32 = std.math.inf(f32);
+    var i: usize = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        const entry = pane_rects[i];
+        if (entry.pane_id == current_id) continue;
+        const ex = entry.rect.x + entry.rect.w * 0.5;
+        const ey = entry.rect.y + entry.rect.h * 0.5;
+        const dx = ex - cx;
+        const dy = ey - cy;
+        const passes = switch (dir) {
+            .left => dx < -1.0 and rangesOverlap(cur.y, cur.y + cur.h, entry.rect.y, entry.rect.y + entry.rect.h),
+            .right => dx > 1.0 and rangesOverlap(cur.y, cur.y + cur.h, entry.rect.y, entry.rect.y + entry.rect.h),
+            .up => dy < -1.0 and rangesOverlap(cur.x, cur.x + cur.w, entry.rect.x, entry.rect.x + entry.rect.w),
+            .down => dy > 1.0 and rangesOverlap(cur.x, cur.x + cur.w, entry.rect.x, entry.rect.x + entry.rect.w),
+        };
+        if (!passes) continue;
+        const primary = switch (dir) {
+            .left, .right => @abs(dx),
+            .up, .down => @abs(dy),
+        };
+        const perpendicular = switch (dir) {
+            .left, .right => @abs(dy),
+            .up, .down => @abs(dx),
+        };
+        const score = primary + perpendicular * 0.1;
+        if (score < best_score) {
+            best_score = score;
+            best_id = entry.pane_id;
+        }
+    }
+    return best_id;
+}
+
+pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
+    if (pane_rect_count == 0) return false;
+    if (state.projects.items.len == 0) return false;
+    const current_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+
+    var current_rect: ?palette.Rect = null;
+    var i: usize = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        if (pane_rects[i].pane_id == current_id) {
+            current_rect = pane_rects[i].rect;
+            break;
+        }
+    }
+    const cur = current_rect orelse return false;
+
+    // Prefer the neighbor on the same side as the key direction so the user's
+    // grow-toward-edge intent maps onto the boundary they expect. When there
+    // is no neighbor on that side, fall back to the opposite neighbor so the
+    // key still moves the nearest boundary (e.g. Alt+Shift+Left in the left
+    // pane shrinks it by pulling its right edge in).
+    var neighbor_side = dir;
+    var neighbor_id = findNeighborId(current_id, cur, neighbor_side);
+    if (neighbor_id == null) {
+        neighbor_side = oppositeDirection(dir);
+        neighbor_id = findNeighborId(current_id, cur, neighbor_side);
+    }
+    const target = neighbor_id orelse return false;
+
+    const axis: runtime.WorkspaceSplitAxis = switch (dir) {
+        .left, .right => .vertical,
+        .up, .down => .horizontal,
+    };
+    // If the neighbor sits on the negative side of the axis (left/up), it is
+    // the split's `first` child; otherwise it is `second`.
+    const neighbor_is_first = (neighbor_side == .left) or (neighbor_side == .up);
+    const first_id = if (neighbor_is_first) target else current_id;
+    const second_id = if (neighbor_is_first) current_id else target;
+    // Boundary direction: right/down = positive (ratio grows); left/up = negative.
+    const positive = (dir == .right) or (dir == .down);
+    const delta: f32 = if (positive) GROW_RATIO_STEP else -GROW_RATIO_STEP;
+    return state.nudgeCurrentProjectWorkspaceSplit(first_id, second_id, axis, delta);
+}
+
 fn tickFocusAnimation(state: *runtime.AppState) void {
     if (state.projects.items.len == 0) return;
     const focused = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id;

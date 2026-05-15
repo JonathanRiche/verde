@@ -25,6 +25,14 @@ pub const NativeKeyboardAction = enum {
     workspace_toggle_maximize,
     workspace_minimize,
     workspace_close,
+    workspace_focus_left,
+    workspace_focus_right,
+    workspace_focus_up,
+    workspace_focus_down,
+    workspace_grow_left,
+    workspace_grow_right,
+    workspace_grow_up,
+    workspace_grow_down,
 };
 
 pub const NativeTerminalAction = enum {
@@ -123,6 +131,14 @@ pub const NativeKeyboardConfig = struct {
     workspace_toggle_maximize: []Keybind,
     workspace_minimize: []Keybind,
     workspace_close: []Keybind,
+    workspace_focus_left: []Keybind,
+    workspace_focus_right: []Keybind,
+    workspace_focus_up: []Keybind,
+    workspace_focus_down: []Keybind,
+    workspace_grow_left: []Keybind,
+    workspace_grow_right: []Keybind,
+    workspace_grow_up: []Keybind,
+    workspace_grow_down: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -154,9 +170,17 @@ pub const NativeKeyboardConfig = struct {
             .workspace_split_chat_horizontal = try cloneEmptyKeybinds(allocator),
             .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
             .workspace_split_terminal_horizontal = try cloneEmptyKeybinds(allocator),
-            .workspace_toggle_maximize = try cloneEmptyKeybinds(allocator),
+            .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
             .workspace_minimize = try cloneEmptyKeybinds(allocator),
             .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
+            .workspace_focus_left = try cloneDefaultWorkspaceFocusLeftKeybinds(allocator),
+            .workspace_focus_right = try cloneDefaultWorkspaceFocusRightKeybinds(allocator),
+            .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
+            .workspace_focus_down = try cloneDefaultWorkspaceFocusDownKeybinds(allocator),
+            .workspace_grow_left = try cloneDefaultWorkspaceGrowLeftKeybinds(allocator),
+            .workspace_grow_right = try cloneDefaultWorkspaceGrowRightKeybinds(allocator),
+            .workspace_grow_up = try cloneDefaultWorkspaceGrowUpKeybinds(allocator),
+            .workspace_grow_down = try cloneDefaultWorkspaceGrowDownKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -202,6 +226,14 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_toggle_maximize);
         self.allocator.free(self.workspace_minimize);
         self.allocator.free(self.workspace_close);
+        self.allocator.free(self.workspace_focus_left);
+        self.allocator.free(self.workspace_focus_right);
+        self.allocator.free(self.workspace_focus_up);
+        self.allocator.free(self.workspace_focus_down);
+        self.allocator.free(self.workspace_grow_left);
+        self.allocator.free(self.workspace_grow_right);
+        self.allocator.free(self.workspace_grow_up);
+        self.allocator.free(self.workspace_grow_down);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -255,6 +287,30 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.workspace_close, event)) {
             return .workspace_close;
+        }
+        if (matchesAny(self.workspace_focus_left, event)) {
+            return .workspace_focus_left;
+        }
+        if (matchesAny(self.workspace_focus_right, event)) {
+            return .workspace_focus_right;
+        }
+        if (matchesAny(self.workspace_focus_up, event)) {
+            return .workspace_focus_up;
+        }
+        if (matchesAny(self.workspace_focus_down, event)) {
+            return .workspace_focus_down;
+        }
+        if (matchesAny(self.workspace_grow_left, event)) {
+            return .workspace_grow_left;
+        }
+        if (matchesAny(self.workspace_grow_right, event)) {
+            return .workspace_grow_right;
+        }
+        if (matchesAny(self.workspace_grow_up, event)) {
+            return .workspace_grow_up;
+        }
+        if (matchesAny(self.workspace_grow_down, event)) {
+            return .workspace_grow_down;
         }
 
         return null;
@@ -539,6 +595,54 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_close = bindings;
             }
         }
+        if (workspace_value.object.get("focus_left")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_left")) |bindings| {
+                self.allocator.free(self.workspace_focus_left);
+                self.workspace_focus_left = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_right")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_right")) |bindings| {
+                self.allocator.free(self.workspace_focus_right);
+                self.workspace_focus_right = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_up")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_up")) |bindings| {
+                self.allocator.free(self.workspace_focus_up);
+                self.workspace_focus_up = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_down")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_down")) |bindings| {
+                self.allocator.free(self.workspace_focus_down);
+                self.workspace_focus_down = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_left")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_left")) |bindings| {
+                self.allocator.free(self.workspace_grow_left);
+                self.workspace_grow_left = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_right")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_right")) |bindings| {
+                self.allocator.free(self.workspace_grow_right);
+                self.workspace_grow_right = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_up")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_up")) |bindings| {
+                self.allocator.free(self.workspace_grow_up);
+                self.workspace_grow_up = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_down")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_down")) |bindings| {
+                self.allocator.free(self.workspace_grow_down);
+                self.workspace_grow_down = bindings;
+            }
+        }
     }
 
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
@@ -757,6 +861,60 @@ fn cloneDefaultTerminalFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybin
 fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Alt+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Up"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Down"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Up"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Down"),
+    });
+}
+
+fn cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Z"),
     });
 }
 
