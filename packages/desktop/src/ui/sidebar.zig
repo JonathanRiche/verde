@@ -299,6 +299,12 @@ pub fn hasActiveThreadDrag() bool {
     return thread_drag.pending or thread_drag.active;
 }
 
+pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+    if (!thread_drag.pending and !thread_drag.active) return false;
+    if (buttons.left != 0) return false;
+    return finishThreadDrag(state, x, y);
+}
+
 fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
     if (!thread_drag.pending and !thread_drag.active) return;
     thread_drag.x = x;
