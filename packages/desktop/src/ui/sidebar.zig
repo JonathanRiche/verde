@@ -339,9 +339,9 @@ fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     }
 
     if (drag.project_index != state.selected_project_index) {
-        workspace_panes.clearThreadDropTarget();
-        state.setSidebarNotice("Switch to that project before dragging its thread into panes.");
-        return true;
+        state.selected_project_index = drag.project_index;
+        state.ensureCurrentProjectWorkspace();
+        state.syncRenameBuffer();
     }
     if (workspace_panes.dropThreadAt(state, drag.thread_index, x, y)) {
         state.setSidebarNotice("");
