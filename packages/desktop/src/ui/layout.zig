@@ -79,6 +79,8 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
         sidebar.renderPalette(state, root_layout.sidebar);
         workspace_panes.renderAt(state, root_layout.workspace);
     }
+    sidebar.renderWorkspaceDragPreview(state);
+    sidebar.renderFloatingDragPreview(state);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
     renderProjectAddModal(state, width, height);
