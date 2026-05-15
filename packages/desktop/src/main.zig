@@ -873,16 +873,24 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 },
                 else => {},
             };
+            if (action) |resolved_app_action| switch (resolved_app_action) {
+                .toggle_terminal,
+                .toggle_browser,
+                .toggle_sidebar,
+                .toggle_sidebar_hidden,
+                .new_thread,
+                => {
+                    handleKeyboardAction(state, keyboard, resolved_app_action);
+                    return true;
+                },
+                else => {},
+            };
             const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
             state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
             if (terminal_key_handled) {
                 return true;
             }
             if (handleFontSizeShortcut(state, &event.key)) {
-                return true;
-            }
-            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .toggle_sidebar_hidden or action == .new_thread) {
-                handleKeyboardAction(state, keyboard, action.?);
                 return true;
             }
             if (browser_ui.handlePaletteKeyDown(state, &event.key)) {

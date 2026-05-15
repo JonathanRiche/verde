@@ -93,6 +93,7 @@ If prompt sending fails, first check that the selected provider is installed, av
 Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` terminal engine.
 
 - Toggle the terminal with `CommandOrControl+J`. The terminal opens as a workspace pane and starts in the selected project's working directory.
+- Create a new chat thread with `CommandOrControl+T`, or split a terminal pane below the focused workspace pane with `CommandOrControl+Shift+T`.
 - Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), maximize or restore a pane, minimize it into the restore strip, or close it.
 - Drag the divider between workspace panes to resize the split.
 - Right-click inside a terminal pane to create normal shell tabs or launch-profile tabs for Claude, OpenCode, Codex, and Cursor.
@@ -122,6 +123,7 @@ Example config:
   },
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
+    "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Alt+B",
     "browser": "Ctrl+B",
@@ -129,13 +131,13 @@ Example config:
       "split_chat_vertical": "CommandOrControl+Alt+C",
       "split_chat_horizontal": "CommandOrControl+Alt+Shift+C",
       "split_terminal_vertical": "CommandOrControl+Alt+J",
-      "split_terminal_horizontal": "CommandOrControl+Alt+Shift+J",
+      "split_terminal_horizontal": "CommandOrControl+Shift+T",
       "toggle_maximize": "CommandOrControl+Alt+M",
       "minimize": "CommandOrControl+Alt+Minus"
     },
     "terminal": {
       "toggle": "CommandOrControl+J",
-      "new_tab": "CommandOrControl+Shift+T",
+      "new_tab": "CommandOrControl+Alt+T",
       "close": "CommandOrControl+Shift+W",
       "rename_tab": "CommandOrControl+Shift+R",
       "tab_previous": "CommandOrControl+Shift+PageUp",
@@ -153,7 +155,7 @@ Example config:
 }
 ```
 
-Keybinds are loaded on startup and app refresh. Use a string for one shortcut or a string array for multiple shortcuts.
+Keybinds are loaded on startup and app refresh. Use a string for one shortcut or a string array for multiple shortcuts. Use `null`, an empty string, or an empty array to disable a binding.
 
 ## Logs
 

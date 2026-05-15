@@ -329,11 +329,7 @@ fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         workspace_panes.clearThreadDropTarget();
         if (drag.project_index < state.projects.items.len and drag.thread_index < state.projects.items[drag.project_index].threads.items.len) {
             state.noteInteraction();
-            state.selected_project_index = drag.project_index;
-            state.projects.items[drag.project_index].selected_thread_index = drag.thread_index;
-            state.requestComposerFocus();
-            state.syncRenameBuffer();
-            state.markDirty();
+            state.selectThreadForProject(drag.project_index, drag.thread_index);
         }
         return true;
     }

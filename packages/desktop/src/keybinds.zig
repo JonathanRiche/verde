@@ -172,7 +172,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_split_chat_vertical = try cloneEmptyKeybinds(allocator),
             .workspace_split_chat_horizontal = try cloneEmptyKeybinds(allocator),
             .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
-            .workspace_split_terminal_horizontal = try cloneEmptyKeybinds(allocator),
+            .workspace_split_terminal_horizontal = try cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator),
             .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
             .workspace_minimize = try cloneEmptyKeybinds(allocator),
             .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
@@ -805,6 +805,12 @@ fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultTerminalNewTabKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+T"),
+    });
+}
+
+fn cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Shift+T"),
     });
 }
@@ -1317,6 +1323,32 @@ test "default new thread keybind uses primary plus t" {
     try std.testing.expect(!config.new_thread[0].meta);
     try std.testing.expect(config.new_thread[0].primary);
     try std.testing.expectEqual(sdl.Keycode.t, config.new_thread[0].key);
+}
+
+test "default terminal pane keybind uses primary shift t" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_split_terminal_horizontal.len);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].alt);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].ctrl);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].meta);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].primary);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.t, config.workspace_split_terminal_horizontal[0].key);
+}
+
+test "default terminal tab keybind uses primary alt t" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.terminal_new_tab.len);
+    try std.testing.expect(config.terminal_new_tab[0].alt);
+    try std.testing.expect(!config.terminal_new_tab[0].ctrl);
+    try std.testing.expect(!config.terminal_new_tab[0].meta);
+    try std.testing.expect(config.terminal_new_tab[0].primary);
+    try std.testing.expect(!config.terminal_new_tab[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
 }
 
 test "default sidebar keybind uses primary plus s" {
