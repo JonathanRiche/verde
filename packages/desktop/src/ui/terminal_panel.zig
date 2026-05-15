@@ -132,7 +132,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     }
     renderContextMenu(state, dock, rect);
     if (dock.takeFocusRequest()) {
-        state.requestTerminalFocus();
+        state.requestTerminalDockFocus(dock_id);
     }
 }
 
@@ -274,9 +274,8 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
         if (row_y > rect.y + rect.h) break;
 
         for (raw_cells, 0..) |raw_cell, x| {
-            const cell_x = rect.x + @as(f32, @floatFromInt(x)) * cell_w;
             const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
-            const cell_rect = palette.Rect{ .x = cell_x, .y = row_y, .w = cell_w * span, .h = cell_h };
+            const cell_rect = terminalCellRect(rect, cell_w, cell_h, x, y, span);
             const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
             var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette });
@@ -297,7 +296,7 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             }
 
             if (!rgbEql(bg, render_state.colors.background) or rawCellNeedsFill(raw_cell)) {
-                queueRect(state, expandedCellRect(cell_rect), rgbPaletteColor(bg, 1.0));
+                queueRect(state, cell_rect, rgbPaletteColor(bg, 1.0));
             }
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
             var text_buf: [128]u8 = undefined;
@@ -305,6 +304,9 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
             const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
             if (glyph_kind == .powerline) {
                 queuePowerlineGlyph(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, 1.0), rect);
+                continue;
+            }
+            if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, 1.0), rect)) {
                 continue;
             }
             const text_rect = terminalTextRect(cell_rect, text_y_offset, glyph_kind);
@@ -587,13 +589,16 @@ fn blendChannel(a: u8, b: u8, t: f32) u8 {
     return @intFromFloat(lhs + (rhs - lhs) * t);
 }
 
-fn expandedCellRect(rect: palette.Rect) palette.Rect {
-    const bleed = theme.scaledUi(0.35);
+fn terminalCellRect(rect: palette.Rect, cell_w: f32, cell_h: f32, x: usize, y: usize, span: f32) palette.Rect {
+    const x0 = @round(rect.x + @as(f32, @floatFromInt(x)) * cell_w);
+    const x1 = @round(rect.x + (@as(f32, @floatFromInt(x)) + span) * cell_w);
+    const y0 = @round(rect.y + @as(f32, @floatFromInt(y)) * cell_h);
+    const y1 = @round(rect.y + (@as(f32, @floatFromInt(y)) + 1.0) * cell_h);
     return .{
-        .x = rect.x - bleed,
-        .y = rect.y - bleed,
-        .w = rect.w + bleed * 2.0,
-        .h = rect.h + bleed * 2.0,
+        .x = x0,
+        .y = y0,
+        .w = @max(x1 - x0, 1.0),
+        .h = @max(y1 - y0, 1.0),
     };
 }
 
@@ -637,6 +642,14 @@ fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Colo
     state.palette_overlay_batch.rect(state.allocator, rect, color) catch {};
 }
 
+fn queueClippedRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect) void {
+    if (clip) |clip_rect| {
+        state.palette_overlay_batch.rectClipped(state.allocator, rect, color, clip_rect) catch {};
+    } else {
+        queueRect(state, rect, color);
+    }
+}
+
 fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color, clip: ?palette.Rect) void {
     if (clip) |clip_rect| {
         state.palette_overlay_batch.triangleClipped(state.allocator, p0, p1, p2, color, clip_rect) catch {};
@@ -662,6 +675,23 @@ fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []co
         .text => .mono,
         .icon, .powerline => .icon,
     };
+    if (glyph_kind == .text) {
+        state.palette_overlay_batch.fixedRoleText(
+            state.allocator,
+            rect,
+            stableText(state, value),
+            color,
+            font_size,
+            font_role,
+            null,
+            clip,
+            .{},
+            rect.w,
+            rect.h,
+            false,
+        ) catch {};
+        return;
+    }
     state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, font_role, null, clip) catch {};
 }
 
@@ -691,6 +721,161 @@ fn queuePowerlineGlyph(state: *app_state.AppState, rect: palette.Rect, cp: u21, 
         ),
         else => queueTerminalText(state, terminalTextRect(rect, 0.0, .icon), "?", color, rect.h, clip, .icon),
     }
+}
+
+fn queueTerminalCellGeometry(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
+    if (queueBlockElement(state, rect, cp, color, clip)) return true;
+    if (queueBoxDrawing(state, rect, cp, color, clip)) return true;
+    if (queueBraillePattern(state, rect, cp, color, clip)) return true;
+    return false;
+}
+
+fn queueBlockElement(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
+    const eighth = rect.h / 8.0;
+    const eighth_w = rect.w / 8.0;
+    switch (cp) {
+        0x2580 => queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h * 0.5 }, color, clip),
+        0x2581...0x2587 => {
+            const rows = @as(f32, @floatFromInt(cp - 0x2580));
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h - eighth * rows, .w = rect.w, .h = eighth * rows }, color, clip);
+        },
+        0x2588 => queueClippedRect(state, rect, color, clip),
+        0x2589...0x258f => {
+            const cols = @as(f32, @floatFromInt(8 - (cp - 0x2588)));
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = eighth_w * cols, .h = rect.h }, color, clip);
+        },
+        0x2590 => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y, .w = rect.w * 0.5, .h = rect.h }, color, clip),
+        0x2594 => queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = @max(eighth, 1.0) }, color, clip),
+        0x2595 => queueClippedRect(state, .{ .x = rect.x + rect.w - @max(eighth_w, 1.0), .y = rect.y, .w = @max(eighth_w, 1.0), .h = rect.h }, color, clip),
+        0x2596 => queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip),
+        0x2597 => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip),
+        0x2598 => queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip),
+        0x2599 => {
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w * 0.5, .h = rect.h }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        0x259a => {
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        0x259b => {
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        0x259c => {
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = rect.h * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        0x259d => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip),
+        0x259e => {
+            queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        0x259f => {
+            queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = rect.y, .w = rect.w * 0.5, .h = rect.h }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h * 0.5, .w = rect.w * 0.5, .h = rect.h * 0.5 }, color, clip);
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn queueBoxDrawing(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
+    if (cp < 0x2500 or cp > 0x257f) return false;
+    const stroke = @max(@round(@min(rect.w, rect.h) * 0.105), 1.0);
+    const cx = rect.x + rect.w * 0.5 - stroke * 0.5;
+    const cy = rect.y + rect.h * 0.5 - stroke * 0.5;
+    switch (cp) {
+        0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254c, 0x254d => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip),
+        0x2502, 0x2503, 0x2506, 0x2507, 0x250a, 0x250b, 0x254e, 0x254f => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip),
+        0x250c...0x250f, 0x256d => {
+            queueClippedRect(state, .{ .x = cx, .y = cy, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = cx, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
+        },
+        0x2510...0x2513, 0x256e => {
+            queueClippedRect(state, .{ .x = cx, .y = cy, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
+        },
+        0x2514...0x2517, 0x2570 => {
+            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = cx, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
+        },
+        0x2518...0x251b, 0x256f => {
+            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 + stroke * 0.5 }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
+        },
+        0x251c...0x254b => {
+            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip);
+            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip);
+        },
+        0x2571 => queueDiagonalGlyph(state, rect, color, clip, true),
+        0x2572 => queueDiagonalGlyph(state, rect, color, clip, false),
+        0x2573 => {
+            queueDiagonalGlyph(state, rect, color, clip, true);
+            queueDiagonalGlyph(state, rect, color, clip, false);
+        },
+        0x2574 => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5, .h = stroke }, color, clip),
+        0x2575 => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h * 0.5 }, color, clip),
+        0x2576 => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = cy, .w = rect.w * 0.5, .h = stroke }, color, clip),
+        0x2577 => queueClippedRect(state, .{ .x = cx, .y = rect.y + rect.h * 0.5, .w = stroke, .h = rect.h * 0.5 }, color, clip),
+        0x2578 => queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w * 0.5, .h = stroke * 1.4 }, color, clip),
+        0x2579 => queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke * 1.4, .h = rect.h * 0.5 }, color, clip),
+        0x257a => queueClippedRect(state, .{ .x = rect.x + rect.w * 0.5, .y = cy, .w = rect.w * 0.5, .h = stroke * 1.4 }, color, clip),
+        0x257b => queueClippedRect(state, .{ .x = cx, .y = rect.y + rect.h * 0.5, .w = stroke * 1.4, .h = rect.h * 0.5 }, color, clip),
+        0x257c...0x257f => {
+            queueClippedRect(state, .{ .x = rect.x, .y = cy, .w = rect.w, .h = stroke }, color, clip);
+            queueClippedRect(state, .{ .x = cx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip);
+        },
+        else => return false,
+    }
+    return true;
+}
+
+fn queueDiagonalGlyph(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect, rising: bool) void {
+    const steps: usize = 8;
+    const step_w = rect.w / @as(f32, @floatFromInt(steps));
+    const step_h = rect.h / @as(f32, @floatFromInt(steps));
+    for (0..steps) |i| {
+        const fi = @as(f32, @floatFromInt(i));
+        const y_index = if (rising) steps - 1 - i else i;
+        queueClippedRect(state, .{
+            .x = rect.x + fi * step_w,
+            .y = rect.y + @as(f32, @floatFromInt(y_index)) * step_h,
+            .w = @max(step_w, 1.0),
+            .h = @max(step_h, 1.0),
+        }, color, clip);
+    }
+}
+
+fn queueBraillePattern(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) bool {
+    if (cp < 0x2800 or cp > 0x28ff) return false;
+    const bits = cp - 0x2800;
+    if (bits == 0) return true;
+    const dot_w = @max(@floor(rect.w / 3.0), 1.0);
+    const dot_h = @max(@floor(rect.h / 5.0), 1.0);
+    const x0 = rect.x + rect.w * 0.18;
+    const x1 = rect.x + rect.w * 0.62;
+    const ys = [_]f32{
+        rect.y + rect.h * 0.08,
+        rect.y + rect.h * 0.32,
+        rect.y + rect.h * 0.56,
+        rect.y + rect.h * 0.80,
+    };
+    const dots = [_]struct { bit: u8, x: f32, y: f32 }{
+        .{ .bit = 0, .x = x0, .y = ys[0] },
+        .{ .bit = 1, .x = x0, .y = ys[1] },
+        .{ .bit = 2, .x = x0, .y = ys[2] },
+        .{ .bit = 6, .x = x0, .y = ys[3] },
+        .{ .bit = 3, .x = x1, .y = ys[0] },
+        .{ .bit = 4, .x = x1, .y = ys[1] },
+        .{ .bit = 5, .x = x1, .y = ys[2] },
+        .{ .bit = 7, .x = x1, .y = ys[3] },
+    };
+    for (dots) |dot| {
+        if ((bits & (@as(u21, 1) << @intCast(dot.bit))) == 0) continue;
+        queueClippedRect(state, .{ .x = dot.x, .y = dot.y, .w = dot_w, .h = dot_h }, color, clip);
+    }
+    return true;
 }
 
 fn paletteColor(color: [4]f32) palette.Color {

@@ -333,12 +333,32 @@ pub const RenderBatch = struct {
         line_height: f32,
         wrap: bool,
     ) !void {
+        try self.fixedRoleText(allocator, r, value, color, font_size, null, null, clip, scroll_value, glyph_width, line_height, wrap);
+    }
+
+    pub fn fixedRoleText(
+        self: *RenderBatch,
+        allocator: std.mem.Allocator,
+        r: Rect,
+        value: []const u8,
+        color: Color,
+        font_size: f32,
+        font_role: ?FontRole,
+        font_id: ?u32,
+        clip: ?Rect,
+        scroll_value: Vec2,
+        glyph_width: f32,
+        line_height: f32,
+        wrap: bool,
+    ) !void {
         try self.appendCommand(allocator, .{
             .kind = .text,
             .rect = r,
             .color = color,
             .text = value,
             .font_size = font_size,
+            .font_role = font_role,
+            .font_id = font_id,
             .clip = clip,
             .scroll = scroll_value,
             .glyph_width = glyph_width,
