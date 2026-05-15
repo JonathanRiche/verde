@@ -1286,10 +1286,22 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .windows => {
+            var ft: std.os.windows.FILETIME = undefined;
+            std.os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | @as(i64, ft.dwLowDateTime);
+            const unix_epoch_in_filetime_ticks: i64 = 116444736000000000;
+            return @divTrunc(ticks - unix_epoch_in_filetime_ticks, 10000);
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+            return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+                @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+        },
+    }
 }
 
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {

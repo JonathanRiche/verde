@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 const profiler = @import("profiler.zig");
@@ -12,6 +13,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const process_env = @import("process_env.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
@@ -4802,7 +4804,8 @@ pub const AppState = struct {
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
         if (!self.browser_textures_enabled) return;
 
-        const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
+        const value = process_env.readEnvVarAlloc(self.allocator, "VERDE_OPEN_BROWSER_ON_START") orelse return;
+        defer self.allocator.free(value);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
         // user click after the window is live instead of front-loading browser
@@ -7380,8 +7383,11 @@ pub const AppState = struct {
     }
 
     fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
+        const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
         const expanded = if (std.mem.startsWith(u8, raw_path, "~/")) blk: {
-            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
+            const home = process_env.readEnvVarAlloc(self.allocator, home_var) orelse
+                return error.EnvironmentVariableNotFound;
+            defer self.allocator.free(home);
             break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, raw_path[2..] });
         } else try self.allocator.dupe(u8, raw_path);
         defer self.allocator.free(expanded);
@@ -7487,8 +7493,10 @@ pub const AppState = struct {
             } else |_| {}
         }
 
-        const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return self.allocator.dupe(u8, "."), 0);
-        return self.allocator.dupe(u8, home);
+        const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+        const home = process_env.readEnvVarAlloc(self.allocator, home_var) orelse
+            return self.allocator.dupe(u8, ".");
+        return home;
     }
 
     fn pushCodeCopyButtonTrampoline(context: *anyopaque, hit: chat_markdown.CodeCopyButtonSink) void {
@@ -7837,8 +7845,19 @@ fn unixTimestampSeconds() i64 {
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    switch (builtin.os.tag) {
+        .windows => {
+            var ft: std.os.windows.FILETIME = undefined;
+            std.os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | @as(i64, ft.dwLowDateTime);
+            const unix_epoch_in_filetime_ticks: i64 = 116444736000000000;
+            return @divTrunc(ticks - unix_epoch_in_filetime_ticks, 10000);
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+            return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+                @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+        },
+    }
 }

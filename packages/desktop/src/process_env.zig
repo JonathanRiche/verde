@@ -1,21 +1,32 @@
 //! Shared subprocess environment helpers for packaged desktop launches.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
-const PATH_SEPARATOR: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
-const SYSTEM_PATH_DIRS = [_][]const u8{
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
+const PATH_SEPARATOR: u8 = if (builtin.os.tag == .windows) ';' else ':';
+// Phase 3 will populate these with the full Windows search list
+// (%SystemRoot%\System32, %ProgramFiles%\nodejs, %LOCALAPPDATA%\Programs\…, etc.).
+const SYSTEM_PATH_DIRS: []const []const u8 = switch (builtin.os.tag) {
+    .windows => &.{},
+    else => &.{
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    },
 };
-const HOME_PATH_SUFFIXES = [_][]const u8{
-    ".local/bin",
-    ".bun/bin",
-    ".cargo/bin",
-    ".local/share/mise/shims",
+const HOME_PATH_SUFFIXES: []const []const u8 = switch (builtin.os.tag) {
+    .windows => &.{},
+    else => &.{
+        ".local/bin",
+        ".bun/bin",
+        ".cargo/bin",
+        ".local/share/mise/shims",
+    },
 };
+
+const HOME_ENV_VAR = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
 
 /// Builds an environment map with a PATH that works for packaged GUI launches.
 pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
@@ -30,8 +41,7 @@ pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.Environ.M
         try path_builder.appendSlice(allocator, current_path);
     }
 
-    if (std.c.getenv("HOME")) |home_z| {
-        const home = std.mem.sliceTo(home_z, 0);
+    if (env_map.get(HOME_ENV_VAR)) |home| {
         for (HOME_PATH_SUFFIXES) |suffix| {
             const dir = try std.fs.path.join(allocator, &.{ home, suffix });
             defer allocator.free(dir);
@@ -51,8 +61,21 @@ pub fn buildAugmentedEnvMap(allocator: std.mem.Allocator) !std.process.Environ.M
 }
 
 fn currentEnviron() std.process.Environ {
-    if (@import("builtin").os.tag == .windows) return .{ .block = .global };
-    return .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    return switch (builtin.os.tag) {
+        .windows => .{ .block = .global },
+        else => .{ .block = .{ .slice = std.mem.span(std.c.environ) } },
+    };
+}
+
+/// Reads a single environment variable from the current process. Returns
+/// caller-owned memory or null when the variable is unset / on alloc failure.
+/// Cross-platform: Zig 0.16 removed `std.process.getEnvVarOwned`; this is the
+/// canonical replacement that goes through `Environ.Map.get`.
+pub fn readEnvVarAlloc(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    var env_map = std.process.Environ.createMap(currentEnviron(), allocator) catch return null;
+    defer env_map.deinit();
+    const value = env_map.get(name) orelse return null;
+    return allocator.dupe(u8, value) catch null;
 }
 
 /// Resolves an executable against the provided environment map.
@@ -89,14 +112,25 @@ pub fn resolveExecutableInEnvMapAlloc(
 }
 
 fn checkExecutableAccess(allocator: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    if (std.c.access(path_z.ptr, std.c.X_OK) == 0) return;
-    return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-        .NOENT, .NOTDIR => error.FileNotFound,
-        .ACCES => error.AccessDenied,
-        else => error.Unexpected,
-    };
+    switch (builtin.os.tag) {
+        .windows => {
+            // Phase 3 will distinguish FileNotFound vs AccessDenied so callers can
+            // skip vs fail-fast; Phase 1 just needs "exists or doesn't" for the
+            // PATH walk loop, which already maps both to "skip this candidate".
+            var threaded = std.Io.Threaded.init_single_threaded;
+            std.Io.Dir.cwd().access(threaded.io(), path, .{}) catch return error.FileNotFound;
+        },
+        else => {
+            const path_z = try allocator.dupeZ(u8, path);
+            defer allocator.free(path_z);
+            if (std.c.access(path_z.ptr, std.c.X_OK) == 0) return;
+            return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+                .NOENT, .NOTDIR => error.FileNotFound,
+                .ACCES => error.AccessDenied,
+                else => error.Unexpected,
+            };
+        },
+    }
 }
 
 /// Returns true when the executable can be found in the augmented PATH.
@@ -128,6 +162,12 @@ fn pathContainsDir(path_env: []const u8, dir: []const u8) bool {
 }
 
 fn isQualifiedExecutablePath(executable: []const u8) bool {
-    return std.mem.indexOfScalar(u8, executable, '/') != null or
-        std.mem.indexOfScalar(u8, executable, '\\') != null;
+    if (std.mem.indexOfScalar(u8, executable, '/') != null) return true;
+    if (std.mem.indexOfScalar(u8, executable, '\\') != null) return true;
+    if (builtin.os.tag == .windows and executable.len >= 2 and
+        std.ascii.isAlphabetic(executable[0]) and executable[1] == ':')
+    {
+        return true;
+    }
+    return false;
 }

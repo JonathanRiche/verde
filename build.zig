@@ -2,19 +2,25 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const target = b.option([]const u8, "target", "Forwarded to the desktop build (e.g. x86_64-windows-msvc)");
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the desktop executable");
+    const sdl3_msvc_root = b.option([]const u8, "sdl3-msvc-root", "Path to extracted SDL3-devel-VC archive (Windows MSVC builds)");
+    const sdl3_ttf_msvc_root = b.option([]const u8, "sdl3-ttf-msvc-root", "Path to extracted SDL3_ttf-devel-VC archive (Windows MSVC builds)");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK");
 
     const build_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = null,
         .forward_runtime_args = false,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_msvc_root = sdl3_msvc_root,
+        .sdl3_ttf_msvc_root = sdl3_ttf_msvc_root,
         .cef_stub_preview = cef_stub_preview,
     });
     b.default_step.dependOn(&build_cmd.step);
@@ -22,10 +28,13 @@ pub fn build(b: *std.Build) void {
     const run_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "run",
         .forward_runtime_args = true,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_msvc_root = sdl3_msvc_root,
+        .sdl3_ttf_msvc_root = sdl3_ttf_msvc_root,
         .cef_stub_preview = cef_stub_preview,
     });
     const run_step = b.step("run", "Run the desktop app from the repo root");
@@ -34,10 +43,13 @@ pub fn build(b: *std.Build) void {
     const test_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "test",
         .forward_runtime_args = false,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_msvc_root = sdl3_msvc_root,
+        .sdl3_ttf_msvc_root = sdl3_ttf_msvc_root,
         .cef_stub_preview = cef_stub_preview,
     });
     const test_step = b.step("test", "Run desktop tests from the repo root");
@@ -47,10 +59,13 @@ pub fn build(b: *std.Build) void {
 const DesktopCommandOptions = struct {
     subcommand: ?[]const u8,
     forward_runtime_args: bool,
+    target: ?[]const u8 = null,
     ui_debug: ?bool = null,
     palette_renderer: ?PaletteRendererBackend = null,
     cef_sdk_path: ?[]const u8 = null,
     sdl3_runtime_lib: ?[]const u8 = null,
+    sdl3_msvc_root: ?[]const u8 = null,
+    sdl3_ttf_msvc_root: ?[]const u8 = null,
     cef_stub_preview: ?bool = null,
 };
 
@@ -69,6 +84,9 @@ fn addDesktopCommand(
     if (optimize != .Debug) {
         argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(optimize)})) catch @panic("OOM");
     }
+    if (options.target) |value| {
+        argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
+    }
     if (options.ui_debug) |value| {
         argv.append(b.allocator, b.fmt("-Dui-debug={}", .{value})) catch @panic("OOM");
     }
@@ -80,6 +98,12 @@ fn addDesktopCommand(
     }
     if (options.sdl3_runtime_lib) |value| {
         argv.append(b.allocator, b.fmt("-Dsdl3-runtime-lib={s}", .{value})) catch @panic("OOM");
+    }
+    if (options.sdl3_msvc_root) |value| {
+        argv.append(b.allocator, b.fmt("-Dsdl3-msvc-root={s}", .{value})) catch @panic("OOM");
+    }
+    if (options.sdl3_ttf_msvc_root) |value| {
+        argv.append(b.allocator, b.fmt("-Dsdl3-ttf-msvc-root={s}", .{value})) catch @panic("OOM");
     }
     if (options.cef_stub_preview) |value| {
         argv.append(b.allocator, b.fmt("-Dcef-stub-preview={}", .{value})) catch @panic("OOM");
