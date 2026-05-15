@@ -1491,6 +1491,11 @@ pub const WorkspaceLayout = struct {
         return resizeNodeSplit(root_node, first_pane_id, second_pane_id, axis, @max(0.18, @min(0.82, ratio)));
     }
 
+    fn nudgeSplitRatio(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, delta: f32) bool {
+        const root_node = self.root orelse return false;
+        return nudgeNodeSplitRatio(root_node, first_pane_id, second_pane_id, axis, delta);
+    }
+
     fn persistedWorkspaceJson(self: *const WorkspaceLayout, allocator: std.mem.Allocator) ![]u8 {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         errdefer writer.deinit();
@@ -1701,6 +1706,23 @@ pub const WorkspaceLayout = struct {
                 }
                 if (resizeNodeSplit(split.first, first_pane_id, second_pane_id, axis, ratio)) return true;
                 return resizeNodeSplit(split.second, first_pane_id, second_pane_id, axis, ratio);
+            },
+        }
+    }
+
+    fn nudgeNodeSplitRatio(node: *WorkspaceNode, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, delta: f32) bool {
+        switch (node.*) {
+            .leaf => return false,
+            .split => |*split| {
+                if (split.axis == axis and
+                    nodeContainsPane(split.first, first_pane_id) and
+                    nodeContainsPane(split.second, second_pane_id))
+                {
+                    split.ratio = @max(0.18, @min(0.82, split.ratio + delta));
+                    return true;
+                }
+                if (nudgeNodeSplitRatio(split.first, first_pane_id, second_pane_id, axis, delta)) return true;
+                return nudgeNodeSplitRatio(split.second, first_pane_id, second_pane_id, axis, delta);
             },
         }
     }
@@ -6688,6 +6710,22 @@ pub const AppState = struct {
         if (layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) {
             self.markDirty();
         }
+    }
+
+    pub fn nudgeCurrentProjectWorkspaceSplit(
+        self: *AppState,
+        first_pane_id: WorkspacePaneId,
+        second_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        delta: f32,
+    ) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.nudgeSplitRatio(first_pane_id, second_pane_id, axis, delta)) {
+            self.markDirty();
+            return true;
+        }
+        return false;
     }
 
     pub fn focusCurrentProjectWorkspaceTerminalPane(self: *AppState) void {

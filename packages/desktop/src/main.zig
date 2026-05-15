@@ -759,6 +759,31 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // Workspace pane shortcuts pre-empt the terminal handler so the
+            // embedded terminal (and anything running inside it, like tmux)
+            // can't swallow Alt-prefixed bindings.
+            if (action) |resolved_workspace_action| switch (resolved_workspace_action) {
+                .workspace_focus_left,
+                .workspace_focus_right,
+                .workspace_focus_up,
+                .workspace_focus_down,
+                .workspace_grow_left,
+                .workspace_grow_right,
+                .workspace_grow_up,
+                .workspace_grow_down,
+                .workspace_split_chat_vertical,
+                .workspace_split_chat_horizontal,
+                .workspace_split_terminal_vertical,
+                .workspace_split_terminal_horizontal,
+                .workspace_toggle_maximize,
+                .workspace_minimize,
+                .workspace_close,
+                => {
+                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
+                    return true;
+                },
+                else => {},
+            };
             const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
             state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
             if (terminal_key_handled) {
@@ -1228,6 +1253,14 @@ fn handleKeyboardAction(
         .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
         .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
         .workspace_close => _ = state.closeFocusedWorkspacePane(),
+        .workspace_focus_left => _ = workspace_panes_ui.focusPaneInDirection(state, .left),
+        .workspace_focus_right => _ = workspace_panes_ui.focusPaneInDirection(state, .right),
+        .workspace_focus_up => _ = workspace_panes_ui.focusPaneInDirection(state, .up),
+        .workspace_focus_down => _ = workspace_panes_ui.focusPaneInDirection(state, .down),
+        .workspace_grow_left => _ = workspace_panes_ui.growPaneInDirection(state, .left),
+        .workspace_grow_right => _ = workspace_panes_ui.growPaneInDirection(state, .right),
+        .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
+        .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
 }
 
