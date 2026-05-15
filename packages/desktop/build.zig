@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
     const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the executable") orelse
         b.graph.environ_map.get("VERDE_SDL3_RUNTIME_LIB") orelse
         defaultSystemSdl3Runtime(b);
+    const sdl3_msvc_root = b.option([]const u8, "sdl3-msvc-root", "Path to extracted SDL3-devel-VC archive (Windows MSVC builds)") orelse
+        b.graph.environ_map.get("VERDE_SDL3_MSVC_ROOT");
+    const sdl3_ttf_msvc_root = b.option([]const u8, "sdl3-ttf-msvc-root", "Path to extracted SDL3_ttf-devel-VC archive (Windows MSVC builds)") orelse
+        b.graph.environ_map.get("VERDE_SDL3_TTF_MSVC_ROOT");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
     const cef_sdk_configured = cef_sdk_path != null and cef_supported;
@@ -132,19 +136,38 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
-            // Phase 1: link names only. Phase 2 wires -Dsdl3-msvc-root and installs
-            // SDL3.dll/SDL3_ttf.dll next to verde.exe. When -Dsdl3-runtime-lib is
-            // supplied (path to a SDL3.dll), install it alongside the exe so the
-            // dev loop has something to load.
-            exe.root_module.linkSystemLibrary("SDL3", .{});
-            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
-            if (sdl3_runtime_lib) |path| {
+            // Phase 1 wiring: -Dsdl3-msvc-root and -Dsdl3-ttf-msvc-root point at
+            // extracted SDL3-devel-*-VC.zip / SDL3_ttf-devel-*-VC.zip releases
+            // from libsdl-org. Each archive lays out:
+            //   <root>/include/...
+            //   <root>/lib/x64/{SDL3,SDL3_ttf}.{dll,lib}
+            // Phase 2 will move the download into scripts/windows/setup.ps1.
+            if (sdl3_msvc_root) |root| {
+                exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "include" }) });
+                exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64" }) });
+                b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                    .{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64", "SDL3.dll" }) },
+                    .bin,
+                    "SDL3.dll",
+                ).step);
+            } else if (sdl3_runtime_lib) |path| {
                 b.getInstallStep().dependOn(&b.addInstallFileWithDir(
                     .{ .cwd_relative = path },
                     .bin,
                     "SDL3.dll",
                 ).step);
             }
+            if (sdl3_ttf_msvc_root) |root| {
+                exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "include" }) });
+                exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64" }) });
+                b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                    .{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64", "SDL3_ttf.dll" }) },
+                    .bin,
+                    "SDL3_ttf.dll",
+                ).step);
+            }
+            exe.root_module.linkSystemLibrary("SDL3", .{});
+            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
         },
         .macos => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
