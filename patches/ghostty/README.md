@@ -27,9 +27,11 @@ in lexical order with `git apply`.
 
 ## Current patches
 
-- `0001-zig-0.16-getenvW.patch` — `packages/ghostty/src/os/path.zig`
-  used `std.process.getenvW`, which was removed in Zig 0.16. Replaced
-  with the cross-platform `std.process.getEnvVarOwned`. Reachable
-  during build-time analysis from `Config.zig::expandPath("pandoc")`
-  even when only the `ghostty-vt` module is consumed. Pushed during
-  Phase 1 of the Windows port.
+- `0001-os-path-expand-stub-on-windows.patch` —
+  `packages/ghostty/src/os/path.zig::expand` used `std.process.getenvW`
+  and `std.fs.cwd().openFile`, both removed in Zig 0.16. The function
+  is only reached from `build/Config.zig::expandPath("pandoc")` and
+  `expandPath("xcodebuild")`, neither of which Verde needs (we consume
+  only the `ghostty-vt` module). Replaced the Windows arm with the
+  same `return null` behavior the POSIX arm has always had upstream.
+  Restore the original walk if a future Verde feature relies on it.
