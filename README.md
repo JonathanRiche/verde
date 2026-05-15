@@ -97,7 +97,7 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 - Drag the divider between workspace panes to resize the split.
 - Right-click inside a terminal pane to create normal shell tabs or launch-profile tabs for Claude, OpenCode, Codex, and Cursor.
 - Terminal-internal tabs and splits remain separate from workspace splits. The terminal keybinds below operate inside the focused terminal pane.
-- Per-terminal zoom works with `Ctrl+-` and `Ctrl+=` while the terminal is focused.
+- Per-terminal zoom works with `Ctrl+-` and `Ctrl+=` while the terminal is focused, and the chosen zoom is restored with the terminal layout.
 
 ## Config And State
 
@@ -112,6 +112,7 @@ Example config:
     "font_size": 20
   },
   "terminal": {
+    "font_size": 18,
     "profiles": [
       {
         "label": "Local Agent",

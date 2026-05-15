@@ -83,12 +83,15 @@ App state is stored through SDL's pref path in `state.sqlite`. User config is lo
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
 
-Config supports UI font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
+Config supports UI and terminal font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
 
 ```json
 {
   "ui": {
     "font_size": 20
+  },
+  "terminal": {
+    "font_size": 18
   },
   "open": {
     "default": "editor"

@@ -7,6 +7,9 @@ const log = std.log.scoped(.native_config);
 const VERDE_CONFIG_RELATIVE_PATH = ".config/verde/verde.json";
 const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 32.0;
+pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
+const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
+const MAX_TERMINAL_FONT_SIZE: f32 = 36.0;
 
 pub const CustomOpenAction = struct {
     label: []u8,
@@ -65,6 +68,7 @@ pub const TerminalLaunchProfileConfig = struct {
 
 pub const AppConfig = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
+    terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
     default_open_action: DefaultOpenAction = .folder,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
 
@@ -237,6 +241,15 @@ fn applyTerminalOverrides(allocator: std.mem.Allocator, config: *AppConfig, term
         log.warn("terminal must be an object when provided", .{});
         return;
     }
+
+    if (terminal_value.object.get("font_size")) |font_size_value| {
+        switch (font_size_value) {
+            .integer => |value| applyTerminalFontSize(config, @floatFromInt(value)),
+            .float => |value| applyTerminalFontSize(config, @floatCast(value)),
+            else => log.warn("terminal.font_size must be a number when provided", .{}),
+        }
+    }
+
     const profiles_value = terminal_value.object.get("profiles") orelse return;
     if (profiles_value != .array) {
         log.warn("terminal.profiles must be an array when provided", .{});
@@ -261,6 +274,10 @@ fn applyTerminalOverrides(allocator: std.mem.Allocator, config: *AppConfig, term
     for (config.terminal_launch_profiles) |*profile| profile.deinit(allocator);
     allocator.free(config.terminal_launch_profiles);
     config.terminal_launch_profiles = profiles.toOwnedSlice(allocator) catch &.{};
+}
+
+fn applyTerminalFontSize(config: *AppConfig, value: f32) void {
+    config.terminal_font_size = theme.clampf(value, MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
 }
 
 fn parseTerminalLaunchProfile(allocator: std.mem.Allocator, value: std.json.Value) ?TerminalLaunchProfileConfig {
