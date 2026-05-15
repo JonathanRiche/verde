@@ -495,8 +495,10 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
             terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
         },
     }
-    const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
-    renderPaneOverlay(state, pane_id, header_rect, reserve);
+    if (kind == .chat and header_h > 0.0) {
+        const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
+        renderPaneOverlay(state, pane_id, header_rect, reserve);
+    }
     const alpha = focusBorderAlpha(pane_id);
     if (alpha > 0.01) {
         var border_color = theme.COLOR_SECONDARY_GREEN;
