@@ -27,6 +27,7 @@ const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
 const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
+const THREAD_DRAG_FLOATING_Z: i32 = 160;
 
 const SidebarHitKind = enum {
     collapse,
@@ -337,6 +338,8 @@ fn renderThreadDragPreview(state: *runtime.AppState) void {
     if (thread_drag.project_index >= state.projects.items.len) return;
     const project = &state.projects.items[thread_drag.project_index];
     if (thread_drag.thread_index >= project.threads.items.len) return;
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
     const thread = &project.threads.items[thread_drag.thread_index];
     const w = theme.scaledUi(220.0);
     const h = theme.scaledUi(38.0);
