@@ -46,8 +46,7 @@
         },
         .zf = .{
             // natecraddock/zf
-            .url = "https://deps.files.ghostty.org/zf-3c52637b7e937c5ae61fd679717da3e276765b23.tar.gz",
-            .hash = "zf-0.10.3-OIRy8RuJAACKA3Lohoumrt85nRbHwbpMcUaLES8vxDnh",
+            .path = "../zf",
             .lazy = true,
         },
         .gobject = .{

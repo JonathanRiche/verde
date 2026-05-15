@@ -23,6 +23,8 @@ pub const INIT_SQL: [:0]const u8 =
     \\    thread_list_expanded integer not null default 0,
     \\    terminal_height real,
     \\    terminal_layout_json text,
+    \\    terminal_docks_json text,
+    \\    workspace_layout_json text,
     \\    selected_thread_index integer not null default 0
     \\);
     \\create unique index if not exists projects_sort_index_idx on projects(sort_index);
@@ -68,6 +70,8 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "projects", "archived", "alter table projects add column archived integer not null default 0");
     try ensureColumn(conn, "projects", "terminal_height", "alter table projects add column terminal_height real");
     try ensureColumn(conn, "projects", "terminal_layout_json", "alter table projects add column terminal_layout_json text");
+    try ensureColumn(conn, "projects", "terminal_docks_json", "alter table projects add column terminal_docks_json text");
+    try ensureColumn(conn, "projects", "workspace_layout_json", "alter table projects add column workspace_layout_json text");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
 }

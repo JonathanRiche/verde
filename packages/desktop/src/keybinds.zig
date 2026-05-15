@@ -18,6 +18,13 @@ pub const NativeKeyboardAction = enum {
     chat_down,
     chat_page_up,
     chat_page_down,
+    workspace_split_chat_vertical,
+    workspace_split_chat_horizontal,
+    workspace_split_terminal_vertical,
+    workspace_split_terminal_horizontal,
+    workspace_toggle_maximize,
+    workspace_minimize,
+    workspace_close,
 };
 
 pub const NativeTerminalAction = enum {
@@ -109,6 +116,13 @@ pub const NativeKeyboardConfig = struct {
     terminal_focus_down: []Keybind,
     terminal_focus_left: []Keybind,
     terminal_focus_right: []Keybind,
+    workspace_split_chat_vertical: []Keybind,
+    workspace_split_chat_horizontal: []Keybind,
+    workspace_split_terminal_vertical: []Keybind,
+    workspace_split_terminal_horizontal: []Keybind,
+    workspace_toggle_maximize: []Keybind,
+    workspace_minimize: []Keybind,
+    workspace_close: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -136,6 +150,13 @@ pub const NativeKeyboardConfig = struct {
             .terminal_focus_down = try cloneDefaultTerminalFocusDownKeybinds(allocator),
             .terminal_focus_left = try cloneDefaultTerminalFocusLeftKeybinds(allocator),
             .terminal_focus_right = try cloneDefaultTerminalFocusRightKeybinds(allocator),
+            .workspace_split_chat_vertical = try cloneEmptyKeybinds(allocator),
+            .workspace_split_chat_horizontal = try cloneEmptyKeybinds(allocator),
+            .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
+            .workspace_split_terminal_horizontal = try cloneEmptyKeybinds(allocator),
+            .workspace_toggle_maximize = try cloneEmptyKeybinds(allocator),
+            .workspace_minimize = try cloneEmptyKeybinds(allocator),
+            .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -174,6 +195,13 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.terminal_focus_down);
         self.allocator.free(self.terminal_focus_left);
         self.allocator.free(self.terminal_focus_right);
+        self.allocator.free(self.workspace_split_chat_vertical);
+        self.allocator.free(self.workspace_split_chat_horizontal);
+        self.allocator.free(self.workspace_split_terminal_vertical);
+        self.allocator.free(self.workspace_split_terminal_horizontal);
+        self.allocator.free(self.workspace_toggle_maximize);
+        self.allocator.free(self.workspace_minimize);
+        self.allocator.free(self.workspace_close);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -206,6 +234,27 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.chat_page_down, event)) {
             return .chat_page_down;
+        }
+        if (matchesAny(self.workspace_split_chat_vertical, event)) {
+            return .workspace_split_chat_vertical;
+        }
+        if (matchesAny(self.workspace_split_chat_horizontal, event)) {
+            return .workspace_split_chat_horizontal;
+        }
+        if (matchesAny(self.workspace_split_terminal_vertical, event)) {
+            return .workspace_split_terminal_vertical;
+        }
+        if (matchesAny(self.workspace_split_terminal_horizontal, event)) {
+            return .workspace_split_terminal_horizontal;
+        }
+        if (matchesAny(self.workspace_toggle_maximize, event)) {
+            return .workspace_toggle_maximize;
+        }
+        if (matchesAny(self.workspace_minimize, event)) {
+            return .workspace_minimize;
+        }
+        if (matchesAny(self.workspace_close, event)) {
+            return .workspace_close;
         }
 
         return null;
@@ -321,6 +370,9 @@ pub const NativeKeyboardConfig = struct {
                 self.allocator.free(self.toggle_terminal);
                 self.toggle_terminal = bindings;
             }
+        }
+        if (keybinds_value.object.get("workspace")) |workspace_value| {
+            self.applyWorkspaceOverrides(workspace_value);
         }
         if (keybinds_value.object.get("chat_up")) |chat_up_value| {
             if (self.parseOverrideValue(chat_up_value, "chat_up")) |bindings| {
@@ -440,6 +492,55 @@ pub const NativeKeyboardConfig = struct {
         }
     }
 
+    fn applyWorkspaceOverrides(self: *NativeKeyboardConfig, workspace_value: std.json.Value) void {
+        if (workspace_value != .object) {
+            log.warn("keybinds.workspace must be an object when provided", .{});
+            return;
+        }
+        if (workspace_value.object.get("split_chat_vertical")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_chat_vertical")) |bindings| {
+                self.allocator.free(self.workspace_split_chat_vertical);
+                self.workspace_split_chat_vertical = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_chat_horizontal")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_chat_horizontal")) |bindings| {
+                self.allocator.free(self.workspace_split_chat_horizontal);
+                self.workspace_split_chat_horizontal = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_terminal_vertical")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_terminal_vertical")) |bindings| {
+                self.allocator.free(self.workspace_split_terminal_vertical);
+                self.workspace_split_terminal_vertical = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_terminal_horizontal")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_terminal_horizontal")) |bindings| {
+                self.allocator.free(self.workspace_split_terminal_horizontal);
+                self.workspace_split_terminal_horizontal = bindings;
+            }
+        }
+        if (workspace_value.object.get("toggle_maximize")) |value| {
+            if (self.parseOverrideValue(value, "workspace.toggle_maximize")) |bindings| {
+                self.allocator.free(self.workspace_toggle_maximize);
+                self.workspace_toggle_maximize = bindings;
+            }
+        }
+        if (workspace_value.object.get("minimize")) |value| {
+            if (self.parseOverrideValue(value, "workspace.minimize")) |bindings| {
+                self.allocator.free(self.workspace_minimize);
+                self.workspace_minimize = bindings;
+            }
+        }
+        if (workspace_value.object.get("close")) |value| {
+            if (self.parseOverrideValue(value, "workspace.close")) |bindings| {
+                self.allocator.free(self.workspace_close);
+                self.workspace_close = bindings;
+            }
+        }
+    }
+
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
         return switch (value) {
             .null => self.allocator.alloc(Keybind, 0) catch null,
@@ -515,6 +616,10 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
+fn cloneEmptyKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.alloc(Keybind, 0);
+}
+
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+O"),
@@ -524,6 +629,12 @@ fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultNewThreadKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+T"),
+    });
+}
+
+fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+W"),
     });
 }
 

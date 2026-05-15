@@ -50,6 +50,28 @@ pub const SplitDirection = enum(u8) {
     right,
 };
 
+pub const TerminalLaunchKind = enum(u8) {
+    shell,
+    claude,
+    opencode,
+    codex,
+    cursor,
+    custom,
+};
+
+pub const TerminalLaunchProfile = struct {
+    kind: TerminalLaunchKind = .shell,
+    label: []const u8 = "",
+    command: []const []const u8 = &.{},
+};
+
+const SessionCreateOptions = struct {
+    cwd: []const u8,
+    cols: u16,
+    rows: u16,
+    profile: TerminalLaunchProfile = .{},
+};
+
 pub const PersistedWorkspace = struct {
     active_tab_index: usize = 0,
     tabs: []const PersistedTab = &.{},
@@ -132,6 +154,7 @@ pub const Dock = struct {
     rename_storage: [96:0]u8 = std.mem.zeroes([96:0]u8),
     workspace_changed: bool = false,
     focus_requested: bool = false,
+    launch_profile: TerminalLaunchProfile = .{},
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
@@ -342,6 +365,13 @@ pub const Dock = struct {
         self.focus_requested = true;
     }
 
+    pub fn createTabWithProfile(self: *Dock, allocator: std.mem.Allocator, profile: TerminalLaunchProfile) !void {
+        const previous_profile = self.launch_profile;
+        self.launch_profile = profile;
+        defer self.launch_profile = previous_profile;
+        try self.createTab(allocator);
+    }
+
     pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
         if (index >= self.tabs.items.len) return;
         var removed = self.tabs.orderedRemove(index);
@@ -548,7 +578,12 @@ pub const Dock = struct {
     fn ensureLeafSession(self: *Dock, allocator: std.mem.Allocator, leaf: *PaneLeaf) !void {
         if (leaf.session != null) return;
         const cwd = self.cwd orelse return;
-        leaf.session = try Session.create(allocator, cwd, INITIAL_COLS, INITIAL_ROWS);
+        leaf.session = try Session.create(allocator, .{
+            .cwd = cwd,
+            .cols = INITIAL_COLS,
+            .rows = INITIAL_ROWS,
+            .profile = self.launch_profile,
+        });
     }
 
     fn ensureSessionsInNode(self: *Dock, allocator: std.mem.Allocator, node: *PaneNode) !void {
@@ -967,7 +1002,7 @@ pub fn clampHeightForAvailable(height: f32, available_height: f32) f32 {
 }
 
 const UnsupportedSession = struct {
-    pub fn create(_: std.mem.Allocator, _: []const u8, _: u16, _: u16) !*UnsupportedSession {
+    pub fn create(_: std.mem.Allocator, _: SessionCreateOptions) !*UnsupportedSession {
         return error.UnsupportedOperatingSystem;
     }
 
@@ -1014,6 +1049,8 @@ const UnixSession = struct {
     cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
+    launch_kind: TerminalLaunchKind = .shell,
+    launch_label: []u8,
 
     const SpawnResult = struct {
         master_fd: std.posix.fd_t,
@@ -1027,18 +1064,21 @@ const UnixSession = struct {
         winp: ?*const std.posix.winsize,
     ) c_int;
 
-    pub fn create(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16) !*UnixSession {
+    pub fn create(allocator: std.mem.Allocator, options: SessionCreateOptions) !*UnixSession {
         const self = try allocator.create(UnixSession);
         errdefer allocator.destroy(self);
 
         var terminal = try ghostty_vt.Terminal.init(allocator, .{
-            .cols = cols,
-            .rows = rows,
+            .cols = options.cols,
+            .rows = options.rows,
         });
         errdefer terminal.deinit(allocator);
-        try terminal.setPwd(cwd);
+        try terminal.setPwd(options.cwd);
 
-        const child = try spawnShell(allocator, cwd, cols, rows);
+        const launch_label = try launchLabel(allocator, options.profile);
+        errdefer allocator.free(launch_label);
+
+        const child = try spawnCommand(allocator, options.cwd, options.cols, options.rows, options.profile);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -1050,10 +1090,12 @@ const UnixSession = struct {
             .terminal = terminal,
             .stream = undefined,
             .render_state = .empty,
-            .cols = cols,
-            .rows = rows,
+            .cols = options.cols,
+            .rows = options.rows,
             .cell_width = CELL_PIXEL_WIDTH,
             .cell_height = CELL_PIXEL_HEIGHT,
+            .launch_kind = options.profile.kind,
+            .launch_label = launch_label,
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
@@ -1075,6 +1117,7 @@ const UnixSession = struct {
         self.stream.deinit();
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
+        allocator.free(self.launch_label);
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -1110,20 +1153,21 @@ const UnixSession = struct {
 
     pub fn statusText(self: *const UnixSession, buf: *[192]u8) []const u8 {
         if (self.running) {
-            return std.fmt.bufPrint(buf, "{d}x{d} shell attached", .{ self.cols, self.rows }) catch "Shell attached";
+            return std.fmt.bufPrint(buf, "{d}x{d} {s} attached", .{ self.cols, self.rows, self.launch_label }) catch "Terminal attached";
         }
         if (self.exit_status) |status| {
             if (std.c.W.IFEXITED(status)) {
-                return std.fmt.bufPrint(buf, "Shell exited with code {d}", .{std.c.W.EXITSTATUS(status)}) catch "Shell exited";
+                return std.fmt.bufPrint(buf, "{s} exited with code {d}", .{ self.launch_label, std.c.W.EXITSTATUS(status) }) catch "Terminal exited";
             }
             if (std.c.W.IFSIGNALED(status)) {
-                return std.fmt.bufPrint(buf, "Shell terminated by signal {d}", .{std.c.W.TERMSIG(status)}) catch "Shell exited";
+                return std.fmt.bufPrint(buf, "{s} terminated by signal {d}", .{ self.launch_label, std.c.W.TERMSIG(status) }) catch "Terminal exited";
             }
         }
-        return "Shell exited.";
+        return std.fmt.bufPrint(buf, "{s} exited.", .{self.launch_label}) catch "Terminal exited.";
     }
 
     pub fn tabTitle(self: *const UnixSession, buffer: *[96]u8) []const u8 {
+        if (self.launch_kind != .shell) return self.launch_label;
         if (builtin.os.tag == .linux) {
             var proc_path_buf: [64]u8 = undefined;
             const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{self.child_pid}) catch "";
@@ -1324,9 +1368,11 @@ const UnixSession = struct {
         );
     }
 
-    fn spawnShell(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16) !SpawnResult {
+    fn spawnCommand(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16, profile: TerminalLaunchProfile) !SpawnResult {
         const cwd_z = try allocator.dupeZ(u8, cwd);
         defer allocator.free(cwd_z);
+        const command = try commandForProfile(allocator, profile);
+        defer freeCommand(allocator, command);
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
@@ -1339,7 +1385,7 @@ const UnixSession = struct {
         if (fork_result < 0) return error.ForkPtyFailed;
 
         if (fork_result == 0) {
-            childExec(cwd_z);
+            childExec(cwd_z, command);
         }
 
         try setNonBlocking(@intCast(master_fd));
@@ -1349,7 +1395,7 @@ const UnixSession = struct {
         };
     }
 
-    fn childExec(cwd: [:0]const u8) noreturn {
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) {
             std.c._exit(127);
         }
@@ -1358,13 +1404,14 @@ const UnixSession = struct {
             _ = setenv("TERM", "xterm-256color", 1);
         }
 
-        const shell = std.c.getenv("SHELL") orelse "/bin/bash";
-        const argv = [_:null]?[*:0]const u8{
-            shell,
-            "-i",
-            null,
-        };
-        _ = std.c.execve(shell, &argv, std.c.environ);
+        var argv: [32:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 32;
+        const count = @min(command.len, argv.len - 1);
+        for (command[0..count], 0..) |arg, index| {
+            argv[index] = arg.ptr;
+        }
+        if (count > 0) {
+            _ = std.c.execve(command[0].ptr, &argv, std.c.environ);
+        }
         std.c._exit(127);
     }
 };
@@ -1751,6 +1798,56 @@ fn pathLabel(path: []const u8) []const u8 {
     return if (base.len > 0) base else trimmed;
 }
 
+fn launchLabel(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![]u8 {
+    const label = std.mem.trim(u8, profile.label, &std.ascii.whitespace);
+    if (label.len > 0) return allocator.dupe(u8, label);
+    const fallback = switch (profile.kind) {
+        .shell => "Shell",
+        .claude => "Claude",
+        .opencode => "OpenCode",
+        .codex => "Codex",
+        .cursor => "Cursor",
+        .custom => if (profile.command.len > 0) profile.command[0] else "Custom",
+    };
+    return allocator.dupe(u8, fallback);
+}
+
+fn commandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![][:0]u8 {
+    return switch (profile.kind) {
+        .shell => blk: {
+            const shell = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
+            break :blk dupeCommand(allocator, &.{ shell, "-i" });
+        },
+        .claude => dupeCommand(allocator, &.{"claude"}),
+        .opencode => dupeCommand(allocator, &.{"opencode"}),
+        .codex => dupeCommand(allocator, &.{"codex"}),
+        .cursor => dupeCommand(allocator, &.{"cursor"}),
+        .custom => {
+            if (profile.command.len == 0) return error.EmptyTerminalLaunchCommand;
+            return dupeCommand(allocator, profile.command);
+        },
+    };
+}
+
+fn dupeCommand(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
+    const command = try allocator.alloc([:0]u8, args.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (command[0..initialized]) |arg| allocator.free(arg);
+        allocator.free(command);
+    }
+    for (args, 0..) |arg, index| {
+        command[index] = try allocator.dupeZ(u8, arg);
+        initialized += 1;
+    }
+    return command;
+}
+
+fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
+    for (command) |arg| allocator.free(arg);
+    allocator.free(command);
+}
+
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
 }
@@ -1780,7 +1877,11 @@ test "unix session PTY smoke" {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const session = try UnixSession.create(allocator, cwd, 80, 24);
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
     defer {
         session.deinit(allocator);
         allocator.destroy(session);
@@ -1829,7 +1930,11 @@ test "repair terminal state resets invalid scrolling region" {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const session = try UnixSession.create(allocator, cwd, 80, 24);
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
     defer {
         session.deinit(allocator);
         allocator.destroy(session);

@@ -37,6 +37,19 @@ const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
 
 var transcript_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+var transcript_pane_id: ?app_state.WorkspacePaneId = null;
+
+const MAX_TRANSCRIPT_HITS = 16;
+const TranscriptHit = struct {
+    pane_id: ?app_state.WorkspacePaneId = null,
+    rect: palette.Rect = .{},
+    track: palette.Rect = .{},
+    thumb: palette.Rect = .{},
+    max_scroll: f32 = 0.0,
+};
+
+var transcript_hit_count: usize = 0;
+var transcript_hits: [MAX_TRANSCRIPT_HITS]TranscriptHit = [_]TranscriptHit{.{}} ** MAX_TRANSCRIPT_HITS;
 
 /// Geometry of the transcript scrollbar from the last paint. Captured during
 /// render so the mouse handlers can do hit-testing without rebuilding the
@@ -49,6 +62,7 @@ var transcript_scrollbar_max_scroll: f32 = 0.0;
 /// constant while dragging so the thumb tracks the cursor without jumping.
 var transcript_scrollbar_drag_grab_offset: f32 = 0.0;
 var transcript_scrollbar_drag_active: bool = false;
+var transcript_scrollbar_drag_pane_id: ?app_state.WorkspacePaneId = null;
 
 const FileSearchHitCache = struct {
     panel_rect: palette.Rect = .{},
@@ -85,9 +99,35 @@ pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void
     renderWorkspaceAt(state, .{ .x = estimateWorkspaceOriginX(state, width), .y = 0.0, .w = width, .h = height });
 }
 
+pub fn resetTranscriptHitCache() void {
+    transcript_hit_count = 0;
+}
+
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
+    renderWorkspaceAtForPane(state, rect, null);
+}
+
+pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
+    const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
+        state.projects.items[state.selected_project_index].selected_thread_index
+    else
+        null;
+    if (pane_id) |id| {
+        if (state.workspaceChatThreadIndexByPane(id)) |thread_index| {
+            state.projects.items[state.selected_project_index].selected_thread_index = thread_index;
+        }
+    }
+    defer {
+        if (restore_thread_index) |thread_index| {
+            if (state.projects.items.len > 0 and thread_index < state.projects.items[state.selected_project_index].threads.items.len) {
+                state.projects.items[state.selected_project_index].selected_thread_index = thread_index;
+            }
+        }
+    }
+
     state.invalidateComposerToolbarOverlayHitRects();
     file_search_hits = .{};
+    if (pane_id == null) transcript_hit_count = 0;
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     if (state.projects.items.len == 0) {
         state.workspace_header_open_menu_open = false;
@@ -100,7 +140,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     const composer_height = theme.clampf(rect.h * 0.29, theme.scaledUi(128.0), theme.scaledUi(COMPOSER_HEIGHT));
     const bottom_margin = theme.clampf(rect.h * 0.018, theme.scaledUi(8.0), theme.scaledUi(14.0));
     const side_margin = theme.clampf(rect.w * 0.045, theme.scaledUi(16.0), theme.scaledUi(48.0));
-    const terminal_visible = state.isTerminalVisible() and !state.isBrowserVisible();
+    const terminal_visible = state.shouldRenderLegacyTerminalDockInChat() and !state.isBrowserVisible();
     const terminal_gap = if (terminal_visible) theme.scaledUi(12.0) else 0.0;
     const terminal_height = if (terminal_visible)
         @min(@max((rect.h - header_height - composer_height - bottom_margin) * 0.32, theme.scaledUi(120.0)), theme.scaledUi(260.0))
@@ -144,7 +184,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
 
     if (split_chat_browser) {
         const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
-        renderTranscript(state, chat_rect);
+        renderTranscript(state, chat_rect, pane_id);
         // Transcript uses only `body` (above composer). The browser column is empty to the right of the
         // composer, so extend the dock through that strip to the same bottom as the composer row.
         const browser_dock_h = composer_bottom - body.y;
@@ -155,7 +195,7 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
             .h = @max(browser_dock_h, theme.scaledUi(120.0)),
         });
     } else {
-        renderTranscript(state, body);
+        renderTranscript(state, body, pane_id);
     }
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
@@ -288,15 +328,18 @@ pub fn handleComposerFileSearchMouseButton(state: *app_state.AppState, x: f32, y
 
 /// True when `(x, y)` lies inside the transcript pane last painted by `renderTranscript`.
 pub fn pointerOverTranscript(x: f32, y: f32) bool {
-    return rectContains(transcript_rect, x, y);
+    return findTranscriptHit(x, y) != null;
 }
 
 pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
-    if (wheel_y == 0.0 or !rectContains(transcript_rect, x, y)) return false;
+    if (wheel_y == 0.0) return false;
+    const hit = findTranscriptHit(x, y) orelse return false;
+    const pane_id = hit.pane_id;
+    if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
     state.transcript_focused = true;
-    const current = state.currentTranscriptScrollY() orelse state.transcript_palette_scroll_y;
+    const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_palette_scroll_y;
     const delta = -wheel_y * theme.scaledUi(TRANSCRIPT_WHEEL_PIXELS);
-    state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(current + delta, null));
+    rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(current + delta, null));
     state.transcript_auto_follow_pending = false;
     state.scroll_transcript_to_bottom_frames = 0;
     state.markDirty();
@@ -404,6 +447,7 @@ fn transcriptMarkdownBubbleHit(
 
 pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
     if (transcript_scrollbar_drag_active and transcript_scrollbar_max_scroll > 1.0 and transcript_scrollbar_track.h > 0.0) {
+        const pane_id = transcript_scrollbar_drag_pane_id;
         const target = scrollFromThumbY(
             transcript_scrollbar_track,
             transcript_scrollbar_thumb.h,
@@ -411,7 +455,7 @@ pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
             state.palette_mouse_y,
             transcript_scrollbar_drag_grab_offset,
         );
-        state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
+        rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
         state.transcript_auto_follow_pending = false;
         state.scroll_transcript_to_bottom_frames = 0;
         state.markDirty();
@@ -451,6 +495,7 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     if (!down) {
         if (transcript_scrollbar_drag_active) {
             transcript_scrollbar_drag_active = false;
+            transcript_scrollbar_drag_pane_id = null;
         }
         if (state.transcriptMarkdownSelectionDragging()) {
             state.endTranscriptMarkdownSelection();
@@ -458,27 +503,33 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
         return false;
     }
 
-    if (!rectContains(transcript_rect, x, y)) return false;
+    const hit = findTranscriptHit(x, y) orelse return false;
+    const pane_id = hit.pane_id;
+    if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
 
     state.transcript_focused = true;
 
     // Scrollbar drag: thumb click starts a drag; track click (above/below
     // thumb) page-jumps toward the cursor by one viewport.
-    if (transcript_scrollbar_max_scroll > 1.0 and transcript_scrollbar_track.h > 0.0) {
-        const track_hit = expandedScrollbarHit(transcript_scrollbar_track);
+    if (hit.max_scroll > 1.0 and hit.track.h > 0.0) {
+        const track_hit = expandedScrollbarHit(hit.track);
         if (rectContains(track_hit, x, y)) {
-            if (rectContains(expandedScrollbarHit(transcript_scrollbar_thumb), x, y)) {
+            if (rectContains(expandedScrollbarHit(hit.thumb), x, y)) {
                 transcript_scrollbar_drag_active = true;
-                transcript_scrollbar_drag_grab_offset = y - transcript_scrollbar_thumb.y;
+                transcript_scrollbar_drag_pane_id = pane_id;
+                transcript_scrollbar_drag_grab_offset = y - hit.thumb.y;
+                transcript_scrollbar_track = hit.track;
+                transcript_scrollbar_thumb = hit.thumb;
+                transcript_scrollbar_max_scroll = hit.max_scroll;
             } else {
                 const target = scrollFromThumbY(
-                    transcript_scrollbar_track,
-                    transcript_scrollbar_thumb.h,
-                    transcript_scrollbar_max_scroll,
+                    hit.track,
+                    hit.thumb.h,
+                    hit.max_scroll,
                     y,
-                    transcript_scrollbar_thumb.h * 0.5,
+                    hit.thumb.h * 0.5,
                 );
-                state.rememberCurrentTranscriptScroll(snapTranscriptScrollY(target, transcript_scrollbar_max_scroll));
+                rememberTranscriptScroll(state, pane_id, snapTranscriptScrollY(target, hit.max_scroll));
                 state.transcript_auto_follow_pending = false;
                 state.scroll_transcript_to_bottom_frames = 0;
                 state.markDirty();
@@ -493,12 +544,12 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     if (clicks <= 1 and state.consumeCardToggleClick(x, y)) {
         return true;
     }
-    if (transcriptMarkdownBubbleHit(state, x, y)) |hit| {
+    if (transcriptMarkdownBubbleHit(state, x, y)) |markdown_hit| {
         state.blurPaletteComposer();
         if (clicks >= 2) {
-            applyTranscriptMarkdownMulticlick(state, hit, @intCast(clicks));
+            applyTranscriptMarkdownMulticlick(state, markdown_hit, @intCast(clicks));
         } else {
-            state.beginTranscriptMarkdownSelection(hit.message_index, hit.point);
+            state.beginTranscriptMarkdownSelection(markdown_hit.message_index, markdown_hit.point);
         }
         return true;
     }
@@ -1101,8 +1152,47 @@ fn transcriptScrollNearBottom(scroll_y: f32, max_scroll: f32) bool {
     return (max_scroll - scroll_y) <= theme.scaledUi(72.0);
 }
 
-fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
+fn currentTranscriptScrollY(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) ?f32 {
+    if (pane_id) |id| return state.workspaceChatTranscriptScrollY(id);
+    return state.currentTranscriptScrollY();
+}
+
+fn rememberTranscriptScroll(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, scroll_y: f32) void {
+    if (pane_id) |id| {
+        state.rememberWorkspaceChatTranscriptScroll(id, scroll_y);
+    } else {
+        state.rememberCurrentTranscriptScroll(scroll_y);
+    }
+}
+
+fn findTranscriptHit(x: f32, y: f32) ?TranscriptHit {
+    var i = transcript_hit_count;
+    while (i > 0) {
+        i -= 1;
+        const hit = transcript_hits[i];
+        if (rectContains(hit.rect, x, y)) return hit;
+    }
+    if (rectContains(transcript_rect, x, y)) {
+        return .{
+            .pane_id = transcript_pane_id,
+            .rect = transcript_rect,
+            .track = transcript_scrollbar_track,
+            .thumb = transcript_scrollbar_thumb,
+            .max_scroll = transcript_scrollbar_max_scroll,
+        };
+    }
+    return null;
+}
+
+fn appendTranscriptHit(hit: TranscriptHit) void {
+    if (transcript_hit_count >= transcript_hits.len) return;
+    transcript_hits[transcript_hit_count] = hit;
+    transcript_hit_count += 1;
+}
+
+fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
     transcript_rect = rect;
+    transcript_pane_id = pane_id;
     const gutter = theme.scaledUi(if (rect.w < theme.scaledUi(760.0)) 32.0 else 64.0);
     const column_width = @min(rect.w - gutter, theme.scaledUi(TRANSCRIPT_MAX_WIDTH));
     const column = snapRect(palette.Rect{ .x = rect.x + (rect.w - column_width) * 0.5, .y = rect.y + theme.scaledUi(28.0), .w = column_width, .h = @max(rect.h - theme.scaledUi(42.0), 1.0) });
@@ -1116,6 +1206,8 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
 
     if (thread.messages.items.len == 0 and !thread.isSendPendingForUi()) {
         state.transcript_palette_scroll_y = 0.0;
+        rememberTranscriptScroll(state, pane_id, 0.0);
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
         queueText(state, .{ .x = column.x, .y = column.y, .w = column.w, .h = theme.scaledUi(30.0) }, "No messages yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(20.0), clip);
         queueText(state, .{ .x = column.x, .y = column.y + theme.scaledUi(32.0), .w = column.w, .h = theme.scaledUi(26.0) }, "Choose a provider, type a prompt below, and start the first chat for this directory.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), clip);
         return;
@@ -1125,7 +1217,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     const max_scroll = @max(0.0, content_height - column.h);
     const has_pending_stream = state.hasPendingStream();
 
-    var scroll_y = snapTranscriptScrollY(state.currentTranscriptScrollY() orelse max_scroll, max_scroll);
+    var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
 
     const pi = state.selected_project_index;
     const ti = state.currentProject().selected_thread_index;
@@ -1157,7 +1249,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
     if (state.scroll_transcript_to_bottom_frames == 0 and !has_pending_stream) {
         state.transcript_auto_follow_pending = false;
     }
-    state.rememberCurrentTranscriptScroll(scroll_y);
+    rememberTranscriptScroll(state, pane_id, scroll_y);
     state.transcript_palette_scroll_y = scroll_y;
 
     var content_y = column.y - scroll_y;
@@ -1181,10 +1273,12 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect) void {
         transcript_scrollbar_track = track;
         transcript_scrollbar_thumb = thumb_rect;
         transcript_scrollbar_max_scroll = max_scroll;
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect, .track = track, .thumb = thumb_rect, .max_scroll = max_scroll });
     } else {
         transcript_scrollbar_track = .{};
         transcript_scrollbar_thumb = .{};
         transcript_scrollbar_max_scroll = 0.0;
+        appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
     }
 }
 

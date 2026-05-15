@@ -6,7 +6,7 @@ const palette = @import("palette");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const sidebar = @import("sidebar.zig");
-const chat_panel = @import("chat_panel.zig");
+const workspace_panes = @import("workspace_panes.zig");
 const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
 
@@ -65,7 +65,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
     sidebar.renderPalette(state, root_layout.sidebar);
-    chat_panel.renderWorkspaceAt(state, root_layout.workspace);
+    workspace_panes.renderAt(state, root_layout.workspace);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
     renderProjectAddModal(state, width, height);

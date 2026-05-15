@@ -52,12 +52,26 @@ pub const DefaultOpenAction = union(enum) {
     }
 };
 
+pub const TerminalLaunchProfileConfig = struct {
+    label: []u8,
+    command: []const []u8,
+
+    pub fn deinit(self: *TerminalLaunchProfileConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.label);
+        for (self.command) |arg| allocator.free(arg);
+        allocator.free(self.command);
+    }
+};
+
 pub const AppConfig = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     default_open_action: DefaultOpenAction = .folder,
+    terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
 
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
         self.default_open_action.deinit(allocator);
+        for (self.terminal_launch_profiles) |*profile| profile.deinit(allocator);
+        allocator.free(self.terminal_launch_profiles);
     }
 };
 
@@ -124,6 +138,9 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     }
     if (root.object.get("open")) |open_value| {
         applyOpenOverrides(allocator, config, open_value);
+    }
+    if (root.object.get("terminal")) |terminal_value| {
+        applyTerminalOverrides(allocator, config, terminal_value);
     }
 }
 
@@ -213,6 +230,85 @@ fn parseCustomOpenAction(allocator: std.mem.Allocator, object: std.json.ObjectMa
             .action = owned_action,
         },
     };
+}
+
+fn applyTerminalOverrides(allocator: std.mem.Allocator, config: *AppConfig, terminal_value: std.json.Value) void {
+    if (terminal_value != .object) {
+        log.warn("terminal must be an object when provided", .{});
+        return;
+    }
+    const profiles_value = terminal_value.object.get("profiles") orelse return;
+    if (profiles_value != .array) {
+        log.warn("terminal.profiles must be an array when provided", .{});
+        return;
+    }
+
+    var profiles: std.ArrayList(TerminalLaunchProfileConfig) = .empty;
+    errdefer {
+        for (profiles.items) |*profile| profile.deinit(allocator);
+        profiles.deinit(allocator);
+    }
+    for (profiles_value.array.items) |profile_value| {
+        if (parseTerminalLaunchProfile(allocator, profile_value)) |profile| {
+            profiles.append(allocator, profile) catch |err| {
+                var owned = profile;
+                owned.deinit(allocator);
+                log.warn("failed to append terminal profile: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    for (config.terminal_launch_profiles) |*profile| profile.deinit(allocator);
+    allocator.free(config.terminal_launch_profiles);
+    config.terminal_launch_profiles = profiles.toOwnedSlice(allocator) catch &.{};
+}
+
+fn parseTerminalLaunchProfile(allocator: std.mem.Allocator, value: std.json.Value) ?TerminalLaunchProfileConfig {
+    if (value != .object) {
+        log.warn("terminal profile entries must be objects", .{});
+        return null;
+    }
+    const label_value = value.object.get("label") orelse {
+        log.warn("terminal profile label is required", .{});
+        return null;
+    };
+    const command_value = value.object.get("command") orelse {
+        log.warn("terminal profile command is required", .{});
+        return null;
+    };
+    if (label_value != .string or command_value != .array) {
+        log.warn("terminal profile label must be a string and command must be a string array", .{});
+        return null;
+    }
+    const label = std.mem.trim(u8, label_value.string, &std.ascii.whitespace);
+    if (label.len == 0 or command_value.array.items.len == 0) {
+        log.warn("terminal profile requires non-empty label and command", .{});
+        return null;
+    }
+
+    const owned_label = allocator.dupe(u8, label) catch return null;
+    errdefer allocator.free(owned_label);
+    var command = allocator.alloc([]u8, command_value.array.items.len) catch return null;
+    var initialized: usize = 0;
+    errdefer {
+        for (command[0..initialized]) |arg| allocator.free(arg);
+        allocator.free(command);
+    }
+    for (command_value.array.items, 0..) |arg_value, index| {
+        if (arg_value != .string) {
+            log.warn("terminal profile command entries must be strings", .{});
+            return null;
+        }
+        const arg = std.mem.trim(u8, arg_value.string, &std.ascii.whitespace);
+        if (arg.len == 0) {
+            log.warn("terminal profile command entries cannot be empty", .{});
+            return null;
+        }
+        command[index] = allocator.dupe(u8, arg) catch return null;
+        initialized += 1;
+    }
+
+    return .{ .label = owned_label, .command = command };
 }
 
 fn applyFontSize(config: *AppConfig, value: f32) void {

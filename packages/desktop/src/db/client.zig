@@ -70,7 +70,7 @@ pub const Client = struct {
         defer projects.deinit(arena);
 
         var project_rows = try self.conn.rows(
-            "select id, project_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, selected_thread_index " ++
+            "select id, project_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index " ++
                 "from projects order by sort_index",
             .{},
         );
@@ -88,7 +88,9 @@ pub const Client = struct {
                 .thread_list_expanded = project_row.int(7) != 0,
                 .terminal_height = if (project_row.nullableFloat(8)) |value| @floatCast(value) else null,
                 .terminal_layout_json = try dupeOptionalText(arena, project_row.nullableText(9)),
-                .selected_thread_index = @intCast(project_row.int(10)),
+                .terminal_docks_json = try dupeOptionalText(arena, project_row.nullableText(10)),
+                .workspace_layout_json = try dupeOptionalText(arena, project_row.nullableText(11)),
+                .selected_thread_index = @intCast(project_row.int(12)),
                 .threads = try self.loadThreads(arena, project_id),
             });
         }
@@ -119,8 +121,8 @@ pub const Client = struct {
 
         for (state.projects, 0..) |project, project_index| {
             try self.conn.exec(
-                "insert into projects (project_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, selected_thread_index) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "insert into projects (project_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 .{
                     project.id orelse project.path,
                     @as(i64, @intCast(project_index)),
@@ -132,6 +134,8 @@ pub const Client = struct {
                     boolToInt(project.thread_list_expanded orelse false),
                     project.terminal_height,
                     project.terminal_layout_json,
+                    project.terminal_docks_json,
+                    project.workspace_layout_json,
                     @as(i64, @intCast(project.selected_thread_index)),
                 },
             );
