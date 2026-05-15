@@ -96,7 +96,15 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     renderDockAtForDock(state, rect, 0);
 }
 
+pub fn paneHeaderHeight() f32 {
+    return theme.scaledUi(34.0);
+}
+
 pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_id: u32) void {
+    renderDockAtForDockWithReserve(state, rect, dock_id, 0.0);
+}
+
+pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, header_right_reserve: f32) void {
     if (state.projects.items.len == 0) return;
     hit_cache.menu_count = 0;
     hit_cache.dock_id = dock_id;
@@ -114,8 +122,9 @@ pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_
         .h = theme.scaledUi(20.0),
     }, "Terminal", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), header);
 
+    const tabs_header = palette.Rect{ .x = header.x, .y = header.y, .w = @max(header.w - header_right_reserve, theme.scaledUi(120.0)), .h = header.h };
     const body = palette.Rect{ .x = rect.x, .y = header.y + header.h, .w = rect.w, .h = @max(rect.h - header.h, 1.0) };
-    renderTabs(state, dock, header);
+    renderTabs(state, dock, tabs_header);
     if (dock.activeTab()) |tab| {
         renderPaneNode(state, dock, tab.root, body);
     } else {

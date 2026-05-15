@@ -107,7 +107,15 @@ pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
     renderWorkspaceAtForPane(state, rect, null);
 }
 
+pub fn paneHeaderHeight(rect: palette.Rect) f32 {
+    return theme.clampf(rect.h * 0.098, theme.scaledUi(38.0), theme.scaledUi(TOP_BAR_HEIGHT));
+}
+
 pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId) void {
+    renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, 0.0);
+}
+
+pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
     const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
         state.projects.items[state.selected_project_index].selected_thread_index
     else
@@ -200,7 +208,7 @@ pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, 
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
     // message geometry or GL text that would otherwise overlap the title bar.
-    renderHeader(state, header);
+    renderHeader(state, header, header_right_reserve);
 
     renderComposer(state, composer_rect);
     if (terminal_height > 0.0) {
@@ -841,7 +849,7 @@ fn queueGlobeMeridianArc(
     }
 }
 
-fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
+fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f32) void {
     workspace_header_hits = .{};
     workspace_header_hits.header_rect = rect;
 
@@ -876,7 +884,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect) void {
     const open_combo_w = open_main_w + chevron_w;
     const actions_w = open_combo_w + button_gap + browser_w;
 
-    const header_inner_w = rect.w - padding_x * 2.0;
+    const header_inner_w = rect.w - padding_x * 2.0 - right_reserve;
     const actions_x = rect.x + padding_x + @max(theme.scaledUi(180.0), header_inner_w - actions_w);
     const title_max_w = @max(actions_x - rect.x - padding_x - title_gap, theme.scaledUi(96.0));
 
