@@ -6649,6 +6649,37 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn splitCurrentProjectWorkspacePaneWithThread(
+        self: *AppState,
+        pane_id: WorkspacePaneId,
+        thread_index: usize,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) bool {
+        if (self.projects.items.len == 0) return false;
+        var project = &self.projects.items[self.selected_project_index];
+        if (thread_index >= project.threads.items.len) return false;
+        var layout = &project.workspace_layout;
+        const target = layout.paneById(pane_id) orelse return false;
+        if (target.minimized) return false;
+        const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
+            log.err("failed to create dropped chat workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create chat pane.");
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, new_after) catch |err| {
+            log.err("failed to split dropped chat workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return false;
+        };
+        project.selected_thread_index = thread_index;
+        self.terminal_focused = false;
+        self.requestComposerFocus();
+        self.syncRenameBuffer();
+        self.markDirty();
+        return true;
+    }
+
     pub fn splitCurrentProjectWorkspacePaneWithTerminal(self: *AppState, pane_id: WorkspacePaneId) bool {
         return self.splitCurrentProjectWorkspacePaneWithTerminalAxis(pane_id, .horizontal);
     }

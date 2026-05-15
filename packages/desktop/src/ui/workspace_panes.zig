@@ -61,6 +61,14 @@ const WorkspacePaneRect = struct {
     pane_id: runtime.WorkspacePaneId,
     rect: palette.Rect,
 };
+
+const ThreadDropTarget = struct {
+    pane_id: runtime.WorkspacePaneId,
+    axis: runtime.WorkspaceSplitAxis,
+    new_after: bool,
+    preview: palette.Rect,
+};
+
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
 
@@ -412,6 +420,53 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
         return false;
     }
     return false;
+}
+
+pub fn renderThreadDropPreview(state: *runtime.AppState, x: f32, y: f32) void {
+    const target = threadDropTargetAt(x, y) orelse return;
+    queueRounded(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 54)), theme.scaledUi(6.0));
+    queueBorder(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
+}
+
+pub fn dropThreadAt(state: *runtime.AppState, thread_index: usize, x: f32, y: f32) bool {
+    const target = threadDropTargetAt(x, y) orelse return false;
+    return state.splitCurrentProjectWorkspacePaneWithThread(target.pane_id, thread_index, target.axis, target.new_after);
+}
+
+fn threadDropTargetAt(x: f32, y: f32) ?ThreadDropTarget {
+    var i: usize = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
+        const entry = pane_rects[i];
+        if (!rectContains(entry.rect, x, y)) continue;
+        return threadDropTargetForPane(entry.pane_id, entry.rect, x, y);
+    }
+    return null;
+}
+
+fn threadDropTargetForPane(pane_id: runtime.WorkspacePaneId, rect: palette.Rect, x: f32, y: f32) ThreadDropTarget {
+    const left_d = @max(x - rect.x, 0.0);
+    const right_d = @max(rect.x + rect.w - x, 0.0);
+    const top_d = @max(y - rect.y, 0.0);
+    const bottom_d = @max(rect.y + rect.h - y, 0.0);
+    const min_x = @min(left_d, right_d);
+    const min_y = @min(top_d, bottom_d);
+    if (min_x <= min_y) {
+        const after = right_d < left_d;
+        const w = @max(rect.w * 0.5, theme.scaledUi(80.0));
+        const preview = if (after)
+            palette.Rect{ .x = rect.x + rect.w - w, .y = rect.y, .w = w, .h = rect.h }
+        else
+            palette.Rect{ .x = rect.x, .y = rect.y, .w = w, .h = rect.h };
+        return .{ .pane_id = pane_id, .axis = .vertical, .new_after = after, .preview = preview };
+    }
+    const after = bottom_d < top_d;
+    const h = @max(rect.h * 0.5, theme.scaledUi(80.0));
+    const preview = if (after)
+        palette.Rect{ .x = rect.x, .y = rect.y + rect.h - h, .w = rect.w, .h = h }
+    else
+        palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = h };
+    return .{ .pane_id = pane_id, .axis = .horizontal, .new_after = after, .preview = preview };
 }
 
 fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect: palette.Rect) void {
