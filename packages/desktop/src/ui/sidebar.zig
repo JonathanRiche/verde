@@ -24,6 +24,7 @@ const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
 const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
+const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 
 const SidebarHitKind = enum {
     collapse,
@@ -94,6 +95,11 @@ pub fn pointerOverSidebar(x: f32, y: f32) bool {
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
+    if (state.isSidebarHidden()) {
+        const reveal = x <= theme.scaledUi(HIDDEN_SIDEBAR_EDGE_REVEAL_CSS) or rectContainsPoint(palette_sidebar_rect, x, y);
+        state.setSidebarHoverRevealed(reveal);
+    }
+
     var new_thread_hover: ?native_state.SidebarThreadHover = null;
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;

@@ -9,11 +9,19 @@ const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
+const profiler = @import("../profiler.zig");
 
 const RootLayout = struct {
     sidebar: palette.Rect,
     workspace: palette.Rect,
 };
+
+const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
+
+var sidebar_anim_width: f32 = -1.0;
+var sidebar_anim_x: f32 = 0.0;
+var sidebar_anim_last_ms: i64 = 0;
+var sidebar_animating: bool = false;
 
 /// Rebuilds palette modal hit targets from the current window size **before** SDL input is
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
@@ -64,8 +72,13 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     state.resetUiDebugFrame();
     const root_layout = computeRootLayout(state, width, height);
     queueRootBackground(state, width, height);
-    sidebar.renderPalette(state, root_layout.sidebar);
-    workspace_panes.renderAt(state, root_layout.workspace);
+    if (state.isSidebarHidden()) {
+        workspace_panes.renderAt(state, root_layout.workspace);
+        sidebar.renderPalette(state, root_layout.sidebar);
+    } else {
+        sidebar.renderPalette(state, root_layout.sidebar);
+        workspace_panes.renderAt(state, root_layout.workspace);
+    }
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
     renderProjectAddModal(state, width, height);
@@ -74,19 +87,48 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     debug_window.render(state, width, height);
 }
 
+pub fn isSidebarAnimating() bool {
+    return sidebar_animating;
+}
+
 fn computeRootLayout(state: *runtime.AppState, width: f32, height: f32) RootLayout {
     const gap: f32 = 0.0;
-    const sidebar_width = if (state.isSidebarCollapsed())
+    const target_sidebar_width = if (state.isSidebarCollapsed())
         theme.clampf(width * 0.07, theme.scaledUi(60.0), theme.scaledUi(76.0))
     else if (width < theme.scaledUi(900.0))
         theme.clampf(width * 0.34, theme.scaledUi(180.0), theme.scaledUi(240.0))
     else
         theme.clampf(width * 0.235, theme.scaledUi(300.0), @min(theme.scaledUi(465.0), width * 0.38));
-    const workspace_width = @max(width - sidebar_width - gap, theme.scaledUi(320.0));
+
+    const hidden = state.isSidebarHidden();
+    const target_sidebar_x = if (hidden and !state.isSidebarHoverRevealed()) -target_sidebar_width else 0.0;
+    const now_ms: i64 = @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+    if (sidebar_anim_width < 0.0) {
+        sidebar_anim_width = target_sidebar_width;
+        sidebar_anim_x = target_sidebar_x;
+        sidebar_anim_last_ms = now_ms;
+    }
+    const dt_ms = @max(now_ms - sidebar_anim_last_ms, 0);
+    sidebar_anim_last_ms = now_ms;
+    const step = if (SIDEBAR_ANIM_DURATION_MS <= 0)
+        1.0
+    else
+        theme.clampf(@as(f32, @floatFromInt(dt_ms)) / @as(f32, @floatFromInt(SIDEBAR_ANIM_DURATION_MS)), 0.0, 1.0);
+    const eased = 1.0 - std.math.pow(f32, 1.0 - step, 3.0);
+    sidebar_anim_width = approach(sidebar_anim_width, target_sidebar_width, eased);
+    sidebar_anim_x = approach(sidebar_anim_x, target_sidebar_x, eased);
+    sidebar_animating = @abs(sidebar_anim_width - target_sidebar_width) > 0.5 or @abs(sidebar_anim_x - target_sidebar_x) > 0.5;
+
+    const layout_sidebar_width = if (hidden) 0.0 else sidebar_anim_width;
+    const workspace_width = @max(width - layout_sidebar_width - gap, theme.scaledUi(320.0));
     return .{
-        .sidebar = .{ .x = 0.0, .y = 0.0, .w = sidebar_width, .h = height },
-        .workspace = .{ .x = sidebar_width + gap, .y = 0.0, .w = workspace_width, .h = height },
+        .sidebar = .{ .x = sidebar_anim_x, .y = 0.0, .w = sidebar_anim_width, .h = height },
+        .workspace = .{ .x = layout_sidebar_width + gap, .y = 0.0, .w = workspace_width, .h = height },
     };
+}
+
+fn approach(current: f32, target: f32, t: f32) f32 {
+    return current + (target - current) * t;
 }
 
 fn queueRootBackground(state: *runtime.AppState, width: f32, height: f32) void {
