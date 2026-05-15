@@ -1071,6 +1071,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.handleComposerWheel(&event.wheel)) {
                 return true;
             }
+            if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
             if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
                 return true;
             }

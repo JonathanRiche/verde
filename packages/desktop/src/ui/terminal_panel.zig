@@ -202,6 +202,23 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
     return false;
 }
 
+pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
+    if (wheel_y == 0.0 or state.projects.items.len == 0) return false;
+    if (paneAtPoint(x, y)) |target| {
+        hit_cache.dock_id = target.dock_id;
+        var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+        dock.focusPane(target.pane_id);
+        focusTerminal(state);
+        hit_cache.menu_open = false;
+        if (dock.handleWheel(state.allocator, target.pane_id, wheel_y)) {
+            state.markDirty();
+        }
+        if (dock.consumeWorkspaceChange()) state.markDirty();
+        return true;
+    }
+    return false;
+}
+
 fn renderTabs(state: *app_state.AppState, dock: anytype, header: palette.Rect) void {
     const tab_h = theme.scaledUi(24.0);
     var x = header.x + theme.scaledUi(92.0);
