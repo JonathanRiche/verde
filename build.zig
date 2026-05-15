@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
+    const target = b.option([]const u8, "target", "Forwarded to the desktop build (e.g. x86_64-windows-msvc)");
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
@@ -11,6 +12,7 @@ pub fn build(b: *std.Build) void {
     const build_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = null,
         .forward_runtime_args = false,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
@@ -22,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "run",
         .forward_runtime_args = true,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
@@ -34,6 +37,7 @@ pub fn build(b: *std.Build) void {
     const test_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = "test",
         .forward_runtime_args = false,
+        .target = target,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .cef_sdk_path = cef_sdk_path,
@@ -47,6 +51,7 @@ pub fn build(b: *std.Build) void {
 const DesktopCommandOptions = struct {
     subcommand: ?[]const u8,
     forward_runtime_args: bool,
+    target: ?[]const u8 = null,
     ui_debug: ?bool = null,
     palette_renderer: ?PaletteRendererBackend = null,
     cef_sdk_path: ?[]const u8 = null,
@@ -68,6 +73,9 @@ fn addDesktopCommand(
     }
     if (optimize != .Debug) {
         argv.append(b.allocator, b.fmt("-Doptimize={s}", .{@tagName(optimize)})) catch @panic("OOM");
+    }
+    if (options.target) |value| {
+        argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
     }
     if (options.ui_debug) |value| {
         argv.append(b.allocator, b.fmt("-Dui-debug={}", .{value})) catch @panic("OOM");

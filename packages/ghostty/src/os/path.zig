@@ -14,10 +14,9 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
     }
 
     const PATH = switch (builtin.os.tag) {
-        .windows => blk: {
-            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
-            const path = try std.unicode.utf16LeToUtf8Alloc(alloc, win_path);
-            break :blk path;
+        .windows => std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return null,
+            else => |e| return e,
         },
         else => return null,
     };
