@@ -2293,6 +2293,8 @@ pub const AppState = struct {
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
     sidebar_collapsed: bool,
+    sidebar_hidden: bool,
+    sidebar_hover_revealed: bool,
     composer_focused: bool,
     composer_focus_requested: bool,
     composer_input_nonce: u32,
@@ -2482,6 +2484,8 @@ pub const AppState = struct {
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
             .import_notice_storage = std.mem.zeroes([256:0]u8),
             .sidebar_collapsed = false,
+            .sidebar_hidden = false,
+            .sidebar_hover_revealed = false,
             .composer_focused = false,
             .composer_focus_requested = false,
             .composer_input_nonce = 0,
@@ -5586,6 +5590,14 @@ pub const AppState = struct {
         return self.sidebar_collapsed;
     }
 
+    pub fn isSidebarHidden(self: *const AppState) bool {
+        return self.sidebar_hidden;
+    }
+
+    pub fn isSidebarHoverRevealed(self: *const AppState) bool {
+        return self.sidebar_hover_revealed;
+    }
+
     pub fn setSidebarCollapsed(self: *AppState, collapsed: bool) void {
         if (self.sidebar_collapsed == collapsed) return;
         self.sidebar_collapsed = collapsed;
@@ -5594,6 +5606,24 @@ pub const AppState = struct {
 
     pub fn toggleSidebarCollapsed(self: *AppState) void {
         self.setSidebarCollapsed(!self.sidebar_collapsed);
+    }
+
+    pub fn setSidebarHidden(self: *AppState, hidden: bool) void {
+        if (self.sidebar_hidden == hidden) return;
+        self.sidebar_hidden = hidden;
+        if (!hidden) self.sidebar_hover_revealed = false;
+        self.markDirty();
+    }
+
+    pub fn toggleSidebarHidden(self: *AppState) void {
+        self.setSidebarHidden(!self.sidebar_hidden);
+    }
+
+    pub fn setSidebarHoverRevealed(self: *AppState, revealed: bool) void {
+        const next = self.sidebar_hidden and revealed;
+        if (self.sidebar_hover_revealed == next) return;
+        self.sidebar_hover_revealed = next;
+        self.markDirty();
     }
 
     pub fn terminalPanelHeight(self: *const AppState, available_height: f32) f32 {

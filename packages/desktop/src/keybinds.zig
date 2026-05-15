@@ -12,6 +12,7 @@ pub const NativeKeyboardAction = enum {
     open_default,
     new_thread,
     toggle_sidebar,
+    toggle_sidebar_hidden,
     toggle_browser,
     toggle_terminal,
     chat_up,
@@ -105,6 +106,7 @@ pub const NativeKeyboardConfig = struct {
     open_default: []Keybind,
     new_thread: []Keybind,
     toggle_sidebar: []Keybind,
+    toggle_sidebar_hidden: []Keybind,
     toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
     chat_up: []Keybind,
@@ -147,6 +149,7 @@ pub const NativeKeyboardConfig = struct {
             .open_default = try cloneDefaultOpenKeybinds(allocator),
             .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
+            .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
             .chat_up = try cloneDefaultChatUpKeybinds(allocator),
@@ -200,6 +203,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.open_default);
         self.allocator.free(self.new_thread);
         self.allocator.free(self.toggle_sidebar);
+        self.allocator.free(self.toggle_sidebar_hidden);
         self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
         self.allocator.free(self.chat_up);
@@ -248,6 +252,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.toggle_sidebar, event)) {
             return .toggle_sidebar;
+        }
+        if (matchesAny(self.toggle_sidebar_hidden, event)) {
+            return .toggle_sidebar_hidden;
         }
         if (matchesAny(self.toggle_browser, event)) {
             return .toggle_browser;
@@ -411,6 +418,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(sidebar_value, "sidebar")) |bindings| {
                 self.allocator.free(self.toggle_sidebar);
                 self.toggle_sidebar = bindings;
+            }
+        }
+        if (keybinds_value.object.get("sidebar_hidden")) |sidebar_hidden_value| {
+            if (self.parseOverrideValue(sidebar_hidden_value, "sidebar_hidden")) |bindings| {
+                self.allocator.free(self.toggle_sidebar_hidden);
+                self.toggle_sidebar_hidden = bindings;
             }
         }
         if (keybinds_value.object.get("browser")) |browser_value| {
@@ -745,6 +758,12 @@ fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+S"),
+    });
+}
+
+fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+B"),
     });
 }
 
@@ -1310,6 +1329,18 @@ test "default sidebar keybind uses primary plus s" {
     try std.testing.expect(!config.toggle_sidebar[0].meta);
     try std.testing.expect(config.toggle_sidebar[0].primary);
     try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar[0].key);
+}
+
+test "default hidden sidebar keybind uses alt plus b" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar_hidden.len);
+    try std.testing.expect(config.toggle_sidebar_hidden[0].alt);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].ctrl);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].meta);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].primary);
+    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_sidebar_hidden[0].key);
 }
 
 test "default chat scroll keybinds use arrows and paging keys" {

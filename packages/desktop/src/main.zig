@@ -800,11 +800,12 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         state.isBrowserVisible() or
         state.hasVisibleTerminalSessions() or
         state.transcriptMarkdownSelectionDragging() or
-        workspace_panes_ui.isFocusAnimating();
+        workspace_panes_ui.isFocusAnimating() or
+        ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
@@ -880,7 +881,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleFontSizeShortcut(state, &event.key)) {
                 return true;
             }
-            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .new_thread) {
+            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .toggle_sidebar_hidden or action == .new_thread) {
                 handleKeyboardAction(state, keyboard, action.?);
                 return true;
             }
@@ -1339,6 +1340,7 @@ fn handleKeyboardAction(
         .open_default => state.runDefaultOpenAction(),
         .new_thread => state.createThreadForProject(state.selected_project_index),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
+        .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
         .chat_up => if (canHandleTranscriptScrollAction(state)) {

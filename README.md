@@ -123,6 +123,7 @@ Example config:
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
     "sidebar": "CommandOrControl+S",
+    "sidebar_hidden": "Alt+B",
     "browser": "Ctrl+B",
     "workspace": {
       "split_chat_vertical": "CommandOrControl+Alt+C",

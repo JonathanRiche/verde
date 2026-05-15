@@ -100,6 +100,7 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
     "refresh": ["CommandOrControl+R", "F5"],
     "open": "Alt+O",
     "sidebar": "CommandOrControl+S",
+    "sidebar_hidden": "Alt+B",
     "browser": "Ctrl+B",
     "terminal": {
       "toggle": "CommandOrControl+J",
