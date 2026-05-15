@@ -14,9 +14,11 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
     }
 
     const PATH = switch (builtin.os.tag) {
-        .windows => std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return null,
-            else => |e| return e,
+        .windows => blk: {
+            var env_map = try std.process.Environ.createMap(.{ .block = .global }, alloc);
+            defer env_map.deinit();
+            const win_path = env_map.get("PATH") orelse return null;
+            break :blk try alloc.dupe(u8, win_path);
         },
         else => return null,
     };

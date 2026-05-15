@@ -67,6 +67,17 @@ fn currentEnviron() std.process.Environ {
     };
 }
 
+/// Reads a single environment variable from the current process. Returns
+/// caller-owned memory or null when the variable is unset / on alloc failure.
+/// Cross-platform: Zig 0.16 removed `std.process.getEnvVarOwned`; this is the
+/// canonical replacement that goes through `Environ.Map.get`.
+pub fn readEnvVarAlloc(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    var env_map = std.process.Environ.createMap(currentEnviron(), allocator) catch return null;
+    defer env_map.deinit();
+    const value = env_map.get(name) orelse return null;
+    return allocator.dupe(u8, value) catch null;
+}
+
 /// Resolves an executable against the provided environment map.
 pub fn resolveExecutableInEnvMapAlloc(
     allocator: std.mem.Allocator,

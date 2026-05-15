@@ -13,6 +13,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const process_env = @import("process_env.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
@@ -4803,7 +4804,7 @@ pub const AppState = struct {
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
         if (!self.browser_textures_enabled) return;
 
-        const value = std.process.getEnvVarOwned(self.allocator, "VERDE_OPEN_BROWSER_ON_START") catch return;
+        const value = process_env.readEnvVarAlloc(self.allocator, "VERDE_OPEN_BROWSER_ON_START") orelse return;
         defer self.allocator.free(value);
         if (!std.mem.eql(u8, value, "1")) return;
         // Wait a couple of app-loop turns so this exercises the same path as a
@@ -7384,7 +7385,7 @@ pub const AppState = struct {
     fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
         const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
         const expanded = if (std.mem.startsWith(u8, raw_path, "~/")) blk: {
-            const home = std.process.getEnvVarOwned(self.allocator, home_var) catch
+            const home = process_env.readEnvVarAlloc(self.allocator, home_var) orelse
                 return error.EnvironmentVariableNotFound;
             defer self.allocator.free(home);
             break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, raw_path[2..] });
@@ -7493,7 +7494,7 @@ pub const AppState = struct {
         }
 
         const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-        const home = std.process.getEnvVarOwned(self.allocator, home_var) catch
+        const home = process_env.readEnvVarAlloc(self.allocator, home_var) orelse
             return self.allocator.dupe(u8, ".");
         return home;
     }

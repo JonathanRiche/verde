@@ -1,18 +1,18 @@
 diff --git a/packages/ghostty/src/os/path.zig b/packages/ghostty/src/os/path.zig
-index a9eef45..6a8b426 100644
+index a9eef45..83e0929 100644
 --- a/packages/ghostty/src/os/path.zig
 +++ b/packages/ghostty/src/os/path.zig
-@@ -14,10 +14,9 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
-     }
+@@ -15,9 +15,10 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
  
      const PATH = switch (builtin.os.tag) {
--        .windows => blk: {
+         .windows => blk: {
 -            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
 -            const path = try std.unicode.utf16LeToUtf8Alloc(alloc, win_path);
 -            break :blk path;
-+        .windows => std.process.getEnvVarOwned(alloc, "PATH") catch |err| switch (err) {
-+            error.EnvironmentVariableNotFound => return null,
-+            else => |e| return e,
++            var env_map = try std.process.Environ.createMap(.{ .block = .global }, alloc);
++            defer env_map.deinit();
++            const win_path = env_map.get("PATH") orelse return null;
++            break :blk try alloc.dupe(u8, win_path);
          },
          else => return null,
      };
