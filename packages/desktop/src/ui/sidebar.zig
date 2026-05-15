@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const palette = @import("palette");
+const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
@@ -207,6 +208,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .thread_row => {
                 if (hit.project_index < state.projects.items.len and hit.thread_index < state.projects.items[hit.project_index].threads.items.len) {
+                    workspace_panes.clearThreadDropTarget();
                     thread_drag = .{
                         .pending = true,
                         .project_index = hit.project_index,
@@ -216,6 +218,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                         .x = x,
                         .y = y,
                     };
+                    _ = sdl.captureMouse(true);
                 }
             },
             .toggle_threads => {
@@ -315,7 +318,9 @@ fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
 fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     const drag = thread_drag;
     thread_drag = .{};
+    _ = sdl.captureMouse(false);
     if (!drag.active) {
+        workspace_panes.clearThreadDropTarget();
         if (drag.project_index < state.projects.items.len and drag.thread_index < state.projects.items[drag.project_index].threads.items.len) {
             state.noteInteraction();
             state.selected_project_index = drag.project_index;
@@ -328,12 +333,14 @@ fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     }
 
     if (drag.project_index != state.selected_project_index) {
+        workspace_panes.clearThreadDropTarget();
         state.setSidebarNotice("Switch to that project before dragging its thread into panes.");
         return true;
     }
     if (workspace_panes.dropThreadAt(state, drag.thread_index, x, y)) {
         state.setSidebarNotice("");
     } else {
+        workspace_panes.clearThreadDropTarget();
         state.setSidebarNotice("Drop on a pane edge to open that thread.");
     }
     return true;
