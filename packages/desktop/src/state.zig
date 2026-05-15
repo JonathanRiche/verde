@@ -5683,19 +5683,33 @@ pub const AppState = struct {
 
     pub fn pollTerminals(self: *AppState) void {
         for (self.projects.items, 0..) |*project, project_index| {
-            if (project.terminal_dock.visible or project.terminal_dock.hasRunningSession()) {
+            const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
+            if (base_visible and !project.terminal_dock.hasRunningSession()) {
+                project.terminal_dock.ensureSession(self.allocator, project.path) catch |err| {
+                    log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
+                    if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
+                };
+            }
+            if (base_visible or project.terminal_dock.hasRunningSession()) {
                 project.terminal_dock.poll(self.allocator) catch |err| {
                     log.err("failed to poll terminal session: {s}", .{@errorName(err)});
-                    if (project_index == self.selected_project_index and project.terminal_dock.visible) {
+                    if (project_index == self.selected_project_index and base_visible) {
                         self.setSidebarNotice("Terminal session failed.");
                     }
                 };
             }
             for (project.terminal_docks.items) |*entry| {
-                if (!entry.dock.visible and !entry.dock.hasRunningSession()) continue;
+                const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
+                if (dock_visible and !entry.dock.hasRunningSession()) {
+                    entry.dock.ensureSession(self.allocator, project.path) catch |err| {
+                        log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
+                        if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
+                    };
+                }
+                if (!dock_visible and !entry.dock.hasRunningSession()) continue;
                 entry.dock.poll(self.allocator) catch |err| {
                     log.err("failed to poll terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
-                    if (project_index == self.selected_project_index and entry.dock.visible) {
+                    if (project_index == self.selected_project_index and dock_visible) {
                         self.setSidebarNotice("Terminal session failed.");
                     }
                 };

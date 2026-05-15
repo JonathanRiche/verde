@@ -380,6 +380,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
         split_menu_open_for = null;
         return true;
     }
+    i = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
+        const pane_rect = pane_rects[i];
+        if (!rectContains(pane_rect.rect, x, y)) continue;
+        _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
+        return false;
+    }
     return false;
 }
 
