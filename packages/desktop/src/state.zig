@@ -6490,9 +6490,7 @@ pub const AppState = struct {
                 }
                 self.terminal_focused = false;
             },
-            .terminal => {
-                self.requestTerminalFocus();
-            },
+            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
         }
         self.markDirty();
         return true;
@@ -6513,7 +6511,7 @@ pub const AppState = struct {
                 }
                 self.terminal_focused = false;
             },
-            .terminal => self.requestTerminalFocus(),
+            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
         }
         self.markDirty();
         return true;

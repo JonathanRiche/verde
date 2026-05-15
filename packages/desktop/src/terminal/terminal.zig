@@ -33,6 +33,11 @@ const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler
 const DeviceAttributes = @typeInfo(
     std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.device_attributes))),
 ).@"fn".return_type.?;
+const ColorScheme = std.meta.Child(
+    @typeInfo(
+        std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.color_scheme))),
+    ).@"fn".return_type.?,
+);
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
@@ -1073,6 +1078,7 @@ const UnixSession = struct {
             .rows = options.rows,
         });
         errdefer terminal.deinit(allocator);
+        configureTerminalTheme(&terminal);
         try terminal.setPwd(options.cwd);
 
         const launch_label = try launchLabel(allocator, options.profile);
@@ -1102,6 +1108,7 @@ const UnixSession = struct {
         self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
         self.stream.handler.effects.size = &UnixSession.streamSize;
         self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
+        self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
         errdefer self.stream.deinit();
 
         try self.refreshRenderState(allocator);
@@ -1340,6 +1347,16 @@ const UnixSession = struct {
         return "verde";
     }
 
+    fn streamColorScheme(_: *TerminalHandler) ?ColorScheme {
+        return .dark;
+    }
+
+    fn configureTerminalTheme(terminal: *ghostty_vt.Terminal) void {
+        terminal.colors.background = ghostty_vt.color.DynamicRGB.init(.{ .r = 0x00, .g = 0x00, .b = 0x00 });
+        terminal.colors.foreground = ghostty_vt.color.DynamicRGB.init(.{ .r = 0xd8, .g = 0xde, .b = 0xe9 });
+        terminal.colors.cursor = ghostty_vt.color.DynamicRGB.init(.{ .r = 0xd8, .g = 0xde, .b = 0xe9 });
+    }
+
     fn captureExitStatus(self: *UnixSession) bool {
         if (self.exit_status != null) return false;
 
@@ -1400,8 +1417,11 @@ const UnixSession = struct {
             std.c._exit(127);
         }
 
-        if (std.c.getenv("TERM") == null) {
-            _ = setenv("TERM", "xterm-256color", 1);
+        _ = setenv("TERM", "xterm-256color", 1);
+        _ = setenv("COLORTERM", "truecolor", 1);
+        _ = setenv("TERM_PROGRAM", "Verde", 1);
+        if (std.c.getenv("LANG") == null) {
+            _ = setenv("LANG", "C.UTF-8", 1);
         }
 
         var argv: [32:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 32;
