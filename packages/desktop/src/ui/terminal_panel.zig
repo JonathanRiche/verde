@@ -114,14 +114,14 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
 }
 
 pub fn paneHeaderHeight() f32 {
-    return theme.scaledUi(34.0);
+    return 0.0;
 }
 
 pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_id: u32) void {
     renderDockAtForDockWithReserve(state, rect, dock_id, 0.0);
 }
 
-pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, header_right_reserve: f32) void {
+pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, _: f32) void {
     if (state.projects.items.len == 0) return;
     hit_cache.menu_count = 0;
     hit_cache.dock_id = dock_id;
@@ -130,22 +130,10 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
 
-    const header = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = theme.scaledUi(34.0) };
-    queueRect(state, header, paletteColor(theme.COLOR_PANEL));
-    queueText(state, .{
-        .x = header.x + theme.scaledUi(14.0),
-        .y = header.y + theme.scaledUi(8.0),
-        .w = header.w - theme.scaledUi(28.0),
-        .h = theme.scaledUi(20.0),
-    }, "Terminal", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), header);
-
-    const tabs_header = palette.Rect{ .x = header.x, .y = header.y, .w = @max(header.w - header_right_reserve, theme.scaledUi(120.0)), .h = header.h };
-    const body = palette.Rect{ .x = rect.x, .y = header.y + header.h, .w = rect.w, .h = @max(rect.h - header.h, 1.0) };
-    renderTabs(state, dock, tabs_header);
     if (dock.activeTab()) |tab| {
-        renderPaneNode(state, dock, tab.root, body);
+        renderPaneNode(state, dock, tab.root, rect);
     } else {
-        renderStatus(state, body, "Starting shell...");
+        renderStatus(state, rect, "Starting shell...");
     }
     renderContextMenu(state, dock, rect);
     if (dock.takeFocusRequest()) {
