@@ -965,6 +965,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_motion => {
+            if (sidebar_ui.finishThreadDragIfMouseReleased(state, event.motion.x, event.motion.y, event.motion.state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
