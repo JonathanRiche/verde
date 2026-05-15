@@ -23,6 +23,7 @@ const DEFAULT_FONT_SCALE: f32 = 1.0;
 const MIN_FONT_SCALE: f32 = 0.75;
 const MAX_FONT_SCALE: f32 = 2.0;
 const FONT_SCALE_STEP: f32 = 0.125;
+const WHEEL_SCROLL_LINES: f32 = 3.0;
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
@@ -315,6 +316,17 @@ pub const Dock = struct {
                     return false;
                 };
             }
+        }
+        return false;
+    }
+
+    pub fn handleWheel(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, wheel_y: f32) bool {
+        const pane = self.findPaneById(pane_id) orelse return false;
+        if (pane.session) |session| {
+            return session.handleWheel(allocator, wheel_y) catch |err| {
+                log.warn("terminal wheel scroll failed: {s}", .{@errorName(err)});
+                return false;
+            };
         }
         return false;
     }
@@ -1239,6 +1251,15 @@ const UnixSession = struct {
         const encoded = writer.buffered();
         if (encoded.len == 0) return true;
         try writeAll(self.master_fd, encoded);
+        return true;
+    }
+
+    pub fn handleWheel(self: *UnixSession, allocator: std.mem.Allocator, wheel_y: f32) !bool {
+        if (wheel_y == 0.0) return false;
+        const line_count_float = @max(@round(@abs(wheel_y) * WHEEL_SCROLL_LINES), 1.0);
+        const line_count: isize = @intFromFloat(line_count_float);
+        self.terminal.scrollViewport(.{ .delta = if (wheel_y > 0.0) -line_count else line_count });
+        try self.refreshRenderState(allocator);
         return true;
     }
 
