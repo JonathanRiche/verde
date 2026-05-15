@@ -16,6 +16,7 @@ const terminal_panel = @import("terminal_panel.zig");
 const theme = @import("theme.zig");
 
 const FOCUS_ANIM_DURATION_MS: i64 = 160;
+const THREAD_DROP_PREVIEW_Z: i32 = 140;
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -424,6 +425,8 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
 
 pub fn renderThreadDropPreview(state: *runtime.AppState, x: f32, y: f32) void {
     const target = threadDropTargetAt(x, y) orelse return;
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DROP_PREVIEW_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
     queueRounded(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 54)), theme.scaledUi(6.0));
     queueBorder(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
 }
