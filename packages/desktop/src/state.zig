@@ -6660,14 +6660,18 @@ pub const AppState = struct {
         var project = &self.projects.items[self.selected_project_index];
         if (thread_index >= project.threads.items.len) return false;
         var layout = &project.workspace_layout;
-        const target = layout.paneById(pane_id) orelse return false;
+        const target_pane_id = if (layout.paneById(pane_id) != null)
+            pane_id
+        else
+            layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse pane_id;
+        const target = layout.paneById(target_pane_id) orelse return false;
         if (target.minimized) return false;
         const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
             log.err("failed to create dropped chat workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create chat pane.");
             return false;
         };
-        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, new_after) catch |err| {
+        layout.splitPaneWithLeaf(self.allocator, target_pane_id, new_pane_id, axis, new_after) catch |err| {
             log.err("failed to split dropped chat workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to split workspace.");
             return false;
