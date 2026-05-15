@@ -824,6 +824,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (state.terminal_focused and terminalOwnedShortcut(&event.key)) {
+                const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
+                state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+                if (terminal_key_handled) {
+                    return true;
+                }
+            }
             const action = keyboard.actionForEvent(&event.key);
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
@@ -1186,6 +1193,18 @@ fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardE
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
+}
+
+fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (!event.down) return false;
+    const ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl);
+    const shift = isKeymodPressed(event.mod, sdl.Keymod.shift);
+    if (!shift or isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.gui)) return false;
+    return switch (event.scancode) {
+        .c, .v, .pageup, .pagedown => ctrl or event.scancode == .pageup or event.scancode == .pagedown,
+        .up, .down, .home, .end => ctrl,
+        else => false,
+    };
 }
 
 fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
