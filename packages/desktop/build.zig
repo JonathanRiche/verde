@@ -143,7 +143,9 @@ pub fn build(b: *std.Build) void {
             //   <root>/lib/x64/{SDL3,SDL3_ttf}.{dll,lib}
             // Phase 2 will move the download into scripts/windows/setup.ps1.
             if (sdl3_msvc_root) |root| {
-                exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "include" }) });
+                const include_path: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ root, "include" }) };
+                exe.root_module.addIncludePath(include_path);
+                palette_module.addIncludePath(include_path);
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64" }) });
                 b.getInstallStep().dependOn(&b.addInstallFileWithDir(
                     .{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64", "SDL3.dll" }) },
@@ -158,7 +160,9 @@ pub fn build(b: *std.Build) void {
                 ).step);
             }
             if (sdl3_ttf_msvc_root) |root| {
-                exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "include" }) });
+                const include_path: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ root, "include" }) };
+                exe.root_module.addIncludePath(include_path);
+                palette_module.addIncludePath(include_path);
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64" }) });
                 b.getInstallStep().dependOn(&b.addInstallFileWithDir(
                     .{ .cwd_relative = b.pathJoin(&.{ root, "lib", "x64", "SDL3_ttf.dll" }) },

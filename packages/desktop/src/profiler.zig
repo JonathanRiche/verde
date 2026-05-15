@@ -65,7 +65,22 @@ var total: usize = 0;
 var sequence: u64 = 0;
 
 pub fn nowNs() i128 {
-    return std.time.nanoTimestamp();
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            var freq: i64 = 0;
+            _ = std.os.windows.kernel32.QueryPerformanceFrequency(&freq);
+            if (freq == 0) return 0;
+            var counter: i64 = 0;
+            _ = std.os.windows.kernel32.QueryPerformanceCounter(&counter);
+            return @divTrunc(@as(i128, counter) * std.time.ns_per_s, @as(i128, freq));
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
+                @as(i128, @intCast(ts.nsec));
+        },
+    }
 }
 
 pub fn elapsedNs(start: i128) u64 {
@@ -89,7 +104,21 @@ pub fn recordFrame(sample: FrameSample) void {
 }
 
 fn unixTimestampMs() i64 {
-    return std.time.milliTimestamp();
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            var ft: std.os.windows.FILETIME = undefined;
+            std.os.windows.kernel32.GetSystemTimeAsFileTime(&ft);
+            const ticks: i64 = (@as(i64, ft.dwHighDateTime) << 32) | @as(i64, ft.dwLowDateTime);
+            const unix_epoch_in_filetime_ticks: i64 = 116444736000000000;
+            return @divTrunc(ticks - unix_epoch_in_filetime_ticks, 10000);
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+            return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+                @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+        },
+    }
 }
 
 pub fn frameCount() usize {
