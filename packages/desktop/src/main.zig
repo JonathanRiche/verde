@@ -820,6 +820,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
+            if (terminal_panel_ui.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             const action = keyboard.actionForEvent(&event.key);
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
@@ -957,6 +961,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+                return true;
+            }
             if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
                 return true;
             }
@@ -1175,6 +1182,7 @@ fn keymodBits(modifier_state: sdl.Keymod) u16 {
 
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
     if (state.isBrowserPaneFocused() or state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
+    if (state.terminal_focused) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);

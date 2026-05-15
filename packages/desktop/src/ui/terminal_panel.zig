@@ -3,6 +3,7 @@
 const std = @import("std");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const palette = @import("palette");
+const sdl = @import("zsdl3");
 
 const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
@@ -47,6 +48,21 @@ const PaneHit = struct {
     rect: palette.Rect = .{},
 };
 
+const TerminalCellCoord = struct {
+    x: usize = 0,
+    y: usize = 0,
+};
+
+const TerminalSelection = struct {
+    active: bool = false,
+    dragging: bool = false,
+    moved: bool = false,
+    dock_id: u32 = 0,
+    pane_id: u32 = 0,
+    anchor: TerminalCellCoord = .{},
+    focus: TerminalCellCoord = .{},
+};
+
 const TabHit = struct {
     dock_id: u32 = 0,
     index: usize = 0,
@@ -86,6 +102,7 @@ const TerminalHitCache = struct {
 };
 
 var hit_cache: TerminalHitCache = .{};
+var selection_state: TerminalSelection = .{};
 
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     renderDockAt(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height });
@@ -136,8 +153,33 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     }
 }
 
+pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!terminalCopyShortcut(event) or !selection_state.active) return false;
+    return copySelectionToClipboard(state);
+}
+
+pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool {
+    if (!selection_state.dragging) return false;
+    updateSelectionFocus(state, x, y) orelse return true;
+    selection_state.moved = true;
+    state.markDirty();
+    return true;
+}
+
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
-    if (!down or state.projects.items.len == 0) return false;
+    if (state.projects.items.len == 0) return false;
+    if (button == 1) {
+        if (down) {
+            if (startSelection(state, x, y)) return true;
+        } else if (selection_state.dragging) {
+            _ = updateSelectionFocus(state, x, y);
+            selection_state.dragging = false;
+            if (!selection_state.moved) selection_state.active = false;
+            state.markDirty();
+            return true;
+        }
+    }
+    if (!down) return false;
     if (button == 1 and hit_cache.menu_open) {
         const dock = state.currentProjectTerminalDockMutable(hit_cache.dock_id) orelse return false;
         var i: usize = 0;
@@ -172,6 +214,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
             dock.focusPane(target.pane_id);
             focusTerminal(state);
+            clearSelection();
             if (dock.consumeWorkspaceChange()) state.markDirty();
             hit_cache.menu_open = false;
             return true;
@@ -194,6 +237,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
             dock.focusPane(target.pane_id);
             focusTerminal(state);
+            clearSelection();
             openContextMenu(.pane, 0, target.pane_id, x, y);
             if (dock.consumeWorkspaceChange()) state.markDirty();
             return true;
@@ -264,11 +308,11 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, render_state, rect);
+    renderViewport(state, pane_id, render_state, rect);
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
 
-fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
+fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
     const cols_f = @as(f32, @floatFromInt(render_state.cols));
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
@@ -299,6 +343,9 @@ fn renderViewport(state: *app_state.AppState, render_state: *const ghostty_vt.Re
 
             if (selection) |range| {
                 if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
+            }
+            if (selectionCoversCell(hit_cache.dock_id, pane_id, x, y)) {
+                bg = blendRgb(bg, render_state.colors.foreground, 0.32);
             }
             if (render_state.cursor.viewport) |cursor| {
                 if (cursor.x == x and cursor.y == y and render_state.cursor.visible) {
@@ -475,6 +522,143 @@ fn focusTerminal(state: *app_state.AppState) void {
     state.requestTerminalDockFocus(hit_cache.dock_id);
 }
 
+fn startSelection(state: *app_state.AppState, x: f32, y: f32) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    const coord = cellAtPoint(state, target, x, y) orelse return false;
+    hit_cache.dock_id = target.dock_id;
+    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    dock.focusPane(target.pane_id);
+    focusTerminal(state);
+    selection_state = .{
+        .active = true,
+        .dragging = true,
+        .moved = false,
+        .dock_id = target.dock_id,
+        .pane_id = target.pane_id,
+        .anchor = coord,
+        .focus = coord,
+    };
+    hit_cache.menu_open = false;
+    if (dock.consumeWorkspaceChange()) state.markDirty();
+    state.markDirty();
+    return true;
+}
+
+fn updateSelectionFocus(state: *app_state.AppState, x: f32, y: f32) ?void {
+    const target = PaneHitTarget{ .dock_id = selection_state.dock_id, .pane_id = selection_state.pane_id };
+    selection_state.focus = cellAtPoint(state, target, x, y) orelse return null;
+}
+
+fn clearSelection() void {
+    selection_state = .{};
+}
+
+fn cellAtPoint(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32) ?TerminalCellCoord {
+    const rect = paneRect(target.dock_id, target.pane_id) orelse return null;
+    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return null;
+    const render_state = dock.renderStateForPane(target.pane_id) orelse return null;
+    if (render_state.cols == 0 or render_state.rows == 0) return null;
+    const cell_w = @max(rect.w / @as(f32, @floatFromInt(render_state.cols)), 1.0);
+    const cell_h = @max(rect.h / @as(f32, @floatFromInt(render_state.rows)), 1.0);
+    const clamped_x = theme.clampf(x, rect.x, rect.x + rect.w - 1.0);
+    const clamped_y = theme.clampf(y, rect.y, rect.y + rect.h - 1.0);
+    const cell_x = theme.clampf(@floor((clamped_x - rect.x) / cell_w), 0.0, @as(f32, @floatFromInt(render_state.cols - 1)));
+    const cell_y = theme.clampf(@floor((clamped_y - rect.y) / cell_h), 0.0, @as(f32, @floatFromInt(render_state.rows - 1)));
+    return .{ .x = @intFromFloat(cell_x), .y = @intFromFloat(cell_y) };
+}
+
+fn paneRect(dock_id: u32, pane_id: u32) ?palette.Rect {
+    var i: usize = 0;
+    while (i < hit_cache.pane_count) : (i += 1) {
+        const hit = hit_cache.panes[i];
+        if (hit.dock_id == dock_id and hit.pane_id == pane_id) return hit.rect;
+    }
+    return null;
+}
+
+fn selectionCoversCell(dock_id: u32, pane_id: u32, x: usize, y: usize) bool {
+    if (!selection_state.active or selection_state.dock_id != dock_id or selection_state.pane_id != pane_id) return false;
+    const start = selectionStart();
+    const end = selectionEnd();
+    if (y < start.y or y > end.y) return false;
+    if (start.y == end.y) return x >= start.x and x <= end.x;
+    if (y == start.y) return x >= start.x;
+    if (y == end.y) return x <= end.x;
+    return true;
+}
+
+fn selectionStart() TerminalCellCoord {
+    return if (coordLessThan(selection_state.focus, selection_state.anchor)) selection_state.focus else selection_state.anchor;
+}
+
+fn selectionEnd() TerminalCellCoord {
+    return if (coordLessThan(selection_state.focus, selection_state.anchor)) selection_state.anchor else selection_state.focus;
+}
+
+fn coordLessThan(a: TerminalCellCoord, b: TerminalCellCoord) bool {
+    return a.y < b.y or (a.y == b.y and a.x < b.x);
+}
+
+fn copySelectionToClipboard(state: *app_state.AppState) bool {
+    const dock = state.currentProjectTerminalDock(selection_state.dock_id) orelse return true;
+    const render_state = dock.renderStateForPane(selection_state.pane_id) orelse return true;
+    const text = selectedRenderStateText(state.allocator, render_state) catch |err| {
+        app_state.log.warn("failed to build terminal selection clipboard text: {s}", .{@errorName(err)});
+        return true;
+    };
+    defer state.allocator.free(text);
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return true;
+
+    const clipboard_text = state.allocator.dupeZ(u8, text) catch return true;
+    defer state.allocator.free(clipboard_text);
+    sdl.setClipboardText(clipboard_text) catch |err| {
+        app_state.log.warn("failed to set terminal selection clipboard text: {s}", .{@errorName(err)});
+    };
+    return true;
+}
+
+fn selectedRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    const start = selectionStart();
+    const end = selectionEnd();
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    var y = start.y;
+    while (y <= end.y and y < row_cells.len) : (y += 1) {
+        const cells_slice = row_cells[y].slice();
+        const raw_cells = cells_slice.items(.raw);
+        if (raw_cells.len == 0) continue;
+        const row_graphemes = cells_slice.items(.grapheme);
+        const row_start = if (y == start.y) start.x else 0;
+        const row_end = if (y == end.y) @min(end.x, raw_cells.len - 1) else raw_cells.len - 1;
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(allocator);
+
+        var x = row_start;
+        while (x <= row_end and x < raw_cells.len) : (x += 1) {
+            const raw_cell = raw_cells[x];
+            if (raw_cell.wide == .spacer_tail) continue;
+            if (!raw_cell.hasText()) {
+                try row.append(allocator, ' ');
+                continue;
+            }
+
+            var text_buf: [128]u8 = undefined;
+            const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse " ";
+            try row.appendSlice(allocator, text);
+            if (raw_cell.wide == .wide and x < row_end) try row.append(allocator, ' ');
+        }
+
+        try output.appendSlice(allocator, std.mem.trimEnd(u8, row.items, " \t"));
+        if (y < end.y) try output.append(allocator, '\n');
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
 fn openContextMenu(kind: TerminalContextMenuKind, tab_index: usize, pane_id: u32, x: f32, y: f32) void {
     hit_cache.menu_open = true;
     hit_cache.menu_kind = kind;
@@ -521,6 +705,20 @@ fn tabAtPoint(x: f32, y: f32) ?TabHitTarget {
 
 fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and x <= rect.x + rect.w and y >= rect.y and y <= rect.y + rect.h;
+}
+
+fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (!event.down or event.repeat) return false;
+    if (event.scancode != .c and event.key != .c) return false;
+    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
+        modifierPressed(event.mod, sdl.Keymod.shift) and
+        !modifierPressed(event.mod, sdl.Keymod.alt) and
+        !modifierPressed(event.mod, sdl.Keymod.gui);
+}
+
+fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
+    const state_bits = @as(*const u16, @ptrCast(&state)).*;
+    return (state_bits & mask) != 0;
 }
 
 fn drawCursor(state: *app_state.AppState, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
