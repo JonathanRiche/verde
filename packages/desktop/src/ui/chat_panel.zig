@@ -1286,10 +1286,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return std.time.milliTimestamp();
 }
 
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {

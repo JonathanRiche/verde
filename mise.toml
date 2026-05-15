@@ -26,3 +26,21 @@ run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts
 [tasks.debug]
 description = "Builds and launches Verde with the in-app diagnostics window enabled."
 run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dui-debug=true -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+
+# Windows tasks. Phase 1 is "compile only" — the exe may fail to launch
+# until Phase 2 wires SDL3. Run from a Developer PowerShell for VS 2022,
+# or rely on setup-windows.ps1 to activate the toolchain.
+[tasks.setup-windows]
+description = "Validates Windows toolchain and prepares local caches."
+shell = "pwsh"
+run = "scripts/windows/setup.ps1"
+
+[tasks.build-windows]
+description = "Builds verde.exe targeting x86_64-windows-msvc with CEF stubbed."
+shell = "pwsh"
+run = "scripts/windows/build.ps1"
+
+[tasks.dev-windows]
+description = "Builds and runs verde.exe targeting x86_64-windows-msvc with CEF stubbed."
+shell = "pwsh"
+run = "scripts/windows/dev.ps1"

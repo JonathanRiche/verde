@@ -132,8 +132,19 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
+            // Phase 1: link names only. Phase 2 wires -Dsdl3-msvc-root and installs
+            // SDL3.dll/SDL3_ttf.dll next to verde.exe. When -Dsdl3-runtime-lib is
+            // supplied (path to a SDL3.dll), install it alongside the exe so the
+            // dev loop has something to load.
             exe.root_module.linkSystemLibrary("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            if (sdl3_runtime_lib) |path| {
+                b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+                    .{ .cwd_relative = path },
+                    .bin,
+                    "SDL3.dll",
+                ).step);
+            }
         },
         .macos => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {

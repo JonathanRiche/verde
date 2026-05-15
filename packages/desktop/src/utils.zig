@@ -14,6 +14,8 @@ const log = std.log.scoped(.native_utils);
 pub const CLIPBOARD_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const PERSISTED_DIFF_MARKER = "EDITORTS_DIFF_V1\n";
 
+// Declared at module scope but only ever referenced from the macOS-only switch arm
+// in captureClipboardImage; Zig's lazy analysis keeps it out of non-Darwin builds.
 extern fn verde_macos_clipboard_copy_image(out_bytes: *?[*]u8, out_len: *usize, out_mime: *?[*:0]const u8) c_int;
 extern fn free(ptr: ?*anyopaque) void;
 
