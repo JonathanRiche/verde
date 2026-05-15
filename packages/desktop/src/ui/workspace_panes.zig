@@ -70,6 +70,8 @@ const ThreadDropTarget = struct {
     preview: palette.Rect,
 };
 
+var last_thread_drop_target: ?ThreadDropTarget = null;
+
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
 
@@ -424,15 +426,22 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
 }
 
 pub fn renderThreadDropPreview(state: *runtime.AppState, x: f32, y: f32) void {
-    const target = threadDropTargetAt(x, y) orelse return;
+    const maybe_target = threadDropTargetAt(x, y);
+    last_thread_drop_target = maybe_target;
+    const target = maybe_target orelse return;
     const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DROP_PREVIEW_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
     queueRounded(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 54)), theme.scaledUi(6.0));
     queueBorder(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
 }
 
+pub fn clearThreadDropTarget() void {
+    last_thread_drop_target = null;
+}
+
 pub fn dropThreadAt(state: *runtime.AppState, thread_index: usize, x: f32, y: f32) bool {
-    const target = threadDropTargetAt(x, y) orelse return false;
+    const target = threadDropTargetAt(x, y) orelse last_thread_drop_target orelse return false;
+    last_thread_drop_target = null;
     return state.splitCurrentProjectWorkspacePaneWithThread(target.pane_id, thread_index, target.axis, target.new_after);
 }
 
