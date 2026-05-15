@@ -3907,15 +3907,70 @@ pub const AppState = struct {
     pub fn createThreadForProject(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
         var project = &self.projects.items[index];
-        _ = project.addThread(self.allocator) catch {
+        const thread_index = project.addThread(self.allocator) catch {
             self.setSidebarNotice("Failed to create a new thread.");
             return;
         };
         self.selected_project_index = index;
+        self.focusProjectThreadInWorkspace(index, thread_index) catch |err| {
+            log.err("failed to focus new thread workspace pane: {s}", .{@errorName(err)});
+        };
         self.requestComposerFocus();
         self.syncRenameBuffer();
         self.setSidebarNotice("New thread ready.");
         self.markDirty();
+    }
+
+    pub fn selectThreadForProject(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        self.selected_project_index = project_index;
+        project.selected_thread_index = thread_index;
+        self.focusProjectThreadInWorkspace(project_index, thread_index) catch |err| {
+            log.err("failed to focus selected thread workspace pane: {s}", .{@errorName(err)});
+        };
+        self.requestComposerFocus();
+        self.syncRenameBuffer();
+        self.requestTranscriptScrollToBottom();
+        self.markDirty();
+    }
+
+    fn focusProjectThreadInWorkspace(self: *AppState, project_index: usize, thread_index: usize) !void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        var layout = &project.workspace_layout;
+        try layout.ensureDefaultChat(self.allocator);
+
+        var chat_pane_id: ?WorkspacePaneId = null;
+        for (layout.panes.items) |*pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => |*ref| {
+                    ref.thread_index = thread_index;
+                    chat_pane_id = pane.id;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        if (chat_pane_id == null) {
+            const new_pane_id = try layout.createChatPane(self.allocator, thread_index);
+            const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId();
+            if (target_pane_id) |target_id| {
+                try layout.splitPaneWithLeaf(self.allocator, target_id, new_pane_id, .vertical, true);
+            } else {
+                try layout.replaceRootWithLeaf(self.allocator, new_pane_id);
+            }
+            chat_pane_id = new_pane_id;
+        }
+
+        layout.focused_pane_id = chat_pane_id;
+        layout.maximized_pane_id = null;
+        project.selected_thread_index = thread_index;
+        self.terminal_focused = false;
     }
 
     pub fn sendDraft(self: *AppState) !void {

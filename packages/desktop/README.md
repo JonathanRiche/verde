@@ -99,12 +99,16 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
   "keybinds": {
     "refresh": ["CommandOrControl+R", "F5"],
     "open": "Alt+O",
+    "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Alt+B",
     "browser": "Ctrl+B",
+    "workspace": {
+      "split_terminal_horizontal": "CommandOrControl+Shift+T"
+    },
     "terminal": {
       "toggle": "CommandOrControl+J",
-      "new_tab": "CommandOrControl+Shift+T",
+      "new_tab": "CommandOrControl+Alt+T",
       "close": "CommandOrControl+Shift+W",
       "rename_tab": "CommandOrControl+Shift+R",
       "tab_previous": "CommandOrControl+Shift+PageUp",
@@ -121,6 +125,8 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
   }
 }
 ```
+
+Keybind values can be a string, a string array, `null`, an empty string, or an empty array. `null` and empty values disable that binding.
 
 `open.default` accepts `folder`, `editor`, `cursor`, `vscode`, `zed`, or a custom shell action:
 
