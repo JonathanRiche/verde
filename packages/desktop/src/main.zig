@@ -983,6 +983,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (event.button.button == 1 and sidebar_ui.hasActiveThreadDrag()) {
+                if (sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;

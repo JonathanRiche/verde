@@ -292,6 +292,10 @@ pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
     renderThreadDragPreview(state);
 }
 
+pub fn hasActiveThreadDrag() bool {
+    return thread_drag.pending or thread_drag.active;
+}
+
 fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
     if (!thread_drag.pending and !thread_drag.active) return;
     thread_drag.x = x;
@@ -329,6 +333,8 @@ fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     }
     if (workspace_panes.dropThreadAt(state, drag.thread_index, x, y)) {
         state.setSidebarNotice("");
+    } else {
+        state.setSidebarNotice("Drop on a pane edge to open that thread.");
     }
     return true;
 }
