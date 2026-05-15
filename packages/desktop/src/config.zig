@@ -9,7 +9,7 @@ const MIN_FONT_SIZE: f32 = 10.0;
 const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
 const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
-const MAX_TERMINAL_FONT_SIZE: f32 = 54.0;
+const MAX_TERMINAL_FONT_SIZE: f32 = 60.0;
 
 pub const CustomOpenAction = struct {
     label: []u8,
