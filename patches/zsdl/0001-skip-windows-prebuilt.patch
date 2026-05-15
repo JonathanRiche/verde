@@ -1,0 +1,45 @@
+diff --git a/packages/zsdl/build.zig b/packages/zsdl/build.zig
+index 03465cc..ef241c1 100644
+--- a/packages/zsdl/build.zig
++++ b/packages/zsdl/build.zig
+@@ -272,13 +272,13 @@ pub const prebuilt_sdl3 = struct {
+         const b = compile_step.step.owner;
+         const target = compile_step.rootModuleTarget();
+         switch (target.os.tag) {
+-            .windows => {
+-                if (target.cpu.arch.isX86()) {
+-                    if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
+-                        compile_step.root_module.addLibraryPath(sdl3_prebuilt.path("bin"));
+-                    }
+-                }
+-            },
++            // Verde patch: the upstream x86_64-windows-gnu prebuilt's
++            // build.zig.zon predates Zig 0.16's mandatory `fingerprint`
++            // field, so requesting it via lazyDependency fails during
++            // package resolution. Verde targets windows-msvc and supplies
++            // SDL3 via -Dsdl3-runtime-lib instead, so the gnu prebuilt is
++            // never needed here.
++            .windows => {},
+             .linux => {
+                 if (target.cpu.arch.isX86()) {
+                     if (b.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+@@ -305,17 +305,8 @@ pub const prebuilt_sdl3 = struct {
+     ) ?*std.Build.Step {
+         _ = aux_libs;
+         switch (target.os.tag) {
+-            .windows => {
+-                if (target.cpu.arch.isX86()) {
+-                    if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
+-                        return &b.addInstallFileWithDir(
+-                            sdl3_prebuilt.path("bin/SDL3.dll"),
+-                            install_dir,
+-                            "SDL3.dll",
+-                        ).step;
+-                    }
+-                }
+-            },
++            // Verde patch: see note in addLibraryPathsTo.
++            .windows => {},
+             .linux => {
+                 if (target.cpu.arch.isX86()) {
+                     if (b.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
