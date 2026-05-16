@@ -83,11 +83,10 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
         const line_without_comment = stripYamlComment(raw_line);
-        const line = std.mem.trim(u8, line_without_comment, " \t\r");
-        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        if (std.mem.trim(u8, line_without_comment, " \t\r").len == 0) continue;
 
-        const indent = leadingSpaces(line);
-        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const indent = leadingSpaces(line_without_comment);
+        const trimmed = std.mem.trim(u8, line_without_comment, " \t\r");
 
         if (indent == 0) {
             current_index = null;

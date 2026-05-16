@@ -484,23 +484,30 @@ fn processCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     }
     const project_index = resolveProjectIndex(state, params) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "project not found");
     if (std.mem.eql(u8, command, "list")) {
-        try state.refreshProjectStackConfig(project_index);
+        if (try refreshStackConfigOrError(allocator, id_value, state, project_index)) |response| return response;
         return try managedProcessesResponseForProject(allocator, id_value, state, project_index);
     }
     if (std.mem.eql(u8, command, "inspect")) {
         const name = stringParam(params, "name") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "process.inspect requires --name or --pane");
-        _ = (try state.managedProcessByNameConst(project_index, name)) orelse
+        const process = state.managedProcessByNameConst(project_index, name) catch |err| switch (err) {
+            error.InvalidStackConfig => return try errorResponseAlloc(allocator, id_value, "invalid_stack_config", stackConfigErrorMessage(state, project_index, err)),
+            else => return err,
+        };
+        _ = process orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "process not found");
         return try managedProcessResponse(allocator, id_value, state, project_index, name);
     }
     if (std.mem.eql(u8, command, "start") or std.mem.eql(u8, command, "stop") or std.mem.eql(u8, command, "restart")) {
         const name = stringParam(params, "name") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "process command requires --name");
-        const changed = if (std.mem.eql(u8, command, "start"))
-            try state.startManagedProcess(project_index, name)
+        const changed = (if (std.mem.eql(u8, command, "start"))
+            state.startManagedProcess(project_index, name)
         else if (std.mem.eql(u8, command, "stop"))
-            try state.stopManagedProcess(project_index, name)
+            state.stopManagedProcess(project_index, name)
         else
-            try state.restartManagedProcess(project_index, name);
+            state.restartManagedProcess(project_index, name)) catch |err| switch (err) {
+            error.InvalidStackConfig => return try errorResponseAlloc(allocator, id_value, "invalid_stack_config", stackConfigErrorMessage(state, project_index, err)),
+            else => return err,
+        };
         if (!changed) return try errorResponseAlloc(allocator, id_value, "not_found", "process not found");
         return try managedProcessResponse(allocator, id_value, state, project_index, name);
     }
@@ -523,16 +530,19 @@ fn processCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 fn stackCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     const project_index = resolveProjectIndex(state, params) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "project not found");
     if (std.mem.eql(u8, command, "status")) {
-        try state.refreshProjectStackConfig(project_index);
+        if (try refreshStackConfigOrError(allocator, id_value, state, project_index)) |response| return response;
         return try managedProcessesResponseForProject(allocator, id_value, state, project_index);
     }
     if (std.mem.eql(u8, command, "start") or std.mem.eql(u8, command, "stop") or std.mem.eql(u8, command, "restart")) {
-        const count = if (std.mem.eql(u8, command, "start"))
-            try state.startProjectStack(project_index)
+        const count = (if (std.mem.eql(u8, command, "start"))
+            state.startProjectStack(project_index)
         else if (std.mem.eql(u8, command, "stop"))
-            try state.stopProjectStack(project_index)
+            state.stopProjectStack(project_index)
         else
-            try state.restartProjectStack(project_index);
+            state.restartProjectStack(project_index)) catch |err| switch (err) {
+            error.InvalidStackConfig => return try errorResponseAlloc(allocator, id_value, "invalid_stack_config", stackConfigErrorMessage(state, project_index, err)),
+            else => return err,
+        };
         _ = count;
         return try managedProcessesResponseForProject(allocator, id_value, state, project_index);
     }
@@ -644,6 +654,15 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 if (thread.model_ref) |model| try s.write(model) else try s.write(null);
                 try s.objectField("send_pending");
                 try s.write(thread.isSendPendingForUi());
+                const pending_approval = threadHasPendingApproval(thread);
+                try s.objectField("pending_approval");
+                try s.write(pending_approval);
+                try s.objectField("attention");
+                try s.write(pending_approval);
+                try s.objectField("attention_reasons");
+                try s.beginArray();
+                if (pending_approval) try s.write("pending_approval");
+                try s.endArray();
             }
         },
         .terminal => |ref| {
@@ -661,6 +680,11 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
+            const attention = terminalDockHasAttention(project, ref.dock_id);
+            try s.objectField("attention");
+            try s.write(attention);
+            try s.objectField("attention_reasons");
+            try writeTerminalAttentionReasons(s, project, ref.dock_id);
         },
     }
     try s.endObject();
@@ -726,6 +750,11 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
                 try s.endObject();
                 break;
             }
+            const attention = terminalDockHasAttention(&project, ref.dock_id);
+            try s.objectField("attention");
+            try s.write(attention);
+            try s.objectField("attention_reasons");
+            try writeTerminalAttentionReasons(s, &project, ref.dock_id);
             try s.endObject();
         }
     }
@@ -736,11 +765,11 @@ fn managedProcessesResponse(allocator: std.mem.Allocator, id_value: std.json.Val
     const project_index = resolveProjectIndexNullable(state, params);
     if (project_index) |index| {
         if (index >= state.projects.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "project not found");
-        try state.refreshProjectStackConfig(index);
+        if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
     } else {
         var index: usize = 0;
         while (index < state.projects.items.len) : (index += 1) {
-            try state.refreshProjectStackConfig(index);
+            if (try refreshStackConfigOrError(allocator, id_value, state, index)) |response| return response;
         }
     }
 
@@ -771,6 +800,8 @@ fn managedProcessesResponseForProject(allocator: std.mem.Allocator, id_value: st
     try s.write(project_index);
     try s.objectField("project_id");
     try s.write(state.projects.items[project_index].id);
+    try s.objectField("stack_config_error");
+    if (state.projects.items[project_index].stack_config_error) |message| try s.write(message) else try s.write(null);
     try s.objectField("processes");
     try writeManagedProcessesArray(&s, state, project_index);
     try s.endObject();
@@ -845,6 +876,14 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
     try s.write(process.watch_trigger_count);
     try s.objectField("last_watch_scan_ms");
     try s.write(process.last_watch_scan_ms);
+    try s.objectField("last_watch_change_ms");
+    try s.write(process.last_watch_change_ms);
+    try s.objectField("pending_watch_restart_ms");
+    try s.write(process.pending_watch_restart_ms);
+    try s.objectField("watch_ready");
+    try s.write(process.watch_ready);
+    try s.objectField("watch_error_count");
+    try s.write(process.watch_error_count);
     try s.objectField("explicit_stop");
     try s.write(process.explicit_stop);
     try s.objectField("watch");
@@ -856,7 +895,12 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
     try s.objectField("pane_id");
     if (process.pane_id) |pane_id| try s.write(pane_id) else try s.write(null);
     try s.objectField("attention");
-    try s.write(process.status == .crashed);
+    try s.write(process.status == .crashed or process.pending_watch_restart_ms != 0);
+    try s.objectField("attention_reasons");
+    try s.beginArray();
+    if (process.status == .crashed) try s.write("process_crashed");
+    if (process.pending_watch_restart_ms != 0) try s.write("watch_restart_pending");
+    try s.endArray();
     if (process.dock_id) |dock_id| {
         if (state.projectTerminalDock(project_index, dock_id)) |dock| {
             try s.objectField("running");
@@ -870,6 +914,46 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
         }
     }
     try s.endObject();
+}
+
+fn refreshStackConfigOrError(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize) !?[]u8 {
+    state.refreshProjectStackConfig(project_index) catch |err| switch (err) {
+        error.InvalidStackConfig => return try errorResponseAlloc(allocator, id_value, "invalid_stack_config", stackConfigErrorMessage(state, project_index, err)),
+        else => return err,
+    };
+    return null;
+}
+
+fn stackConfigErrorMessage(state: *app_state.AppState, project_index: usize, err: anyerror) []const u8 {
+    if (project_index < state.projects.items.len) {
+        if (state.projects.items[project_index].stack_config_error) |message| return message;
+    }
+    return @errorName(err);
+}
+
+fn threadHasPendingApproval(thread: *const app_state.ChatThread) bool {
+    const send_state = thread.send_state;
+    if (!send_state.mutex.tryLock()) return true;
+    defer send_state.mutex.unlock();
+    return send_state.status == .pending and send_state.pending_approval != null;
+}
+
+fn terminalDockHasAttention(project: *const app_state.Project, dock_id: u32) bool {
+    for (project.managed_processes.items) |process| {
+        if (process.dock_id == null or process.dock_id.? != dock_id) continue;
+        if (process.status == .crashed or process.pending_watch_restart_ms != 0) return true;
+    }
+    return false;
+}
+
+fn writeTerminalAttentionReasons(s: *std.json.Stringify, project: *const app_state.Project, dock_id: u32) !void {
+    try s.beginArray();
+    for (project.managed_processes.items) |process| {
+        if (process.dock_id == null or process.dock_id.? != dock_id) continue;
+        if (process.status == .crashed) try s.write("process_crashed");
+        if (process.pending_watch_restart_ms != 0) try s.write("watch_restart_pending");
+    }
+    try s.endArray();
 }
 
 fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
