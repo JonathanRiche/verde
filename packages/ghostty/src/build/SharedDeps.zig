@@ -474,12 +474,14 @@ pub fn add(
         step.root_module.addImport("z2d", dep.module("z2d"));
     }
     self.addUucode(b, step.root_module, target, optimize);
-    if (b.lazyDependency("zf", .{
-        .target = target,
-        .optimize = optimize,
-        .with_tui = false,
-    })) |dep| {
-        step.root_module.addImport("zf", dep.module("zf"));
+    if (!(self.config.app_runtime == .none and self.config.emit_lib_vt)) {
+        if (b.lazyDependency("zf", .{
+            .target = target,
+            .optimize = optimize,
+            .with_tui = false,
+        })) |dep| {
+            step.root_module.addImport("zf", dep.module("zf"));
+        }
     }
 
     // Mac Stuff

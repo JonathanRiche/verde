@@ -1,0 +1,11 @@
+.{
+    .name = .zf,
+    .version = "0.10.3",
+    .fingerprint = 0x30d847ee275a0eb1,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src/zf",
+    },
+}

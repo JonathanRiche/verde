@@ -182,6 +182,23 @@ fn renderStateTab(state: *runtime.AppState, rect: palette.Rect) void {
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_focused: {}", .{state.terminal_focused});
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "terminal_visible: {}", .{state.isTerminalVisible()});
     y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "selected_project_index: {d}", .{state.selected_project_index});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_visible_panes: {d}", .{state.debug_workspace_visible_pane_count});
+    y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_minimized_panes: {d}", .{state.currentProjectWorkspaceMinimizedPaneCount()});
+    if (state.currentProjectWorkspaceMaximizedPaneId()) |pane_id| {
+        y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_maximized_pane: {d}", .{pane_id});
+    } else {
+        y = renderLine(state, rect, y, "workspace_maximized_pane: <none>", paletteColor(theme.COLOR_WHITE), font_size);
+    }
+    if (state.focusedWorkspacePaneKind()) |kind| {
+        y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_focused_kind: {s}", .{@tagName(kind)});
+    } else {
+        y = renderLine(state, rect, y, "workspace_focused_kind: <none>", paletteColor(theme.COLOR_WHITE), font_size);
+    }
+    if (state.focusedWorkspaceTerminalDockId()) |dock_id| {
+        y = renderFmtLine(state, rect, y, paletteColor(theme.COLOR_WHITE), font_size, "workspace_terminal_dock_id: {d}", .{dock_id});
+    } else {
+        y = renderLine(state, rect, y, "workspace_terminal_dock_id: <none>", paletteColor(theme.COLOR_WHITE), font_size);
+    }
 
     if (state.projects.items.len > 0) {
         y += theme.scaledUi(8.0);

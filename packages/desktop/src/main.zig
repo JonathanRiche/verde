@@ -17,6 +17,7 @@ const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
 const utils = @import("utils.zig");
 const ui_layout = @import("ui/layout.zig");
+const workspace_panes_ui = @import("ui/workspace_panes.zig");
 const sidebar_ui = @import("ui/sidebar.zig");
 const chat_panel_ui = @import("ui/chat_panel.zig");
 const browser_ui = @import("ui/browser.zig");
@@ -215,7 +216,7 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_PROSE_BOLD_ITALIC_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_prose_bold_italic_font_path);
-    const palette_gpu_mono_font_path = try paletteGpuFontPath(
+    const palette_gpu_mono_font_path = try ghosttyMonoFontPath(allocator) orelse try paletteGpuFontPath(
         allocator,
         storage.pref_path,
         "JetBrainsMonoNerdFont-Regular.ttf",
@@ -439,6 +440,83 @@ fn paletteGpuFontPath(
     }
 
     return try installBundledFont(allocator, pref_path, file_name, bytes);
+}
+
+fn ghosttyMonoFontPath(allocator: std.mem.Allocator) !?[:0]u8 {
+    const family = try ghosttyFontFamily(allocator) orelse return null;
+    defer allocator.free(family);
+    return try fontPathForFamily(allocator, family);
+}
+
+fn ghosttyFontFamily(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.c.getenv("HOME") orelse return null;
+    const config_path = try std.fs.path.join(allocator, &.{ std.mem.span(home), ".config", "ghostty", "config" });
+    defer allocator.free(config_path);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), config_path, allocator, .limited(128 * 1024)) catch return null;
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |index| raw_line[0..index] else raw_line;
+        const line = std.mem.trim(u8, no_comment, " \t\r");
+        if (line.len == 0) continue;
+        const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..equals], " \t\r");
+        if (!std.mem.eql(u8, key, "font-family")) continue;
+        return try allocator.dupe(u8, unquoteGhosttyValue(line[equals + 1 ..]));
+    }
+    return null;
+}
+
+fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 {
+    var compact = std.ArrayList(u8).empty;
+    defer compact.deinit(allocator);
+    for (family) |byte| {
+        if (byte == ' ' or byte == '\t' or byte == '-' or byte == '_') continue;
+        try compact.append(allocator, byte);
+    }
+
+    const compact_name = compact.items;
+    const candidates = [_][]const u8{
+        "/usr/share/fonts/TTF",
+        "/usr/local/share/fonts",
+    };
+    for (candidates) |dir| {
+        const path = try allocFontCandidatePath(allocator, dir, compact_name);
+        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
+        allocator.free(path);
+    }
+
+    const home = std.c.getenv("HOME") orelse return null;
+    const home_slice = std.mem.span(home);
+    const local_candidates = [_][]const u8{
+        ".local/share/fonts",
+        ".fonts",
+    };
+    for (local_candidates) |dir| {
+        const parent = try std.fs.path.join(allocator, &.{ home_slice, dir });
+        defer allocator.free(parent);
+        const path = try allocFontCandidatePath(allocator, parent, compact_name);
+        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
+        allocator.free(path);
+    }
+    return null;
+}
+
+fn allocFontCandidatePath(allocator: std.mem.Allocator, dir: []const u8, compact_name: []const u8) ![:0]u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}-Regular.ttf", .{ dir, compact_name });
+    defer allocator.free(path);
+    return try allocator.dupeZ(u8, path);
+}
+
+fn unquoteGhosttyValue(raw_value: []const u8) []const u8 {
+    var value = std.mem.trim(u8, raw_value, " \t\r");
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+    if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') value = value[1 .. value.len - 1];
+    return value;
 }
 
 fn installBundledFont(
@@ -721,11 +799,13 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         state.isPickerPending() or
         state.isBrowserVisible() or
         state.hasVisibleTerminalSessions() or
-        state.transcriptMarkdownSelectionDragging();
+        state.transcriptMarkdownSelectionDragging() or
+        workspace_panes_ui.isFocusAnimating() or
+        ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
@@ -740,6 +820,17 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     "browser-input sdl key_down key=0x{x} scancode={} focused={} visible={}",
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
+            }
+            if (terminal_panel_ui.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (state.terminal_focused and terminalOwnedShortcut(&event.key)) {
+                const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
+                state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
+                if (terminal_key_handled) {
+                    return true;
+                }
             }
             const action = keyboard.actionForEvent(&event.key);
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
@@ -757,16 +848,49 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // Workspace pane shortcuts pre-empt the terminal handler so the
+            // embedded terminal (and anything running inside it, like tmux)
+            // can't swallow Alt-prefixed bindings.
+            if (action) |resolved_workspace_action| switch (resolved_workspace_action) {
+                .workspace_focus_left,
+                .workspace_focus_right,
+                .workspace_focus_up,
+                .workspace_focus_down,
+                .workspace_grow_left,
+                .workspace_grow_right,
+                .workspace_grow_up,
+                .workspace_grow_down,
+                .workspace_split_chat_vertical,
+                .workspace_split_chat_horizontal,
+                .workspace_split_terminal_vertical,
+                .workspace_split_terminal_horizontal,
+                .workspace_toggle_maximize,
+                .workspace_minimize,
+                .workspace_close,
+                => {
+                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
+                    return true;
+                },
+                else => {},
+            };
+            if (action) |resolved_app_action| switch (resolved_app_action) {
+                .toggle_terminal,
+                .toggle_browser,
+                .toggle_sidebar,
+                .toggle_sidebar_hidden,
+                .new_thread,
+                => {
+                    handleKeyboardAction(state, keyboard, resolved_app_action);
+                    return true;
+                },
+                else => {},
+            };
             const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
             state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
             if (terminal_key_handled) {
                 return true;
             }
             if (handleFontSizeShortcut(state, &event.key)) {
-                return true;
-            }
-            if (action == .toggle_terminal or action == .toggle_browser or action == .toggle_sidebar or action == .new_thread) {
-                handleKeyboardAction(state, keyboard, action.?);
                 return true;
             }
             if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
@@ -849,10 +973,20 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
         },
         .mouse_motion => {
+            if (sidebar_ui.finishThreadDragIfMouseReleased(state, event.motion.x, event.motion.y, event.motion.state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+                return true;
+            }
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+                return true;
+            }
             browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             sidebar_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (state.routePaletteComposerMouseMotion(&event.motion, ui_scale)) {
@@ -861,6 +995,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             _ = state.handleBrowserMouse(browserMouseMotionEvent(&event.motion));
         },
         .mouse_button_down, .mouse_button_up => {
+            if (event.button.button == 1 and sidebar_ui.hasActiveThreadDrag()) {
+                if (sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -915,6 +1055,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.button.button == 1 and sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -958,6 +1102,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (state.handleComposerWheel(&event.wheel)) {
+                return true;
+            }
+            if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
             if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
@@ -1061,9 +1208,22 @@ fn keymodBits(modifier_state: sdl.Keymod) u16 {
 
 fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardEvent) bool {
     if (state.isBrowserPaneFocused() or state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
+    if (state.terminal_focused) return false;
     if (!event.down or event.repeat) return false;
     if (event.scancode != .v and event.key != .v) return false;
     return isPrimaryModifierPressed(event.mod);
+}
+
+fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (!event.down) return false;
+    const ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl);
+    const shift = isKeymodPressed(event.mod, sdl.Keymod.shift);
+    if (!shift or isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.gui)) return false;
+    return switch (event.scancode) {
+        .c, .v, .pageup, .pagedown => ctrl or event.scancode == .pageup or event.scancode == .pagedown,
+        .up, .down, .home, .end => ctrl,
+        else => false,
+    };
 }
 
 fn logPasteShortcutEvent(state: *const AppState, event: *const sdl.KeyboardEvent, matched: bool) void {
@@ -1198,6 +1358,7 @@ fn handleKeyboardAction(
         .open_default => state.runDefaultOpenAction(),
         .new_thread => state.createThreadForProject(state.selected_project_index),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
+        .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_browser => state.toggleBrowser(),
         .toggle_terminal => state.toggleCurrentProjectTerminal(),
         .chat_up => if (canHandleTranscriptScrollAction(state)) {
@@ -1212,6 +1373,21 @@ fn handleKeyboardAction(
         .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
             state.requestTranscriptPageScroll(1);
         },
+        .workspace_split_chat_vertical => _ = state.splitFocusedWorkspacePaneWithChatAxis(.vertical),
+        .workspace_split_chat_horizontal => _ = state.splitFocusedWorkspacePaneWithChatAxis(.horizontal),
+        .workspace_split_terminal_vertical => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.vertical),
+        .workspace_split_terminal_horizontal => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.horizontal),
+        .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
+        .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
+        .workspace_close => _ = state.closeFocusedWorkspacePane(),
+        .workspace_focus_left => _ = workspace_panes_ui.focusPaneInDirection(state, .left),
+        .workspace_focus_right => _ = workspace_panes_ui.focusPaneInDirection(state, .right),
+        .workspace_focus_up => _ = workspace_panes_ui.focusPaneInDirection(state, .up),
+        .workspace_focus_down => _ = workspace_panes_ui.focusPaneInDirection(state, .down),
+        .workspace_grow_left => _ = workspace_panes_ui.growPaneInDirection(state, .left),
+        .workspace_grow_right => _ = workspace_panes_ui.growPaneInDirection(state, .right),
+        .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
+        .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
 }
 
