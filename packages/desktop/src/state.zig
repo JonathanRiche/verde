@@ -25,6 +25,8 @@ const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 const STACK_CONFIG_REFRESH_MS: i64 = 2000;
 const MANAGED_PROCESS_BASE_RESTART_BACKOFF_MS: i64 = 1000;
 const MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS: i64 = 30000;
+const MANAGED_PROCESS_WATCH_SCAN_MS: i64 = 1000;
+const MANAGED_PROCESS_WATCH_DEBOUNCE_MS: i64 = 500;
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
     return text_measure.textPrefixWidth(.ui, text, font_size, end);
@@ -338,6 +340,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 return;
             }
             if (state.acceptPrimaryFileSearchResult()) return;
+            if (state.handleWorkspaceCommand(state.currentProject().currentDraft())) return;
             state.sendDraft() catch |err| {
                 log.err("failed to send draft: {s}", .{@errorName(err)});
             };
@@ -1276,6 +1279,11 @@ pub const ManagedProcess = struct {
     restart_count: u32 = 0,
     watch_trigger_count: u32 = 0,
     last_watch_scan_ms: i64 = 0,
+    last_watch_change_ms: i64 = 0,
+    pending_watch_restart_ms: i64 = 0,
+    watch_signature: u64 = 0,
+    watch_ready: bool = false,
+    watch_error_count: u32 = 0,
     dock_id: ?u32 = null,
     pane_id: ?WorkspacePaneId = null,
     explicit_stop: bool = false,
@@ -1299,6 +1307,7 @@ pub const ManagedProcess = struct {
     fn updateFromDefinition(self: *ManagedProcess, allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !void {
         self.kind = definition.kind;
         self.restart = definition.restart;
+        var reset_watch_state = false;
         if (!std.mem.eql(u8, self.command, definition.command)) {
             allocator.free(self.command);
             self.command = try allocator.dupe(u8, definition.command);
@@ -1306,12 +1315,15 @@ pub const ManagedProcess = struct {
         if (!std.mem.eql(u8, self.cwd, definition.cwd)) {
             allocator.free(self.cwd);
             self.cwd = try allocator.dupe(u8, definition.cwd);
+            reset_watch_state = true;
         }
+        if (!watchPatternsEqual(self.watch.items, definition.watch.items)) reset_watch_state = true;
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.clearRetainingCapacity();
         for (definition.watch.items) |pattern| {
             try self.watch.append(allocator, try allocator.dupe(u8, pattern));
         }
+        if (reset_watch_state) self.resetWatchState();
     }
 
     fn deinit(self: *ManagedProcess, allocator: std.mem.Allocator) void {
@@ -1320,6 +1332,23 @@ pub const ManagedProcess = struct {
         allocator.free(self.cwd);
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.deinit(allocator);
+    }
+
+    fn resetWatchState(self: *ManagedProcess) void {
+        self.watch_signature = 0;
+        self.watch_ready = false;
+        self.last_watch_scan_ms = 0;
+        self.last_watch_change_ms = 0;
+        self.pending_watch_restart_ms = 0;
+        self.watch_error_count = 0;
+    }
+
+    fn watchPatternsEqual(left: []const []u8, right: []const []u8) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |l, r| {
+            if (!std.mem.eql(u8, l, r)) return false;
+        }
+        return true;
     }
 };
 
@@ -1960,6 +1989,7 @@ pub const Project = struct {
     terminal_docks: std.ArrayList(TerminalDockEntry) = .empty,
     managed_processes: std.ArrayList(ManagedProcess) = .empty,
     last_stack_config_refresh_ms: i64 = 0,
+    stack_config_error: ?[]u8 = null,
     next_terminal_dock_id: u32 = 1,
     workspace_layout: WorkspaceLayout,
     threads: std.ArrayList(ChatThread),
@@ -1985,6 +2015,7 @@ pub const Project = struct {
             .terminal_docks = .empty,
             .managed_processes = .empty,
             .last_stack_config_refresh_ms = 0,
+            .stack_config_error = null,
             .next_terminal_dock_id = 1,
             .workspace_layout = try WorkspaceLayout.initDefaultChat(allocator),
             .threads = .empty,
@@ -2124,6 +2155,24 @@ pub const Project = struct {
         return null;
     }
 
+    fn clearManagedProcesses(self: *Project, allocator: std.mem.Allocator) void {
+        for (self.managed_processes.items) |*process| {
+            self.terminateManagedProcessSession(process);
+            process.deinit(allocator);
+        }
+        self.managed_processes.clearRetainingCapacity();
+    }
+
+    fn terminateManagedProcessSession(self: *Project, process: *ManagedProcess) void {
+        const dock_id = process.dock_id orelse return;
+        const entry = self.terminalDockEntryById(dock_id) orelse return;
+        _ = entry.dock.terminateActiveSession();
+        process.status = .stopped;
+        process.explicit_stop = true;
+        process.next_restart_ms = 0;
+        process.pending_watch_restart_ms = 0;
+    }
+
     fn managedProcessByDockId(self: *Project, dock_id: u32) ?*ManagedProcess {
         for (self.managed_processes.items) |*process| {
             if (process.dock_id != null and process.dock_id.? == dock_id) return process;
@@ -2158,6 +2207,7 @@ pub const Project = struct {
         self.terminal_docks.deinit(allocator);
         for (self.managed_processes.items) |*process| process.deinit(allocator);
         self.managed_processes.deinit(allocator);
+        if (self.stack_config_error) |message| allocator.free(message);
         self.workspace_layout.deinit(allocator);
         for (self.threads.items) |*thread| {
             thread.deinit(allocator);
@@ -2214,6 +2264,16 @@ pub const Project = struct {
         }
 
         self.sidebar_thread_cache_dirty = false;
+    }
+
+    fn setStackConfigError(self: *Project, allocator: std.mem.Allocator, message: []const u8) void {
+        if (self.stack_config_error) |existing| allocator.free(existing);
+        self.stack_config_error = allocator.dupe(u8, message) catch null;
+    }
+
+    fn clearStackConfigError(self: *Project, allocator: std.mem.Allocator) void {
+        if (self.stack_config_error) |existing| allocator.free(existing);
+        self.stack_config_error = null;
     }
 };
 
@@ -6803,8 +6863,29 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return;
         var project = &self.projects.items[project_index];
         project.last_stack_config_refresh_ms = unixTimestampMs();
-        var loaded = try stack_config.loadFromProject(self.allocator, project.path) orelse return;
+        const maybe_loaded = stack_config.loadFromProject(self.allocator, project.path) catch |err| {
+            project.setStackConfigError(self.allocator, @errorName(err));
+            return err;
+        };
+        if (maybe_loaded == null) {
+            project.clearStackConfigError(self.allocator);
+            project.clearManagedProcesses(self.allocator);
+            return;
+        }
+        var loaded = maybe_loaded.?;
         defer loaded.deinit(self.allocator);
+        project.clearStackConfigError(self.allocator);
+
+        var process_index: usize = 0;
+        while (process_index < project.managed_processes.items.len) {
+            if (stackDefinitionByName(&loaded, project.managed_processes.items[process_index].name) != null) {
+                process_index += 1;
+                continue;
+            }
+            var removed = project.managed_processes.orderedRemove(process_index);
+            project.terminateManagedProcessSession(&removed);
+            removed.deinit(self.allocator);
+        }
 
         for (loaded.processes.items) |definition| {
             if (project.managedProcessByName(definition.name)) |process| {
@@ -6814,6 +6895,13 @@ pub const AppState = struct {
             }
         }
         self.refreshManagedProcessStatuses(project_index);
+    }
+
+    fn stackDefinitionByName(config: *const stack_config.Config, name: []const u8) ?*const stack_config.ProcessDefinition {
+        for (config.processes.items) |*definition| {
+            if (std.mem.eql(u8, definition.name, name)) return definition;
+        }
+        return null;
     }
 
     pub fn refreshManagedProcessStatuses(self: *AppState, project_index: usize) void {
@@ -6857,6 +6945,15 @@ pub const AppState = struct {
 
         for (self.projects.items[project_index].managed_processes.items) |*process| {
             if (process.explicit_stop) continue;
+            if (process.watch.items.len > 0 and process.status == .running) {
+                self.pollManagedProcessWatch(project_index, process, now);
+            }
+            if (process.pending_watch_restart_ms != 0 and now >= process.pending_watch_restart_ms) {
+                restart_names.append(self.allocator, self.allocator.dupe(u8, process.name) catch continue) catch continue;
+                process.pending_watch_restart_ms = 0;
+                process.status = .restarting;
+                continue;
+            }
             const should_restart_crash = process.status == .crashed and process.restart == .on_crash;
             const should_restart_always = process.status != .running and process.restart == .always and process.last_start_ms != 0;
             if (!should_restart_crash and !should_restart_always) continue;
@@ -6904,6 +7001,7 @@ pub const AppState = struct {
         process.last_start_ms = unixTimestampMs();
         process.last_exit_ms = 0;
         process.next_restart_ms = 0;
+        process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
         project.workspace_layout.maximized_pane_id = null;
@@ -6921,6 +7019,7 @@ pub const AppState = struct {
         process.status = .stopped;
         process.last_exit_ms = unixTimestampMs();
         process.next_restart_ms = 0;
+        process.pending_watch_restart_ms = 0;
         if (process.dock_id) |dock_id| {
             if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| {
                 _ = dock.terminateActiveSession();
@@ -6998,6 +7097,120 @@ pub const AppState = struct {
         return self.projects.items[project_index].managedProcessByName(name);
     }
 
+    pub fn focusManagedProcessTerminal(self: *AppState, project_index: usize, name: []const u8) !bool {
+        try self.refreshProjectStackConfig(project_index);
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        const process = self.projects.items[project_index].managedProcessByName(name) orelse return false;
+        if (process.pane_id) |pane_id| {
+            _ = self.focusCurrentProjectWorkspacePane(pane_id);
+            if (process.dock_id) |dock_id| self.requestTerminalDockFocus(dock_id);
+            return true;
+        }
+        if (process.dock_id) |dock_id| {
+            process.pane_id = try self.projects.items[project_index].workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+            _ = self.focusCurrentProjectWorkspacePane(process.pane_id.?);
+            self.requestTerminalDockFocus(dock_id);
+            self.markDirty();
+            return true;
+        }
+        return false;
+    }
+
+    fn handleWorkspaceCommand(self: *AppState, raw_text: []const u8) bool {
+        const text = std.mem.trim(u8, raw_text, " \t\r\n");
+        if (!std.mem.startsWith(u8, text, "/")) return false;
+        var parts = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        const root = parts.next() orelse return false;
+        if (!std.mem.eql(u8, root, "/stack") and !std.mem.eql(u8, root, "/process")) return false;
+        const action = parts.next() orelse {
+            self.setSidebarNotice(if (std.mem.eql(u8, root, "/stack")) "Usage: /stack start|stop|restart|status" else "Usage: /process start|stop|restart|focus|crashed <name>");
+            return true;
+        };
+        const project_index = self.selected_project_index;
+        if (std.mem.eql(u8, root, "/stack")) {
+            if (std.mem.eql(u8, action, "status")) {
+                self.refreshProjectStackConfig(project_index) catch |err| {
+                    self.setSidebarNotice(@errorName(err));
+                    return true;
+                };
+                self.refreshManagedProcessStatuses(project_index);
+                const count: usize = self.projects.items[project_index].managed_processes.items.len;
+                self.clearDraft();
+                self.syncPaletteComposerFromDraft();
+                var buffer: [96]u8 = undefined;
+                self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Stack has {d} configured process(es).", .{count}) catch "Stack status updated.");
+                return true;
+            }
+            const result = if (std.mem.eql(u8, action, "start"))
+                self.startProjectStack(project_index)
+            else if (std.mem.eql(u8, action, "stop"))
+                self.stopProjectStack(project_index)
+            else if (std.mem.eql(u8, action, "restart"))
+                self.restartProjectStack(project_index)
+            else {
+                self.setSidebarNotice("Usage: /stack start|stop|restart|status");
+                return true;
+            };
+            const count = result catch |err| {
+                self.setSidebarNotice(@errorName(err));
+                return true;
+            };
+            self.clearDraft();
+            self.syncPaletteComposerFromDraft();
+            var buffer: [96]u8 = undefined;
+            self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Stack {s}: {d} process(es).", .{ action, count }) catch "Stack command applied.");
+            return true;
+        }
+
+        if (std.mem.eql(u8, action, "crashed")) {
+            self.refreshProjectStackConfig(project_index) catch |err| {
+                self.setSidebarNotice(@errorName(err));
+                return true;
+            };
+            self.refreshManagedProcessStatuses(project_index);
+            var crashed: usize = 0;
+            for (self.projects.items[project_index].managed_processes.items) |process| {
+                if (process.status == .crashed) crashed += 1;
+            }
+            self.clearDraft();
+            self.syncPaletteComposerFromDraft();
+            var buffer: [96]u8 = undefined;
+            self.setSidebarNotice(std.fmt.bufPrint(&buffer, "{d} crashed process(es).", .{crashed}) catch "Crashed process status updated.");
+            return true;
+        }
+
+        const name = parts.next() orelse {
+            self.setSidebarNotice("Usage: /process start|stop|restart|focus <name>");
+            return true;
+        };
+        const changed = if (std.mem.eql(u8, action, "start"))
+            self.startManagedProcess(project_index, name)
+        else if (std.mem.eql(u8, action, "stop"))
+            self.stopManagedProcess(project_index, name)
+        else if (std.mem.eql(u8, action, "restart"))
+            self.restartManagedProcess(project_index, name)
+        else if (std.mem.eql(u8, action, "focus"))
+            self.focusManagedProcessTerminal(project_index, name)
+        else {
+            self.setSidebarNotice("Usage: /process start|stop|restart|focus|crashed <name>");
+            return true;
+        };
+        const changed_result = changed catch |err| {
+            self.setSidebarNotice(@errorName(err));
+            return true;
+        };
+        if (!changed_result) {
+            self.setSidebarNotice("Process not found.");
+            return true;
+        }
+        self.clearDraft();
+        self.syncPaletteComposerFromDraft();
+        var buffer: [128]u8 = undefined;
+        self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Process {s}: {s}.", .{ action, name }) catch "Process command applied.");
+        return true;
+    }
+
     fn resolveManagedProcessCwd(self: *AppState, project_path: []const u8, raw_cwd: []const u8) ![]u8 {
         if (raw_cwd.len == 0 or std.mem.eql(u8, raw_cwd, ".")) return self.allocator.dupe(u8, project_path);
         if (std.fs.path.isAbsolute(raw_cwd)) return self.allocator.dupe(u8, raw_cwd);
@@ -7008,6 +7221,101 @@ pub const AppState = struct {
         const capped_shift: u6 = @intCast(@min(restart_count, 5));
         const backoff = MANAGED_PROCESS_BASE_RESTART_BACKOFF_MS * (@as(i64, 1) << capped_shift);
         return @min(backoff, MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS);
+    }
+
+    fn pollManagedProcessWatch(self: *AppState, project_index: usize, process: *ManagedProcess, now: i64) void {
+        if (now - process.last_watch_scan_ms < MANAGED_PROCESS_WATCH_SCAN_MS) return;
+        process.last_watch_scan_ms = now;
+        const project = &self.projects.items[project_index];
+        const signature = self.scanManagedProcessWatchSignature(project.path, process.watch.items) catch |err| {
+            process.watch_error_count += 1;
+            log.warn("failed to scan watch patterns for managed process {s}: {s}", .{ process.name, @errorName(err) });
+            return;
+        };
+        if (!process.watch_ready or process.watch_signature == 0) {
+            process.watch_signature = signature;
+            process.watch_ready = true;
+            return;
+        }
+        if (process.watch_signature == signature) return;
+        process.watch_signature = signature;
+        process.last_watch_change_ms = now;
+        process.pending_watch_restart_ms = now + MANAGED_PROCESS_WATCH_DEBOUNCE_MS;
+        process.watch_trigger_count += 1;
+        process.status = .restarting;
+    }
+
+    fn scanManagedProcessWatchSignature(self: *AppState, project_path: []const u8, patterns: []const []u8) !u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hashBytes(&hasher, "verde-watch-v1");
+        for (patterns) |pattern| hashBytes(&hasher, pattern);
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), project_path, .{ .iterate = true });
+        defer dir.close(threaded.io());
+        var walker = try dir.walk(self.allocator);
+        defer walker.deinit();
+
+        while (try walker.next(threaded.io())) |entry| {
+            if (entry.kind == .directory and shouldSkipManagedWatchDirectory(entry.basename)) {
+                walker.leave(threaded.io());
+                continue;
+            }
+            const rel_path = std.mem.sliceTo(entry.path, 0);
+            if (!managedWatchPathMatches(patterns, rel_path)) continue;
+            const stat = entry.dir.statFile(threaded.io(), entry.basename, .{}) catch continue;
+            hashBytes(&hasher, rel_path);
+            hashU64(&hasher, @intFromEnum(stat.kind));
+            hashU64(&hasher, stat.size);
+            const mtime_ns: i128 = stat.mtime.nanoseconds;
+            hashBytes(&hasher, std.mem.asBytes(&mtime_ns));
+        }
+        return hasher.final();
+    }
+
+    fn shouldSkipManagedWatchDirectory(name: []const u8) bool {
+        return std.mem.eql(u8, name, ".git") or
+            std.mem.eql(u8, name, ".zig-cache") or
+            std.mem.eql(u8, name, "zig-out") or
+            std.mem.eql(u8, name, "node_modules");
+    }
+
+    fn managedWatchPathMatches(patterns: []const []u8, path: []const u8) bool {
+        for (patterns) |pattern| {
+            if (globMatch(pattern, path)) return true;
+        }
+        return false;
+    }
+
+    fn globMatch(pattern: []const u8, path: []const u8) bool {
+        if (pattern.len == 0) return path.len == 0;
+        if (pattern[0] == '*') {
+            const deep = pattern.len >= 2 and pattern[1] == '*';
+            const rest = if (deep) pattern[2..] else pattern[1..];
+            var index: usize = 0;
+            while (index <= path.len) : (index += 1) {
+                if (!deep and index > 0 and path[index - 1] == '/') break;
+                if (globMatch(rest, path[index..])) return true;
+            }
+            return false;
+        }
+        if (path.len == 0) return false;
+        if (pattern[0] == '?') {
+            if (path[0] == '/') return false;
+            return globMatch(pattern[1..], path[1..]);
+        }
+        if (pattern[0] != path[0]) return false;
+        return globMatch(pattern[1..], path[1..]);
+    }
+
+    fn hashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+        hasher.update(bytes);
+        hashU64(hasher, bytes.len);
+    }
+
+    fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
+        var copy = value;
+        hasher.update(std.mem.asBytes(&copy));
     }
 
     fn selectWorkspaceChatPaneThread(self: *AppState, pane_id: WorkspacePaneId) bool {
