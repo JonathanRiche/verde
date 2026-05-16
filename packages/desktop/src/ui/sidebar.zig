@@ -2,11 +2,13 @@
 
 const std = @import("std");
 const palette = @import("palette");
+const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
 const utils = @import("../utils.zig");
 const native_state = @import("../state.zig");
+const workspace_panes = @import("workspace_panes.zig");
 const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
@@ -24,6 +26,9 @@ const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
 const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
+const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
+const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
+const THREAD_DRAG_FLOATING_Z: i32 = 160;
 
 const SidebarHitKind = enum {
     collapse,
@@ -66,6 +71,19 @@ var sidebar_menu_row_enabled: [8]bool = undefined;
 var sidebar_menu_row_labels: [8][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
 
+const ThreadDragState = struct {
+    pending: bool = false,
+    active: bool = false,
+    project_index: usize = 0,
+    thread_index: usize = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+};
+
+var thread_drag: ThreadDragState = .{};
+
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
@@ -94,6 +112,13 @@ pub fn pointerOverSidebar(x: f32, y: f32) bool {
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
+    if (state.isSidebarHidden()) {
+        const reveal = x <= theme.scaledUi(HIDDEN_SIDEBAR_EDGE_REVEAL_CSS) or rectContainsPoint(palette_sidebar_rect, x, y);
+        state.setSidebarHoverRevealed(reveal);
+    }
+
+    updateThreadDrag(state, x, y);
+
     var new_thread_hover: ?native_state.SidebarThreadHover = null;
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
@@ -140,7 +165,10 @@ fn threadHoverEq(a: ?native_state.SidebarThreadHover, b: ?native_state.SidebarTh
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
-    if (!down) return rectContainsPoint(palette_sidebar_rect, x, y);
+    if (!down) {
+        if (thread_drag.pending or thread_drag.active) return finishThreadDrag(state, x, y);
+        return rectContainsPoint(palette_sidebar_rect, x, y);
+    }
     if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
 
     if (state.sidebar_context_menu_open and handleSidebarContextMenuPrimary(state, x, y)) {
@@ -180,11 +208,17 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .thread_row => {
                 if (hit.project_index < state.projects.items.len and hit.thread_index < state.projects.items[hit.project_index].threads.items.len) {
-                    state.noteInteraction();
-                    state.selected_project_index = hit.project_index;
-                    state.projects.items[hit.project_index].selected_thread_index = hit.thread_index;
-                    state.requestComposerFocus();
-                    state.syncRenameBuffer();
+                    workspace_panes.clearThreadDropTarget();
+                    thread_drag = .{
+                        .pending = true,
+                        .project_index = hit.project_index,
+                        .thread_index = hit.thread_index,
+                        .start_x = x,
+                        .start_y = y,
+                        .x = x,
+                        .y = y,
+                    };
+                    _ = sdl.captureMouse(true);
                 }
             },
             .toggle_threads => {
@@ -250,6 +284,98 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
         }
     }
     return false;
+}
+
+pub fn renderWorkspaceDragPreview(state: *runtime.AppState) void {
+    if (!thread_drag.active) return;
+    workspace_panes.renderThreadDropPreview(state, thread_drag.x, thread_drag.y);
+}
+
+pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
+    renderThreadDragPreview(state);
+}
+
+pub fn hasActiveThreadDrag() bool {
+    return thread_drag.pending or thread_drag.active;
+}
+
+pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+    if (!thread_drag.pending and !thread_drag.active) return false;
+    if (buttons.left != 0) return false;
+    return finishThreadDrag(state, x, y);
+}
+
+fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
+    if (!thread_drag.pending and !thread_drag.active) return;
+    thread_drag.x = x;
+    thread_drag.y = y;
+    if (thread_drag.pending) {
+        const dx = x - thread_drag.start_x;
+        const dy = y - thread_drag.start_y;
+        const threshold = theme.scaledUi(THREAD_DRAG_THRESHOLD_CSS);
+        if (dx * dx + dy * dy >= threshold * threshold) {
+            thread_drag.pending = false;
+            thread_drag.active = true;
+        }
+    }
+    state.markDirty();
+}
+
+fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
+    const drag = thread_drag;
+    thread_drag = .{};
+    _ = sdl.captureMouse(false);
+    if (!drag.active) {
+        workspace_panes.clearThreadDropTarget();
+        if (drag.project_index < state.projects.items.len and drag.thread_index < state.projects.items[drag.project_index].threads.items.len) {
+            state.noteInteraction();
+            state.selectThreadForProject(drag.project_index, drag.thread_index);
+        }
+        return true;
+    }
+
+    if (drag.project_index != state.selected_project_index) {
+        state.selected_project_index = drag.project_index;
+        state.ensureCurrentProjectWorkspace();
+        state.syncRenameBuffer();
+    }
+    if (workspace_panes.dropThreadAt(state, drag.thread_index, x, y)) {
+        state.setSidebarNotice("");
+    } else {
+        workspace_panes.clearThreadDropTarget();
+        state.setSidebarNotice("Drop on a pane edge to open that thread.");
+    }
+    return true;
+}
+
+fn renderThreadDragPreview(state: *runtime.AppState) void {
+    if (!thread_drag.active) return;
+    if (thread_drag.project_index >= state.projects.items.len) return;
+    const project = &state.projects.items[thread_drag.project_index];
+    if (thread_drag.thread_index >= project.threads.items.len) return;
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+    const thread = &project.threads.items[thread_drag.thread_index];
+    const w = theme.scaledUi(220.0);
+    const h = theme.scaledUi(38.0);
+    const rect: palette.Rect = .{
+        .x = thread_drag.x + theme.scaledUi(12.0),
+        .y = thread_drag.y + theme.scaledUi(10.0),
+        .w = w,
+        .h = h,
+    };
+    queuePaletteRoundedRect(state, rect, paletteColor(colors.rgba(27, 35, 34, 232)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, rect, paletteColor(colors.rgba(93, 223, 143, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, rect);
+    var title_buf = std.mem.zeroes([64:0]u8);
+    const row_label = truncatedThreadTitle(&title_buf, thread.title, 24);
+    const font = theme.scaledUi(13.5);
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(42.0),
+        .y = rect.y + (rect.h - font * 1.25) * 0.5,
+        .w = rect.w - theme.scaledUi(52.0),
+        .h = font * 1.25,
+    }, row_label, paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
 fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {

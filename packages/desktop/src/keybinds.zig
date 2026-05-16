@@ -12,12 +12,28 @@ pub const NativeKeyboardAction = enum {
     open_default,
     new_thread,
     toggle_sidebar,
+    toggle_sidebar_hidden,
     toggle_browser,
     toggle_terminal,
     chat_up,
     chat_down,
     chat_page_up,
     chat_page_down,
+    workspace_split_chat_vertical,
+    workspace_split_chat_horizontal,
+    workspace_split_terminal_vertical,
+    workspace_split_terminal_horizontal,
+    workspace_toggle_maximize,
+    workspace_minimize,
+    workspace_close,
+    workspace_focus_left,
+    workspace_focus_right,
+    workspace_focus_up,
+    workspace_focus_down,
+    workspace_grow_left,
+    workspace_grow_right,
+    workspace_grow_up,
+    workspace_grow_down,
 };
 
 pub const NativeTerminalAction = enum {
@@ -90,6 +106,7 @@ pub const NativeKeyboardConfig = struct {
     open_default: []Keybind,
     new_thread: []Keybind,
     toggle_sidebar: []Keybind,
+    toggle_sidebar_hidden: []Keybind,
     toggle_browser: []Keybind,
     toggle_terminal: []Keybind,
     chat_up: []Keybind,
@@ -109,6 +126,21 @@ pub const NativeKeyboardConfig = struct {
     terminal_focus_down: []Keybind,
     terminal_focus_left: []Keybind,
     terminal_focus_right: []Keybind,
+    workspace_split_chat_vertical: []Keybind,
+    workspace_split_chat_horizontal: []Keybind,
+    workspace_split_terminal_vertical: []Keybind,
+    workspace_split_terminal_horizontal: []Keybind,
+    workspace_toggle_maximize: []Keybind,
+    workspace_minimize: []Keybind,
+    workspace_close: []Keybind,
+    workspace_focus_left: []Keybind,
+    workspace_focus_right: []Keybind,
+    workspace_focus_up: []Keybind,
+    workspace_focus_down: []Keybind,
+    workspace_grow_left: []Keybind,
+    workspace_grow_right: []Keybind,
+    workspace_grow_up: []Keybind,
+    workspace_grow_down: []Keybind,
 
     pub fn load(allocator: std.mem.Allocator) !NativeKeyboardConfig {
         var config: NativeKeyboardConfig = .{
@@ -117,6 +149,7 @@ pub const NativeKeyboardConfig = struct {
             .open_default = try cloneDefaultOpenKeybinds(allocator),
             .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
+            .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
             .toggle_terminal = try cloneDefaultTerminalKeybinds(allocator),
             .chat_up = try cloneDefaultChatUpKeybinds(allocator),
@@ -136,6 +169,21 @@ pub const NativeKeyboardConfig = struct {
             .terminal_focus_down = try cloneDefaultTerminalFocusDownKeybinds(allocator),
             .terminal_focus_left = try cloneDefaultTerminalFocusLeftKeybinds(allocator),
             .terminal_focus_right = try cloneDefaultTerminalFocusRightKeybinds(allocator),
+            .workspace_split_chat_vertical = try cloneEmptyKeybinds(allocator),
+            .workspace_split_chat_horizontal = try cloneEmptyKeybinds(allocator),
+            .workspace_split_terminal_vertical = try cloneEmptyKeybinds(allocator),
+            .workspace_split_terminal_horizontal = try cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator),
+            .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
+            .workspace_minimize = try cloneEmptyKeybinds(allocator),
+            .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
+            .workspace_focus_left = try cloneDefaultWorkspaceFocusLeftKeybinds(allocator),
+            .workspace_focus_right = try cloneDefaultWorkspaceFocusRightKeybinds(allocator),
+            .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
+            .workspace_focus_down = try cloneDefaultWorkspaceFocusDownKeybinds(allocator),
+            .workspace_grow_left = try cloneDefaultWorkspaceGrowLeftKeybinds(allocator),
+            .workspace_grow_right = try cloneDefaultWorkspaceGrowRightKeybinds(allocator),
+            .workspace_grow_up = try cloneDefaultWorkspaceGrowUpKeybinds(allocator),
+            .workspace_grow_down = try cloneDefaultWorkspaceGrowDownKeybinds(allocator),
         };
 
         var parsed = shared_config.readRootValue(allocator) catch |err| {
@@ -155,6 +203,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.open_default);
         self.allocator.free(self.new_thread);
         self.allocator.free(self.toggle_sidebar);
+        self.allocator.free(self.toggle_sidebar_hidden);
         self.allocator.free(self.toggle_browser);
         self.allocator.free(self.toggle_terminal);
         self.allocator.free(self.chat_up);
@@ -174,6 +223,21 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.terminal_focus_down);
         self.allocator.free(self.terminal_focus_left);
         self.allocator.free(self.terminal_focus_right);
+        self.allocator.free(self.workspace_split_chat_vertical);
+        self.allocator.free(self.workspace_split_chat_horizontal);
+        self.allocator.free(self.workspace_split_terminal_vertical);
+        self.allocator.free(self.workspace_split_terminal_horizontal);
+        self.allocator.free(self.workspace_toggle_maximize);
+        self.allocator.free(self.workspace_minimize);
+        self.allocator.free(self.workspace_close);
+        self.allocator.free(self.workspace_focus_left);
+        self.allocator.free(self.workspace_focus_right);
+        self.allocator.free(self.workspace_focus_up);
+        self.allocator.free(self.workspace_focus_down);
+        self.allocator.free(self.workspace_grow_left);
+        self.allocator.free(self.workspace_grow_right);
+        self.allocator.free(self.workspace_grow_up);
+        self.allocator.free(self.workspace_grow_down);
     }
 
     pub fn actionForEvent(self: *const NativeKeyboardConfig, event: *const sdl.KeyboardEvent) ?NativeKeyboardAction {
@@ -188,6 +252,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.toggle_sidebar, event)) {
             return .toggle_sidebar;
+        }
+        if (matchesAny(self.toggle_sidebar_hidden, event)) {
+            return .toggle_sidebar_hidden;
         }
         if (matchesAny(self.toggle_browser, event)) {
             return .toggle_browser;
@@ -206,6 +273,51 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.chat_page_down, event)) {
             return .chat_page_down;
+        }
+        if (matchesAny(self.workspace_split_chat_vertical, event)) {
+            return .workspace_split_chat_vertical;
+        }
+        if (matchesAny(self.workspace_split_chat_horizontal, event)) {
+            return .workspace_split_chat_horizontal;
+        }
+        if (matchesAny(self.workspace_split_terminal_vertical, event)) {
+            return .workspace_split_terminal_vertical;
+        }
+        if (matchesAny(self.workspace_split_terminal_horizontal, event)) {
+            return .workspace_split_terminal_horizontal;
+        }
+        if (matchesAny(self.workspace_toggle_maximize, event)) {
+            return .workspace_toggle_maximize;
+        }
+        if (matchesAny(self.workspace_minimize, event)) {
+            return .workspace_minimize;
+        }
+        if (matchesAny(self.workspace_close, event)) {
+            return .workspace_close;
+        }
+        if (matchesAny(self.workspace_focus_left, event)) {
+            return .workspace_focus_left;
+        }
+        if (matchesAny(self.workspace_focus_right, event)) {
+            return .workspace_focus_right;
+        }
+        if (matchesAny(self.workspace_focus_up, event)) {
+            return .workspace_focus_up;
+        }
+        if (matchesAny(self.workspace_focus_down, event)) {
+            return .workspace_focus_down;
+        }
+        if (matchesAny(self.workspace_grow_left, event)) {
+            return .workspace_grow_left;
+        }
+        if (matchesAny(self.workspace_grow_right, event)) {
+            return .workspace_grow_right;
+        }
+        if (matchesAny(self.workspace_grow_up, event)) {
+            return .workspace_grow_up;
+        }
+        if (matchesAny(self.workspace_grow_down, event)) {
+            return .workspace_grow_down;
         }
 
         return null;
@@ -308,6 +420,12 @@ pub const NativeKeyboardConfig = struct {
                 self.toggle_sidebar = bindings;
             }
         }
+        if (keybinds_value.object.get("sidebar_hidden")) |sidebar_hidden_value| {
+            if (self.parseOverrideValue(sidebar_hidden_value, "sidebar_hidden")) |bindings| {
+                self.allocator.free(self.toggle_sidebar_hidden);
+                self.toggle_sidebar_hidden = bindings;
+            }
+        }
         if (keybinds_value.object.get("browser")) |browser_value| {
             if (self.parseOverrideValue(browser_value, "browser")) |bindings| {
                 self.allocator.free(self.toggle_browser);
@@ -321,6 +439,9 @@ pub const NativeKeyboardConfig = struct {
                 self.allocator.free(self.toggle_terminal);
                 self.toggle_terminal = bindings;
             }
+        }
+        if (keybinds_value.object.get("workspace")) |workspace_value| {
+            self.applyWorkspaceOverrides(workspace_value);
         }
         if (keybinds_value.object.get("chat_up")) |chat_up_value| {
             if (self.parseOverrideValue(chat_up_value, "chat_up")) |bindings| {
@@ -440,6 +561,103 @@ pub const NativeKeyboardConfig = struct {
         }
     }
 
+    fn applyWorkspaceOverrides(self: *NativeKeyboardConfig, workspace_value: std.json.Value) void {
+        if (workspace_value != .object) {
+            log.warn("keybinds.workspace must be an object when provided", .{});
+            return;
+        }
+        if (workspace_value.object.get("split_chat_vertical")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_chat_vertical")) |bindings| {
+                self.allocator.free(self.workspace_split_chat_vertical);
+                self.workspace_split_chat_vertical = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_chat_horizontal")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_chat_horizontal")) |bindings| {
+                self.allocator.free(self.workspace_split_chat_horizontal);
+                self.workspace_split_chat_horizontal = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_terminal_vertical")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_terminal_vertical")) |bindings| {
+                self.allocator.free(self.workspace_split_terminal_vertical);
+                self.workspace_split_terminal_vertical = bindings;
+            }
+        }
+        if (workspace_value.object.get("split_terminal_horizontal")) |value| {
+            if (self.parseOverrideValue(value, "workspace.split_terminal_horizontal")) |bindings| {
+                self.allocator.free(self.workspace_split_terminal_horizontal);
+                self.workspace_split_terminal_horizontal = bindings;
+            }
+        }
+        if (workspace_value.object.get("toggle_maximize")) |value| {
+            if (self.parseOverrideValue(value, "workspace.toggle_maximize")) |bindings| {
+                self.allocator.free(self.workspace_toggle_maximize);
+                self.workspace_toggle_maximize = bindings;
+            }
+        }
+        if (workspace_value.object.get("minimize")) |value| {
+            if (self.parseOverrideValue(value, "workspace.minimize")) |bindings| {
+                self.allocator.free(self.workspace_minimize);
+                self.workspace_minimize = bindings;
+            }
+        }
+        if (workspace_value.object.get("close")) |value| {
+            if (self.parseOverrideValue(value, "workspace.close")) |bindings| {
+                self.allocator.free(self.workspace_close);
+                self.workspace_close = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_left")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_left")) |bindings| {
+                self.allocator.free(self.workspace_focus_left);
+                self.workspace_focus_left = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_right")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_right")) |bindings| {
+                self.allocator.free(self.workspace_focus_right);
+                self.workspace_focus_right = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_up")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_up")) |bindings| {
+                self.allocator.free(self.workspace_focus_up);
+                self.workspace_focus_up = bindings;
+            }
+        }
+        if (workspace_value.object.get("focus_down")) |value| {
+            if (self.parseOverrideValue(value, "workspace.focus_down")) |bindings| {
+                self.allocator.free(self.workspace_focus_down);
+                self.workspace_focus_down = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_left")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_left")) |bindings| {
+                self.allocator.free(self.workspace_grow_left);
+                self.workspace_grow_left = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_right")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_right")) |bindings| {
+                self.allocator.free(self.workspace_grow_right);
+                self.workspace_grow_right = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_up")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_up")) |bindings| {
+                self.allocator.free(self.workspace_grow_up);
+                self.workspace_grow_up = bindings;
+            }
+        }
+        if (workspace_value.object.get("grow_down")) |value| {
+            if (self.parseOverrideValue(value, "workspace.grow_down")) |bindings| {
+                self.allocator.free(self.workspace_grow_down);
+                self.workspace_grow_down = bindings;
+            }
+        }
+    }
+
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
         return switch (value) {
             .null => self.allocator.alloc(Keybind, 0) catch null,
@@ -515,6 +733,10 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
+fn cloneEmptyKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.alloc(Keybind, 0);
+}
+
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+O"),
@@ -527,9 +749,21 @@ fn cloneDefaultNewThreadKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
+fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+W"),
+    });
+}
+
 fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+S"),
+    });
+}
+
+fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+B"),
     });
 }
 
@@ -570,6 +804,12 @@ fn cloneDefaultChatPageDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 }
 
 fn cloneDefaultTerminalNewTabKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+Alt+T"),
+    });
+}
+
+fn cloneDefaultWorkspaceSplitTerminalHorizontalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Shift+T"),
     });
@@ -646,6 +886,60 @@ fn cloneDefaultTerminalFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybin
 fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+Alt+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Up"),
+    });
+}
+
+fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Down"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Left"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Right"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Up"),
+    });
+}
+
+fn cloneDefaultWorkspaceGrowDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Shift+Down"),
+    });
+}
+
+fn cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Z"),
     });
 }
 
@@ -1031,6 +1325,32 @@ test "default new thread keybind uses primary plus t" {
     try std.testing.expectEqual(sdl.Keycode.t, config.new_thread[0].key);
 }
 
+test "default terminal pane keybind uses primary shift t" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_split_terminal_horizontal.len);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].alt);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].ctrl);
+    try std.testing.expect(!config.workspace_split_terminal_horizontal[0].meta);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].primary);
+    try std.testing.expect(config.workspace_split_terminal_horizontal[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.t, config.workspace_split_terminal_horizontal[0].key);
+}
+
+test "default terminal tab keybind uses primary alt t" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.terminal_new_tab.len);
+    try std.testing.expect(config.terminal_new_tab[0].alt);
+    try std.testing.expect(!config.terminal_new_tab[0].ctrl);
+    try std.testing.expect(!config.terminal_new_tab[0].meta);
+    try std.testing.expect(config.terminal_new_tab[0].primary);
+    try std.testing.expect(!config.terminal_new_tab[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
+}
+
 test "default sidebar keybind uses primary plus s" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
@@ -1041,6 +1361,18 @@ test "default sidebar keybind uses primary plus s" {
     try std.testing.expect(!config.toggle_sidebar[0].meta);
     try std.testing.expect(config.toggle_sidebar[0].primary);
     try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar[0].key);
+}
+
+test "default hidden sidebar keybind uses alt plus b" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar_hidden.len);
+    try std.testing.expect(config.toggle_sidebar_hidden[0].alt);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].ctrl);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].meta);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].primary);
+    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_sidebar_hidden[0].key);
 }
 
 test "default chat scroll keybinds use arrows and paging keys" {

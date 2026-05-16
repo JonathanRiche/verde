@@ -3069,7 +3069,6 @@ extern fn SDL_GetMouseState(x: ?*f32, y: ?*f32) u32;
 // - SDL_WarpMouseGlobal
 // - SDL_SetWindowRelativeMouseMode
 // - SDL_GetWindowRelativeMouseMode
-// - SDL_CaptureMouse
 // - SDL_CreateCursor
 // - SDL_CreateColorCursor
 // - SDL_CreateSystemCursor
@@ -3077,6 +3076,10 @@ extern fn SDL_GetMouseState(x: ?*f32, y: ?*f32) u32;
 // - SDL_GetCursor
 // - SDL_GetDefaultCursor
 // - SDL_DestroyCursor
+
+/// Capture mouse events outside the focused window while dragging.
+pub const captureMouse = SDL_CaptureMouse;
+extern fn SDL_CaptureMouse(enabled: bool) bool;
 
 pub fn showCursor() Error!void {
     if (!SDL_ShowCursor()) return makeError();

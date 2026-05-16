@@ -21,8 +21,11 @@ pub const CELL_PIXEL_WIDTH: u32 = 9;
 pub const CELL_PIXEL_HEIGHT: u32 = 18;
 const DEFAULT_FONT_SCALE: f32 = 1.0;
 const MIN_FONT_SCALE: f32 = 0.75;
-const MAX_FONT_SCALE: f32 = 2.0;
+const MAX_FONT_SCALE: f32 = 3.3333333;
 const FONT_SCALE_STEP: f32 = 0.125;
+const WHEEL_SCROLL_LINES: f32 = 3.0;
+const KEY_SCROLL_LINES: isize = 3;
+pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
@@ -33,7 +36,13 @@ const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler
 const DeviceAttributes = @typeInfo(
     std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.device_attributes))),
 ).@"fn".return_type.?;
+const ColorScheme = std.meta.Child(
+    @typeInfo(
+        std.meta.Child(std.meta.Child(@TypeOf(TerminalHandler.Effects.readonly.color_scheme))),
+    ).@"fn".return_type.?,
+);
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const MIN_SPLIT_RATIO: f32 = 0.12;
@@ -50,8 +59,31 @@ pub const SplitDirection = enum(u8) {
     right,
 };
 
+pub const TerminalLaunchKind = enum(u8) {
+    shell,
+    claude,
+    opencode,
+    codex,
+    cursor,
+    custom,
+};
+
+pub const TerminalLaunchProfile = struct {
+    kind: TerminalLaunchKind = .shell,
+    label: []const u8 = "",
+    command: []const []const u8 = &.{},
+};
+
+const SessionCreateOptions = struct {
+    cwd: []const u8,
+    cols: u16,
+    rows: u16,
+    profile: TerminalLaunchProfile = .{},
+};
+
 pub const PersistedWorkspace = struct {
     active_tab_index: usize = 0,
+    font_scale: ?f32 = null,
     tabs: []const PersistedTab = &.{},
 };
 
@@ -132,9 +164,14 @@ pub const Dock = struct {
     rename_storage: [96:0]u8 = std.mem.zeroes([96:0]u8),
     workspace_changed: bool = false,
     focus_requested: bool = false,
+    launch_profile: TerminalLaunchProfile = .{},
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
+    }
+
+    pub fn setDefaultFontSize(self: *Dock, font_size: f32) void {
+        self.font_scale = fontScaleForFontSize(font_size);
     }
 
     pub fn deinit(self: *Dock, allocator: std.mem.Allocator) void {
@@ -269,6 +306,7 @@ pub const Dock = struct {
     ) bool {
         if (terminalZoomDelta(event)) |delta| {
             self.font_scale = clampf(self.font_scale + delta, MIN_FONT_SCALE, MAX_FONT_SCALE);
+            self.workspace_changed = true;
             return true;
         }
 
@@ -281,11 +319,48 @@ pub const Dock = struct {
 
         if (self.activePane()) |pane| {
             if (pane.session) |session| {
+                if (self.handleTerminalShortcut(allocator, session, event)) return true;
                 return session.handleKeyDown(event) catch |err| {
                     log.warn("terminal key input failed: {s}", .{@errorName(err)});
                     return false;
                 };
             }
+        }
+        return false;
+    }
+
+    fn handleTerminalShortcut(_: *Dock, allocator: std.mem.Allocator, session: *Session, event: *const sdl.KeyboardEvent) bool {
+        if (!event.down) return false;
+        if (terminalScrollShortcut(event, session.visibleRows())) |scroll| {
+            session.scrollViewport(allocator, scroll) catch |err| {
+                log.warn("terminal keyboard scroll failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            return true;
+        }
+        if (event.repeat) return false;
+        if (terminalPasteShortcut(event)) {
+            return session.pasteClipboard(allocator) catch |err| {
+                log.warn("terminal paste failed: {s}", .{@errorName(err)});
+                return true;
+            };
+        }
+        if (terminalCopyShortcut(event)) {
+            return session.copyScreenToClipboard(allocator) catch |err| {
+                log.warn("terminal copy failed: {s}", .{@errorName(err)});
+                return true;
+            };
+        }
+        return false;
+    }
+
+    pub fn handleWheel(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, wheel_y: f32) bool {
+        const pane = self.findPaneById(pane_id) orelse return false;
+        if (pane.session) |session| {
+            return session.handleWheel(allocator, wheel_y) catch |err| {
+                log.warn("terminal wheel scroll failed: {s}", .{@errorName(err)});
+                return false;
+            };
         }
         return false;
     }
@@ -340,6 +415,13 @@ pub const Dock = struct {
         self.active_tab_index = self.tabs.items.len - 1;
         self.workspace_changed = true;
         self.focus_requested = true;
+    }
+
+    pub fn createTabWithProfile(self: *Dock, allocator: std.mem.Allocator, profile: TerminalLaunchProfile) !void {
+        const previous_profile = self.launch_profile;
+        self.launch_profile = profile;
+        defer self.launch_profile = previous_profile;
+        try self.createTab(allocator);
     }
 
     pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
@@ -465,6 +547,7 @@ pub const Dock = struct {
 
         return try std.json.Stringify.valueAlloc(allocator, PersistedWorkspace{
             .active_tab_index = self.active_tab_index,
+            .font_scale = self.font_scale,
             .tabs = try persisted_tabs.toOwnedSlice(arena_allocator),
         }, .{});
     }
@@ -472,6 +555,10 @@ pub const Dock = struct {
     pub fn applyPersistedLayoutJson(self: *Dock, allocator: std.mem.Allocator, json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(PersistedWorkspace, allocator, json, .{});
         defer parsed.deinit();
+
+        if (parsed.value.font_scale) |font_scale| {
+            self.font_scale = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
+        }
 
         self.clearTabs(allocator);
 
@@ -548,7 +635,12 @@ pub const Dock = struct {
     fn ensureLeafSession(self: *Dock, allocator: std.mem.Allocator, leaf: *PaneLeaf) !void {
         if (leaf.session != null) return;
         const cwd = self.cwd orelse return;
-        leaf.session = try Session.create(allocator, cwd, INITIAL_COLS, INITIAL_ROWS);
+        leaf.session = try Session.create(allocator, .{
+            .cwd = cwd,
+            .cols = INITIAL_COLS,
+            .rows = INITIAL_ROWS,
+            .profile = self.launch_profile,
+        });
     }
 
     fn ensureSessionsInNode(self: *Dock, allocator: std.mem.Allocator, node: *PaneNode) !void {
@@ -967,7 +1059,7 @@ pub fn clampHeightForAvailable(height: f32, available_height: f32) f32 {
 }
 
 const UnsupportedSession = struct {
-    pub fn create(_: std.mem.Allocator, _: []const u8, _: u16, _: u16) !*UnsupportedSession {
+    pub fn create(_: std.mem.Allocator, _: SessionCreateOptions) !*UnsupportedSession {
         return error.UnsupportedOperatingSystem;
     }
 
@@ -1000,6 +1092,26 @@ const UnsupportedSession = struct {
     pub fn handleKeyDown(_: *UnsupportedSession, _: *const sdl.KeyboardEvent) !bool {
         return false;
     }
+
+    pub fn scrollViewport(_: *UnsupportedSession, _: std.mem.Allocator, _: TerminalScroll) !void {}
+
+    pub fn pasteClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
+        return false;
+    }
+
+    pub fn copyScreenToClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
+        return false;
+    }
+
+    pub fn visibleRows(_: *const UnsupportedSession) u16 {
+        return INITIAL_ROWS;
+    }
+};
+
+const TerminalScroll = union(enum) {
+    delta: isize,
+    top,
+    bottom,
 };
 
 const UnixSession = struct {
@@ -1014,6 +1126,8 @@ const UnixSession = struct {
     cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
+    launch_kind: TerminalLaunchKind = .shell,
+    launch_label: []u8,
 
     const SpawnResult = struct {
         master_fd: std.posix.fd_t,
@@ -1027,18 +1141,22 @@ const UnixSession = struct {
         winp: ?*const std.posix.winsize,
     ) c_int;
 
-    pub fn create(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16) !*UnixSession {
+    pub fn create(allocator: std.mem.Allocator, options: SessionCreateOptions) !*UnixSession {
         const self = try allocator.create(UnixSession);
         errdefer allocator.destroy(self);
 
         var terminal = try ghostty_vt.Terminal.init(allocator, .{
-            .cols = cols,
-            .rows = rows,
+            .cols = options.cols,
+            .rows = options.rows,
         });
         errdefer terminal.deinit(allocator);
-        try terminal.setPwd(cwd);
+        configureTerminalTheme(allocator, &terminal);
+        try terminal.setPwd(options.cwd);
 
-        const child = try spawnShell(allocator, cwd, cols, rows);
+        const launch_label = try launchLabel(allocator, options.profile);
+        errdefer allocator.free(launch_label);
+
+        const child = try spawnCommand(allocator, options.cwd, options.cols, options.rows, options.profile);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -1050,16 +1168,19 @@ const UnixSession = struct {
             .terminal = terminal,
             .stream = undefined,
             .render_state = .empty,
-            .cols = cols,
-            .rows = rows,
+            .cols = options.cols,
+            .rows = options.rows,
             .cell_width = CELL_PIXEL_WIDTH,
             .cell_height = CELL_PIXEL_HEIGHT,
+            .launch_kind = options.profile.kind,
+            .launch_label = launch_label,
         };
         self.stream = self.terminal.vtStream();
         self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
         self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
         self.stream.handler.effects.size = &UnixSession.streamSize;
         self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
+        self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
         errdefer self.stream.deinit();
 
         try self.refreshRenderState(allocator);
@@ -1075,6 +1196,7 @@ const UnixSession = struct {
         self.stream.deinit();
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
+        allocator.free(self.launch_label);
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -1110,20 +1232,21 @@ const UnixSession = struct {
 
     pub fn statusText(self: *const UnixSession, buf: *[192]u8) []const u8 {
         if (self.running) {
-            return std.fmt.bufPrint(buf, "{d}x{d} shell attached", .{ self.cols, self.rows }) catch "Shell attached";
+            return std.fmt.bufPrint(buf, "{d}x{d} {s} attached", .{ self.cols, self.rows, self.launch_label }) catch "Terminal attached";
         }
         if (self.exit_status) |status| {
             if (std.c.W.IFEXITED(status)) {
-                return std.fmt.bufPrint(buf, "Shell exited with code {d}", .{std.c.W.EXITSTATUS(status)}) catch "Shell exited";
+                return std.fmt.bufPrint(buf, "{s} exited with code {d}", .{ self.launch_label, std.c.W.EXITSTATUS(status) }) catch "Terminal exited";
             }
             if (std.c.W.IFSIGNALED(status)) {
-                return std.fmt.bufPrint(buf, "Shell terminated by signal {d}", .{std.c.W.TERMSIG(status)}) catch "Shell exited";
+                return std.fmt.bufPrint(buf, "{s} terminated by signal {d}", .{ self.launch_label, std.c.W.TERMSIG(status) }) catch "Terminal exited";
             }
         }
-        return "Shell exited.";
+        return std.fmt.bufPrint(buf, "{s} exited.", .{self.launch_label}) catch "Terminal exited.";
     }
 
     pub fn tabTitle(self: *const UnixSession, buffer: *[96]u8) []const u8 {
+        if (self.launch_kind != .shell) return self.launch_label;
         if (builtin.os.tag == .linux) {
             var proc_path_buf: [64]u8 = undefined;
             const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{self.child_pid}) catch "";
@@ -1188,6 +1311,49 @@ const UnixSession = struct {
         if (encoded.len == 0) return true;
         try writeAll(self.master_fd, encoded);
         return true;
+    }
+
+    pub fn handleWheel(self: *UnixSession, allocator: std.mem.Allocator, wheel_y: f32) !bool {
+        if (wheel_y == 0.0) return false;
+        const line_count_float = @max(@round(@abs(wheel_y) * WHEEL_SCROLL_LINES), 1.0);
+        const line_count: isize = @intFromFloat(line_count_float);
+        try self.scrollViewport(allocator, .{ .delta = if (wheel_y > 0.0) -line_count else line_count });
+        return true;
+    }
+
+    pub fn scrollViewport(self: *UnixSession, allocator: std.mem.Allocator, scroll: TerminalScroll) !void {
+        self.terminal.scrollViewport(switch (scroll) {
+            .delta => |delta| .{ .delta = delta },
+            .top => .top,
+            .bottom => .bottom,
+        });
+        try self.refreshRenderState(allocator);
+    }
+
+    pub fn pasteClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        if (!self.running) return false;
+        const clipboard_ptr = sdl.getClipboardText() catch return false;
+        defer sdl.free(clipboard_ptr);
+        const clipboard_text = std.mem.sliceTo(clipboard_ptr, 0);
+        if (clipboard_text.len == 0) return false;
+
+        try writeTerminalPaste(allocator, self.master_fd, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+        return true;
+    }
+
+    pub fn copyScreenToClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        const screen_text = try copyableRenderStateText(allocator, &self.render_state);
+        defer allocator.free(screen_text);
+        if (std.mem.trim(u8, screen_text, " \t\r\n").len == 0) return false;
+
+        const clipboard_text = try allocator.dupeZ(u8, screen_text);
+        defer allocator.free(clipboard_text);
+        try sdl.setClipboardText(clipboard_text);
+        return true;
+    }
+
+    pub fn visibleRows(self: *const UnixSession) u16 {
+        return self.rows;
     }
 
     fn refreshRenderState(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -1296,6 +1462,140 @@ const UnixSession = struct {
         return "verde";
     }
 
+    fn streamColorScheme(_: *TerminalHandler) ?ColorScheme {
+        return .dark;
+    }
+
+    const TerminalTheme = struct {
+        background: ghostty_vt.color.RGB = terminalRgb(0x2c, 0x25, 0x25),
+        foreground: ghostty_vt.color.RGB = terminalRgb(0xe6, 0xd9, 0xdb),
+        cursor: ghostty_vt.color.RGB = terminalRgb(0xc3, 0xb7, 0xb8),
+        palette: [256]ghostty_vt.color.RGB = defaultTerminalPalette(),
+    };
+
+    fn configureTerminalTheme(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal) void {
+        var terminal_theme = TerminalTheme{};
+        loadGhosttyTheme(allocator, &terminal_theme) catch |err| {
+            log.debug("using built-in terminal theme fallback: {s}", .{@errorName(err)});
+        };
+
+        terminal.colors.background = ghostty_vt.color.DynamicRGB.init(terminal_theme.background);
+        terminal.colors.foreground = ghostty_vt.color.DynamicRGB.init(terminal_theme.foreground);
+        terminal.colors.cursor = ghostty_vt.color.DynamicRGB.init(terminal_theme.cursor);
+        terminal.colors.palette.changeDefault(terminal_theme.palette);
+    }
+
+    fn defaultTerminalPalette() [256]ghostty_vt.color.RGB {
+        var palette = ghostty_vt.color.default;
+        const ansi = [_]ghostty_vt.color.RGB{
+            terminalRgb(0x72, 0x69, 0x6a),
+            terminalRgb(0xfd, 0x68, 0x83),
+            terminalRgb(0xad, 0xda, 0x78),
+            terminalRgb(0xf9, 0xcc, 0x6c),
+            terminalRgb(0xf3, 0x8d, 0x70),
+            terminalRgb(0xa8, 0xa9, 0xeb),
+            terminalRgb(0x85, 0xda, 0xcc),
+            terminalRgb(0xe6, 0xd9, 0xdb),
+            terminalRgb(0x94, 0x8a, 0x8b),
+            terminalRgb(0xff, 0x82, 0x97),
+            terminalRgb(0xc8, 0xe2, 0x92),
+            terminalRgb(0xfc, 0xd6, 0x75),
+            terminalRgb(0xf8, 0xa7, 0x88),
+            terminalRgb(0xbe, 0xbf, 0xfd),
+            terminalRgb(0x9b, 0xf1, 0xe1),
+            terminalRgb(0xf1, 0xe5, 0xe7),
+        };
+        @memcpy(palette[0..ansi.len], &ansi);
+        return palette;
+    }
+
+    fn loadGhosttyTheme(allocator: std.mem.Allocator, terminal_theme: *TerminalTheme) !void {
+        const home = std.c.getenv("HOME") orelse return error.HomeUnset;
+        const home_slice = std.mem.span(home);
+        const config_path = try std.fs.path.join(allocator, &.{ home_slice, ".config", "ghostty", "config" });
+        defer allocator.free(config_path);
+
+        try parseGhosttyThemeFile(allocator, config_path, terminal_theme, true);
+    }
+
+    fn parseGhosttyThemeFile(allocator: std.mem.Allocator, path: []const u8, terminal_theme: *TerminalTheme, follow_includes: bool) !void {
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const content = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(64 * 1024));
+        defer allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw_line| {
+            const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |index| raw_line[0..index] else raw_line;
+            const line = std.mem.trim(u8, no_comment, " \t\r");
+            if (line.len == 0) continue;
+            const equals = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trim(u8, line[0..equals], " \t\r");
+            const value = std.mem.trim(u8, line[equals + 1 ..], " \t\r");
+
+            if (std.mem.eql(u8, key, "background")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.background = rgb;
+            } else if (std.mem.eql(u8, key, "foreground")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.foreground = rgb;
+            } else if (std.mem.eql(u8, key, "cursor-color")) {
+                if (parseHexRgb(value)) |rgb| terminal_theme.cursor = rgb;
+            } else if (std.mem.eql(u8, key, "palette")) {
+                parseGhosttyPalette(value, terminal_theme);
+            } else if (follow_includes and std.mem.eql(u8, key, "config-file")) {
+                const include_path = try resolveGhosttyPath(allocator, path, value);
+                defer allocator.free(include_path);
+                parseGhosttyThemeFile(allocator, include_path, terminal_theme, false) catch |err| {
+                    log.debug("failed to load ghostty theme include {s}: {s}", .{ include_path, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    fn parseGhosttyPalette(value: []const u8, terminal_theme: *TerminalTheme) void {
+        const equals = std.mem.indexOfScalar(u8, value, '=') orelse return;
+        const index_text = std.mem.trim(u8, value[0..equals], " \t\r");
+        const color_text = std.mem.trim(u8, value[equals + 1 ..], " \t\r");
+        const index = std.fmt.parseInt(usize, index_text, 10) catch return;
+        if (index >= terminal_theme.palette.len) return;
+        terminal_theme.palette[index] = parseHexRgb(color_text) orelse return;
+    }
+
+    fn resolveGhosttyPath(allocator: std.mem.Allocator, base_path: []const u8, raw_value: []const u8) ![]u8 {
+        var value = std.mem.trim(u8, rawValueWithoutOptionalPrefix(raw_value), " \t\r");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+        if (value.len >= 2 and value[0] == '\'' and value[value.len - 1] == '\'') value = value[1 .. value.len - 1];
+
+        if (std.mem.startsWith(u8, value, "~/")) {
+            const home = std.c.getenv("HOME") orelse return error.HomeUnset;
+            return std.fs.path.join(allocator, &.{ std.mem.span(home), value[2..] });
+        }
+        if (std.fs.path.isAbsolute(value)) return allocator.dupe(u8, value);
+
+        const base_dir = std.fs.path.dirname(base_path) orelse ".";
+        return std.fs.path.join(allocator, &.{ base_dir, value });
+    }
+
+    fn rawValueWithoutOptionalPrefix(value: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, value, " \t\r");
+        if (trimmed.len > 0 and trimmed[0] == '?') return std.mem.trim(u8, trimmed[1..], " \t\r");
+        return trimmed;
+    }
+
+    fn parseHexRgb(raw_value: []const u8) ?ghostty_vt.color.RGB {
+        var value = std.mem.trim(u8, raw_value, " \t\r");
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+        if (value.len != 7 or value[0] != '#') return null;
+        return terminalRgb(
+            std.fmt.parseInt(u8, value[1..3], 16) catch return null,
+            std.fmt.parseInt(u8, value[3..5], 16) catch return null,
+            std.fmt.parseInt(u8, value[5..7], 16) catch return null,
+        );
+    }
+
+    fn terminalRgb(r: u8, g: u8, b: u8) ghostty_vt.color.RGB {
+        return .{ .r = r, .g = g, .b = b };
+    }
+
     fn captureExitStatus(self: *UnixSession) bool {
         if (self.exit_status != null) return false;
 
@@ -1324,9 +1624,11 @@ const UnixSession = struct {
         );
     }
 
-    fn spawnShell(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16) !SpawnResult {
+    fn spawnCommand(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16, profile: TerminalLaunchProfile) !SpawnResult {
         const cwd_z = try allocator.dupeZ(u8, cwd);
         defer allocator.free(cwd_z);
+        const command = try commandForProfile(allocator, profile);
+        defer freeCommand(allocator, command);
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
@@ -1339,7 +1641,7 @@ const UnixSession = struct {
         if (fork_result < 0) return error.ForkPtyFailed;
 
         if (fork_result == 0) {
-            childExec(cwd_z);
+            childExec(cwd_z, command);
         }
 
         try setNonBlocking(@intCast(master_fd));
@@ -1349,22 +1651,31 @@ const UnixSession = struct {
         };
     }
 
-    fn childExec(cwd: [:0]const u8) noreturn {
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) {
             std.c._exit(127);
         }
 
-        if (std.c.getenv("TERM") == null) {
-            _ = setenv("TERM", "xterm-256color", 1);
+        _ = setenv("TERM", "xterm-ghostty", 1);
+        _ = setenv("COLORTERM", "truecolor", 1);
+        _ = setenv("TERM_PROGRAM", "ghostty", 1);
+        _ = setenv("TERM_PROGRAM_VERSION", "1.1.0", 1);
+        _ = setenv("CLICOLOR", "1", 1);
+        _ = setenv("CLICOLOR_FORCE", "1", 0);
+        _ = setenv("FORCE_COLOR", "3", 0);
+        _ = unsetenv("NO_COLOR");
+        if (std.c.getenv("LANG") == null) {
+            _ = setenv("LANG", "C.UTF-8", 1);
         }
 
-        const shell = std.c.getenv("SHELL") orelse "/bin/bash";
-        const argv = [_:null]?[*:0]const u8{
-            shell,
-            "-i",
-            null,
-        };
-        _ = std.c.execve(shell, &argv, std.c.environ);
+        var argv: [32:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 32;
+        const count = @min(command.len, argv.len - 1);
+        for (command[0..count], 0..) |arg, index| {
+            argv[index] = arg.ptr;
+        }
+        if (count > 0) {
+            _ = std.c.execve(command[0].ptr, &argv, std.c.environ);
+        }
         std.c._exit(127);
     }
 };
@@ -1385,6 +1696,82 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
         if (written == 0) return error.WriteFailed;
         remaining = remaining[written..];
     }
+}
+
+fn writeTerminalPaste(allocator: std.mem.Allocator, fd: std.posix.fd_t, text: []const u8, bracketed: bool) !void {
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(allocator);
+
+    if (bracketed) try encoded.appendSlice(allocator, "\x1b[200~");
+    for (text) |byte| {
+        try encoded.append(allocator, if (terminalPasteUnsafeByte(byte))
+            ' '
+        else if (!bracketed and byte == '\n')
+            '\r'
+        else
+            byte);
+    }
+    if (bracketed) try encoded.appendSlice(allocator, "\x1b[201~");
+    try writeAll(fd, encoded.items);
+}
+
+fn copyableRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    for (row_cells, 0..) |cells, row_index| {
+        const cells_slice = cells.slice();
+        const raw_cells = cells_slice.items(.raw);
+        const row_graphemes = cells_slice.items(.grapheme);
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(allocator);
+
+        for (raw_cells, 0..) |raw_cell, cell_index| {
+            if (raw_cell.wide == .spacer_tail) continue;
+            if (!raw_cell.hasText()) {
+                try row.append(allocator, ' ');
+                continue;
+            }
+
+            var text_buf: [128]u8 = undefined;
+            const text = terminalCellText(raw_cell, terminalGraphemesForCell(raw_cell, row_graphemes, cell_index), &text_buf) orelse " ";
+            try row.appendSlice(allocator, text);
+            if (raw_cell.wide == .wide) try row.append(allocator, ' ');
+        }
+
+        const trimmed = std.mem.trimEnd(u8, row.items, " \t");
+        try output.appendSlice(allocator, trimmed);
+        if (row_index + 1 < row_cells.len) try output.append(allocator, '\n');
+    }
+
+    return output.toOwnedSlice(allocator);
+}
+
+fn terminalGraphemesForCell(cell: ghostty_vt.Cell, graphemes: []const []const u21, index: usize) []const u21 {
+    return if (cell.hasGrapheme()) graphemes[index] else &.{};
+}
+
+fn terminalCellText(raw_cell: ghostty_vt.Cell, graphemes: []const u21, buffer: []u8) ?[]const u8 {
+    if (!raw_cell.hasText()) return null;
+    var index: usize = 0;
+    index += std.unicode.utf8Encode(raw_cell.codepoint(), buffer[index..]) catch return null;
+    if (raw_cell.hasGrapheme()) {
+        for (graphemes) |cp| {
+            if (index >= buffer.len) break;
+            index += std.unicode.utf8Encode(cp, buffer[index..]) catch break;
+        }
+    }
+    return buffer[0..index];
+}
+
+fn terminalPasteUnsafeByte(byte: u8) bool {
+    return switch (byte) {
+        0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F, 0x03, 0x1C, 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F => true,
+        else => false,
+    };
 }
 
 fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
@@ -1521,6 +1908,41 @@ fn modsFromKeyboardEvent(event: *const sdl.KeyboardEvent) ghostty_vt.input.KeyMo
 fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
     const state_bits = @as(*const u16, @ptrCast(&state)).*;
     return (state_bits & mask) != 0;
+}
+
+fn terminalScrollShortcut(event: *const sdl.KeyboardEvent, rows: u16) ?TerminalScroll {
+    if (modifierPressed(event.mod, sdl.Keymod.alt) or modifierPressed(event.mod, sdl.Keymod.gui)) return null;
+    const shift = modifierPressed(event.mod, sdl.Keymod.shift);
+    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+    return switch (event.scancode) {
+        .pageup => if (shift and !ctrl) .{ .delta = -terminalPageScrollLines(rows) } else null,
+        .pagedown => if (shift and !ctrl) .{ .delta = terminalPageScrollLines(rows) } else null,
+        .up => if (shift and ctrl) .{ .delta = -KEY_SCROLL_LINES } else null,
+        .down => if (shift and ctrl) .{ .delta = KEY_SCROLL_LINES } else null,
+        .home => if (shift and ctrl) .top else null,
+        .end => if (shift and ctrl) .bottom else null,
+        else => null,
+    };
+}
+
+fn terminalPageScrollLines(rows: u16) isize {
+    return @max(@as(isize, @intCast(rows)) - 1, KEY_SCROLL_LINES);
+}
+
+fn terminalPasteShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .v) return false;
+    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
+        modifierPressed(event.mod, sdl.Keymod.shift) and
+        !modifierPressed(event.mod, sdl.Keymod.alt) and
+        !modifierPressed(event.mod, sdl.Keymod.gui);
+}
+
+fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .c) return false;
+    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
+        modifierPressed(event.mod, sdl.Keymod.shift) and
+        !modifierPressed(event.mod, sdl.Keymod.alt) and
+        !modifierPressed(event.mod, sdl.Keymod.gui);
 }
 
 fn mapScancodeToGhostty(scancode: sdl.Scancode) ?ghostty_vt.input.Key {
@@ -1707,6 +2129,10 @@ fn scaledCellPixelHeight(font_scale: f32) u32 {
     return scaledCellPixels(CELL_PIXEL_HEIGHT, font_scale);
 }
 
+fn fontScaleForFontSize(font_size: f32) f32 {
+    return clampf(font_size / DEFAULT_FONT_SIZE, MIN_FONT_SCALE, MAX_FONT_SCALE);
+}
+
 fn scaledCellPixels(base: u32, font_scale: f32) u32 {
     const clamped = clampf(font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE);
     return @max(1, @as(u32, @intFromFloat(@round(@as(f32, @floatFromInt(base)) * clamped))));
@@ -1751,6 +2177,56 @@ fn pathLabel(path: []const u8) []const u8 {
     return if (base.len > 0) base else trimmed;
 }
 
+fn launchLabel(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![]u8 {
+    const label = std.mem.trim(u8, profile.label, &std.ascii.whitespace);
+    if (label.len > 0) return allocator.dupe(u8, label);
+    const fallback = switch (profile.kind) {
+        .shell => "Shell",
+        .claude => "Claude",
+        .opencode => "OpenCode",
+        .codex => "Codex",
+        .cursor => "Cursor",
+        .custom => if (profile.command.len > 0) profile.command[0] else "Custom",
+    };
+    return allocator.dupe(u8, fallback);
+}
+
+fn commandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![][:0]u8 {
+    return switch (profile.kind) {
+        .shell => blk: {
+            const shell = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
+            break :blk dupeCommand(allocator, &.{ shell, "-i" });
+        },
+        .claude => dupeCommand(allocator, &.{"claude"}),
+        .opencode => dupeCommand(allocator, &.{"opencode"}),
+        .codex => dupeCommand(allocator, &.{"codex"}),
+        .cursor => dupeCommand(allocator, &.{"cursor"}),
+        .custom => {
+            if (profile.command.len == 0) return error.EmptyTerminalLaunchCommand;
+            return dupeCommand(allocator, profile.command);
+        },
+    };
+}
+
+fn dupeCommand(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
+    const command = try allocator.alloc([:0]u8, args.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (command[0..initialized]) |arg| allocator.free(arg);
+        allocator.free(command);
+    }
+    for (args, 0..) |arg, index| {
+        command[index] = try allocator.dupeZ(u8, arg);
+        initialized += 1;
+    }
+    return command;
+}
+
+fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
+    for (command) |arg| allocator.free(arg);
+    allocator.free(command);
+}
+
 fn clampf(value: f32, min_value: f32, max_value: f32) f32 {
     return @max(min_value, @min(value, max_value));
 }
@@ -1780,7 +2256,11 @@ test "unix session PTY smoke" {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const session = try UnixSession.create(allocator, cwd, 80, 24);
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
     defer {
         session.deinit(allocator);
         allocator.destroy(session);
@@ -1829,7 +2309,11 @@ test "repair terminal state resets invalid scrolling region" {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    const session = try UnixSession.create(allocator, cwd, 80, 24);
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
     defer {
         session.deinit(allocator);
         allocator.destroy(session);
