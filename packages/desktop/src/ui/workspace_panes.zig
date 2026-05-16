@@ -542,7 +542,7 @@ fn updateResizeDrag(state: *runtime.AppState, hit: WorkspacePaneHit, x: f32, y: 
     state.resizeCurrentProjectWorkspaceSplit(hit.pane_id, hit.sibling_pane_id, hit.axis, ratio);
 }
 
-const PANE_HEADER_RIGHT_RESERVE: f32 = 138.0;
+const PANE_HEADER_RIGHT_RESERVE: f32 = 46.0;
 
 fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
     const kind = state.workspacePaneKindById(pane_id) orelse return;
@@ -584,35 +584,14 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
 
     const menu_open_here = if (split_menu_open_for) |id| id == pane_id else false;
     const header_hovered = rectContains(header_rect, state.palette_mouse_x, state.palette_mouse_y);
-    const mx = state.palette_mouse_x;
-    const my = state.palette_mouse_y;
-
-    // Window controls aligned to the right within the reserved strip.
-    const btn_w = theme.scaledUi(22.0);
-    const btn_h = theme.scaledUi(20.0);
-    const btn_gap = theme.scaledUi(2.0);
-    const right_margin = theme.scaledUi(10.0);
-    const btn_y = header_rect.y + (header_rect.h - btn_h) * 0.5;
-
-    const close_rect = palette.Rect{ .x = header_rect.x + header_rect.w - right_margin - btn_w, .y = btn_y, .w = btn_w, .h = btn_h };
-    const min_rect = palette.Rect{ .x = close_rect.x - btn_gap - btn_w, .y = btn_y, .w = btn_w, .h = btn_h };
-    const max_rect = palette.Rect{ .x = min_rect.x - btn_gap - btn_w, .y = btn_y, .w = btn_w, .h = btn_h };
 
     // Render only when focused — non-focused panes keep their panel header clean.
     if (focused) {
-        const is_maximized = state.isCurrentProjectWorkspacePaneMaximized(pane_id);
-        const max_kind: WindowControlKind = if (is_maximized) .restore else .maximize;
-        renderWindowControlButton(state, max_rect, max_kind, rectContains(max_rect, mx, my));
-        appendHit(.{ .pane_id = pane_id, .action = .maximize, .rect = max_rect });
-        renderWindowControlButton(state, min_rect, .minimize, rectContains(min_rect, mx, my));
-        appendHit(.{ .pane_id = pane_id, .action = .minimize, .rect = min_rect });
-        renderWindowControlButton(state, close_rect, .close, rectContains(close_rect, mx, my));
-        appendHit(.{ .pane_id = pane_id, .action = .close, .rect = close_rect });
-
         // Split trigger (+): always visible on focused pane, brightens on header hover.
         const split_w = theme.scaledUi(24.0);
         const split_h = theme.scaledUi(20.0);
-        const split_x = max_rect.x - theme.scaledUi(10.0) - split_w;
+        const right_margin = theme.scaledUi(10.0);
+        const split_x = header_rect.x + header_rect.w - right_margin - split_w;
         const split_y = header_rect.y + (header_rect.h - split_h) * 0.5;
         const split_rect = palette.Rect{ .x = split_x, .y = split_y, .w = split_w, .h = split_h };
         const split_active = menu_open_here;
@@ -624,68 +603,8 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
     _ = reserve;
 }
 
-const WindowControlKind = enum { close, minimize, maximize, restore };
-
-fn renderWindowControlButton(state: *runtime.AppState, rect: palette.Rect, kind: WindowControlKind, hovered: bool) void {
-    if (hovered) {
-        const bg = switch (kind) {
-            .close => colors.rgba(232, 76, 72, 220),
-            else => colors.rgba(48, 54, 62, 255),
-        };
-        queueRounded(state, rect, paletteColor(bg), theme.scaledUi(4.0));
-    }
-    const icon_color = if (hovered) theme.COLOR_WHITE else colors.rgba(170, 178, 188, 255);
-    const cx = rect.x + rect.w * 0.5;
-    const cy = rect.y + rect.h * 0.5;
-    const stroke = theme.scaledUi(1.0);
-    switch (kind) {
-        .close => {
-            queueText(state, .{
-                .x = rect.x,
-                .y = rect.y + theme.scaledUi(2.0),
-                .w = rect.w,
-                .h = rect.h,
-            }, "\u{00D7}", paletteColor(icon_color), theme.scaledUi(15.0), rect);
-        },
-        .minimize => {
-            const bar_w = theme.scaledUi(9.0);
-            const bar_h = stroke;
-            queueRect(state, .{
-                .x = cx - bar_w * 0.5,
-                .y = cy + theme.scaledUi(3.0) - bar_h * 0.5,
-                .w = bar_w,
-                .h = bar_h,
-            }, paletteColor(icon_color));
-        },
-        .maximize => {
-            const sq = theme.scaledUi(9.0);
-            queueBorder(state, .{
-                .x = cx - sq * 0.5,
-                .y = cy - sq * 0.5,
-                .w = sq,
-                .h = sq,
-            }, paletteColor(icon_color), theme.scaledUi(1.0), stroke);
-        },
-        .restore => {
-            const sq = theme.scaledUi(8.0);
-            const off = theme.scaledUi(2.0);
-            queueBorder(state, .{
-                .x = cx - sq * 0.5 + off,
-                .y = cy - sq * 0.5 - off,
-                .w = sq,
-                .h = sq,
-            }, paletteColor(icon_color), theme.scaledUi(1.0), stroke);
-            queueBorder(state, .{
-                .x = cx - sq * 0.5 - off,
-                .y = cy - sq * 0.5 + off,
-                .w = sq,
-                .h = sq,
-            }, paletteColor(icon_color), theme.scaledUi(1.0), stroke);
-        },
-    }
-}
-
 fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active: bool, emphasized: bool, clip: palette.Rect) void {
+    _ = clip;
     if (active) {
         queueRounded(state, rect, paletteColor(colors.rgba(40, 50, 58, 255)), theme.scaledUi(5.0));
         queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(5.0), theme.scaledUi(1.0));
@@ -693,29 +612,43 @@ fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active
         queueRounded(state, rect, paletteColor(colors.rgba(28, 32, 38, 255)), theme.scaledUi(5.0));
         queueBorder(state, rect, paletteColor(colors.rgba(62, 70, 78, 255)), theme.scaledUi(5.0), theme.scaledUi(1.0));
     }
-    const text_color = if (active or emphasized)
+    const icon_color = if (active or emphasized)
         theme.COLOR_WHITE
     else
         colors.rgba(120, 128, 138, 255);
-    queueText(state, .{
-        .x = rect.x + theme.scaledUi(4.0),
-        .y = rect.y + theme.scaledUi(1.0),
-        .w = @max(rect.w - theme.scaledUi(8.0), 1.0),
-        .h = rect.h,
-    }, "+", paletteColor(text_color), theme.scaledUi(15.0), clip);
+
+    // Draw the plus glyph as two centered rectangles so positioning is exact and
+    // does not depend on the font's "+" glyph metrics.
+    const cx = rect.x + rect.w * 0.5;
+    const cy = rect.y + rect.h * 0.5;
+    const arm = theme.scaledUi(9.0);
+    const stroke = theme.scaledUi(1.5);
+    queueRect(state, .{
+        .x = cx - arm * 0.5,
+        .y = cy - stroke * 0.5,
+        .w = arm,
+        .h = stroke,
+    }, paletteColor(icon_color));
+    queueRect(state, .{
+        .x = cx - stroke * 0.5,
+        .y = cy - arm * 0.5,
+        .w = stroke,
+        .h = arm,
+    }, paletteColor(icon_color));
 }
 
 fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect) void {
     const pane_id = split_menu_open_for orelse return;
 
-    const menu_w = theme.scaledUi(248.0);
-    const header_h = theme.scaledUi(24.0);
-    const cell_h = theme.scaledUi(48.0);
-    const cell_gap = theme.scaledUi(8.0);
-    const menu_pad_x = theme.scaledUi(12.0);
-    const menu_pad_top = theme.scaledUi(8.0);
-    const menu_pad_bottom = theme.scaledUi(12.0);
-    const menu_h = menu_pad_top + header_h + menu_pad_bottom + cell_h * 2.0 + cell_gap;
+    const menu_w = theme.scaledUi(272.0);
+    const header_h = theme.scaledUi(20.0);
+    const header_gap = theme.scaledUi(8.0);
+    const cell_h = theme.scaledUi(52.0);
+    const cell_gap = theme.scaledUi(10.0);
+    const menu_pad_x = theme.scaledUi(14.0);
+    const menu_pad_top = theme.scaledUi(12.0);
+    const menu_pad_bottom = theme.scaledUi(14.0);
+    const menu_h = menu_pad_top + header_h + header_gap + menu_pad_bottom + cell_h * 2.0 + cell_gap;
 
     var menu_x = split_menu_anchor.x;
     const max_x = workspace_rect.x + workspace_rect.w - menu_w - theme.scaledUi(8.0);
@@ -739,7 +672,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     }, "Split pane", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), menu_rect);
 
     const grid_x = menu_rect.x + menu_pad_x;
-    const grid_y = menu_rect.y + menu_pad_top + header_h;
+    const grid_y = menu_rect.y + menu_pad_top + header_h + header_gap;
     const cell_w = (menu_rect.w - menu_pad_x * 2.0 - cell_gap) * 0.5;
 
     const Opt = struct {
