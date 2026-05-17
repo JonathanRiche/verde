@@ -19,7 +19,6 @@ const OVERLAY_IGNORE_ATTR = "data-verde-inspector-ignore";
 const BOX_ATTR = "data-verde-box";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const VERDE_RGB = "34, 197, 94";
-const VERDE_BUTTON_BG = "#16a34a";
 const VERDE_BORDER_GLOW = "rgba(240, 253, 244, 0.98)";
 const OVERLAY_MARGIN_FILL = `rgba(${VERDE_RGB}, 0.12)`;
 const OVERLAY_BORDER_FILL = `rgba(${VERDE_RGB}, 0.19)`;
@@ -568,6 +567,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       prompt: overlay.promptTextarea.value,
     });
   });
+  for (const eventName of ["mousedown", "mouseup", "click", "dblclick", "select", "copy", "cut", "paste"] as const) {
+    overlay.promptTextarea.addEventListener(eventName, (event) => {
+      event.stopPropagation();
+    });
+  }
 
   overlay.promptButton.addEventListener("click", () => {
     if (!selection) return;
@@ -657,6 +661,7 @@ function createOverlay(doc: Document): OverlayParts {
     "z-index:2147483647",
     "display:none",
     "font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    "user-select:none",
   ].join(";");
 
   const margin = createBox(doc, "margin", OVERLAY_MARGIN_FILL);
@@ -725,23 +730,24 @@ function createOverlay(doc: Document): OverlayParts {
     "right:20px",
     "bottom:20px",
     "width:min(420px, calc(100vw - 40px))",
-    "padding:14px",
-    "border:1px solid rgba(148, 163, 184, 0.35)",
-    "border-radius:16px",
-    "background:rgba(15, 23, 42, 0.94)",
-    "color:#e2e8f0",
-    "box-shadow:0 24px 80px rgba(2, 6, 23, 0.45)",
-    "backdrop-filter:blur(14px)",
+    "padding:12px",
+    "border:1px solid rgba(80, 200, 120, 0.22)",
+    "border-radius:10px",
+    "background:rgba(25, 31, 36, 0.96)",
+    "color:#f0f0f5",
+    "box-shadow:0 18px 48px rgba(0, 0, 0, 0.38)",
+    "backdrop-filter:blur(10px)",
     "pointer-events:auto",
+    "user-select:none",
   ].join(";");
 
   const promptTitle = doc.createElement("div");
   promptTitle.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTitle.style.cssText = "font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:6px;";
+  promptTitle.style.cssText = "font-size:12px;font-weight:700;color:#f0f0f5;margin-bottom:6px;";
 
   const promptMeta = doc.createElement("div");
   promptMeta.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptMeta.style.cssText = "font-size:11px;color:#94a3b8;margin-bottom:10px;";
+  promptMeta.style.cssText = "font-size:11px;color:#b9bbc3;margin-bottom:10px;";
 
   const promptTextarea = doc.createElement("textarea");
   promptTextarea.setAttribute(OVERLAY_IGNORE_ATTR, "true");
@@ -752,13 +758,18 @@ function createOverlay(doc: Document): OverlayParts {
     "min-height:128px",
     "resize:vertical",
     "padding:12px",
-    "border-radius:12px",
-    "border:1px solid rgba(148, 163, 184, 0.3)",
-    "background:rgba(2, 6, 23, 0.8)",
-    "color:#f8fafc",
+    "border-radius:8px",
+    "border:1px solid rgba(80, 200, 120, 0.2)",
+    "background:rgba(29, 38, 43, 0.95)",
+    "color:#f0f0f5",
     "font:inherit",
+    "font-size:13px",
+    "line-height:1.45",
     "box-sizing:border-box",
     "outline:none",
+    "caret-color:#50c878",
+    "user-select:text",
+    "-webkit-user-select:text",
   ].join(";");
 
   const promptActions = doc.createElement("div");
@@ -771,10 +782,10 @@ function createOverlay(doc: Document): OverlayParts {
   promptButton.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptButton.style.cssText = [
     "pointer-events:auto",
-    "padding:10px 14px",
+    "padding:9px 14px",
     "border:0",
-    "border-radius:999px",
-    `background:${VERDE_BUTTON_BG}`,
+    "border-radius:8px",
+    "background:#375846",
     "color:white",
     "font:inherit",
     "font-weight:700",

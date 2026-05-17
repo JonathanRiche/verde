@@ -434,6 +434,8 @@ fn encodeMouseButton(button: browser_input.MouseButton) u8 {
         .left => 1,
         .middle => 2,
         .right => 3,
+        .back => 4,
+        .forward => 5,
     };
 }
 

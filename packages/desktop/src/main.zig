@@ -36,6 +36,7 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_GetModState() sdl.Keymod;
 extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
@@ -57,6 +58,7 @@ const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
+const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
     "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
@@ -98,6 +100,8 @@ const NOTO_SANS_BOLD_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-BoldItalic
 const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
+var macos_cmd_w_pane_close_until_ms: i64 = 0;
+
 const WindowFrame = struct {
     x: c_int,
     y: c_int,
@@ -129,6 +133,9 @@ fn mainInner(init: std.process.Init) !void {
     }
 
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
+    if (builtin.os.tag == .macos) {
+        _ = SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
+    }
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
     defer sdl.quit();
@@ -332,11 +339,12 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollCursorModelOptionsCache();
             }
         }.run, .{&state});
+        var send_needs_render = false;
         recordSpan(&frame_sample, .poll_send, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollSend();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollSend();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &send_needs_render });
         recordSpan(&frame_sample, .poll_browser, struct {
             fn run(app_state: *AppState) void {
                 app_state.pollBrowser();
@@ -376,7 +384,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -836,6 +844,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     switch (event.type) {
         .quit => return false,
+        .window_close_requested => return handleWindowCloseRequested(state),
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(
@@ -870,6 +879,22 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (handleBrowserSelectAllShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleBrowserCopyCutShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleBrowserClipboardShortcut(state, &event.key)) {
+                return true;
+            }
+            if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, &event.key)) {
+                return true;
+            }
             // Workspace pane shortcuts pre-empt the terminal handler so the
             // embedded terminal (and anything running inside it, like tmux)
             // can't swallow Alt-prefixed bindings.
@@ -890,6 +915,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 .workspace_minimize,
                 .workspace_close,
                 => {
+                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
                     handleKeyboardAction(state, keyboard, resolved_workspace_action);
                     return true;
                 },
@@ -915,10 +941,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleFontSizeShortcut(state, &event.key)) {
                 return true;
             }
-            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
-                syncWindowTextInput(window, state);
-                return true;
-            }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
@@ -926,6 +948,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handlePendingThreadFollowupShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleWorkspaceContextMenuShortcut(state, &event.key)) {
                 return true;
             }
             if (handleComposerFocusShortcut(state, &event.key)) {
@@ -1165,6 +1190,50 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
     });
 }
 
+fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
+    if (event.scancode != .v and event.key != .v) return false;
+
+    const text = state.readClipboardTextForPaste() orelse return true;
+    defer state.allocator.free(text);
+    if (text.len == 0) return true;
+    _ = state.handleBrowserKey(.{
+        .key_code = 0,
+        .text = text,
+        .pressed = true,
+        .ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl),
+        .shift = isKeymodPressed(event.mod, sdl.Keymod.shift),
+        .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
+        .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
+    });
+    return true;
+}
+
+fn handleBrowserSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
+    if (event.scancode != .a and event.key != .a) return false;
+    state.selectAllBrowserFocusedElement();
+    return true;
+}
+
+fn handleBrowserCopyCutShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
+    const copy = event.scancode == .c or event.key == .c;
+    const cut = event.scancode == .x or event.key == .x;
+    if (!copy and !cut) return false;
+    state.copyBrowserFocusedSelection(cut);
+    return true;
+}
+
 fn browserMouseMotionEvent(event: *const sdl.MouseMotionEvent) browser_runtime.MouseEvent {
     return .{
         .x = event.x,
@@ -1180,6 +1249,8 @@ fn browserMouseButtonEvent(event: *const sdl.MouseButtonEvent) browser_runtime.M
             1 => .left,
             2 => .middle,
             3 => .right,
+            4 => .back,
+            5 => .forward,
             else => null,
         },
         .pressed = event.down,
@@ -1302,6 +1373,21 @@ fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.Keybo
     return true;
 }
 
+fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .application and
+        !(event.scancode == .f10 and isKeymodPressed(event.mod, sdl.Keymod.shift)))
+    {
+        return false;
+    }
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui))
+    {
+        return false;
+    }
+    return workspace_panes_ui.openFocusedChatPaneContextMenu(state);
+}
+
 fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
     if (state.composer_focused) return false;
     if (!state.isTranscriptFocused()) return false;
@@ -1413,6 +1499,34 @@ fn handleKeyboardAction(
         .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
         .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
+}
+
+fn handleWindowCloseRequested(state: *AppState) bool {
+    if (builtin.os.tag == .macos) {
+        const now_ms = std.time.milliTimestamp();
+        if (macos_cmd_w_pane_close_until_ms >= now_ms) {
+            macos_cmd_w_pane_close_until_ms = 0;
+            return true;
+        }
+        if (isKeymodPressed(SDL_GetModState(), sdl.Keymod.gui)) {
+            _ = state.closeFocusedWorkspacePane();
+            return true;
+        }
+    }
+    return false;
+}
+
+fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keybinds.NativeKeyboardAction) void {
+    if (builtin.os.tag != .macos or action != .workspace_close) return;
+    if (event.key != .w) return;
+    if (!isKeymodPressed(event.mod, sdl.Keymod.gui)) return;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return;
+    }
+    macos_cmd_w_pane_close_until_ms = std.time.milliTimestamp() + MACOS_CMD_W_CLOSE_SUPPRESS_MS;
 }
 
 fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

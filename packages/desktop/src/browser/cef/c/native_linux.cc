@@ -612,7 +612,7 @@ void focusDomTargetAtPoint(double x, double y, unsigned int button, int mouse_up
   (void)executeMainFrameScript("focus-click-target", script);
 }
 
-bool handleEditableKeyFallback(unsigned int key_code, int pressed) {
+bool handleEditableKeyFallback(unsigned int key_code, int pressed, unsigned int modifiers) {
   if (!pressed) {
     return false;
   }
@@ -626,16 +626,30 @@ bool handleEditableKeyFallback(unsigned int key_code, int pressed) {
     key = "Tab";
   } else if (key_code == 0xffff) {
     key = "Delete";
+  } else if (key_code == 0xff50) {
+    key = "Home";
+  } else if (key_code == 0xff51) {
+    key = "ArrowLeft";
+  } else if (key_code == 0xff52) {
+    key = "ArrowUp";
+  } else if (key_code == 0xff53) {
+    key = "ArrowRight";
+  } else if (key_code == 0xff54) {
+    key = "ArrowDown";
+  } else if (key_code == 0xff57) {
+    key = "End";
   } else {
     return false;
   }
 
+  const bool shift = (modifiers & (1u << 0)) != 0;
   char script[4096];
   std::snprintf(
       script,
       sizeof(script),
-      "(function(){const key='%s';const point=window.__verdeInputPoint;let el=window.__verdeInputTarget;if(el&&!el.isConnected)el=null;if(!el){el=document.activeElement;}const resolve=(node)=>{if(!node)return null;if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;return (node.closest&&node.closest('input,textarea,[contenteditable=\"true\"]'))||null;};el=resolve(el);if(!el&&point){el=resolve(document.elementFromPoint(point.x,point.y));}if(!el)return false;window.__verdeInputTarget=el;if(el.focus)el.focus({preventScroll:true});const evt=new KeyboardEvent('keydown',{key:key,bubbles:true,cancelable:true});el.dispatchEvent(evt);if(evt.defaultPrevented)return true;if(key==='Backspace'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start>0){el.value=el.value.slice(0,start-1)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start-1,start-1);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return true;}if(key==='Delete'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start<el.value.length){el.value=el.value.slice(0,start)+el.value.slice(start+1);if(el.setSelectionRange)el.setSelectionRange(start,start);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentForward'}));return true;}if(key==='Enter'){if(el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;el.value=el.value.slice(0,start)+'\\n'+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start+1,start+1);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:'\\n',inputType:'insertLineBreak'}));return true;}if(el instanceof HTMLInputElement&&el.form&&typeof el.form.requestSubmit==='function'){el.form.requestSubmit();return true;}}return false;})();",
-      key);
+      "(function(){const key='%s';const shift=%s;const point=window.__verdeInputPoint;let el=window.__verdeInputTarget;if(el&&!el.isConnected)el=null;if(!el){el=document.activeElement;}const resolve=(node)=>{if(!node)return null;if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;return (node.closest&&node.closest('input,textarea,[contenteditable=\"true\"]'))||null;};el=resolve(el);if(!el&&point){el=resolve(document.elementFromPoint(point.x,point.y));}if(!el)return false;window.__verdeInputTarget=el;if(el.focus)el.focus({preventScroll:true});const evt=new KeyboardEvent('keydown',{key:key,bubbles:true,cancelable:true,shiftKey:shift});el.dispatchEvent(evt);if(evt.defaultPrevented)return true;if((el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)&&(key==='ArrowLeft'||key==='ArrowRight'||key==='ArrowUp'||key==='ArrowDown'||key==='Home'||key==='End')){const len=el.value.length;const start=el.selectionStart??len;const end=el.selectionEnd??len;let next=(key==='Home'||key==='ArrowUp')?0:(key==='End'||key==='ArrowDown')?len:key==='ArrowLeft'?Math.max(0,start-1):Math.min(len,end+1);if(shift){el.setSelectionRange(Math.min(start,next),Math.max(start,next));}else{el.setSelectionRange(next,next);}return true;}if(key==='Backspace'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start>0){el.value=el.value.slice(0,start-1)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start-1,start-1);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));return true;}if(key==='Delete'&&(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement)){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;if(start===end&&start<el.value.length){el.value=el.value.slice(0,start)+el.value.slice(start+1);if(el.setSelectionRange)el.setSelectionRange(start,start);}else{el.value=el.value.slice(0,start)+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start,start);}el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentForward'}));return true;}if(key==='Enter'){if(el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;el.value=el.value.slice(0,start)+'\\n'+el.value.slice(end);if(el.setSelectionRange)el.setSelectionRange(start+1,start+1);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:'\\n',inputType:'insertLineBreak'}));return true;}if(el instanceof HTMLInputElement&&el.form&&typeof el.form.requestSubmit==='function'){el.form.requestSubmit();return true;}}return false;})();",
+      key,
+      shift ? "true" : "false");
   return executeMainFrameScript("editable-key-fallback", script);
 }
 
@@ -1011,7 +1025,7 @@ extern "C" int verde_cef_send_key_event(unsigned int key_code,
   event.unmodified_character = static_cast<char16_t>(key_code);
   event.focus_on_editable_field = true;
   g_runtime.browser->GetHost()->SendKeyEvent(event);
-  const bool fallback_dispatched = handleEditableKeyFallback(key_code, pressed);
+  const bool fallback_dispatched = handleEditableKeyFallback(key_code, pressed, modifiers);
   inputDebugLog("key_event fallback=%d", fallback_dispatched ? 1 : 0);
   if (fallback_dispatched) {
     return 1;
