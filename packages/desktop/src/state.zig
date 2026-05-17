@@ -6674,6 +6674,15 @@ pub const AppState = struct {
         event: *const sdl.KeyboardEvent,
     ) bool {
         if (!self.canRouteTerminalInput()) return false;
+        if (keyboard.terminalActionForEvent(event)) |action| {
+            switch (action) {
+                .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
+                .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
+                .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
+                .split_right => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
+                else => {},
+            }
+        }
         var dock = self.currentProjectTerminalMutable();
         const handled = dock.handleKeyDown(self.allocator, keyboard, event);
         if (dock.consumeWorkspaceChange()) self.markDirty();
@@ -7386,6 +7395,15 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn clearCurrentProjectWorkspacePaneMaximized(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (layout.maximized_pane_id == null) return false;
+        layout.maximized_pane_id = null;
+        self.markDirty();
+        return true;
+    }
+
     pub fn closeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
         var project = &self.projects.items[self.selected_project_index];
@@ -7502,12 +7520,20 @@ pub const AppState = struct {
     }
 
     pub fn splitFocusedWorkspacePaneWithTerminalAxis(self: *AppState, axis: WorkspaceSplitAxis) bool {
+        return self.splitFocusedWorkspacePaneWithTerminalPlacement(axis, true);
+    }
+
+    pub fn splitFocusedWorkspacePaneWithTerminalPlacement(self: *AppState, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (self.projects.items.len == 0) return false;
         const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
-        return self.splitCurrentProjectWorkspacePaneWithTerminalAxis(pane_id, axis);
+        return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, new_after);
     }
 
     pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, true);
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithTerminalPlacement(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (self.projects.items.len == 0) return false;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const target = layout.paneById(pane_id) orelse return false;
@@ -7531,7 +7557,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to create terminal pane.");
             return false;
         };
-        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, true) catch |err| {
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, new_after) catch |err| {
             log.err("failed to split terminal workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to split workspace.");
             return false;

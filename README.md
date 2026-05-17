@@ -296,12 +296,12 @@ If prompt sending fails, first check that the selected provider is installed, av
 
 Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` terminal engine.
 
-- Toggle the terminal with `CommandOrControl+J`. The terminal opens as a workspace pane and starts in the selected project's working directory.
 - Create a new chat thread with `CommandOrControl+T`, or split a terminal pane below the focused workspace pane with `CommandOrControl+Shift+T`.
+- Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
 - Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), maximize or restore a pane, minimize it into the restore strip, or close it.
 - Drag the divider between workspace panes to resize the split.
-- Right-click inside a terminal pane to create normal shell tabs or launch-profile tabs for Claude, OpenCode, Codex, and Cursor.
-- Terminal-internal tabs and splits remain separate from workspace splits. The terminal keybinds below operate inside the focused terminal pane.
+- Right-click inside a terminal pane to create normal shell tabs, launch-profile tabs for Claude, OpenCode, Codex, and Cursor, or new workspace terminal panes around the focused pane.
+- Terminal-internal tabs remain inside the focused terminal pane. Terminal split actions create workspace terminal panes.
 - Per-terminal zoom works with `Ctrl+-` and `Ctrl+=` while the terminal is focused, and the chosen zoom is restored with the terminal layout.
 
 ## Config And State
@@ -336,20 +336,24 @@ Example config:
       "split_chat_horizontal": "CommandOrControl+Alt+Shift+C",
       "split_terminal_vertical": "CommandOrControl+Alt+J",
       "split_terminal_horizontal": "CommandOrControl+Shift+T",
+      "focus_up": ["Alt+Up", "Ctrl+K"],
+      "focus_down": ["Alt+Down", "Ctrl+J"],
+      "focus_left": ["Alt+Left", "Ctrl+H"],
+      "focus_right": ["Alt+Right", "Ctrl+L"],
       "toggle_maximize": "CommandOrControl+Alt+M",
       "minimize": "CommandOrControl+Alt+Minus"
     },
     "terminal": {
-      "toggle": "CommandOrControl+J",
+      "toggle": null,
       "new_tab": "CommandOrControl+Alt+T",
       "close": "CommandOrControl+Shift+W",
       "rename_tab": "CommandOrControl+Shift+R",
       "tab_previous": "CommandOrControl+Shift+PageUp",
       "tab_next": "CommandOrControl+Shift+PageDown",
-      "split_up": "CommandOrControl+Shift+Up",
-      "split_down": ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
-      "split_left": "CommandOrControl+Shift+Left",
-      "split_right": ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
+      "split_up": null,
+      "split_down": null,
+      "split_left": null,
+      "split_right": null,
       "focus_up": "CommandOrControl+Alt+Up",
       "focus_down": "CommandOrControl+Alt+Down",
       "focus_left": "CommandOrControl+Alt+Left",
