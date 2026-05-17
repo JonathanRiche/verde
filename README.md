@@ -341,7 +341,8 @@ Example config:
       "focus_left": ["Alt+Left", "Ctrl+H"],
       "focus_right": ["Alt+Right", "Ctrl+L"],
       "toggle_maximize": "CommandOrControl+Alt+M",
-      "minimize": "CommandOrControl+Alt+Minus"
+      "minimize": "CommandOrControl+Alt+Minus",
+      "close": ["CommandOrControl+W", "Alt+X"]
     },
     "terminal": {
       "toggle": null,
