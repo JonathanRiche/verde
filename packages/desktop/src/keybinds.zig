@@ -752,6 +752,7 @@ fn cloneDefaultNewThreadKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+W"),
+        try parseDefaultAccelerator("Alt+X"),
     });
 }
 
@@ -1358,6 +1359,17 @@ test "default terminal internal split keybinds are disabled" {
     try std.testing.expectEqual(@as(usize, 0), config.terminal_split_down.len);
     try std.testing.expectEqual(@as(usize, 0), config.terminal_split_left.len);
     try std.testing.expectEqual(@as(usize, 0), config.terminal_split_right.len);
+}
+
+test "default workspace close supports primary w and alt x" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_close.len);
+    try std.testing.expect(config.workspace_close[0].primary);
+    try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close[0].key);
+    try std.testing.expect(config.workspace_close[1].alt);
+    try std.testing.expectEqual(sdl.Keycode.x, config.workspace_close[1].key);
 }
 
 test "default workspace focus supports alt arrows and ctrl hjkl" {

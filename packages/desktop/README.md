@@ -109,7 +109,8 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
       "focus_up": ["Alt+Up", "Ctrl+K"],
       "focus_down": ["Alt+Down", "Ctrl+J"],
       "focus_left": ["Alt+Left", "Ctrl+H"],
-      "focus_right": ["Alt+Right", "Ctrl+L"]
+      "focus_right": ["Alt+Right", "Ctrl+L"],
+      "close": ["CommandOrControl+W", "Alt+X"]
     },
     "terminal": {
       "toggle": null,

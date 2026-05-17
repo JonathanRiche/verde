@@ -1117,6 +1117,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
+            // Terminal panes route wheel input by the event coordinates, so let
+            // them claim scroll before chat/composer hit caches can consume it.
+            if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
+                return true;
+            }
             if (chat_panel_ui.handleTranscriptPaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
@@ -1124,9 +1129,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (state.handleComposerWheel(&event.wheel)) {
-                return true;
-            }
-            if (terminal_panel_ui.handlePaletteWheel(state, event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
             if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
