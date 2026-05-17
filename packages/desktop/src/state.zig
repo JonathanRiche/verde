@@ -716,6 +716,12 @@ const InspectorPromptSubmittedEvent = struct {
     },
 };
 
+const BrowserClipboardEvent = struct {
+    source: []const u8,
+    text: []const u8 = "",
+    cut: bool = false,
+};
+
 const InspectorSelectionPayload = struct {
     mode: []const u8,
     element: ?InspectorElementPayload = null,
@@ -838,6 +844,7 @@ pub const ChatThread = struct {
     access_mode: AccessMode = .full_access,
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
+    tui_dock_id: ?u32 = null,
     messages: std.ArrayList(ChatMessage),
     send_state: *SendState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
@@ -863,6 +870,7 @@ pub const ChatThread = struct {
             .access_mode = .full_access,
             .provider = .codex,
             .harness = .local_cli,
+            .tui_dock_id = null,
             .messages = .empty,
             .send_state = send_state,
             .transcript_markdown_entries = .empty,
@@ -885,9 +893,9 @@ pub const ChatThread = struct {
     }
 
     fn setDraft(self: *ChatThread, value: []const u8) void {
-        @memset(&self.draft_storage, 0);
         const len = @min(value.len, AppState.DRAFT_CAPACITY - 1);
         @memcpy(self.draft_storage[0..len], value[0..len]);
+        self.draft_storage[len] = 0;
     }
 
     fn clearDraft(self: *ChatThread) void {
@@ -1423,6 +1431,28 @@ pub const WorkspaceLayout = struct {
     fn paneByIdMutable(self: *WorkspaceLayout, pane_id: WorkspacePaneId) ?*WorkspacePane {
         for (self.panes.items) |*pane| {
             if (pane.id == pane_id) return pane;
+        }
+        return null;
+    }
+
+    fn visibleChatPaneIdForThread(self: *const WorkspaceLayout, thread_index: usize) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => |ref| if (ref.thread_index == thread_index) return pane.id,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn visibleTerminalPaneIdForDock(self: *const WorkspaceLayout, dock_id: u32) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+                else => {},
+            }
         }
         return null;
     }
@@ -2570,6 +2600,7 @@ pub const AppState = struct {
     browser_pane_max: [2]f32,
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
+    browser_clipboard_copy_pending: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
     sidebar_project_hover: ?usize,
@@ -2752,6 +2783,7 @@ pub const AppState = struct {
             .browser_pane_max = .{ 0.0, 0.0 },
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
+            .browser_clipboard_copy_pending = false,
             .sidebar_thread_hover = null,
             .sidebar_project_hover = null,
             .sidebar_new_thread_hover = null,
@@ -4204,11 +4236,6 @@ pub const AppState = struct {
             return;
         }
 
-        if (thread.draftImageCount() > 0) {
-            self.setSidebarNotice("Queued follow-up messages do not support image attachments yet.");
-            return;
-        }
-
         const kind: FollowupKind = switch (thread.provider) {
             .codex => .steer,
             .opencode => .queue,
@@ -4543,6 +4570,7 @@ pub const AppState = struct {
                     thread.access_mode = persisted_thread.access_mode orelse .full_access;
                     thread.provider = persisted_thread.provider;
                     thread.harness = persisted_thread.harness;
+                    thread.tui_dock_id = persisted_thread.tui_dock_id;
                     thread.setDraft(persisted_thread.draft);
                     if (persisted_thread.draft_image) |image| {
                         try thread.setDraftImage(self.allocator, image.path, image.mime, image.byte_size);
@@ -4787,6 +4815,7 @@ pub const AppState = struct {
             .access_mode = thread.access_mode,
             .provider = thread.provider,
             .harness = thread.harness,
+            .tui_dock_id = thread.tui_dock_id,
             .draft = try allocator.dupe(u8, thread.currentDraft()),
             .draft_image = try persistedImageSnapshot(allocator, thread.draft_image),
             .messages = try messages.toOwnedSlice(allocator),
@@ -6188,6 +6217,12 @@ pub const AppState = struct {
         }
         if (!contains_pointer and !self.browser_pane_focused) return false;
         if (is_pointer_event and !contains_pointer) return false;
+        if (event.button) |button| {
+            if (event.pressed and (button == .back or button == .forward)) {
+                self.navigateBrowserHistory(if (button == .back) -1 else 1);
+                return true;
+            }
+        }
 
         var pane_event = event;
         const displayed_width = self.browser_pane_max[0] - self.browser_pane_min[0];
@@ -6353,6 +6388,10 @@ pub const AppState = struct {
                     self.reapplyBrowserInspectorAfterLoad();
                 },
                 .js_message => |message| {
+                    if (isBrowserClipboardMessage(message)) {
+                        self.handleBrowserClipboardMessage(message);
+                        continue;
+                    }
                     if (isInspectorBridgeMessage(message)) {
                         if (isInspectorHoverMessage(message) or
                             isInspectorLifecycleMessage(message) or
@@ -6373,6 +6412,11 @@ pub const AppState = struct {
                 },
                 .eval_result => |result| {
                     self.browser_state.setLastEvalResult(result) catch {};
+                    if (self.browser_clipboard_copy_pending) {
+                        self.browser_clipboard_copy_pending = false;
+                        self.copyBrowserEvalResultToClipboard(result);
+                        continue;
+                    }
                     if (self.browser_state.consumeSuppressedEvalResult()) {
                         continue;
                     }
@@ -6412,6 +6456,27 @@ pub const AppState = struct {
             .draw_box => "Browser inspector switched to Draw Box mode.",
             .draw_freeform => "Browser inspector switched to Draw Freeform mode.",
         };
+    }
+
+    fn isBrowserClipboardMessage(message: []const u8) bool {
+        return std.mem.indexOf(u8, message, "\"source\":\"verde-browser-clipboard\"") != null;
+    }
+
+    fn handleBrowserClipboardMessage(self: *AppState, message: []const u8) void {
+        var parsed = std.json.parseFromSlice(BrowserClipboardEvent, self.allocator, message, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch |err| {
+            log.warn("failed to parse browser clipboard message: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser clipboard message could not be parsed.");
+            return;
+        };
+        defer parsed.deinit();
+
+        if (!std.mem.eql(u8, parsed.value.source, "verde-browser-clipboard")) {
+            return;
+        }
+        self.copyBrowserEvalResultToClipboard(parsed.value.text);
     }
 
     fn handleInspectorPromptSubmitted(self: *AppState, message: []const u8) void {
@@ -7451,6 +7516,10 @@ pub const AppState = struct {
     }
 
     pub fn splitCurrentProjectWorkspacePaneWithChatAxis(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        return self.splitCurrentProjectWorkspacePaneWithChatPlacement(pane_id, axis, true);
+    }
+
+    pub fn splitCurrentProjectWorkspacePaneWithChatPlacement(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (self.projects.items.len == 0) return false;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
         const target = layout.paneById(pane_id) orelse return false;
@@ -7465,7 +7534,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to create chat pane.");
             return false;
         };
-        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, true) catch |err| {
+        layout.splitPaneWithLeaf(self.allocator, pane_id, new_pane_id, axis, new_after) catch |err| {
             log.err("failed to split chat workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to split workspace.");
             return false;
@@ -7527,6 +7596,105 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return false;
         const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
         return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, axis, new_after);
+    }
+
+    pub fn openTerminalPaneForProjectIndex(self: *AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+        const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+        return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
+    }
+
+    pub fn openThreadInTui(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        var thread = &project.threads.items[thread_index];
+        const provider_thread_id = thread.provider_thread_id orelse {
+            self.setSidebarNotice("Thread has no provider session id yet.");
+            return;
+        };
+        const command = self.tuiResumeCommand(thread.provider, provider_thread_id) catch |err| {
+            log.warn("failed to build TUI resume command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to build TUI resume command.");
+            return;
+        };
+        defer self.allocator.free(command);
+
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+
+        project = &self.projects.items[project_index];
+        thread = &project.threads.items[thread_index];
+        var layout = &project.workspace_layout;
+        const pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
+        const pane = layout.paneByIdMutable(pane_id) orelse return;
+
+        const dock_id = thread.tui_dock_id orelse self.createCurrentProjectTerminalDock() catch |err| {
+            log.err("failed to allocate TUI terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create TUI terminal.");
+            return;
+        };
+        thread.tui_dock_id = dock_id;
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
+        dock.ensureSession(self.allocator, project.path) catch |err| {
+            log.err("failed to start TUI terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start TUI terminal.");
+            return;
+        };
+
+        pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
+        pane.minimized = false;
+        layout.focused_pane_id = pane_id;
+        layout.maximized_pane_id = null;
+        dock.visible = false;
+        self.requestTerminalFocus();
+        _ = self.writeWorkspaceTerminalPane(pane_id, command) catch |err| {
+            log.warn("failed to write TUI resume command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to write TUI resume command.");
+            return;
+        };
+        self.setSidebarNotice("Thread opened in TUI.");
+        self.markDirty();
+    }
+
+    pub fn openThreadInChat(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        const dock_id = project.threads.items[thread_index].tui_dock_id orelse return;
+
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+        project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        const pane_id = layout.visibleTerminalPaneIdForDock(dock_id) orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
+        const pane = layout.paneByIdMutable(pane_id) orelse return;
+        pane.ref = .{ .chat = .{ .thread_index = thread_index } };
+        pane.minimized = false;
+        layout.focused_pane_id = pane_id;
+        layout.maximized_pane_id = null;
+        project.selected_thread_index = thread_index;
+        self.terminal_focused = false;
+        self.requestComposerFocus();
+        self.syncRenameBuffer();
+        self.setSidebarNotice("Thread opened in chat.");
+        self.markDirty();
+    }
+
+    fn tuiResumeCommand(self: *AppState, provider: Provider, thread_id: []const u8) ![]u8 {
+        return switch (provider) {
+            .codex => std.fmt.allocPrint(self.allocator, "codex resume {s}\n", .{thread_id}),
+            .opencode => blk: {
+                if (!std.mem.startsWith(u8, thread_id, "ses")) {
+                    break :blk self.allocator.dupe(u8, "opencode --continue\n");
+                }
+                break :blk std.fmt.allocPrint(self.allocator, "opencode --session {s}\n", .{thread_id});
+            },
+            .claude => std.fmt.allocPrint(self.allocator, "claude --resume {s}\n", .{thread_id}),
+            .cursor => std.fmt.allocPrint(self.allocator, "cursor-agent --resume {s}\n", .{thread_id}),
+        };
     }
 
     pub fn splitCurrentProjectWorkspacePaneWithTerminalAxis(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
@@ -8342,6 +8510,136 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    pub fn navigateBrowserHistory(self: *AppState, delta: i32) void {
+        const script = if (delta < 0) "history.back()" else "history.forward()";
+        self.browser_state.controller.eval(script) catch |err| {
+            log.warn("failed to navigate browser history: {s}", .{@errorName(err)});
+            self.browser_state.setLastError("Failed to navigate browser history.") catch {};
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn selectAllBrowserFocusedElement(self: *AppState) void {
+        const script =
+            \\(function(){
+            \\  let el=window.__verdeInputTarget;
+            \\  if(el&&!el.isConnected)el=null;
+            \\  const resolve=(node)=>{
+            \\    if(!node)return null;
+            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
+            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
+            \\  };
+            \\  el=resolve(el)||resolve(document.activeElement);
+            \\  if(!el)return false;
+            \\  window.__verdeInputTarget=el;
+            \\  if(el.focus)el.focus({preventScroll:true});
+            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
+            \\    if(el.setSelectionRange)el.setSelectionRange(0,el.value.length);
+            \\    return true;
+            \\  }
+            \\  if(el.isContentEditable){
+            \\    const range=document.createRange();
+            \\    range.selectNodeContents(el);
+            \\    const selection=window.getSelection();
+            \\    if(!selection)return false;
+            \\    selection.removeAllRanges();
+            \\    selection.addRange(range);
+            \\    return true;
+            \\  }
+            \\  return false;
+            \\})()
+        ;
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            log.warn("failed to select browser focused element text: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn copyBrowserFocusedSelection(self: *AppState, cut: bool) void {
+        const script = if (cut)
+            \\(function(){
+            \\  const post=(text)=>{
+            \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:true});
+            \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
+            \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
+            \\  };
+            \\  let el=window.__verdeInputTarget;
+            \\  if(el&&!el.isConnected)el=null;
+            \\  const resolve=(node)=>{
+            \\    if(!node)return null;
+            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
+            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
+            \\  };
+            \\  el=resolve(el)||resolve(document.activeElement);
+            \\  let text='';
+            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
+            \\    const start=el.selectionStart??0;
+            \\    const end=el.selectionEnd??0;
+            \\    text=el.value.slice(start,end);
+            \\    if(text.length>0){
+            \\      el.value=el.value.slice(0,start)+el.value.slice(end);
+            \\      if(el.setSelectionRange)el.setSelectionRange(start,start);
+            \\      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteByCut'}));
+            \\    }
+            \\  }else{
+            \\    text=String(window.getSelection?.()||'');
+            \\    if(text.length>0&&el&&el.isContentEditable){document.execCommand('delete',false);}
+            \\  }
+            \\  window.__verdeClipboardSelection=text;
+            \\  post(text);
+            \\  return text.length>0;
+            \\})()
+        else
+            \\(function(){
+            \\  const post=(text)=>{
+            \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:false});
+            \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
+            \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
+            \\  };
+            \\  let el=window.__verdeInputTarget;
+            \\  if(el&&!el.isConnected)el=null;
+            \\  const resolve=(node)=>{
+            \\    if(!node)return null;
+            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
+            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
+            \\  };
+            \\  el=resolve(el)||resolve(document.activeElement);
+            \\  let text='';
+            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){
+            \\    text=el.value.slice(el.selectionStart??0,el.selectionEnd??0);
+            \\  }else{
+            \\    text=String(window.getSelection?.()||'');
+            \\  }
+            \\  window.__verdeClipboardSelection=text;
+            \\  post(text);
+            \\  return text.length>0;
+            \\})()
+        ;
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            log.warn("failed to capture browser focused selection: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    fn copyBrowserEvalResultToClipboard(self: *AppState, result: []const u8) void {
+        if (result.len == 0) return;
+        const z = self.allocator.dupeZ(u8, result) catch |err| {
+            log.warn("failed to copy browser selection: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(z);
+        sdl.setClipboardText(z) catch |err| {
+            log.warn("failed to set browser selection clipboard text: {s}", .{@errorName(err)});
+            return;
+        };
+        self.setSidebarNotice("Browser selection copied.");
+    }
+
     fn setCurrentThreadModelRef(self: *AppState, value: ?[:0]const u8) void {
         const thread = self.currentThreadMutable();
         if (thread.model_ref) |existing| {
@@ -8749,7 +9047,7 @@ pub const AppState = struct {
     }
 
     pub fn reloadFromStorage(self: *AppState) !void {
-        self.pollSend();
+        _ = self.pollSend();
         if (self.hasAnyPendingSends()) {
             self.setSidebarNotice("Finish running provider requests before refreshing from disk.");
             return;
@@ -8815,7 +9113,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
-        self.pollSend();
+        _ = self.pollSend();
         runtime_log.diagnostic("AppState.deinit sends polled", .{});
         ai_harness.shutdownOwnedProviderProcesses();
         runtime_log.diagnostic("AppState.deinit provider processes shutdown", .{});
@@ -9061,17 +9359,19 @@ pub const AppState = struct {
         }
     }
 
-    pub fn pollSend(self: *AppState) void {
-        if (self.pending_send_count == 0) return;
+    pub fn pollSend(self: *AppState) bool {
+        if (self.pending_send_count == 0) return false;
 
+        var changed = false;
         for (self.projects.items, 0..) |*project, project_index| {
             for (project.threads.items, 0..) |*thread, thread_index| {
-                self.pollThreadSend(project_index, thread_index, thread);
+                changed = self.pollThreadSend(project_index, thread_index, thread) or changed;
             }
         }
+        return changed;
     }
 
-    fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) void {
+    fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
         self.capturePendingProviderThreadId(thread);
         self.issuePendingCodexSteer(self.projects.items[project_index].path, project_index, thread_index, thread);
         self.issuePendingThreadStop(self.projects.items[project_index].path, thread);
@@ -9084,7 +9384,7 @@ pub const AppState = struct {
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
         const send_state = thread.send_state;
 
-        if (!send_state.mutex.tryLock()) return;
+        if (!send_state.mutex.tryLock()) return false;
         switch (send_state.status) {
             .completed => {
                 completed_result = send_state.result;
@@ -9242,6 +9542,7 @@ pub const AppState = struct {
         if (next_status == .completed or next_status == .aborted) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
+        return next_status != .idle;
     }
 
     fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {
@@ -9559,6 +9860,7 @@ pub const AppState = struct {
     }
 
     pub fn hasAnyPendingSends(self: *AppState) bool {
+        if (self.pending_send_count > 0) return true;
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
                 if (thread.isSendPendingForUi()) return true;

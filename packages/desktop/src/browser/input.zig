@@ -5,6 +5,8 @@ pub const MouseButton = enum {
     left,
     middle,
     right,
+    back,
+    forward,
 };
 
 /// Carries normalized pointer input into the browser runtime.

@@ -9,8 +9,13 @@ const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 
+// Nerd Font Symbols codicon-refresh.
+const NF_COD_REFRESH = "\u{EB37}";
+
 const BrowserHitKind = enum {
     address,
+    back,
+    forward,
     navigate,
     inspect_toggle,
     inspect_mode_menu,
@@ -106,6 +111,16 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
                     state.browser_address_selection_anchor = offset;
                     state.browser_address_drag_active = true;
                 }
+            },
+            .back => {
+                blurAddress(state);
+                state.browser_inspector_menu_open = false;
+                state.navigateBrowserHistory(-1);
+            },
+            .forward => {
+                blurAddress(state);
+                state.browser_inspector_menu_open = false;
+                state.navigateBrowserHistory(1);
             },
             .navigate => {
                 blurAddress(state);
@@ -314,6 +329,25 @@ fn stablePaletteText(state: *app_state.AppState, value: []const u8) ![]const u8 
     return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
+fn queuePaletteIcon(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color) void {
+    const stable_value = stablePaletteText(state, value) catch |err| {
+        app_state.log.warn("failed to retain browser palette icon: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        rect,
+        stable_value,
+        color,
+        rect.h * 0.92,
+        .icon,
+        null,
+        null,
+    ) catch |err| {
+        app_state.log.warn("failed to queue browser palette icon: {s}", .{@errorName(err)});
+    };
+}
+
 fn renderPaletteToolbarButton(
     state: *app_state.AppState,
     rect: palette.Rect,
@@ -339,7 +373,8 @@ fn renderPaletteToolbarButton(
 
 /// Renders the compact browser toolbar with URL entry and primary actions.
 fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
-    const navigate_icon = ">";
+    const back_icon = "<";
+    const forward_icon = ">";
     const close_icon = "x";
     const toolbar_height = theme.scaledUi(52.0);
     const button_size = theme.scaledUi(36.0);
@@ -348,7 +383,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
     const pad_y = theme.scaledUi(8.0);
     const avail = @max(dock_rect.w - pad_x * 2.0, theme.scaledUi(180.0));
     const gap = theme.scaledUi(8.0);
-    const field_width = @max(avail - button_size * 3.0 - inspect_menu_button_width - gap * 3.0, theme.scaledUi(180.0));
+    const field_width = @max(avail - button_size * 5.0 - inspect_menu_button_width - gap * 5.0, theme.scaledUi(180.0));
     palette_toolbar_rect = .{ .x = dock_rect.x, .y = dock_rect.y, .w = dock_rect.w, .h = toolbar_height };
     queuePaletteRect(state, palette_toolbar_rect, paletteColor(colors.rgba(18, 20, 25, 255)));
 
@@ -356,11 +391,39 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
     renderPaletteAddressField(state, address_rect);
     addPaletteHit(address_rect, .address);
 
-    const navigate_rect: palette.Rect = .{ .x = address_rect.x + address_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
+    const back_rect: palette.Rect = .{ .x = address_rect.x + address_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderPaletteToolbarButton(
+        state,
+        back_rect,
+        back_icon,
+        theme.COLOR_PANEL_ALT,
+        theme.lighten(theme.COLOR_PANEL_ALT, 0.08),
+        theme.lighten(theme.COLOR_PANEL_ALT, 0.14),
+        theme.COLOR_WHITE,
+        rectHovered(back_rect),
+        false,
+    );
+    addPaletteHit(back_rect, .back);
+
+    const forward_rect: palette.Rect = .{ .x = back_rect.x + back_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderPaletteToolbarButton(
+        state,
+        forward_rect,
+        forward_icon,
+        theme.COLOR_PANEL_ALT,
+        theme.lighten(theme.COLOR_PANEL_ALT, 0.08),
+        theme.lighten(theme.COLOR_PANEL_ALT, 0.14),
+        theme.COLOR_WHITE,
+        rectHovered(forward_rect),
+        false,
+    );
+    addPaletteHit(forward_rect, .forward);
+
+    const navigate_rect: palette.Rect = .{ .x = forward_rect.x + forward_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
     renderPaletteToolbarButton(
         state,
         navigate_rect,
-        navigate_icon,
+        "",
         theme.COLOR_SECONDARY_GREEN,
         theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10),
         theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10),
@@ -368,6 +431,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
         rectHovered(navigate_rect),
         false,
     );
+    queuePaletteIcon(state, centeredIconRect(navigate_rect), NF_COD_REFRESH, paletteColor(theme.COLOR_WHITE));
     addPaletteHit(navigate_rect, .navigate);
 
     const can_use_inspector = state.canUseBrowserInspector();
@@ -604,7 +668,7 @@ fn deleteAddressSelection(state: *app_state.AppState) bool {
     const sel = addressSelectionRange(state, address) orelse return false;
     const buffer = browser_state.addressBuffer();
     const current_len = address.len;
-    std.mem.copyForwards(u8, buffer[sel.start..current_len - (sel.end - sel.start)], buffer[sel.end..current_len]);
+    std.mem.copyForwards(u8, buffer[sel.start .. current_len - (sel.end - sel.start)], buffer[sel.end..current_len]);
     buffer[current_len - (sel.end - sel.start)] = 0;
     state.browser_address_cursor = sel.start;
     clearAddressSelection(state);

@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const palette = @import("palette");
+const sdl = @import("zsdl3");
 
 const runtime = @import("runtime.zig");
 const chat_panel = @import("chat_panel.zig");
@@ -17,22 +18,31 @@ const theme = @import("theme.zig");
 
 const FOCUS_ANIM_DURATION_MS: i64 = 160;
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
+const PANE_CONTEXT_MENU_Z: i32 = 180;
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
 }
 
-const MAX_WORKSPACE_PANE_HITS = 32;
+const MAX_WORKSPACE_PANE_HITS = 48;
 const WorkspacePaneAction = enum {
     focus,
     maximize,
     minimize,
     restore,
     toggle_split_menu,
-    split_chat_vertical,
-    split_chat_horizontal,
-    split_terminal_vertical,
-    split_terminal_horizontal,
+    copy_selection,
+    paste_into_prompt,
+    new_chat_thread,
+    refresh_chat_thread,
+    split_chat_left,
+    split_chat_right,
+    split_chat_up,
+    split_chat_down,
+    split_terminal_left,
+    split_terminal_right,
+    split_terminal_up,
+    split_terminal_down,
     close,
     resize_split,
 };
@@ -55,7 +65,11 @@ var hit_cache: WorkspacePaneHitCache = .{};
 var resize_drag: ?WorkspacePaneHit = null;
 var split_menu_open_for: ?runtime.WorkspacePaneId = null;
 var split_menu_rect: palette.Rect = .{};
+var split_submenu_rect: palette.Rect = .{};
 var split_menu_anchor: palette.Rect = .{};
+var split_menu_show_paste: bool = false;
+const SplitMenuKind = enum { split_button, chat_context };
+var split_menu_kind: SplitMenuKind = .split_button;
 
 const MAX_WORKSPACE_PANE_RECTS = 16;
 const WorkspacePaneRect = struct {
@@ -101,6 +115,32 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     }
 
     return focusPaneInDirectionFromRects(state, current_id, dir, pane_rects[0..pane_rect_count], false);
+}
+
+pub fn openFocusedChatPaneContextMenu(state: *runtime.AppState) bool {
+    if (state.projects.items.len == 0) return false;
+    const pane_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    if (state.workspacePaneKindById(pane_id) != .chat) return false;
+    var rect: ?palette.Rect = null;
+    var i: usize = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        if (pane_rects[i].pane_id == pane_id) {
+            rect = pane_rects[i].rect;
+            break;
+        }
+    }
+    const pane_rect = rect orelse return false;
+    split_menu_show_paste = false;
+    split_menu_kind = .chat_context;
+    split_menu_open_for = pane_id;
+    split_menu_anchor = .{
+        .x = pane_rect.x + @min(pane_rect.w * 0.5, theme.scaledUi(360.0)),
+        .y = pane_rect.y + @min(pane_rect.h * 0.5, theme.scaledUi(320.0)),
+        .w = 0.0,
+        .h = 0.0,
+    };
+    state.markDirty();
+    return true;
 }
 
 fn focusPaneInDirectionFromRects(
@@ -362,7 +402,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (button == 3 and down) {
-        // Right-click on a pane header opens the split menu anchored at the cursor.
+        // Right-click on a pane opens the chat thread context menu anchored at the cursor.
         var ri: usize = hit_cache.count;
         while (ri > 0) {
             ri -= 1;
@@ -370,7 +410,34 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             if (hit.action != .focus) continue;
             if (!rectContains(hit.rect, x, y)) continue;
             _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+            split_menu_show_paste = false;
+            split_menu_kind = .chat_context;
+            if (state.palette_composer.textRect().contains(.{ .x = x, .y = y })) {
+                if (state.readClipboardTextForPaste()) |text| {
+                    split_menu_show_paste = text.len > 0;
+                    state.allocator.free(text);
+                }
+            }
             split_menu_open_for = hit.pane_id;
+            split_menu_anchor = .{ .x = x, .y = y, .w = 0.0, .h = 0.0 };
+            return true;
+        }
+        ri = pane_rect_count;
+        while (ri > 0) {
+            ri -= 1;
+            const pane_rect = pane_rects[ri];
+            if (!rectContains(pane_rect.rect, x, y)) continue;
+            if (state.workspacePaneKindById(pane_rect.pane_id) != .chat) return false;
+            _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
+            split_menu_show_paste = false;
+            split_menu_kind = .chat_context;
+            if (state.palette_composer.textRect().contains(.{ .x = x, .y = y })) {
+                if (state.readClipboardTextForPaste()) |text| {
+                    split_menu_show_paste = text.len > 0;
+                    state.allocator.free(text);
+                }
+            }
+            split_menu_open_for = pane_rect.pane_id;
             split_menu_anchor = .{ .x = x, .y = y, .w = 0.0, .h = 0.0 };
             return true;
         }
@@ -407,26 +474,64 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             .restore => _ = state.restoreCurrentProjectWorkspacePane(hit.pane_id),
             .toggle_split_menu => {
                 _ = state.focusCurrentProjectWorkspacePane(hit.pane_id);
+                split_menu_show_paste = false;
+                split_menu_kind = .split_button;
+                split_menu_anchor = hit.rect;
                 if (split_menu_open_for) |id| {
                     split_menu_open_for = if (id == hit.pane_id) null else hit.pane_id;
                 } else {
                     split_menu_open_for = hit.pane_id;
                 }
             },
-            .split_chat_vertical => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatAxis(hit.pane_id, .vertical);
+            .copy_selection => {
+                copyTranscriptSelectionToClipboard(state);
                 split_menu_open_for = null;
             },
-            .split_chat_horizontal => {
-                _ = state.splitCurrentProjectWorkspacePaneWithChatAxis(hit.pane_id, .horizontal);
+            .paste_into_prompt => {
+                _ = state.pasteClipboardTextIntoPaletteComposer();
                 split_menu_open_for = null;
             },
-            .split_terminal_vertical => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalAxis(hit.pane_id, .vertical);
+            .new_chat_thread => {
+                if (state.projects.items.len > 0) state.createThreadForProject(state.selected_project_index);
                 split_menu_open_for = null;
             },
-            .split_terminal_horizontal => {
-                _ = state.splitCurrentProjectWorkspacePaneWithTerminalAxis(hit.pane_id, .horizontal);
+            .refresh_chat_thread => {
+                if (state.projects.items.len > 0) {
+                    const thread_index = state.currentProject().selected_thread_index;
+                    state.syncThreadFromProvider(state.selected_project_index, thread_index);
+                }
+                split_menu_open_for = null;
+            },
+            .split_chat_left => {
+                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .vertical, false);
+                split_menu_open_for = null;
+            },
+            .split_chat_right => {
+                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .vertical, true);
+                split_menu_open_for = null;
+            },
+            .split_chat_up => {
+                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .horizontal, false);
+                split_menu_open_for = null;
+            },
+            .split_chat_down => {
+                _ = state.splitCurrentProjectWorkspacePaneWithChatPlacement(hit.pane_id, .horizontal, true);
+                split_menu_open_for = null;
+            },
+            .split_terminal_left => {
+                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .vertical, false);
+                split_menu_open_for = null;
+            },
+            .split_terminal_right => {
+                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .vertical, true);
+                split_menu_open_for = null;
+            },
+            .split_terminal_up => {
+                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .horizontal, false);
+                split_menu_open_for = null;
+            },
+            .split_terminal_down => {
+                _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(hit.pane_id, .horizontal, true);
                 split_menu_open_for = null;
             },
             .close => {
@@ -443,7 +548,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
     // No hit matched. If the split menu is open, dismiss on outside click;
     // absorb clicks that landed inside the menu panel but missed a cell so it stays open.
     if (split_menu_open_for != null) {
-        if (rectContains(split_menu_rect, x, y)) return true;
+        if (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y)) return true;
         split_menu_open_for = null;
         return true;
     }
@@ -465,7 +570,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
     }
     // Focus-follows-mouse: hovering into a pane focuses it. Skip while a split
     // menu is open and the cursor is inside that menu so the open pane stays put.
-    if (split_menu_open_for != null and rectContains(split_menu_rect, x, y)) return false;
+    if (split_menu_open_for != null and (rectContains(split_menu_rect, x, y) or rectContains(split_submenu_rect, x, y))) return false;
     var i: usize = 0;
     while (i < pane_rect_count) : (i += 1) {
         const entry = pane_rects[i];
@@ -654,7 +759,7 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
         const split_emphasized = header_hovered or split_active;
         renderSplitTriggerButton(state, split_rect, split_active, split_emphasized, header_rect);
         appendHit(.{ .pane_id = pane_id, .action = .toggle_split_menu, .rect = split_rect });
-        if (menu_open_here) split_menu_anchor = split_rect;
+        if (menu_open_here and split_menu_kind == .split_button) split_menu_anchor = split_rect;
     }
     _ = reserve;
 }
@@ -673,38 +778,51 @@ fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active
     else
         colors.rgba(120, 128, 138, 255);
 
-    // Draw the plus glyph as two centered rectangles so positioning is exact and
-    // does not depend on the font's "+" glyph metrics.
-    const cx = rect.x + rect.w * 0.5;
-    const cy = rect.y + rect.h * 0.5;
-    const arm = theme.scaledUi(9.0);
-    const stroke = theme.scaledUi(1.5);
-    queueRect(state, .{
-        .x = cx - arm * 0.5,
-        .y = cy - stroke * 0.5,
-        .w = arm,
-        .h = stroke,
-    }, paletteColor(icon_color));
-    queueRect(state, .{
-        .x = cx - stroke * 0.5,
-        .y = cy - arm * 0.5,
-        .w = stroke,
-        .h = arm,
-    }, paletteColor(icon_color));
+    const cell = theme.scaledUi(4.0);
+    const gap = theme.scaledUi(2.0);
+    const grid_w = cell * 2.0 + gap;
+    const grid_h = grid_w;
+    const start_x = rect.x + (rect.w - grid_w) * 0.5;
+    const start_y = rect.y + (rect.h - grid_h) * 0.5;
+    var row: usize = 0;
+    while (row < 2) : (row += 1) {
+        var col: usize = 0;
+        while (col < 2) : (col += 1) {
+            queueRect(state, .{
+                .x = start_x + @as(f32, @floatFromInt(col)) * (cell + gap),
+                .y = start_y + @as(f32, @floatFromInt(row)) * (cell + gap),
+                .w = cell,
+                .h = cell,
+            }, paletteColor(icon_color));
+        }
+    }
 }
 
 fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect) void {
     const pane_id = split_menu_open_for orelse return;
+    const previous_z = state.palette_overlay_batch.setZIndex(PANE_CONTEXT_MENU_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
-    const menu_w = theme.scaledUi(272.0);
-    const header_h = theme.scaledUi(20.0);
-    const header_gap = theme.scaledUi(8.0);
-    const cell_h = theme.scaledUi(52.0);
-    const cell_gap = theme.scaledUi(10.0);
+    const menu_w = theme.scaledUi(230.0);
+    const submenu_w = theme.scaledUi(210.0);
+    const row_h = theme.scaledUi(28.0);
+    const row_gap = theme.scaledUi(4.0);
     const menu_pad_x = theme.scaledUi(14.0);
     const menu_pad_top = theme.scaledUi(12.0);
-    const menu_pad_bottom = theme.scaledUi(14.0);
-    const menu_h = menu_pad_top + header_h + header_gap + menu_pad_bottom + cell_h * 2.0 + cell_gap;
+    const menu_pad_bottom = theme.scaledUi(12.0);
+    const copy_count: usize = if (split_menu_kind == .chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
+    const paste_count: usize = if (split_menu_kind == .chat_context and split_menu_show_paste) 1 else 0;
+    const command_count: usize = switch (split_menu_kind) {
+        .chat_context => copy_count + paste_count + 3,
+        .split_button => 1,
+    };
+    const split_count: usize = 8;
+    const menu_h = menu_pad_top + menu_pad_bottom +
+        @as(f32, @floatFromInt(command_count)) * row_h +
+        @as(f32, @floatFromInt(command_count - 1)) * row_gap;
+    const submenu_h = menu_pad_top + menu_pad_bottom +
+        @as(f32, @floatFromInt(split_count)) * row_h +
+        @as(f32, @floatFromInt(split_count - 1)) * row_gap;
 
     var menu_x = split_menu_anchor.x;
     const max_x = workspace_rect.x + workspace_rect.w - menu_w - theme.scaledUi(8.0);
@@ -716,90 +834,138 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
 
     const menu_rect = palette.Rect{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
     split_menu_rect = menu_rect;
+    split_submenu_rect = .{};
 
     queueRounded(state, menu_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(10.0));
     queueBorder(state, menu_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(10.0), theme.scaledUi(1.0));
 
-    queueText(state, .{
-        .x = menu_rect.x + menu_pad_x,
-        .y = menu_rect.y + menu_pad_top,
-        .w = menu_rect.w - menu_pad_x * 2.0,
-        .h = header_h,
-    }, "Split pane", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), menu_rect);
-
-    const grid_x = menu_rect.x + menu_pad_x;
-    const grid_y = menu_rect.y + menu_pad_top + header_h + header_gap;
-    const cell_w = (menu_rect.w - menu_pad_x * 2.0 - cell_gap) * 0.5;
-
-    const Opt = struct {
+    const MenuRow = struct {
         action: WorkspacePaneAction,
-        row: u8,
-        col: u8,
         label: []const u8,
     };
-    const opts = [_]Opt{
-        .{ .action = .split_chat_vertical, .row = 0, .col = 0, .label = "Chat right" },
-        .{ .action = .split_chat_horizontal, .row = 0, .col = 1, .label = "Chat below" },
-        .{ .action = .split_terminal_vertical, .row = 1, .col = 0, .label = "Term right" },
-        .{ .action = .split_terminal_horizontal, .row = 1, .col = 1, .label = "Term below" },
+    var y = menu_rect.y + menu_pad_top;
+    const row_rect_w = menu_rect.w - menu_pad_x * 2.0;
+    if (split_menu_kind == .chat_context) {
+        if (copy_count > 0) y = renderContextMenuRow(state, pane_id, .copy_selection, "Copy", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        if (paste_count > 0) y = renderContextMenuRow(state, pane_id, .paste_into_prompt, "Paste", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        y = renderContextMenuRow(state, pane_id, .new_chat_thread, "New Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+        y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
+    }
+    const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
+
+    const rows = [_]MenuRow{
+        .{ .action = .split_chat_left, .label = "Chat Left" },
+        .{ .action = .split_chat_right, .label = "Chat Right" },
+        .{ .action = .split_chat_up, .label = "Chat Above" },
+        .{ .action = .split_chat_down, .label = "Chat Below" },
+        .{ .action = .split_terminal_left, .label = "Terminal Left" },
+        .{ .action = .split_terminal_right, .label = "Terminal Right" },
+        .{ .action = .split_terminal_up, .label = "Terminal Above" },
+        .{ .action = .split_terminal_down, .label = "Terminal Below" },
     };
 
-    for (opts) |o| {
-        const col_f: f32 = @floatFromInt(o.col);
-        const row_f: f32 = @floatFromInt(o.row);
-        const cx = grid_x + col_f * (cell_w + cell_gap);
-        const cy = grid_y + row_f * (cell_h + cell_gap);
-        const cell_rect = palette.Rect{ .x = cx, .y = cy, .w = cell_w, .h = cell_h };
-        const hovered = rectContains(cell_rect, state.palette_mouse_x, state.palette_mouse_y);
-        const cell_bg = if (hovered) colors.rgba(42, 50, 58, 255) else colors.rgba(31, 36, 42, 255);
-        const cell_border = if (hovered) theme.COLOR_SECONDARY_GREEN else colors.rgba(66, 74, 84, 255);
-        queueRounded(state, cell_rect, paletteColor(cell_bg), theme.scaledUi(6.0));
-        queueBorder(state, cell_rect, paletteColor(cell_border), theme.scaledUi(6.0), theme.scaledUi(1.0));
-
-        const diag_w = theme.scaledUi(30.0);
-        const diag_h = theme.scaledUi(24.0);
-        const diag = palette.Rect{
-            .x = cell_rect.x + theme.scaledUi(10.0),
-            .y = cell_rect.y + (cell_rect.h - diag_h) * 0.5,
-            .w = diag_w,
-            .h = diag_h,
-        };
-        const diag_stroke = if (hovered) colors.rgba(180, 200, 220, 255) else colors.rgba(110, 130, 150, 255);
-        const fill_color = if (o.row == 0) colors.rgba(76, 168, 110, 220) else colors.rgba(196, 144, 96, 220);
-        queueBorder(state, diag, paletteColor(diag_stroke), theme.scaledUi(2.0), theme.scaledUi(1.0));
-        if (o.col == 0) {
-            const line = palette.Rect{ .x = diag.x + diag.w * 0.5, .y = diag.y, .w = theme.scaledUi(1.0), .h = diag.h };
-            queueRect(state, line, paletteColor(diag_stroke));
-            const fill = palette.Rect{
-                .x = diag.x + diag.w * 0.5 + theme.scaledUi(2.0),
-                .y = diag.y + theme.scaledUi(2.0),
-                .w = diag.w * 0.5 - theme.scaledUi(3.0),
-                .h = diag.h - theme.scaledUi(4.0),
-            };
-            queueRect(state, fill, paletteColor(fill_color));
-        } else {
-            const line = palette.Rect{ .x = diag.x, .y = diag.y + diag.h * 0.5, .w = diag.w, .h = theme.scaledUi(1.0) };
-            queueRect(state, line, paletteColor(diag_stroke));
-            const fill = palette.Rect{
-                .x = diag.x + theme.scaledUi(2.0),
-                .y = diag.y + diag.h * 0.5 + theme.scaledUi(2.0),
-                .w = diag.w - theme.scaledUi(4.0),
-                .h = diag.h * 0.5 - theme.scaledUi(3.0),
-            };
-            queueRect(state, fill, paletteColor(fill_color));
-        }
-
-        const text_x = diag.x + diag.w + theme.scaledUi(10.0);
-        const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-        queueText(state, .{
-            .x = text_x,
-            .y = cell_rect.y + (cell_rect.h - theme.scaledUi(14.0)) * 0.5,
-            .w = cell_rect.x + cell_rect.w - text_x - theme.scaledUi(8.0),
-            .h = theme.scaledUi(14.0),
-        }, o.label, paletteColor(text_color), theme.scaledUi(12.0), menu_rect);
-
-        appendHit(.{ .pane_id = pane_id, .action = o.action, .rect = cell_rect });
+    var submenu_x = menu_rect.x + menu_rect.w + theme.scaledUi(6.0);
+    if (submenu_x + submenu_w > workspace_rect.x + workspace_rect.w - theme.scaledUi(8.0)) {
+        submenu_x = menu_rect.x - submenu_w - theme.scaledUi(6.0);
     }
+    var submenu_y = split_trigger_rect.y;
+    const submenu_max_y = workspace_rect.y + workspace_rect.h - submenu_h - theme.scaledUi(8.0);
+    if (submenu_y > submenu_max_y) submenu_y = submenu_max_y;
+    if (submenu_y < workspace_rect.y + theme.scaledUi(8.0)) submenu_y = workspace_rect.y + theme.scaledUi(8.0);
+    const submenu_rect = palette.Rect{ .x = submenu_x, .y = submenu_y, .w = submenu_w, .h = submenu_h };
+    const submenu_visible = rectContains(split_trigger_rect, state.palette_mouse_x, state.palette_mouse_y) or rectContains(submenu_rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (submenu_visible) {
+        split_submenu_rect = submenu_rect;
+        queueRounded(state, submenu_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(10.0));
+        queueBorder(state, submenu_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(10.0), theme.scaledUi(1.0));
+        y = submenu_rect.y + menu_pad_top;
+        const submenu_row_w = submenu_rect.w - menu_pad_x * 2.0;
+        for (rows) |row| {
+            y = renderContextMenuRow(state, pane_id, row.action, row.label, submenu_rect, menu_pad_x, y, submenu_row_w, row_h) + row_gap;
+        }
+    }
+}
+
+fn renderContextMenuStaticRow(
+    state: *runtime.AppState,
+    label: []const u8,
+    menu_rect: palette.Rect,
+    pad_x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    arrow: bool,
+) palette.Rect {
+    const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
+    const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (hovered) queueRounded(state, rect, paletteColor(colors.rgba(42, 50, 58, 255)), theme.scaledUi(5.0));
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
+        .w = @max(rect.w - theme.scaledUi(32.0), 1.0),
+        .h = theme.scaledUi(14.0),
+    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), menu_rect);
+    if (arrow) {
+        queueText(state, .{
+            .x = rect.x + rect.w - theme.scaledUi(20.0),
+            .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
+            .w = theme.scaledUi(12.0),
+            .h = theme.scaledUi(14.0),
+        }, ">", paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), menu_rect);
+    }
+    return rect;
+}
+
+fn renderContextMenuRow(
+    state: *runtime.AppState,
+    pane_id: runtime.WorkspacePaneId,
+    action: WorkspacePaneAction,
+    label: []const u8,
+    menu_rect: palette.Rect,
+    pad_x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) f32 {
+    const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
+    const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (hovered) {
+        queueRounded(state, rect, paletteColor(colors.rgba(42, 50, 58, 255)), theme.scaledUi(5.0));
+    }
+    const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(8.0),
+        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
+        .w = @max(rect.w - theme.scaledUi(16.0), 1.0),
+        .h = theme.scaledUi(14.0),
+    }, label, paletteColor(text_color), theme.scaledUi(12.0), menu_rect);
+    appendHit(.{ .pane_id = pane_id, .action = action, .rect = rect });
+    return rect.y + rect.h;
+}
+
+fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
+    const text = (chat_panel.transcriptMarkdownSelectionPlainText(state) catch {
+        state.setSidebarNotice("Failed to copy selection.");
+        return;
+    }) orelse {
+        state.setSidebarNotice("No transcript text selected.");
+        return;
+    };
+    defer state.allocator.free(text);
+    if (text.len == 0) {
+        state.setSidebarNotice("No transcript text selected.");
+        return;
+    }
+    const z = state.allocator.dupeZ(u8, text) catch {
+        state.setSidebarNotice("Failed to copy selection.");
+        return;
+    };
+    defer state.allocator.free(z);
+    sdl.setClipboardText(z) catch {
+        state.setSidebarNotice("Failed to copy selection.");
+        return;
+    };
+    state.setSidebarNotice("Copied selection.");
 }
 
 fn renderRestoreStrip(state: *runtime.AppState, rect: palette.Rect, minimized_count: usize) void {

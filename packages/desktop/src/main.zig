@@ -332,11 +332,12 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollCursorModelOptionsCache();
             }
         }.run, .{&state});
+        var send_needs_render = false;
         recordSpan(&frame_sample, .poll_send, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollSend();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollSend();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &send_needs_render });
         recordSpan(&frame_sample, .poll_browser, struct {
             fn run(app_state: *AppState) void {
                 app_state.pollBrowser();
@@ -376,7 +377,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -870,6 +871,22 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (handleBrowserSelectAllShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleBrowserCopyCutShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleBrowserClipboardShortcut(state, &event.key)) {
+                return true;
+            }
+            if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, &event.key)) {
+                return true;
+            }
             // Workspace pane shortcuts pre-empt the terminal handler so the
             // embedded terminal (and anything running inside it, like tmux)
             // can't swallow Alt-prefixed bindings.
@@ -915,10 +932,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleFontSizeShortcut(state, &event.key)) {
                 return true;
             }
-            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
-                syncWindowTextInput(window, state);
-                return true;
-            }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
@@ -926,6 +939,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (handlePendingThreadFollowupShortcut(state, &event.key)) {
+                return true;
+            }
+            if (handleWorkspaceContextMenuShortcut(state, &event.key)) {
                 return true;
             }
             if (handleComposerFocusShortcut(state, &event.key)) {
@@ -1165,6 +1181,50 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
     });
 }
 
+fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
+    if (event.scancode != .v and event.key != .v) return false;
+
+    const text = state.readClipboardTextForPaste() orelse return true;
+    defer state.allocator.free(text);
+    if (text.len == 0) return true;
+    _ = state.handleBrowserKey(.{
+        .key_code = 0,
+        .text = text,
+        .pressed = true,
+        .ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl),
+        .shift = isKeymodPressed(event.mod, sdl.Keymod.shift),
+        .alt = isKeymodPressed(event.mod, sdl.Keymod.alt),
+        .super = isKeymodPressed(event.mod, sdl.Keymod.gui),
+    });
+    return true;
+}
+
+fn handleBrowserSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
+    if (event.scancode != .a and event.key != .a) return false;
+    state.selectAllBrowserFocusedElement();
+    return true;
+}
+
+fn handleBrowserCopyCutShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.isBrowserPaneFocused()) return false;
+    if (!event.down or event.repeat) return false;
+    if (!isPrimaryModifierPressed(event.mod)) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.shift)) return false;
+    const copy = event.scancode == .c or event.key == .c;
+    const cut = event.scancode == .x or event.key == .x;
+    if (!copy and !cut) return false;
+    state.copyBrowserFocusedSelection(cut);
+    return true;
+}
+
 fn browserMouseMotionEvent(event: *const sdl.MouseMotionEvent) browser_runtime.MouseEvent {
     return .{
         .x = event.x,
@@ -1180,6 +1240,8 @@ fn browserMouseButtonEvent(event: *const sdl.MouseButtonEvent) browser_runtime.M
             1 => .left,
             2 => .middle,
             3 => .right,
+            4 => .back,
+            5 => .forward,
             else => null,
         },
         .pressed = event.down,
@@ -1300,6 +1362,21 @@ fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.Keybo
 
     state.queueOrSteerDraftDuringSend();
     return true;
+}
+
+fn handleWorkspaceContextMenuShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (event.scancode != .application and
+        !(event.scancode == .f10 and isKeymodPressed(event.mod, sdl.Keymod.shift)))
+    {
+        return false;
+    }
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui))
+    {
+        return false;
+    }
+    return workspace_panes_ui.openFocusedChatPaneContextMenu(state);
 }
 
 fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
