@@ -2,7 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const args = @import("cli_args.zig");
+const completion = @import("cli_completion.zig");
 const output = @import("cli_output.zig");
+const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 
@@ -45,6 +47,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try printCapabilities(allocator, out, parsed.json);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "completion")) {
+        try handleCompletion(allocator, out, parsed.rest);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "state")) {
         try handleState(allocator, out, parsed.rest);
         return .handled;
@@ -71,6 +77,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde --help                  Show this help
         \\  verde version [--json]        Print version metadata
         \\  verde capabilities [--json]   Print CLI capability metadata
+        \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
@@ -97,6 +104,11 @@ fn printHelp(out: output.Output) !void {
         \\  process list|inspect|start|stop|restart|logs ...
         \\  stack status|start|stop|restart ...
         \\
+        \\Completion shells:
+        \\  bash
+        \\  zsh
+        \\  fish
+        \\
     , .{});
 }
 
@@ -117,20 +129,10 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         .version = VERSION,
         .protocol_version = 1,
         .cli = .{
-            .state = &.{ "path", "projects", "panes", "threads", "transcript" },
-            .live = &.{
-                "status",         "capabilities",    "projects",       "panes",
-                "active",         "inspect",         "threads",        "terminals",
-                "processes",      "pane.focus",      "pane.split",     "pane.resize",
-                "pane.minimize",  "pane.maximize",   "pane.restore",   "pane.close",
-                "chat.status",    "chat.transcript", "chat.draft.set", "chat.draft.append",
-                "chat.send",      "chat.followup",   "chat.stop",      "chat.approve",
-                "terminal.write", "terminal.tail",   "terminal.screen", "process.list",
-                "process.inspect", "process.start",  "process.stop",   "process.restart",
-                "process.logs",   "stack.status",    "stack.start",    "stack.stop",
-                "stack.restart",
-            },
-            .encodings = &.{ "json", "jsonl" },
+            .state = spec.state_commands[0..],
+            .live = spec.live_capabilities[0..],
+            .completion = spec.shells[0..],
+            .encodings = spec.encodings[0..],
         },
         .ipc = .{
             .transport = "unix",
@@ -148,8 +150,38 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  protocol: 1
         \\  state: path, projects, panes, threads, transcript
         \\  live: status, projects, panes, pane control, chat control, terminal/process control
+        \\  completion: bash, zsh, fish
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
+        \\
+    , .{});
+}
+
+fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try printCompletionHelp(out);
+        return;
+    }
+    const shell = args.positional(argv, 0) orelse {
+        try out.stderr("missing completion shell; expected bash, zsh, or fish\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, shell, "help")) {
+        try printCompletionHelp(out);
+        return;
+    }
+    if (!try completion.print(allocator, out, shell)) {
+        try out.stderr("unsupported completion shell: {s}; expected bash, zsh, or fish\n", .{shell});
+        std.process.exit(2);
+    }
+}
+
+fn printCompletionHelp(out: output.Output) !void {
+    try out.stdout(
+        \\Usage:
+        \\  verde completion bash
+        \\  verde completion zsh
+        \\  verde completion fish
         \\
     , .{});
 }

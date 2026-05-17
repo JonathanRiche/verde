@@ -92,6 +92,7 @@ verde app                     # Launch the desktop app explicitly
 verde --help                  # Show CLI help
 verde version [--json]        # Print version metadata
 verde capabilities [--json]   # Print supported CLI/live features
+verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
 verde live <command>          # Control or inspect the running app
 ```
@@ -107,6 +108,39 @@ Use `--json` when scripting. Live IPC responses use a stable envelope:
 ```
 
 Errors return `ok: false` with an `error.code` and `error.message`.
+
+### Shell Completion
+
+`verde completion` prints static completion scripts for the supported shells.
+The generated completions cover command names, nested live-control commands,
+flags, and fixed flag values such as `--kind chat|terminal`,
+`--axis horizontal|vertical`, and `--decision approve|deny`.
+
+```bash
+verde completion bash
+verde completion zsh
+verde completion fish
+```
+
+Common install patterns:
+
+```bash
+# bash
+verde completion bash > ~/.local/share/bash-completion/completions/verde
+
+# zsh
+mkdir -p ~/.zfunc
+verde completion zsh > ~/.zfunc/_verde
+# Ensure ~/.zfunc is in fpath before compinit, for example:
+# fpath=(~/.zfunc $fpath)
+
+# fish
+verde completion fish > ~/.config/fish/completions/verde.fish
+```
+
+The first completion slice is intentionally static so tab completion stays fast
+and never depends on the desktop app being open. Dynamic project, pane, process,
+and thread completions can be layered on top of this later.
 
 ### Offline State Commands
 

@@ -39,6 +39,9 @@ Useful read-only checks:
 verde --help
 verde version --json
 verde capabilities --json
+verde completion bash
+verde completion zsh
+verde completion fish
 verde state path --json
 verde state projects --json
 verde state panes --project current --json
@@ -52,6 +55,14 @@ verde live threads --project current --json
 verde live terminals --project current --json
 verde live processes --json
 ```
+
+Shell completion is part of the CLI surface. Use `verde completion bash`,
+`verde completion zsh`, or `verde completion fish` to inspect the supported
+command tree from an agent shell. The completions are static by design: they
+complete commands, nested live-control groups, flags, and fixed values without
+requiring the desktop app or live socket. For automation, still use explicit
+commands with `--json`; completion output is a discovery aid, not an assertion
+format.
 
 Pane and terminal smoke test:
 
