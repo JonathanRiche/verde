@@ -9,8 +9,24 @@ const browser_runtime = @import("../browser/mod.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 
-// Nerd Font Symbols codicon-refresh.
+// Nerd Font Symbols codicon glyphs. Codepoints match the Microsoft Codicons
+// table (https://microsoft.github.io/vscode-codicons/dist/codicon.html) and
+// are present in SymbolsNerdFontMono-Regular.ttf.
+const NF_COD_ARROW_LEFT = "\u{EA9B}";
+const NF_COD_ARROW_RIGHT = "\u{EA9C}";
 const NF_COD_REFRESH = "\u{EB37}";
+const NF_COD_INSPECT = "\u{EBD1}";
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_CLOSE = "\u{EA76}";
+
+const TOOLBAR_HEIGHT: f32 = 52.0;
+const TOOLBAR_BUTTON_SIZE: f32 = 34.0;
+const TOOLBAR_BUTTON_RADIUS: f32 = 8.0;
+const TOOLBAR_ICON_SIZE: f32 = 15.0;
+const TOOLBAR_CHEVRON_SIZE: f32 = 11.0;
+const TOOLBAR_GAP: f32 = 6.0;
+const TOOLBAR_DROPDOWN_WIDTH: f32 = 20.0;
+const TOOLBAR_FIELD_MIN_WIDTH: f32 = 120.0;
 
 const BrowserHitKind = enum {
     address,
@@ -43,7 +59,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
 
-    const toolbar_height = theme.scaledUi(52.0);
+    const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
         .x = rect.x,
         .y = rect.y + toolbar_height,
@@ -289,12 +305,6 @@ fn queuePaletteRect(state: *app_state.AppState, rect: palette.Rect, color: palet
     };
 }
 
-fn queuePaletteTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color) void {
-    state.palette_overlay_batch.triangle(state.allocator, p0, p1, p2, color) catch |err| {
-        app_state.log.warn("failed to queue browser palette triangle: {s}", .{@errorName(err)});
-    };
-}
-
 fn queuePaletteBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
         app_state.log.warn("failed to queue browser palette border: {s}", .{@errorName(err)});
@@ -329,17 +339,23 @@ fn stablePaletteText(state: *app_state.AppState, value: []const u8) ![]const u8 
     return try state.palette_frame_text_arena.allocator().dupe(u8, value);
 }
 
-fn queuePaletteIcon(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color) void {
-    const stable_value = stablePaletteText(state, value) catch |err| {
+fn queuePaletteIcon(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    glyph: []const u8,
+    font_size: f32,
+    color: palette.Color,
+) void {
+    const stable_value = stablePaletteText(state, glyph) catch |err| {
         app_state.log.warn("failed to retain browser palette icon: {s}", .{@errorName(err)});
         return;
     };
     state.palette_overlay_batch.roleText(
         state.allocator,
-        rect,
+        snapRect(rect),
         stable_value,
         color,
-        rect.h * 0.92,
+        font_size,
         .icon,
         null,
         null,
@@ -348,148 +364,170 @@ fn queuePaletteIcon(state: *app_state.AppState, rect: palette.Rect, value: []con
     };
 }
 
-fn renderPaletteToolbarButton(
+fn snapRect(rect: palette.Rect) palette.Rect {
+    return .{ .x = @round(rect.x), .y = @round(rect.y), .w = @round(rect.w), .h = @round(rect.h) };
+}
+
+/// Centers a square `font_size`×`font_size` icon rect inside `button_rect`.
+fn iconRectForButton(button_rect: palette.Rect, font_size: f32) palette.Rect {
+    return .{
+        .x = button_rect.x + (button_rect.w - font_size) * 0.5,
+        .y = button_rect.y + (button_rect.h - font_size) * 0.5,
+        .w = font_size,
+        .h = font_size,
+    };
+}
+
+/// Renders a single icon toolbar button with consistent state styling. The
+/// caller controls the base color (so the accent refresh button can stay green
+/// while the neutral nav buttons share a single palette).
+fn renderToolbarIconButton(
     state: *app_state.AppState,
     rect: palette.Rect,
-    label: []const u8,
+    glyph: []const u8,
     base_color: [4]f32,
-    hover_color: [4]f32,
-    active_color: [4]f32,
-    text_color: [4]f32,
+    icon_color: [4]f32,
     hovered: bool,
-    active: bool,
+    disabled: bool,
 ) void {
-    const bg = if (active) active_color else if (hovered) hover_color else base_color;
-    const font_size = theme.scaledUi(14.0);
-    const label_width = @as(f32, @floatFromInt(label.len)) * font_size * 0.55;
-    queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(8.0));
-    queuePaletteText(state, .{
-        .x = rect.x + @max((rect.w - label_width) * 0.5, 0.0),
-        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
-        .w = rect.w,
-        .h = font_size * 1.25,
-    }, label, paletteColor(text_color), font_size, rect);
+    const bg = if (disabled)
+        theme.darken(base_color, 0.04)
+    else if (hovered)
+        theme.lighten(base_color, 0.10)
+    else
+        base_color;
+    queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
+    const icon_size = theme.scaledUi(TOOLBAR_ICON_SIZE);
+    queuePaletteIcon(state, iconRectForButton(rect, icon_size), glyph, icon_size, paletteColor(icon_color));
+}
+
+/// Renders the inspector toggle and its mode dropdown as a single split-button
+/// unit: one shared rounded background, a hairline divider, and per-segment
+/// hover pills. This avoids the visual mismatch of two abutting rounded rects.
+fn renderInspectorSplitButton(
+    state: *app_state.AppState,
+    inspect_rect: palette.Rect,
+    dropdown_rect: palette.Rect,
+    base_color: [4]f32,
+    icon_color: [4]f32,
+    inspect_hovered: bool,
+    dropdown_hovered: bool,
+    disabled: bool,
+) void {
+    const combined: palette.Rect = .{
+        .x = inspect_rect.x,
+        .y = inspect_rect.y,
+        .w = inspect_rect.w + dropdown_rect.w,
+        .h = inspect_rect.h,
+    };
+    const bg = if (disabled) theme.darken(base_color, 0.04) else base_color;
+    queuePaletteRoundedRect(state, combined, paletteColor(bg), theme.scaledUi(TOOLBAR_BUTTON_RADIUS));
+
+    if (!disabled and (inspect_hovered or dropdown_hovered)) {
+        const pill_inset = theme.scaledUi(2.0);
+        const pill_radius = theme.scaledUi(TOOLBAR_BUTTON_RADIUS - 2.0);
+        const hover_color = paletteColor(theme.lighten(base_color, 0.10));
+        const seg = if (inspect_hovered) inspect_rect else dropdown_rect;
+        queuePaletteRoundedRect(state, .{
+            .x = seg.x + pill_inset,
+            .y = seg.y + pill_inset,
+            .w = seg.w - pill_inset * 2.0,
+            .h = seg.h - pill_inset * 2.0,
+        }, hover_color, pill_radius);
+    }
+
+    // Hairline divider between the segments, inset vertically so it reads as
+    // a separator rather than a hard edge.
+    const divider_inset = theme.scaledUi(8.0);
+    queuePaletteRect(state, snapRect(.{
+        .x = dropdown_rect.x,
+        .y = inspect_rect.y + divider_inset,
+        .w = theme.scaledUi(1.0),
+        .h = inspect_rect.h - divider_inset * 2.0,
+    }), paletteColor(colors.rgba(0, 0, 0, 70)));
+
+    const icon_size = theme.scaledUi(TOOLBAR_ICON_SIZE);
+    queuePaletteIcon(state, iconRectForButton(inspect_rect, icon_size), NF_COD_INSPECT, icon_size, paletteColor(icon_color));
+    const chevron_size = theme.scaledUi(TOOLBAR_CHEVRON_SIZE);
+    queuePaletteIcon(state, iconRectForButton(dropdown_rect, chevron_size), NF_COD_CHEVRON_DOWN, chevron_size, paletteColor(icon_color));
 }
 
 /// Renders the compact browser toolbar with URL entry and primary actions.
 fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
-    const back_icon = "<";
-    const forward_icon = ">";
-    const close_icon = "x";
-    const toolbar_height = theme.scaledUi(52.0);
-    const button_size = theme.scaledUi(36.0);
-    const inspect_menu_button_width = theme.scaledUi(22.0);
+    const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
+    const button_size = theme.scaledUi(TOOLBAR_BUTTON_SIZE);
+    const dropdown_width = theme.scaledUi(TOOLBAR_DROPDOWN_WIDTH);
     const pad_x = theme.scaledUi(10.0);
-    const pad_y = theme.scaledUi(8.0);
+    const pad_y = (toolbar_height - button_size) * 0.5;
+    const gap = theme.scaledUi(TOOLBAR_GAP);
     const avail = @max(dock_rect.w - pad_x * 2.0, theme.scaledUi(180.0));
-    const gap = theme.scaledUi(8.0);
-    const field_width = @max(avail - button_size * 5.0 - inspect_menu_button_width - gap * 5.0, theme.scaledUi(180.0));
+
+    // Layout: [field] [back][fwd][refresh] [inspect|menu] [close]
+    // Five neutral buttons + one split button (= 1.5 button widths) + 5 gaps.
+    const buttons_width = button_size * 5.0 + (button_size + dropdown_width) + gap * 5.0;
+    const field_width = @max(avail - buttons_width, theme.scaledUi(TOOLBAR_FIELD_MIN_WIDTH));
+
     palette_toolbar_rect = .{ .x = dock_rect.x, .y = dock_rect.y, .w = dock_rect.w, .h = toolbar_height };
     queuePaletteRect(state, palette_toolbar_rect, paletteColor(colors.rgba(18, 20, 25, 255)));
 
-    const address_rect: palette.Rect = .{ .x = dock_rect.x + pad_x, .y = dock_rect.y + pad_y, .w = field_width, .h = button_size };
+    const address_rect: palette.Rect = .{
+        .x = dock_rect.x + pad_x,
+        .y = dock_rect.y + pad_y,
+        .w = field_width,
+        .h = button_size,
+    };
     renderPaletteAddressField(state, address_rect);
     addPaletteHit(address_rect, .address);
 
-    const back_rect: palette.Rect = .{ .x = address_rect.x + address_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderPaletteToolbarButton(
-        state,
-        back_rect,
-        back_icon,
-        theme.COLOR_PANEL_ALT,
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.08),
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.14),
-        theme.COLOR_WHITE,
-        rectHovered(back_rect),
-        false,
-    );
+    var cursor_x = address_rect.x + address_rect.w + gap;
+
+    const neutral_base = theme.COLOR_PANEL_ALT;
+    const neutral_icon = theme.COLOR_WHITE;
+
+    const back_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderToolbarIconButton(state, back_rect, NF_COD_ARROW_LEFT, neutral_base, neutral_icon, rectHovered(back_rect), false);
     addPaletteHit(back_rect, .back);
+    cursor_x += button_size + gap;
 
-    const forward_rect: palette.Rect = .{ .x = back_rect.x + back_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderPaletteToolbarButton(
-        state,
-        forward_rect,
-        forward_icon,
-        theme.COLOR_PANEL_ALT,
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.08),
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.14),
-        theme.COLOR_WHITE,
-        rectHovered(forward_rect),
-        false,
-    );
+    const forward_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderToolbarIconButton(state, forward_rect, NF_COD_ARROW_RIGHT, neutral_base, neutral_icon, rectHovered(forward_rect), false);
     addPaletteHit(forward_rect, .forward);
+    cursor_x += button_size + gap;
 
-    const navigate_rect: palette.Rect = .{ .x = forward_rect.x + forward_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderPaletteToolbarButton(
-        state,
-        navigate_rect,
-        "",
-        theme.COLOR_SECONDARY_GREEN,
-        theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.10),
-        theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10),
-        theme.COLOR_WHITE,
-        rectHovered(navigate_rect),
-        false,
-    );
-    queuePaletteIcon(state, centeredIconRect(navigate_rect), NF_COD_REFRESH, paletteColor(theme.COLOR_WHITE));
+    // Refresh / navigate: accent color signals the primary action in the row.
+    const navigate_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderToolbarIconButton(state, navigate_rect, NF_COD_REFRESH, theme.COLOR_SECONDARY_GREEN, theme.COLOR_WHITE, rectHovered(navigate_rect), false);
     addPaletteHit(navigate_rect, .navigate);
+    cursor_x += button_size + gap;
 
     const can_use_inspector = state.canUseBrowserInspector();
     const inspector_active = state.isBrowserInspectorEnabled();
     const inspector_mode = state.browserInspectorMode();
-    const inspector_button_color = if (inspector_active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT;
-    const inspector_hover_color = if (inspector_active) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.lighten(theme.COLOR_PANEL_ALT, 0.08);
-    const inspector_active_color = if (inspector_active) theme.darken(theme.COLOR_SECONDARY_GREEN, 0.10) else theme.lighten(theme.COLOR_PANEL_ALT, 0.14);
-    const inspect_rect: palette.Rect = .{ .x = navigate_rect.x + navigate_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderPaletteToolbarButton(
+    const inspector_base = if (inspector_active) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT;
+    const inspector_icon = if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
+
+    const inspect_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
+    const inspect_menu_rect: palette.Rect = .{ .x = inspect_rect.x + inspect_rect.w, .y = address_rect.y, .w = dropdown_width, .h = button_size };
+    renderInspectorSplitButton(
         state,
         inspect_rect,
-        "",
-        inspector_button_color,
-        inspector_hover_color,
-        inspector_active_color,
-        if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
-        can_use_inspector and rectHovered(inspect_rect),
-        false,
-    );
-    drawCursorIcon(state, centeredIconRect(inspect_rect), paletteColor(if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE));
-    addPaletteHit(inspect_rect, .inspect_toggle);
-
-    const inspect_menu_rect: palette.Rect = .{ .x = inspect_rect.x + inspect_rect.w, .y = address_rect.y, .w = inspect_menu_button_width, .h = button_size };
-    renderPaletteToolbarButton(
-        state,
         inspect_menu_rect,
-        "",
-        inspector_button_color,
-        inspector_hover_color,
-        inspector_active_color,
-        if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE,
+        inspector_base,
+        inspector_icon,
+        can_use_inspector and rectHovered(inspect_rect),
         can_use_inspector and rectHovered(inspect_menu_rect),
-        false,
+        !can_use_inspector,
     );
-    drawCaretDownIcon(
-        state,
-        centeredIconRect(inspect_menu_rect),
-        paletteColor(if (can_use_inspector) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE),
-    );
+    addPaletteHit(inspect_rect, .inspect_toggle);
     addPaletteHit(inspect_menu_rect, .inspect_mode_menu);
     if (!can_use_inspector) state.browser_inspector_menu_open = false;
     if (state.browser_inspector_menu_open) {
         renderInspectorModeMenu(state, inspect_menu_rect, inspector_mode);
     }
+    cursor_x = inspect_menu_rect.x + inspect_menu_rect.w + gap;
 
-    const close_rect: palette.Rect = .{ .x = inspect_menu_rect.x + inspect_menu_rect.w + gap, .y = address_rect.y, .w = button_size, .h = button_size };
-    renderPaletteToolbarButton(
-        state,
-        close_rect,
-        close_icon,
-        theme.COLOR_PANEL_ALT,
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.08),
-        theme.lighten(theme.COLOR_PANEL_ALT, 0.14),
-        theme.COLOR_WHITE,
-        rectHovered(close_rect),
-        false,
-    );
+    const close_rect: palette.Rect = .{ .x = cursor_x, .y = address_rect.y, .w = button_size, .h = button_size };
+    renderToolbarIconButton(state, close_rect, NF_COD_CLOSE, neutral_base, neutral_icon, rectHovered(close_rect), false);
     addPaletteHit(close_rect, .close);
 }
 
@@ -512,48 +550,6 @@ fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, ins
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Box", inspector_mode == .draw_box, .inspect_mode_draw_box);
     y += row_height;
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Draw Freeform", inspector_mode == .draw_freeform, .inspect_mode_draw_freeform);
-}
-
-fn centeredIconRect(rect: palette.Rect) palette.Rect {
-    const size = @min(rect.w, rect.h) * 0.54;
-    return .{
-        .x = rect.x + (rect.w - size) * 0.5,
-        .y = rect.y + (rect.h - size) * 0.5,
-        .w = size,
-        .h = size,
-    };
-}
-
-/// Small ▼ for the inspector mode split button (Unicode caret is often absent from the UI font).
-fn drawCaretDownIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const cx = rect.x + rect.w * 0.5;
-    const tip_y = rect.y + rect.h * 0.72;
-    const wing_y = rect.y + rect.h * 0.30;
-    const left_x = rect.x + rect.w * 0.20;
-    const right_x = rect.x + rect.w * 0.80;
-    queuePaletteTriangle(
-        state,
-        .{ .x = cx, .y = tip_y },
-        .{ .x = left_x, .y = wing_y },
-        .{ .x = right_x, .y = wing_y },
-        color,
-    );
-}
-
-fn drawCursorIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
-    const points = [_]palette.draw.Vec2{
-        .{ .x = rect.x + rect.w * 0.16, .y = rect.y + rect.h * 0.06 },
-        .{ .x = rect.x + rect.w * 0.16, .y = rect.y + rect.h * 0.88 },
-        .{ .x = rect.x + rect.w * 0.42, .y = rect.y + rect.h * 0.64 },
-        .{ .x = rect.x + rect.w * 0.58, .y = rect.y + rect.h * 0.96 },
-        .{ .x = rect.x + rect.w * 0.74, .y = rect.y + rect.h * 0.88 },
-        .{ .x = rect.x + rect.w * 0.58, .y = rect.y + rect.h * 0.58 },
-        .{ .x = rect.x + rect.w * 0.88, .y = rect.y + rect.h * 0.58 },
-    };
-    queuePaletteTriangle(state, points[0], points[1], points[2], color);
-    queuePaletteTriangle(state, points[0], points[2], points[6], color);
-    queuePaletteTriangle(state, points[2], points[3], points[4], color);
-    queuePaletteTriangle(state, points[2], points[4], points[5], color);
 }
 
 fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, label: []const u8, selected: bool, kind: BrowserHitKind) void {
