@@ -7,6 +7,7 @@ const theme = @import("theme.zig");
 const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
 const utils = @import("../utils.zig");
+const profiler = @import("../profiler.zig");
 const native_state = @import("../state.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const Provider = native_state.Provider;
@@ -55,20 +56,23 @@ var sidebar_max_scroll_y: f32 = 0.0;
 
 const SidebarContextMenuAction = enum {
     project_new_chat,
+    project_open_terminal,
     project_rename,
     project_import_codex,
     project_import_opencode,
     project_import_claude,
     project_archive,
+    thread_open_tui,
+    thread_open_chat,
     thread_sync,
     thread_archive,
 };
 
 var sidebar_menu_panel_rect: palette.Rect = .{};
-var sidebar_menu_row_rects: [8]palette.Rect = undefined;
-var sidebar_menu_row_actions: [8]SidebarContextMenuAction = undefined;
-var sidebar_menu_row_enabled: [8]bool = undefined;
-var sidebar_menu_row_labels: [8][]const u8 = undefined;
+var sidebar_menu_row_rects: [16]palette.Rect = undefined;
+var sidebar_menu_row_actions: [16]SidebarContextMenuAction = undefined;
+var sidebar_menu_row_enabled: [16]bool = undefined;
+var sidebar_menu_row_labels: [16][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
 
 const ThreadDragState = struct {
@@ -399,11 +403,14 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .project_new_chat => {
                     if (pi < state.projects.items.len) state.createThreadForProject(pi);
                 },
+                .project_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
                 .project_rename => state.beginProjectRename(pi),
                 .project_import_codex => state.beginThreadImport(pi, .codex),
                 .project_import_opencode => state.beginThreadImport(pi, .opencode),
                 .project_import_claude => state.beginThreadImport(pi, .claude),
                 .project_archive => state.archiveProjectAtIndex(pi),
+                .thread_open_tui => state.openThreadInTui(pi, ti),
+                .thread_open_chat => state.openThreadInChat(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
                 .thread_archive => state.archiveThreadAtIndex(pi, ti),
             }
@@ -427,6 +434,15 @@ fn appendSidebarContextMenuRow(action: SidebarContextMenuAction, enabled: bool, 
     sidebar_menu_row_count += 1;
 }
 
+fn openTuiLabel(provider: Provider) []const u8 {
+    return switch (provider) {
+        .codex => "Open in TUI: Codex",
+        .opencode => "Open in TUI: OpenCode",
+        .claude => "Open in TUI: Claude",
+        .cursor => "Open in TUI: Cursor",
+    };
+}
+
 fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect) void {
     if (!state.sidebar_context_menu_open) return;
 
@@ -442,6 +458,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .project => {
             const pi = state.sidebar_context_menu_project_index;
             appendSidebarContextMenuRow(.project_new_chat, true, "Start a new chat");
+            appendSidebarContextMenuRow(.project_open_terminal, pi < state.projects.items.len, "Open terminal");
             appendSidebarContextMenuRow(.project_rename, true, "Rename project");
             appendSidebarContextMenuRow(.project_import_codex, true, "Import Codex thread");
             appendSidebarContextMenuRow(.project_import_opencode, true, "Import OpenCode thread");
@@ -462,15 +479,24 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
             const ti = state.sidebar_context_menu_thread_index;
             var can_sync = false;
             var can_archive = true;
+            var provider: Provider = .opencode;
+            var in_tui = false;
             if (pi < state.projects.items.len) {
                 const proj = state.projects.items[pi];
                 if (ti < proj.threads.items.len) {
                     const th = proj.threads.items[ti];
                     can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
                     can_archive = !th.isSendPendingForUi();
+                    provider = th.provider;
+                    in_tui = th.tui_dock_id != null;
                 }
             }
             appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
+            if (in_tui) {
+                appendSidebarContextMenuRow(.thread_open_chat, true, "Open as chat");
+            } else {
+                appendSidebarContextMenuRow(.thread_open_tui, can_sync, openTuiLabel(provider));
+            }
             appendSidebarContextMenuRow(.thread_archive, can_archive, "Archive thread");
         },
     }
@@ -728,18 +754,37 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
     var title_buf = std.mem.zeroes([64:0]u8);
     const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
-    const row_label = truncatedThreadTitle(&title_buf, thread.title, title_chars);
+    const running = thread.isSendPendingForUi();
+    const title = truncatedThreadTitle(&title_buf, thread.title, title_chars);
+    var tui_title_buf: [72]u8 = undefined;
+    const row_label = if (running)
+        "Working..."
+    else if (thread.tui_dock_id != null)
+        std.fmt.bufPrint(&tui_title_buf, "TUI: {s}", .{title}) catch title
+    else
+        title;
 
     const title_emphasis = selected or hovered;
     const title_font = theme.scaledUi(13.5);
     const title_line = title_font * 1.30;
     const title_y = @round(rect.y + (rect.h - title_line) * 0.5);
+    const pulse = if (running)
+        0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
+    else
+        0.0;
+    const mix_t = pulse * 0.35;
+    const running_color = [4]f32{
+        theme.COLOR_SECONDARY_GREEN[0] + (theme.COLOR_WHITE[0] - theme.COLOR_SECONDARY_GREEN[0]) * mix_t,
+        theme.COLOR_SECONDARY_GREEN[1] + (theme.COLOR_WHITE[1] - theme.COLOR_SECONDARY_GREEN[1]) * mix_t,
+        theme.COLOR_SECONDARY_GREEN[2] + (theme.COLOR_WHITE[2] - theme.COLOR_SECONDARY_GREEN[2]) * mix_t,
+        1.0,
+    };
     queuePaletteText(state, .{
         .x = rect.x + theme.scaledUi(title_left_css),
         .y = title_y,
         .w = rect.w - theme.scaledUi(title_area_right_css),
         .h = title_line,
-    }, row_label, paletteColor(if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
+    }, row_label, paletteColor(if (running) running_color else if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
     queuePaletteText(state, .{
         .x = rect.x + rect.w - theme.scaledUi(60.0),
         .y = title_y,
