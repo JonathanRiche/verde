@@ -57,9 +57,10 @@ Keep the CEF SDK in a persistent directory such as `$HOME/.cache/verde/cef-sdk`;
 
 ## Embedded Terminal
 
-The desktop shell includes a bottom-docked embedded terminal powered by Ghostty's `libghostty-vt`.
+The desktop shell includes embedded terminal panes powered by Ghostty's `libghostty-vt`.
 
-- Toggle it with `CommandOrControl+J`.
+- Create a terminal pane with `CommandOrControl+Shift+T`.
+- Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
 - It starts in the selected project's directory.
 - `Ctrl+-` and `Ctrl+=` adjust only the terminal font scale while the terminal is focused.
 
@@ -104,19 +105,23 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
     "sidebar_hidden": "Alt+B",
     "browser": "Ctrl+B",
     "workspace": {
-      "split_terminal_horizontal": "CommandOrControl+Shift+T"
+      "split_terminal_horizontal": "CommandOrControl+Shift+T",
+      "focus_up": ["Alt+Up", "Ctrl+K"],
+      "focus_down": ["Alt+Down", "Ctrl+J"],
+      "focus_left": ["Alt+Left", "Ctrl+H"],
+      "focus_right": ["Alt+Right", "Ctrl+L"]
     },
     "terminal": {
-      "toggle": "CommandOrControl+J",
+      "toggle": null,
       "new_tab": "CommandOrControl+Alt+T",
       "close": "CommandOrControl+Shift+W",
       "rename_tab": "CommandOrControl+Shift+R",
       "tab_previous": "CommandOrControl+Shift+PageUp",
       "tab_next": "CommandOrControl+Shift+PageDown",
-      "split_up": "CommandOrControl+Shift+Up",
-      "split_down": ["CommandOrControl+Shift+E", "CommandOrControl+Shift+Down"],
-      "split_left": "CommandOrControl+Shift+Left",
-      "split_right": ["CommandOrControl+Shift+O", "CommandOrControl+Shift+Right"],
+      "split_up": null,
+      "split_down": null,
+      "split_left": null,
+      "split_right": null,
       "focus_up": "CommandOrControl+Alt+Up",
       "focus_down": "CommandOrControl+Alt+Down",
       "focus_left": "CommandOrControl+Alt+Left",
