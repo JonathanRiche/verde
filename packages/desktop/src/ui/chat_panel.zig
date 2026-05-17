@@ -95,6 +95,23 @@ const WorkspaceHeaderHitCache = struct {
 
 var workspace_header_hits: WorkspaceHeaderHitCache = .{};
 
+const ProcessDashboardAction = enum {
+    start,
+    stop,
+    restart,
+    focus,
+};
+
+const ProcessDashboardHit = struct {
+    rect: palette.Rect = .{},
+    process_index: usize = 0,
+    action: ProcessDashboardAction = .focus,
+};
+
+const MAX_PROCESS_DASHBOARD_HITS = 64;
+var process_dashboard_hit_count: usize = 0;
+var process_dashboard_hits: [MAX_PROCESS_DASHBOARD_HITS]ProcessDashboardHit = [_]ProcessDashboardHit{.{}} ** MAX_PROCESS_DASHBOARD_HITS;
+
 pub fn renderWorkspace(state: *app_state.AppState, width: f32, height: f32) void {
     renderWorkspaceAt(state, .{ .x = estimateWorkspaceOriginX(state, width), .y = 0.0, .w = width, .h = height });
 }
@@ -135,6 +152,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
 
     state.invalidateComposerToolbarOverlayHitRects();
     file_search_hits = .{};
+    process_dashboard_hit_count = 0;
     if (pane_id == null) transcript_hit_count = 0;
     queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
     if (state.projects.items.len == 0) {
@@ -176,11 +194,21 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         .w = rect.w,
         .h = @max(composer_y - (header.y + header.h) - attachment_reserve, theme.scaledUi(120.0)),
     };
+    const process_strip_height = if (pane_id == null and state.currentProject().managed_processes.items.len > 0)
+        theme.scaledUi(52.0)
+    else
+        0.0;
+    const transcript_body = if (process_strip_height > 0.0) palette.Rect{
+        .x = body.x,
+        .y = body.y + process_strip_height,
+        .w = body.w,
+        .h = @max(body.h - process_strip_height, theme.scaledUi(96.0)),
+    } else body;
 
-    const split_chat_browser = state.isBrowserVisible() and body.w >= theme.scaledUi(900.0);
-    const browser_width = if (split_chat_browser) state.browserPanelWidth(body.w) else 0.0;
-    const composer_lane_w = if (split_chat_browser) body.w - browser_width else body.w;
-    const composer_lane_x = body.x;
+    const split_chat_browser = state.isBrowserVisible() and transcript_body.w >= theme.scaledUi(900.0);
+    const browser_width = if (split_chat_browser) state.browserPanelWidth(transcript_body.w) else 0.0;
+    const composer_lane_w = if (split_chat_browser) transcript_body.w - browser_width else transcript_body.w;
+    const composer_lane_x = transcript_body.x;
 
     const composer_width = @max(theme.scaledUi(220.0), @min(composer_lane_w - side_margin * 2.0, theme.scaledUi(980.0)));
     const composer_rect = palette.Rect{
@@ -191,19 +219,28 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     };
 
     if (split_chat_browser) {
-        const chat_rect = palette.Rect{ .x = body.x, .y = body.y, .w = body.w - browser_width, .h = body.h };
+        const chat_rect = palette.Rect{ .x = transcript_body.x, .y = transcript_body.y, .w = transcript_body.w - browser_width, .h = transcript_body.h };
         renderTranscript(state, chat_rect, pane_id);
         // Transcript uses only `body` (above composer). The browser column is empty to the right of the
         // composer, so extend the dock through that strip to the same bottom as the composer row.
-        const browser_dock_h = composer_bottom - body.y;
+        const browser_dock_h = composer_bottom - transcript_body.y;
         browser_panel.renderDockAt(state, .{
             .x = chat_rect.x + chat_rect.w,
-            .y = body.y,
+            .y = transcript_body.y,
             .w = browser_width,
             .h = @max(browser_dock_h, theme.scaledUi(120.0)),
         });
     } else {
-        renderTranscript(state, body, pane_id);
+        renderTranscript(state, transcript_body, pane_id);
+    }
+
+    if (process_strip_height > 0.0) {
+        renderProcessDashboard(state, .{
+            .x = body.x + side_margin,
+            .y = body.y + theme.scaledUi(6.0),
+            .w = @max(body.w - side_margin * 2.0, theme.scaledUi(220.0)),
+            .h = process_strip_height - theme.scaledUi(10.0),
+        });
     }
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
@@ -238,6 +275,29 @@ fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f3
 pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
     if (state.projects.items.len == 0) return false;
+
+    var process_hit_index: usize = 0;
+    while (process_hit_index < process_dashboard_hit_count) : (process_hit_index += 1) {
+        const hit = process_dashboard_hits[process_hit_index];
+        if (!rectContains(hit.rect, x, y)) continue;
+        if (hit.process_index >= state.currentProject().managed_processes.items.len) return true;
+        const name = state.currentProject().managed_processes.items[hit.process_index].name;
+        const project_index = state.selected_project_index;
+        const applied = switch (hit.action) {
+            .start => state.startManagedProcess(project_index, name),
+            .stop => state.stopManagedProcess(project_index, name),
+            .restart => state.restartManagedProcess(project_index, name),
+            .focus => state.focusManagedProcessTerminal(project_index, name),
+        } catch |err| {
+            state.setSidebarNotice(@errorName(err));
+            return true;
+        };
+        if (!applied) state.setSidebarNotice("Process not found.");
+        state.workspace_header_open_menu_open = false;
+        state.blurPaletteComposer();
+        state.noteInteraction();
+        return true;
+    }
 
     if (state.workspace_header_open_menu_open and rectContains(workspace_header_hits.menu_panel_rect, x, y)) {
         var i: usize = 0;
@@ -1140,6 +1200,96 @@ fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(38.0) }, "No projects yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(28.0), rect);
     y += theme.scaledUi(42.0);
     queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the project rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
+}
+
+fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
+    if (state.projects.items.len == 0) return;
+    const project = state.currentProject();
+    if (project.managed_processes.items.len == 0) return;
+
+    const clip = snapRect(rect);
+    queuePanel(state, rect, paletteColor(colors.rgba(20, 28, 30, 232)), paletteColor(colors.rgba(64, 78, 84, 180)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+    queueChromeLabel(state, .{
+        .x = rect.x + theme.scaledUi(12.0),
+        .y = rect.y + theme.scaledUi(10.0),
+        .w = theme.scaledUi(92.0),
+        .h = theme.scaledUi(22.0),
+    }, "Stack", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), clip);
+
+    var x = rect.x + theme.scaledUi(76.0);
+    const row_y = rect.y + theme.scaledUi(7.0);
+    const max_items = @min(project.managed_processes.items.len, 5);
+    for (project.managed_processes.items[0..max_items], 0..) |process, process_index| {
+        const item_w = theme.clampf(rect.w * 0.18, theme.scaledUi(120.0), theme.scaledUi(190.0));
+        if (x + item_w > rect.x + rect.w - theme.scaledUi(8.0)) break;
+        const item = palette.Rect{ .x = x, .y = row_y, .w = item_w, .h = rect.h - theme.scaledUi(14.0) };
+        queueRounded(state, item, paletteColor(colors.rgba(13, 18, 19, 210)), theme.scaledUi(5.0));
+        const dot = palette.Rect{ .x = item.x + theme.scaledUi(9.0), .y = item.y + theme.scaledUi(12.0), .w = theme.scaledUi(8.0), .h = theme.scaledUi(8.0) };
+        queueRounded(state, dot, managedProcessStatusColor(process.status), theme.scaledUi(4.0));
+        queueChromeLabel(state, .{
+            .x = item.x + theme.scaledUi(24.0),
+            .y = item.y + theme.scaledUi(5.0),
+            .w = @max(item.w - theme.scaledUi(108.0), theme.scaledUi(44.0)),
+            .h = theme.scaledUi(18.0),
+        }, process.name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), clip);
+        var detail_buffer: [96]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buffer, "{s} · {s}", .{ @tagName(process.kind), @tagName(process.status) }) catch @tagName(process.status);
+        queueChromeLabel(state, .{
+            .x = item.x + theme.scaledUi(24.0),
+            .y = item.y + theme.scaledUi(23.0),
+            .w = @max(item.w - theme.scaledUi(108.0), theme.scaledUi(44.0)),
+            .h = theme.scaledUi(16.0),
+        }, detail, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), clip);
+        const button_w = theme.scaledUi(20.0);
+        const button_h = theme.scaledUi(20.0);
+        const button_gap = theme.scaledUi(4.0);
+        var bx = item.x + item.w - theme.scaledUi(10.0) - button_w;
+        const by = item.y + (item.h - button_h) * 0.5;
+        renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, ">", process_index, .focus, clip);
+        bx -= button_w + button_gap;
+        renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "R", process_index, .restart, clip);
+        bx -= button_w + button_gap;
+        if (process.status == .running or process.status == .starting or process.status == .restarting) {
+            renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "X", process_index, .stop, clip);
+        } else {
+            renderProcessDashboardButton(state, .{ .x = bx, .y = by, .w = button_w, .h = button_h }, "S", process_index, .start, clip);
+        }
+        x += item_w + theme.scaledUi(8.0);
+    }
+
+    if (project.managed_processes.items.len > max_items) {
+        var more_buffer: [32]u8 = undefined;
+        const more = std.fmt.bufPrint(&more_buffer, "+{d}", .{project.managed_processes.items.len - max_items}) catch "+";
+        queueChromeLabel(state, .{
+            .x = rect.x + rect.w - theme.scaledUi(42.0),
+            .y = rect.y + theme.scaledUi(15.0),
+            .w = theme.scaledUi(32.0),
+            .h = theme.scaledUi(18.0),
+        }, more, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+    }
+}
+
+fn renderProcessDashboardButton(state: *app_state.AppState, rect: palette.Rect, label: []const u8, process_index: usize, action: ProcessDashboardAction, clip: palette.Rect) void {
+    queueRounded(state, rect, paletteColor(colors.rgba(34, 43, 47, 230)), theme.scaledUi(4.0));
+    queueChromeLabel(state, .{
+        .x = rect.x,
+        .y = rect.y + theme.scaledUi(2.0),
+        .w = rect.w,
+        .h = rect.h - theme.scaledUi(4.0),
+    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(11.0), clip);
+    if (process_dashboard_hit_count < process_dashboard_hits.len) {
+        process_dashboard_hits[process_dashboard_hit_count] = .{ .rect = rect, .process_index = process_index, .action = action };
+        process_dashboard_hit_count += 1;
+    }
+}
+
+fn managedProcessStatusColor(status: app_state.ManagedProcessStatus) palette.Color {
+    return paletteColor(switch (status) {
+        .running => colors.rgba(80, 200, 120, 255),
+        .starting, .restarting => colors.rgba(236, 178, 70, 255),
+        .crashed => colors.rgba(228, 84, 84, 255),
+        .stopped => colors.rgba(125, 139, 145, 255),
+    });
 }
 
 /// While the current thread is streaming, keep `transcript_auto_follow_pending` on when the viewport

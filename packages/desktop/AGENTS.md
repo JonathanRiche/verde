@@ -12,6 +12,94 @@ zigdoc ghostty-vt.Terminal
 zigdoc vaxis.Window
 ```
 
+Use the repository `mise` tasks for desktop build/run verification:
+
+- `mise run build` for installable ReleaseSafe builds.
+- `mise run dev` for launching the desktop app during manual/live testing.
+
+Do not run `zig build`, `zig build run`, or the generated desktop binary directly for normal verification unless the user explicitly asks for a lower-level build command.
+
+## CLI And Live-Control Testing
+
+Use the new CLI surface to smoke-test Verde behavior from another shell while the desktop app is running.
+
+Basic workflow:
+
+1. Build/install the CLI with `mise run build`.
+2. Start the app with `mise run dev` and keep that process running.
+3. Wait until `verde live status --json` returns `ok: true`; exit code `3` means the app or live socket is not ready yet.
+4. Use `verde live active --json` or `verde live panes --project current --json` to find workspace pane IDs.
+5. Prefer `--json` for scripts and assertions. Use `jq` if available, but keep commands readable when reporting results.
+6. Close any test panes you create with `verde live pane close --pane <id> --json`.
+7. Stop the `mise run dev` app when verification is complete, then confirm no dev app process is still running.
+
+Useful read-only checks:
+
+```bash
+verde --help
+verde version --json
+verde capabilities --json
+verde completion bash
+verde completion zsh
+verde completion fish
+verde state path --json
+verde state projects --json
+verde state panes --project current --json
+verde state threads --project current --json
+verde live capabilities --json
+verde live status --json
+verde live projects --json
+verde live active --json
+verde live panes --project current --json
+verde live threads --project current --json
+verde live terminals --project current --json
+verde live processes --json
+```
+
+Shell completion is part of the CLI surface. Use `verde completion bash`,
+`verde completion zsh`, or `verde completion fish` to inspect the supported
+command tree from an agent shell. The completions are static by design: they
+complete commands, nested live-control groups, flags, and fixed values without
+requiring the desktop app or live socket. For automation, still use explicit
+commands with `--json`; completion output is a discovery aid, not an assertion
+format.
+
+Pane and terminal smoke test:
+
+```bash
+verde live pane split --pane <chat-pane-id> --kind terminal --axis vertical --json
+verde live terminal write --pane <terminal-pane-id> --text $'printf "verde-cli-smoke\\n"\r' --json
+verde live process inspect --pane <terminal-pane-id> --json
+verde live pane close --pane <terminal-pane-id> --json
+```
+
+Chat smoke test, only when it is acceptable to create a real thread/send:
+
+```bash
+verde live pane split --pane <chat-pane-id> --kind chat --axis horizontal --json
+verde live chat draft set --pane <new-chat-pane-id> --text "Reply with exactly: verde-live-smoke" --json
+verde live chat send --pane <new-chat-pane-id> --json
+verde live chat status --pane <new-chat-pane-id> --json
+verde live chat transcript --pane <new-chat-pane-id> --json
+verde live pane close --pane <new-chat-pane-id> --json
+```
+
+Selector rules:
+
+- Use `--pane <id>` for deterministic tests.
+- Use `--focused` only for interactive smoke tests where focus is part of what you are testing.
+- Use `--project current` unless the test intentionally targets another project by index, id, or path.
+- Chat commands require a chat workspace pane. Terminal commands require a terminal workspace pane.
+
+Expected exit codes:
+
+- `0`: CLI command parsed and, for live commands, received a live response.
+- `1`: command failed after argument parsing.
+- `2`: invalid CLI arguments.
+- `3`: live server is not running or not ready.
+- `4`: project/thread target not found for offline state commands.
+- Live IPC application errors are returned as JSON with `ok: false`; scripts must check the response body, not only the process exit code. Common `error.code` values are `not_found`, `invalid_target`, `rejected`, `unsupported`, and `method_not_found`.
+
 ## Common Zig Patterns
 
 These patterns reflect current Zig APIs and may differ from older documentation.
