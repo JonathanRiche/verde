@@ -78,6 +78,210 @@ Common tasks:
 - `mise run build`: creates a local release-style build for the current platform.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
 
+## CLI And Live Control
+
+`verde` is both the desktop launcher and a CLI for reading persisted state or
+controlling a running desktop app. CLI-only commands run before SDL startup, so
+they can be used from scripts without opening a window.
+
+Top-level commands:
+
+```bash
+verde                         # Launch the desktop app
+verde app                     # Launch the desktop app explicitly
+verde --help                  # Show CLI help
+verde version [--json]        # Print version metadata
+verde capabilities [--json]   # Print supported CLI/live features
+verde completion <shell>      # Print shell completion script
+verde state <command>         # Read persisted state while the app is closed
+verde live <command>          # Control or inspect the running app
+```
+
+Use `--json` when scripting. Live IPC responses use a stable envelope:
+
+```json
+{
+  "id": 1,
+  "ok": true,
+  "result": {}
+}
+```
+
+Errors return `ok: false` with an `error.code` and `error.message`.
+
+### Shell Completion
+
+`verde completion` prints static completion scripts for the supported shells.
+The generated completions cover command names, nested live-control commands,
+flags, and fixed flag values such as `--kind chat|terminal`,
+`--axis horizontal|vertical`, and `--decision approve|deny`.
+
+```bash
+verde completion bash
+verde completion zsh
+verde completion fish
+```
+
+Common install patterns:
+
+```bash
+# bash
+verde completion bash > ~/.local/share/bash-completion/completions/verde
+
+# zsh
+mkdir -p ~/.zfunc
+verde completion zsh > ~/.zfunc/_verde
+# Ensure ~/.zfunc is in fpath before compinit, for example:
+# fpath=(~/.zfunc $fpath)
+
+# fish
+verde completion fish > ~/.config/fish/completions/verde.fish
+```
+
+The first completion slice is intentionally static so tab completion stays fast
+and never depends on the desktop app being open. Dynamic project, pane, process,
+and thread completions can be layered on top of this later.
+
+### Offline State Commands
+
+State commands read Verde's persisted SQLite state and do not require the app to
+be running.
+
+```bash
+verde state path [--json]
+verde state projects [--json]
+verde state panes --project <id|index|path|current> [--json]
+verde state threads --project <id|index|path|current> [--json]
+verde state transcript --project <id|index|path|current> --thread <index|provider-id> [--json]
+```
+
+- `path` prints the SDL pref path and `state.sqlite` location.
+- `projects` lists imported projects and the selected project.
+- `panes` prints the saved workspace layout and terminal dock state for a
+  project.
+- `threads` lists saved chat threads for a project.
+- `transcript` prints one saved chat transcript by thread index or provider
+  thread id.
+
+### Live Discovery Commands
+
+Live commands talk to the running desktop app over a current-user Unix socket at
+Verde's SDL pref path. Start the app normally first, for example with `verde` or
+from source with `mise run dev`.
+
+```bash
+verde live capabilities [--json]
+verde live status [--json]
+verde live projects [--json]
+verde live active [--json]
+verde live panes [--project <id|index|path|current>] [--json]
+verde live threads [--project <id|index|path|current>] [--json]
+verde live terminals [--project <id|index|path|current>] [--json]
+verde live processes [--json]
+verde live inspect --pane <pane-id> [--project <id|index|path|current>] [--json]
+verde live inspect --focused [--json]
+```
+
+- `capabilities` prints the live method list without requiring the app to be
+  running.
+- `status` returns protocol version, app pid, selected project, focused pane,
+  current pane graph, and terminal/process summary.
+- `projects` lists live projects.
+- `active` returns the current project and focused pane.
+- `panes`, `threads`, and `terminals` inspect one project.
+- `processes` returns the terminal-pane process graph currently available to
+  Verde.
+- `inspect` returns details for a specific pane or the focused pane.
+
+### Pane Control
+
+Workspace panes are the primary live-control target. Most commands return the
+updated pane graph so scripts can keep using the returned pane IDs.
+
+```bash
+verde live pane focus --pane <pane-id> [--project <id|index|path|current>] [--json]
+verde live pane focus --focused [--json]
+verde live pane split --pane <pane-id> --kind chat --axis horizontal [--json]
+verde live pane split --pane <pane-id> --kind terminal --axis vertical [--json]
+verde live pane resize --pane <pane-id> --first <pane-id> --second <pane-id> --axis horizontal --ratio 0.6 [--json]
+verde live pane minimize --pane <pane-id> [--json]
+verde live pane maximize --pane <pane-id> [--json]
+verde live pane restore --pane <pane-id> [--json]
+verde live pane close --pane <pane-id> [--json]
+```
+
+- `split` creates a chat or terminal workspace pane next to the target pane.
+  `--kind` accepts `chat` or `terminal`; `--axis` accepts `horizontal` or
+  `vertical`.
+- `resize` updates the split ratio between two sibling panes. `--ratio` is a
+  floating-point value such as `0.6`.
+- `minimize`, `maximize`, `restore`, and `close` match the pane header actions
+  in the UI.
+
+### Chat Control
+
+Chat commands resolve the target pane to its backing chat thread. They use the
+same draft, composer, send, stop, and approval paths as the UI.
+
+```bash
+verde live chat status --pane <pane-id> [--json]
+verde live chat status --focused [--json]
+verde live chat transcript --pane <pane-id> [--json]
+verde live chat draft set --pane <pane-id> --text "explain this failure" [--json]
+verde live chat draft append --pane <pane-id> --text "more detail" [--json]
+verde live chat send --pane <pane-id> --prompt "run the tests and fix failures" [--json]
+verde live chat send --pane <pane-id> "run the tests and fix failures" [--json]
+verde live chat followup --pane <pane-id> --prompt "then update docs" [--json]
+verde live chat stop --pane <pane-id> [--json]
+verde live chat approve --pane <pane-id> --decision approve [--json]
+verde live chat approve --pane <pane-id> --decision deny [--json]
+```
+
+- `status` returns thread title, provider, model, message count, send state, and
+  pending approval status.
+- `transcript` returns persisted messages for the pane's thread.
+- `draft set` replaces the current draft; `draft append` appends to it.
+- `send` sends `--prompt`, `--text`, or a trailing prompt argument. If no prompt
+  is supplied, it sends the current draft.
+- `followup` queues or steers a prompt while a send is active.
+- `stop` aborts the current send for that chat thread.
+- `approve` resolves the current pending approval. `--decision` accepts
+  `approve` or `deny`; `--call <id>` is accepted for future call-id targeting.
+
+### Terminal And Process Control
+
+Terminal commands resolve the target workspace pane to its terminal dock and
+write through the same active PTY input path as the UI.
+
+```bash
+verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
+verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
+verde live process inspect --pane <pane-id> [--json]
+verde live process inspect --focused [--json]
+```
+
+- `terminal write` sends text to the active terminal tab/pane. Include `\r` when
+  you want to submit a shell command.
+- `process inspect` currently returns the same pane/terminal details as
+  `inspect` for a terminal pane. Process spawn, restart, and rename are reserved
+  for a later slice.
+
+### Selectors And Exit Codes
+
+- Use `--pane <id>` for deterministic automation.
+- Use `--focused` for interactive smoke tests.
+- Use `--project current` for the selected project, or pass a project index, id,
+  or path.
+- Chat commands require a chat pane. Terminal commands require a terminal pane.
+- Exit `0` means the CLI command parsed and, for live commands, received a live
+  response. Scripts should still check the JSON envelope's `ok` field.
+- Exit `1` means command failure before a structured live response, `2` invalid
+  arguments, `3` live server not running, and `4` offline state target not
+  found.
+- Live IPC request failures return JSON error codes such as `not_found`,
+  `invalid_request`, `invalid_target`, `rejected`, `unsupported`, or
+  `method_not_found`.
+
 ## Provider Notes
 
 - Codex threads use the local `codex` CLI and start `codex app-server` automatically when needed.

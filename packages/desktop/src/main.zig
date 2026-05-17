@@ -11,6 +11,8 @@ const app_config = @import("config.zig");
 const browser_runtime = @import("browser/mod.zig");
 const browser_texture = @import("browser/texture.zig");
 const chat_threads = @import("chat/threads.zig");
+const cli = @import("cli.zig");
+const live_ipc = @import("ipc/server.zig");
 const keybinds = @import("keybinds.zig");
 const profiler = @import("profiler.zig");
 const runtime_log = @import("runtime_log.zig");
@@ -120,6 +122,11 @@ fn mainInner(init: std.process.Init) !void {
         debug_allocator.allocator()
     else
         std.heap.smp_allocator;
+
+    switch (try cli.dispatch(allocator, init.io, init.minimal.args)) {
+        .handled => return,
+        .launch_app => {},
+    }
 
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
@@ -272,6 +279,18 @@ fn mainInner(init: std.process.Init) !void {
     state.openBrowserOnLaunchIfRequested();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
+    var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
+        log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    if (live_server) |*server| {
+        server.start() catch |err| {
+            log.warn("failed to start live-control server: {s}", .{@errorName(err)});
+            server.deinit();
+            live_server = null;
+        };
+    }
+    defer if (live_server) |*server| server.deinit();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
 
@@ -328,6 +347,9 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollTerminals();
             }
         }.run, .{&state});
+        if (live_server) |*server| {
+            if (server.processPending(&state)) needs_render = true;
+        }
 
         var observed_fb_width: c_int = 0;
         var observed_fb_height: c_int = 0;

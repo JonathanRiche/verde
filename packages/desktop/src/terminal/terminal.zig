@@ -25,6 +25,7 @@ const MAX_FONT_SCALE: f32 = 3.3333333;
 const FONT_SCALE_STEP: f32 = 0.125;
 const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
+const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -72,6 +73,12 @@ pub const TerminalLaunchProfile = struct {
     kind: TerminalLaunchKind = .shell,
     label: []const u8 = "",
     command: []const []const u8 = &.{},
+};
+
+pub const SessionSnapshot = struct {
+    running: bool,
+    exit_code: ?u32 = null,
+    signal: ?u32 = null,
 };
 
 const SessionCreateOptions = struct {
@@ -228,6 +235,22 @@ pub const Dock = struct {
         try self.ensureWorkspace(allocator);
     }
 
+    pub fn restartWithProfile(self: *Dock, allocator: std.mem.Allocator, cwd: []const u8, profile: TerminalLaunchProfile) !void {
+        if (self.cwd) |old_cwd| allocator.free(old_cwd);
+        self.cwd = try allocator.dupe(u8, cwd);
+        self.clearTabs(allocator);
+
+        const previous_profile = self.launch_profile;
+        self.launch_profile = profile;
+        defer self.launch_profile = previous_profile;
+
+        try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
+        self.active_tab_index = self.tabs.items.len - 1;
+        self.visible = true;
+        self.workspace_changed = true;
+        self.focus_requested = true;
+    }
+
     pub fn poll(self: *Dock, allocator: std.mem.Allocator) !void {
         for (self.tabs.items) |*tab| {
             try pollPaneNode(tab.root, allocator);
@@ -296,6 +319,37 @@ pub const Dock = struct {
             }
         }
         return false;
+    }
+
+    pub fn writeInputToActivePane(self: *Dock, bytes: []const u8) !bool {
+        if (bytes.len == 0) return false;
+        const pane = self.activePane() orelse return false;
+        const session = pane.session orelse return false;
+        return try session.writeInput(bytes);
+    }
+
+    pub fn terminateActiveSession(self: *Dock) bool {
+        const pane = self.activePane() orelse return false;
+        const session = pane.session orelse return false;
+        return session.terminate();
+    }
+
+    pub fn activeSessionSnapshot(self: *const Dock) ?SessionSnapshot {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        return session.snapshot();
+    }
+
+    pub fn activeOutputTailAlloc(self: *const Dock, allocator: std.mem.Allocator, max_bytes: usize) !?[]u8 {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        return try session.outputTailAlloc(allocator, max_bytes);
+    }
+
+    pub fn activeScreenTextAlloc(self: *const Dock, allocator: std.mem.Allocator) !?[]u8 {
+        const pane = self.activePaneConst() orelse return null;
+        const session = pane.session orelse return null;
+        return try session.screenTextAlloc(allocator);
     }
 
     pub fn handleKeyDown(
@@ -1085,8 +1139,24 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn snapshot(_: *const UnsupportedSession) SessionSnapshot {
+        return .{ .running = false };
+    }
+
     pub fn writeInput(_: *UnsupportedSession, _: []const u8) !bool {
         return false;
+    }
+
+    pub fn terminate(_: *UnsupportedSession) bool {
+        return false;
+    }
+
+    pub fn outputTailAlloc(_: *const UnsupportedSession, allocator: std.mem.Allocator, _: usize) ![]u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    pub fn screenTextAlloc(_: *const UnsupportedSession, allocator: std.mem.Allocator) ![]u8 {
+        return allocator.dupe(u8, "");
     }
 
     pub fn handleKeyDown(_: *UnsupportedSession, _: *const sdl.KeyboardEvent) !bool {
@@ -1128,6 +1198,7 @@ const UnixSession = struct {
     exit_status: ?u32 = null,
     launch_kind: TerminalLaunchKind = .shell,
     launch_label: []u8,
+    output_ring: std.ArrayList(u8) = .empty,
 
     const SpawnResult = struct {
         master_fd: std.posix.fd_t,
@@ -1197,6 +1268,7 @@ const UnixSession = struct {
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
         allocator.free(self.launch_label);
+        self.output_ring.deinit(allocator);
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -1280,10 +1352,39 @@ const UnixSession = struct {
         return self.running;
     }
 
+    pub fn snapshot(self: *const UnixSession) SessionSnapshot {
+        if (self.running) return .{ .running = true };
+        const status = self.exit_status orelse return .{ .running = false };
+        if (std.c.W.IFEXITED(status)) {
+            return .{ .running = false, .exit_code = @intCast(std.c.W.EXITSTATUS(status)) };
+        }
+        if (std.c.W.IFSIGNALED(status)) {
+            return .{ .running = false, .signal = @intFromEnum(std.c.W.TERMSIG(status)) };
+        }
+        return .{ .running = false };
+    }
+
     pub fn writeInput(self: *UnixSession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
         try writeAll(self.master_fd, bytes);
         return true;
+    }
+
+    pub fn terminate(self: *UnixSession) bool {
+        if (!self.running) return false;
+        std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
+        self.running = false;
+        _ = self.captureExitStatus();
+        return true;
+    }
+
+    pub fn outputTailAlloc(self: *const UnixSession, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
+        const count = @min(max_bytes, self.output_ring.items.len);
+        return allocator.dupe(u8, self.output_ring.items[self.output_ring.items.len - count ..]);
+    }
+
+    pub fn screenTextAlloc(self: *const UnixSession, allocator: std.mem.Allocator) ![]u8 {
+        return copyableRenderStateText(allocator, &self.render_state);
     }
 
     pub fn handleKeyDown(self: *UnixSession, event: *const sdl.KeyboardEvent) !bool {
@@ -1379,12 +1480,30 @@ const UnixSession = struct {
                 break;
             }
 
+            try self.appendOutput(allocator, buffer[0..read_len]);
             self.stream.nextSlice(buffer[0..read_len]);
             try self.repairTerminalState(allocator);
             changed = true;
         }
 
         return changed;
+    }
+
+    fn appendOutput(self: *UnixSession, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        if (bytes.len >= OUTPUT_RING_CAPACITY) {
+            self.output_ring.clearRetainingCapacity();
+            try self.output_ring.appendSlice(allocator, bytes[bytes.len - OUTPUT_RING_CAPACITY ..]);
+            return;
+        }
+        const overflow = if (self.output_ring.items.len + bytes.len > OUTPUT_RING_CAPACITY)
+            self.output_ring.items.len + bytes.len - OUTPUT_RING_CAPACITY
+        else
+            0;
+        if (overflow > 0) {
+            std.mem.copyForwards(u8, self.output_ring.items[0 .. self.output_ring.items.len - overflow], self.output_ring.items[overflow..]);
+            self.output_ring.shrinkRetainingCapacity(self.output_ring.items.len - overflow);
+        }
+        try self.output_ring.appendSlice(allocator, bytes);
     }
 
     fn repairTerminalState(self: *UnixSession, allocator: std.mem.Allocator) !void {
