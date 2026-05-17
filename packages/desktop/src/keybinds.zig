@@ -768,9 +768,7 @@ fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 }
 
 fn cloneDefaultTerminalKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+J"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultBrowserKeybinds(allocator: std.mem.Allocator) ![]Keybind {
@@ -840,29 +838,19 @@ fn cloneDefaultTerminalTabNextKeybinds(allocator: std.mem.Allocator) ![]Keybind 
 }
 
 fn cloneDefaultTerminalSplitUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Shift+Up"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultTerminalSplitDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Shift+E"),
-        try parseDefaultAccelerator("CommandOrControl+Shift+Down"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultTerminalSplitLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Shift+Left"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultTerminalSplitRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
-    return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+Shift+O"),
-        try parseDefaultAccelerator("CommandOrControl+Shift+Right"),
-    });
+    return cloneEmptyKeybinds(allocator);
 }
 
 fn cloneDefaultTerminalFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
@@ -892,24 +880,28 @@ fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybi
 fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Left"),
+        try parseDefaultAccelerator("Ctrl+H"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Right"),
+        try parseDefaultAccelerator("Ctrl+L"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Up"),
+        try parseDefaultAccelerator("Ctrl+K"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+Down"),
+        try parseDefaultAccelerator("Ctrl+J"),
     });
 }
 
@@ -1349,6 +1341,52 @@ test "default terminal tab keybind uses primary alt t" {
     try std.testing.expect(config.terminal_new_tab[0].primary);
     try std.testing.expect(!config.terminal_new_tab[0].shift);
     try std.testing.expectEqual(sdl.Keycode.t, config.terminal_new_tab[0].key);
+}
+
+test "default terminal toggle has no keybind" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), config.toggle_terminal.len);
+}
+
+test "default terminal internal split keybinds are disabled" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_up.len);
+    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_down.len);
+    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_left.len);
+    try std.testing.expectEqual(@as(usize, 0), config.terminal_split_right.len);
+}
+
+test "default workspace focus supports alt arrows and ctrl hjkl" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_left.len);
+    try std.testing.expect(config.workspace_focus_left[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_focus_left[0].key);
+    try std.testing.expect(config.workspace_focus_left[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[1].key);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_down.len);
+    try std.testing.expect(config.workspace_focus_down[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_focus_down[0].key);
+    try std.testing.expect(config.workspace_focus_down[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[1].key);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_up.len);
+    try std.testing.expect(config.workspace_focus_up[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_focus_up[0].key);
+    try std.testing.expect(config.workspace_focus_up[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[1].key);
+
+    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_right.len);
+    try std.testing.expect(config.workspace_focus_right[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_focus_right[0].key);
+    try std.testing.expect(config.workspace_focus_right[1].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[1].key);
 }
 
 test "default sidebar keybind uses primary plus s" {
