@@ -60,6 +60,7 @@ pub const PersistedThread = struct {
     access_mode: ?AccessMode = null,
     provider: Provider = .opencode,
     harness: Harness = .local_cli,
+    tui_dock_id: ?u32 = null,
     draft: []const u8 = "",
     draft_image: ?PersistedImageAttachment = null,
     messages: []const PersistedMessage = &.{},

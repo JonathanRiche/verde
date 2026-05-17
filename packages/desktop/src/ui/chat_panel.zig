@@ -2547,7 +2547,13 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
     const size_label = runtime.formatByteSize(&size_buf, image.byte_size);
     const clear_size = theme.scaledUi(22.0);
     const clear_rect = palette.Rect{ .x = preview.x + preview.w - clear_size - theme.scaledUi(8.0), .y = preview.y + theme.scaledUi(8.0), .w = clear_size, .h = clear_size };
-    state.setComposerDraftImageClearRectAt(clear_rect, index);
+    const clear_hit_pad = theme.scaledUi(8.0);
+    state.setComposerDraftImageClearRectAt(.{
+        .x = clear_rect.x - clear_hit_pad,
+        .y = clear_rect.y - clear_hit_pad,
+        .w = clear_rect.w + clear_hit_pad * 2.0,
+        .h = clear_rect.h + clear_hit_pad * 2.0,
+    }, index);
     const label_x = thumb.x + thumb.w + theme.scaledUi(12.0);
     const label_w = @max(clear_rect.x - label_x - theme.scaledUi(12.0), theme.scaledUi(1.0));
     queueText(state, .{ .x = label_x, .y = preview.y + theme.scaledUi(15.0), .w = label_w, .h = theme.scaledUi(20.0) }, image.file_name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), preview);
@@ -2566,7 +2572,6 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
 /// While a reply is streaming, show Tab queue/steer hint once the user has typed a non-empty draft (matches `handlePendingThreadFollowupShortcut`).
 fn renderComposerFollowupHint(state: *app_state.AppState) void {
     if (!state.hasPendingStream()) return;
-    if (state.currentThread().draftImageCount() != 0) return;
     const hint = state.pendingFollowupHint() orelse return;
     const draft = state.palette_composer.text();
     if (std.mem.trim(u8, draft, &std.ascii.whitespace).len == 0) return;
