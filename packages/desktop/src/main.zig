@@ -36,6 +36,7 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_GetModState() sdl.Keymod;
 extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
@@ -57,6 +58,7 @@ const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
+const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
     "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
@@ -98,6 +100,8 @@ const NOTO_SANS_BOLD_ITALIC_BYTES = @embedFile("assets/fonts/NotoSans-BoldItalic
 const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
+var macos_cmd_w_pane_close_until_ms: i64 = 0;
+
 const WindowFrame = struct {
     x: c_int,
     y: c_int,
@@ -129,6 +133,9 @@ fn mainInner(init: std.process.Init) !void {
     }
 
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
+    if (builtin.os.tag == .macos) {
+        _ = SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
+    }
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
     defer sdl.quit();
@@ -837,6 +844,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     switch (event.type) {
         .quit => return false,
+        .window_close_requested => return handleWindowCloseRequested(state),
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(
@@ -907,6 +915,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 .workspace_minimize,
                 .workspace_close,
                 => {
+                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
                     handleKeyboardAction(state, keyboard, resolved_workspace_action);
                     return true;
                 },
@@ -1490,6 +1499,34 @@ fn handleKeyboardAction(
         .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
         .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
+}
+
+fn handleWindowCloseRequested(state: *AppState) bool {
+    if (builtin.os.tag == .macos) {
+        const now_ms = std.time.milliTimestamp();
+        if (macos_cmd_w_pane_close_until_ms >= now_ms) {
+            macos_cmd_w_pane_close_until_ms = 0;
+            return true;
+        }
+        if (isKeymodPressed(SDL_GetModState(), sdl.Keymod.gui)) {
+            _ = state.closeFocusedWorkspacePane();
+            return true;
+        }
+    }
+    return false;
+}
+
+fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keybinds.NativeKeyboardAction) void {
+    if (builtin.os.tag != .macos or action != .workspace_close) return;
+    if (event.key != .w) return;
+    if (!isKeymodPressed(event.mod, sdl.Keymod.gui)) return;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return;
+    }
+    macos_cmd_w_pane_close_until_ms = std.time.milliTimestamp() + MACOS_CMD_W_CLOSE_SUPPRESS_MS;
 }
 
 fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
