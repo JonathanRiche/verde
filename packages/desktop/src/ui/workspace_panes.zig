@@ -89,12 +89,32 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     if (pane_rect_count == 0) return false;
     if (state.projects.items.len == 0) return false;
     const current_id = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id orelse return false;
+    const maximized = state.currentProjectWorkspaceMaximizedPaneId() != null;
+    if (maximized) {
+        if (state.currentProjectWorkspaceRoot()) |root| {
+            var expanded_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
+            var expanded_count: usize = 0;
+            collectNodePaneRects(root, pane_rects[0].rect, &expanded_rects, &expanded_count);
+            if (focusPaneInDirectionFromRects(state, current_id, dir, expanded_rects[0..expanded_count], true)) return true;
+        }
+        return state.clearCurrentProjectWorkspacePaneMaximized();
+    }
 
+    return focusPaneInDirectionFromRects(state, current_id, dir, pane_rects[0..pane_rect_count], false);
+}
+
+fn focusPaneInDirectionFromRects(
+    state: *runtime.AppState,
+    current_id: runtime.WorkspacePaneId,
+    dir: FocusDirection,
+    rects: []const WorkspacePaneRect,
+    clear_maximized: bool,
+) bool {
     var current_rect: ?palette.Rect = null;
     var i: usize = 0;
-    while (i < pane_rect_count) : (i += 1) {
-        if (pane_rects[i].pane_id == current_id) {
-            current_rect = pane_rects[i].rect;
+    while (i < rects.len) : (i += 1) {
+        if (rects[i].pane_id == current_id) {
+            current_rect = rects[i].rect;
             break;
         }
     }
@@ -106,8 +126,8 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     var best_score: f32 = std.math.inf(f32);
 
     i = 0;
-    while (i < pane_rect_count) : (i += 1) {
-        const entry = pane_rects[i];
+    while (i < rects.len) : (i += 1) {
+        const entry = rects[i];
         if (entry.pane_id == current_id) continue;
         const ex = entry.rect.x + entry.rect.w * 0.5;
         const ey = entry.rect.y + entry.rect.h * 0.5;
@@ -138,9 +158,45 @@ pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool 
     }
 
     const target = best_id orelse return false;
+    if (clear_maximized) _ = state.clearCurrentProjectWorkspacePaneMaximized();
     _ = state.focusCurrentProjectWorkspacePane(target);
     state.markDirty();
     return true;
+}
+
+fn collectNodePaneRects(
+    node: *const runtime.WorkspaceNode,
+    rect: palette.Rect,
+    out: *[MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect,
+    count: *usize,
+) void {
+    if (count.* >= out.len) return;
+    switch (node.*) {
+        .leaf => |pane_id| {
+            out[count.*] = .{ .pane_id = pane_id, .rect = rect };
+            count.* += 1;
+        },
+        .split => |split| {
+            const gap = theme.scaledUi(1.0);
+            if (split.axis == .vertical) {
+                const first_w = @max(theme.scaledUi(180.0), rect.w * split.ratio - gap * 0.5);
+                const second_w = @max(theme.scaledUi(180.0), rect.w - first_w - gap);
+                const clamped_first_w = @max(theme.scaledUi(120.0), rect.w - second_w - gap);
+                const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = clamped_first_w, .h = rect.h };
+                const second_rect = palette.Rect{ .x = rect.x + clamped_first_w + gap, .y = rect.y, .w = @max(rect.w - clamped_first_w - gap, theme.scaledUi(120.0)), .h = rect.h };
+                collectNodePaneRects(split.first, first_rect, out, count);
+                collectNodePaneRects(split.second, second_rect, out, count);
+            } else {
+                const first_h = @max(theme.scaledUi(160.0), rect.h * split.ratio - gap * 0.5);
+                const second_h = @max(theme.scaledUi(120.0), rect.h - first_h - gap);
+                const clamped_first_h = @max(theme.scaledUi(120.0), rect.h - second_h - gap);
+                const first_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = clamped_first_h };
+                const second_rect = palette.Rect{ .x = rect.x, .y = rect.y + clamped_first_h + gap, .w = rect.w, .h = @max(rect.h - clamped_first_h - gap, theme.scaledUi(120.0)) };
+                collectNodePaneRects(split.first, first_rect, out, count);
+                collectNodePaneRects(split.second, second_rect, out, count);
+            }
+        },
+    }
 }
 
 fn rangesOverlap(a0: f32, a1: f32, b0: f32, b1: f32) bool {

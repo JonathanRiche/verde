@@ -430,19 +430,19 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         count += 1;
     } else {
         actions[count] = .split_up;
-        labels[count] = "Split Up";
+        labels[count] = "New Pane Above";
         enabled[count] = true;
         count += 1;
         actions[count] = .split_down;
-        labels[count] = "Split Down";
+        labels[count] = "New Pane Below";
         enabled[count] = true;
         count += 1;
         actions[count] = .split_left;
-        labels[count] = "Split Left";
+        labels[count] = "New Pane Left";
         enabled[count] = true;
         count += 1;
         actions[count] = .split_right;
-        labels[count] = "Split Right";
+        labels[count] = "New Pane Right";
         enabled[count] = true;
         count += 1;
         actions[count] = .close_pane;
@@ -485,6 +485,10 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
 }
 
 fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: TerminalContextMenuAction) void {
+    const focus_menu_dock_after = switch (action) {
+        .split_up, .split_down, .split_left, .split_right => false,
+        else => true,
+    };
     switch (action) {
         .new_tab => dock.createTab(state.allocator) catch |err| app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)}),
         .new_claude_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .claude, .label = "Claude" }) catch |err| app_state.log.warn("failed to create Claude terminal tab: {s}", .{@errorName(err)}),
@@ -496,13 +500,13 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         },
         .rename_tab => if (dock.activeTab()) |tab| dock.beginRenameTab(tab.id),
         .close_tab => dock.closeTab(state.allocator, hit_cache.menu_tab_index) catch |err| app_state.log.warn("failed to close terminal tab: {s}", .{@errorName(err)}),
-        .split_up => dock.splitActivePane(state.allocator, .up) catch |err| app_state.log.warn("failed to split terminal pane up: {s}", .{@errorName(err)}),
-        .split_down => dock.splitActivePane(state.allocator, .down) catch |err| app_state.log.warn("failed to split terminal pane down: {s}", .{@errorName(err)}),
-        .split_left => dock.splitActivePane(state.allocator, .left) catch |err| app_state.log.warn("failed to split terminal pane left: {s}", .{@errorName(err)}),
-        .split_right => dock.splitActivePane(state.allocator, .right) catch |err| app_state.log.warn("failed to split terminal pane right: {s}", .{@errorName(err)}),
+        .split_up => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
+        .split_down => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
+        .split_left => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
+        .split_right => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
         .close_pane => dock.closeActivePaneOrTab(state.allocator) catch |err| app_state.log.warn("failed to close terminal pane: {s}", .{@errorName(err)}),
     }
-    focusTerminal(state);
+    if (focus_menu_dock_after) focusTerminal(state);
     if (dock.consumeWorkspaceChange()) state.markDirty();
 }
 
