@@ -59,11 +59,24 @@ The snapshot path now carries a monotonic `frame_sequence` from the WebKitGTK he
 
 The app now uploads at most one pending native WebKitGTK frame per `AppState.pollBrowser()` render tick. Browser event draining no longer triggers repeated native snapshot uploads inside the same browser poll loop. Replaced-but-not-uploaded frames are deleted, so rapid scrolling should prefer the newest available frame instead of uploading a backlog.
 
+Frame file ownership is split between helper and app:
+
+- If the helper replaces a frame path before it has announced that frame to the app, the helper deletes the old unpublished file.
+- Once the helper announces a frame path, the app owns deleting that file after upload or stale-frame discard.
+
 Timing diagnostics were added around the file-backed snapshot path:
 
 - Helper stderr logs snapshot sequence, WebKit capture duration, scale duration, file write duration, byte count, source/output size, whether scaling occurred, and whether another request was queued while capture was pending.
 - App logs snapshot read duration and texture upload duration per uploaded sequence.
 - App logs total render-tick upload duration when a frame was uploaded.
+
+These per-frame diagnostics are gated by:
+
+```bash
+VERDE_BROWSER_FRAME_LOG=1
+```
+
+They should stay disabled for normal subjective scroll-feel testing because logging every snapshot/upload can distort performance.
 
 Snapshot request throttling remains conservative:
 
@@ -72,14 +85,17 @@ Snapshot request throttling remains conservative:
 - Size-change requests still coalesce through the existing `snapshot_pending` / `snapshot_requested_while_pending` path.
 - Scaling still only runs when WebKit returns a different size than the requested pane size.
 
-The file transfer path is still the active implementation. The next low-risk performance step is to reuse the CEF helper's existing shared-memory style as a model for WebKitGTK, using shm or memfd-backed frame slots so the helper can publish pixels without repeatedly creating and reading RGBA files. That should stay separate from the stale-frame fix unless file IO remains the measured bottleneck.
+The default snapshot transfer path now uses three memfd-backed shared frame slots modeled after the CEF helper path. The desktop process creates anonymous `memfd_create` fds named `verde-browser-linux-frame-*`, sizes them to `4096 * 2160 * 4`, maps them shared, passes fixed fd numbers to the WebKitGTK helper through `VERDE_BROWSER_LINUX_FRAME0_FD` through `VERDE_BROWSER_LINUX_FRAME2_FD`, and copies each announced slot into a staging buffer before uploading. This removes per-frame temp-file create/read/delete from the normal Wayland snapshot path.
+
+The old file transfer path remains as a fallback if shared slot creation or helper-side `mmap` is unavailable. Helper frame diagnostics include `shared_slot=<n>` for shared frames and `shared_slot=-1` for fallback file frames when `VERDE_BROWSER_FRAME_LOG=1` is set.
 
 Verification commands used after this pass:
 
 ```bash
 cc -fsyntax-only packages/desktop/src/browser/platform/linux_webkitgtk.c $(pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 x11)
 zig build --release=safe -Dbrowser-backend=native_webview --summary all
-VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+zig build test --release=safe -Dbrowser-backend=stub
+VERDE_BROWSER_FRAME_LOG=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
 ./packages/desktop/zig-out/bin/verde live status --json
 VERDE_BROWSER_LINUX_WAYLAND_HELPER=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
 ./packages/desktop/zig-out/bin/verde live status --json
@@ -88,6 +104,8 @@ VERDE_BROWSER_LINUX_WAYLAND_HELPER=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER
 Fresh live-status evidence:
 
 - Default launch reported `runtime_kind: "native_webview"`, `presentation_kind: "snapshot_texture"`, `runtime_initialized: true`, `visible: true`, and URL `https://lytx.io/`.
+- Shared-slot launch with `VERDE_BROWSER_FRAME_LOG=1` reported the same default `snapshot_texture` status and accepted a live `window.scrollBy(0, 600)` eval during the smoke run.
+- Screenshot evidence for the shared-slot smoke run was captured at `/tmp/verde-webkit-memfd-snapshot.png`.
 - Diagnostic launch with `VERDE_BROWSER_LINUX_WAYLAND_HELPER=1` reported `runtime_kind: "native_webview"`, `presentation_kind: "helper_window"`, `runtime_initialized: true`, `visible: true`, and URL `https://lytx.io/`.
 - After terminating the smoke-test app processes, `pgrep -af 'verde-browser-linux|zig-out/bin/verde|mise run dev'` returned no remaining app/helper processes.
 

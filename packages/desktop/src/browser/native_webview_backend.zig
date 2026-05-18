@@ -36,6 +36,11 @@ pub fn configuredSupportsPopout() bool {
     return false;
 }
 
+fn frameLogEnabled() bool {
+    const value = std.c.getenv("VERDE_BROWSER_FRAME_LOG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
 /// Wraps platform-native webview controllers behind the app-facing browser backend contract.
 pub const Backend = struct {
     allocator: std.mem.Allocator,
@@ -237,7 +242,9 @@ pub const Backend = struct {
         };
         if (!uploaded) return;
         const upload_end = monotonicTimestampNs();
-        log.info("snapshot render_tick upload_ms={d:.3}", .{nanosToMillis(upload_end - upload_start)});
+        if (frameLogEnabled()) {
+            log.info("snapshot render_tick upload_ms={d:.3}", .{nanosToMillis(upload_end - upload_start)});
+        }
     }
 
     /// Alias used by the shared backend contract.
