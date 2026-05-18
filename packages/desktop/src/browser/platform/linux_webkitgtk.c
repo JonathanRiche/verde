@@ -2,6 +2,7 @@
 #include <gdk/gdkx.h>
 #include <gtk/gtk.h>
 #include <jsc/jsc.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,10 @@ struct verde_browser_linux {
     gboolean snapshot_requested_while_pending;
     gboolean snapshot_dirty;
     gchar *snapshot_path;
+    guint64 snapshot_next_sequence;
+    guint64 snapshot_pending_sequence;
+    guint64 snapshot_ready_sequence;
+    gint64 snapshot_request_started_us;
     gint snapshot_width;
     gint snapshot_height;
     gsize snapshot_byte_len;
@@ -56,6 +61,11 @@ static void verde_browser_linux_queue_event(struct verde_browser_linux *browser,
     event->kind = kind;
     event->payload = payload != NULL ? g_strdup(payload) : NULL;
     g_queue_push_tail(browser->events, event);
+}
+
+static double verde_browser_linux_elapsed_ms(gint64 start_us, gint64 end_us) {
+    if (start_us <= 0 || end_us < start_us) return 0.0;
+    return (double)(end_us - start_us) / 1000.0;
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
@@ -173,6 +183,8 @@ static void verde_browser_linux_on_script_message(WebKitUserContentManager *mana
 static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     GError *error = NULL;
+    const guint64 sequence = browser->snapshot_pending_sequence;
+    const gint64 request_started_us = browser->snapshot_request_started_us;
     cairo_surface_t *surface = webkit_web_view_get_snapshot_finish(WEBKIT_WEB_VIEW(object), result, &error);
     browser->snapshot_pending = FALSE;
 
@@ -196,6 +208,7 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
     const gint source_height = cairo_image_surface_get_height(surface);
     const gint target_width = browser->target_width > 0 ? browser->target_width : source_width;
     const gint target_height = browser->target_height > 0 ? browser->target_height : source_height;
+    const gint64 scale_started_us = g_get_monotonic_time();
 
     if (source_width > 0 && source_height > 0 && (source_width != target_width || source_height != target_height)) {
         output_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, target_width, target_height);
@@ -217,6 +230,7 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
     } else {
         cairo_surface_flush(output_surface);
     }
+    const gint64 scale_finished_us = g_get_monotonic_time();
 
     const gint width = cairo_image_surface_get_width(output_surface);
     const gint height = cairo_image_surface_get_height(output_surface);
@@ -231,8 +245,11 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
     }
 
     const gsize contiguous_len = (gsize)width * (gsize)height * 4;
-    FILE *file = fopen(browser->snapshot_path, "wb");
+    gchar *snapshot_path = g_strdup_printf("/tmp/verde-browser-linux-frame-%d-%" G_GUINT64_FORMAT ".rgba", getpid(), sequence);
+    const gint64 write_started_us = g_get_monotonic_time();
+    FILE *file = fopen(snapshot_path, "wb");
     if (file == NULL) {
+        g_free(snapshot_path);
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to open Linux snapshot file.");
         if (output_surface != surface) cairo_surface_destroy(output_surface);
         cairo_surface_destroy(surface);
@@ -246,6 +263,8 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
         }
         if (fwrite(row_ptr, 1, (gsize)width * 4, file) != (gsize)width * 4) {
             fclose(file);
+            remove(snapshot_path);
+            g_free(snapshot_path);
             verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to write Linux snapshot pixels.");
             if (output_surface != surface) cairo_surface_destroy(output_surface);
             cairo_surface_destroy(surface);
@@ -253,11 +272,31 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
         }
     }
     fclose(file);
+    const gint64 write_finished_us = g_get_monotonic_time();
 
+    g_free(browser->snapshot_path);
+    browser->snapshot_path = snapshot_path;
+    browser->snapshot_ready_sequence = sequence;
     browser->snapshot_width = width;
     browser->snapshot_height = height;
     browser->snapshot_byte_len = contiguous_len;
     browser->snapshot_dirty = TRUE;
+    fprintf(
+        stderr,
+        "verde-browser-linux snapshot seq=%" G_GUINT64_FORMAT " capture_ms=%.3f scale_ms=%.3f write_ms=%.3f bytes=%zu size=%dx%d source=%dx%d scaled=%d queued_again=%d\n",
+        sequence,
+        verde_browser_linux_elapsed_ms(request_started_us, write_started_us),
+        verde_browser_linux_elapsed_ms(scale_started_us, scale_finished_us),
+        verde_browser_linux_elapsed_ms(write_started_us, write_finished_us),
+        (size_t)contiguous_len,
+        width,
+        height,
+        source_width,
+        source_height,
+        (output_surface != surface) ? 1 : 0,
+        browser->snapshot_requested_while_pending ? 1 : 0
+    );
+    fflush(stderr);
     if (output_surface != surface) cairo_surface_destroy(output_surface);
     cairo_surface_destroy(surface);
     if (browser->snapshot_requested_while_pending) {
@@ -268,11 +307,14 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
 
 static void verde_browser_linux_request_snapshot(struct verde_browser_linux *browser) {
     if (browser == NULL) return;
+    if (!browser->visible || verde_browser_linux_direct_surface_active()) return;
     if (browser->snapshot_pending) {
         browser->snapshot_requested_while_pending = TRUE;
         return;
     }
     browser->snapshot_pending = TRUE;
+    browser->snapshot_pending_sequence = ++browser->snapshot_next_sequence;
+    browser->snapshot_request_started_us = g_get_monotonic_time();
     webkit_web_view_get_snapshot(
         browser->web_view,
         WEBKIT_SNAPSHOT_REGION_VISIBLE,
@@ -443,7 +485,6 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
 
     struct verde_browser_linux *browser = g_new0(struct verde_browser_linux, 1);
     browser->events = g_queue_new();
-    browser->snapshot_path = g_strdup_printf("/tmp/verde-browser-linux-frame-%d.rgba", getpid());
     browser->target_width = 1280;
     browser->target_height = 720;
     browser->content_manager = webkit_user_content_manager_new();
@@ -705,8 +746,8 @@ int verde_browser_linux_poll_event(struct verde_browser_linux *browser, int *kin
     return 1;
 }
 
-int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **path, int *width, int *height, size_t *byte_len) {
-    if (browser == NULL || path == NULL || width == NULL || height == NULL || byte_len == NULL) return 0;
+int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **path, uint64_t *sequence, int *width, int *height, size_t *byte_len) {
+    if (browser == NULL || path == NULL || sequence == NULL || width == NULL || height == NULL || byte_len == NULL) return 0;
 
     while (g_main_context_pending(NULL)) {
         g_main_context_iteration(NULL, FALSE);
@@ -715,6 +756,7 @@ int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **p
     if (!browser->snapshot_dirty || browser->snapshot_path == NULL) return 0;
 
     *path = g_strdup(browser->snapshot_path);
+    *sequence = (uint64_t)browser->snapshot_ready_sequence;
     *width = browser->snapshot_width;
     *height = browser->snapshot_height;
     *byte_len = browser->snapshot_byte_len;

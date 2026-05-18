@@ -7,11 +7,29 @@ const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("linux_ipc.zig");
 
+const log = std.log.scoped(.linux_webkitgtk);
+
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
+
+fn monotonicTimestampNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(i128, @intCast(ts.nsec));
+}
+
+fn nanosToMillis(nanos: i128) f64 {
+    return @as(f64, @floatFromInt(nanos)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn deleteFramePath(path: []const u8) void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    std.Io.Dir.deleteFileAbsolute(threaded.io(), path) catch {};
+}
 
 pub fn configuredPresentationKind() browser_types.PresentationKind {
     return if (visibleHelperEnabled()) .helper_window else .snapshot_texture;
@@ -65,6 +83,7 @@ const SharedQueue = struct {
 const SharedFrame = struct {
     mutex: Mutex = .{},
     path: ?[]u8 = null,
+    sequence: u64 = 0,
     width: u32 = 0,
     height: u32 = 0,
     byte_len: usize = 0,
@@ -74,8 +93,12 @@ const SharedFrame = struct {
     fn deinit(self: *SharedFrame, allocator: std.mem.Allocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.path) |path| allocator.free(path);
+        if (self.path) |path| {
+            deleteFramePath(path);
+            allocator.free(path);
+        }
         self.path = null;
+        self.sequence = 0;
         self.width = 0;
         self.height = 0;
         self.byte_len = 0;
@@ -86,12 +109,22 @@ const SharedFrame = struct {
     fn update(self: *SharedFrame, allocator: std.mem.Allocator, event: ipc.Event) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.path) |path| allocator.free(path);
+
+        if (event.frame_sequence <= self.sequence) {
+            if (event.frame_path) |path| deleteFramePath(path);
+            return;
+        }
+
+        if (self.path) |path| {
+            deleteFramePath(path);
+            allocator.free(path);
+        }
 
         self.path = if (event.frame_path) |path|
             try allocator.dupe(u8, path)
         else
             null;
+        self.sequence = event.frame_sequence;
         self.width = event.width;
         self.height = event.height;
         self.byte_len = event.byte_len;
@@ -104,25 +137,57 @@ const SharedFrame = struct {
         allocator: std.mem.Allocator,
         frame_buffer: *std.ArrayList(u8),
         texture: *browser_texture.PaneTexture,
-    ) !void {
+    ) !bool {
+        var upload_path: []u8 = undefined;
+        var upload_sequence: u64 = 0;
+        var upload_width: u32 = 0;
+        var upload_height: u32 = 0;
+        var upload_byte_len: usize = 0;
+
         self.mutex.lock();
-        defer self.mutex.unlock();
+        if (!self.dirty or self.path == null or self.width == 0 or self.height == 0 or self.byte_len == 0) {
+            self.mutex.unlock();
+            return false;
+        }
+        upload_path = self.path.?;
+        upload_sequence = self.sequence;
+        upload_width = self.width;
+        upload_height = self.height;
+        upload_byte_len = self.byte_len;
+        self.path = null;
+        self.dirty = false;
+        self.mutex.unlock();
+        defer {
+            deleteFramePath(upload_path);
+            allocator.free(upload_path);
+        }
 
-        if (!self.dirty) return;
-        const frame_path = self.path orelse return;
-        if (self.width == 0 or self.height == 0 or self.byte_len == 0) return;
-
-        try frame_buffer.resize(allocator, self.byte_len);
+        const read_start = monotonicTimestampNs();
+        try frame_buffer.resize(allocator, upload_byte_len);
         var threaded = std.Io.Threaded.init_single_threaded;
-        const file = try std.Io.Dir.openFileAbsolute(threaded.io(), frame_path, .{ .mode = .read_only });
+        const file = try std.Io.Dir.openFileAbsolute(threaded.io(), upload_path, .{ .mode = .read_only });
         defer file.close(threaded.io());
 
         var read_buffer: [8 * 1024]u8 = undefined;
         var reader = file.reader(threaded.io(), &read_buffer);
-        try reader.interface.readSliceAll(frame_buffer.items[0..self.byte_len]);
+        try reader.interface.readSliceAll(frame_buffer.items[0..upload_byte_len]);
+        const read_end = monotonicTimestampNs();
 
-        try texture.uploadBgra(self.width, self.height, frame_buffer.items[0..self.byte_len]);
-        self.dirty = false;
+        const upload_start = monotonicTimestampNs();
+        try texture.uploadBgra(upload_width, upload_height, frame_buffer.items[0..upload_byte_len]);
+        const upload_end = monotonicTimestampNs();
+        log.info(
+            "snapshot frame seq={} read_ms={d:.3} upload_ms={d:.3} bytes={} size={}x{}",
+            .{
+                upload_sequence,
+                nanosToMillis(read_end - read_start),
+                nanosToMillis(upload_end - upload_start),
+                upload_byte_len,
+                upload_width,
+                upload_height,
+            },
+        );
+        return true;
     }
 };
 
@@ -415,8 +480,8 @@ pub const Controller = struct {
     }
 
     /// Uploads the latest helper snapshot into the pane texture, if a new frame is ready.
-    pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !void {
-        try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+    pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !bool {
+        return try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
     }
 
     // Launches the installed browser helper binary beside the desktop executable.

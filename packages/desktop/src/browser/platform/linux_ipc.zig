@@ -61,6 +61,7 @@ pub const EventKind = enum {
 /// Encodes one browser helper event.
 pub const Event = struct {
     kind: EventKind,
+    frame_sequence: u64 = 0,
     width: u32 = 0,
     height: u32 = 0,
     byte_len: usize = 0,

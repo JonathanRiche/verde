@@ -363,6 +363,15 @@ pub const Controller = struct {
         return event;
     }
 
+    /// Uploads at most one pending browser frame for this app render tick.
+    pub fn uploadFrame(self: *Controller) void {
+        const backend = if (self.backend) |*backend| backend else return;
+        switch (backend.*) {
+            .native_webview => |*active| active.uploadFrame(),
+            .cef, .stub => {},
+        }
+    }
+
     /// Alias used by the compile-time backend contract.
     pub fn isRuntimeInitialized(self: *const Controller) bool {
         return self.runtimeInitialized();
