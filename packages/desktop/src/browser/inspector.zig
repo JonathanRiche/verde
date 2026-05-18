@@ -17,17 +17,34 @@ pub const disable_script =
     \\})();
 ;
 
-/// Wraps the bundled inspector runtime with the bridge expected by the CEF renderer process.
+/// Wraps the bundled inspector runtime with the backend-neutral browser bridge.
 pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.InspectorMode) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         \\(function() {{
         \\  const mode = "{s}";
+        \\  const postToBridge = function(payload) {{
+        \\    if (window.__VERDE_BROWSER_IPC__ && typeof window.__VERDE_BROWSER_IPC__.postMessage === "function") {{
+        \\      window.__VERDE_BROWSER_IPC__.postMessage(payload);
+        \\      return true;
+        \\    }}
+        \\    if (window.__VERDE_CEF_IPC__ && typeof window.__VERDE_CEF_IPC__.postMessage === "function") {{
+        \\      window.__VERDE_CEF_IPC__.postMessage(payload);
+        \\      return true;
+        \\    }}
+        \\    if (window.verde && typeof window.verde.postMessage === "function") {{
+        \\      window.verde.postMessage(payload);
+        \\      return true;
+        \\    }}
+        \\    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.verde) {{
+        \\      window.webkit.messageHandlers.verde.postMessage(payload);
+        \\      return true;
+        \\    }}
+        \\    return false;
+        \\  }};
         \\  window.__VERDE_INSPECTOR_BRIDGE__ = {{
         \\    postMessage: function(event) {{
-        \\      if (window.__VERDE_CEF_IPC__ && typeof window.__VERDE_CEF_IPC__.postMessage === "function") {{
-        \\        window.__VERDE_CEF_IPC__.postMessage(JSON.stringify(event));
-        \\      }}
+        \\      postToBridge(JSON.stringify(event));
         \\    }}
         \\  }};
         \\  if (!window.VerdeInspector) {{

@@ -49,15 +49,33 @@ The npm package is intended for macOS Apple Silicon, macOS Intel, and Linux x86_
 ## Source Builds
 
 Source builds require Zig `0.16.0` and SDL3 development files for your platform.
+The default browser backend uses the host platform webview instead of bundled
+Chromium. Linux builds also require GTK 3 and WebKitGTK 4.1 development
+packages. Windows native-webview builds require the Microsoft WebView2 SDK
+headers at compile time and `WebView2Loader.dll` next to `verde.exe` or on the
+DLL search path.
 
 For release-style local installs, use the packaged install scripts:
 
 ```bash
-bash ./scripts/release/install-linux-local-cef.sh
+bash ./scripts/release/install-linux-local.sh
 ./scripts/release/install-macos-local.sh
 ```
 
-The macOS installer downloads and bundles the matching CEF runtime by default. To use an existing CEF SDK cache, set `VERDE_CEF_SDK_PATH`. To build a no-CEF app bundle for faster local iteration, set `VERDE_CEF_DISABLE_DOWNLOAD=1`.
+Source builds use the native webview backend by default and do not download CEF.
+CEF is still available as an explicit fallback:
+
+```bash
+mise run build-cef
+# or
+zig build --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=/path/to/cef
+```
+
+The native browser runtime targets the host platform webview stack: WebKitGTK on
+Linux, WKWebView on macOS, and WebView2 on Windows. Linux requires WebKitGTK 4.1
+runtime packages. Windows systems that do not include WebView2 need the
+Microsoft WebView2 Runtime installed separately, and packaged builds must ship
+or locate `WebView2Loader.dll`.
 
 ## Development
 
@@ -71,11 +89,13 @@ mise run dev
 
 Common tasks:
 
-- `mise run setup`: downloads the CEF SDK into the local build cache.
-- `mise run dev`: builds and runs Verde from the repo-local Zig build output.
+- `mise run setup`: checks desktop build dependencies.
+- `mise run dev`: builds and runs Verde with the native webview backend.
 - `mise run run`: builds and launches Verde in development mode.
 - `mise run debug`: launches Verde with the in-app diagnostics window enabled.
 - `mise run build`: creates a local release-style build for the current platform.
+- `mise run dev-cef`: builds and runs Verde with the legacy CEF backend.
+- `mise run build-cef`: creates a release-style build with the legacy CEF backend.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
 
 ## CLI And Live Control
@@ -180,18 +200,40 @@ verde live terminals [--project <id|index|path|current>] [--json]
 verde live processes [--json]
 verde live inspect --pane <pane-id> [--project <id|index|path|current>] [--json]
 verde live inspect --focused [--json]
+verde live browser eval --script "document.title" [--json]
+verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 ```
 
 - `capabilities` prints the live method list without requiring the app to be
   running.
 - `status` returns protocol version, app pid, selected project, focused pane,
-  current pane graph, and terminal/process summary.
+  current pane graph, terminal/process summary, and browser runtime state,
+  including backend kind, presentation kind, initialized/visible state, URL,
+  last browser error, last bridge message, and last eval result.
 - `projects` lists live projects.
 - `active` returns the current project and focused pane.
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
   Verde.
 - `inspect` returns details for a specific pane or the focused pane.
+
+### Browser Control
+
+Browser commands require the browser pane to be visible. They route through the
+same backend-neutral browser contract used by the Palette toolbar and inspector.
+
+```bash
+verde live browser eval --script "JSON.stringify({title:document.title,url:location.href})" [--json]
+verde live browser post-json --json-payload '{"type":"ping"}' [--json]
+```
+
+- `eval` queues JavaScript evaluation in the active browser runtime; inspect
+  `verde live status --json` for `browser.last_eval_result`.
+- `post-json` sends a JSON payload through the host-to-page bridge.
+- Page-to-host bridge messages are processed only for app and loopback pages by
+  default: `app://`, `localhost`, `127.0.0.1`, and `[::1]`. Set
+  `VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE=1` only for local diagnostics that need
+  arbitrary pages or `data:` URLs to call back into Verde.
 
 ### Pane Control
 

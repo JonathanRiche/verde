@@ -415,7 +415,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             state.composer_focused = focused;
             if (focused) {
                 state.terminal_focused = false;
-                state.browser_pane_focused = false;
+                state.unfocusBrowserPane();
             }
         },
         .model_clicked, .reasoning_clicked => {},
@@ -2596,10 +2596,15 @@ pub const AppState = struct {
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
     browser_launch_open_delay_frames: u8,
+    browser_start_eval_pending: bool,
     browser_pane_min: [2]f32,
     browser_pane_max: [2]f32,
     browser_pane_input_size: [2]f32,
     browser_pane_hovered: bool,
+    app_window_screen_origin: [2]i32,
+    app_window_display_scale: f32,
+    browser_surface_suspended_for_palette_overlay: bool,
+    browser_suppressed_closed_events: u8,
     browser_clipboard_copy_pending: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
@@ -2779,10 +2784,15 @@ pub const AppState = struct {
             .file_search_state = .{},
             .browser_state = browser_state,
             .browser_launch_open_delay_frames = 0,
+            .browser_start_eval_pending = false,
             .browser_pane_min = .{ 0.0, 0.0 },
             .browser_pane_max = .{ 0.0, 0.0 },
             .browser_pane_input_size = .{ 0.0, 0.0 },
             .browser_pane_hovered = false,
+            .app_window_screen_origin = .{ 0, 0 },
+            .app_window_display_scale = 1.0,
+            .browser_surface_suspended_for_palette_overlay = false,
+            .browser_suppressed_closed_events = 0,
             .browser_clipboard_copy_pending = false,
             .sidebar_thread_hover = null,
             .sidebar_project_hover = null,
@@ -5114,7 +5124,7 @@ pub const AppState = struct {
         self.palette_composer.focused = true;
         self.composer_focused = true;
         self.terminal_focused = false;
-        self.browser_pane_focused = false;
+        self.unfocusBrowserPane();
         const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
             log.warn("palette composer paste failed: {s}", .{@errorName(err)});
             return false;
@@ -6055,12 +6065,39 @@ pub const AppState = struct {
         return &self.browser_state;
     }
 
+    /// Supplies the native SDL window handle that platform webviews attach under.
+    pub fn attachBrowserHostWindow(self: *AppState, handle: ?*anyopaque) void {
+        self.browser_state.controller.setHostWindow(handle) catch |err| {
+            log.warn("failed to attach browser host window: {s}", .{@errorName(err)});
+        };
+    }
+
     /// Opens the browser during startup when an explicit debug environment flag requests it.
     pub fn openBrowserOnLaunchIfRequested(self: *AppState) void {
         if (!self.browser_textures_enabled) return;
 
         const value = std.mem.sliceTo(std.c.getenv("VERDE_OPEN_BROWSER_ON_START") orelse return, 0);
         if (!std.mem.eql(u8, value, "1")) return;
+        self.browser_start_eval_pending = false;
+        if (std.c.getenv("VERDE_BROWSER_START_URL")) |raw_start_url| {
+            const start_url = std.mem.sliceTo(raw_start_url, 0);
+            if (start_url.len > 0) {
+                const normalized = self.normalizeBrowserUrl(start_url) catch |err| {
+                    log.warn("failed to normalize browser startup URL: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to normalize browser startup URL.");
+                    return;
+                };
+                defer self.allocator.free(normalized);
+                self.browser_state.setCurrentUrl(normalized) catch |err| {
+                    log.warn("failed to store browser startup URL: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.browser_state.setAddress(normalized);
+            }
+        }
+        if (std.c.getenv("VERDE_BROWSER_START_EVAL")) |raw_start_eval| {
+            self.browser_start_eval_pending = std.mem.sliceTo(raw_start_eval, 0).len > 0;
+        }
         // Wait a couple of app-loop turns so this exercises the same path as a
         // user click after the window is live instead of front-loading browser
         // creation before the first frame.
@@ -6083,7 +6120,7 @@ pub const AppState = struct {
         self.browser_state.setControlsVisible(true);
         self.browser_address_focused = true;
         self.browser_address_cursor = self.browser_state.addressInput().len;
-        self.browser_pane_focused = false;
+        self.unfocusBrowserPane();
         self.terminal_focused = false;
         self.composer_focused = false;
         self.browser_state.status = .opening;
@@ -6110,12 +6147,13 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser opened.");
     }
 
-    /// Closes the browser dock and fully tears the runtime down so CEF exits until the next open.
+    /// Closes the browser dock and fully tears the browser runtime down until the next open.
     pub fn closeBrowser(self: *AppState) void {
         self.browser_state.setControlsVisible(false);
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
-        self.browser_pane_focused = false;
+        self.browser_surface_suspended_for_palette_overlay = false;
+        self.unfocusBrowserPane();
         self.browser_pane_hovered = false;
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
@@ -6130,7 +6168,8 @@ pub const AppState = struct {
         self.browser_state.setControlsVisible(false);
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
-        self.browser_pane_focused = false;
+        self.browser_surface_suspended_for_palette_overlay = false;
+        self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
         self.browser_state.controller.hide() catch |err| {
@@ -6143,14 +6182,56 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser hidden.");
     }
 
+    /// Temporarily hides the native browser surface while the host SDL window is hidden/minimized.
+    pub fn suspendBrowserForHostWindowHidden(self: *AppState) void {
+        if (!self.isBrowserVisible()) return;
+        self.unfocusBrowserPane();
+        self.browser_address_focused = false;
+        self.browser_state.controller.hide() catch |err| {
+            log.warn("failed to hide browser runtime for host window lifecycle: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to hide browser runtime while the app window changed visibility.") catch {};
+            return;
+        };
+        self.suppressNextBrowserClosedEvent();
+    }
+
+    /// Restores a visible browser dock after the host SDL window is shown/restored.
+    pub fn resumeBrowserAfterHostWindowShown(self: *AppState) void {
+        if (!self.isBrowserVisible()) return;
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.warn("failed to restore browser runtime after host window lifecycle: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to restore browser runtime after the app window became visible.") catch {};
+            return;
+        };
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
     /// Reports whether the browser dock is visible in the chat workspace.
     pub fn isBrowserVisible(self: *const AppState) bool {
         return self.browser_state.controls_visible;
     }
 
-    /// Reports whether the current browser runtime can host the bundled CEF inspector.
+    /// Reports whether the current browser runtime can host the bundled page inspector.
     pub fn canUseBrowserInspector(self: *const AppState) bool {
-        return self.browser_state.controller.runtimeKind() == .cef and self.browser_state.controller.sdkConfigured();
+        return self.browser_state.controller.supportsInspector();
+    }
+
+    fn browserBridgePolicyAllowsCurrentPage(self: *const AppState) bool {
+        const page_url = if (self.browser_state.current_url) |url| url else self.browser_state.addressInput();
+        return (browser_runtime.BridgePolicy{
+            .allow_untrusted = browserBridgePolicyAllowsUntrustedPages(),
+        }).allowsHostMessaging(page_url);
+    }
+
+    fn browserBridgePolicyAllowsUntrustedPages() bool {
+        const raw = std.c.getenv("VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE") orelse return false;
+        const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), &std.ascii.whitespace);
+        return std.mem.eql(u8, value, "1") or
+            std.ascii.eqlIgnoreCase(value, "true") or
+            std.ascii.eqlIgnoreCase(value, "yes");
     }
 
     /// Reports whether the bundled browser inspector is currently armed.
@@ -6181,11 +6262,115 @@ pub const AppState = struct {
         self.browser_pane_max = max;
         self.browser_pane_input_size = input_size;
         self.browser_pane_hovered = hovered;
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Records the app window origin used to place native child/overlay browser surfaces.
+    pub fn noteAppWindowFrame(self: *AppState, screen_x: i32, screen_y: i32, display_scale: f32) void {
+        self.app_window_screen_origin = .{ screen_x, screen_y };
+        self.app_window_display_scale = @max(display_scale, 0.001);
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    fn syncBrowserPaneBoundsToBackend(self: *AppState) void {
+        if (!self.isBrowserVisible()) return;
+        if (self.browser_pane_max[0] <= self.browser_pane_min[0] or self.browser_pane_max[1] <= self.browser_pane_min[1]) return;
+        if (self.syncBrowserSurfaceOcclusion()) return;
+        const pane_width = self.browser_pane_max[0] - self.browser_pane_min[0];
+        const pane_height = self.browser_pane_max[1] - self.browser_pane_min[1];
+        const uses_native_surface = switch (self.browser_state.controller.presentationKind()) {
+            .native_child_view, .helper_window => true,
+            .snapshot_texture, .offscreen_texture, .stub => false,
+        };
+        const scale = if (uses_native_surface) @max(self.app_window_display_scale, 0.001) else 1.0;
+        const x = self.app_window_screen_origin[0] + @as(i32, @intFromFloat(@round(self.browser_pane_min[0] / scale)));
+        const y = self.app_window_screen_origin[1] + @as(i32, @intFromFloat(@round(self.browser_pane_min[1] / scale)));
+        const width: u32 = @intFromFloat(@max(@round(pane_width / scale), 1.0));
+        const height: u32 = @intFromFloat(@max(@round(pane_height / scale), 1.0));
+        self.browser_state.controller.setPaneBounds(.{
+            .screen_x = x,
+            .screen_y = y,
+            .width = width,
+            .height = height,
+        }) catch |err| {
+            log.warn("failed to sync browser pane bounds: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn syncBrowserSurfaceOcclusion(self: *AppState) bool {
+        const blocked = self.browserBlockedByPaletteOverlay();
+        if (blocked) {
+            if (!self.browser_surface_suspended_for_palette_overlay) {
+                self.browser_state.controller.hide() catch |err| {
+                    log.warn("failed to hide browser runtime for palette overlay: {s}", .{@errorName(err)});
+                    self.browser_state.status = .failed;
+                    self.browser_state.setLastError("Failed to hide browser runtime for Palette overlay.") catch {};
+                    return true;
+                };
+                self.suppressNextBrowserClosedEvent();
+                self.browser_surface_suspended_for_palette_overlay = true;
+                self.unfocusBrowserPane();
+            }
+            return true;
+        }
+
+        if (self.browser_surface_suspended_for_palette_overlay) {
+            self.browser_surface_suspended_for_palette_overlay = false;
+            self.browser_state.status = .opening;
+            self.browser_state.controller.show() catch |err| {
+                log.warn("failed to restore browser runtime after palette overlay: {s}", .{@errorName(err)});
+                self.browser_state.status = .failed;
+                self.browser_state.setLastError("Failed to restore browser runtime after Palette overlay.") catch {};
+                return false;
+            };
+        }
+        return false;
+    }
+
+    fn browserBlockedByPaletteOverlay(self: *const AppState) bool {
+        return self.show_project_creator or
+            self.rename_project_index != null or
+            self.thread_import_provider != null or
+            self.modal_image_path != null or
+            self.transcript_selection_text != null or
+            self.palette_modal_text_focus != .none or
+            self.browser_inspector_menu_open or
+            self.workspace_header_open_menu_open or
+            self.sidebar_context_menu_open or
+            self.composer_locked_model_picker_open or
+            self.palette_composer.active_menu != null or
+            self.palette_model_cascade.isOpen();
+    }
+
+    fn suppressNextBrowserClosedEvent(self: *AppState) void {
+        self.browser_suppressed_closed_events = std.math.add(u8, self.browser_suppressed_closed_events, 1) catch std.math.maxInt(u8);
+    }
+
+    fn consumeSuppressedBrowserClosedEvent(self: *AppState) bool {
+        if (self.browser_suppressed_closed_events == 0) return false;
+        self.browser_suppressed_closed_events -= 1;
+        return true;
     }
 
     /// Clears browser-pane keyboard focus when another UI surface takes ownership.
     pub fn unfocusBrowserPane(self: *AppState) void {
+        const was_focused = self.browser_pane_focused;
         self.browser_pane_focused = false;
+        if (was_focused) {
+            self.browser_state.controller.blur() catch |err| {
+                log.warn("failed to clear native browser focus: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn focusBrowserPane(self: *AppState) void {
+        self.browser_pane_focused = true;
+        self.terminal_focused = false;
+        self.composer_focused = false;
+        self.browser_address_focused = false;
+        self.browser_state.controller.focus() catch |err| {
+            log.warn("failed to focus native browser surface: {s}", .{@errorName(err)});
+        };
     }
 
     /// Reports whether the browser pane currently owns keyboard input.
@@ -6212,7 +6397,7 @@ pub const AppState = struct {
         const contains_pointer = self.browserPaneContains(event.x, event.y);
         const is_pointer_event = event.button != null or event.wheel_x != 0.0 or event.wheel_y != 0.0;
         if (event.button != null and event.pressed and !contains_pointer) {
-            self.browser_pane_focused = false;
+            self.unfocusBrowserPane();
             return false;
         }
         if (!contains_pointer and !self.browser_pane_focused) return false;
@@ -6221,6 +6406,9 @@ pub const AppState = struct {
             if (event.pressed and (button == .back or button == .forward)) {
                 self.navigateBrowserHistory(if (button == .back) -1 else 1);
                 return true;
+            }
+            if (event.pressed and contains_pointer) {
+                self.focusBrowserPane();
             }
         }
 
@@ -6237,11 +6425,11 @@ pub const AppState = struct {
             return false;
         };
         if (handled and contains_pointer and event.button != null and event.pressed) {
-            self.browser_pane_focused = true;
-            self.terminal_focused = false;
-            self.composer_focused = false;
+            self.focusBrowserPane();
         }
-        return handled;
+        if (handled) return true;
+
+        return contains_pointer and is_pointer_event and self.browser_state.controller.presentationKind() == .native_child_view;
     }
 
     /// Forwards browser-pane keyboard and text input when the pane owns focus.
@@ -6295,6 +6483,38 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser navigation requested.");
     }
 
+    /// Navigates typed addresses or reloads when the URL bar already matches the current page.
+    pub fn navigateOrReloadBrowserFromAddress(self: *AppState) void {
+        const trimmed = std.mem.trim(u8, self.browser_state.addressInput(), &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.reloadBrowser();
+            return;
+        }
+        const normalized = self.normalizeBrowserUrl(trimmed) catch {
+            self.setSidebarNotice("Failed to normalize browser URL.");
+            return;
+        };
+        defer self.allocator.free(normalized);
+
+        if (self.browser_state.current_url) |current_url| {
+            if (std.mem.eql(u8, current_url, normalized)) {
+                self.reloadBrowser();
+                return;
+            }
+        }
+
+        self.browser_state.status = .opening;
+        self.browser_state.controller.navigate(normalized) catch |err| {
+            log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
+            self.setSidebarNotice("Browser navigation failed.");
+            return;
+        };
+        self.browser_state.setAddress(normalized);
+        self.setSidebarNotice("Browser navigation requested.");
+    }
+
     /// Evaluates the current browser JavaScript input inside the browser runtime.
     pub fn evalBrowserScript(self: *AppState) void {
         const trimmed = std.mem.trim(u8, self.browser_state.scriptInput(), &std.ascii.whitespace);
@@ -6331,7 +6551,7 @@ pub const AppState = struct {
         self.setSidebarNotice("Browser JSON bridge requested.");
     }
 
-    /// Toggles the bundled page inspector overlay inside the CEF browser runtime.
+    /// Toggles the bundled page inspector overlay inside the browser runtime.
     pub fn toggleBrowserInspector(self: *AppState) void {
         if (self.browser_state.inspectorEnabled()) {
             self.disableBrowserInspector(true);
@@ -6373,8 +6593,11 @@ pub const AppState = struct {
                     self.browser_state.setLastError(null) catch {};
                 },
                 .closed => {
-                    self.browser_state.status = .hidden;
                     self.browser_pane_focused = false;
+                    if (self.consumeSuppressedBrowserClosedEvent()) {
+                        continue;
+                    }
+                    self.browser_state.status = .hidden;
                     self.setSidebarNotice("Browser window closed.");
                 },
                 .navigated => |url| {
@@ -6386,8 +6609,16 @@ pub const AppState = struct {
                 .title_changed => {},
                 .document_loaded => {
                     self.reapplyBrowserInspectorAfterLoad();
+                    self.runBrowserStartupEvalIfRequested();
                 },
                 .js_message => |message| {
+                    if (!self.browserBridgePolicyAllowsCurrentPage()) {
+                        const page_url = if (self.browser_state.current_url) |url| url else self.browser_state.addressInput();
+                        log.warn("blocked browser bridge message from disallowed page URL: {s}", .{page_url});
+                        self.browser_state.setLastError("Browser bridge message rejected by origin policy.") catch {};
+                        self.setSidebarNotice("Browser bridge message blocked for this page.");
+                        continue;
+                    }
                     if (isBrowserClipboardMessage(message)) {
                         self.handleBrowserClipboardMessage(message);
                         continue;
@@ -6433,13 +6664,33 @@ pub const AppState = struct {
 
     // Adds an https scheme for bare hostnames so the browser control surface accepts normal typed URLs.
     fn normalizeBrowserUrl(self: *AppState, value: []const u8) ![]u8 {
-        if (std.mem.indexOf(u8, value, "://") != null) {
-            return try self.allocator.dupe(u8, value);
-        }
-        if (std.mem.startsWith(u8, value, "about:")) {
+        if (hasUriScheme(value)) {
             return try self.allocator.dupe(u8, value);
         }
         return try std.fmt.allocPrint(self.allocator, "https://{s}", .{value});
+    }
+
+    fn hasUriScheme(value: []const u8) bool {
+        return std.mem.indexOf(u8, value, "://") != null or
+            std.mem.startsWith(u8, value, "about:") or
+            std.mem.startsWith(u8, value, "data:") or
+            std.mem.startsWith(u8, value, "file:") or
+            std.mem.startsWith(u8, value, "blob:") or
+            std.mem.startsWith(u8, value, "javascript:") or
+            std.mem.startsWith(u8, value, "mailto:");
+    }
+
+    fn runBrowserStartupEvalIfRequested(self: *AppState) void {
+        if (!self.browser_start_eval_pending) return;
+        self.browser_start_eval_pending = false;
+        const raw_script = std.c.getenv("VERDE_BROWSER_START_EVAL") orelse return;
+        const script = std.mem.sliceTo(raw_script, 0);
+        if (script.len == 0) return;
+        self.browser_state.controller.eval(script) catch |err| {
+            log.warn("failed to run browser startup eval: {s}", .{@errorName(err)});
+            self.browser_state.setLastError("Failed to run browser startup eval.") catch {};
+            self.setSidebarNotice("Browser startup eval failed.");
+        };
     }
 
     fn inspectorModeStoredNotice(mode: browser_runtime.InspectorMode) []const u8 {
@@ -6646,7 +6897,11 @@ pub const AppState = struct {
             return;
         }
         if (!self.canUseBrowserInspector()) {
-            self.setSidebarNotice("The browser inspector currently requires a real CEF runtime.");
+            self.setSidebarNotice("The browser inspector is not available for this browser backend.");
+            return;
+        }
+        if (!self.browserBridgePolicyAllowsCurrentPage()) {
+            self.setSidebarNotice("Browser inspector is only available for app and localhost pages.");
             return;
         }
 
@@ -7972,7 +8227,7 @@ pub const AppState = struct {
     pub fn requestComposerFocus(self: *AppState) void {
         self.composer_focus_requested = true;
         self.terminal_focused = false;
-        self.browser_pane_focused = false;
+        self.unfocusBrowserPane();
     }
 
     pub fn requestTerminalFocus(self: *AppState) void {
@@ -7989,7 +8244,7 @@ pub const AppState = struct {
         self.terminal_focused = true;
         self.composer_focused = false;
         self.palette_composer.focused = false;
-        self.browser_pane_focused = false;
+        self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.palette_modal_text_focus = .none;
     }
@@ -8267,7 +8522,7 @@ pub const AppState = struct {
         self.composer_focused = self.palette_composer.focused;
         if (self.composer_focused) {
             self.terminal_focused = false;
-            self.browser_pane_focused = false;
+            self.unfocusBrowserPane();
         }
         return handled or was_focused != self.palette_composer.focused;
     }
@@ -8305,7 +8560,7 @@ pub const AppState = struct {
         self.composer_focused = self.palette_composer.focused;
         if (self.composer_focused) {
             self.terminal_focused = false;
-            self.browser_pane_focused = false;
+            self.unfocusBrowserPane();
         }
         if (handled) self.noteInteraction();
         return handled or was_focused != self.palette_composer.focused;
@@ -8418,7 +8673,7 @@ pub const AppState = struct {
         self.palette_composer.dragging_selection = false;
         self.composer_focused = true;
         self.terminal_focused = false;
-        self.browser_pane_focused = false;
+        self.unfocusBrowserPane();
         self.ensurePaletteComposerCursorVisible();
         self.noteInteraction();
         return true;
@@ -8511,12 +8766,25 @@ pub const AppState = struct {
     }
 
     pub fn navigateBrowserHistory(self: *AppState, delta: i32) void {
-        const script = if (delta < 0) "history.back()" else "history.forward()";
-        self.browser_state.controller.eval(script) catch |err| {
+        const result = if (delta < 0)
+            self.browser_state.controller.goBack()
+        else
+            self.browser_state.controller.goForward();
+        result catch |err| {
             log.warn("failed to navigate browser history: {s}", .{@errorName(err)});
             self.browser_state.setLastError("Failed to navigate browser history.") catch {};
             return;
         };
+        self.markDirty();
+    }
+
+    pub fn reloadBrowser(self: *AppState) void {
+        self.browser_state.controller.reload() catch |err| {
+            log.warn("failed to reload browser: {s}", .{@errorName(err)});
+            self.browser_state.setLastError("Failed to reload browser.") catch {};
+            return;
+        };
+        self.setSidebarNotice("Browser reload requested.");
         self.markDirty();
     }
 
@@ -8563,6 +8831,8 @@ pub const AppState = struct {
             \\(function(){
             \\  const post=(text)=>{
             \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:true});
+            \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
+            \\    if(window.__VERDE_CEF_IPC__&&typeof window.__VERDE_CEF_IPC__.postMessage==='function'){window.__VERDE_CEF_IPC__.postMessage(payload);return;}
             \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
             \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
             \\  };
@@ -8596,6 +8866,8 @@ pub const AppState = struct {
             \\(function(){
             \\  const post=(text)=>{
             \\    const payload=JSON.stringify({source:'verde-browser-clipboard',text:String(text||''),cut:false});
+            \\    if(window.__VERDE_BROWSER_IPC__&&typeof window.__VERDE_BROWSER_IPC__.postMessage==='function'){window.__VERDE_BROWSER_IPC__.postMessage(payload);return;}
+            \\    if(window.__VERDE_CEF_IPC__&&typeof window.__VERDE_CEF_IPC__.postMessage==='function'){window.__VERDE_CEF_IPC__.postMessage(payload);return;}
             \\    if(window.verde&&typeof window.verde.postMessage==='function'){window.verde.postMessage(payload);return;}
             \\    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.verde){window.webkit.messageHandlers.verde.postMessage(payload);}
             \\  };

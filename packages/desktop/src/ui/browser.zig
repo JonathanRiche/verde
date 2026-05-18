@@ -141,7 +141,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .navigate => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
-                state.navigateBrowserFromAddress();
+                state.navigateOrReloadBrowserFromAddress();
             },
             .inspect_toggle => {
                 blurAddress(state);
@@ -816,7 +816,7 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
             );
             state.palette_overlay_batch.image(
                 state.allocator,
-                .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = pane_rect.h },
+                snapRect(pane_rect),
                 palette.TextureId.init(pane_texture.texture_id),
                 .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
                 paletteColor(theme.COLOR_WHITE),

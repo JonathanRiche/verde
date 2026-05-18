@@ -36,11 +36,14 @@ APP_DIR="$WORK_DIR/Verde.app"
 DMG_DIR="$WORK_DIR/dmg"
 ICON_FILE="$APP_DIR/Contents/Resources/verde.icns"
 
-source "$SCRIPT_DIR/cef-common.sh"
+BROWSER_BACKEND="${VERDE_BROWSER_BACKEND:-native_webview}"
 need_cmd zig
-need_cmake
 need_cmd bash
 need_cmd xcrun
+if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+  source "$SCRIPT_DIR/cef-common.sh"
+  need_cmake
+fi
 
 set_macos_build_version() {
   local binary="$1"
@@ -80,6 +83,27 @@ copy_node_runtime() {
   cp -a "$source_dir/." "$destination_dir/"
 }
 
+assert_no_cef_payload() {
+  local app_dir="$1"
+  local macos_dir="$app_dir/Contents/MacOS"
+  local cef_payload=(
+    "verde-browser-cef"
+    "verde-browser-cef-process"
+    "Chromium Embedded Framework.framework"
+  )
+
+  if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+    return
+  fi
+
+  for name in "${cef_payload[@]}"; do
+    if [[ -e "$macos_dir/$name" ]]; then
+      echo "native webview app unexpectedly contains CEF payload: Contents/MacOS/$name" >&2
+      exit 1
+    fi
+  done
+}
+
 mkdir -p "$OUTPUT_DIR"
 
 cd "$REPO_ROOT/packages/desktop"
@@ -99,11 +123,11 @@ compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.solid.frag.
 compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.text.frag.msl"
 compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.image.frag.msl"
 
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR")
-if [[ "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" "-Dbrowser-backend=$BROWSER_BACKEND")
+if [[ "$BROWSER_BACKEND" == "cef" && "${VERDE_CEF_DISABLE_DOWNLOAD:-0}" != "1" ]]; then
   verde_cef_ensure_sdk macos "$ARCH"
   BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
-elif [[ -n "${VERDE_CEF_SDK_PATH:-}" ]]; then
+elif [[ "$BROWSER_BACKEND" == "cef" && -n "${VERDE_CEF_SDK_PATH:-}" ]]; then
   BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH")
 fi
 "${BUILD_ARGS[@]}"
@@ -115,16 +139,19 @@ mkdir -p \
 install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
 ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
-if [[ -x "$PREFIX_DIR/bin/verde-browser-cef" ]]; then
-  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$APP_DIR/Contents/MacOS/verde-browser-cef"
+if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+  if [[ -x "$PREFIX_DIR/bin/verde-browser-cef" ]]; then
+    install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$APP_DIR/Contents/MacOS/verde-browser-cef"
+  fi
+  if [[ -x "$PREFIX_DIR/bin/verde-browser-cef-process" ]]; then
+    install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$APP_DIR/Contents/MacOS/verde-browser-cef-process"
+  fi
+  if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
+    ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
+      "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
+  fi
 fi
-if [[ -x "$PREFIX_DIR/bin/verde-browser-cef-process" ]]; then
-  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$APP_DIR/Contents/MacOS/verde-browser-cef-process"
-fi
-if [[ -d "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" ]]; then
-  ditto "$PREFIX_DIR/bin/Chromium Embedded Framework.framework" \
-    "$APP_DIR/Contents/MacOS/Chromium Embedded Framework.framework"
-fi
+assert_no_cef_payload "$APP_DIR"
 copy_node_runtime "$APP_DIR/Contents/Resources/node_modules"
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 

@@ -376,7 +376,9 @@ class VerdeApp final : public CefApp, public CefRenderProcessHandler {
         "postMessage",
         CefV8Value::CreateFunction("postMessage", handler),
         V8_PROPERTY_ATTRIBUTE_NONE);
+    global->SetValue("__VERDE_BROWSER_IPC__", bridge, V8_PROPERTY_ATTRIBUTE_NONE);
     global->SetValue("__VERDE_CEF_IPC__", bridge, V8_PROPERTY_ATTRIBUTE_NONE);
+    global->SetValue("verde", bridge, V8_PROPERTY_ATTRIBUTE_NONE);
   }
 
  private:
@@ -947,6 +949,34 @@ extern "C" int verde_cef_post_json(const char* json) {
       "(function(){const payload=" + std::string(json) +
       ";window.dispatchEvent(new MessageEvent('verde-host-message',{data:payload}));})();";
   return verde_cef_eval(script.c_str());
+}
+
+extern "C" int verde_cef_go_back() {
+  if (!g_runtime.browser) {
+    return 0;
+  }
+  if (g_runtime.browser->CanGoBack()) {
+    g_runtime.browser->GoBack();
+  }
+  return 1;
+}
+
+extern "C" int verde_cef_go_forward() {
+  if (!g_runtime.browser) {
+    return 0;
+  }
+  if (g_runtime.browser->CanGoForward()) {
+    g_runtime.browser->GoForward();
+  }
+  return 1;
+}
+
+extern "C" int verde_cef_reload() {
+  if (!g_runtime.browser) {
+    return 0;
+  }
+  g_runtime.browser->Reload();
+  return 1;
 }
 
 extern "C" int verde_cef_send_mouse_move(double x,

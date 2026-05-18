@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window") orelse false;
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu") orelse .sdl_gpu;
+    const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview, cef, or stub") orelse .native_webview;
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
     const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the executable") orelse
         b.graph.environ_map.get("VERDE_SDL3_RUNTIME_LIB") orelse
@@ -12,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK") orelse false;
     const cef_supported = target.result.os.tag == .linux or target.result.os.tag == .macos;
     const cef_sdk_configured = cef_sdk_path != null and cef_supported;
+    const build_cef_backend = browser_backend == .cef and cef_sdk_configured and !cef_stub_preview;
     const fff_root = b.path("../../vendor/fff");
     const fff_lib_name = switch (target.result.os.tag) {
         .windows => "fff_c.dll",
@@ -58,8 +60,18 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "ui_debug", ui_debug);
     build_options.addOption(PaletteRendererBackend, "palette_renderer", palette_renderer);
+    build_options.addOption(BrowserBackendKind, "browser_backend", browser_backend);
     build_options.addOption(bool, "cef_sdk_configured", cef_sdk_configured);
     build_options.addOption(bool, "cef_stub_preview", cef_stub_preview);
+    const build_options_module = build_options.createModule();
+    const browser_contract = b.createModule(.{
+        .root_source_file = b.path("src/browser/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_module },
+        },
+    });
 
     const build_inspector_bundle = b.addSystemCommand(&.{
         "bun",
@@ -88,7 +100,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "palette", .module = palette_module },
@@ -132,8 +144,19 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkSystemLibrary("util", .{});
         },
         .windows => {
+            exe.root_module.link_libcpp = true;
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/browser/platform/windows_webview2.cpp"),
+                .flags = &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" },
+            });
             exe.root_module.linkSystemLibrary("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            exe.root_module.linkSystemLibrary("advapi32", .{});
+            exe.root_module.linkSystemLibrary("ole32", .{});
+            exe.root_module.linkSystemLibrary("shell32", .{});
+            exe.root_module.linkSystemLibrary("shlwapi", .{});
+            exe.root_module.linkSystemLibrary("user32", .{});
+            exe.root_module.linkSystemLibrary("version", .{});
         },
         .macos => {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
@@ -147,6 +170,10 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},
             });
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/browser/platform/macos_wkwebview.m"),
+                .flags = &.{ "-fobjc-arc", "-fblocks" },
+            });
             if (b.graph.environ_map.get("HOMEBREW_PREFIX")) |prefix| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
@@ -155,6 +182,7 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkFramework("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkFramework("AppKit", .{});
+            exe.root_module.linkFramework("WebKit", .{});
         },
         else => {},
     }
@@ -178,7 +206,7 @@ pub fn build(b: *std.Build) void {
         } else |_| {}
     }
     b.getInstallStep().dependOn(&install_exe.step);
-    if (target.result.os.tag == .linux and !cef_sdk_configured) {
+    if (target.result.os.tag == .linux and browser_backend == .native_webview) {
         const browser_helper = b.addExecutable(.{
             .name = "verde-browser-linux",
             .root_module = b.createModule(.{
@@ -195,9 +223,10 @@ pub fn build(b: *std.Build) void {
         });
         browser_helper.root_module.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
         browser_helper.root_module.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("x11", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
     }
-    if (cef_sdk_configured) {
+    if (build_cef_backend) {
         const build_cef_helper = b.addSystemCommand(&.{
             "bash",
             "-lc",
@@ -314,13 +343,26 @@ pub fn build(b: *std.Build) void {
         chat_markdown_tests.root_module.linkSystemLibrary("util", .{});
     }
     test_step.dependOn(&b.addRunArtifact(chat_markdown_tests).step);
+    const browser_contract_tests = b.addTest(.{
+        .root_module = browser_contract,
+    });
+    browser_contract_tests.root_module.link_libc = true;
+    if (target.result.os.tag == .linux) {
+        if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
+            browser_contract_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
+        }
+        browser_contract_tests.root_module.linkSystemLibrary("SDL3", .{});
+        browser_contract_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
+        browser_contract_tests.root_module.linkSystemLibrary("util", .{});
+    }
+    test_step.dependOn(&b.addRunArtifact(browser_contract_tests).step);
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "build_options", .module = build_options_module },
                 .{ .name = "browser_inspector_bundle", .module = inspector_bundle_module },
                 .{ .name = "ghostty-vt", .module = ghostty.module("ghostty-vt") },
                 .{ .name = "palette", .module = palette.module("palette") },
@@ -356,8 +398,26 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/platform/macos_clipboard.m"),
             .flags = &.{},
         });
+        exe_tests.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/macos_wkwebview.m"),
+            .flags = &.{ "-fobjc-arc", "-fblocks" },
+        });
         exe_tests.root_module.linkFramework("SDL3", .{});
         exe_tests.root_module.linkFramework("AppKit", .{});
+        exe_tests.root_module.linkFramework("WebKit", .{});
+    } else if (target.result.os.tag == .windows) {
+        exe_tests.root_module.link_libcpp = true;
+        exe_tests.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/windows_webview2.cpp"),
+            .flags = &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" },
+        });
+        exe_tests.root_module.linkSystemLibrary("SDL3", .{});
+        exe_tests.root_module.linkSystemLibrary("advapi32", .{});
+        exe_tests.root_module.linkSystemLibrary("ole32", .{});
+        exe_tests.root_module.linkSystemLibrary("shell32", .{});
+        exe_tests.root_module.linkSystemLibrary("shlwapi", .{});
+        exe_tests.root_module.linkSystemLibrary("user32", .{});
+        exe_tests.root_module.linkSystemLibrary("version", .{});
     }
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
@@ -367,6 +427,12 @@ pub fn build(b: *std.Build) void {
 
 const PaletteRendererBackend = enum {
     sdl_gpu,
+};
+
+const BrowserBackendKind = enum {
+    native_webview,
+    cef,
+    stub,
 };
 
 fn defaultSystemSdl3Runtime(b: *std.Build) ?[]const u8 {

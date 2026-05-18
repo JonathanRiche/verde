@@ -3699,13 +3699,13 @@ test "builds a body view with headings lists and fenced code" {
     }
 
     switch (body.blockAt(2)) {
-        .text => |text| try std.testing.expectEqualStrings("- first item", text.text),
+        .text => |text| try std.testing.expectEqualStrings("•  first item", text.text),
         else => unreachable,
     }
 
     switch (body.blockAt(3)) {
         .text => |text| {
-            try std.testing.expectEqualStrings("- second item with bold and soft", text.text);
+            try std.testing.expectEqualStrings("•  second item with bold and soft", text.text);
 
             var found_bold = false;
             var found_soft = false;

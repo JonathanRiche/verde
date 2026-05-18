@@ -100,6 +100,7 @@ fn printHelp(out: output.Output) !void {
         \\  inspect --pane <id> [--project <id|index|current>] [--json]
         \\  pane focus|split|resize|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
+        \\  browser eval|post-json ...
         \\  terminal write|tail|screen --pane <id> ...
         \\  process list|inspect|start|stop|restart|logs ...
         \\  stack status|start|stop|restart ...
@@ -276,6 +277,10 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         try handleLiveChat(allocator, out, io, argv, json);
         return;
     }
+    if (std.mem.eql(u8, command, "browser")) {
+        try handleLiveBrowser(allocator, out, io, argv, json);
+        return;
+    }
     if (std.mem.eql(u8, command, "terminal")) {
         try handleLiveTerminal(allocator, out, io, argv, json);
         return;
@@ -374,6 +379,27 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     const method = try std.fmt.allocPrint(allocator, "chat.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live browser command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "eval")) {
+        try sendLiveRequest(allocator, out, io, "browser.eval", .{
+            .script = args.optionValue(argv, "--script") orelse trailingFreeArg(argv, 2) orelse "",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "post-json")) {
+        try sendLiveRequest(allocator, out, io, "browser.postJson", .{
+            .json = args.optionValue(argv, "--json-payload") orelse trailingFreeArg(argv, 2) orelse "",
+        }, json);
+        return;
+    }
+    try out.stderr("unknown live browser command: {s}\n", .{subcommand});
+    std.process.exit(2);
 }
 
 fn handleLiveTerminal(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
