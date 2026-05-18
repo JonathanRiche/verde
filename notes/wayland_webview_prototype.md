@@ -53,6 +53,44 @@ Important limitations:
 
 - After terminating the app, `pgrep -af 'verde-browser-linux|zig-out/bin/verde|mise run dev'` returned no remaining app/helper processes.
 
+## Snapshot Performance Follow-up
+
+The snapshot path now carries a monotonic `frame_sequence` from the WebKitGTK helper to the app over the JSON-line helper protocol. The helper writes each published frame to a sequence-specific path such as `/tmp/verde-browser-linux-frame-<pid>-<sequence>.rgba`, and the app stores only the newest announced sequence. If an older frame event arrives after a newer one, the app discards it and deletes that stale frame file.
+
+The app now uploads at most one pending native WebKitGTK frame per `AppState.pollBrowser()` render tick. Browser event draining no longer triggers repeated native snapshot uploads inside the same browser poll loop. Replaced-but-not-uploaded frames are deleted, so rapid scrolling should prefer the newest available frame instead of uploading a backlog.
+
+Timing diagnostics were added around the file-backed snapshot path:
+
+- Helper stderr logs snapshot sequence, WebKit capture duration, scale duration, file write duration, byte count, source/output size, whether scaling occurred, and whether another request was queued while capture was pending.
+- App logs snapshot read duration and texture upload duration per uploaded sequence.
+- App logs total render-tick upload duration when a frame was uploaded.
+
+Snapshot request throttling remains conservative:
+
+- Direct diagnostic helper-window mode still suppresses snapshot requests.
+- Hidden helper windows no longer start new snapshot requests.
+- Size-change requests still coalesce through the existing `snapshot_pending` / `snapshot_requested_while_pending` path.
+- Scaling still only runs when WebKit returns a different size than the requested pane size.
+
+The file transfer path is still the active implementation. The next low-risk performance step is to reuse the CEF helper's existing shared-memory style as a model for WebKitGTK, using shm or memfd-backed frame slots so the helper can publish pixels without repeatedly creating and reading RGBA files. That should stay separate from the stale-frame fix unless file IO remains the measured bottleneck.
+
+Verification commands used after this pass:
+
+```bash
+cc -fsyntax-only packages/desktop/src/browser/platform/linux_webkitgtk.c $(pkg-config --cflags gtk+-3.0 webkit2gtk-4.1 x11)
+zig build --release=safe -Dbrowser-backend=native_webview --summary all
+VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+./packages/desktop/zig-out/bin/verde live status --json
+VERDE_BROWSER_LINUX_WAYLAND_HELPER=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+./packages/desktop/zig-out/bin/verde live status --json
+```
+
+Fresh live-status evidence:
+
+- Default launch reported `runtime_kind: "native_webview"`, `presentation_kind: "snapshot_texture"`, `runtime_initialized: true`, `visible: true`, and URL `https://lytx.io/`.
+- Diagnostic launch with `VERDE_BROWSER_LINUX_WAYLAND_HELPER=1` reported `runtime_kind: "native_webview"`, `presentation_kind: "helper_window"`, `runtime_initialized: true`, `visible: true`, and URL `https://lytx.io/`.
+- After terminating the smoke-test app processes, `pgrep -af 'verde-browser-linux|zig-out/bin/verde|mise run dev'` returned no remaining app/helper processes.
+
 ## Current Blocker
 
 The helper can create a GTK/WebKit Wayland toplevel and position it as a diagnostic overlay, but this is not yet a true child/subsurface of the SDL window. GTK 3/WebKitGTK does not expose a stable public API in this code path for taking the WebKit widget's internal `wl_surface` and reparenting it under SDL's `wl_surface` with the Wayland subsurface protocol.

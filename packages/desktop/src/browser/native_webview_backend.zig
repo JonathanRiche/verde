@@ -9,6 +9,8 @@ const browser_types = @import("types.zig");
 const DEFAULT_PANE_WIDTH: u32 = 1280;
 const DEFAULT_PANE_HEIGHT: u32 = 720;
 
+const log = std.log.scoped(.native_webview);
+
 const PlatformController = switch (builtin.os.tag) {
     .windows => @import("platform/windows_webview2.zig").Controller,
     .macos => @import("platform/macos_wkwebview.zig").Controller,
@@ -222,10 +224,20 @@ pub const Backend = struct {
 
     /// Returns the next event from the native platform backend, if available.
     pub fn popEvent(self: *Backend) ?browser_types.Event {
-        if (builtin.os.tag == .linux) {
-            self.platform.uploadFrame(&self.pane_texture) catch {};
-        }
         return self.platform.popEvent();
+    }
+
+    /// Uploads at most one pending platform frame for the current app render tick.
+    pub fn uploadFrame(self: *Backend) void {
+        if (builtin.os.tag != .linux) return;
+        const upload_start = monotonicTimestampNs();
+        const uploaded = self.platform.uploadFrame(&self.pane_texture) catch |err| {
+            log.warn("snapshot render_tick upload failed: {}", .{err});
+            return;
+        };
+        if (!uploaded) return;
+        const upload_end = monotonicTimestampNs();
+        log.info("snapshot render_tick upload_ms={d:.3}", .{nanosToMillis(upload_end - upload_start)});
     }
 
     /// Alias used by the shared backend contract.
@@ -233,3 +245,14 @@ pub const Backend = struct {
         return self.popEvent();
     }
 };
+
+fn nanosToMillis(nanos: i128) f64 {
+    return @as(f64, @floatFromInt(nanos)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn monotonicTimestampNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(i128, @intCast(ts.nsec));
+}

@@ -6604,6 +6604,7 @@ pub const AppState = struct {
                 self.toggleBrowser();
             }
         }
+        self.browser_state.controller.uploadFrame();
         while (self.browser_state.controller.pollEvent()) |event| {
             defer event.deinit(self.allocator);
             switch (event) {

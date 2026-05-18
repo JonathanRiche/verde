@@ -26,7 +26,7 @@ extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64,
 extern fn verde_browser_linux_key_input(browser: ?*RawBrowser, key_code: c_uint, down: c_int, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const u8, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, payload: *?[*:0]u8) c_int;
-extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, width: *c_int, height: *c_int, byte_len: *usize) c_int;
+extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, width: *c_int, height: *c_int, byte_len: *usize) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
 
 const Mutex = struct {
@@ -300,14 +300,16 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
 
     while (true) {
         var frame_path: ?[*:0]u8 = null;
+        var frame_sequence: u64 = 0;
         var width: c_int = 0;
         var height: c_int = 0;
         var byte_len: usize = 0;
-        if (verde_browser_linux_poll_frame(browser, &frame_path, &width, &height, &byte_len) == 0) break;
+        if (verde_browser_linux_poll_frame(browser, &frame_path, &frame_sequence, &width, &height, &byte_len) == 0) break;
         defer if (frame_path != null) verde_browser_linux_free_string(frame_path);
 
         const event: ipc.Event = .{
             .kind = .frame_ready,
+            .frame_sequence = frame_sequence,
             .width = @intCast(@max(width, 0)),
             .height = @intCast(@max(height, 0)),
             .byte_len = byte_len,
