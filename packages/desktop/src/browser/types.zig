@@ -43,6 +43,12 @@ pub const PaneBounds = struct {
     height: u32 = 1,
 };
 
+/// Native Wayland handles exported by SDL for app-owned child surfaces.
+pub const LinuxWaylandHost = extern struct {
+    display: ?*anyopaque = null,
+    surface: ?*anyopaque = null,
+};
+
 /// Tracks the host-side lifecycle of the native browser runtime.
 pub const Status = enum {
     hidden,

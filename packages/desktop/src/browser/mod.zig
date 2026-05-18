@@ -7,6 +7,7 @@ pub const BrowserBackend = @import("contract.zig").BrowserBackend;
 pub const BridgePolicy = @import("bridge_policy.zig").Policy;
 pub const Event = @import("types.zig").Event;
 pub const KeyEvent = @import("input.zig").KeyEvent;
+pub const LinuxWaylandHost = @import("types.zig").LinuxWaylandHost;
 pub const MouseButton = @import("input.zig").MouseButton;
 pub const MouseEvent = @import("input.zig").MouseEvent;
 pub const RuntimeKind = @import("types.zig").RuntimeKind;
