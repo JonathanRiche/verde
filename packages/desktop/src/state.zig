@@ -2426,6 +2426,8 @@ pub const SendState = struct {
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
     pending_approval: ?PendingApproval = null,
+    ui_revision: u64 = 0,
+    polled_ui_revision: u64 = 0,
     pending_followup: ?PendingFollowup = null,
     pending_followup_signal_sent: bool = false,
     approval_decision: ?ai_harness.ApprovalDecision = null,
@@ -4481,6 +4483,8 @@ pub const AppState = struct {
         freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
         freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+        send_state.ui_revision = 1;
+        send_state.polled_ui_revision = 0;
         send_state.approval_decision = null;
         send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
@@ -9395,9 +9399,16 @@ pub const AppState = struct {
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
         const send_state = thread.send_state;
+        var stream_changed = false;
 
         if (!send_state.mutex.tryLock()) return false;
         switch (send_state.status) {
+            .pending => {
+                if (send_state.ui_revision != send_state.polled_ui_revision) {
+                    send_state.polled_ui_revision = send_state.ui_revision;
+                    stream_changed = true;
+                }
+            },
             .completed => {
                 completed_result = send_state.result;
                 send_state.result = null;
@@ -9554,7 +9565,7 @@ pub const AppState = struct {
         if (next_status == .completed or next_status == .aborted) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
-        return next_status != .idle;
+        return next_status != .idle or stream_changed;
     }
 
     fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {
@@ -9920,6 +9931,7 @@ pub const AppState = struct {
         defer send_state.mutex.unlock();
         if (send_state.pending_approval == null) return;
         send_state.approval_decision = decision;
+        send_state.ui_revision +%= 1;
         send_state.condition.broadcast();
     }
 
