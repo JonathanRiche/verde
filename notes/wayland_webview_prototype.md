@@ -168,9 +168,57 @@ Fresh live-status evidence:
 - Diagnostic launch with `VERDE_BROWSER_LINUX_WAYLAND_HELPER=1` reported `runtime_kind: "native_webview"`, `presentation_kind: "helper_window"`, `runtime_initialized: true`, `visible: true`, and URL `https://lytx.io/`.
 - After terminating the smoke-test app processes, `pgrep -af 'verde-browser-linux|zig-out/bin/verde|mise run dev'` returned no remaining app/helper processes.
 
+## WPE Exportable Render Target
+
+GTK/WebKitGTK is still useful as the conservative fallback, but it is the wrong primary path for a high-performance Wayland pane inside an SDL-owned app window. Local GTK 4 and WebKitGTK 6 headers expose APIs for GTK-owned widgets and GTK-owned Wayland surfaces, not an API for rendering a `WebKitWebView` into an externally supplied SDL child `wl_surface`.
+
+WPE WebKit is the better Wayland target for this app shape. It lets the app create an embedder-owned WPE view backend, load a `WebKitWebView`, and receive exported render frames. Those frames can then be imported into Verde's renderer or presented through an app-owned Wayland surface without the current WebKitGTK snapshot/readback/upload loop.
+
+A standalone probe now lives at:
+
+```text
+packages/desktop/src/browser/platform/linux_wpe_exportable_probe.c
+```
+
+Compile command:
+
+```bash
+cc -Wall -Wextra -o /tmp/verde-wpe-probe packages/desktop/src/browser/platform/linux_wpe_exportable_probe.c $(pkg-config --cflags --libs wpe-webkit-2.0 wpebackend-fdo-1.0 egl glib-2.0 gobject-2.0)
+```
+
+Runtime command used on Hyprland:
+
+```bash
+/tmp/verde-wpe-probe https://lytx.io/ 1280 720 1
+```
+
+Observed result:
+
+```text
+wpe-probe: backend=libWPEBackend-fdo-1.0.so
+wpe-probe: EGL initialized version=1.5
+wpe-probe: loading https://lytx.io/ at 1280x720 scale=1.00
+wpe-probe: load started uri=https://lytx.io/
+wpe-probe: exported EGL frame=1 size=1280x720 image=...
+wpe-probe: load committed uri=https://lytx.io/
+wpe-probe: exported EGL frame=2 size=1280x720 image=...
+wpe-probe: load finished uri=https://lytx.io/
+wpe-probe: summary frames=344 raw_egl=0 exported_egl=344 shm=0 exit=0
+```
+
+This proves the viable render target is WPEBackend-fdo exportable EGL frames. It does not yet prove final in-pane presentation, input routing, or popup/z-order behavior inside Verde.
+
+Recommended implementation sequence:
+
+1. Add a `VERDE_BROWSER_LINUX_WPE=1` helper/runtime path that owns the WPE view backend and exports EGL frames.
+2. Import each exported `EGLImageKHR` into the existing SDL/OpenGL texture path, or into a new app-owned Wayland presentation path if that is cleaner with the current renderer.
+3. Drive WPE size, scale, refresh rate, visibility, and focus from Verde's existing browser pane state.
+4. Translate Verde browser pane pointer, wheel, key, and text events to `wpe_view_backend_dispatch_*` calls so scrolling is native WebKit scrolling instead of snapshot polling.
+5. Keep `snapshot_texture` as the default until the WPE path renders `https://lytx.io/` visibly in the pane and passes focus, clipping, and z-order smoke tests.
+
 ## Current Blocker
 
-The helper can create a GTK/WebKit Wayland toplevel and position it as a diagnostic overlay, but this is not yet a true child/subsurface of the SDL window. GTK 3/WebKitGTK does not expose a stable public API in this code path for taking the WebKit widget's internal `wl_surface` and reparenting it under SDL's `wl_surface` with the Wayland subsurface protocol.
+The helper can create a GTK/WebKit Wayland toplevel and position it as a diagnostic overlay, but this is not yet a true child/subsurface of the SDL window. GTK/WebKitGTK does not expose a stable public API in this code path for taking the WebKit widget's internal `wl_surface` and reparenting it under SDL's `wl_surface` with the Wayland subsurface protocol.
 
 Local header inspection found:
 
