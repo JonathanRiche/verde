@@ -50,8 +50,14 @@ fn frameLogEnabled() bool {
 }
 
 pub fn configuredPresentationKind() browser_types.PresentationKind {
+    if (wpeEnabled()) return .offscreen_texture;
     if (waylandSubsurfaceEnabled()) return .native_wayland_surface;
     return if (visibleHelperEnabled()) .helper_window else .snapshot_texture;
+}
+
+fn wpeEnabled() bool {
+    const value = std.c.getenv("VERDE_BROWSER_LINUX_WPE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 fn waylandSubsurfaceEnabled() bool {
@@ -645,7 +651,7 @@ pub const Controller = struct {
 
     // Launches the installed browser helper binary beside the desktop executable.
     fn spawnHelper(self: *Controller) !void {
-        const helper_path = try browserHelperPath(self.allocator);
+        const helper_path = try browserHelperPath(self.allocator, wpeEnabled());
         defer self.allocator.free(helper_path);
 
         var stdin_pipe: [2]std.posix.fd_t = undefined;
@@ -834,11 +840,11 @@ test "Wayland diagnostic helper selection requires explicit Wayland opt-in" {
 }
 
 /// Resolves the installed Linux browser helper path beside the running desktop executable.
-fn browserHelperPath(allocator: std.mem.Allocator) ![]u8 {
+fn browserHelperPath(allocator: std.mem.Allocator, use_wpe: bool) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
     const exe_dir = try std.process.executableDirPathAlloc(threaded.io(), allocator);
     defer allocator.free(exe_dir);
-    return try std.fs.path.join(allocator, &.{ exe_dir, "verde-browser-linux" });
+    return try std.fs.path.join(allocator, &.{ exe_dir, if (use_wpe) "verde-browser-linux-wpe" else "verde-browser-linux" });
 }
 
 /// Reads JSON-line events from the helper stdout pipe and stores them in thread-safe queues.
