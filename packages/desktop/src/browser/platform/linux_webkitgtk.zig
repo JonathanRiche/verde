@@ -234,7 +234,7 @@ pub const Controller = struct {
         });
     }
 
-    /// Reports whether Linux is using the diagnostic helper window or the default snapshot texture path.
+    /// Reports whether Linux is using Wayland native presentation, the diagnostic helper window, or snapshot fallback.
     pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {
         _ = self;
         return configuredPresentationKind();
@@ -519,11 +519,45 @@ pub const Controller = struct {
 };
 
 fn visibleHelperEnabled() bool {
+    if (waylandDiagnosticHelperEnabled()) return true;
     const override_value = if (std.c.getenv("VERDE_BROWSER_LINUX_SHOW_HELPER")) |value_ptr| std.mem.span(value_ptr) else null;
     const unsafe_wayland = if (std.c.getenv("VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER")) |value_ptr| std.mem.span(value_ptr) else null;
     const session_type = if (std.c.getenv("XDG_SESSION_TYPE")) |value_ptr| std.mem.span(value_ptr) else null;
     const gdk_backend = if (std.c.getenv("GDK_BACKEND")) |value_ptr| std.mem.span(value_ptr) else null;
     return visibleHelperEnabledFromValues(override_value, unsafe_wayland, session_type, gdk_backend);
+}
+
+fn waylandDiagnosticHelperEnabled() bool {
+    const override_value = if (std.c.getenv("VERDE_BROWSER_LINUX_WAYLAND_HELPER")) |value_ptr|
+        std.mem.span(value_ptr)
+    else if (std.c.getenv("VERDE_BROWSER_LINUX_NATIVE_WAYLAND_SURFACE")) |value_ptr|
+        std.mem.span(value_ptr)
+    else
+        null;
+    const session_type = if (std.c.getenv("XDG_SESSION_TYPE")) |value_ptr| std.mem.span(value_ptr) else null;
+    const wayland_display = if (std.c.getenv("WAYLAND_DISPLAY")) |value_ptr| std.mem.span(value_ptr) else null;
+    const gdk_backend = if (std.c.getenv("GDK_BACKEND")) |value_ptr| std.mem.span(value_ptr) else null;
+    return waylandDiagnosticHelperEnabledFromValues(override_value, session_type, wayland_display, gdk_backend);
+}
+
+fn waylandDiagnosticHelperEnabledFromValues(override_value: ?[]const u8, session_type: ?[]const u8, wayland_display: ?[]const u8, gdk_backend: ?[]const u8) bool {
+    if (override_value) |value| {
+        if (std.mem.eql(u8, value, "0")) return false;
+        if (!std.mem.eql(u8, value, "1")) return false;
+    } else {
+        return false;
+    }
+    if (session_type) |value| {
+        if (std.mem.eql(u8, value, "wayland")) return true;
+        if (std.mem.eql(u8, value, "x11")) return false;
+    }
+    if (wayland_display) |value| {
+        if (value.len > 0) return true;
+    }
+    if (gdk_backend) |value| {
+        return std.mem.indexOf(u8, value, "wayland") != null;
+    }
+    return false;
 }
 
 fn visibleHelperEnabledFromValues(override_value: ?[]const u8, unsafe_wayland: ?[]const u8, session_type: ?[]const u8, gdk_backend: ?[]const u8) bool {
@@ -553,6 +587,15 @@ test "visible helper selection honors overrides and session defaults" {
     try std.testing.expect(!visibleHelperEnabledFromValues(null, null, "wayland", "x11"));
     try std.testing.expect(visibleHelperEnabledFromValues(null, null, null, "x11"));
     try std.testing.expect(!visibleHelperEnabledFromValues(null, null, null, "x11,wayland"));
+}
+
+test "Wayland diagnostic helper selection requires explicit Wayland opt-in" {
+    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", "wayland", null, null));
+    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", null, "wayland-1", null));
+    try std.testing.expect(waylandDiagnosticHelperEnabledFromValues("1", null, null, "wayland"));
+    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues(null, "wayland", "wayland-1", null));
+    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues("0", "wayland", "wayland-1", null));
+    try std.testing.expect(!waylandDiagnosticHelperEnabledFromValues("1", "x11", "wayland-1", "wayland"));
 }
 
 /// Resolves the installed Linux browser helper path beside the running desktop executable.

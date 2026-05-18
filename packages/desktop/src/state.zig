@@ -6295,7 +6295,7 @@ pub const AppState = struct {
         const pane_width = self.browser_pane_max[0] - self.browser_pane_min[0];
         const pane_height = self.browser_pane_max[1] - self.browser_pane_min[1];
         const uses_native_surface = switch (self.browser_state.controller.presentationKind()) {
-            .native_child_view, .helper_window => true,
+            .native_child_view, .native_wayland_surface, .helper_window => true,
             .snapshot_texture, .offscreen_texture, .stub => false,
         };
         const scale = if (uses_native_surface) @max(self.app_window_display_scale, 0.001) else 1.0;
@@ -6445,7 +6445,10 @@ pub const AppState = struct {
         }
         if (handled) return true;
 
-        return contains_pointer and is_pointer_event and self.browser_state.controller.presentationKind() == .native_child_view;
+        return contains_pointer and is_pointer_event and switch (self.browser_state.controller.presentationKind()) {
+            .native_child_view, .native_wayland_surface => true,
+            .helper_window, .snapshot_texture, .offscreen_texture, .stub => false,
+        };
     }
 
     /// Forwards browser-pane keyboard and text input when the pane owns focus.
