@@ -42,6 +42,102 @@ const TerminalGlyphKind = enum {
     powerline,
 };
 
+const CachedDrawCommand = union(enum) {
+    rect: struct {
+        rect: palette.Rect,
+        color: palette.Color,
+        clip: ?palette.Rect = null,
+    },
+    border: struct {
+        rect: palette.Rect,
+        color: palette.Color,
+        radius: f32,
+        width: f32,
+    },
+    triangle: struct {
+        p0: palette.draw.Vec2,
+        p1: palette.draw.Vec2,
+        p2: palette.draw.Vec2,
+        color: palette.Color,
+        clip: ?palette.Rect = null,
+    },
+    terminal_text: struct {
+        rect: palette.Rect,
+        value: []const u8,
+        color: palette.Color,
+        font_size: f32,
+        clip: ?palette.Rect = null,
+        glyph_kind: TerminalGlyphKind,
+    },
+};
+
+const TerminalPaneDrawCache = struct {
+    active: bool = false,
+    dock_id: u32 = 0,
+    pane_id: u32 = 0,
+    rect: palette.Rect = .{},
+    rows: u16 = 0,
+    cols: u16 = 0,
+    arena: ?std.heap.ArenaAllocator = null,
+    commands: std.ArrayList(CachedDrawCommand) = .empty,
+
+    fn matches(self: *const TerminalPaneDrawCache, dock_id: u32, pane_id: u32) bool {
+        return self.active and self.dock_id == dock_id and self.pane_id == pane_id;
+    }
+
+    fn validFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) bool {
+        return self.active and
+            rectEql(self.rect, rect) and
+            self.rows == render_state.rows and
+            self.cols == render_state.cols and
+            render_state.dirty == .false;
+    }
+
+    fn beginRebuild(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, dock_id: u32, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
+        self.active = true;
+        self.dock_id = dock_id;
+        self.pane_id = pane_id;
+        self.rect = rect;
+        self.rows = render_state.rows;
+        self.cols = render_state.cols;
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(allocator);
+        _ = self.arena.?.reset(.retain_capacity);
+        self.commands.clearRetainingCapacity();
+    }
+
+    fn append(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, command: CachedDrawCommand) void {
+        self.commands.append(allocator, command) catch {
+            self.active = false;
+        };
+    }
+
+    fn stableText(self: *TerminalPaneDrawCache, value: []const u8) []const u8 {
+        if (self.arena) |*arena| {
+            return arena.allocator().dupe(u8, value) catch "";
+        }
+        return "";
+    }
+};
+
+const MAX_TERMINAL_PANE_DRAW_CACHES = 96;
+
+const TerminalDrawCache = struct {
+    entries: [MAX_TERMINAL_PANE_DRAW_CACHES]TerminalPaneDrawCache = [_]TerminalPaneDrawCache{.{}} ** MAX_TERMINAL_PANE_DRAW_CACHES,
+    next_recycle: usize = 0,
+
+    fn entryFor(self: *TerminalDrawCache, dock_id: u32, pane_id: u32) *TerminalPaneDrawCache {
+        for (&self.entries) |*entry| {
+            if (entry.matches(dock_id, pane_id)) return entry;
+        }
+        for (&self.entries) |*entry| {
+            if (!entry.active) return entry;
+        }
+        const entry = &self.entries[self.next_recycle];
+        self.next_recycle = (self.next_recycle + 1) % self.entries.len;
+        return entry;
+    }
+};
+
 const PaneHit = struct {
     dock_id: u32 = 0,
     pane_id: u32 = 0,
@@ -103,6 +199,8 @@ const TerminalHitCache = struct {
 
 var hit_cache: TerminalHitCache = .{};
 var selection_state: TerminalSelection = .{};
+var draw_cache: TerminalDrawCache = .{};
+var active_capture: ?*TerminalPaneDrawCache = null;
 
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     renderDockAt(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height });
@@ -297,11 +395,24 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         return;
     };
     renderViewport(state, pane_id, render_state, rect);
+    dock.markPaneRendered(pane_id);
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
 
 fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
+    const dock_id = hit_cache.dock_id;
+    const cache = draw_cache.entryFor(dock_id, pane_id);
+    const selection_dynamic = selectionAffectsPane(dock_id, pane_id);
+    if (!selection_dynamic and cache.validFor(render_state, rect)) {
+        replayCachedViewport(state, cache);
+        return;
+    }
+
+    cache.beginRebuild(state.allocator, dock_id, pane_id, render_state, rect);
+    active_capture = cache;
+    defer active_capture = null;
+
     const cols_f = @as(f32, @floatFromInt(render_state.cols));
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
     const cell_w = @max(rect.w / cols_f, 1.0);
@@ -380,6 +491,21 @@ fn renderStatus(state: *app_state.AppState, rect: palette.Rect, label: []const u
         .w = rect.w - theme.scaledUi(32.0),
         .h = theme.scaledUi(24.0),
     }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
+}
+
+fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDrawCache) void {
+    for (cache.commands.items) |command| {
+        switch (command) {
+            .rect => |cmd| queueClippedRect(state, cmd.rect, cmd.color, cmd.clip),
+            .border => |cmd| queueBorder(state, cmd.rect, cmd.color, cmd.radius, cmd.width),
+            .triangle => |cmd| queueTriangle(state, cmd.p0, cmd.p1, cmd.p2, cmd.color, cmd.clip),
+            .terminal_text => |cmd| queueTerminalText(state, cmd.rect, cmd.value, cmd.color, cmd.font_size, cmd.clip, cmd.glyph_kind),
+        }
+    }
+}
+
+fn selectionAffectsPane(dock_id: u32, pane_id: u32) bool {
+    return selection_state.active and selection_state.dock_id == dock_id and selection_state.pane_id == pane_id;
 }
 
 fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palette.Rect) void {
@@ -785,6 +911,10 @@ fn rgbEql(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB) bool {
     return a.r == b.r and a.g == b.g and a.b == b.b;
 }
 
+fn rectEql(a: palette.Rect, b: palette.Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
 fn blendRgb(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB, amount: f32) ghostty_vt.color.RGB {
     const t = theme.clampf(amount, 0.0, 1.0);
     return .{
@@ -850,11 +980,17 @@ fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {
 }
 
 fn queueRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    if (active_capture) |cache| {
+        cache.append(state.allocator, .{ .rect = .{ .rect = rect, .color = color } });
+    }
     state.palette_overlay_batch.rect(state.allocator, rect, color) catch {};
 }
 
 fn queueClippedRect(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: ?palette.Rect) void {
     if (clip) |clip_rect| {
+        if (active_capture) |cache| {
+            cache.append(state.allocator, .{ .rect = .{ .rect = rect, .color = color, .clip = clip_rect } });
+        }
         state.palette_overlay_batch.rectClipped(state.allocator, rect, color, clip_rect) catch {};
     } else {
         queueRect(state, rect, color);
@@ -862,6 +998,9 @@ fn queueClippedRect(state: *app_state.AppState, rect: palette.Rect, color: palet
 }
 
 fn queueTriangle(state: *app_state.AppState, p0: palette.draw.Vec2, p1: palette.draw.Vec2, p2: palette.draw.Vec2, color: palette.Color, clip: ?palette.Rect) void {
+    if (active_capture) |cache| {
+        cache.append(state.allocator, .{ .triangle = .{ .p0 = p0, .p1 = p1, .p2 = p2, .color = color, .clip = clip } });
+    }
     if (clip) |clip_rect| {
         state.palette_overlay_batch.triangleClipped(state.allocator, p0, p1, p2, color, clip_rect) catch {};
     } else {
@@ -874,6 +1013,9 @@ fn queueRounded(state: *app_state.AppState, rect: palette.Rect, color: palette.C
 }
 
 fn queueBorder(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
+    if (active_capture) |cache| {
+        cache.append(state.allocator, .{ .border = .{ .rect = rect, .color = color, .radius = radius, .width = width } });
+    }
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch {};
 }
 
@@ -882,6 +1024,18 @@ fn queueText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, 
 }
 
 fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect, glyph_kind: TerminalGlyphKind) void {
+    if (active_capture) |cache| {
+        cache.append(state.allocator, .{
+            .terminal_text = .{
+                .rect = rect,
+                .value = cache.stableText(value),
+                .color = color,
+                .font_size = font_size,
+                .clip = clip,
+                .glyph_kind = glyph_kind,
+            },
+        });
+    }
     const font_role: ?palette.FontRole = switch (glyph_kind) {
         .text => .mono,
         .icon, .powerline => .icon,
