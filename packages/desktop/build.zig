@@ -139,9 +139,14 @@ pub fn build(b: *std.Build) void {
             if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
                 exe.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
             }
+            exe.root_module.addCSourceFile(.{
+                .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
+                .flags = &.{},
+            });
             exe.root_module.linkSystemLibrary("SDL3", .{});
             exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
             exe.root_module.linkSystemLibrary("util", .{});
+            exe.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
         },
         .windows => {
             exe.root_module.link_libcpp = true;
@@ -221,9 +226,8 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/browser/platform/linux_webkitgtk.c"),
             .flags = &.{},
         });
-        browser_helper.root_module.linkSystemLibrary("gtk+-3.0", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("webkit2gtk-4.1", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("x11", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
     }
     if (build_cef_backend) {
@@ -351,9 +355,14 @@ pub fn build(b: *std.Build) void {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
             browser_contract_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
+        browser_contract_tests.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
+            .flags = &.{},
+        });
         browser_contract_tests.root_module.linkSystemLibrary("SDL3", .{});
         browser_contract_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         browser_contract_tests.root_module.linkSystemLibrary("util", .{});
+        browser_contract_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
     }
     test_step.dependOn(&b.addRunArtifact(browser_contract_tests).step);
     const exe_tests = b.addTest(.{
@@ -388,8 +397,13 @@ pub fn build(b: *std.Build) void {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_x86_64_linux_gnu", .{})) |sdl3_prebuilt| {
             exe_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
+        exe_tests.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_wayland_subsurface.c"),
+            .flags = &.{},
+        });
         exe_tests.root_module.linkSystemLibrary("SDL3", .{});
         exe_tests.root_module.linkSystemLibrary("util", .{});
+        exe_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
     } else if (target.result.os.tag == .macos) {
         if (zsdl.builder.lazyDependency("sdl3_prebuilt_macos", .{})) |sdl3_prebuilt| {
             exe_tests.root_module.addFrameworkPath(sdl3_prebuilt.path("Frameworks"));

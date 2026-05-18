@@ -1,6 +1,11 @@
 # Wayland WebView Prototype Notes
 
-This branch adds an explicit Linux presentation kind, `native_wayland_surface`, but does not use it for the current helper-process prototype because the prototype is not a true SDL child/subsurface.
+This branch adds an explicit Linux presentation kind, `native_wayland_surface`. The current implementation has two Wayland-only paths:
+
+- `VERDE_BROWSER_LINUX_WAYLAND_HELPER=1` starts the older diagnostic GTK/WebKit helper as a separate Wayland toplevel.
+- `VERDE_BROWSER_LINUX_SUBSURFACE=1` creates a real SDL-parented `wl_subsurface` inside the browser pane, but it is a probe surface only. It does not load or display WebKit content yet.
+
+If the pane shows a dark rectangle with a green border under `VERDE_BROWSER_LINUX_SUBSURFACE=1`, that is expected. It proves the app can attach, position, resize, clip, and stack an app-owned Wayland subsurface under the SDL window. It is not a loaded page.
 
 The diagnostic Wayland toplevel overlay is gated by:
 
@@ -12,7 +17,7 @@ VERDE_BROWSER_LINUX_WAYLAND_HELPER=1
 
 When the flag is set in a Wayland session, Verde reports `presentation_kind: "helper_window"` through `verde live status --json`, treats browser pane bounds as diagnostic native window bounds, and asks the WebKitGTK helper to show a visible Wayland GTK/WebKit toplevel instead of producing visible snapshot frames. The default Linux path remains `snapshot_texture`.
 
-`native_wayland_surface` is reserved for a future implementation that can prove a real SDL-parented Wayland subsurface.
+`native_wayland_surface` now means the app-owned subsurface probe is active. It should not be treated as a working WebKit renderer until WebKit can render into that child surface.
 
 Important limitations:
 
@@ -21,6 +26,60 @@ Important limitations:
 - `SDL.window.wayland.surface` is discovered and passed through the existing host-window channel, but it is not currently used to parent WebKit under SDL.
 - Current diagnostic mode should report `helper_window`; `native_wayland_surface` is reserved for a future true embedding path.
 - Snapshot mode must remain the default.
+
+## True Subsurface Probe
+
+The true SDL-parented subsurface path is gated by:
+
+```bash
+VERDE_BROWSER_LINUX_SUBSURFACE=1
+```
+
+Launch command used for the latest Hyprland smoke test:
+
+```bash
+VERDE_BROWSER_LINUX_SUBSURFACE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+```
+
+What is implemented:
+
+- Verde reads SDL's Wayland display and parent `wl_surface` handles from the host window.
+- The Linux browser backend passes those handles to a C shim instead of using Zig `@cImport`.
+- The shim creates an app-owned `wl_surface`, makes it a `wl_subsurface` of SDL's parent surface, and commits a `wl_shm` probe buffer.
+- Browser pane bounds are passed as pane-relative coordinates for `native_wayland_surface`, so the child surface sits inside the browser content area instead of using global screen coordinates.
+- The subsurface is shown/hidden and resized with the browser pane.
+
+What is not implemented:
+
+- WebKitGTK does not render into this subsurface.
+- `https://lytx.io/` will not visually load in this mode.
+- JavaScript eval, reload, history, and page scrolling are no-ops in this mode.
+- Live status reports the probe limitation as `last_error` instead of pretending navigation succeeded.
+
+Latest local verification:
+
+```bash
+cc -Wall -Wextra -fsyntax-only packages/desktop/src/browser/platform/linux_wayland_subsurface.c $(pkg-config --cflags wayland-client)
+zig build --release=safe -Dbrowser-backend=native_webview --summary all
+VERDE_BROWSER_LINUX_SUBSURFACE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+./packages/desktop/zig-out/bin/verde live status --json
+grim /tmp/verde-wayland-subsurface-current.png
+```
+
+Observed status from the smoke test:
+
+- `runtime_kind: "native_webview"`
+- `presentation_kind: "native_wayland_surface"`
+- `runtime_initialized: true`
+- `visible: true`
+- `address: "https://lytx.io/"`
+- `last_error: "Wayland subsurface probe is attached, but WebKitGTK content is not embedded in it yet."`
+
+Screenshot evidence:
+
+```text
+/tmp/verde-wayland-subsurface-current.png
+```
 
 ## Prototype Evidence
 

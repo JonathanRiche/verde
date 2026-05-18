@@ -6299,8 +6299,16 @@ pub const AppState = struct {
             .snapshot_texture, .offscreen_texture, .stub => false,
         };
         const scale = if (uses_native_surface) @max(self.app_window_display_scale, 0.001) else 1.0;
-        const x = self.app_window_screen_origin[0] + @as(i32, @intFromFloat(@round(self.browser_pane_min[0] / scale)));
-        const y = self.app_window_screen_origin[1] + @as(i32, @intFromFloat(@round(self.browser_pane_min[1] / scale)));
+        const pane_x: i32 = @intFromFloat(@round(self.browser_pane_min[0] / scale));
+        const pane_y: i32 = @intFromFloat(@round(self.browser_pane_min[1] / scale));
+        const x = if (self.browser_state.controller.presentationKind() == .native_wayland_surface)
+            pane_x
+        else
+            self.app_window_screen_origin[0] + pane_x;
+        const y = if (self.browser_state.controller.presentationKind() == .native_wayland_surface)
+            pane_y
+        else
+            self.app_window_screen_origin[1] + pane_y;
         const width: u32 = @intFromFloat(@max(@round(pane_width / scale), 1.0));
         const height: u32 = @intFromFloat(@max(@round(pane_height / scale), 1.0));
         self.browser_state.controller.setPaneBounds(.{

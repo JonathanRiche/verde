@@ -61,6 +61,7 @@ const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
+var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
     "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
@@ -756,8 +757,14 @@ fn nativeBrowserHostWindow(window: *sdl.Window) ?*anyopaque {
         .windows => "SDL.window.win32.hwnd",
         .linux => {
             const properties = SDL_GetWindowProperties(window);
-            if (sdl.getPointerProperty(properties, "SDL.window.wayland.surface", null)) |surface| {
-                return surface;
+            const wayland_display = sdl.getPointerProperty(properties, "SDL.window.wayland.display", null);
+            const wayland_surface = sdl.getPointerProperty(properties, "SDL.window.wayland.surface", null);
+            if (wayland_display != null and wayland_surface != null) {
+                linux_wayland_browser_host = .{
+                    .display = wayland_display,
+                    .surface = wayland_surface,
+                };
+                return &linux_wayland_browser_host;
             }
             const x11_window = sdl.getNumberProperty(properties, "SDL.window.x11.window", 0);
             if (x11_window <= 0) return null;
