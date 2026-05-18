@@ -36,6 +36,7 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_GetWindowFlags(window: *sdl.Window) sdl.Window.Flags;
 extern fn SDL_GetModState() sdl.Keymod;
 extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
@@ -350,11 +351,12 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollBrowser();
             }
         }.run, .{&state});
+        var terminal_needs_render = false;
         recordSpan(&frame_sample, .poll_terminals, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollTerminals();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollTerminals();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &terminal_needs_render });
         if (live_server) |*server| {
             if (server.processPending(&state)) needs_render = true;
         }
@@ -384,7 +386,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or send_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -589,8 +591,9 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
 
     const snapshot = profiler.snapshot();
     if (snapshot.count == 0) return;
+    const sections = recentRenderedSectionStats();
     runtime_log.diagnostic(
-        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2}",
+        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_terminals_avg_ms={d:.2}",
         .{
             @tagName(palette_renderer.activeBackend()),
             snapshot.count,
@@ -599,11 +602,49 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
             snapshot.slow_count,
             snapshot.hitch_count,
             profiler.nsToMs(snapshot.latest.active_ns),
+            sections.rendered_count,
+            profiler.nsToMs(sections.render_root_avg_ns),
+            profiler.nsToMs(sections.draw_backend_avg_ns),
+            profiler.nsToMs(sections.poll_terminals_avg_ns),
         },
     );
     if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
         if (stats.hasWork()) logSdlGpuFrameStats(stats);
     }
+}
+
+const RenderedSectionStats = struct {
+    rendered_count: usize = 0,
+    render_root_avg_ns: u64 = 0,
+    draw_backend_avg_ns: u64 = 0,
+    poll_terminals_avg_ns: u64 = 0,
+};
+
+fn recentRenderedSectionStats() RenderedSectionStats {
+    const count = profiler.frameCount();
+    if (count == 0) return .{};
+
+    var rendered_count: usize = 0;
+    var render_root_sum: u128 = 0;
+    var draw_backend_sum: u128 = 0;
+    var poll_terminals_sum: u128 = 0;
+
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const frame = profiler.frameAt(index) orelse continue;
+        if (!frame.rendered) continue;
+        rendered_count += 1;
+        render_root_sum += frame.sectionNs(.render_root);
+        draw_backend_sum += frame.sectionNs(.draw_backend);
+        poll_terminals_sum += frame.sectionNs(.poll_terminals);
+    }
+    if (rendered_count == 0) return .{};
+    return .{
+        .rendered_count = rendered_count,
+        .render_root_avg_ns = @intCast(render_root_sum / rendered_count),
+        .draw_backend_avg_ns = @intCast(draw_backend_sum / rendered_count),
+        .poll_terminals_avg_ns = @intCast(poll_terminals_sum / rendered_count),
+    };
 }
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
@@ -828,14 +869,13 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.hasAnyPendingSends() or
         state.isPickerPending() or
         state.isBrowserVisible() or
-        state.hasVisibleTerminalSessions() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
+    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
@@ -843,8 +883,15 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     switch (event.type) {
-        .quit => return false,
-        .window_close_requested => return handleWindowCloseRequested(state),
+        .quit => {
+            runtime_log.diagnostic("shutdown requested by SDL quit event", .{});
+            return false;
+        },
+        .window_close_requested => {
+            const keep_running = handleWindowCloseRequested(window, state);
+            runtime_log.diagnostic("window close requested keep_running={} window_id={d}", .{ keep_running, @intFromEnum(event.window.window_id) });
+            return keep_running;
+        },
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(
@@ -1501,7 +1548,7 @@ fn handleKeyboardAction(
     }
 }
 
-fn handleWindowCloseRequested(state: *AppState) bool {
+fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
         const now_ms = std.time.milliTimestamp();
         if (macos_cmd_w_pane_close_until_ms >= now_ms) {
@@ -1512,6 +1559,14 @@ fn handleWindowCloseRequested(state: *AppState) bool {
             _ = state.closeFocusedWorkspacePane();
             return true;
         }
+    }
+    const window_flags = SDL_GetWindowFlags(window);
+    if (!window_flags.input_focus) {
+        runtime_log.diagnostic(
+            "ignoring window close request without input focus mouse_focus={} hidden={} minimized={} occluded={}",
+            .{ window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
+        );
+        return true;
     }
     return false;
 }

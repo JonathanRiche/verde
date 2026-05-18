@@ -251,10 +251,12 @@ pub const Dock = struct {
         self.focus_requested = true;
     }
 
-    pub fn poll(self: *Dock, allocator: std.mem.Allocator) !void {
+    pub fn poll(self: *Dock, allocator: std.mem.Allocator) !bool {
+        var changed = false;
         for (self.tabs.items) |*tab| {
-            try pollPaneNode(tab.root, allocator);
+            changed = (try pollPaneNode(tab.root, allocator)) or changed;
         }
+        return changed;
     }
 
     pub fn resizePaneToFit(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, width: f32, height: f32) !void {
@@ -287,6 +289,11 @@ pub const Dock = struct {
         const pane = self.findPaneByIdConst(pane_id) orelse return null;
         if (pane.session) |session| return session.renderState();
         return null;
+    }
+
+    pub fn markPaneRendered(self: *Dock, pane_id: u32) void {
+        const pane = self.findPaneById(pane_id) orelse return;
+        if (pane.session) |session| session.markRendered();
     }
 
     pub fn hasRunningSession(self: *const Dock) bool {
@@ -815,14 +822,15 @@ fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
     }
 }
 
-fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !void {
+fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !bool {
     switch (node.*) {
         .leaf => |*leaf| {
-            if (leaf.session) |session| try session.poll(allocator);
+            return if (leaf.session) |session| try session.poll(allocator) else false;
         },
         .split => |*split| {
-            try pollPaneNode(split.first, allocator);
-            try pollPaneNode(split.second, allocator);
+            const first_changed = try pollPaneNode(split.first, allocator);
+            const second_changed = try pollPaneNode(split.second, allocator);
+            return first_changed or second_changed;
         },
     }
 }
@@ -1119,13 +1127,17 @@ const UnsupportedSession = struct {
 
     pub fn deinit(_: *UnsupportedSession, _: std.mem.Allocator) void {}
 
-    pub fn poll(_: *UnsupportedSession, _: std.mem.Allocator) !void {}
+    pub fn poll(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
+        return false;
+    }
 
     pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16, _: u32, _: u32) !void {}
 
     pub fn displayText(_: *const UnsupportedSession) []const u8 {
         return "";
     }
+
+    pub fn markRendered(_: *UnsupportedSession) void {}
 
     pub fn statusText(_: *const UnsupportedSession, _: *[192]u8) []const u8 {
         return "Native shell embedding is only enabled on Linux and macOS.";
@@ -1271,12 +1283,13 @@ const UnixSession = struct {
         self.output_ring.deinit(allocator);
     }
 
-    pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !void {
+    pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
         const changed = try self.drainOutput(allocator);
         const exited = self.captureExitStatus();
         if (changed or exited) {
             try self.refreshRenderState(allocator);
         }
+        return changed or exited;
     }
 
     pub fn resize(self: *UnixSession, allocator: std.mem.Allocator, cols: u16, rows: u16, cell_width: u32, cell_height: u32) !void {
@@ -1300,6 +1313,13 @@ const UnixSession = struct {
 
     pub fn renderState(self: *const UnixSession) *const ghostty_vt.RenderState {
         return &self.render_state;
+    }
+
+    pub fn markRendered(self: *UnixSession) void {
+        self.render_state.dirty = .false;
+        const row_data = self.render_state.row_data.slice();
+        const row_dirties = row_data.items(.dirty);
+        @memset(row_dirties, false);
     }
 
     pub fn statusText(self: *const UnixSession, buf: *[192]u8) []const u8 {
@@ -2388,8 +2408,9 @@ test "unix session PTY smoke" {
     try session.writeInput("printf 'verde-terminal-smoke'\r");
 
     var found = false;
+    var saw_change = false;
     for (0..40) |_| {
-        try session.poll(allocator);
+        if (try session.poll(allocator)) saw_change = true;
         const screen = try session.terminal.plainString(allocator);
         defer allocator.free(screen);
         if (std.mem.indexOf(u8, screen, "verde-terminal-smoke") != null) {
@@ -2399,13 +2420,43 @@ test "unix session PTY smoke" {
         std.time.sleep(50 * std.time.ns_per_ms);
     }
 
+    try testing.expect(saw_change);
     try testing.expect(found);
 
     _ = try session.writeInput("exit\r");
     for (0..40) |_| {
-        try session.poll(allocator);
+        _ = try session.poll(allocator);
         if (!session.running) break;
         std.time.sleep(25 * std.time.ns_per_ms);
+    }
+}
+
+test "unix session clears render dirty state after render" {
+    if (!SESSION_SUPPORTED) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
+    defer {
+        session.deinit(allocator);
+        allocator.destroy(session);
+    }
+
+    try testing.expect(session.render_state.dirty != .false);
+    session.markRendered();
+    try testing.expectEqual(.false, session.render_state.dirty);
+
+    const row_data = session.render_state.row_data.slice();
+    const row_dirties = row_data.items(.dirty);
+    for (row_dirties) |dirty| {
+        try testing.expect(!dirty);
     }
 }
 

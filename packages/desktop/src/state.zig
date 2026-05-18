@@ -5995,7 +5995,8 @@ pub const AppState = struct {
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
-    pub fn pollTerminals(self: *AppState) void {
+    pub fn pollTerminals(self: *AppState) bool {
+        var visible_changed = false;
         for (self.projects.items, 0..) |*project, project_index| {
             const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
             if (base_visible and !project.terminal_dock.hasRunningSession()) {
@@ -6003,14 +6004,19 @@ pub const AppState = struct {
                     log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
                     if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                 };
+                if (project_index == self.selected_project_index) {
+                    visible_changed = true;
+                }
             }
             if (base_visible or project.terminal_dock.hasRunningSession()) {
-                project.terminal_dock.poll(self.allocator) catch |err| {
+                const changed = project.terminal_dock.poll(self.allocator) catch |err| blk: {
                     log.err("failed to poll terminal session: {s}", .{@errorName(err)});
                     if (project_index == self.selected_project_index and base_visible) {
                         self.setSidebarNotice("Terminal session failed.");
                     }
+                    break :blk false;
                 };
+                if (changed and project_index == self.selected_project_index and base_visible) visible_changed = true;
             }
             for (project.terminal_docks.items) |*entry| {
                 const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
@@ -6019,30 +6025,36 @@ pub const AppState = struct {
                         log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                         if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                     };
+                    if (project_index == self.selected_project_index) {
+                        visible_changed = true;
+                    }
                 }
                 if (!dock_visible and !entry.dock.hasRunningSession()) continue;
-                entry.dock.poll(self.allocator) catch |err| {
+                const changed = entry.dock.poll(self.allocator) catch |err| blk: {
                     log.err("failed to poll terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                     if (project_index == self.selected_project_index and dock_visible) {
                         self.setSidebarNotice("Terminal session failed.");
                     }
+                    break :blk false;
                 };
+                if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
             }
             self.pollManagedProcesses(project_index);
         }
         for (self.archived_projects.items) |*project| {
             if (project.terminal_dock.visible or project.terminal_dock.hasRunningSession()) {
-                project.terminal_dock.poll(self.allocator) catch |err| {
+                _ = project.terminal_dock.poll(self.allocator) catch |err| {
                     log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
                 };
             }
             for (project.terminal_docks.items) |*entry| {
                 if (!entry.dock.visible and !entry.dock.hasRunningSession()) continue;
-                entry.dock.poll(self.allocator) catch |err| {
+                _ = entry.dock.poll(self.allocator) catch |err| {
                     log.err("failed to poll archived terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                 };
             }
         }
+        return visible_changed;
     }
 
     /// Returns mutable browser UI/runtime state for desktop control surfaces.
