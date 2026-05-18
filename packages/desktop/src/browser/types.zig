@@ -25,6 +25,7 @@ pub const RuntimeMode = enum {
 /// Describes how browser pixels/input are presented inside the Palette-owned pane.
 pub const PresentationKind = enum {
     native_child_view,
+    native_wayland_surface,
     helper_window,
     snapshot_texture,
     offscreen_texture,

@@ -756,6 +756,9 @@ fn nativeBrowserHostWindow(window: *sdl.Window) ?*anyopaque {
         .windows => "SDL.window.win32.hwnd",
         .linux => {
             const properties = SDL_GetWindowProperties(window);
+            if (sdl.getPointerProperty(properties, "SDL.window.wayland.surface", null)) |surface| {
+                return surface;
+            }
             const x11_window = sdl.getNumberProperty(properties, "SDL.window.x11.window", 0);
             if (x11_window <= 0) return null;
             return @ptrFromInt(@as(usize, @intCast(x11_window)));

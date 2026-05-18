@@ -67,6 +67,8 @@ static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
 static void verde_browser_linux_request_snapshot(struct verde_browser_linux *browser);
 static void verde_browser_linux_run_internal_script(struct verde_browser_linux *browser, const char *script);
 static gboolean verde_browser_linux_visible_helper_enabled(void);
+static gboolean verde_browser_linux_wayland_diagnostic_helper_enabled(void);
+static gboolean verde_browser_linux_direct_surface_active(void);
 
 static gboolean verde_browser_linux_apply_size(struct verde_browser_linux *browser, int width, int height) {
     if (browser == NULL || width <= 0 || height <= 0) return FALSE;
@@ -85,6 +87,7 @@ static gboolean verde_browser_linux_apply_size(struct verde_browser_linux *brows
 }
 
 static gboolean verde_browser_linux_visible_helper_enabled(void) {
+    if (verde_browser_linux_wayland_diagnostic_helper_enabled()) return TRUE;
     const char *value = getenv("VERDE_BROWSER_LINUX_SHOW_HELPER");
     const char *unsafe_wayland = getenv("VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER");
     const gboolean allow_wayland_helper = unsafe_wayland != NULL && strcmp(unsafe_wayland, "1") == 0;
@@ -102,6 +105,28 @@ static gboolean verde_browser_linux_visible_helper_enabled(void) {
     if (session_type != NULL && strcmp(session_type, "wayland") == 0) return FALSE;
 
     return gdk_backend != NULL && strstr(gdk_backend, "x11") != NULL && strstr(gdk_backend, "wayland") == NULL;
+}
+
+static gboolean verde_browser_linux_wayland_diagnostic_helper_enabled(void) {
+    const char *value = getenv("VERDE_BROWSER_LINUX_WAYLAND_HELPER");
+    if (value == NULL) value = getenv("VERDE_BROWSER_LINUX_NATIVE_WAYLAND_SURFACE");
+    if (value == NULL || strcmp(value, "1") != 0) return FALSE;
+
+    const char *session_type = getenv("XDG_SESSION_TYPE");
+    if (session_type != NULL) {
+        if (strcmp(session_type, "wayland") == 0) return TRUE;
+        if (strcmp(session_type, "x11") == 0) return FALSE;
+    }
+
+    const char *wayland_display = getenv("WAYLAND_DISPLAY");
+    if (wayland_display != NULL && wayland_display[0] != '\0') return TRUE;
+
+    const char *gdk_backend = getenv("GDK_BACKEND");
+    return gdk_backend != NULL && strstr(gdk_backend, "wayland") != NULL;
+}
+
+static gboolean verde_browser_linux_direct_surface_active(void) {
+    return verde_browser_linux_visible_helper_enabled();
 }
 
 static void verde_browser_linux_apply_host_window(struct verde_browser_linux *browser) {
@@ -341,6 +366,7 @@ static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitL
     (void)web_view;
     if (load_event == WEBKIT_LOAD_FINISHED) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED, NULL);
+        if (verde_browser_linux_direct_surface_active()) return;
         verde_browser_linux_request_snapshot(browser);
     }
 }
@@ -356,6 +382,7 @@ static void verde_browser_linux_on_eval_finished(GObject *object, GAsyncResult *
     }
     if (value == NULL) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_EVAL_RESULT, "null");
+        if (verde_browser_linux_direct_surface_active()) return;
         verde_browser_linux_request_snapshot(browser);
         return;
     }
@@ -364,7 +391,7 @@ static void verde_browser_linux_on_eval_finished(GObject *object, GAsyncResult *
     verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_EVAL_RESULT, payload);
     g_free(payload);
     g_object_unref(value);
-    verde_browser_linux_request_snapshot(browser);
+    if (!verde_browser_linux_direct_surface_active()) verde_browser_linux_request_snapshot(browser);
 }
 
 static void verde_browser_linux_on_post_json_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
@@ -377,7 +404,7 @@ static void verde_browser_linux_on_post_json_finished(GObject *object, GAsyncRes
         return;
     }
     if (value != NULL) g_object_unref(value);
-    verde_browser_linux_request_snapshot(browser);
+    if (!verde_browser_linux_direct_surface_active()) verde_browser_linux_request_snapshot(browser);
 }
 
 static void verde_browser_linux_on_internal_script_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
@@ -392,7 +419,7 @@ static void verde_browser_linux_on_internal_script_finished(GObject *object, GAs
     if (value != NULL) {
         g_object_unref(value);
     }
-    verde_browser_linux_request_snapshot(browser);
+    if (!verde_browser_linux_direct_surface_active()) verde_browser_linux_request_snapshot(browser);
 }
 
 static void verde_browser_linux_run_internal_script(struct verde_browser_linux *browser, const char *script) {
@@ -541,7 +568,7 @@ int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int
     }
     if (url != NULL) {
         webkit_web_view_load_uri(browser->web_view, url);
-    } else {
+    } else if (!verde_browser_linux_direct_surface_active()) {
         verde_browser_linux_request_snapshot(browser);
     }
     return 1;
@@ -567,7 +594,7 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
         gtk_window_move(GTK_WINDOW(browser->window), x, y);
         verde_browser_linux_apply_host_window(browser);
     }
-    if (size_changed) {
+    if (size_changed && !verde_browser_linux_direct_surface_active()) {
         verde_browser_linux_request_snapshot(browser);
     }
     return 1;
@@ -575,7 +602,7 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
 
 int verde_browser_linux_resize(struct verde_browser_linux *browser, int width, int height) {
     if (browser == NULL || width <= 0 || height <= 0) return 0;
-    if (verde_browser_linux_apply_size(browser, width, height)) {
+    if (verde_browser_linux_apply_size(browser, width, height) && !verde_browser_linux_direct_surface_active()) {
         verde_browser_linux_request_snapshot(browser);
     }
     return 1;
