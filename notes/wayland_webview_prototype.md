@@ -1,5 +1,29 @@
 # Wayland WebView Prototype Notes
 
+## Next Agent Goal
+
+Read this document and continue the WPE Linux webview path. Focus only on the env-gated WPE path:
+
+```bash
+VERDE_BROWSER_LINUX_WPE=1
+```
+
+Do not spend time on GTK/WebKitGTK, CEF, Windows, macOS, or the `VERDE_BROWSER_LINUX_SUBSURFACE=1` probe unless needed for comparison. Keep default Linux fallback behavior unchanged.
+
+Current state: WPE renders in the Verde pane, but the HiDPI/viewport contract is wrong. On Hyprland it reported `innerWidth=593`, `devicePixelRatio=1`, and rendered a narrow/light layout for `https://lytx.io/`. Fix WPE sizing/scale so the pane renders crisp at physical pixel resolution while exposing the correct CSS viewport. Also make WPE match dark color scheme if possible.
+
+Build and test with:
+
+```bash
+zig build --release=safe -Dbrowser-backend=native_webview --summary all
+zig build test --release=safe -Dbrowser-backend=stub
+VERDE_BROWSER_LINUX_WPE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+./packages/desktop/zig-out/bin/verde live status --json
+./packages/desktop/zig-out/bin/verde live browser eval "JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio,screenW:screen.width,screenH:screen.height,visualW:visualViewport.width,visualH:visualViewport.height,scheme:matchMedia('(prefers-color-scheme: dark)').matches})"
+```
+
+Take screenshot evidence on Hyprland, update this document with results, and commit only relevant changes.
+
 This branch adds an explicit Linux presentation kind, `native_wayland_surface`. The current implementation has two Wayland-only paths:
 
 - `VERDE_BROWSER_LINUX_WAYLAND_HELPER=1` starts the older diagnostic GTK/WebKit helper as a separate Wayland toplevel.
