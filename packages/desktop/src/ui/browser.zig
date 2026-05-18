@@ -798,22 +798,18 @@ fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
 fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     const browser_state = state.browserState();
     const pane_hovered = rectHovered(pane_rect);
-    const width_px: u32 = @intFromFloat(@max(pane_rect.w, 1.0));
-    const height_px: u32 = @intFromFloat(@max(pane_rect.h, 1.0));
-    const input_size = .{ @as(f32, @floatFromInt(width_px)), @as(f32, @floatFromInt(height_px)) };
-    browser_state.controller.resizePane(width_px, height_px) catch {};
+    const input_size = state.browserPaneInputSize(pane_rect.w, pane_rect.h);
+    state.noteBrowserPaneRegion(
+        .{ pane_rect.x, pane_rect.y },
+        .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
+        input_size,
+        pane_hovered,
+    );
 
     queuePaletteRect(state, pane_rect, paletteColor(colors.rgba(9, 11, 16, 255)));
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {
-            // Fill the pane so the preview uses the full column (resizePane already matches pane_rect size).
-            state.noteBrowserPaneRegion(
-                .{ pane_rect.x, pane_rect.y },
-                .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
-                input_size,
-                pane_hovered,
-            );
             state.palette_overlay_batch.image(
                 state.allocator,
                 snapRect(pane_rect),
@@ -827,13 +823,6 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     }
 
     // Fall back to the full pane bounds while the browser frame has not arrived yet.
-    state.noteBrowserPaneRegion(
-        .{ pane_rect.x, pane_rect.y },
-        .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
-        input_size,
-        pane_hovered,
-    );
-
     renderPanePlaceholder();
 }
 

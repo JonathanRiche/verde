@@ -10,7 +10,7 @@ VERDE_BROWSER_LINUX_WPE=1
 
 Do not spend time on GTK/WebKitGTK, CEF, Windows, macOS, or the `VERDE_BROWSER_LINUX_SUBSURFACE=1` probe unless needed for comparison. Keep default Linux fallback behavior unchanged.
 
-Current state: WPE renders in the Verde pane, but the HiDPI/viewport contract is wrong. On Hyprland it reported `innerWidth=593`, `devicePixelRatio=1`, and rendered a narrow/light layout for `https://lytx.io/`. Fix WPE sizing/scale so the pane renders crisp at physical pixel resolution while exposing the correct CSS viewport. Also make WPE match dark color scheme if possible.
+Current state: WPE renders in the Verde pane and now receives an explicit device scale on HiDPI Wayland outputs. On the local Hyprland eDP monitor at scale `1.67`, `https://lytx.io/` reported `devicePixelRatio=1.6666666269302368` and a logical viewport of `670x787`, with a visible in-pane render captured at `/tmp/verde-wpe-hidpi-scale.png`. The remaining WPE work is performance/usability hardening: remove the CPU readback path if possible, keep checking input/scroll feel, and solve dark color-scheme matching without regressing page rendering.
 
 Build and test with:
 
@@ -262,6 +262,7 @@ What is implemented:
 - The WPE helper is selected only when `VERDE_BROWSER_LINUX_WPE=1` is set. The default Linux native-webview path remains WebKitGTK `snapshot_texture`.
 - Pointer move/button, wheel, keyboard, navigation, reload/history, eval, and the Verde JS bridge are wired through the existing helper protocol.
 - WPE frame publication is throttled to roughly one frame per display tick so the app does not ingest the full WPE export stream.
+- Verde passes the pane's logical viewport plus the app window device scale through the helper protocol. WPE applies that value with `wpe_view_backend_dispatch_set_device_scale_factor()`, so HiDPI outputs can render physical-pixel frames while exposing logical CSS coordinates to the page and input pipeline.
 
 Verification commands:
 
@@ -272,7 +273,7 @@ zig build test --release=safe -Dbrowser-backend=stub
 VERDE_BROWSER_LINUX_WPE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
 ./packages/desktop/zig-out/bin/verde live status --json
 ./packages/desktop/zig-out/bin/verde live browser eval "JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio,screenW:screen.width,screenH:screen.height,visualW:visualViewport.width,visualH:visualViewport.height,scheme:matchMedia('(prefers-color-scheme: dark)').matches})"
-grim /tmp/verde-wpe-app-upright.png
+grim -g '12,1118 1416x910' /tmp/verde-wpe-hidpi-scale.png
 ```
 
 Observed status from the latest smoke test:
@@ -284,19 +285,21 @@ Observed status from the latest smoke test:
 - `visible: true`
 - `url: "https://lytx.io/"`
 - `last_error: null`
-- eval accepted and returned page context from WPE: title `Lytx`, URL `https://lytx.io/`, and viewport metrics `{"w":593,"h":907,"dpr":1,"screenW":593,"screenH":907,"visualW":593,"visualH":907,"scheme":false}`.
+- On the local scale-1.00 DP monitor, eval returned viewport metrics `{"w":593,"h":907,"dpr":1,"screenW":1200,"screenH":800,"visualW":593,"visualH":907,"scheme":false}`.
+- On the local scale-1.67 eDP monitor, eval returned viewport metrics `{"w":670,"h":787,"dpr":1.6666666269302368,"screenW":670,"screenH":787,"visualW":670,"visualH":787,"scheme":false}`.
 
 Screenshot evidence:
 
 ```text
 /tmp/verde-wpe-app-upright.png
+/tmp/verde-wpe-hidpi-scale.png
 ```
 
 Current WPE limitations:
 
 - The integrated path is still a CPU readback into shared memory, not a final zero-copy EGL texture import into Verde's renderer.
-- On the tested HiDPI Hyprland setup, WPE currently receives a 593 px CSS viewport with `devicePixelRatio=1`, so the page uses a narrower/mobile layout and may not be full-resolution. The next fix should pass an explicit device scale/render-size contract to WPE so the exported frame is physical-pixel sharp while the browser viewport remains predictable.
-- The page reports `prefers-color-scheme: dark` as false, so sites such as `https://lytx.io/` may choose their light theme unless the WPE context/settings are updated to match app or system dark preference.
+- The HiDPI viewport/device-scale contract is now wired for WPE, but it still needs repeated subjective testing across monitors and resize/move cases.
+- The page reports `prefers-color-scheme: dark` as false. A WPE platform `WPE_SETTING_DARK_MODE` attempt was tested after WPE view creation, but it did not flip the media query and made the captured page render mostly blank, so that change was removed. Do not re-add it without proving visible page rendering and `scheme:true`.
 - Popup/window creation, downloads, context menus, IME composition, clipboard integration, and WebKit process crash recovery are not hardened yet.
 - `snapshot_texture` remains the default until WPE scale, input, clipping, and subjective scroll feel pass repeated app-level testing.
 

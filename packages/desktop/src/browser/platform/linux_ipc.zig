@@ -28,6 +28,7 @@ pub const Command = struct {
     kind: CommandKind,
     width: u32 = 0,
     height: u32 = 0,
+    scale: f32 = 1.0,
     x: f32 = 0.0,
     y: f32 = 0.0,
     wheel_x: f32 = 0.0,

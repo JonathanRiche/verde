@@ -317,6 +317,7 @@ pub const Controller = struct {
     pane_height: u32 = DEFAULT_HEIGHT,
     pane_screen_x: i32 = 0,
     pane_screen_y: i32 = 0,
+    pane_scale: f32 = 1.0,
     host_window: u64 = 0,
     current_url: ?[]u8 = null,
     wayland_subsurface: WaylandSubsurface = .{},
@@ -444,6 +445,7 @@ pub const Controller = struct {
             .kind = .show,
             .width = self.pane_width,
             .height = self.pane_height,
+            .scale = self.pane_scale,
             .screen_x = self.pane_screen_x,
             .screen_y = self.pane_screen_y,
             .payload = self.current_url orelse "about:blank",
@@ -472,6 +474,7 @@ pub const Controller = struct {
             .screen_y = self.pane_screen_y,
             .width = width,
             .height = height,
+            .scale = self.pane_scale,
         });
     }
 
@@ -481,6 +484,7 @@ pub const Controller = struct {
         self.pane_height = @max(bounds.height, 1);
         self.pane_screen_x = bounds.screen_x;
         self.pane_screen_y = bounds.screen_y;
+        self.pane_scale = @max(bounds.scale, 0.05);
         if (waylandSubsurfaceEnabled()) {
             try self.wayland_subsurface.setBounds(
                 self.pane_screen_x,
@@ -496,6 +500,7 @@ pub const Controller = struct {
             .screen_y = self.pane_screen_y,
             .width = self.pane_width,
             .height = self.pane_height,
+            .scale = self.pane_scale,
         });
     }
 
@@ -510,6 +515,7 @@ pub const Controller = struct {
             .kind = .navigate,
             .width = self.pane_width,
             .height = self.pane_height,
+            .scale = self.pane_scale,
             .screen_x = self.pane_screen_x,
             .screen_y = self.pane_screen_y,
             .payload = url,

@@ -196,6 +196,7 @@ pub const Controller = struct {
             .screen_y = bounds.screen_y,
             .width = @max(bounds.width, 1),
             .height = @max(bounds.height, 1),
+            .scale = @max(bounds.scale, 0.05),
         };
         if (self.backend) |*backend| {
             try self.applyPaneBounds(backend);

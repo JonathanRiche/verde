@@ -51,6 +51,7 @@ pub const Backend = struct {
     pane_screen_y: i32 = 0,
     pane_width: u32 = DEFAULT_PANE_WIDTH,
     pane_height: u32 = DEFAULT_PANE_HEIGHT,
+    pane_scale: f32 = 1.0,
 
     /// Creates the native webview browser backend selected for the active target OS.
     pub fn init(allocator: std.mem.Allocator) !Backend {
@@ -146,6 +147,7 @@ pub const Backend = struct {
             .screen_y = self.pane_screen_y,
             .width = width,
             .height = height,
+            .scale = self.pane_scale,
         });
     }
 
@@ -155,19 +157,23 @@ pub const Backend = struct {
         const next_height = @max(bounds.height, 1);
         const next_screen_x = bounds.screen_x;
         const next_screen_y = bounds.screen_y;
+        const next_scale = @max(bounds.scale, 0.05);
         if (self.pane_screen_x == next_screen_x and
             self.pane_screen_y == next_screen_y and
             self.pane_width == next_width and
-            self.pane_height == next_height) return;
+            self.pane_height == next_height and
+            @abs(self.pane_scale - next_scale) <= 0.001) return;
         self.pane_screen_x = next_screen_x;
         self.pane_screen_y = next_screen_y;
         self.pane_width = next_width;
         self.pane_height = next_height;
+        self.pane_scale = next_scale;
         try self.platform.setPaneBounds(.{
             .screen_x = self.pane_screen_x,
             .screen_y = self.pane_screen_y,
             .width = self.pane_width,
             .height = self.pane_height,
+            .scale = self.pane_scale,
         });
     }
 
