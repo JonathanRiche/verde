@@ -41,6 +41,7 @@ pub const PaneBounds = struct {
     screen_y: i32 = 0,
     width: u32 = 1,
     height: u32 = 1,
+    scale: f32 = 1.0,
 };
 
 /// Native Wayland handles exported by SDL for app-owned child surfaces.

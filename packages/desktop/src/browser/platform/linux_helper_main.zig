@@ -10,6 +10,7 @@ extern fn verde_browser_linux_destroy(browser: ?*RawBrowser) void;
 extern fn verde_browser_linux_show(browser: ?*RawBrowser, width: c_int, height: c_int, url: ?[*:0]const u8) c_int;
 extern fn verde_browser_linux_hide(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_set_host_window(browser: ?*RawBrowser, host_window: usize) c_int;
+extern fn verde_browser_linux_set_device_scale(browser: ?*RawBrowser, scale: f64) c_int;
 extern fn verde_browser_linux_set_bounds(browser: ?*RawBrowser, x: c_int, y: c_int, width: c_int, height: c_int) c_int;
 extern fn verde_browser_linux_resize(browser: ?*RawBrowser, width: c_int, height: c_int) c_int;
 extern fn verde_browser_linux_navigate(browser: ?*RawBrowser, url: [*:0]const u8) c_int;
@@ -146,6 +147,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
             .kind = parsed.value.kind,
             .width = parsed.value.width,
             .height = parsed.value.height,
+            .scale = parsed.value.scale,
             .x = parsed.value.x,
             .y = parsed.value.y,
             .wheel_x = parsed.value.wheel_x,
@@ -175,6 +177,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
         .show => {
             const width = @max(command.width, 1);
             const height = @max(command.height, 1);
+            _ = verde_browser_linux_set_device_scale(browser, command.scale);
             _ = verde_browser_linux_set_bounds(browser, command.screen_x, command.screen_y, @intCast(width), @intCast(height));
             if (command.payload) |payload| {
                 const owned = try allocator.dupeZ(u8, payload);
@@ -186,22 +189,29 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
         },
         .hide => _ = verde_browser_linux_hide(browser),
         .set_host_window => _ = verde_browser_linux_set_host_window(browser, @intCast(command.host_window)),
-        .set_bounds => _ = verde_browser_linux_set_bounds(
-            browser,
-            command.screen_x,
-            command.screen_y,
-            @intCast(@max(command.width, 1)),
-            @intCast(@max(command.height, 1)),
-        ),
-        .resize_pane => _ = verde_browser_linux_resize(
-            browser,
-            @intCast(@max(command.width, 1)),
-            @intCast(@max(command.height, 1)),
-        ),
+        .set_bounds => {
+            _ = verde_browser_linux_set_device_scale(browser, command.scale);
+            _ = verde_browser_linux_set_bounds(
+                browser,
+                command.screen_x,
+                command.screen_y,
+                @intCast(@max(command.width, 1)),
+                @intCast(@max(command.height, 1)),
+            );
+        },
+        .resize_pane => {
+            _ = verde_browser_linux_set_device_scale(browser, command.scale);
+            _ = verde_browser_linux_resize(
+                browser,
+                @intCast(@max(command.width, 1)),
+                @intCast(@max(command.height, 1)),
+            );
+        },
         .navigate => {
             const payload = command.payload orelse return true;
             const owned = try allocator.dupeZ(u8, payload);
             defer allocator.free(owned);
+            _ = verde_browser_linux_set_device_scale(browser, command.scale);
             _ = verde_browser_linux_set_bounds(
                 browser,
                 command.screen_x,

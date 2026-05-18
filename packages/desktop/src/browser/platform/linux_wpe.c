@@ -77,6 +77,7 @@ struct verde_browser_linux {
     gboolean visible;
     gint target_width;
     gint target_height;
+    gdouble device_scale;
     guint pointer_modifiers;
 };
 
@@ -407,6 +408,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     browser->events = g_queue_new();
     browser->target_width = 1280;
     browser->target_height = 720;
+    browser->device_scale = 1.0;
     browser->frame_ready_slot = -1;
     browser->egl_display = EGL_NO_DISPLAY;
     browser->egl_context = EGL_NO_CONTEXT;
@@ -434,7 +436,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     }
     browser->view_backend = wpe_view_backend_exportable_fdo_get_view_backend(browser->exportable);
     wpe_view_backend_dispatch_set_size(browser->view_backend, browser->target_width, browser->target_height);
-    wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, 1.0f);
+    wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
     wpe_view_backend_set_target_refresh_rate(browser->view_backend, 60000);
     wpe_view_backend_add_activity_state(browser->view_backend, wpe_view_activity_state_visible | wpe_view_activity_state_in_window);
 
@@ -499,6 +501,18 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
 int verde_browser_linux_set_host_window(struct verde_browser_linux *browser, size_t host_window) {
     (void)browser;
     (void)host_window;
+    return 1;
+}
+
+int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, double scale) {
+    if (browser == NULL) return 0;
+    if (!(scale >= 0.05 && scale <= 5.0)) scale = 1.0;
+    const double diff = browser->device_scale > scale ? browser->device_scale - scale : scale - browser->device_scale;
+    if (diff <= 0.001) return 1;
+    browser->device_scale = scale;
+    if (browser->view_backend != NULL) {
+        wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
+    }
     return 1;
 }
 

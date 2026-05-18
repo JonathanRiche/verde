@@ -6288,34 +6288,58 @@ pub const AppState = struct {
         self.syncBrowserPaneBoundsToBackend();
     }
 
+    /// Returns the device scale used by WPE when it renders logical browser pixels into a high-density frame.
+    pub fn browserPaneDeviceScale(self: *const AppState) f32 {
+        const presentation = self.browser_state.controller.presentationKind();
+        const runtime = self.browser_state.controller.runtimeKind();
+        if (runtime == .native_webview and presentation == .offscreen_texture) {
+            return theme.clampf(self.app_window_display_scale, 1.0, 5.0);
+        }
+        return 1.0;
+    }
+
+    /// Returns the browser input coordinate space for the current visible pane rectangle.
+    pub fn browserPaneInputSize(self: *const AppState, pane_width: f32, pane_height: f32) [2]f32 {
+        const scale = self.browserPaneDeviceScale();
+        return .{
+            @max(@round(pane_width / scale), 1.0),
+            @max(@round(pane_height / scale), 1.0),
+        };
+    }
+
     fn syncBrowserPaneBoundsToBackend(self: *AppState) void {
         if (!self.isBrowserVisible()) return;
         if (self.browser_pane_max[0] <= self.browser_pane_min[0] or self.browser_pane_max[1] <= self.browser_pane_min[1]) return;
         if (self.syncBrowserSurfaceOcclusion()) return;
         const pane_width = self.browser_pane_max[0] - self.browser_pane_min[0];
         const pane_height = self.browser_pane_max[1] - self.browser_pane_min[1];
-        const uses_native_surface = switch (self.browser_state.controller.presentationKind()) {
+        const presentation = self.browser_state.controller.presentationKind();
+        const runtime = self.browser_state.controller.runtimeKind();
+        const uses_native_surface = switch (presentation) {
             .native_child_view, .native_wayland_surface, .helper_window => true,
             .snapshot_texture, .offscreen_texture, .stub => false,
         };
+        const uses_scaled_wpe_texture = runtime == .native_webview and presentation == .offscreen_texture;
         const scale = if (uses_native_surface) @max(self.app_window_display_scale, 0.001) else 1.0;
+        const size_scale = if (uses_scaled_wpe_texture) self.browserPaneDeviceScale() else scale;
         const pane_x: i32 = @intFromFloat(@round(self.browser_pane_min[0] / scale));
         const pane_y: i32 = @intFromFloat(@round(self.browser_pane_min[1] / scale));
-        const x = if (self.browser_state.controller.presentationKind() == .native_wayland_surface)
+        const x = if (presentation == .native_wayland_surface)
             pane_x
         else
             self.app_window_screen_origin[0] + pane_x;
-        const y = if (self.browser_state.controller.presentationKind() == .native_wayland_surface)
+        const y = if (presentation == .native_wayland_surface)
             pane_y
         else
             self.app_window_screen_origin[1] + pane_y;
-        const width: u32 = @intFromFloat(@max(@round(pane_width / scale), 1.0));
-        const height: u32 = @intFromFloat(@max(@round(pane_height / scale), 1.0));
+        const width: u32 = @intFromFloat(@max(@round(pane_width / size_scale), 1.0));
+        const height: u32 = @intFromFloat(@max(@round(pane_height / size_scale), 1.0));
         self.browser_state.controller.setPaneBounds(.{
             .screen_x = x,
             .screen_y = y,
             .width = width,
             .height = height,
+            .scale = if (uses_scaled_wpe_texture) self.browserPaneDeviceScale() else 1.0,
         }) catch |err| {
             log.warn("failed to sync browser pane bounds: {s}", .{@errorName(err)});
         };

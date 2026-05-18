@@ -503,6 +503,12 @@ int verde_browser_linux_set_host_window(struct verde_browser_linux *browser, siz
     return 1;
 }
 
+int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, double scale) {
+    (void)browser;
+    (void)scale;
+    return 1;
+}
+
 void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     if (browser == NULL) return;
 
