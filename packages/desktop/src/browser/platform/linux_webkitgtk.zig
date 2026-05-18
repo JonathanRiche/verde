@@ -10,6 +10,13 @@ const ipc = @import("linux_ipc.zig");
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+pub fn configuredPresentationKind() browser_types.PresentationKind {
+    return if (visibleHelperEnabled()) .helper_window else .snapshot_texture;
+}
+
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
 
@@ -131,6 +138,9 @@ pub const Controller = struct {
     reader_thread: ?std.Thread = null,
     pane_width: u32 = DEFAULT_WIDTH,
     pane_height: u32 = DEFAULT_HEIGHT,
+    pane_screen_x: i32 = 0,
+    pane_screen_y: i32 = 0,
+    host_window: u64 = 0,
     current_url: ?[]u8 = null,
 
     /// Creates the helper-backed Linux browser controller.
@@ -172,12 +182,72 @@ pub const Controller = struct {
         self.allocator.destroy(self.frame);
     }
 
+    pub fn shutdown(self: *Controller) void {
+        self.deinit();
+    }
+
+    pub fn runtimeKind(self: *const Controller) browser_types.RuntimeKind {
+        _ = self;
+        return .native_webview;
+    }
+
+    pub fn isRuntimeInitialized(self: *const Controller) bool {
+        return self.child_pid != null;
+    }
+
+    pub fn runtimeMode(self: *const Controller) browser_types.RuntimeMode {
+        _ = self;
+        return .keep_warm;
+    }
+
+    pub fn supportsInspector(self: *const Controller) bool {
+        _ = self;
+        return true;
+    }
+
+    pub fn supportsPopout(self: *const Controller) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn sdkConfigured(self: *const Controller) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn paneSessionId(self: *const Controller) ?browser_types.SessionId {
+        if (self.child_pid == null) return null;
+        return 1;
+    }
+
+    pub fn paneTexture(self: *const Controller) ?browser_texture.PaneTexture {
+        _ = self;
+        return null;
+    }
+
+    /// Linux uses a helper process and does not need the SDL host window handle.
+    pub fn setHostWindow(self: *Controller, handle: ?*anyopaque) !void {
+        self.host_window = if (handle) |value| @intFromPtr(value) else 0;
+        try self.sendCommand(.{
+            .kind = .set_host_window,
+            .host_window = self.host_window,
+        });
+    }
+
+    /// Reports whether Linux is using the diagnostic helper window or the default snapshot texture path.
+    pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {
+        _ = self;
+        return configuredPresentationKind();
+    }
+
     /// Requests that the Linux browser helper warm the offscreen browser surface.
     pub fn show(self: *Controller) !void {
         try self.sendCommand(.{
             .kind = .show,
             .width = self.pane_width,
             .height = self.pane_height,
+            .screen_x = self.pane_screen_x,
+            .screen_y = self.pane_screen_y,
             .payload = self.current_url orelse "about:blank",
         });
     }
@@ -194,10 +264,24 @@ pub const Controller = struct {
 
     /// Updates the offscreen browser size to match the pane viewport.
     pub fn resizePane(self: *Controller, width: u32, height: u32) !void {
-        self.pane_width = @max(width, 1);
-        self.pane_height = @max(height, 1);
+        try self.setPaneBounds(.{
+            .screen_x = self.pane_screen_x,
+            .screen_y = self.pane_screen_y,
+            .width = width,
+            .height = height,
+        });
+    }
+
+    /// Moves and resizes the helper-owned native surface to the Palette browser content rectangle.
+    pub fn setPaneBounds(self: *Controller, bounds: browser_types.PaneBounds) !void {
+        self.pane_width = @max(bounds.width, 1);
+        self.pane_height = @max(bounds.height, 1);
+        self.pane_screen_x = bounds.screen_x;
+        self.pane_screen_y = bounds.screen_y;
         try self.sendCommand(.{
-            .kind = .resize_pane,
+            .kind = .set_bounds,
+            .screen_x = self.pane_screen_x,
+            .screen_y = self.pane_screen_y,
             .width = self.pane_width,
             .height = self.pane_height,
         });
@@ -210,6 +294,8 @@ pub const Controller = struct {
             .kind = .navigate,
             .width = self.pane_width,
             .height = self.pane_height,
+            .screen_x = self.pane_screen_x,
+            .screen_y = self.pane_screen_y,
             .payload = url,
         });
     }
@@ -222,6 +308,31 @@ pub const Controller = struct {
     /// Sends a host-originated JSON payload into the Linux browser helper.
     pub fn postJson(self: *Controller, json: []const u8) !void {
         try self.sendCommand(.{ .kind = .post_json, .payload = json });
+    }
+
+    /// Navigates backward through the helper using WebKitGTK history.
+    pub fn goBack(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .go_back });
+    }
+
+    /// Navigates forward through the helper using WebKitGTK history.
+    pub fn goForward(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .go_forward });
+    }
+
+    /// Reloads the helper page using WebKitGTK navigation.
+    pub fn reload(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .reload });
+    }
+
+    /// Gives the visible helper's WebKit view native focus when that presentation is active.
+    pub fn focus(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .focus });
+    }
+
+    /// Clears native focus from the visible helper when that presentation is active.
+    pub fn blur(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .blur });
     }
 
     /// Sends pointer motion, click, and wheel input into the offscreen browser.
@@ -298,6 +409,11 @@ pub const Controller = struct {
         return self.queue.pop();
     }
 
+    /// Alias used by the shared backend contract.
+    pub fn pollEvent(self: *Controller) ?browser_types.Event {
+        return self.popEvent();
+    }
+
     /// Uploads the latest helper snapshot into the pane texture, if a new frame is ready.
     pub fn uploadFrame(self: *Controller, texture: *browser_texture.PaneTexture) !void {
         try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
@@ -329,12 +445,10 @@ pub const Controller = struct {
         const helper_dir_z = try std.fmt.allocPrintSentinel(arena, "{s}", .{helper_dir}, 0);
         const argv = try arena.allocSentinel(?[*:0]u8, 1, null);
         argv[0] = helper_path_z.ptr;
-        const envp = std.c.environ;
-
         const child_pid = std.c.fork();
         if (child_pid < 0) return error.Unexpected;
         if (child_pid == 0) {
-            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, envp, stdin_pipe, stdout_pipe);
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, stdin_pipe, stdout_pipe);
         }
 
         _ = std.c.close(stdin_pipe[0]);
@@ -404,6 +518,43 @@ pub const Controller = struct {
     }
 };
 
+fn visibleHelperEnabled() bool {
+    const override_value = if (std.c.getenv("VERDE_BROWSER_LINUX_SHOW_HELPER")) |value_ptr| std.mem.span(value_ptr) else null;
+    const unsafe_wayland = if (std.c.getenv("VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER")) |value_ptr| std.mem.span(value_ptr) else null;
+    const session_type = if (std.c.getenv("XDG_SESSION_TYPE")) |value_ptr| std.mem.span(value_ptr) else null;
+    const gdk_backend = if (std.c.getenv("GDK_BACKEND")) |value_ptr| std.mem.span(value_ptr) else null;
+    return visibleHelperEnabledFromValues(override_value, unsafe_wayland, session_type, gdk_backend);
+}
+
+fn visibleHelperEnabledFromValues(override_value: ?[]const u8, unsafe_wayland: ?[]const u8, session_type: ?[]const u8, gdk_backend: ?[]const u8) bool {
+    const allow_wayland_helper = if (unsafe_wayland) |value| std.mem.eql(u8, value, "1") else false;
+    const wayland_session = if (session_type) |value| std.mem.eql(u8, value, "wayland") else false;
+    const wayland_backend = if (gdk_backend) |value| std.mem.indexOf(u8, value, "wayland") != null else false;
+
+    if (override_value) |value| {
+        if (std.mem.eql(u8, value, "1")) return (!wayland_session and !wayland_backend) or allow_wayland_helper;
+        if (std.mem.eql(u8, value, "0")) return false;
+    }
+    if (session_type) |value| {
+        if (std.mem.eql(u8, value, "x11")) return true;
+        if (std.mem.eql(u8, value, "wayland")) return false;
+    }
+    if (gdk_backend) |value| {
+        return std.mem.indexOf(u8, value, "x11") != null and std.mem.indexOf(u8, value, "wayland") == null;
+    }
+    return false;
+}
+
+test "visible helper selection honors overrides and session defaults" {
+    try std.testing.expect(!visibleHelperEnabledFromValues("1", null, "wayland", null));
+    try std.testing.expect(visibleHelperEnabledFromValues("1", "1", "wayland", null));
+    try std.testing.expect(!visibleHelperEnabledFromValues("0", null, "x11", null));
+    try std.testing.expect(visibleHelperEnabledFromValues(null, null, "x11", null));
+    try std.testing.expect(!visibleHelperEnabledFromValues(null, null, "wayland", "x11"));
+    try std.testing.expect(visibleHelperEnabledFromValues(null, null, null, "x11"));
+    try std.testing.expect(!visibleHelperEnabledFromValues(null, null, null, "x11,wayland"));
+}
+
 /// Resolves the installed Linux browser helper path beside the running desktop executable.
 fn browserHelperPath(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
@@ -447,6 +598,8 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .opened => .opened,
         .closed => .closed,
         .navigated => .{ .navigated = try allocator.dupe(u8, event.payload orelse "about:blank") },
+        .title_changed => .{ .title_changed = try allocator.dupe(u8, event.payload orelse "") },
+        .document_loaded => .document_loaded,
         .js_message => .{ .js_message = try allocator.dupe(u8, event.payload orelse "{}") },
         .eval_result => .{ .eval_result = try allocator.dupe(u8, event.payload orelse "null") },
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
@@ -458,7 +611,6 @@ fn execHelperChild(
     helper_dir_z: [*:0]const u8,
     helper_path_z: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]const ?[*:0]const u8,
     stdin_pipe: [2]std.posix.fd_t,
     stdout_pipe: [2]std.posix.fd_t,
 ) noreturn {
@@ -477,7 +629,14 @@ fn execHelperChild(
     restoreDefaultSignal(std.posix.SIG.PIPE);
     if (std.c.chdir(helper_dir_z) != 0) std.c._exit(126);
 
-    _ = std.c.execve(helper_path_z, argv, envp);
+    // The snapshot helper renders into a texture owned by Palette, whose pane
+    // dimensions are already framebuffer pixels. Inheriting a global GDK_SCALE
+    // would make WebKit produce an oversized DPR surface that Palette then
+    // downsamples, causing visibly soft text on scale-1 outputs.
+    _ = setenv("GDK_SCALE", "1", 1);
+    _ = unsetenv("GDK_DPI_SCALE");
+
+    _ = std.c.execve(helper_path_z, argv, std.c.environ);
     std.c._exit(127);
 }
 

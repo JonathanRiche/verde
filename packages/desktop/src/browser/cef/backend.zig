@@ -22,6 +22,9 @@ const browser_helper = if (builtin.os.tag == .linux or builtin.os.tag == .macos)
         pub fn navigate(_: *Controller, _: u32, _: u32, _: []const u8) !void {}
         pub fn eval(_: *Controller, _: []const u8) !void {}
         pub fn postJson(_: *Controller, _: []const u8) !void {}
+        pub fn goBack(_: *Controller) !void {}
+        pub fn goForward(_: *Controller) !void {}
+        pub fn reload(_: *Controller) !void {}
         pub fn handleMouse(_: *Controller, _: browser_input.MouseEvent) !bool {
             return false;
         }
@@ -69,6 +72,17 @@ pub const Backend = struct {
         self.queue.deinit(self.allocator);
     }
 
+    /// CEF uses its helper process and does not attach to the SDL host window.
+    pub fn setHostWindow(self: *Backend, handle: ?*anyopaque) !void {
+        _ = self;
+        _ = handle;
+    }
+
+    /// Fully tears down the CEF backend.
+    pub fn shutdown(self: *Backend) void {
+        self.deinit();
+    }
+
     /// Returns the runtime family this backend is preparing the desktop app to use.
     pub fn runtimeKind(self: *const Backend) browser_types.RuntimeKind {
         _ = self;
@@ -85,9 +99,20 @@ pub const Backend = struct {
         return self.runtime_mode;
     }
 
+    /// Reports that CEF presents the pane through an off-screen texture stream.
+    pub fn presentationKind(self: *const Backend) browser_types.PresentationKind {
+        _ = self;
+        return .offscreen_texture;
+    }
+
     /// Reports whether detached native browser windows are supported yet.
     pub fn supportsPopout(self: *const Backend) bool {
         return self.runtime_config.supports_popout;
+    }
+
+    /// Reports whether the real CEF runtime can host the bundled inspector bridge.
+    pub fn supportsInspector(self: *const Backend) bool {
+        return self.sdkConfigured();
     }
 
     /// Reports whether the build has been pointed at a real CEF SDK yet.
@@ -137,16 +162,25 @@ pub const Backend = struct {
         pane.setVisible(false);
         if (self.helper) |*helper| {
             try helper.hide();
+            return;
         }
         try self.queue.push(self.allocator, .closed);
     }
 
     /// Resizes the pane session to match the visible browser viewport in the dock.
     pub fn resizePane(self: *Backend, width: u32, height: u32) !void {
+        try self.setPaneBounds(.{
+            .width = width,
+            .height = height,
+        });
+    }
+
+    /// Updates the pane session bounds. CEF's offscreen path only consumes the size.
+    pub fn setPaneBounds(self: *Backend, bounds: browser_types.PaneBounds) !void {
         try self.ensureRuntime();
-        const pane = try self.ensurePaneSession(width, height);
-        const next_width = @max(width, 1);
-        const next_height = @max(height, 1);
+        const pane = try self.ensurePaneSession(bounds.width, bounds.height);
+        const next_width = @max(bounds.width, 1);
+        const next_height = @max(bounds.height, 1);
         if (pane.width == next_width and pane.height == next_height) return;
         pane.resize(next_width, next_height);
 
@@ -218,6 +252,49 @@ pub const Backend = struct {
         });
     }
 
+    /// Navigates backward through the CEF helper when available.
+    pub fn goBack(self: *Backend) !void {
+        try self.ensureRuntime();
+        if (self.usingNativeRuntime()) {
+            const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
+            try helper.goBack();
+            return;
+        }
+        try self.eval("history.back()");
+    }
+
+    /// Navigates forward through the CEF helper when available.
+    pub fn goForward(self: *Backend) !void {
+        try self.ensureRuntime();
+        if (self.usingNativeRuntime()) {
+            const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
+            try helper.goForward();
+            return;
+        }
+        try self.eval("history.forward()");
+    }
+
+    /// Reloads the current document through the CEF helper when available.
+    pub fn reload(self: *Backend) !void {
+        try self.ensureRuntime();
+        if (self.usingNativeRuntime()) {
+            const helper = if (self.helper) |*helper| helper else return error.BrowserUnavailable;
+            try helper.reload();
+            return;
+        }
+        try self.eval("location.reload()");
+    }
+
+    /// CEF focus remains represented in app state until the helper exposes a native focus command.
+    pub fn focus(self: *Backend) !void {
+        try self.ensureRuntime();
+    }
+
+    /// CEF blur remains represented in app state until the helper exposes a native blur command.
+    pub fn blur(self: *Backend) !void {
+        _ = self;
+    }
+
     /// Forwards direct pane pointer input into the active native helper runtime.
     pub fn handleMouse(self: *Backend, event: browser_input.MouseEvent) !bool {
         try self.ensureRuntime();
@@ -244,6 +321,11 @@ pub const Backend = struct {
             };
         }
         return self.queue.pop();
+    }
+
+    /// Alias used by the shared backend contract.
+    pub fn pollEvent(self: *Backend) ?browser_types.Event {
+        return self.popEvent();
     }
 
     // Reports whether this build should use the real helper runtime instead of the synthetic preview.

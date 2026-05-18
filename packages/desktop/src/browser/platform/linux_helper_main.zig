@@ -9,10 +9,17 @@ extern fn verde_browser_linux_create() ?*RawBrowser;
 extern fn verde_browser_linux_destroy(browser: ?*RawBrowser) void;
 extern fn verde_browser_linux_show(browser: ?*RawBrowser, width: c_int, height: c_int, url: ?[*:0]const u8) c_int;
 extern fn verde_browser_linux_hide(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_set_host_window(browser: ?*RawBrowser, host_window: usize) c_int;
+extern fn verde_browser_linux_set_bounds(browser: ?*RawBrowser, x: c_int, y: c_int, width: c_int, height: c_int) c_int;
 extern fn verde_browser_linux_resize(browser: ?*RawBrowser, width: c_int, height: c_int) c_int;
 extern fn verde_browser_linux_navigate(browser: ?*RawBrowser, url: [*:0]const u8) c_int;
 extern fn verde_browser_linux_eval(browser: ?*RawBrowser, js: [*:0]const u8) c_int;
 extern fn verde_browser_linux_post_json(browser: ?*RawBrowser, json: [*:0]const u8) c_int;
+extern fn verde_browser_linux_go_back(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_go_forward(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_reload(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_focus(browser: ?*RawBrowser) c_int;
+extern fn verde_browser_linux_blur(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_mouse_move(browser: ?*RawBrowser, x: f64, y: f64, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_mouse_button(browser: ?*RawBrowser, x: f64, y: f64, button: c_uint, down: c_int, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64, delta_x: f64, delta_y: f64, modifiers: c_uint) c_int;
@@ -143,9 +150,12 @@ fn stdinReaderMain(context: *ReaderContext) !void {
             .y = parsed.value.y,
             .wheel_x = parsed.value.wheel_x,
             .wheel_y = parsed.value.wheel_y,
+            .screen_x = parsed.value.screen_x,
+            .screen_y = parsed.value.screen_y,
             .button = parsed.value.button,
             .pressed = parsed.value.pressed,
             .key_code = parsed.value.key_code,
+            .host_window = parsed.value.host_window,
             .ctrl = parsed.value.ctrl,
             .shift = parsed.value.shift,
             .alt = parsed.value.alt,
@@ -165,6 +175,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
         .show => {
             const width = @max(command.width, 1);
             const height = @max(command.height, 1);
+            _ = verde_browser_linux_set_bounds(browser, command.screen_x, command.screen_y, @intCast(width), @intCast(height));
             if (command.payload) |payload| {
                 const owned = try allocator.dupeZ(u8, payload);
                 defer allocator.free(owned);
@@ -174,6 +185,14 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             }
         },
         .hide => _ = verde_browser_linux_hide(browser),
+        .set_host_window => _ = verde_browser_linux_set_host_window(browser, @intCast(command.host_window)),
+        .set_bounds => _ = verde_browser_linux_set_bounds(
+            browser,
+            command.screen_x,
+            command.screen_y,
+            @intCast(@max(command.width, 1)),
+            @intCast(@max(command.height, 1)),
+        ),
         .resize_pane => _ = verde_browser_linux_resize(
             browser,
             @intCast(@max(command.width, 1)),
@@ -183,8 +202,10 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             const payload = command.payload orelse return true;
             const owned = try allocator.dupeZ(u8, payload);
             defer allocator.free(owned);
-            _ = verde_browser_linux_resize(
+            _ = verde_browser_linux_set_bounds(
                 browser,
+                command.screen_x,
+                command.screen_y,
                 @intCast(@max(command.width, 1)),
                 @intCast(@max(command.height, 1)),
             );
@@ -202,6 +223,11 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             defer allocator.free(owned);
             _ = verde_browser_linux_post_json(browser, owned);
         },
+        .go_back => _ = verde_browser_linux_go_back(browser),
+        .go_forward => _ = verde_browser_linux_go_forward(browser),
+        .reload => _ = verde_browser_linux_reload(browser),
+        .focus => _ = verde_browser_linux_focus(browser),
+        .blur => _ = verde_browser_linux_blur(browser),
         .mouse_move => _ = verde_browser_linux_mouse_move(
             browser,
             command.x,
@@ -300,8 +326,10 @@ fn mapEventKind(raw_kind: c_int) ipc.EventKind {
         1 => .opened,
         2 => .closed,
         3 => .navigated,
-        4 => .js_message,
-        5 => .eval_result,
+        4 => .title_changed,
+        5 => .document_loaded,
+        6 => .js_message,
+        7 => .eval_result,
         else => .failed,
     };
 }

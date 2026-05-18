@@ -40,6 +40,9 @@ const native_api = if (build_options.cef_sdk_configured and builtin.os.tag == .l
         extern fn verde_cef_resize_browser(width: c_int, height: c_int) void;
         extern fn verde_cef_navigate(url: [*:0]const u8) c_int;
         extern fn verde_cef_eval(js: [*:0]const u8) c_int;
+        extern fn verde_cef_go_back() c_int;
+        extern fn verde_cef_go_forward() c_int;
+        extern fn verde_cef_reload() c_int;
         extern fn verde_cef_get_frame(
             pixels: *?[*]const u8,
             len: *usize,
@@ -104,6 +107,18 @@ else
 
         fn verde_cef_eval(js: [*:0]const u8) c_int {
             _ = js;
+            return 0;
+        }
+
+        fn verde_cef_go_back() c_int {
+            return 0;
+        }
+
+        fn verde_cef_go_forward() c_int {
+            return 0;
+        }
+
+        fn verde_cef_reload() c_int {
             return 0;
         }
 
@@ -197,6 +212,21 @@ pub fn navigate(url: [*:0]const u8) bool {
 /// Dispatches JavaScript into the main frame of the active browser.
 pub fn eval(js: [*:0]const u8) bool {
     return native_api.verde_cef_eval(js) != 0;
+}
+
+/// Navigates backward in the active browser history.
+pub fn goBack() bool {
+    return native_api.verde_cef_go_back() != 0;
+}
+
+/// Navigates forward in the active browser history.
+pub fn goForward() bool {
+    return native_api.verde_cef_go_forward() != 0;
+}
+
+/// Reloads the active browser document.
+pub fn reload() bool {
+    return native_api.verde_cef_reload() != 0;
 }
 
 /// Returns the latest off-screen frame pointer and metadata from the native shim.

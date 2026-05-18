@@ -36,6 +36,7 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_GetWindowProperties(window: *sdl.Window) sdl.PropertiesID;
 extern fn SDL_GetModState() sdl.Keymod;
 extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
@@ -283,6 +284,7 @@ fn mainInner(init: std.process.Init) !void {
         .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
     });
     defer state.deinit();
+    state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
@@ -410,6 +412,10 @@ fn mainInner(init: std.process.Init) !void {
                 }
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
+        var window_screen_x: c_int = 0;
+        var window_screen_y: c_int = 0;
+        window.getPosition(&window_screen_x, &window_screen_y) catch {};
+        state.noteAppWindowFrame(window_screen_x, window_screen_y, ui_scale);
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
         _ = state.palette_frame_text_arena.reset(.retain_capacity);
@@ -703,6 +709,22 @@ fn currentWindowDisplayScale(window: *sdl.Window) f32 {
     return clampf(scale, 1.0, 2.5);
 }
 
+fn nativeBrowserHostWindow(window: *sdl.Window) ?*anyopaque {
+    const property_name: [:0]const u8 = switch (builtin.os.tag) {
+        .macos => "SDL.window.cocoa.window",
+        .windows => "SDL.window.win32.hwnd",
+        .linux => {
+            const properties = SDL_GetWindowProperties(window);
+            const x11_window = sdl.getNumberProperty(properties, "SDL.window.x11.window", 0);
+            if (x11_window <= 0) return null;
+            return @ptrFromInt(@as(usize, @intCast(x11_window)));
+        },
+        else => return null,
+    };
+    const properties = SDL_GetWindowProperties(window);
+    return sdl.getPointerProperty(properties, property_name, null);
+}
+
 fn clampInt(value: c_int, min_value: c_int, max_value: c_int) c_int {
     return @max(min_value, @min(value, max_value));
 }
@@ -820,6 +842,9 @@ fn processOneEvent(
         else => {},
     }
     const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
+    if (!keep_running) {
+        runtime_log.diagnostic("event requested shutdown type={s}", .{@tagName(event.type)});
+    }
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
 }
@@ -843,8 +868,21 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     switch (event.type) {
-        .quit => return false,
-        .window_close_requested => return handleWindowCloseRequested(state),
+        .quit => {
+            log.info("quit event received", .{});
+            return false;
+        },
+        .window_close_requested => {
+            const keep_running = handleWindowCloseRequested(state);
+            log.info("window close requested keep_running={}", .{keep_running});
+            return keep_running;
+        },
+        .window_hidden, .window_minimized => {
+            state.suspendBrowserForHostWindowHidden();
+        },
+        .window_shown, .window_restored => {
+            state.resumeBrowserAfterHostWindowShown();
+        },
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(

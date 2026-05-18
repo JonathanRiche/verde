@@ -216,6 +216,21 @@ pub const Controller = struct {
         });
     }
 
+    /// Navigates backward through the helper using the native CEF browser API.
+    pub fn goBack(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .go_back });
+    }
+
+    /// Navigates forward through the helper using the native CEF browser API.
+    pub fn goForward(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .go_forward });
+    }
+
+    /// Reloads the helper-backed page using the native CEF browser API.
+    pub fn reload(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .reload });
+    }
+
     /// Sends pointer motion, button, and wheel input into the helper-backed browser.
     pub fn handleMouse(self: *Controller, event: browser_input.MouseEvent) !bool {
         if (event.button) |button| {

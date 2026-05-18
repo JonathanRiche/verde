@@ -188,6 +188,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
     if (std.mem.startsWith(u8, method, "chat.")) return try chatCommandResponse(allocator, id_value, state, params, method["chat.".len..]);
+    if (std.mem.startsWith(u8, method, "browser.")) return try browserCommandResponse(allocator, id_value, state, params, method["browser.".len..]);
     if (std.mem.startsWith(u8, method, "terminal.")) return try terminalCommandResponse(allocator, id_value, state, params, method["terminal.".len..]);
     if (std.mem.startsWith(u8, method, "process.")) return try processCommandResponse(allocator, id_value, state, params, method["process.".len..]);
     if (std.mem.startsWith(u8, method, "stack.")) return try stackCommandResponse(allocator, id_value, state, params, method["stack.".len..]);
@@ -218,6 +219,8 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     }
     try s.objectField("pending_send_count");
     try s.write(state.pending_send_count);
+    try s.objectField("browser");
+    try writeBrowserStatus(&s, state);
     try s.objectField("panes");
     try writeSelectedProjectPanes(&s, state);
     try s.objectField("terminals");
@@ -229,20 +232,50 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     return try writer.toOwnedSlice();
 }
 
+fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
+    const browser = state.browserStateConst();
+    try s.beginObject();
+    try s.objectField("runtime_kind");
+    try s.write(@tagName(browser.controller.runtimeKind()));
+    try s.objectField("presentation_kind");
+    try s.write(@tagName(browser.controller.presentationKind()));
+    try s.objectField("runtime_initialized");
+    try s.write(browser.controller.runtimeInitialized());
+    try s.objectField("status");
+    try s.write(browser.statusLabel());
+    try s.objectField("visible");
+    try s.write(state.isBrowserVisible());
+    try s.objectField("pane_focused");
+    try s.write(state.isBrowserPaneFocused());
+    try s.objectField("address_focused");
+    try s.write(state.browser_address_focused);
+    try s.objectField("url");
+    if (browser.current_url) |url| try s.write(url) else try s.write(null);
+    try s.objectField("address");
+    try s.write(browser.addressInput());
+    try s.objectField("last_error");
+    if (browser.last_error) |message| try s.write(message) else try s.write(null);
+    try s.objectField("last_js_message");
+    if (browser.last_js_message) |message| try s.write(message) else try s.write(null);
+    try s.objectField("last_eval_result");
+    if (browser.last_eval_result) |result| try s.write(result) else try s.write(null);
+    try s.endObject();
+}
+
 fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",         "capabilities",    "projects",       "panes",
-            "active",         "inspect",         "threads",        "terminals",
-            "processes",      "pane.focus",      "pane.split",     "pane.resize",
-            "pane.minimize",  "pane.maximize",   "pane.restore",   "pane.close",
-            "chat.status",    "chat.transcript", "chat.draft.set", "chat.draft.append",
-            "chat.send",      "chat.followup",   "chat.stop",      "chat.approve",
-            "terminal.write", "terminal.tail",   "terminal.screen", "process.list",
-            "process.inspect", "process.start",  "process.stop",    "process.restart",
-            "process.logs",   "stack.status",    "stack.start",     "stack.stop",
-            "stack.restart",
+            "status",          "capabilities",     "projects",        "panes",
+            "active",          "inspect",          "threads",         "terminals",
+            "processes",       "pane.focus",       "pane.split",      "pane.resize",
+            "pane.minimize",   "pane.maximize",    "pane.restore",    "pane.close",
+            "chat.status",     "chat.transcript",  "chat.draft.set",  "chat.draft.append",
+            "chat.send",       "chat.followup",    "chat.stop",       "chat.approve",
+            "browser.eval",    "browser.postJson", "terminal.write",  "terminal.tail",
+            "terminal.screen", "process.list",     "process.inspect", "process.start",
+            "process.stop",    "process.restart",  "process.logs",    "stack.status",
+            "stack.start",     "stack.stop",       "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -438,6 +471,32 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!accepted) return try errorResponseAlloc(allocator, id_value, "rejected", "chat operation did not apply");
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
+}
+
+fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (!state.isBrowserVisible()) {
+        return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible");
+    }
+
+    if (std.mem.eql(u8, command, "eval")) {
+        const script = stringParam(params, "script") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
+        if (script.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
+        state.browserState().controller.eval(script) catch |err| {
+            return try errorResponseAlloc(allocator, id_value, "browser_eval_failed", @errorName(err));
+        };
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "postJson")) {
+        const payload = stringParam(params, "json") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.post-json requires json payload");
+        if (payload.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.post-json requires json payload");
+        state.browserState().controller.postJson(payload) catch |err| {
+            return try errorResponseAlloc(allocator, id_value, "browser_post_json_failed", @errorName(err));
+        };
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
 }
 
 fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {

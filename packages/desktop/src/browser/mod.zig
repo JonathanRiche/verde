@@ -3,6 +3,8 @@
 const std = @import("std");
 
 pub const Controller = @import("controller.zig").Controller;
+pub const BrowserBackend = @import("contract.zig").BrowserBackend;
+pub const BridgePolicy = @import("bridge_policy.zig").Policy;
 pub const Event = @import("types.zig").Event;
 pub const KeyEvent = @import("input.zig").KeyEvent;
 pub const MouseButton = @import("input.zig").MouseButton;

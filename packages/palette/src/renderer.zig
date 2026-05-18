@@ -694,7 +694,7 @@ pub const Renderer = struct {
         if (pixels.len != byte_len) return error.InvalidGpuTexture;
 
         const upload_start = nowNs();
-        const texture_entry = try self.ensureTexture(id, width, height, format, byte_len);
+        const texture_entry = try self.ensureTexture(id, width, height, format, kind, byte_len);
         const mapped = c.SDL_MapGPUTransferBuffer(device, texture_entry.transfer, true) orelse return error.SdlGpuMapFailed;
         @memcpy(@as([*]u8, @ptrCast(mapped))[0..byte_len], pixels);
         c.SDL_UnmapGPUTransferBuffer(device, texture_entry.transfer);
@@ -716,10 +716,10 @@ pub const Renderer = struct {
         }
     }
 
-    fn ensureTexture(self: *Renderer, id: u32, width: u32, height: u32, format: TextureFormat, byte_len: usize) !*GpuTexture {
+    fn ensureTexture(self: *Renderer, id: u32, width: u32, height: u32, format: TextureFormat, kind: TextureUploadKind, byte_len: usize) !*GpuTexture {
         const device = self.device orelse return error.SdlGpuCreateDeviceFailed;
         if (self.textures.getPtr(id)) |entry| {
-            if (entry.width == width and entry.height == height and entry.format == format and entry.transfer_size >= byte_len) return entry;
+            if (entry.width == width and entry.height == height and entry.format == format and entry.kind == kind and entry.transfer_size >= byte_len) return entry;
             entry.deinit(device);
             _ = self.textures.remove(id);
         }
@@ -730,11 +730,14 @@ pub const Renderer = struct {
         // base level. COLOR_TARGET usage is required by SDL_GPU's mipmap
         // generator.
         const max_dim = @max(width, height);
-        const num_levels = blk: {
-            var n: u32 = 1;
-            var d = max_dim;
-            while (d > 1) : (n += 1) d >>= 1;
-            break :blk n;
+        const num_levels = switch (kind) {
+            .browser => 1,
+            .image => blk: {
+                var n: u32 = 1;
+                var d = max_dim;
+                while (d > 1) : (n += 1) d >>= 1;
+                break :blk n;
+            },
         };
         const texture = c.SDL_CreateGPUTexture(device, &.{
             .type = c.SDL_GPU_TEXTURETYPE_2D,
@@ -765,8 +768,9 @@ pub const Renderer = struct {
             .height = height,
             .num_levels = num_levels,
             .format = format,
+            .kind = kind,
             .dirty = false,
-            .dirty_kind = .image,
+            .dirty_kind = kind,
         });
         return self.textures.getPtr(id).?;
     }
@@ -1214,6 +1218,7 @@ const GpuTexture = struct {
     height: u32,
     num_levels: u32,
     format: Renderer.TextureFormat,
+    kind: TextureUploadKind = .image,
     dirty: bool = false,
     dirty_kind: TextureUploadKind = .image,
 

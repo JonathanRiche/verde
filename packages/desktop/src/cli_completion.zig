@@ -56,6 +56,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("\"\n  local draft=\"");
     try writeWords(w, &spec.chat_draft_commands);
+    try w.writeAll("\"\n  local browser=\"");
+    try writeWords(w, &spec.browser_commands);
     try w.writeAll("\"\n  local terminal=\"");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
@@ -80,6 +82,10 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_send_flags);
     try w.writeAll("\"\n  local chat_approve_flags=\"");
     try writeWords(w, &spec.chat_approve_flags);
+    try w.writeAll("\"\n  local browser_eval_flags=\"");
+    try writeWords(w, &spec.browser_eval_flags);
+    try w.writeAll("\"\n  local browser_post_json_flags=\"");
+    try writeWords(w, &spec.browser_post_json_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -136,6 +142,13 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\              *) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
+        \\          browser)
+        \\            case "$third" in
+        \\              eval) COMPREPLY=( $(compgen -W "$browser_eval_flags" -- "$cur") ) ;;
+        \\              post-json) COMPREPLY=( $(compgen -W "$browser_post_json_flags" -- "$cur") ) ;;
+        \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\            esac
+        \\            ;;
         \\          terminal)
         \\            case "$third" in
         \\              write) COMPREPLY=( $(compgen -W "$terminal_write_flags" -- "$cur") ) ;;
@@ -160,6 +173,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
         \\    3:live:pane:*) COMPREPLY=( $(compgen -W "$pane" -- "$cur") ) ;;
         \\    3:live:chat:*) COMPREPLY=( $(compgen -W "$chat" -- "$cur") ) ;;
+        \\    3:live:browser:*) COMPREPLY=( $(compgen -W "$browser" -- "$cur") ) ;;
         \\    3:live:terminal:*) COMPREPLY=( $(compgen -W "$terminal" -- "$cur") ) ;;
         \\    3:live:process:*) COMPREPLY=( $(compgen -W "$process" -- "$cur") ) ;;
         \\    3:live:stack:*) COMPREPLY=( $(compgen -W "$stack" -- "$cur") ) ;;
@@ -199,6 +213,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("\"\n  local draft=\"");
     try writeWords(w, &spec.chat_draft_commands);
+    try w.writeAll("\"\n  local browser=\"");
+    try writeWords(w, &spec.browser_commands);
     try w.writeAll("\"\n  local terminal=\"");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
@@ -223,6 +239,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_send_flags);
     try w.writeAll("\"\n  local chat_approve_flags=\"");
     try writeWords(w, &spec.chat_approve_flags);
+    try w.writeAll("\"\n  local browser_eval_flags=\"");
+    try writeWords(w, &spec.browser_eval_flags);
+    try w.writeAll("\"\n  local browser_post_json_flags=\"");
+    try writeWords(w, &spec.browser_post_json_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -279,6 +299,13 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\              *) compadd -- ${(s: :)pane_flags} ;;
         \\            esac
         \\            ;;
+        \\          browser)
+        \\            case "$third" in
+        \\              eval) compadd -- ${(s: :)browser_eval_flags} ;;
+        \\              post-json) compadd -- ${(s: :)browser_post_json_flags} ;;
+        \\              *) compadd -- ${(s: :)json_flags} ;;
+        \\            esac
+        \\            ;;
         \\          terminal)
         \\            case "$third" in
         \\              write) compadd -- ${(s: :)terminal_write_flags} ;;
@@ -303,6 +330,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    3:live:*) compadd -- ${(s: :)live} ;;
         \\    4:live:pane:*) compadd -- ${(s: :)pane} ;;
         \\    4:live:chat:*) compadd -- ${(s: :)chat} ;;
+        \\    4:live:browser:*) compadd -- ${(s: :)browser} ;;
         \\    4:live:terminal:*) compadd -- ${(s: :)terminal} ;;
         \\    4:live:process:*) compadd -- ${(s: :)process} ;;
         \\    4:live:stack:*) compadd -- ${(s: :)stack} ;;
@@ -350,6 +378,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live chat draft' -a '");
     try writeWords(w, &spec.chat_draft_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live browser' -a '");
+    try writeWords(w, &spec.browser_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live terminal' -a '");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live process' -a '");

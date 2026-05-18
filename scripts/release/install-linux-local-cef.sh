@@ -24,7 +24,7 @@ need_cmake
 verde_cef_ensure_sdk linux "$ARCH"
 
 cd "$DESKTOP_ROOT"
-zig build --release=safe -p "$PREFIX" -Dcef-sdk-path="$VERDE_CEF_SDK_PATH_RESOLVED"
+zig build --release=safe -p "$PREFIX" -Dbrowser-backend=cef -Dcef-sdk-path="$VERDE_CEF_SDK_PATH_RESOLVED"
 
 echo
 echo "Installed Verde into $PREFIX"

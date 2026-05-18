@@ -4,25 +4,33 @@ zls = "0.16.0"
 # zls = "0.15.2"
 
 [tasks.setup]
-description = "Downloads the CEF SDK into the local build cache."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" && echo \"CEF SDK cache: $VERDE_CEF_SDK_PATH_RESOLVED\"'"
+description = "Checks desktop build dependencies."
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh'"
 
 [tasks.build]
 description = "Builds the desktop app."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) scripts/release/install-macos-local.sh ;; Linux) scripts/release/install-linux-local-cef.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) scripts/release/install-macos-local.sh ;; Linux) zig build --release=safe -Dbrowser-backend=native_webview && scripts/dev/check-native-webview-install.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
 
 [tasks.dev]
 description = "Builds and runs Verde from the repo-local Zig build output."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build run --release=safe -Dbrowser-backend=native_webview'"
+
+[tasks.dev-cef]
+description = "Builds and runs Verde with the legacy CEF browser backend."
+run = "VERDE_BROWSER_BACKEND=cef VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+
+[tasks.build-cef]
+description = "Builds Verde with the legacy CEF browser backend."
+run = "VERDE_BROWSER_BACKEND=cef VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) VERDE_BROWSER_BACKEND=cef scripts/release/install-macos-local.sh ;; Linux) scripts/release/install-linux-local-cef.sh ;; *) echo \"unsupported build host: $(uname -s)\" >&2; exit 1 ;; esac'"
 
 [tasks.dev-sdl-gpu]
 description = "Builds and runs Verde with the experimental SDL_GPU palette renderer."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dpalette-renderer=sdl_gpu -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build run --release=safe -Dpalette-renderer=sdl_gpu -Dbrowser-backend=native_webview'"
 
 [tasks.run]
 description = "Builds and launches Verde in development mode."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build run -Dbrowser-backend=native_webview'"
 
 [tasks.debug]
 description = "Builds and launches Verde with the in-app diagnostics window enabled."
-run = "VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run -Dui-debug=true -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && zig build run -Dui-debug=true -Dbrowser-backend=native_webview'"
