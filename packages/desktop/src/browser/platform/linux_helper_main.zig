@@ -26,7 +26,7 @@ extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64,
 extern fn verde_browser_linux_key_input(browser: ?*RawBrowser, key_code: c_uint, down: c_int, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const u8, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, payload: *?[*:0]u8) c_int;
-extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, width: *c_int, height: *c_int, byte_len: *usize) c_int;
+extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
 
 const Mutex = struct {
@@ -301,10 +301,11 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
     while (true) {
         var frame_path: ?[*:0]u8 = null;
         var frame_sequence: u64 = 0;
+        var frame_slot: c_int = -1;
         var width: c_int = 0;
         var height: c_int = 0;
         var byte_len: usize = 0;
-        if (verde_browser_linux_poll_frame(browser, &frame_path, &frame_sequence, &width, &height, &byte_len) == 0) break;
+        if (verde_browser_linux_poll_frame(browser, &frame_path, &frame_sequence, &frame_slot, &width, &height, &byte_len) == 0) break;
         defer if (frame_path != null) verde_browser_linux_free_string(frame_path);
 
         const event: ipc.Event = .{
@@ -313,6 +314,7 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
             .width = @intCast(@max(width, 0)),
             .height = @intCast(@max(height, 0)),
             .byte_len = byte_len,
+            .frame_slot = if (frame_slot >= 0) @intCast(frame_slot) else 0,
             .frame_path = if (frame_path) |value| std.mem.span(value) else null,
         };
         const encoded = try std.json.Stringify.valueAlloc(allocator, event, .{});

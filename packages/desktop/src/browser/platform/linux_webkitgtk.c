@@ -6,9 +6,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <webkit2/webkit2.h>
 #include <X11/Xlib.h>
+
+#define VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT 3
+#define VERDE_BROWSER_LINUX_FRAME_BYTES_MAX (4096u * 2160u * 4u)
 
 enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_OPENED = 1,
@@ -36,9 +40,13 @@ struct verde_browser_linux {
     gboolean snapshot_requested_while_pending;
     gboolean snapshot_dirty;
     gchar *snapshot_path;
+    unsigned char *frame_slots[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
+    gboolean frame_slots_ready[VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT];
+    guint8 frame_next_slot;
     guint64 snapshot_next_sequence;
     guint64 snapshot_pending_sequence;
     guint64 snapshot_ready_sequence;
+    gint snapshot_ready_slot;
     gint64 snapshot_request_started_us;
     gint snapshot_width;
     gint snapshot_height;
@@ -79,6 +87,7 @@ static void verde_browser_linux_run_internal_script(struct verde_browser_linux *
 static gboolean verde_browser_linux_visible_helper_enabled(void);
 static gboolean verde_browser_linux_wayland_diagnostic_helper_enabled(void);
 static gboolean verde_browser_linux_direct_surface_active(void);
+static gboolean verde_browser_linux_frame_log_enabled(void);
 
 static gboolean verde_browser_linux_apply_size(struct verde_browser_linux *browser, int width, int height) {
     if (browser == NULL || width <= 0 || height <= 0) return FALSE;
@@ -137,6 +146,57 @@ static gboolean verde_browser_linux_wayland_diagnostic_helper_enabled(void) {
 
 static gboolean verde_browser_linux_direct_surface_active(void) {
     return verde_browser_linux_visible_helper_enabled();
+}
+
+static gboolean verde_browser_linux_frame_log_enabled(void) {
+    const char *value = getenv("VERDE_BROWSER_FRAME_LOG");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
+static gboolean verde_browser_linux_read_frame_fd(guint index, int *fd) {
+    char name[64];
+    snprintf(name, sizeof(name), "VERDE_BROWSER_LINUX_FRAME%u_FD", index);
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') return FALSE;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0) return FALSE;
+    *fd = (int)parsed;
+    return TRUE;
+}
+
+static gboolean verde_browser_linux_shared_frames_enabled(struct verde_browser_linux *browser) {
+    if (browser == NULL) return FALSE;
+    for (guint index = 0; index < VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT; index += 1) {
+        if (!browser->frame_slots_ready[index] || browser->frame_slots[index] == NULL) return FALSE;
+    }
+    return TRUE;
+}
+
+static void verde_browser_linux_map_frame_slots(struct verde_browser_linux *browser) {
+    if (browser == NULL) return;
+    for (guint index = 0; index < VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT; index += 1) {
+        int fd = -1;
+        if (!verde_browser_linux_read_frame_fd(index, &fd)) return;
+        void *mapping = mmap(NULL, VERDE_BROWSER_LINUX_FRAME_BYTES_MAX, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapping == MAP_FAILED) {
+            browser->frame_slots[index] = NULL;
+            browser->frame_slots_ready[index] = FALSE;
+            return;
+        }
+        browser->frame_slots[index] = mapping;
+        browser->frame_slots_ready[index] = TRUE;
+    }
+}
+
+static void verde_browser_linux_unmap_frame_slots(struct verde_browser_linux *browser) {
+    if (browser == NULL) return;
+    for (guint index = 0; index < VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT; index += 1) {
+        if (!browser->frame_slots_ready[index] || browser->frame_slots[index] == NULL) continue;
+        munmap(browser->frame_slots[index], VERDE_BROWSER_LINUX_FRAME_BYTES_MAX);
+        browser->frame_slots[index] = NULL;
+        browser->frame_slots_ready[index] = FALSE;
+    }
 }
 
 static void verde_browser_linux_apply_host_window(struct verde_browser_linux *browser) {
@@ -245,58 +305,84 @@ static void verde_browser_linux_on_snapshot_finished(GObject *object, GAsyncResu
     }
 
     const gsize contiguous_len = (gsize)width * (gsize)height * 4;
-    gchar *snapshot_path = g_strdup_printf("/tmp/verde-browser-linux-frame-%d-%" G_GUINT64_FORMAT ".rgba", getpid(), sequence);
+    gchar *snapshot_path = NULL;
+    gint snapshot_slot = -1;
     const gint64 write_started_us = g_get_monotonic_time();
-    FILE *file = fopen(snapshot_path, "wb");
-    if (file == NULL) {
-        g_free(snapshot_path);
-        verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to open Linux snapshot file.");
-        if (output_surface != surface) cairo_surface_destroy(output_surface);
-        cairo_surface_destroy(surface);
-        return;
-    }
 
-    for (gint row = 0; row < height; row += 1) {
-        unsigned char *row_ptr = data + (gsize)row * (gsize)stride;
-        for (gint x = 0; x < width; x += 1) {
-            row_ptr[(gsize)x * 4 + 3] = 255;
+    if (verde_browser_linux_shared_frames_enabled(browser) && contiguous_len <= VERDE_BROWSER_LINUX_FRAME_BYTES_MAX) {
+        snapshot_slot = browser->frame_next_slot;
+        unsigned char *slot = browser->frame_slots[snapshot_slot];
+        for (gint row = 0; row < height; row += 1) {
+            unsigned char *row_ptr = data + (gsize)row * (gsize)stride;
+            unsigned char *target_row = slot + (gsize)row * (gsize)width * 4;
+            for (gint x = 0; x < width; x += 1) {
+                row_ptr[(gsize)x * 4 + 3] = 255;
+            }
+            memcpy(target_row, row_ptr, (gsize)width * 4);
         }
-        if (fwrite(row_ptr, 1, (gsize)width * 4, file) != (gsize)width * 4) {
-            fclose(file);
-            remove(snapshot_path);
+        browser->frame_next_slot = (guint8)((browser->frame_next_slot + 1) % VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT);
+    } else {
+        snapshot_path = g_strdup_printf("/tmp/verde-browser-linux-frame-%d-%" G_GUINT64_FORMAT ".rgba", getpid(), sequence);
+        FILE *file = fopen(snapshot_path, "wb");
+        if (file == NULL) {
             g_free(snapshot_path);
-            verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to write Linux snapshot pixels.");
+            verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to open Linux snapshot file.");
             if (output_surface != surface) cairo_surface_destroy(output_surface);
             cairo_surface_destroy(surface);
             return;
         }
+
+        for (gint row = 0; row < height; row += 1) {
+            unsigned char *row_ptr = data + (gsize)row * (gsize)stride;
+            for (gint x = 0; x < width; x += 1) {
+                row_ptr[(gsize)x * 4 + 3] = 255;
+            }
+            if (fwrite(row_ptr, 1, (gsize)width * 4, file) != (gsize)width * 4) {
+                fclose(file);
+                remove(snapshot_path);
+                g_free(snapshot_path);
+                verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to write Linux snapshot pixels.");
+                if (output_surface != surface) cairo_surface_destroy(output_surface);
+                cairo_surface_destroy(surface);
+                return;
+            }
+        }
+        fclose(file);
     }
-    fclose(file);
     const gint64 write_finished_us = g_get_monotonic_time();
 
-    g_free(browser->snapshot_path);
+    if (browser->snapshot_path != NULL) {
+        if (browser->snapshot_dirty) {
+            remove(browser->snapshot_path);
+        }
+        g_free(browser->snapshot_path);
+    }
     browser->snapshot_path = snapshot_path;
     browser->snapshot_ready_sequence = sequence;
+    browser->snapshot_ready_slot = snapshot_slot;
     browser->snapshot_width = width;
     browser->snapshot_height = height;
     browser->snapshot_byte_len = contiguous_len;
     browser->snapshot_dirty = TRUE;
-    fprintf(
-        stderr,
-        "verde-browser-linux snapshot seq=%" G_GUINT64_FORMAT " capture_ms=%.3f scale_ms=%.3f write_ms=%.3f bytes=%zu size=%dx%d source=%dx%d scaled=%d queued_again=%d\n",
-        sequence,
-        verde_browser_linux_elapsed_ms(request_started_us, write_started_us),
-        verde_browser_linux_elapsed_ms(scale_started_us, scale_finished_us),
-        verde_browser_linux_elapsed_ms(write_started_us, write_finished_us),
-        (size_t)contiguous_len,
-        width,
-        height,
-        source_width,
-        source_height,
-        (output_surface != surface) ? 1 : 0,
-        browser->snapshot_requested_while_pending ? 1 : 0
-    );
-    fflush(stderr);
+    if (verde_browser_linux_frame_log_enabled()) {
+        fprintf(
+            stderr,
+            "verde-browser-linux snapshot seq=%" G_GUINT64_FORMAT " capture_ms=%.3f scale_ms=%.3f write_ms=%.3f bytes=%zu size=%dx%d source=%dx%d scaled=%d shared_slot=%d queued_again=%d\n",
+            sequence,
+            verde_browser_linux_elapsed_ms(request_started_us, write_started_us),
+            verde_browser_linux_elapsed_ms(scale_started_us, scale_finished_us),
+            verde_browser_linux_elapsed_ms(write_started_us, write_finished_us),
+            (size_t)contiguous_len,
+            width,
+            height,
+            source_width,
+            source_height,
+            (output_surface != surface) ? 1 : 0,
+            snapshot_slot,
+            browser->snapshot_requested_while_pending ? 1 : 0
+        );
+        fflush(stderr);
+    }
     if (output_surface != surface) cairo_surface_destroy(output_surface);
     cairo_surface_destroy(surface);
     if (browser->snapshot_requested_while_pending) {
@@ -487,6 +573,8 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     browser->events = g_queue_new();
     browser->target_width = 1280;
     browser->target_height = 720;
+    browser->snapshot_ready_slot = -1;
+    verde_browser_linux_map_frame_slots(browser);
     browser->content_manager = webkit_user_content_manager_new();
     WebKitUserScript *bridge_script = webkit_user_script_new(
         "(function(){"
@@ -504,6 +592,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     webkit_user_script_unref(bridge_script);
     if (!webkit_user_content_manager_register_script_message_handler(browser->content_manager, "verde")) {
         g_free(browser->snapshot_path);
+        verde_browser_linux_unmap_frame_slots(browser);
         g_queue_free(browser->events);
         g_object_unref(browser->content_manager);
         g_free(browser);
@@ -587,6 +676,7 @@ void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
         remove(browser->snapshot_path);
         g_free(browser->snapshot_path);
     }
+    verde_browser_linux_unmap_frame_slots(browser);
     g_queue_free(browser->events);
     g_free(browser);
 }
@@ -746,17 +836,18 @@ int verde_browser_linux_poll_event(struct verde_browser_linux *browser, int *kin
     return 1;
 }
 
-int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **path, uint64_t *sequence, int *width, int *height, size_t *byte_len) {
-    if (browser == NULL || path == NULL || sequence == NULL || width == NULL || height == NULL || byte_len == NULL) return 0;
+int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **path, uint64_t *sequence, int *slot, int *width, int *height, size_t *byte_len) {
+    if (browser == NULL || path == NULL || sequence == NULL || slot == NULL || width == NULL || height == NULL || byte_len == NULL) return 0;
 
     while (g_main_context_pending(NULL)) {
         g_main_context_iteration(NULL, FALSE);
     }
 
-    if (!browser->snapshot_dirty || browser->snapshot_path == NULL) return 0;
+    if (!browser->snapshot_dirty || (browser->snapshot_path == NULL && browser->snapshot_ready_slot < 0)) return 0;
 
-    *path = g_strdup(browser->snapshot_path);
+    *path = browser->snapshot_path != NULL ? g_strdup(browser->snapshot_path) : NULL;
     *sequence = (uint64_t)browser->snapshot_ready_sequence;
+    *slot = browser->snapshot_ready_slot;
     *width = browser->snapshot_width;
     *height = browser->snapshot_height;
     *byte_len = browser->snapshot_byte_len;

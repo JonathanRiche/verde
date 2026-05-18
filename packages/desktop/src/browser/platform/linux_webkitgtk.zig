@@ -11,6 +11,9 @@ const log = std.log.scoped(.linux_webkitgtk);
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
+const FRAME_FD_BASE: std.posix.fd_t = 240;
+const FRAME_SLOT_COUNT: usize = 3;
+const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
@@ -29,6 +32,11 @@ fn nanosToMillis(nanos: i128) f64 {
 fn deleteFramePath(path: []const u8) void {
     var threaded = std.Io.Threaded.init_single_threaded;
     std.Io.Dir.deleteFileAbsolute(threaded.io(), path) catch {};
+}
+
+fn frameLogEnabled() bool {
+    const value = std.c.getenv("VERDE_BROWSER_FRAME_LOG") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 pub fn configuredPresentationKind() browser_types.PresentationKind {
@@ -82,6 +90,9 @@ const SharedQueue = struct {
 
 const SharedFrame = struct {
     mutex: Mutex = .{},
+    slots: [FRAME_SLOT_COUNT][]align(std.heap.page_size_min) u8 = undefined,
+    slot_ready: [FRAME_SLOT_COUNT]bool = [_]bool{false} ** FRAME_SLOT_COUNT,
+    staging: std.ArrayList(u8) = .empty,
     path: ?[]u8 = null,
     sequence: u64 = 0,
     width: u32 = 0,
@@ -97,6 +108,12 @@ const SharedFrame = struct {
             deleteFramePath(path);
             allocator.free(path);
         }
+        for (0..FRAME_SLOT_COUNT) |index| {
+            if (!self.slot_ready[index]) continue;
+            std.posix.munmap(self.slots[index]);
+            self.slot_ready[index] = false;
+        }
+        self.staging.deinit(allocator);
         self.path = null;
         self.sequence = 0;
         self.width = 0;
@@ -115,15 +132,24 @@ const SharedFrame = struct {
             return;
         }
 
-        if (self.path) |path| {
-            deleteFramePath(path);
-            allocator.free(path);
+        if (event.frame_path) |path| {
+            if (self.path) |old_path| {
+                deleteFramePath(old_path);
+                allocator.free(old_path);
+            }
+            self.path = try allocator.dupe(u8, path);
+        } else {
+            if (event.frame_slot >= FRAME_SLOT_COUNT) return error.InvalidFrameSlot;
+            if (!self.slot_ready[event.frame_slot]) return error.InvalidFrameSlot;
+            if (event.byte_len > self.slots[event.frame_slot].len) return error.FrameTooLarge;
+            try self.staging.resize(allocator, event.byte_len);
+            @memcpy(self.staging.items[0..event.byte_len], self.slots[event.frame_slot][0..event.byte_len]);
+            if (self.path) |old_path| {
+                deleteFramePath(old_path);
+                allocator.free(old_path);
+                self.path = null;
+            }
         }
-
-        self.path = if (event.frame_path) |path|
-            try allocator.dupe(u8, path)
-        else
-            null;
         self.sequence = event.frame_sequence;
         self.width = event.width;
         self.height = event.height;
@@ -138,55 +164,70 @@ const SharedFrame = struct {
         frame_buffer: *std.ArrayList(u8),
         texture: *browser_texture.PaneTexture,
     ) !bool {
-        var upload_path: []u8 = undefined;
+        var upload_path: ?[]u8 = null;
         var upload_sequence: u64 = 0;
         var upload_width: u32 = 0;
         var upload_height: u32 = 0;
         var upload_byte_len: usize = 0;
+        var upload_pixels: []u8 = &.{};
 
-        self.mutex.lock();
-        if (!self.dirty or self.path == null or self.width == 0 or self.height == 0 or self.byte_len == 0) {
-            self.mutex.unlock();
-            return false;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (!self.dirty or self.width == 0 or self.height == 0 or self.byte_len == 0) {
+                return false;
+            }
+            upload_sequence = self.sequence;
+            upload_width = self.width;
+            upload_height = self.height;
+            upload_byte_len = self.byte_len;
+            if (self.path) |path| {
+                upload_path = path;
+                self.path = null;
+            } else {
+                try frame_buffer.resize(allocator, upload_byte_len);
+                @memcpy(frame_buffer.items[0..upload_byte_len], self.staging.items[0..upload_byte_len]);
+                upload_pixels = frame_buffer.items[0..upload_byte_len];
+            }
+            self.dirty = false;
         }
-        upload_path = self.path.?;
-        upload_sequence = self.sequence;
-        upload_width = self.width;
-        upload_height = self.height;
-        upload_byte_len = self.byte_len;
-        self.path = null;
-        self.dirty = false;
-        self.mutex.unlock();
         defer {
-            deleteFramePath(upload_path);
-            allocator.free(upload_path);
+            if (upload_path) |path| {
+                deleteFramePath(path);
+                allocator.free(path);
+            }
         }
 
         const read_start = monotonicTimestampNs();
-        try frame_buffer.resize(allocator, upload_byte_len);
-        var threaded = std.Io.Threaded.init_single_threaded;
-        const file = try std.Io.Dir.openFileAbsolute(threaded.io(), upload_path, .{ .mode = .read_only });
-        defer file.close(threaded.io());
+        if (upload_path) |path| {
+            try frame_buffer.resize(allocator, upload_byte_len);
+            var threaded = std.Io.Threaded.init_single_threaded;
+            const file = try std.Io.Dir.openFileAbsolute(threaded.io(), path, .{ .mode = .read_only });
+            defer file.close(threaded.io());
 
-        var read_buffer: [8 * 1024]u8 = undefined;
-        var reader = file.reader(threaded.io(), &read_buffer);
-        try reader.interface.readSliceAll(frame_buffer.items[0..upload_byte_len]);
+            var read_buffer: [8 * 1024]u8 = undefined;
+            var reader = file.reader(threaded.io(), &read_buffer);
+            try reader.interface.readSliceAll(frame_buffer.items[0..upload_byte_len]);
+            upload_pixels = frame_buffer.items[0..upload_byte_len];
+        }
         const read_end = monotonicTimestampNs();
 
         const upload_start = monotonicTimestampNs();
-        try texture.uploadBgra(upload_width, upload_height, frame_buffer.items[0..upload_byte_len]);
+        try texture.uploadBgra(upload_width, upload_height, upload_pixels);
         const upload_end = monotonicTimestampNs();
-        log.info(
-            "snapshot frame seq={} read_ms={d:.3} upload_ms={d:.3} bytes={} size={}x{}",
-            .{
-                upload_sequence,
-                nanosToMillis(read_end - read_start),
-                nanosToMillis(upload_end - upload_start),
-                upload_byte_len,
-                upload_width,
-                upload_height,
-            },
-        );
+        if (frameLogEnabled()) {
+            log.info(
+                "snapshot frame seq={} read_ms={d:.3} upload_ms={d:.3} bytes={} size={}x{}",
+                .{
+                    upload_sequence,
+                    nanosToMillis(read_end - read_start),
+                    nanosToMillis(upload_end - upload_start),
+                    upload_byte_len,
+                    upload_width,
+                    upload_height,
+                },
+            );
+        }
         return true;
     }
 };
@@ -501,6 +542,15 @@ pub const Controller = struct {
             _ = std.c.close(stdout_pipe[0]);
             _ = std.c.close(stdout_pipe[1]);
         }
+        const frame_fds: ?[FRAME_SLOT_COUNT]std.posix.fd_t = createFrameSlots(self.frame, self.allocator) catch |err| frame_fds: {
+            log.warn("Linux WebKit shared frame slots unavailable: {}; falling back to temp-frame files", .{err});
+            break :frame_fds null;
+        };
+        var frame_fds_to_close = frame_fds;
+        errdefer if (frame_fds_to_close) |fds| {
+            for (fds) |fd| _ = std.c.close(fd);
+            self.frame.deinit(self.allocator);
+        };
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -513,9 +563,13 @@ pub const Controller = struct {
         const child_pid = std.c.fork();
         if (child_pid < 0) return error.Unexpected;
         if (child_pid == 0) {
-            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, stdin_pipe, stdout_pipe);
+            execHelperChild(helper_dir_z.ptr, helper_path_z.ptr, argv.ptr, stdin_pipe, stdout_pipe, frame_fds);
         }
 
+        if (frame_fds) |fds| {
+            for (fds) |fd| _ = std.c.close(fd);
+            frame_fds_to_close = null;
+        }
         _ = std.c.close(stdin_pipe[0]);
         _ = std.c.close(stdout_pipe[1]);
         const stdin_file: std.Io.File = .{ .handle = stdin_pipe[1], .flags = .{ .nonblocking = false } };
@@ -721,15 +775,24 @@ fn execHelperChild(
     argv: [*:null]const ?[*:0]const u8,
     stdin_pipe: [2]std.posix.fd_t,
     stdout_pipe: [2]std.posix.fd_t,
+    frame_fds: ?[FRAME_SLOT_COUNT]std.posix.fd_t,
 ) noreturn {
     _ = std.c.setpgid(0, 0);
     if (std.c.dup2(stdin_pipe[0], std.c.STDIN_FILENO) < 0) std.c._exit(126);
     if (std.c.dup2(stdout_pipe[1], std.c.STDOUT_FILENO) < 0) std.c._exit(126);
+    if (frame_fds) |fds| {
+        inline for (fds, 0..) |frame_fd, index| {
+            if (std.c.dup2(frame_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) < 0) std.c._exit(126);
+        }
+    }
 
     _ = std.c.close(stdin_pipe[0]);
     _ = std.c.close(stdin_pipe[1]);
     _ = std.c.close(stdout_pipe[0]);
     _ = std.c.close(stdout_pipe[1]);
+    if (frame_fds) |fds| {
+        for (fds) |frame_fd| _ = std.c.close(frame_fd);
+    }
     closeInheritedFileDescriptors();
 
     var empty_signal_mask = std.posix.sigemptyset();
@@ -743,6 +806,11 @@ fn execHelperChild(
     // downsamples, causing visibly soft text on scale-1 outputs.
     _ = setenv("GDK_SCALE", "1", 1);
     _ = unsetenv("GDK_DPI_SCALE");
+    if (frame_fds != null) {
+        _ = setenv("VERDE_BROWSER_LINUX_FRAME0_FD", "240", 1);
+        _ = setenv("VERDE_BROWSER_LINUX_FRAME1_FD", "241", 1);
+        _ = setenv("VERDE_BROWSER_LINUX_FRAME2_FD", "242", 1);
+    }
 
     _ = std.c.execve(helper_path_z, argv, std.c.environ);
     std.c._exit(127);
@@ -753,8 +821,36 @@ fn closeInheritedFileDescriptors() void {
     const max_fd: usize = @intCast(@min(limits.cur, 4096));
     var fd: usize = 3;
     while (fd < max_fd) : (fd += 1) {
+        if (fd >= FRAME_FD_BASE and fd < FRAME_FD_BASE + FRAME_SLOT_COUNT) continue;
         _ = std.c.close(@intCast(fd));
     }
+}
+
+// Creates shared frame slots so the WebKit helper can publish pixels without rewriting files.
+fn createFrameSlots(frame: *SharedFrame, allocator: std.mem.Allocator) ![FRAME_SLOT_COUNT]std.posix.fd_t {
+    var frame_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
+    errdefer frame.deinit(allocator);
+
+    inline for (0..FRAME_SLOT_COUNT) |index| {
+        const frame_name = try std.fmt.allocPrint(allocator, "verde-browser-linux-frame-{d}", .{index});
+        defer allocator.free(frame_name);
+
+        frame_fds[index] = try std.posix.memfd_create(frame_name, std.posix.MFD.CLOEXEC);
+        errdefer _ = std.c.close(frame_fds[index]);
+
+        if (std.c.ftruncate(frame_fds[index], FRAME_BYTES_MAX) != 0) return error.Unexpected;
+        frame.slots[index] = try std.posix.mmap(
+            null,
+            FRAME_BYTES_MAX,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            frame_fds[index],
+            0,
+        );
+        frame.slot_ready[index] = true;
+        @memset(frame.slots[index], 0);
+    }
+    return frame_fds;
 }
 
 fn waitForChildExit(child_pid: std.posix.pid_t, timeout_ms: u16) bool {

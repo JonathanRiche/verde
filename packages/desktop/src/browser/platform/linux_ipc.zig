@@ -65,6 +65,7 @@ pub const Event = struct {
     width: u32 = 0,
     height: u32 = 0,
     byte_len: usize = 0,
+    frame_slot: u8 = 0,
     payload: ?[]const u8 = null,
     frame_path: ?[]const u8 = null,
 };
