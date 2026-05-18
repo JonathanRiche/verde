@@ -229,6 +229,27 @@ pub fn build(b: *std.Build) void {
         browser_helper.root_module.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
         browser_helper.root_module.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });
         b.installArtifact(browser_helper);
+
+        const browser_wpe_helper = b.addExecutable(.{
+            .name = "verde-browser-linux-wpe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/browser/platform/linux_helper_main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        browser_wpe_helper.build_id = .sha1;
+        browser_wpe_helper.root_module.link_libc = true;
+        browser_wpe_helper.root_module.addCSourceFile(.{
+            .file = b.path("src/browser/platform/linux_wpe.c"),
+            .flags = &.{},
+        });
+        browser_wpe_helper.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
+        browser_wpe_helper.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
+        browser_wpe_helper.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+        browser_wpe_helper.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+        browser_wpe_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
+        b.installArtifact(browser_wpe_helper);
     }
     if (build_cef_backend) {
         const build_cef_helper = b.addSystemCommand(&.{

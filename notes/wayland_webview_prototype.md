@@ -216,6 +216,66 @@ Recommended implementation sequence:
 4. Translate Verde browser pane pointer, wheel, key, and text events to `wpe_view_backend_dispatch_*` calls so scrolling is native WebKit scrolling instead of snapshot polling.
 5. Keep `snapshot_texture` as the default until the WPE path renders `https://lytx.io/` visibly in the pane and passes focus, clipping, and z-order smoke tests.
 
+## WPE In-App Smoke
+
+The first Verde-integrated WPE path is now gated by:
+
+```bash
+VERDE_BROWSER_LINUX_WPE=1
+```
+
+Launch command used on Hyprland:
+
+```bash
+VERDE_BROWSER_LINUX_WPE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+```
+
+What is implemented:
+
+- `packages/desktop/src/browser/platform/linux_wpe.c` exposes the same helper ABI as the Linux WebKitGTK helper, so the existing JSON-line helper process can drive WPE.
+- The helper creates a WPE WebKit view backend using WPEBackend-fdo exportable EGL frames.
+- Exported EGL frames are imported through EGL/GLES2, read back as RGBA, swizzled into the existing BGRA shared memfd frame slots, and announced with the existing `frame_ready` IPC event.
+- The WPE helper is selected only when `VERDE_BROWSER_LINUX_WPE=1` is set. The default Linux native-webview path remains WebKitGTK `snapshot_texture`.
+- Pointer move/button, wheel, keyboard, navigation, reload/history, eval, and the Verde JS bridge are wired through the existing helper protocol.
+- WPE frame publication is throttled to roughly one frame per display tick so the app does not ingest the full WPE export stream.
+
+Verification commands:
+
+```bash
+cc -Wall -Wextra -fsyntax-only packages/desktop/src/browser/platform/linux_wpe.c $(pkg-config --cflags wpe-webkit-2.0 wpebackend-fdo-1.0 egl glesv2 glib-2.0 gobject-2.0 javascriptcoregtk-6.0)
+zig build --release=safe -Dbrowser-backend=native_webview --summary all
+zig build test --release=safe -Dbrowser-backend=stub
+VERDE_BROWSER_LINUX_WPE=1 VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://lytx.io/ ./packages/desktop/zig-out/bin/verde app
+./packages/desktop/zig-out/bin/verde live status --json
+./packages/desktop/zig-out/bin/verde live browser eval "JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio,screenW:screen.width,screenH:screen.height,visualW:visualViewport.width,visualH:visualViewport.height,scheme:matchMedia('(prefers-color-scheme: dark)').matches})"
+grim /tmp/verde-wpe-app-upright.png
+```
+
+Observed status from the latest smoke test:
+
+- `runtime_kind: "native_webview"`
+- `presentation_kind: "offscreen_texture"`
+- `runtime_initialized: true`
+- `status: "Ready"`
+- `visible: true`
+- `url: "https://lytx.io/"`
+- `last_error: null`
+- eval accepted and returned page context from WPE: title `Lytx`, URL `https://lytx.io/`, and viewport metrics `{"w":593,"h":907,"dpr":1,"screenW":593,"screenH":907,"visualW":593,"visualH":907,"scheme":false}`.
+
+Screenshot evidence:
+
+```text
+/tmp/verde-wpe-app-upright.png
+```
+
+Current WPE limitations:
+
+- The integrated path is still a CPU readback into shared memory, not a final zero-copy EGL texture import into Verde's renderer.
+- On the tested HiDPI Hyprland setup, WPE currently receives a 593 px CSS viewport with `devicePixelRatio=1`, so the page uses a narrower/mobile layout and may not be full-resolution. The next fix should pass an explicit device scale/render-size contract to WPE so the exported frame is physical-pixel sharp while the browser viewport remains predictable.
+- The page reports `prefers-color-scheme: dark` as false, so sites such as `https://lytx.io/` may choose their light theme unless the WPE context/settings are updated to match app or system dark preference.
+- Popup/window creation, downloads, context menus, IME composition, clipboard integration, and WebKit process crash recovery are not hardened yet.
+- `snapshot_texture` remains the default until WPE scale, input, clipping, and subjective scroll feel pass repeated app-level testing.
+
 ## Current Blocker
 
 The helper can create a GTK/WebKit Wayland toplevel and position it as a diagnostic overlay, but this is not yet a true child/subsurface of the SDL window. GTK/WebKitGTK does not expose a stable public API in this code path for taking the WebKit widget's internal `wl_surface` and reparenting it under SDL's `wl_surface` with the Wayland subsurface protocol.
