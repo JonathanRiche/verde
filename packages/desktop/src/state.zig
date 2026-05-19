@@ -6701,6 +6701,7 @@ pub const AppState = struct {
         self.browser_pane_focused = true;
         self.terminal_focused = false;
         self.composer_focused = false;
+        self.palette_composer.focused = false;
         self.browser_address_focused = false;
         if (self.projects.items.len > 0) {
             var layout = &self.projects.items[self.selected_project_index].workspace_layout;
@@ -8075,6 +8076,7 @@ pub const AppState = struct {
             .browser => {
                 self.terminal_focused = false;
                 self.composer_focused = false;
+                self.palette_composer.focused = false;
             },
         }
         self.markDirty();

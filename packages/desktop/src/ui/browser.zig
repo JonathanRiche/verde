@@ -740,6 +740,7 @@ fn focusAddress(state: *app_state.AppState) void {
     state.browser_address_focused = true;
     state.terminal_focused = false;
     state.composer_focused = false;
+    state.blurPaletteComposer();
     state.unfocusBrowserPane();
     state.browser_inspector_menu_open = false;
     state.browser_address_cursor = @min(state.browser_address_cursor, state.browserState().addressInput().len);
