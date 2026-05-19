@@ -108,10 +108,12 @@ const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 var macos_cmd_w_pane_close_until_ms: i64 = 0;
+var macos_launch_close_suppress_until_ms: i64 = 0;
 var macos_last_text_input_timestamp_ns: u64 = 0;
 var macos_last_text_input_len: usize = 0;
 var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
 const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
+const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 1000;
 
 const WindowFrame = struct {
     x: c_int,
@@ -178,6 +180,9 @@ fn mainInner(init: std.process.Init) !void {
     defer window.destroy();
     window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
     activateMacosHostWindow(window);
+    if (builtin.os.tag == .macos) {
+        macos_launch_close_suppress_until_ms = currentTimeMillis() + MACOS_LAUNCH_CLOSE_SUPPRESS_MS;
+    }
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
 
@@ -1674,6 +1679,10 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         }
         if (isKeymodPressed(SDL_GetModState(), sdl.Keymod.gui)) {
             _ = state.closeFocusedWorkspacePane();
+            return true;
+        }
+        if (macos_launch_close_suppress_until_ms >= now_ms) {
+            runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
             return true;
         }
     }
