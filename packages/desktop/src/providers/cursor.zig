@@ -725,6 +725,7 @@ fn staticModelsAlloc(allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
     }
 
     try appendModel(allocator, &models, "default", "Auto");
+    try appendModel(allocator, &models, "composer-2.5", "Composer 2.5");
     try appendModel(allocator, &models, "composer-2", "Composer 2");
     try appendModel(allocator, &models, "gpt-5.5", "GPT-5.5");
     try appendModel(allocator, &models, "gpt-5.4", "GPT-5.4");
