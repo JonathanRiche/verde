@@ -6179,6 +6179,16 @@ pub const AppState = struct {
         self.browser_launch_open_delay_frames = 2;
     }
 
+    /// Reopens the browser runtime when the selected project restored a visible browser workspace pane.
+    pub fn restorePersistedBrowserPaneOnLaunch(self: *AppState) void {
+        if (!self.browser_textures_enabled) return;
+        if (self.browser_launch_open_delay_frames > 0 or self.browser_state.controls_visible) return;
+        if (self.projects.items.len == 0) return;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        if (!layout.hasVisiblePaneKind(.browser)) return;
+        self.browser_launch_open_delay_frames = 2;
+    }
+
     /// Toggles the desktop browser control surface and the underlying browser runtime.
     pub fn toggleBrowser(self: *AppState) void {
         if (!self.browser_textures_enabled) {

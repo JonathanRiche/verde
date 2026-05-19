@@ -299,6 +299,7 @@ fn mainInner(init: std.process.Init) !void {
     defer state.deinit();
     state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
+    state.restorePersistedBrowserPaneOnLaunch();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
