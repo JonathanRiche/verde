@@ -4,13 +4,15 @@ This document is a handoff for a Codex agent running on macOS. The branch alread
 
 ## Goal
 
-Finish and verify the macOS native webview backend for Verde.
+Finish and verify the macOS native webview backend for Verde, using a Swift
+WKWebView shim instead of the current Objective-C shim.
 
 The expected result is:
 
 - `native_webview` is the default desktop browser backend on macOS.
 - The browser pane is a real `WKWebView` clipped to the Palette browser content rectangle.
 - Palette remains the UI shell, and SDL3 GPU remains the desktop renderer.
+- The macOS platform shim is implemented in Swift, not Objective-C.
 - Default macOS dev/build flows do not download or package CEF.
 - CEF remains available only as an explicit opt-in fallback.
 - The parity matrix below passes on macOS and is documented with evidence.
@@ -39,6 +41,58 @@ Important files already implemented or changed:
 - `notes/webview_migration_release_notes.md`
 
 The macOS implementation has not been compiled or run on macOS from this Linux development machine. Cross-target build attempts on Linux failed before meaningful WKWebView verification because this checkout lacks macOS cross-build prerequisites and `libfff_c.dylib`.
+
+Important direction change for the Mac agent:
+
+- `macos_wkwebview.m` is the current working shape, but it is not the desired
+  final implementation.
+- Replace the Objective-C shim with a Swift shim before completing this goal.
+- Keep the C ABI exported to Zig exactly the same unless there is a strong
+  reason to change it and the Zig wrapper is updated with matching names.
+- Do not mark the macOS goal complete while `macos_wkwebview.m` remains the
+  active WKWebView implementation.
+
+The Swift rewrite should preserve the behavior and exported functions currently
+provided by `macos_wkwebview.m`:
+
+- `verde_macos_webview_create`
+- `verde_macos_webview_destroy`
+- `verde_macos_webview_show`
+- `verde_macos_webview_hide`
+- `verde_macos_webview_set_bounds`
+- `verde_macos_webview_navigate`
+- `verde_macos_webview_eval`
+- `verde_macos_webview_post_json`
+- `verde_macos_webview_go_back`
+- `verde_macos_webview_go_forward`
+- `verde_macos_webview_reload`
+- `verde_macos_webview_focus`
+- `verde_macos_webview_blur`
+- `verde_macos_webview_pop_event`
+- `verde_macos_webview_free_string`
+
+Expected Swift implementation shape:
+
+- Add a Swift source file such as
+  `packages/desktop/src/browser/platform/macos_wkwebview.swift`.
+- Export Zig-callable functions with Swift C entry points, for example
+  `@_cdecl("verde_macos_webview_create")`.
+- Retain/release the browser object explicitly with `Unmanaged`:
+  `Unmanaged.passRetained(browser).toOpaque()` on create and
+  `Unmanaged<VerdeMacBrowser>.fromOpaque(handle).takeRetainedValue()` on
+  destroy.
+- Convert incoming C strings to Swift `String` safely.
+- Return event payloads as C strings allocated in a way compatible with the
+  existing free function, or update both allocation and free paths together.
+- Keep all AppKit and WebKit work on the main thread.
+- Preserve the current invalidation behavior: remove KVO observers, remove the
+  script message handler, nil the navigation delegate, stop loading, remove the
+  child view, and ignore delayed callbacks after invalidation.
+- Wire Swift compilation into `packages/desktop/build.zig` for macOS. Remove
+  or stop compiling `macos_wkwebview.m` once the Swift shim replaces it.
+
+The rewrite should be behavior-preserving first. Do not redesign the browser
+contract while converting Objective-C to Swift.
 
 ## What To Verify First
 
@@ -215,13 +269,15 @@ Acceptance criteria:
 If build fails:
 
 - Check `packages/desktop/build.zig` macOS WebKit/AppKit link wiring.
-- Check Objective-C ARC/block flags for `macos_wkwebview.m`.
+- Check Swift compilation/link wiring for `macos_wkwebview.swift`.
+- If the Objective-C file is still being compiled, treat that as unfinished
+  migration work, not as the final Mac implementation.
 - Check SDL native property names used in `packages/desktop/src/main.zig`.
 - Check whether the local macOS build needs `libfff_c.dylib` built or installed first.
 
 If WKWebView appears in the wrong place:
 
-- Inspect `verde_macos_wkwebview_set_bounds` in `macos_wkwebview.m`.
+- Inspect the Swift implementation of `verde_macos_webview_set_bounds`.
 - Verify conversion from Palette screen bounds through the `NSWindow` content view.
 - Test multiple display scale factors and external displays.
 - Ensure bounds updates are triggered by `AppState.noteBrowserPaneRegion` and `AppState.noteAppWindowFrame`.
@@ -234,14 +290,14 @@ If WKWebView covers Palette UI:
 
 If bridge/eval fails:
 
-- Inspect `verde_macos_wkwebview_inject_bridge` and script message handling in `macos_wkwebview.m`.
+- Inspect bridge injection and script message handling in the Swift WKWebView shim.
 - Confirm messages use `window.__VERDE_BROWSER_IPC__`.
 - Confirm compatibility aliases are created.
 - Confirm app-side bridge origin policy is not blocking the test page unless the page is intentionally untrusted.
 
 If shutdown crashes or leaks:
 
-- Inspect the Objective-C invalidation path.
+- Inspect the Swift invalidation path.
 - Confirm KVO observers, script message handlers, navigation delegates, loading state, and subviews are removed before the retained browser handle is released.
 - Confirm delayed WebKit callbacks are ignored after invalidation.
 
@@ -260,7 +316,7 @@ The macOS goal is complete only when:
 - `zig build --release=safe -Dbrowser-backend=native_webview` passes on macOS.
 - `zig build test --release=safe -Dbrowser-backend=stub` passes on macOS.
 - `mise run dev` opens a working WKWebView browser pane by default.
+- The active macOS WKWebView shim is Swift, not Objective-C.
 - `mise run build` creates a macOS package/install without CEF payloads.
 - The macOS parity matrix above passes or any excluded item is explicitly documented and accepted.
 - `notes/webview_migration_audit.md` is updated with concrete evidence.
-
