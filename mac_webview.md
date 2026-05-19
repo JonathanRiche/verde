@@ -105,10 +105,10 @@ git status --short
 mise run setup
 zig build --release=safe -Dbrowser-backend=native_webview
 zig build test --release=safe -Dbrowser-backend=stub
-mise run dev
+mise run dev-mac
 ```
 
-If `mise run setup` or `mise run dev` attempts to download CEF, that is a bug for this goal.
+If `mise run setup` or `mise run dev-mac` attempts to download CEF, that is a bug for this goal.
 
 Also run:
 
@@ -132,7 +132,7 @@ Use the native-webview default unless explicitly testing the CEF fallback.
 Run startup smoke:
 
 ```bash
-VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=about:blank mise run dev
+VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=about:blank mise run dev-mac
 ```
 
 From another terminal, query live status:
@@ -315,7 +315,7 @@ The macOS goal is complete only when:
 
 - `zig build --release=safe -Dbrowser-backend=native_webview` passes on macOS.
 - `zig build test --release=safe -Dbrowser-backend=stub` passes on macOS.
-- `mise run dev` opens a working WKWebView browser pane by default.
+- `mise run dev-mac` opens a working WKWebView browser pane by default.
 - The active macOS WKWebView shim is Swift, not Objective-C.
 - `mise run build` creates a macOS package/install without CEF payloads.
 - The macOS parity matrix above passes or any excluded item is explicitly documented and accepted.

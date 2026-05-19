@@ -15,6 +15,10 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname 
 description = "Builds and runs Verde from the repo-local Zig build output with WPE on Linux."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_LINUX_WPE=1 zig build run --release=safe -Dbrowser-backend=native_webview'"
 
+[tasks.dev-mac]
+description = "Builds and runs Verde from the repo-local Zig build output with native WKWebView on macOS."
+run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname -s)\" in Darwin) zig build run --release=safe -Dbrowser-backend=native_webview ;; *) echo \"dev-mac is only supported on macOS\" >&2; exit 1 ;; esac'"
+
 [tasks.dev-cef]
 description = "Builds and runs Verde with the legacy CEF browser backend."
 run = "VERDE_BROWSER_BACKEND=cef VERDE_CEF_CACHE_DIR=\"$HOME/.cache/verde/cef-sdk\" bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && source scripts/release/cef-common.sh && verde_cef_ensure_sdk \"$(verde_cef_host_os)\" \"$(uname -m)\" >/dev/null && zig build run --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=\"$VERDE_CEF_SDK_PATH_RESOLVED\"'"
