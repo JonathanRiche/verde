@@ -1670,7 +1670,7 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
     };
 }
 
-fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
+fn handleWindowCloseRequested(_: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
         const now_ms = currentTimeMillis();
         if (macos_cmd_w_pane_close_until_ms >= now_ms) {
@@ -1685,14 +1685,6 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
             return true;
         }
-    }
-    const window_flags = SDL_GetWindowFlags(window);
-    if (!window_flags.input_focus) {
-        runtime_log.diagnostic(
-            "ignoring window close request without input focus mouse_focus={} hidden={} minimized={} occluded={}",
-            .{ window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
-        );
-        return true;
     }
     return false;
 }
