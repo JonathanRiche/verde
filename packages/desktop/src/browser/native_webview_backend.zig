@@ -27,7 +27,8 @@ pub fn configuredPresentationKind() browser_types.PresentationKind {
 
 pub fn configuredSupportsInspector() bool {
     return switch (builtin.os.tag) {
-        .linux, .macos, .windows => true,
+        .linux => @import("platform/linux_webkitgtk.zig").configuredSupportsInspector(),
+        .macos, .windows => true,
         else => false,
     };
 }

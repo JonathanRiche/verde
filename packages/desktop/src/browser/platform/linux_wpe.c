@@ -382,6 +382,7 @@ static void verde_browser_linux_export_shm_buffer(void *data, struct wpe_fdo_shm
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
+    if (jsc_value_is_string(value)) return jsc_value_to_string(value);
     char *json = jsc_value_to_json(value, 0);
     if (json != NULL) return json;
     return jsc_value_to_string(value);
@@ -418,6 +419,28 @@ static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitL
     if (load_event == WEBKIT_LOAD_FINISHED) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED, NULL);
     }
+}
+
+static void verde_browser_linux_on_web_process_terminated(WebKitWebView *web_view, WebKitWebProcessTerminationReason reason, gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    const char *message = "WPE web process terminated.";
+    (void)web_view;
+    switch (reason) {
+    case WEBKIT_WEB_PROCESS_CRASHED:
+        message = "WPE web process crashed.";
+        break;
+    case WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT:
+        message = "WPE web process exceeded its memory limit.";
+        break;
+    case WEBKIT_WEB_PROCESS_TERMINATED_BY_API:
+        message = "WPE web process was terminated by API request.";
+        break;
+    default:
+        break;
+    }
+    fprintf(stderr, "verde-browser-linux-wpe: %s\n", message);
+    fflush(stderr);
+    verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, message);
 }
 
 static void verde_browser_linux_on_eval_finished(GObject *object, GAsyncResult *result, gpointer user_data) {
@@ -556,6 +579,7 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     g_signal_connect(browser->web_view, "notify::uri", G_CALLBACK(verde_browser_linux_on_uri_changed), browser);
     g_signal_connect(browser->web_view, "notify::title", G_CALLBACK(verde_browser_linux_on_title_changed), browser);
     g_signal_connect(browser->web_view, "load-changed", G_CALLBACK(verde_browser_linux_on_load_changed), browser);
+    g_signal_connect(browser->web_view, "web-process-terminated", G_CALLBACK(verde_browser_linux_on_web_process_terminated), browser);
     webkit_web_view_load_uri(browser->web_view, "about:blank");
     return browser;
 }

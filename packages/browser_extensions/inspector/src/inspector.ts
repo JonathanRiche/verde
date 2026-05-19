@@ -736,7 +736,6 @@ function createOverlay(doc: Document): OverlayParts {
     "background:rgba(25, 31, 36, 0.96)",
     "color:#f0f0f5",
     "box-shadow:0 18px 48px rgba(0, 0, 0, 0.38)",
-    "backdrop-filter:blur(10px)",
     "pointer-events:auto",
     "user-select:none",
   ].join(";");

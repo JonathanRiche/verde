@@ -4,6 +4,7 @@ const std = @import("std");
 const ipc = @import("linux_ipc.zig");
 
 const IDLE_SLEEP_MS = 2;
+const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 
 const RawBrowser = opaque {};
 
@@ -147,7 +148,7 @@ fn sleepMillis(ms: u64) void {
 /// Reads JSON-line commands from stdin and forwards them into the helper's command queue.
 fn stdinReaderMain(context: *ReaderContext) !void {
     const stdin_file = std.Io.File.stdin();
-    var read_buffer: [16 * 1024]u8 = undefined;
+    var read_buffer: [IPC_LINE_BUFFER_BYTES]u8 = undefined;
     var reader = stdin_file.readerStreaming(context.io, &read_buffer);
 
     while (true) {

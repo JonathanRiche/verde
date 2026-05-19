@@ -75,6 +75,7 @@ static double verde_browser_linux_elapsed_ms(gint64 start_us, gint64 end_us) {
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
+    if (jsc_value_is_string(value)) return jsc_value_to_string(value);
     char *json = jsc_value_to_json(value, 0);
     if (json != NULL) return json;
     return jsc_value_to_string(value);

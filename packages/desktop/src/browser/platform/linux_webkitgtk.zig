@@ -14,6 +14,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const FRAME_FD_BASE: std.posix.fd_t = 240;
 const FRAME_SLOT_COUNT: usize = 3;
 const FRAME_BYTES_MAX: usize = 4096 * 2160 * 4;
+const IPC_LINE_BUFFER_BYTES = 256 * 1024;
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn unsetenv(name: [*:0]const u8) c_int;
@@ -53,6 +54,11 @@ pub fn configuredPresentationKind() browser_types.PresentationKind {
     if (wpeEnabled()) return .offscreen_texture;
     if (waylandSubsurfaceEnabled()) return .native_wayland_surface;
     return if (visibleHelperEnabled()) .helper_window else .snapshot_texture;
+}
+
+pub fn configuredSupportsInspector() bool {
+    if (waylandSubsurfaceEnabled()) return false;
+    return true;
 }
 
 fn wpeEnabled() bool {
@@ -384,7 +390,7 @@ pub const Controller = struct {
 
     pub fn supportsInspector(self: *const Controller) bool {
         _ = self;
-        return !waylandSubsurfaceEnabled();
+        return configuredSupportsInspector();
     }
 
     pub fn supportsPopout(self: *const Controller) bool {
@@ -858,7 +864,7 @@ fn helperReaderMain(context: *ReaderContext) !void {
     defer context.allocator.destroy(context);
     defer _ = std.c.close(context.stdout_file.handle);
 
-    var read_buffer: [16 * 1024]u8 = undefined;
+    var read_buffer: [IPC_LINE_BUFFER_BYTES]u8 = undefined;
     var threaded = std.Io.Threaded.init_single_threaded;
     var reader = context.stdout_file.reader(threaded.io(), &read_buffer);
 
