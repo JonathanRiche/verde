@@ -6702,9 +6702,16 @@ pub const AppState = struct {
         self.terminal_focused = false;
         self.composer_focused = false;
         self.browser_address_focused = false;
+        if (self.projects.items.len > 0) {
+            var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+            if (layout.visibleBrowserPaneId()) |pane_id| {
+                layout.focused_pane_id = pane_id;
+            }
+        }
         self.browser_state.controller.focus() catch |err| {
             log.warn("failed to focus native browser surface: {s}", .{@errorName(err)});
         };
+        self.markDirty();
     }
 
     /// Reports whether the browser pane currently owns keyboard input.
@@ -7406,6 +7413,11 @@ pub const AppState = struct {
     pub fn currentProjectHasVisibleWorkspaceTerminalPane(self: *const AppState) bool {
         if (self.projects.items.len == 0) return false;
         return self.projects.items[self.selected_project_index].workspace_layout.hasVisiblePaneKind(.terminal);
+    }
+
+    pub fn currentProjectVisibleBrowserPaneId(self: *const AppState) ?WorkspacePaneId {
+        if (self.projects.items.len == 0) return null;
+        return self.projects.items[self.selected_project_index].workspace_layout.visibleBrowserPaneId();
     }
 
     pub fn currentProjectWorkspaceRoot(self: *const AppState) ?*const WorkspaceNode {
