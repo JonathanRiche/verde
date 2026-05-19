@@ -113,6 +113,9 @@ pub fn build(b: *std.Build) void {
     });
     exe.build_id = .sha1;
     exe.each_lib_rpath = false;
+    if (target.result.os.tag == .macos) {
+        exe.headerpad_max_install_names = true;
+    }
     const build_fff = b.addSystemCommand(&.{
         "cargo",
         "build",
@@ -175,17 +178,14 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},
             });
-            exe.root_module.addCSourceFile(.{
-                .file = b.path("src/browser/platform/macos_wkwebview.m"),
-                .flags = &.{ "-fobjc-arc", "-fblocks" },
-            });
-            if (b.graph.environ_map.get("HOMEBREW_PREFIX")) |prefix| {
+            addMacOSSwiftWebView(b, exe);
+            if (macOSHomebrewPrefix(b)) |prefix| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
                 palette_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
             }
-            exe.root_module.linkFramework("SDL3", .{});
-            exe.root_module.linkSystemLibrary("SDL3_ttf", .{});
+            exe.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+            exe.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
             exe.root_module.linkFramework("AppKit", .{});
             exe.root_module.linkFramework("WebKit", .{});
         },
@@ -384,6 +384,10 @@ pub fn build(b: *std.Build) void {
         browser_contract_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         browser_contract_tests.root_module.linkSystemLibrary("util", .{});
         browser_contract_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
+    } else if (target.result.os.tag == .macos) {
+        addMacOSWebViewTestStub(b, browser_contract_tests);
+        browser_contract_tests.root_module.linkFramework("AppKit", .{});
+        browser_contract_tests.root_module.linkFramework("WebKit", .{});
     }
     test_step.dependOn(&b.addRunArtifact(browser_contract_tests).step);
     const exe_tests = b.addTest(.{
@@ -433,11 +437,13 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/platform/macos_clipboard.m"),
             .flags = &.{},
         });
-        exe_tests.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/macos_wkwebview.m"),
-            .flags = &.{ "-fobjc-arc", "-fblocks" },
-        });
-        exe_tests.root_module.linkFramework("SDL3", .{});
+        if (browser_backend == .native_webview) {
+            addMacOSSwiftWebView(b, exe_tests);
+        } else {
+            addMacOSWebViewTestStub(b, exe_tests);
+        }
+        exe_tests.root_module.linkSystemLibrary("sdl3", .{ .use_pkg_config = .yes });
+        exe_tests.root_module.linkSystemLibrary("sdl3-ttf", .{ .use_pkg_config = .yes });
         exe_tests.root_module.linkFramework("AppKit", .{});
         exe_tests.root_module.linkFramework("WebKit", .{});
     } else if (target.result.os.tag == .windows) {
@@ -470,6 +476,67 @@ const BrowserBackendKind = enum {
     stub,
 };
 
+fn addMacOSSwiftWebView(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    const swift_obj = b.addSystemCommand(&.{
+        "xcrun",
+        "swiftc",
+        "-parse-as-library",
+        "-emit-object",
+        "-O",
+        "-sdk",
+        macOSSDKRoot(b),
+        "-target",
+        "arm64-apple-macosx13.0",
+        "-module-name",
+        "VerdeMacWebView",
+    });
+    swift_obj.addFileArg(b.path("src/browser/platform/macos_wkwebview.swift"));
+    swift_obj.addArg("-o");
+    const object_path = swift_obj.addOutputFileArg("macos_wkwebview.o");
+    compile.root_module.addObjectFile(object_path);
+    compile.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ macOSSDKRoot(b), "usr", "lib", "swift" }) });
+    compile.root_module.addLibraryPath(.{ .cwd_relative = "/Library/Developer/CommandLineTools/usr/lib/swift/macosx" });
+    compile.root_module.addRPath(.{ .cwd_relative = "/Library/Developer/CommandLineTools/usr/lib/swift/macosx" });
+    compile.root_module.linkSystemLibrary("swiftCore", .{});
+    compile.root_module.linkSystemLibrary("swiftFoundation", .{});
+    compile.root_module.linkSystemLibrary("swiftDispatch", .{});
+    compile.root_module.linkSystemLibrary("swiftCoreFoundation", .{});
+    compile.root_module.linkSystemLibrary("swiftCoreGraphics", .{});
+    compile.root_module.linkSystemLibrary("swiftCoreImage", .{});
+    compile.root_module.linkSystemLibrary("swiftDarwin", .{});
+    compile.root_module.linkSystemLibrary("swiftIOKit", .{});
+    compile.root_module.linkSystemLibrary("swiftMetal", .{});
+    compile.root_module.linkSystemLibrary("swiftOSLog", .{});
+    compile.root_module.linkSystemLibrary("swiftObjectiveC", .{});
+    compile.root_module.linkSystemLibrary("swiftQuartzCore", .{});
+    compile.root_module.linkSystemLibrary("swiftUniformTypeIdentifiers", .{});
+    compile.root_module.linkSystemLibrary("swiftWebKit", .{});
+    compile.root_module.linkSystemLibrary("swiftXPC", .{});
+    compile.root_module.linkSystemLibrary("swiftos", .{});
+    compile.step.dependOn(&swift_obj.step);
+}
+
+fn addMacOSWebViewTestStub(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    compile.root_module.addCSourceFile(.{
+        .file = b.path("src/browser/platform/macos_wkwebview_test_stub.c"),
+        .flags = &.{},
+    });
+}
+
+fn macOSSDKRoot(b: *std.Build) []const u8 {
+    if (b.graph.environ_map.get("SDKROOT")) |sdkroot| return sdkroot;
+    const candidates = [_][]const u8{
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX14.5.sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX14.sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    };
+    for (candidates) |sdkroot| {
+        std.Io.Dir.accessAbsolute(b.graph.io, b.pathJoin(&.{ sdkroot, "usr", "lib", "swift", "libswiftCore.tbd" }), .{}) catch continue;
+        return sdkroot;
+    }
+    return "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+}
+
 fn defaultSystemSdl3Runtime(b: *std.Build) ?[]const u8 {
     if (b.graph.host.result.os.tag != .linux) return null;
     const candidates = [_][]const u8{
@@ -479,6 +546,16 @@ fn defaultSystemSdl3Runtime(b: *std.Build) ?[]const u8 {
     for (candidates) |path| {
         std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch continue;
         return path;
+    }
+    return null;
+}
+
+fn macOSHomebrewPrefix(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("HOMEBREW_PREFIX")) |prefix| return prefix;
+    const candidates = [_][]const u8{ "/opt/homebrew", "/usr/local" };
+    for (candidates) |prefix| {
+        std.Io.Dir.accessAbsolute(b.graph.io, b.pathJoin(&.{ prefix, "include", "SDL3_ttf", "SDL_ttf.h" }), .{}) catch continue;
+        return prefix;
     }
     return null;
 }

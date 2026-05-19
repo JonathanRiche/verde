@@ -94,6 +94,9 @@ Common tasks:
 - `mise run run`: builds and launches Verde in development mode.
 - `mise run debug`: launches Verde with the in-app diagnostics window enabled.
 - `mise run build`: creates a local release-style build for the current platform.
+- `mise run check-mac-webview`: on macOS, rebuilds/installs the WKWebView app and runs automated package/runtime readiness checks, including Swift/CEF-free packaging and native-keyboard ownership guards.
+- `mise run mac-webview-manual-signoff`: on macOS, runs the guided foreground physical-input signoff flow and writes a timestamped evidence run.
+- `mise run check-mac-webview-manual`: on macOS, checks the latest timestamped physical-input evidence run required for final WKWebView signoff.
 - `mise run dev-cef`: builds and runs Verde with the legacy CEF backend.
 - `mise run build-cef`: creates a release-style build with the legacy CEF backend.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.

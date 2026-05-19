@@ -90,6 +90,32 @@ fn findHit(kind: BrowserHitKind) ?BrowserHit {
     return null;
 }
 
+pub fn triggerPaletteToolbarHit(state: *app_state.AppState, name: []const u8) bool {
+    const kind = toolbarHitKindByName(name) orelse return false;
+    const hit = findHit(kind) orelse return false;
+    return handlePaletteMouseButton(
+        state,
+        hit.rect.x + hit.rect.w * 0.5,
+        hit.rect.y + hit.rect.h * 0.5,
+        true,
+        1,
+    );
+}
+
+fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
+    if (std.mem.eql(u8, name, "address")) return .address;
+    if (std.mem.eql(u8, name, "back")) return .back;
+    if (std.mem.eql(u8, name, "forward")) return .forward;
+    if (std.mem.eql(u8, name, "navigate") or std.mem.eql(u8, name, "reload")) return .navigate;
+    if (std.mem.eql(u8, name, "inspect-toggle")) return .inspect_toggle;
+    if (std.mem.eql(u8, name, "inspect-menu")) return .inspect_mode_menu;
+    if (std.mem.eql(u8, name, "inspect-point")) return .inspect_mode_point;
+    if (std.mem.eql(u8, name, "inspect-draw-box")) return .inspect_mode_draw_box;
+    if (std.mem.eql(u8, name, "inspect-draw-freeform")) return .inspect_mode_draw_freeform;
+    if (std.mem.eql(u8, name, "close")) return .close;
+    return null;
+}
+
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };

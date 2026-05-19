@@ -20,6 +20,7 @@ const EventKind = enum(c_int) {
 };
 
 extern fn verde_macos_webview_create(ns_window: ?*anyopaque) ?*anyopaque;
+extern fn verde_macos_app_configure_foreground() void;
 extern fn verde_macos_webview_destroy(handle: ?*anyopaque) void;
 extern fn verde_macos_webview_show(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_hide(handle: ?*anyopaque) c_int;
@@ -32,8 +33,14 @@ extern fn verde_macos_webview_go_forward(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_reload(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_focus(handle: ?*anyopaque) c_int;
 extern fn verde_macos_webview_blur(handle: ?*anyopaque) c_int;
+extern fn verde_macos_webview_has_focus(handle: ?*anyopaque) c_int;
+extern fn verde_macos_webview_appkit_diagnostics(handle: ?*anyopaque) ?[*:0]u8;
 extern fn verde_macos_webview_pop_event(handle: ?*anyopaque, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_macos_webview_free_string(value: ?[*:0]u8) void;
+
+pub fn configureForegroundApp() void {
+    verde_macos_app_configure_foreground();
+}
 
 /// Owns a WKWebView child view attached to the SDL-created NSWindow.
 pub const Controller = struct {
@@ -176,6 +183,17 @@ pub const Controller = struct {
         if (self.handle) |handle| {
             if (verde_macos_webview_blur(handle) == 0) return error.BrowserUnavailable;
         }
+    }
+
+    pub fn hasFocus(self: *const Controller) bool {
+        const handle = self.handle orelse return false;
+        return verde_macos_webview_has_focus(handle) != 0;
+    }
+
+    pub fn appKitDiagnostics(self: *const Controller, allocator: std.mem.Allocator) ?[]u8 {
+        const ptr = verde_macos_webview_appkit_diagnostics(self.handle) orelse return null;
+        defer verde_macos_webview_free_string(ptr);
+        return allocator.dupe(u8, std.mem.span(ptr)) catch null;
     }
 
     pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {

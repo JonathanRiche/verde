@@ -1226,11 +1226,13 @@ pub const WorkspacePaneId = u32;
 pub const WorkspacePaneKind = enum {
     chat,
     terminal,
+    browser,
 };
 
 pub const WorkspacePaneRef = union(WorkspacePaneKind) {
     chat: ChatPaneRef,
     terminal: TerminalPaneRef,
+    browser: BrowserPaneRef,
 };
 
 pub const ChatPaneRef = struct {
@@ -1242,6 +1244,8 @@ pub const ChatPaneRef = struct {
 pub const TerminalPaneRef = struct {
     dock_id: u32 = 0,
 };
+
+pub const BrowserPaneRef = struct {};
 
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
@@ -1494,9 +1498,21 @@ pub const WorkspaceLayout = struct {
             switch (pane.ref) {
                 .chat => if (kind == .chat) return true,
                 .terminal => if (kind == .terminal) return true,
+                .browser => if (kind == .browser) return true,
             }
         }
         return false;
+    }
+
+    fn visibleBrowserPaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
+        for (self.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .browser => return pane.id,
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn hasTerminalDockPane(self: *const WorkspaceLayout, dock_id: u32) bool {
@@ -1541,6 +1557,30 @@ pub const WorkspaceLayout = struct {
         });
         self.focused_pane_id = pane_id;
         try self.ensurePaneInRootSplit(allocator, pane_id, .horizontal, 0.64);
+        return pane_id;
+    }
+
+    fn ensureBrowserPane(self: *WorkspaceLayout, allocator: std.mem.Allocator) !WorkspacePaneId {
+        for (self.panes.items) |*pane| {
+            switch (pane.ref) {
+                .browser => {
+                    pane.minimized = false;
+                    self.focused_pane_id = pane.id;
+                    try self.ensurePaneInRootSplit(allocator, pane.id, .vertical, 0.58);
+                    return pane.id;
+                },
+                else => {},
+            }
+        }
+
+        const pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
+        try self.panes.append(allocator, .{
+            .id = pane_id,
+            .ref = .{ .browser = .{} },
+        });
+        self.focused_pane_id = pane_id;
+        try self.ensurePaneInRootSplit(allocator, pane_id, .vertical, 0.58);
         return pane_id;
     }
 
@@ -1591,6 +1631,10 @@ pub const WorkspaceLayout = struct {
                     changed = true;
                 },
                 .terminal => if (kind == .terminal and !pane.minimized) {
+                    pane.minimized = true;
+                    changed = true;
+                },
+                .browser => if (kind == .browser and !pane.minimized) {
                     pane.minimized = true;
                     changed = true;
                 },
@@ -1674,6 +1718,10 @@ pub const WorkspaceLayout = struct {
                     try stringify.objectField("dock");
                     try stringify.write(ref.dock_id);
                 },
+                .browser => {
+                    try stringify.objectField("kind");
+                    try stringify.write("browser");
+                },
             }
             try stringify.endObject();
         }
@@ -1728,6 +1776,12 @@ pub const WorkspaceLayout = struct {
                     .ref = .{ .terminal = .{ .dock_id = dock_id } },
                     .minimized = minimized,
                 });
+            } else if (std.mem.eql(u8, kind, "browser")) {
+                try next_layout.panes.append(allocator, .{
+                    .id = pane_id,
+                    .ref = .{ .browser = .{} },
+                    .minimized = minimized,
+                });
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
@@ -1777,6 +1831,10 @@ pub const WorkspaceLayout = struct {
                     return;
                 },
                 .terminal => if (kind == .terminal) {
+                    self.focused_pane_id = pane.id;
+                    return;
+                },
+                .browser => if (kind == .browser) {
                     self.focused_pane_id = pane.id;
                     return;
                 },
@@ -5960,6 +6018,7 @@ pub const AppState = struct {
         const focused_kind = if (layout.focusedPane()) |pane| switch (pane.ref) {
             .chat => WorkspacePaneKind.chat,
             .terminal => WorkspacePaneKind.terminal,
+            .browser => WorkspacePaneKind.browser,
         } else null;
         const terminal_visible = layout.hasVisiblePaneKind(.terminal);
         if (terminal_visible and focused_kind == .terminal) {
@@ -6132,6 +6191,19 @@ pub const AppState = struct {
             return;
         }
 
+        self.ensureCurrentProjectWorkspace();
+        const browser_pane_id = if (self.projects.items.len > 0)
+            self.projects.items[self.selected_project_index].workspace_layout.ensureBrowserPane(self.allocator) catch |err| {
+                log.err("failed to open browser workspace pane: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open browser pane.");
+                return;
+            }
+        else
+            null;
+        if (self.projects.items.len > 0) {
+            self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id = null;
+        }
+
         const restore_last_url = !self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null;
         self.browser_state.setControlsVisible(true);
         self.browser_address_focused = true;
@@ -6139,6 +6211,7 @@ pub const AppState = struct {
         self.unfocusBrowserPane();
         self.terminal_focused = false;
         self.composer_focused = false;
+        if (browser_pane_id) |pane_id| _ = self.focusCurrentProjectWorkspacePane(pane_id);
         self.browser_state.status = .opening;
         if (restore_last_url) {
             const url = self.browser_state.current_url.?;
@@ -6149,6 +6222,7 @@ pub const AppState = struct {
                 self.setSidebarNotice("Failed to reopen browser.");
                 return;
             };
+            self.blurNativeBrowserForAddressField();
             self.setSidebarNotice("Browser reopened.");
             return;
         }
@@ -6160,7 +6234,15 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to show browser.");
             return;
         };
+        self.blurNativeBrowserForAddressField();
         self.setSidebarNotice("Browser opened.");
+    }
+
+    fn blurNativeBrowserForAddressField(self: *AppState) void {
+        if (!self.browser_address_focused) return;
+        self.browser_state.controller.blur() catch |err| {
+            log.warn("failed to clear native browser focus for address field: {s}", .{@errorName(err)});
+        };
     }
 
     /// Closes the browser dock and fully tears the browser runtime down until the next open.
@@ -6176,7 +6258,11 @@ pub const AppState = struct {
         self.browser_state.controller.shutdown();
         self.browser_state.status = .hidden;
         self.browser_state.setLastError(null) catch {};
+        if (self.projects.items.len > 0) {
+            _ = self.projects.items[self.selected_project_index].workspace_layout.minimizePaneKind(self.allocator, .browser);
+        }
         self.setSidebarNotice("Browser closed.");
+        self.markDirty();
     }
 
     /// Hides the desktop browser control surface and its browser runtime.
@@ -6195,7 +6281,11 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to hide browser.");
             return;
         };
+        if (self.projects.items.len > 0) {
+            _ = self.projects.items[self.selected_project_index].workspace_layout.minimizePaneKind(self.allocator, .browser);
+        }
         self.setSidebarNotice("Browser hidden.");
+        self.markDirty();
     }
 
     /// Temporarily hides the native browser surface while the host SDL window is hidden/minimized.
@@ -6265,6 +6355,179 @@ pub const AppState = struct {
     /// Reports which interaction mode the bundled browser inspector will use.
     pub fn browserInspectorMode(self: *const AppState) browser_runtime.InspectorMode {
         return self.browser_state.inspectorMode();
+    }
+
+    /// Reports whether the browser inspector mode menu is open in Palette UI.
+    pub fn isBrowserInspectorMenuOpen(self: *const AppState) bool {
+        return self.browser_inspector_menu_open;
+    }
+
+    /// Reports whether a Palette overlay has temporarily hidden the native browser surface.
+    pub fn isBrowserSurfaceSuspendedForPaletteOverlay(self: *const AppState) bool {
+        return self.browser_surface_suspended_for_palette_overlay;
+    }
+
+    /// Reports whether the workspace header Open menu is currently open.
+    pub fn isWorkspaceHeaderOpenMenuOpen(self: *const AppState) bool {
+        return self.workspace_header_open_menu_open;
+    }
+
+    /// Reports whether the Add Project modal is currently open.
+    pub fn isProjectImportModalOpen(self: *const AppState) bool {
+        return self.show_project_creator;
+    }
+
+    /// Reports whether the Thread Import modal is currently open.
+    pub fn isThreadImportModalOpen(self: *const AppState) bool {
+        return self.thread_import_provider != null;
+    }
+
+    /// Reports whether the image preview modal is currently open.
+    pub fn isImageModalOpen(self: *const AppState) bool {
+        return self.modal_image_path != null;
+    }
+
+    /// Reports whether the transcript selection modal is currently open.
+    pub fn isTranscriptSelectionModalOpen(self: *const AppState) bool {
+        return self.transcript_selection_text != null;
+    }
+
+    /// Reports which Palette modal text field owns focus.
+    pub fn paletteModalTextFocusName(self: *const AppState) []const u8 {
+        return @tagName(self.palette_modal_text_focus);
+    }
+
+    /// Reports whether a sidebar context menu is open over the workspace.
+    pub fn isSidebarContextMenuOpen(self: *const AppState) bool {
+        return self.sidebar_context_menu_open;
+    }
+
+    /// Reports whether a composer-owned menu/cascade is open over the workspace.
+    pub fn isComposerMenuOpen(self: *const AppState) bool {
+        return self.composer_locked_model_picker_open or
+            self.palette_composer.active_menu != null or
+            self.palette_model_cascade.isOpen();
+    }
+
+    /// Opens or closes the browser inspector mode menu for live parity smokes.
+    pub fn setBrowserInspectorMenuOpen(self: *AppState, open: bool) bool {
+        if (open and (!self.isBrowserVisible() or !self.canUseBrowserInspector())) return false;
+        self.browser_inspector_menu_open = open;
+        if (open) {
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+        return true;
+    }
+
+    /// Opens or closes the workspace header Open menu for live overlay parity smokes.
+    pub fn setWorkspaceHeaderOpenMenuOpen(self: *AppState, open: bool) void {
+        self.workspace_header_open_menu_open = open;
+        if (open) {
+            self.browser_inspector_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes a sidebar context menu for live overlay parity smokes.
+    pub fn setSidebarContextMenuOpen(self: *AppState, open: bool) void {
+        self.sidebar_context_menu_open = open;
+        self.sidebar_context_menu_kind = if (open) .project else .none;
+        if (open) {
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes a composer-owned menu for live overlay parity smokes.
+    pub fn setComposerMenuOpen(self: *AppState, open: bool) void {
+        if (open) {
+            self.palette_composer.active_menu = .reasoning;
+            self.palette_composer.hovered_menu_index = 0;
+            self.composer_locked_model_picker_open = false;
+            _ = self.palette_model_cascade.handleInput(.close);
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        } else {
+            self.palette_composer.active_menu = null;
+            self.palette_composer.hovered_menu_index = null;
+            self.composer_locked_model_picker_open = false;
+            _ = self.palette_model_cascade.handleInput(.close);
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes the Add Project modal for live overlay parity smokes.
+    pub fn setProjectImportModalOpen(self: *AppState, open: bool) void {
+        if (open) {
+            self.show_project_creator = true;
+            self.palette_modal_text_focus = .project_import;
+            self.project_import_cursor = self.importDirectoryDraft().len;
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        } else {
+            self.cancelProjectImport();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes the Thread Import modal for live overlay parity smokes.
+    pub fn setThreadImportModalOpen(self: *AppState, open: bool) void {
+        if (open) {
+            self.thread_import_provider = .codex;
+            self.thread_import_project_index = self.selected_project_index;
+            self.thread_import_selected_index = null;
+            self.import_thread_id_storage[0] = 0;
+            self.palette_modal_text_focus = .thread_import;
+            self.thread_import_cursor = 0;
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        } else {
+            self.cancelThreadImport();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes the image preview modal for live overlay parity smokes.
+    pub fn setImageModalOpen(self: *AppState, open: bool) void {
+        if (open) {
+            self.openImageModal("live-smoke-image.png");
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        } else {
+            self.closeImageModal();
+        }
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
+    /// Opens or closes the transcript selection modal for live overlay parity smokes.
+    pub fn setTranscriptSelectionModalOpen(self: *AppState, open: bool) void {
+        if (open) {
+            self.closeTranscriptSelectionModal();
+            self.transcript_selection_text = self.allocator.dupeZ(u8, "Live transcript selection smoke") catch null;
+            self.transcript_selection_modal_requested = true;
+            self.browser_inspector_menu_open = false;
+            self.workspace_header_open_menu_open = false;
+            self.browser_address_focused = false;
+            self.unfocusBrowserPane();
+        } else {
+            self.closeTranscriptSelectionModal();
+        }
+        self.syncBrowserPaneBoundsToBackend();
     }
 
     /// Computes the height reserved for the browser dock inside the chat workspace.
@@ -6378,6 +6641,11 @@ pub const AppState = struct {
                 self.browser_state.setLastError("Failed to restore browser runtime after Palette overlay.") catch {};
                 return false;
             };
+            if (!self.browser_pane_focused) {
+                self.browser_state.controller.blur() catch |err| {
+                    log.warn("failed to clear restored native browser focus: {s}", .{@errorName(err)});
+                };
+            }
         }
         return false;
     }
@@ -6410,15 +6678,16 @@ pub const AppState = struct {
     /// Clears browser-pane keyboard focus when another UI surface takes ownership.
     pub fn unfocusBrowserPane(self: *AppState) void {
         const was_focused = self.browser_pane_focused;
+        const native_focused = self.isNativeBrowserSurfaceFocused();
         self.browser_pane_focused = false;
-        if (was_focused) {
+        if (was_focused or native_focused) {
             self.browser_state.controller.blur() catch |err| {
                 log.warn("failed to clear native browser focus: {s}", .{@errorName(err)});
             };
         }
     }
 
-    fn focusBrowserPane(self: *AppState) void {
+    pub fn focusBrowserPane(self: *AppState) void {
         self.browser_pane_focused = true;
         self.terminal_focused = false;
         self.composer_focused = false;
@@ -6431,6 +6700,21 @@ pub const AppState = struct {
     /// Reports whether the browser pane currently owns keyboard input.
     pub fn isBrowserPaneFocused(self: *const AppState) bool {
         return self.isBrowserVisible() and self.browser_pane_focused;
+    }
+
+    /// Reports whether the native child browser view owns OS keyboard input.
+    pub fn isNativeBrowserSurfaceFocused(self: *const AppState) bool {
+        return self.isBrowserVisible() and self.browser_state.controller.hasNativeFocus();
+    }
+
+    /// Reports whether the browser pane is backed by a platform view that receives
+    /// keyboard input directly from the OS rather than through SDL forwarding.
+    pub fn browserPaneUsesNativeKeyboardSurface(self: *const AppState) bool {
+        if (!self.isBrowserVisible()) return false;
+        return switch (self.browser_state.controller.presentationKind()) {
+            .native_child_view, .native_wayland_surface, .helper_window => true,
+            .snapshot_texture, .offscreen_texture, .stub => false,
+        };
     }
 
     /// Reports whether the last rendered browser pane contains the given framebuffer-space point.
@@ -6726,6 +7010,10 @@ pub const AppState = struct {
                 },
             }
         }
+        if (self.isNativeBrowserSurfaceFocused() and self.browser_address_focused) {
+            self.browser_address_focused = false;
+            needs_render = true;
+        }
         return needs_render;
     }
 
@@ -6953,7 +7241,7 @@ pub const AppState = struct {
     }
 
     // Enables the bundled inspector and dispatches one internal eval into the current browser document.
-    fn enableBrowserInspector(self: *AppState, show_notice: bool) void {
+    pub fn enableBrowserInspector(self: *AppState, show_notice: bool) void {
         self.applyBrowserInspector(show_notice, "Browser inspector enabled.");
     }
 
@@ -6992,7 +7280,7 @@ pub const AppState = struct {
     }
 
     // Disables the bundled inspector overlay while leaving the page alive.
-    fn disableBrowserInspector(self: *AppState, show_notice: bool) void {
+    pub fn disableBrowserInspector(self: *AppState, show_notice: bool) void {
         self.browser_state.setInspectorEnabled(false);
         if (!self.isBrowserVisible() or !self.canUseBrowserInspector()) {
             if (show_notice) self.setSidebarNotice("Browser inspector disabled.");
@@ -7101,6 +7389,7 @@ pub const AppState = struct {
         return switch (pane.ref) {
             .chat => .chat,
             .terminal => .terminal,
+            .browser => .browser,
         };
     }
 
@@ -7137,6 +7426,7 @@ pub const AppState = struct {
         return switch (pane.ref) {
             .chat => .chat,
             .terminal => .terminal,
+            .browser => .browser,
         };
     }
 
@@ -7726,6 +8016,8 @@ pub const AppState = struct {
         project.selected_thread_index = thread_index;
         if (!pane.minimized) project.workspace_layout.focused_pane_id = pane_id;
         self.terminal_focused = false;
+        self.unfocusBrowserPane();
+        self.browser_address_focused = false;
         self.syncPaletteComposerFromDraft();
         self.markDirty();
         return true;
@@ -7754,8 +8046,14 @@ pub const AppState = struct {
                     project.selected_thread_index = ref.thread_index;
                 }
                 self.terminal_focused = false;
+                self.unfocusBrowserPane();
+                self.browser_address_focused = false;
             },
             .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
+            .browser => {
+                self.terminal_focused = false;
+                self.composer_focused = false;
+            },
         }
         self.markDirty();
         return true;
@@ -7777,6 +8075,10 @@ pub const AppState = struct {
                 self.terminal_focused = false;
             },
             .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
+            .browser => {
+                self.terminal_focused = false;
+                self.composer_focused = false;
+            },
         }
         self.markDirty();
         return true;
@@ -7808,6 +8110,20 @@ pub const AppState = struct {
                 }
                 if (!layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
                 self.setSidebarNotice("Terminal pane closed.");
+            },
+            .browser => {
+                self.browser_state.setControlsVisible(false);
+                self.browser_state.setInspectorEnabled(false);
+                self.browser_state.clearSuppressedEvalResults();
+                self.browser_surface_suspended_for_palette_overlay = false;
+                self.unfocusBrowserPane();
+                self.browser_pane_hovered = false;
+                self.browser_address_focused = false;
+                self.browser_inspector_menu_open = false;
+                self.browser_state.controller.hide() catch |err| {
+                    log.warn("failed to hide browser runtime after closing pane: {s}", .{@errorName(err)});
+                };
+                self.setSidebarNotice("Browser pane closed.");
             },
         }
         if (layout.root == null) {
@@ -8111,6 +8427,14 @@ pub const AppState = struct {
             switch (pane.ref) {
                 .chat => self.terminal_focused = false,
                 .terminal => self.requestTerminalFocus(),
+                .browser => {
+                    self.terminal_focused = false;
+                    self.composer_focused = false;
+                    self.browser_state.setControlsVisible(true);
+                    self.browser_state.controller.show() catch |err| {
+                        log.warn("failed to restore browser runtime with pane: {s}", .{@errorName(err)});
+                    };
+                },
             }
             self.setSidebarNotice("Workspace pane restored.");
             self.markDirty();
@@ -8206,6 +8530,7 @@ pub const AppState = struct {
                     .kind = switch (pane.ref) {
                         .chat => .chat,
                         .terminal => .terminal,
+                        .browser => .browser,
                     },
                 };
             }
@@ -8888,6 +9213,57 @@ pub const AppState = struct {
         self.browser_state.expectSuppressedEvalResult();
         self.browser_state.controller.eval(script) catch |err| {
             log.warn("failed to select browser focused element text: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn pasteBrowserTextIntoFocusedElement(self: *AppState, text: []const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        stringify.write(text) catch |err| {
+            log.warn("failed to encode browser paste text: {s}", .{@errorName(err)});
+            return;
+        };
+        const encoded = out.written();
+        const script = std.fmt.allocPrint(self.allocator,
+            \\(function(){{
+            \\  const text={s};
+            \\  let el=window.__verdeInputTarget;
+            \\  if(el&&!el.isConnected)el=null;
+            \\  const resolve=(node)=>{{
+            \\    if(!node)return null;
+            \\    if(node.isContentEditable||node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)return node;
+            \\    return (node.closest&&node.closest('input,textarea,[contenteditable="true"]'))||null;
+            \\  }};
+            \\  el=resolve(el)||resolve(document.activeElement);
+            \\  if(!el)return false;
+            \\  window.__verdeInputTarget=el;
+            \\  if(el.focus)el.focus({{preventScroll:true}});
+            \\  if(el.isContentEditable){{
+            \\    document.execCommand('insertText',false,text);
+            \\    return true;
+            \\  }}
+            \\  if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){{
+            \\    const start=el.selectionStart??el.value.length;
+            \\    const end=el.selectionEnd??el.value.length;
+            \\    el.value=el.value.slice(0,start)+text+el.value.slice(end);
+            \\    const next=start+text.length;
+            \\    if(el.setSelectionRange)el.setSelectionRange(next,next);
+            \\    el.dispatchEvent(new InputEvent('input',{{bubbles:true,data:text,inputType:'insertFromPaste'}}));
+            \\    return true;
+            \\  }}
+            \\  return false;
+            \\}})()
+        , .{encoded}) catch |err| {
+            log.warn("failed to build browser paste script: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(script);
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            log.warn("failed to paste browser text: {s}", .{@errorName(err)});
             return;
         };
         self.markDirty();

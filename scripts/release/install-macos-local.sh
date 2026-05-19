@@ -27,6 +27,14 @@ ARCH="$(uname -m)"
 BROWSER_BACKEND="${VERDE_BROWSER_BACKEND:-native_webview}"
 MACOS_MIN_VERSION="${VERDE_MACOS_MIN_VERSION:-13.0}"
 MACOS_SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
 need_cmd zig
 need_cmd bash
 need_cmd xcrun
@@ -80,12 +88,22 @@ assert_no_cef_payload() {
 
 cd "$REPO_ROOT/packages/desktop"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MACOS_MIN_VERSION}"
-export SDKROOT="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+if [[ -n "${SDKROOT:-}" ]]; then
+  export SDKROOT
+fi
 
 compile_palette_metallib() {
   local shader="$1"
   local air="$WORK_DIR/$(basename "$shader" .msl).air"
   local metallib="${shader%.msl}.metallib"
+  if ! xcrun -sdk macosx -find metal >/dev/null 2>&1; then
+    if [[ -f "$metallib" ]]; then
+      echo "warning: xcrun metal unavailable; using existing $(basename "$metallib")" >&2
+      return 0
+    fi
+    echo "missing required command: xcrun metal" >&2
+    exit 1
+  fi
   xcrun -sdk macosx metal -x metal -c "$shader" -o "$air"
   xcrun -sdk macosx metallib "$air" -o "$metallib"
 }

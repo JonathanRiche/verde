@@ -10,6 +10,7 @@ const palette = @import("palette");
 const sdl = @import("zsdl3");
 
 const runtime = @import("runtime.zig");
+const browser_panel = @import("browser.zig");
 const chat_panel = @import("chat_panel.zig");
 const colors = @import("colors.zig");
 const profiler = @import("../profiler.zig");
@@ -715,6 +716,7 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
     const header_h = switch (kind) {
         .chat => chat_panel.paneHeaderHeight(rect),
         .terminal => terminal_panel.paneHeaderHeight(),
+        .browser => 0.0,
     };
     switch (kind) {
         .chat => chat_panel.renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, reserve),
@@ -722,6 +724,7 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse 0;
             terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
         },
+        .browser => browser_panel.renderDockAt(state, rect),
     }
     if (kind == .chat and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
@@ -984,10 +987,12 @@ fn renderRestoreStrip(state: *runtime.AppState, rect: palette.Rect, minimized_co
         const label = switch (pane.kind) {
             .chat => "Chat",
             .terminal => "Terminal",
+            .browser => "Browser",
         };
         const chip_w = switch (pane.kind) {
             .chat => theme.scaledUi(82.0),
             .terminal => theme.scaledUi(108.0),
+            .browser => theme.scaledUi(104.0),
         };
         const chip_rect = palette.Rect{ .x = x, .y = y, .w = chip_w, .h = chip_h };
         renderRestoreChip(state, chip_rect, label, rectContains(chip_rect, mx, my), rect);

@@ -64,7 +64,8 @@ The 15-PageUp capture keeps the sidebar, transcript, and composer text readable 
 
 # Browser Webview Smoke Checklist
 
-Use this checklist for the native webview migration described in `webview.md`.
+Use this checklist for the native webview migration. For the current macOS
+WKWebView handoff, `mac_webview.md` is the authoritative signoff document.
 
 1. Start the default native webview path without downloading CEF:
    ```bash
@@ -121,7 +122,21 @@ Use this checklist for the native webview migration described in `webview.md`.
 
 11. Before release, repeat the checklist on each native runtime:
     - Linux WebKitGTK on the normal Hyprland Wayland session, plus X11 where available. Linux should report `presentation_kind: "snapshot_texture"` on Wayland by default and `presentation_kind: "helper_window"` on X11 unless `VERDE_BROWSER_LINUX_SHOW_HELPER=0` is set. On Wayland, `VERDE_BROWSER_LINUX_SHOW_HELPER=1` must still report `snapshot_texture` unless paired with the diagnostic-only `VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER=1` flag. On X11, verify native focus, click, wheel, and key input in the helper window in addition to the default snapshot path.
-    - macOS WKWebView.
+    - macOS WKWebView. Run the automated gate:
+      ```bash
+      mise run check-mac-webview
+      ```
+      This refreshes the installed local macOS app before checking installed
+      Swift symbols, codesign, CEF-free contents, source-level native-keyboard
+      ownership checks for the doubled-key fix, runtime startup, and the
+      manual-evidence validator self-test for doubled text, address-focus,
+      inspector status, URL-match, and generated unavailable-evidence handling.
+      Then complete the direct keyboard/trackpad checklist in
+      `notes/mac-webview-smoke/manual-input-checklist.md` and run the
+      run-specific completion command printed by
+      `scripts/dev/run-macos-wkwebview-manual-signoff.sh`. The automated gate
+      does not prove real keypresses, Command-key shortcuts, modifier
+      click/wheel, IME/composition, or physical inspector gestures.
     - Windows WebView2 with and without the runtime/loader preinstalled to confirm clear failure reporting.
 
 Pass criteria: the webview is clipped to the browser content area only, never covers Palette toolbar/sidebar/terminal/chat/modal UI, follows pane resize/split changes, does not show blank/stale/offset content after navigation, mouse hit testing matches the visible page, and `verde` live status reports the selected runtime kind, presentation kind, initialization state, focused/visible state, URL, last browser error, last bridge message, and last eval result.

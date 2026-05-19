@@ -100,7 +100,7 @@ fn printHelp(out: output.Output) !void {
         \\  inspect --pane <id> [--project <id|index|current>] [--json]
         \\  pane focus|split|resize|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
-        \\  browser eval|post-json ...
+        \\  browser open|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
         \\  terminal write|tail|screen --pane <id> ...
         \\  process list|inspect|start|stop|restart|logs ...
         \\  stack status|start|stop|restart ...
@@ -386,6 +386,144 @@ fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.I
         try out.stderr("missing live browser command\n", .{});
         std.process.exit(2);
     };
+    if (std.mem.eql(u8, subcommand, "open")) {
+        try sendLiveRequest(allocator, out, io, "browser.open", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "close")) {
+        try sendLiveRequest(allocator, out, io, "browser.close", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "toggle")) {
+        try sendLiveRequest(allocator, out, io, "browser.toggle", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "back")) {
+        try sendLiveRequest(allocator, out, io, "browser.back", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "forward")) {
+        try sendLiveRequest(allocator, out, io, "browser.forward", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "reload")) {
+        try sendLiveRequest(allocator, out, io, "browser.reload", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "focus")) {
+        try sendLiveRequest(allocator, out, io, "browser.focus", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "blur")) {
+        try sendLiveRequest(allocator, out, io, "browser.blur", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "toolbar-hit")) {
+        try sendLiveRequest(allocator, out, io, "browser.toolbarHit", .{
+            .target = args.optionValue(argv, "--target") orelse trailingFreeArg(argv, 2) orelse "",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "select-all")) {
+        try sendLiveRequest(allocator, out, io, "browser.selectAllFocused", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "copy")) {
+        try sendLiveRequest(allocator, out, io, "browser.copyFocused", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "cut")) {
+        try sendLiveRequest(allocator, out, io, "browser.cutFocused", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "paste-text")) {
+        try sendLiveRequest(allocator, out, io, "browser.pasteTextFocused", .{
+            .text = args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2) orelse "",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-enable")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.enable", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-disable")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.disable", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-toggle")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.toggle", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-mode")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.mode", .{
+            .mode = args.optionValue(argv, "--mode") orelse trailingFreeArg(argv, 2) orelse "",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-menu-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.menuOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "inspector-menu-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.inspector.menuClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "workspace-menu-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.workspaceMenuOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "workspace-menu-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.workspaceMenuClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "sidebar-menu-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.sidebarMenuOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "sidebar-menu-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.sidebarMenuClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "composer-menu-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.composerMenuOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "composer-menu-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.composerMenuClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "project-modal-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.projectModalOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "project-modal-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.projectModalClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "thread-modal-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.threadModalOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "thread-modal-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.threadModalClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "image-modal-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.imageModalOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "image-modal-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.imageModalClose", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "transcript-modal-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.transcriptModalOpen", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "transcript-modal-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.transcriptModalClose", .{}, json);
+        return;
+    }
     if (std.mem.eql(u8, subcommand, "eval")) {
         try sendLiveRequest(allocator, out, io, "browser.eval", .{
             .script = args.optionValue(argv, "--script") orelse trailingFreeArg(argv, 2) orelse "",

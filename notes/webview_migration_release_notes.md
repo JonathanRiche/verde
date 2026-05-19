@@ -18,6 +18,18 @@ Release validation requirements:
 
 - Run the browser smoke checklist in `testing.md` on Linux WebKitGTK, macOS
   WKWebView, and Windows WebView2.
+- On macOS, run `mise run check-mac-webview` to verify the stub tests, refreshed
+  local WKWebView app install, Swift-only package/symbol/codesign gate, and
+  installed-app runtime smoke. The gate also source-checks the native-keyboard
+  ownership rules that prevent doubled physical text input in focused WKWebView
+  fields. It self-tests the manual evidence validators so doubled text, stale
+  address-field focus, invalid inspector status, failed URL matches, and
+  malformed unavailable records cannot be accepted as passing physical input
+  evidence. Then complete
+  `notes/mac-webview-smoke/manual-input-checklist.md` for real keyboard,
+  Command-key shortcut, modifier, IME/composition, and physical inspector
+  gesture parity, then run `mise run check-mac-webview-manual` to check the
+  latest timestamped evidence run before final sign-off.
 - Capture Hyprland Wayland screenshots proving that the browser surface stays
   clipped to the Palette browser pane and does not cover toolbar, sidebar,
   terminal, chat, or modal UI.
