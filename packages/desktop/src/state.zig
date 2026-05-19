@@ -6625,20 +6625,23 @@ pub const AppState = struct {
     }
 
     /// Applies queued browser runtime events back onto app-visible browser state.
-    pub fn pollBrowser(self: *AppState) void {
-        if (!self.browser_textures_enabled) return;
+    pub fn pollBrowser(self: *AppState) bool {
+        if (!self.browser_textures_enabled) return false;
 
-        if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return;
+        if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return false;
 
+        var needs_render = false;
         if (self.browser_launch_open_delay_frames > 0) {
             self.browser_launch_open_delay_frames -= 1;
             if (self.browser_launch_open_delay_frames == 0) {
                 self.toggleBrowser();
+                needs_render = true;
             }
         }
-        self.browser_state.controller.uploadFrame();
+        needs_render = self.browser_state.controller.uploadFrame() or needs_render;
         while (self.browser_state.controller.pollEvent()) |event| {
             defer event.deinit(self.allocator);
+            needs_render = true;
             switch (event) {
                 .opened => {
                     self.browser_state.status = .ready;
@@ -6712,6 +6715,7 @@ pub const AppState = struct {
                 },
             }
         }
+        return needs_render;
     }
 
     // Adds an https scheme for bare hostnames so the browser control surface accepts normal typed URLs.

@@ -3,6 +3,8 @@
 const std = @import("std");
 const ipc = @import("linux_ipc.zig");
 
+const IDLE_SLEEP_MS = 2;
+
 const RawBrowser = opaque {};
 
 extern fn verde_browser_linux_create() ?*RawBrowser;
@@ -112,20 +114,34 @@ pub fn main(init: std.process.Init) !void {
     defer reader_thread.join();
 
     while (true) {
+        var did_work = false;
         while (queue.pop()) |command| {
+            did_work = true;
             defer if (command.payload) |payload| allocator.free(payload);
             if (!try applyCommand(allocator, browser, command)) {
                 std.process.exit(0);
             }
         }
 
-        try flushBrowserEvents(allocator, init.io, browser);
-        try flushBrowserFrames(allocator, init.io, browser);
+        did_work = (try flushBrowserEvents(allocator, init.io, browser)) > 0 or did_work;
+        did_work = (try flushBrowserFrames(allocator, init.io, browser)) > 0 or did_work;
         if (queue.isDrained()) {
             std.process.exit(0);
         }
-        std.atomic.spinLoopHint();
+        if (did_work) {
+            std.atomic.spinLoopHint();
+        } else {
+            sleepMillis(IDLE_SLEEP_MS);
+        }
     }
+}
+
+fn sleepMillis(ms: u64) void {
+    const request: std.c.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&request, null);
 }
 
 /// Reads JSON-line commands from stdin and forwards them into the helper's command queue.
@@ -278,12 +294,13 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
 }
 
 /// Serializes any pending GTK/WebKit events onto stdout as JSON lines.
-fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !void {
+fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !usize {
     const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
     var writer = stdout_file.writerStreaming(io, &write_buffer);
     defer writer.interface.flush() catch {};
 
+    var count: usize = 0;
     while (true) {
         var raw_kind: c_int = 0;
         var payload: ?[*:0]u8 = null;
@@ -298,16 +315,19 @@ fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
         defer allocator.free(encoded);
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
+        count += 1;
     }
+    return count;
 }
 
 /// Serializes any newly rendered browser snapshot onto stdout as a frame-ready event.
-fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !void {
+fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !usize {
     const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;
     var writer = stdout_file.writerStreaming(io, &write_buffer);
     defer writer.interface.flush() catch {};
 
+    var count: usize = 0;
     while (true) {
         var frame_path: ?[*:0]u8 = null;
         var frame_sequence: u64 = 0;
@@ -331,7 +351,9 @@ fn flushBrowserFrames(allocator: std.mem.Allocator, io: std.Io, browser: *RawBro
         defer allocator.free(encoded);
         try writer.interface.writeAll(encoded);
         try writer.interface.writeByte('\n');
+        count += 1;
     }
+    return count;
 }
 
 /// Maps the C helper event code into the shared JSON protocol enum.

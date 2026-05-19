@@ -239,18 +239,19 @@ pub const Backend = struct {
     }
 
     /// Uploads at most one pending platform frame for the current app render tick.
-    pub fn uploadFrame(self: *Backend) void {
-        if (builtin.os.tag != .linux) return;
+    pub fn uploadFrame(self: *Backend) bool {
+        if (builtin.os.tag != .linux) return false;
         const upload_start = monotonicTimestampNs();
         const uploaded = self.platform.uploadFrame(&self.pane_texture) catch |err| {
             log.warn("snapshot render_tick upload failed: {}", .{err});
-            return;
+            return false;
         };
-        if (!uploaded) return;
+        if (!uploaded) return false;
         const upload_end = monotonicTimestampNs();
         if (frameLogEnabled()) {
             log.info("snapshot render_tick upload_ms={d:.3}", .{nanosToMillis(upload_end - upload_start)});
         }
+        return true;
     }
 
     /// Alias used by the shared backend contract.
