@@ -2664,6 +2664,7 @@ pub const AppState = struct {
     app_window_screen_origin: [2]i32,
     app_window_display_scale: f32,
     browser_surface_suspended_for_palette_overlay: bool,
+    browser_surface_suspended_for_layout: bool,
     browser_suppressed_closed_events: u8,
     browser_clipboard_copy_pending: bool,
     /// Palette sidebar thread row under the cursor (hover highlight).
@@ -2852,6 +2853,7 @@ pub const AppState = struct {
             .app_window_screen_origin = .{ 0, 0 },
             .app_window_display_scale = 1.0,
             .browser_surface_suspended_for_palette_overlay = false,
+            .browser_surface_suspended_for_layout = false,
             .browser_suppressed_closed_events = 0,
             .browser_clipboard_copy_pending = false,
             .sidebar_thread_hover = null,
@@ -6261,6 +6263,7 @@ pub const AppState = struct {
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
         self.browser_surface_suspended_for_palette_overlay = false;
+        self.browser_surface_suspended_for_layout = false;
         self.unfocusBrowserPane();
         self.browser_pane_hovered = false;
         self.browser_address_focused = false;
@@ -6281,6 +6284,7 @@ pub const AppState = struct {
         self.browser_state.setInspectorEnabled(false);
         self.browser_state.clearSuppressedEvalResults();
         self.browser_surface_suspended_for_palette_overlay = false;
+        self.browser_surface_suspended_for_layout = false;
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
@@ -6375,6 +6379,10 @@ pub const AppState = struct {
     /// Reports whether a Palette overlay has temporarily hidden the native browser surface.
     pub fn isBrowserSurfaceSuspendedForPaletteOverlay(self: *const AppState) bool {
         return self.browser_surface_suspended_for_palette_overlay;
+    }
+
+    pub fn isBrowserSurfaceSuspendedForLayout(self: *const AppState) bool {
+        return self.browser_surface_suspended_for_layout;
     }
 
     /// Reports whether the workspace header Open menu is currently open.
@@ -6558,7 +6566,26 @@ pub const AppState = struct {
         self.browser_pane_max = max;
         self.browser_pane_input_size = input_size;
         self.browser_pane_hovered = hovered;
+        self.restoreBrowserSurfaceForRenderedLayout();
         self.syncBrowserPaneBoundsToBackend();
+    }
+
+    pub fn noteBrowserPaneNotRendered(self: *AppState) void {
+        if (!self.isBrowserVisible()) return;
+        self.browser_pane_hovered = false;
+        self.browser_pane_min = .{ 0.0, 0.0 };
+        self.browser_pane_max = .{ 0.0, 0.0 };
+        self.browser_pane_input_size = .{ 0.0, 0.0 };
+        if (self.browser_surface_suspended_for_layout) return;
+        self.browser_state.controller.hide() catch |err| {
+            log.warn("failed to hide browser runtime while pane is not rendered: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to hide browser runtime while pane is not visible in the layout.") catch {};
+            return;
+        };
+        self.suppressNextBrowserClosedEvent();
+        self.browser_surface_suspended_for_layout = true;
+        self.unfocusBrowserPane();
     }
 
     /// Records the app window origin used to place native child/overlay browser surfaces.
@@ -6589,6 +6616,7 @@ pub const AppState = struct {
 
     fn syncBrowserPaneBoundsToBackend(self: *AppState) void {
         if (!self.isBrowserVisible()) return;
+        if (self.browser_surface_suspended_for_layout) return;
         if (self.browser_pane_max[0] <= self.browser_pane_min[0] or self.browser_pane_max[1] <= self.browser_pane_min[1]) return;
         if (self.syncBrowserSurfaceOcclusion()) return;
         const pane_width = self.browser_pane_max[0] - self.browser_pane_min[0];
@@ -6623,6 +6651,24 @@ pub const AppState = struct {
         }) catch |err| {
             log.warn("failed to sync browser pane bounds: {s}", .{@errorName(err)});
         };
+    }
+
+    fn restoreBrowserSurfaceForRenderedLayout(self: *AppState) void {
+        if (!self.browser_surface_suspended_for_layout) return;
+        self.browser_surface_suspended_for_layout = false;
+        if (self.browserBlockedByPaletteOverlay()) return;
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.warn("failed to restore browser runtime after pane returned to layout: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to restore browser runtime after pane returned to the layout.") catch {};
+            return;
+        };
+        if (!self.browser_pane_focused) {
+            self.browser_state.controller.blur() catch |err| {
+                log.warn("failed to clear restored native browser focus: {s}", .{@errorName(err)});
+            };
+        }
     }
 
     fn syncBrowserSurfaceOcclusion(self: *AppState) bool {
@@ -8140,6 +8186,7 @@ pub const AppState = struct {
                 self.browser_state.setInspectorEnabled(false);
                 self.browser_state.clearSuppressedEvalResults();
                 self.browser_surface_suspended_for_palette_overlay = false;
+                self.browser_surface_suspended_for_layout = false;
                 self.unfocusBrowserPane();
                 self.browser_pane_hovered = false;
                 self.browser_address_focused = false;

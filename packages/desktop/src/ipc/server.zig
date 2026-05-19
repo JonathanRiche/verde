@@ -282,6 +282,8 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.write(state.isBrowserInspectorMenuOpen());
     try s.objectField("surface_suspended_for_palette_overlay");
     try s.write(state.isBrowserSurfaceSuspendedForPaletteOverlay());
+    try s.objectField("surface_suspended_for_layout");
+    try s.write(state.isBrowserSurfaceSuspendedForLayout());
     try s.objectField("workspace_header_open_menu_open");
     try s.write(state.isWorkspaceHeaderOpenMenuOpen());
     try s.objectField("sidebar_context_menu_open");
