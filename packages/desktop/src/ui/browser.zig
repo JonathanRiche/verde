@@ -120,6 +120,14 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
 
+    if (down and (rectContainsPoint(palette_toolbar_rect, x, y) or
+        (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y))))
+    {
+        if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.focusCurrentProjectWorkspacePane(pane_id);
+        }
+    }
+
     if (!down) {
         state.browser_address_drag_active = false;
         return rectContainsPoint(palette_toolbar_rect, x, y) or

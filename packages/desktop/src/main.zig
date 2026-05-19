@@ -982,6 +982,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // Pane-level bindings must stay app-owned even when a native webview
+            // or embedded terminal has keyboard focus.
+            if (action) |resolved_workspace_action| {
+                if (isWorkspacePaneAction(resolved_workspace_action)) {
+                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
+                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             const native_browser_focused = state.isNativeBrowserSurfaceFocused();
             if (native_browser_focused) {
                 state.browser_address_focused = false;
@@ -1010,32 +1020,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
-            // Workspace pane shortcuts pre-empt the terminal handler so the
-            // embedded terminal (and anything running inside it, like tmux)
-            // can't swallow Alt-prefixed bindings.
-            if (action) |resolved_workspace_action| switch (resolved_workspace_action) {
-                .workspace_focus_left,
-                .workspace_focus_right,
-                .workspace_focus_up,
-                .workspace_focus_down,
-                .workspace_grow_left,
-                .workspace_grow_right,
-                .workspace_grow_up,
-                .workspace_grow_down,
-                .workspace_split_chat_vertical,
-                .workspace_split_chat_horizontal,
-                .workspace_split_terminal_vertical,
-                .workspace_split_terminal_horizontal,
-                .workspace_toggle_maximize,
-                .workspace_minimize,
-                .workspace_close,
-                => {
-                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
-                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
-                    return true;
-                },
-                else => {},
-            };
             if (action) |resolved_app_action| switch (resolved_app_action) {
                 .toggle_terminal,
                 .toggle_browser,
@@ -1657,6 +1641,28 @@ fn handleKeyboardAction(
         .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
         .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
+}
+
+fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
+    return switch (action) {
+        .workspace_focus_left,
+        .workspace_focus_right,
+        .workspace_focus_up,
+        .workspace_focus_down,
+        .workspace_grow_left,
+        .workspace_grow_right,
+        .workspace_grow_up,
+        .workspace_grow_down,
+        .workspace_split_chat_vertical,
+        .workspace_split_chat_horizontal,
+        .workspace_split_terminal_vertical,
+        .workspace_split_terminal_horizontal,
+        .workspace_toggle_maximize,
+        .workspace_minimize,
+        .workspace_close,
+        => true,
+        else => false,
+    };
 }
 
 fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
