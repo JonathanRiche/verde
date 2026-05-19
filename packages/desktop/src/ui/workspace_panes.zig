@@ -89,6 +89,7 @@ var last_thread_drop_target: ?ThreadDropTarget = null;
 
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
+var browser_pane_rendered: bool = false;
 
 var focus_prev_id: ?runtime.WorkspacePaneId = null;
 var focus_curr_id: ?runtime.WorkspacePaneId = null;
@@ -371,6 +372,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     tickFocusAnimation(state);
     hit_cache.count = 0;
     pane_rect_count = 0;
+    browser_pane_rendered = false;
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
 
@@ -387,18 +389,21 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
         renderLeaf(state, pane_id, workspace_rect);
         renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
         renderSplitMenuOverlay(state, workspace_rect);
+        if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
         return;
     }
     if (state.currentProjectWorkspaceRoot()) |root| {
         renderNode(state, root, workspace_rect);
         renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
         renderSplitMenuOverlay(state, workspace_rect);
+        if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
         return;
     }
 
     chat_panel.renderWorkspaceAt(state, workspace_rect);
     renderRestoreStrip(state, .{ .x = rect.x, .y = rect.y + workspace_rect.h, .w = rect.w, .h = restore_h }, minimized_count);
     renderSplitMenuOverlay(state, workspace_rect);
+    if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
 }
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
@@ -724,7 +729,10 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
             const dock_id = state.workspaceTerminalDockIdByPane(pane_id) orelse 0;
             terminal_panel.renderDockAtForDockWithReserve(state, rect, dock_id, reserve);
         },
-        .browser => browser_panel.renderDockAt(state, rect),
+        .browser => {
+            browser_pane_rendered = true;
+            browser_panel.renderDockAt(state, rect);
+        },
     }
     if (kind == .chat and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
