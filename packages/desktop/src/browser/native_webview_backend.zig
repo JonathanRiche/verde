@@ -222,6 +222,17 @@ pub const Backend = struct {
         try self.platform.blur();
     }
 
+    /// Reports whether a platform-native child browser view owns OS keyboard focus.
+    pub fn hasNativeFocus(self: *const Backend) bool {
+        if (builtin.os.tag != .macos) return false;
+        return self.platform.hasFocus();
+    }
+
+    pub fn macosAppKitDiagnostics(self: *const Backend, allocator: std.mem.Allocator) ?[]u8 {
+        if (builtin.os.tag != .macos) return null;
+        return self.platform.appKitDiagnostics(allocator);
+    }
+
     /// Forwards pointer input into the Linux pane backend when it exists.
     pub fn handleMouse(self: *Backend, event: browser_input.MouseEvent) !bool {
         if (builtin.os.tag != .linux) return false;

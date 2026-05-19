@@ -86,6 +86,12 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.browser_eval_flags);
     try w.writeAll("\"\n  local browser_post_json_flags=\"");
     try writeWords(w, &spec.browser_post_json_flags);
+    try w.writeAll("\"\n  local browser_toolbar_hit_flags=\"");
+    try writeWords(w, &spec.browser_toolbar_hit_flags);
+    try w.writeAll("\"\n  local browser_paste_text_flags=\"");
+    try writeWords(w, &spec.browser_paste_text_flags);
+    try w.writeAll("\"\n  local browser_inspector_mode_flags=\"");
+    try writeWords(w, &spec.browser_inspector_mode_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -98,6 +104,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.axis_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("\"\n  local inspector_mode_values=\"");
+    try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
         \\"
         \\
@@ -105,6 +113,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --kind) COMPREPLY=( $(compgen -W "$kind_values" -- "$cur") ); return 0 ;;
         \\    --axis) COMPREPLY=( $(compgen -W "$axis_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
+        \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
         \\    --project|--thread|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
         \\  esac
         \\
@@ -146,6 +155,9 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\            case "$third" in
         \\              eval) COMPREPLY=( $(compgen -W "$browser_eval_flags" -- "$cur") ) ;;
         \\              post-json) COMPREPLY=( $(compgen -W "$browser_post_json_flags" -- "$cur") ) ;;
+        \\              toolbar-hit) COMPREPLY=( $(compgen -W "$browser_toolbar_hit_flags" -- "$cur") ) ;;
+        \\              paste-text) COMPREPLY=( $(compgen -W "$browser_paste_text_flags" -- "$cur") ) ;;
+        \\              inspector-mode) COMPREPLY=( $(compgen -W "$browser_inspector_mode_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
@@ -243,6 +255,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.browser_eval_flags);
     try w.writeAll("\"\n  local browser_post_json_flags=\"");
     try writeWords(w, &spec.browser_post_json_flags);
+    try w.writeAll("\"\n  local browser_toolbar_hit_flags=\"");
+    try writeWords(w, &spec.browser_toolbar_hit_flags);
+    try w.writeAll("\"\n  local browser_paste_text_flags=\"");
+    try writeWords(w, &spec.browser_paste_text_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -255,6 +271,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.axis_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("\"\n  local inspector_mode_values=\"");
+    try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
         \\"
         \\
@@ -262,6 +280,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --kind) compadd -- ${(s: :)kind_values}; return ;;
         \\    --axis) compadd -- ${(s: :)axis_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
+        \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
         \\    --project|--thread|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
         \\  esac
         \\
@@ -303,6 +322,9 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\            case "$third" in
         \\              eval) compadd -- ${(s: :)browser_eval_flags} ;;
         \\              post-json) compadd -- ${(s: :)browser_post_json_flags} ;;
+        \\              toolbar-hit) compadd -- ${(s: :)browser_toolbar_hit_flags} ;;
+        \\              paste-text) compadd -- ${(s: :)browser_paste_text_flags} ;;
+        \\              inspector-mode) compadd -- ${(s: :)browser_inspector_mode_flags} ;;
         \\              *) compadd -- ${(s: :)json_flags} ;;
         \\            esac
         \\            ;;
@@ -400,6 +422,7 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l call -r -d 'Approval call id'
         \\complete -c verde -l name -r -d 'Configured process name'
         \\complete -c verde -l lines -r -d 'Number of output lines'
+        \\complete -c verde -l mode -r -d 'Browser inspector mode'
         \\complete -c verde -s h -l help -d 'Show help'
         \\
         \\complete -c verde -n '__verde_prev_is --kind' -a '
@@ -409,5 +432,7 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.axis_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --decision' -a '");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --mode' -a '");
+    try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll("'\n");
 }

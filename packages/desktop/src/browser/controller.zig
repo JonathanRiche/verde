@@ -180,6 +180,23 @@ pub const Controller = struct {
         }
     }
 
+    /// Reports whether a platform-native child browser view owns OS keyboard focus.
+    pub fn hasNativeFocus(self: *const Controller) bool {
+        const backend = if (self.backend) |*backend| backend else return false;
+        return switch (backend.*) {
+            .native_webview => |*active| active.hasNativeFocus(),
+            .cef, .stub => false,
+        };
+    }
+
+    pub fn macosAppKitDiagnostics(self: *const Controller, allocator: std.mem.Allocator) ?[]u8 {
+        const backend = if (self.backend) |*backend| backend else return null;
+        return switch (backend.*) {
+            .native_webview => |*active| active.macosAppKitDiagnostics(allocator),
+            .cef, .stub => null,
+        };
+    }
+
     /// Resizes the pane session to match the latest visible dock geometry.
     pub fn resizePane(self: *Controller, width: u32, height: u32) !void {
         self.pane_bounds.width = @max(width, 1);

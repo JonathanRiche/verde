@@ -1,11 +1,14 @@
 # macOS WKWebView Finish Goal
 
-This document is a handoff for a Codex agent running on macOS. The branch already contains a broad native-webview migration; the remaining macOS work is to build, smoke-test, and fix the WKWebView backend until it satisfies the macOS parts of `webview.md`.
+This document tracks the macOS WKWebView sign-off work for the native-webview
+migration. The automated macOS build/package/runtime gates now pass; the
+remaining completion blocker is the direct physical input parity pass listed
+below.
 
 ## Goal
 
-Finish and verify the macOS native webview backend for Verde, using a Swift
-WKWebView shim instead of the current Objective-C shim.
+Finish and verify the macOS native webview backend for Verde, using the Swift
+WKWebView shim.
 
 The expected result is:
 
@@ -24,7 +27,7 @@ Do not spend time on Linux X11 or Windows in this goal. Linux X11 and Windows ar
 Important files already implemented or changed:
 
 - `packages/desktop/src/browser/platform/macos_wkwebview.zig`
-- `packages/desktop/src/browser/platform/macos_wkwebview.m`
+- `packages/desktop/src/browser/platform/macos_wkwebview.swift`
 - `packages/desktop/src/browser/native_webview_backend.zig`
 - `packages/desktop/src/browser/controller.zig`
 - `packages/desktop/src/browser/types.zig`
@@ -39,23 +42,51 @@ Important files already implemented or changed:
 - `testing.md`
 - `notes/webview_migration_audit.md`
 - `notes/webview_migration_release_notes.md`
+- `notes/mac-webview-smoke/input-regression.html`
+- `notes/mac-webview-smoke/manual-input-checklist.md`
+- `notes/mac-webview-smoke/readiness-matrix.md`
+- `scripts/dev/capture-macos-wkwebview-input-evidence.sh`
+- `scripts/dev/capture-macos-wkwebview-status-evidence.sh`
+- `scripts/dev/check-macos-wkwebview.sh`
+- `scripts/dev/check-macos-wkwebview-ready.sh`
+- `scripts/dev/open-macos-wkwebview-input-smoke.sh`
+- `scripts/dev/run-macos-wkwebview-manual-input-checklist.sh`
+- `scripts/dev/run-macos-wkwebview-manual-input-step.sh`
+- `scripts/dev/run-macos-wkwebview-manual-signoff.sh`
+- `scripts/dev/run-macos-wkwebview-manual-status-checklist.sh`
+- `scripts/dev/smoke-macos-wkwebview-runtime.sh`
+- `scripts/dev/summarize-macos-wkwebview-manual-evidence.sh`
+- `scripts/dev/validate-macos-wkwebview-input-evidence.sh`
+- `scripts/dev/validate-macos-wkwebview-status-evidence.sh`
 
-The macOS implementation has not been compiled or run on macOS from this Linux development machine. Cross-target build attempts on Linux failed before meaningful WKWebView verification because this checkout lacks macOS cross-build prerequisites and `libfff_c.dylib`.
+The old Objective-C `macos_wkwebview.m` shim has been removed. The active macOS
+implementation is `macos_wkwebview.swift`, built through
+`packages/desktop/build.zig`.
 
-Important direction change for the Mac agent:
+Current status:
 
-- `macos_wkwebview.m` is the current working shape, but it is not the desired
-  final implementation.
-- Replace the Objective-C shim with a Swift shim before completing this goal.
-- Keep the C ABI exported to Zig exactly the same unless there is a strong
-  reason to change it and the Zig wrapper is updated with matching names.
-- Do not mark the macOS goal complete while `macos_wkwebview.m` remains the
-  active WKWebView implementation.
+- `mise run check-mac-webview` passes on macOS. It runs
+  `zig build test --release=safe -Dbrowser-backend=stub`,
+  the manual evidence validator self-test for doubled text/address-focus,
+  inspector status, URL-match, and generated unavailable-evidence regressions,
+  `scripts/release/install-macos-local.sh`, the Swift-only
+  build/package/codesign/CEF-free checker, installed-binary symbol validation,
+  native-keyboard ownership guards for the doubled-key fix, and the
+  installed-app runtime smoke.
+- `mise run build` installs `/Users/jhonellebriche/Applications/Verde.app`
+  without CEF payloads.
+- The installed app runtime smoke reports `runtime_kind: "native_webview"`,
+  `presentation_kind: "native_child_view"`, `status: "Ready"`,
+  `visible: true`, `url: "about:blank"`, and `last_error: null`.
+- `notes/webview_migration_audit.md` and
+  `notes/mac-webview-smoke/readiness-matrix.md` contain the current automated
+  evidence and remaining gaps.
 
-The Swift rewrite should preserve the behavior and exported functions currently
-provided by `macos_wkwebview.m`:
+The Swift shim exports these Zig-callable functions:
 
 - `verde_macos_webview_create`
+- `verde_macos_app_configure_foreground`
+- `verde_macos_webview_appkit_diagnostics`
 - `verde_macos_webview_destroy`
 - `verde_macos_webview_show`
 - `verde_macos_webview_hide`
@@ -68,52 +99,48 @@ provided by `macos_wkwebview.m`:
 - `verde_macos_webview_reload`
 - `verde_macos_webview_focus`
 - `verde_macos_webview_blur`
+- `verde_macos_webview_has_focus`
 - `verde_macos_webview_pop_event`
 - `verde_macos_webview_free_string`
 
-Expected Swift implementation shape:
-
-- Add a Swift source file such as
-  `packages/desktop/src/browser/platform/macos_wkwebview.swift`.
-- Export Zig-callable functions with Swift C entry points, for example
-  `@_cdecl("verde_macos_webview_create")`.
-- Retain/release the browser object explicitly with `Unmanaged`:
-  `Unmanaged.passRetained(browser).toOpaque()` on create and
-  `Unmanaged<VerdeMacBrowser>.fromOpaque(handle).takeRetainedValue()` on
-  destroy.
-- Convert incoming C strings to Swift `String` safely.
-- Return event payloads as C strings allocated in a way compatible with the
-  existing free function, or update both allocation and free paths together.
-- Keep all AppKit and WebKit work on the main thread.
-- Preserve the current invalidation behavior: remove KVO observers, remove the
-  script message handler, nil the navigation delegate, stop loading, remove the
-  child view, and ignore delayed callbacks after invalidation.
-- Wire Swift compilation into `packages/desktop/build.zig` for macOS. Remove
-  or stop compiling `macos_wkwebview.m` once the Swift shim replaces it.
-
-The rewrite should be behavior-preserving first. Do not redesign the browser
-contract while converting Objective-C to Swift.
+`scripts/dev/check-macos-wkwebview.sh` verifies the Swift exports, matching Zig
+externs, active Swift build wiring, absence of the stale Objective-C shim,
+installed-binary Swift symbols, CEF-free installed app contents, and strict
+codesign. It also source-checks the native-keyboard ownership invariants behind
+the doubled-key fix: SDL text input must stop while WKWebView owns keyboard
+focus, the click-to-WKWebView handoff must stop SDL text input before forwarding
+the focus click, and SDL text input may only be started through the Verde-owned
+text-field synchronization path.
 
 ## What To Verify First
 
-Start from a clean pull of this branch on a macOS machine with the normal Verde development prerequisites.
+Start from a clean pull of this branch on a macOS machine with the normal Verde
+development prerequisites.
 
 Run:
 
 ```bash
 git status --short
 mise run setup
-zig build --release=safe -Dbrowser-backend=native_webview
-zig build test --release=safe -Dbrowser-backend=stub
-mise run dev-mac
+mise run build
+mise run check-mac-webview
 ```
 
-If `mise run setup` or `mise run dev-mac` attempts to download CEF, that is a bug for this goal.
+`mise run check-mac-webview` includes the stub Zig test gate, the manual
+evidence validator self-test, and refreshes the local installed macOS app before
+checking installed symbols/codesign/runtime. The self-test proves that exact
+text evidence passes, doubled text and stale address-field focus fail, physical
+inspector/URL-match status validators reject bad captures, and generated
+unavailable evidence is summarized explicitly. The build/package checker also
+guards the native-keyboard ownership rules that prevent duplicated physical text
+input in focused WKWebView fields. If `mise run setup`, `mise run build`, `mise run dev-mac`, or
+`mise run check-mac-webview` attempts to download CEF, that is a bug for this
+goal.
 
-Also run:
+For an interactive dev smoke, also run:
 
 ```bash
-mise run build
+VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=about:blank mise run dev-mac
 ```
 
 Then inspect the macOS app bundle or install prefix and confirm it does not contain CEF or Chromium payloads such as:
@@ -174,7 +201,8 @@ Navigation:
 - Navigate to `about:blank`.
 - Navigate to a localhost dev server.
 - Back/forward toolbar buttons.
-- Mouse back/forward buttons if available on the test device.
+- Mouse back/forward buttons if available on the test device, or generated
+  unavailable evidence if the device has no hardware browser buttons.
 - Reload.
 - Navigation event updates URL bar.
 - Title change event updates internal browser state.
@@ -270,8 +298,8 @@ If build fails:
 
 - Check `packages/desktop/build.zig` macOS WebKit/AppKit link wiring.
 - Check Swift compilation/link wiring for `macos_wkwebview.swift`.
-- If the Objective-C file is still being compiled, treat that as unfinished
-  migration work, not as the final Mac implementation.
+- If `packages/desktop/src/browser/platform/macos_wkwebview.m` reappears or is
+  compiled, treat that as a regression. The final Mac implementation is Swift.
 - Check SDL native property names used in `packages/desktop/src/main.zig`.
 - Check whether the local macOS build needs `libfff_c.dylib` built or installed first.
 
@@ -313,10 +341,48 @@ Before marking this macOS goal complete, update `notes/webview_migration_audit.m
 
 The macOS goal is complete only when:
 
-- `zig build --release=safe -Dbrowser-backend=native_webview` passes on macOS.
-- `zig build test --release=safe -Dbrowser-backend=stub` passes on macOS.
+- `mise run check-mac-webview` passes on macOS.
 - `mise run dev-mac` opens a working WKWebView browser pane by default.
 - The active macOS WKWebView shim is Swift, not Objective-C.
 - `mise run build` creates a macOS package/install without CEF payloads.
 - The macOS parity matrix above passes or any excluded item is explicitly documented and accepted.
 - `notes/webview_migration_audit.md` is updated with concrete evidence.
+
+As of the current audit, the automated gates pass. The remaining unproven items
+are physical/manual input parity:
+
+- real keypress text input after duplicate-input fixes
+- real Command+A/C/V/X in focused WKWebView inputs
+- editing keys in input and textarea
+- modifier click and modifier wheel/trackpad scroll
+- IME/composed text
+- physical inspector Point, Draw Box, and Draw Freeform gestures
+- mouse back/forward buttons if the test device has them, or generated
+  unavailable evidence if it does not
+
+Use `notes/mac-webview-smoke/manual-input-checklist.md` for the final direct
+keyboard/trackpad pass and paste the summary table into
+`notes/webview_migration_audit.md`.
+The shortest guided command is:
+
+```bash
+mise run mac-webview-manual-signoff
+```
+
+Before marking the manual pass complete, run
+`scripts/dev/check-macos-wkwebview-manual-evidence-complete.sh
+notes/mac-webview-smoke/manual-evidence/runs/<timestamp>/*.json` using the
+run-specific evidence directory printed by
+`scripts/dev/run-macos-wkwebview-manual-signoff.sh`; it fails if any summary row
+is `missing` or `fail`. `mise run check-mac-webview-manual` checks the latest
+timestamped evidence run by default. Older root-level JSON files under
+`notes/mac-webview-smoke/manual-evidence/` are legacy debug captures and are
+ignored for final signoff; the required evidence lives under
+`notes/mac-webview-smoke/manual-evidence/runs/<timestamp>/`.
+
+If terminal-based captures show empty page input, check
+`browser.macos_appkit_diagnostics` in `verde live status --json` before changing
+the WKWebView input path. The latest diagnostics prove the WKWebView can be
+attached and first responder while the app is inactive from the terminal's point
+of view (`appActive: false`, `windowIsKey: false`, `windowIsMain: false`), so
+those captures do not prove physical key delivery into WKWebView.
