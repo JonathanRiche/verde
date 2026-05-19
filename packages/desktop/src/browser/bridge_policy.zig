@@ -28,6 +28,15 @@ pub const Policy = struct {
             std.mem.eql(u8, host, "::1");
     }
 
+    pub fn allowsInspector(self: Policy, url: []const u8) bool {
+        if (self.allowsHostMessaging(url)) return true;
+
+        const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
+        const scheme = url[0..scheme_end];
+        return std.ascii.eqlIgnoreCase(scheme, "http") or
+            std.ascii.eqlIgnoreCase(scheme, "https");
+    }
+
     fn hostFromAuthority(authority: []const u8) ?[]const u8 {
         if (authority.len == 0) return null;
         if (authority[0] == '[') {
@@ -57,8 +66,22 @@ test "browser bridge policy allows app and loopback origins only" {
     try std.testing.expect(!policy.allowsHostMessaging("about:blank"));
 }
 
+test "browser bridge policy allows user-triggered inspector on web pages" {
+    const policy: Policy = .{};
+
+    try std.testing.expect(policy.allowsInspector("app://desktop/browser"));
+    try std.testing.expect(policy.allowsInspector("http://localhost:5173"));
+    try std.testing.expect(policy.allowsInspector("https://example.com"));
+    try std.testing.expect(policy.allowsInspector("http://example.com/path"));
+
+    try std.testing.expect(!policy.allowsInspector("data:text/html,<script></script>"));
+    try std.testing.expect(!policy.allowsInspector("file:///tmp/page.html"));
+    try std.testing.expect(!policy.allowsInspector("about:blank"));
+}
+
 test "browser bridge policy can explicitly allow untrusted pages" {
     const policy: Policy = .{ .allow_untrusted = true };
     try std.testing.expect(policy.allowsHostMessaging("https://example.com"));
     try std.testing.expect(policy.allowsHostMessaging("data:text/html,<script></script>"));
+    try std.testing.expect(policy.allowsInspector("data:text/html,<script></script>"));
 }

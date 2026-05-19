@@ -6242,6 +6242,13 @@ pub const AppState = struct {
         }).allowsHostMessaging(page_url);
     }
 
+    fn browserInspectorPolicyAllowsCurrentPage(self: *const AppState) bool {
+        const page_url = if (self.browser_state.current_url) |url| url else self.browser_state.addressInput();
+        return (browser_runtime.BridgePolicy{
+            .allow_untrusted = browserBridgePolicyAllowsUntrustedPages(),
+        }).allowsInspector(page_url);
+    }
+
     fn browserBridgePolicyAllowsUntrustedPages() bool {
         const raw = std.c.getenv("VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE") orelse return false;
         const value = std.mem.trim(u8, std.mem.sliceTo(raw, 0), &std.ascii.whitespace);
@@ -6667,7 +6674,11 @@ pub const AppState = struct {
                     self.runBrowserStartupEvalIfRequested();
                 },
                 .js_message => |message| {
-                    if (!self.browserBridgePolicyAllowsCurrentPage()) {
+                    const inspector_message = isInspectorBridgeMessage(message);
+                    const inspector_message_allowed = inspector_message and
+                        self.browser_state.inspectorEnabled() and
+                        self.browserInspectorPolicyAllowsCurrentPage();
+                    if (!inspector_message_allowed and !self.browserBridgePolicyAllowsCurrentPage()) {
                         const page_url = if (self.browser_state.current_url) |url| url else self.browser_state.addressInput();
                         log.warn("blocked browser bridge message from disallowed page URL: {s}", .{page_url});
                         self.browser_state.setLastError("Browser bridge message rejected by origin policy.") catch {};
@@ -6678,7 +6689,7 @@ pub const AppState = struct {
                         self.handleBrowserClipboardMessage(message);
                         continue;
                     }
-                    if (isInspectorBridgeMessage(message)) {
+                    if (inspector_message) {
                         if (isInspectorHoverMessage(message) or
                             isInspectorLifecycleMessage(message) or
                             isInspectorPromptChangedMessage(message))
@@ -6956,8 +6967,8 @@ pub const AppState = struct {
             self.setSidebarNotice("The browser inspector is not available for this browser backend.");
             return;
         }
-        if (!self.browserBridgePolicyAllowsCurrentPage()) {
-            self.setSidebarNotice("Browser inspector is only available for app and localhost pages.");
+        if (!self.browserInspectorPolicyAllowsCurrentPage()) {
+            self.setSidebarNotice("Browser inspector is only available for app, localhost, and web pages.");
             return;
         }
 
