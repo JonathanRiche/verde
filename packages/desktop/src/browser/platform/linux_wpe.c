@@ -19,7 +19,10 @@
 
 #define VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT 3
 #define VERDE_BROWSER_LINUX_FRAME_BYTES_MAX (4096u * 2160u * 4u)
-#define VERDE_BROWSER_LINUX_FRAME_MIN_INTERVAL_US 16666
+#define VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US 16666
+#define VERDE_BROWSER_LINUX_IDLE_FRAME_MIN_INTERVAL_US 100000
+#define VERDE_BROWSER_LINUX_ACTIVE_AFTER_INPUT_US 400000
+#define VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US 2000000
 
 enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_OPENED = 1,
@@ -73,6 +76,8 @@ struct verde_browser_linux {
     gsize frame_byte_len;
     gboolean frame_dirty;
     gint64 last_frame_published_us;
+    gint64 active_until_us;
+    guint frame_complete_timer_id;
 
     gboolean visible;
     gint target_width;
@@ -82,6 +87,42 @@ struct verde_browser_linux {
 };
 
 int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, int y, int width, int height);
+
+static void verde_browser_linux_mark_active_for(struct verde_browser_linux *browser, gint64 duration_us) {
+    if (browser == NULL) return;
+    const gint64 active_until_us = g_get_monotonic_time() + duration_us;
+    if (active_until_us > browser->active_until_us) browser->active_until_us = active_until_us;
+}
+
+static void verde_browser_linux_mark_active(struct verde_browser_linux *browser) {
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_INPUT_US);
+}
+
+static gint64 verde_browser_linux_frame_min_interval_us(struct verde_browser_linux *browser, gint64 now_us) {
+    if (browser != NULL && now_us <= browser->active_until_us) return VERDE_BROWSER_LINUX_ACTIVE_FRAME_MIN_INTERVAL_US;
+    return VERDE_BROWSER_LINUX_IDLE_FRAME_MIN_INTERVAL_US;
+}
+
+static void verde_browser_linux_dispatch_frame_complete(struct verde_browser_linux *browser) {
+    if (browser == NULL || browser->exportable == NULL) return;
+    wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+}
+
+static gboolean verde_browser_linux_frame_complete_timer(gpointer user_data) {
+    struct verde_browser_linux *browser = user_data;
+    if (browser != NULL) {
+        browser->frame_complete_timer_id = 0;
+        verde_browser_linux_dispatch_frame_complete(browser);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void verde_browser_linux_schedule_frame_complete(struct verde_browser_linux *browser, gint64 delay_us) {
+    if (browser == NULL || browser->frame_complete_timer_id != 0) return;
+    guint delay_ms = (guint)((delay_us + 999) / 1000);
+    if (delay_ms == 0) delay_ms = 1;
+    browser->frame_complete_timer_id = g_timeout_add(delay_ms, verde_browser_linux_frame_complete_timer, browser);
+}
 
 static void verde_browser_linux_queue_event(struct verde_browser_linux *browser, int kind, const char *payload) {
     struct verde_browser_linux_event *event = g_new0(struct verde_browser_linux_event, 1);
@@ -93,6 +134,44 @@ static void verde_browser_linux_queue_event(struct verde_browser_linux *browser,
 static gboolean verde_browser_linux_frame_log_enabled(void) {
     const char *value = getenv("VERDE_BROWSER_FRAME_LOG");
     return value != NULL && strcmp(value, "1") == 0;
+}
+
+static gboolean verde_browser_linux_prefer_dark_scheme_enabled(void) {
+    const char *value = getenv("VERDE_BROWSER_LINUX_WPE_PREFER_DARK");
+    if (value == NULL || value[0] == '\0') return TRUE;
+    return g_ascii_strcasecmp(value, "0") != 0 &&
+        g_ascii_strcasecmp(value, "false") != 0 &&
+        g_ascii_strcasecmp(value, "off") != 0 &&
+        g_ascii_strcasecmp(value, "light") != 0;
+}
+
+static void verde_browser_linux_add_prefer_dark_scheme_script(WebKitUserContentManager *manager) {
+    if (manager == NULL || !verde_browser_linux_prefer_dark_scheme_enabled()) return;
+    WebKitUserScript *scheme_script = webkit_user_script_new(
+        "(function(){"
+        "document.documentElement.style.colorScheme='dark';"
+        "document.documentElement.setAttribute('data-theme','dark');"
+        "document.documentElement.classList.add('dark');"
+        "const originalMatchMedia=window.matchMedia&&window.matchMedia.bind(window);"
+        "if(originalMatchMedia){"
+        "window.matchMedia=function(query){"
+        "const result=originalMatchMedia(query);"
+        "const text=String(query);"
+        "if(text.indexOf('prefers-color-scheme')!==-1){"
+        "const wantsDark=text.indexOf('dark')!==-1;"
+        "try{Object.defineProperty(result,'matches',{value:wantsDark,configurable:true});}catch(e){}"
+        "}"
+        "return result;"
+        "};"
+        "}"
+        "})();",
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+        NULL,
+        NULL
+    );
+    webkit_user_content_manager_add_script(manager, scheme_script);
+    webkit_user_script_unref(scheme_script);
 }
 
 static guint32 verde_browser_linux_now_ms(void) {
@@ -270,14 +349,16 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
     struct verde_browser_linux *browser = data;
     if (browser == NULL || image == NULL) return;
     const gint64 now_us = g_get_monotonic_time();
-    if (browser->last_frame_published_us > 0 && (now_us - browser->last_frame_published_us) < VERDE_BROWSER_LINUX_FRAME_MIN_INTERVAL_US) {
+    const gint64 min_interval_us = verde_browser_linux_frame_min_interval_us(browser, now_us);
+    const gint64 elapsed_us = now_us - browser->last_frame_published_us;
+    if (browser->last_frame_published_us > 0 && elapsed_us < min_interval_us) {
         wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, image);
-        wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+        verde_browser_linux_schedule_frame_complete(browser, min_interval_us - elapsed_us);
         return;
     }
     const gboolean ok = verde_browser_linux_export_egl_image(browser, image);
     wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image(browser->exportable, image);
-    wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+    verde_browser_linux_dispatch_frame_complete(browser);
     if (!ok) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "Failed to import WPE EGL frame.");
         return;
@@ -297,7 +378,7 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
 static void verde_browser_linux_export_shm_buffer(void *data, struct wpe_fdo_shm_exported_buffer *buffer) {
     struct verde_browser_linux *browser = data;
     wpe_view_backend_exportable_fdo_egl_dispatch_release_shm_exported_buffer(browser->exportable, buffer);
-    wpe_view_backend_exportable_fdo_dispatch_frame_complete(browser->exportable);
+    verde_browser_linux_dispatch_frame_complete(browser);
 }
 
 static char *verde_browser_linux_value_to_json_or_string(JSCValue *value) {
@@ -333,6 +414,7 @@ static void verde_browser_linux_on_title_changed(GObject *object, GParamSpec *ps
 static void verde_browser_linux_on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data) {
     struct verde_browser_linux *browser = user_data;
     (void)web_view;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     if (load_event == WEBKIT_LOAD_FINISHED) {
         verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_DOCUMENT_LOADED, NULL);
     }
@@ -445,10 +527,12 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
     browser->content_manager = webkit_web_view_get_user_content_manager(browser->web_view);
     g_object_ref(browser->content_manager);
 
-    WebKitColor background = { 0.0, 0.0, 0.0, 1.0 };
+    WebKitColor background = { 1.0, 1.0, 1.0, 1.0 };
     webkit_web_view_set_background_color(browser->web_view, &background);
     WebKitSettings *settings = webkit_web_view_get_settings(browser->web_view);
     webkit_settings_set_enable_developer_extras(settings, TRUE);
+
+    verde_browser_linux_add_prefer_dark_scheme_script(browser->content_manager);
 
     WebKitUserScript *bridge_script = webkit_user_script_new(
         "(function(){"
@@ -478,6 +562,10 @@ struct verde_browser_linux *verde_browser_linux_create(void) {
 
 void verde_browser_linux_destroy(struct verde_browser_linux *browser) {
     if (browser == NULL) return;
+    if (browser->frame_complete_timer_id != 0) {
+        g_source_remove(browser->frame_complete_timer_id);
+        browser->frame_complete_timer_id = 0;
+    }
     if (browser->content_manager != NULL) {
         webkit_user_content_manager_unregister_script_message_handler(browser->content_manager, "verde", NULL);
         g_object_unref(browser->content_manager);
@@ -510,6 +598,7 @@ int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, do
     const double diff = browser->device_scale > scale ? browser->device_scale - scale : scale - browser->device_scale;
     if (diff <= 0.001) return 1;
     browser->device_scale = scale;
+    verde_browser_linux_mark_active(browser);
     if (browser->view_backend != NULL) {
         wpe_view_backend_dispatch_set_device_scale_factor(browser->view_backend, (float)browser->device_scale);
     }
@@ -518,6 +607,7 @@ int verde_browser_linux_set_device_scale(struct verde_browser_linux *browser, do
 
 int verde_browser_linux_show(struct verde_browser_linux *browser, int width, int height, const char *url) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     if (width > 0 && height > 0) {
         verde_browser_linux_set_bounds(browser, 0, 0, width, height);
     }
@@ -545,6 +635,7 @@ int verde_browser_linux_set_bounds(struct verde_browser_linux *browser, int x, i
     (void)x;
     (void)y;
     if (browser->target_width == width && browser->target_height == height) return 1;
+    verde_browser_linux_mark_active(browser);
     browser->target_width = width;
     browser->target_height = height;
     wpe_view_backend_dispatch_set_size(browser->view_backend, (uint32_t)width, (uint32_t)height);
@@ -557,6 +648,7 @@ int verde_browser_linux_resize(struct verde_browser_linux *browser, int width, i
 
 int verde_browser_linux_navigate(struct verde_browser_linux *browser, const char *url) {
     if (browser == NULL || url == NULL) return 0;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     webkit_web_view_load_uri(browser->web_view, url);
     return 1;
 }
@@ -577,18 +669,21 @@ int verde_browser_linux_post_json(struct verde_browser_linux *browser, const cha
 
 int verde_browser_linux_go_back(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     if (webkit_web_view_can_go_back(browser->web_view)) webkit_web_view_go_back(browser->web_view);
     return 1;
 }
 
 int verde_browser_linux_go_forward(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     if (webkit_web_view_can_go_forward(browser->web_view)) webkit_web_view_go_forward(browser->web_view);
     return 1;
 }
 
 int verde_browser_linux_reload(struct verde_browser_linux *browser) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active_for(browser, VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US);
     webkit_web_view_reload(browser->web_view);
     return 1;
 }
@@ -636,6 +731,7 @@ int verde_browser_linux_poll_frame(struct verde_browser_linux *browser, char **p
 
 int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x, double y, unsigned int modifiers) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active(browser);
     struct wpe_input_pointer_event event = {
         .type = wpe_input_pointer_event_type_motion,
         .time = verde_browser_linux_now_ms(),
@@ -651,6 +747,7 @@ int verde_browser_linux_mouse_move(struct verde_browser_linux *browser, double x
 
 int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double x, double y, unsigned int button, int down, unsigned int modifiers) {
     if (browser == NULL || button == 0) return 0;
+    verde_browser_linux_mark_active(browser);
     const guint32 button_modifier = verde_browser_linux_pointer_button_modifier(button);
     if (down != 0) browser->pointer_modifiers |= button_modifier;
     else browser->pointer_modifiers &= ~button_modifier;
@@ -669,6 +766,7 @@ int verde_browser_linux_mouse_button(struct verde_browser_linux *browser, double
 
 int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double x, double y, double delta_x, double delta_y, unsigned int modifiers) {
     if (browser == NULL) return 0;
+    verde_browser_linux_mark_active(browser);
     struct wpe_input_axis_2d_event event = {
         .base = {
             .type = wpe_input_axis_event_type_motion_smooth | wpe_input_axis_event_type_mask_2d,
@@ -679,8 +777,8 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
             .value = 0,
             .modifiers = verde_browser_linux_encode_modifiers(modifiers) | browser->pointer_modifiers,
         },
-        .x_axis = -delta_x * 96.0,
-        .y_axis = -delta_y * 96.0,
+        .x_axis = delta_x * 96.0,
+        .y_axis = delta_y * 96.0,
     };
     wpe_view_backend_dispatch_axis_event(browser->view_backend, &event.base);
     return 1;
@@ -688,6 +786,7 @@ int verde_browser_linux_mouse_wheel(struct verde_browser_linux *browser, double 
 
 int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned int key_code, int down, unsigned int modifiers) {
     if (browser == NULL || key_code == 0) return 0;
+    verde_browser_linux_mark_active(browser);
     struct wpe_input_keyboard_event event = {
         .time = verde_browser_linux_now_ms(),
         .key_code = key_code,
@@ -701,6 +800,7 @@ int verde_browser_linux_key_input(struct verde_browser_linux *browser, unsigned 
 
 int verde_browser_linux_text_input(struct verde_browser_linux *browser, const char *text, unsigned int modifiers) {
     if (browser == NULL || text == NULL || text[0] == '\0') return 0;
+    verde_browser_linux_mark_active(browser);
     char *escaped = g_strescape(text, NULL);
     char *script = g_strdup_printf(
         "(function(){const text='%s';const el=document.activeElement;if(!el)return false;if(el.isContentEditable){document.execCommand('insertText',false,text);return true;}if(el instanceof HTMLInputElement||el instanceof HTMLTextAreaElement){const start=el.selectionStart??el.value.length;const end=el.selectionEnd??el.value.length;const before=el.value.slice(0,start);const after=el.value.slice(end);el.value=before+text+after;const next=start+text.length;if(el.setSelectionRange)el.setSelectionRange(next,next);el.dispatchEvent(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'}));return true;}return true;})()",

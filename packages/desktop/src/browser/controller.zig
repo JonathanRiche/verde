@@ -365,11 +365,11 @@ pub const Controller = struct {
     }
 
     /// Uploads at most one pending browser frame for this app render tick.
-    pub fn uploadFrame(self: *Controller) void {
-        const backend = if (self.backend) |*backend| backend else return;
+    pub fn uploadFrame(self: *Controller) bool {
+        const backend = if (self.backend) |*backend| backend else return false;
         switch (backend.*) {
-            .native_webview => |*active| active.uploadFrame(),
-            .cef, .stub => {},
+            .native_webview => |*active| return active.uploadFrame(),
+            .cef, .stub => return false,
         }
     }
 

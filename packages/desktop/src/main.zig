@@ -349,11 +349,12 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollSend();
             }
         }.run, .{ &state, &send_needs_render });
+        var browser_needs_render = false;
         recordSpan(&frame_sample, .poll_browser, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollBrowser();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollBrowser();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &browser_needs_render });
         var terminal_needs_render = false;
         recordSpan(&frame_sample, .poll_terminals, struct {
             fn run(app_state: *AppState, changed: *bool) void {
@@ -389,7 +390,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or send_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -902,7 +903,6 @@ fn processOneEvent(
 
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
-        state.isBrowserVisible() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         ui_layout.isSidebarAnimating();
