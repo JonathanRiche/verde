@@ -7467,6 +7467,14 @@ pub const AppState = struct {
         return self.projects.items[self.selected_project_index].workspace_layout.visibleBrowserPaneId();
     }
 
+    pub fn threadIsOpenInTui(self: *const AppState, project_index: usize, thread_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return false;
+        const dock_id = project.threads.items[thread_index].tui_dock_id orelse return false;
+        return project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) != null;
+    }
+
     pub fn currentProjectWorkspaceRoot(self: *const AppState) ?*const WorkspaceNode {
         if (self.projects.items.len == 0) return null;
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;

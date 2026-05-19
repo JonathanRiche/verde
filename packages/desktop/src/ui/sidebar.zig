@@ -488,7 +488,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                     can_sync = th.provider_thread_id != null and !th.isSendPendingForUi();
                     can_archive = !th.isSendPendingForUi();
                     provider = th.provider;
-                    in_tui = th.tui_dock_id != null;
+                    in_tui = state.threadIsOpenInTui(pi, ti);
                 }
             }
             appendSidebarContextMenuRow(.thread_sync, can_sync, "Sync thread");
@@ -759,7 +759,7 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     var tui_title_buf: [72]u8 = undefined;
     const row_label = if (running)
         "Working..."
-    else if (thread.tui_dock_id != null)
+    else if (state.threadIsOpenInTui(project_index, thread_index))
         std.fmt.bufPrint(&tui_title_buf, "TUI: {s}", .{title}) catch title
     else
         title;
