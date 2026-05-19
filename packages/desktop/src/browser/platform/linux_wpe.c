@@ -301,7 +301,7 @@ static gboolean verde_browser_linux_publish_pixels(struct verde_browser_linux *b
         bgra[offset + 0] = rgba[offset + 2];
         bgra[offset + 1] = rgba[offset + 1];
         bgra[offset + 2] = rgba[offset + 0];
-        bgra[offset + 3] = rgba[offset + 3];
+        bgra[offset + 3] = 255;
     }
 
     browser->frame_next_slot = (guint8)((browser->frame_next_slot + 1) % VERDE_BROWSER_LINUX_FRAME_SLOT_COUNT);
