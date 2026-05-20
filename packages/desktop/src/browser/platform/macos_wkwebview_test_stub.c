@@ -8,6 +8,10 @@ void *verde_macos_webview_create(void *ns_window) {
 void verde_macos_app_configure_foreground(void) {
 }
 
+void verde_macos_host_window_order_out(void *ns_window) {
+    (void)ns_window;
+}
+
 void verde_macos_webview_destroy(void *handle) {
     (void)handle;
 }

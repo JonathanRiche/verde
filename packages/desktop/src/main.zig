@@ -1671,6 +1671,7 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
 }
 
 extern fn SDL_HideWindow(window: *sdl.Window) bool;
+extern fn verde_macos_host_window_order_out(ns_window: ?*anyopaque) void;
 
 fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
@@ -1691,6 +1692,7 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     }
     if (builtin.os.tag == .macos) {
         _ = state.browser_state.controller.hide() catch {};
+        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
         _ = SDL_HideWindow(window);
     }
     return false;
