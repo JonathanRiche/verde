@@ -182,6 +182,7 @@ fn mainInner(init: std.process.Init) !void {
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
         macos_launch_close_suppress_until_ms = currentTimeMillis() + MACOS_LAUNCH_CLOSE_SUPPRESS_MS;
+        verde_macos_host_window_install_close_monitor(nativeBrowserHostWindow(window));
     }
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
@@ -333,6 +334,10 @@ fn mainInner(init: std.process.Init) !void {
     var last_framebuffer_width: c_int = 0;
     var last_framebuffer_height: c_int = 0;
     while (running) {
+        if (macosHostWindowRequestedClose(window, &state)) {
+            running = false;
+            break;
+        }
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
         var event_flags = EventFlags{};
@@ -1671,7 +1676,9 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
 }
 
 extern fn SDL_HideWindow(window: *sdl.Window) bool;
+extern fn verde_macos_host_window_install_close_monitor(ns_window: ?*anyopaque) void;
 extern fn verde_macos_host_window_order_out(ns_window: ?*anyopaque) void;
+extern fn verde_macos_host_window_should_close(ns_window: ?*anyopaque) bool;
 
 fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
@@ -1696,6 +1703,17 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         _ = SDL_HideWindow(window);
     }
     return false;
+}
+
+fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
+    if (builtin.os.tag != .macos) return false;
+    const host_window = nativeBrowserHostWindow(window);
+    if (!verde_macos_host_window_should_close(host_window)) return false;
+    _ = state.browser_state.controller.hide() catch {};
+    verde_macos_host_window_order_out(host_window);
+    _ = SDL_HideWindow(window);
+    runtime_log.diagnostic("shutdown requested by macOS close button monitor", .{});
+    return true;
 }
 
 fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keybinds.NativeKeyboardAction) void {
