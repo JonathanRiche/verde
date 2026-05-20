@@ -93,6 +93,22 @@ pub fn build(b: *std.Build) void {
         ),
     });
 
+    const build_provider_bridge = b.addSystemCommand(&.{
+        "bun",
+        "build",
+        "src/providers/provider_bridge.ts",
+        "--target=node",
+        "--outfile",
+    });
+    const provider_bridge_output = build_provider_bridge.addOutputFileArg("provider_bridge.mjs");
+    build_provider_bridge.setCwd(b.path("."));
+    build_provider_bridge.addFileInput(b.path("src/providers/provider_bridge.ts"));
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(
+        provider_bridge_output,
+        .{ .custom = "share/verde" },
+        "provider_bridge.mjs",
+    ).step);
+
     const exe = b.addExecutable(.{
         .name = "verde",
         .root_module = b.createModule(.{

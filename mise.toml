@@ -3,6 +3,10 @@ zig = "0.16.0"
 zls = "0.16.0"
 # zls = "0.15.2"
 
+[tasks.tail]
+description = "Tails the desktop app log file."
+run = "tail -f -n 80 /home/rtg/.local/share/verde/Native/logs/verde.stderr.log"
+
 [tasks.setup]
 description = "Checks desktop build dependencies."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh'"

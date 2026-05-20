@@ -1,22 +1,39 @@
-//! Cursor provider harness backed by the official `@cursor/sdk` TypeScript runtime.
-//!
-//! Cursor's public SDK is TypeScript. Keep this provider as a thin Zig-owned
-//! bridge so Verde uses Cursor's harness, rules, hooks, skills, MCP config, and
-//! model routing as Cursor intends instead of reimplementing that agent loop.
+//! Cursor provider harness backed by Cursor CLI ACP (`agent acp`).
 
 const std = @import("std");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
-const builtin = @import("builtin");
 
-const MAX_BRIDGE_STDOUT_BYTES = 16 * 1024 * 1024;
-const MAX_BRIDGE_STDERR_BYTES = 512 * 1024;
+const DEFAULT_EXECUTABLE = "agent";
+const FALLBACK_EXECUTABLE = "cursor-agent";
 const DEFAULT_MODEL = "composer-2";
-const IMPORT_MESSAGE_LIMIT = 1000;
+const MAX_ACP_LINE_BYTES = 16 * 1024 * 1024;
+const MAX_CURSOR_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+const Mutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Mutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock();
+    }
+};
+
+const ActiveProcessState = struct {
+    mutex: Mutex = .{},
+    child: ?*std.process.Child = null,
+    stdin: ?std.Io.File = null,
+    session_id: ?[]const u8 = null,
+};
+
+var active_process_state: ActiveProcessState = .{};
 
 pub const Config = struct {
-    executable: []const u8 = "node",
+    executable: []const u8 = DEFAULT_EXECUTABLE,
     cwd: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     model: ?[]const u8 = DEFAULT_MODEL,
@@ -27,10 +44,7 @@ pub const Client = struct {
     config: Config,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
-        return .{
-            .allocator = allocator,
-            .config = config,
-        };
+        return .{ .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *Client) void {
@@ -38,29 +52,94 @@ pub const Client = struct {
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
-        const response = self.runBridge(.auth, std.heap.page_allocator, .{}) catch |err| switch (err) {
-            error.CursorSignedOut => return .signed_out,
+        var env_map = try self.cursorEnvMap(self.allocator);
+        defer env_map.deinit();
+
+        const executable = self.resolveExecutable(self.allocator, &env_map) catch |err| switch (err) {
             error.FileNotFound => return .unknown,
             else => return err,
         };
-        defer response.deinit(std.heap.page_allocator);
-        return .signed_in;
+        defer self.allocator.free(executable);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const result = std.process.run(self.allocator, threaded.io(), .{
+            .argv = &.{ executable, "status", "--format", "json" },
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+            .stdout_limit = .limited(MAX_CURSOR_OUTPUT_BYTES),
+            .stderr_limit = .limited(512 * 1024),
+        }) catch |err| switch (err) {
+            error.FileNotFound => return .unknown,
+            else => return err,
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        switch (result.term) {
+            .exited => |code| if (code != 0) return .signed_out,
+            else => return .signed_out,
+        }
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result.stdout, .{}) catch return .unknown;
+        defer parsed.deinit();
+        if (getOptionalObjectBool(parsed.value, "isAuthenticated") orelse false) return .signed_in;
+        if (getOptionalObjectString(parsed.value, "status")) |status| {
+            if (std.mem.eql(u8, status, "authenticated")) return .signed_in;
+        }
+        return .signed_out;
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
-        const response = self.runBridge(.list_threads, allocator, .{}) catch {
-            return allocator.alloc(provider_types.ChatThreadSummary, 0);
-        };
-        defer response.deinit(allocator);
-        return parseThreadSummariesAlloc(allocator, response.items orelse "[]");
+        var acp = try self.spawnAcp(allocator, null);
+        defer acp.deinit();
+
+        var state: ListThreadsState = .{};
+        errdefer state.deinit(allocator);
+
+        try acp.writeLine(try makeInitializeRequestAlloc(allocator, 1));
+        try acp.writeLine(try makeSessionListRequestAlloc(allocator, 2, try self.cwdAbsoluteAlloc(allocator)));
+        try acp.closeStdin();
+
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
+            defer allocator.free(raw_line);
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            if (try handleListThreadsLine(allocator, line, &state)) break;
+        }
+
+        acp.stop();
+        const threads = try state.threads.toOwnedSlice(allocator);
+        state.threads = .empty;
+        return threads;
     }
 
     pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-        const response = self.runBridge(.list_models, allocator, .{}) catch {
-            return staticModelsAlloc(allocator);
-        };
-        defer response.deinit(allocator);
-        return parseModelsAlloc(allocator, response.items orelse "[]") catch staticModelsAlloc(allocator);
+        var env_map = try self.cursorEnvMap(allocator);
+        defer env_map.deinit();
+
+        const executable = self.resolveExecutable(allocator, &env_map) catch return staticModelsAlloc(allocator);
+        defer allocator.free(executable);
+
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const result = std.process.run(allocator, threaded.io(), .{
+            .argv = &.{ executable, "models" },
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
+            .stdout_limit = .limited(MAX_CURSOR_OUTPUT_BYTES),
+            .stderr_limit = .limited(512 * 1024),
+        }) catch return staticModelsAlloc(allocator);
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        switch (result.term) {
+            .exited => |code| if (code != 0) return staticModelsAlloc(allocator),
+            else => return staticModelsAlloc(allocator),
+        }
+        return parseModelsTextAlloc(allocator, result.stdout) catch staticModelsAlloc(allocator);
     }
 
     pub fn readThread(
@@ -68,17 +147,36 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
-        const response = try self.runBridge(.read_thread, allocator, .{
-            .thread_id = thread_id,
-        });
-        defer response.deinit(allocator);
+        var acp = try self.spawnAcp(allocator, null);
+        defer acp.deinit();
 
-        const title = response.title orelse thread_id;
-        const messages = try parseMessagesAlloc(allocator, response.items orelse "[]");
+        const cwd = try self.cwdAbsoluteAlloc(allocator);
+        defer allocator.free(cwd);
+
+        var state: ReadThreadState = .{};
+        errdefer state.deinit(allocator);
+
+        try acp.writeLine(try makeInitializeRequestAlloc(allocator, 1));
+        try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd));
+        try acp.closeStdin();
+
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
+            defer allocator.free(raw_line);
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            if (try handleReadThreadLine(allocator, line, thread_id, &state)) break;
+        }
+
+        acp.stop();
+        const messages = try state.messages.toOwnedSlice(allocator);
+        state.messages = .empty;
+        const title = if (state.title) |title| title else try allocator.dupe(u8, thread_id);
+        state.title = null;
         return .{
             .thread_id = try allocator.dupe(u8, thread_id),
-            .title = try allocator.dupe(u8, title),
-            .updated_at = response.updated_at,
+            .title = title,
             .messages = messages,
         };
     }
@@ -88,31 +186,87 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
-        const bridge_response = try self.runBridge(.send_prompt, allocator, .{
-            .request = request,
-        });
-        defer bridge_response.deinit(allocator);
+        const model_arg = try cursorModelArgAlloc(allocator, request.model orelse self.config.model orelse DEFAULT_MODEL, request.cursor_model_params_json);
+        defer if (model_arg) |arg| allocator.free(arg);
 
-        if (request.on_thread_id) |on_thread_id| {
-            on_thread_id(request.stream_context, bridge_response.thread_id);
+        var acp = try self.spawnAcp(allocator, model_arg);
+        defer acp.deinit();
+
+        const cwd = try self.cwdAbsoluteAllocForRequest(allocator, request);
+        defer allocator.free(cwd);
+
+        var state: SendPromptState = .{};
+        errdefer state.deinit(allocator);
+
+        try acp.writeLine(try makeInitializeRequestAlloc(allocator, 1));
+        if (request.thread_id) |thread_id| {
+            try acp.writeLine(try makeSessionLoadRequestAlloc(allocator, 2, thread_id, cwd));
+        } else {
+            try acp.writeLine(try makeSessionNewRequestAlloc(allocator, 2, cwd));
         }
-        if (bridge_response.run_id) |run_id| {
-            if (request.on_turn_id) |on_turn_id| {
-                on_turn_id(request.stream_context, run_id);
+
+        var read_buffer: [16 * 1024]u8 = undefined;
+        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
+            defer allocator.free(raw_line);
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            const action = try handleSendPromptLine(allocator, line, request, &state, acp.child.stdin);
+            switch (action) {
+                .continue_reading => {},
+                .session_ready => {
+                    if (state.session_id) |session_id| {
+                        registerActiveChild(&acp.child, acp.child.stdin, session_id);
+                        if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
+                        if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
+                        try acp.writeLine(try makePromptRequestAlloc(allocator, 3, session_id, request, state.capabilities.image));
+                    }
+                },
+                .prompt_done => break,
+            }
+            if (request.on_should_stop) |should_stop| {
+                if (should_stop(request.stream_context)) {
+                    if (state.session_id) |session_id| {
+                        try acp.writeLine(try makeCancelNotificationAlloc(allocator, session_id));
+                    }
+                    return error.CodexTurnInterrupted;
+                }
             }
         }
+
+        unregisterActiveChild(&acp.child);
+        try acp.closeStdin();
+        acp.stop();
+
+        const thread_id = state.session_id orelse return error.CursorAcpFailed;
+        state.session_id = null;
+        const reply_text = try state.reply.toOwnedSlice(allocator);
+        state.reply = .empty;
         return .{
-            .thread_id = try allocator.dupe(u8, bridge_response.thread_id),
-            .reply_text = try allocator.dupe(u8, bridge_response.reply_text),
+            .thread_id = thread_id,
+            .reply_text = reply_text,
         };
     }
 
     pub fn interruptThread(self: *Client, request: provider_types.InterruptThreadRequest) !void {
-        const response = try self.runBridge(.interrupt_thread, self.allocator, .{
-            .thread_id = request.thread_id,
-            .turn_id = request.turn_id,
-        });
-        response.deinit(self.allocator);
+        _ = self;
+        active_process_state.mutex.lock();
+        defer active_process_state.mutex.unlock();
+
+        const child = active_process_state.child orelse return;
+        const session_id = active_process_state.session_id orelse return;
+        if (!std.mem.eql(u8, session_id, request.thread_id)) return;
+        if (active_process_state.stdin) |stdin| {
+            const line = try makeCancelNotificationAlloc(std.heap.page_allocator, session_id);
+            defer std.heap.page_allocator.free(line);
+            writeJsonLineToFile(std.heap.page_allocator, stdin, line) catch {
+                var threaded = std.Io.Threaded.init_single_threaded;
+                child.kill(threaded.io());
+            };
+        } else {
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
+        }
     }
 
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
@@ -121,394 +275,1016 @@ pub const Client = struct {
         return error.UnsupportedOperation;
     }
 
-    fn runBridge(
-        self: *Client,
-        command: BridgeCommand,
-        allocator: std.mem.Allocator,
-        input: BridgeInput,
-    ) !BridgeResponse {
-        const request_json = try makeBridgeRequestJsonAlloc(allocator, self.config, command, input);
-        defer allocator.free(request_json);
-        const bridge_cwd = try resolveBridgeCwdAlloc(allocator, self.config.cwd);
-        defer if (bridge_cwd) |path| allocator.free(path);
-
+    fn cursorEnvMap(self: *Client, allocator: std.mem.Allocator) !std.process.Environ.Map {
         var env_map = try process_env.buildAugmentedEnvMap(allocator);
-        defer env_map.deinit();
-        try env_map.put("VERDE_CURSOR_REQUEST", request_json);
-        try addBundledNodeModulesEnv(allocator, &env_map);
+        errdefer env_map.deinit();
         try ensureCursorApiKeyEnv(allocator, self.config, &env_map);
-
-        const executable = try process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, self.config.executable);
-        defer allocator.free(executable);
-
-        if (command == .send_prompt) {
-            runtime_log.diagnostic("cursor.runBridge send_prompt bridge_cwd={s} request_json_len={d}", .{ bridge_cwd orelse "(inherit)", request_json.len });
-            return self.runBridgeStreaming(allocator, input, executable, bridge_cwd, &env_map);
-        }
-
-        var threaded = std.Io.Threaded.init(allocator, .{});
-        defer threaded.deinit();
-
-        const result = try std.process.run(allocator, threaded.io(), .{
-            .argv = &.{ executable, "--input-type=module", "--eval", BRIDGE_SCRIPT },
-            // Keep Node module resolution anchored at Verde's launch cwd; the selected
-            // project is still passed to Cursor through `local.cwd` in the JSON request.
-            .cwd = if (bridge_cwd) |path| .{ .path = path } else .inherit,
-            .environ_map = &env_map,
-            .stdout_limit = .limited(MAX_BRIDGE_STDOUT_BYTES),
-            .stderr_limit = .limited(MAX_BRIDGE_STDERR_BYTES),
-        });
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-
-        return parseBridgeEventsAlloc(allocator, result.stdout, result.term, if (input.request) |request| request else null);
+        return env_map;
     }
 
-    fn runBridgeStreaming(
-        self: *Client,
-        allocator: std.mem.Allocator,
-        input: BridgeInput,
-        executable: []const u8,
-        bridge_cwd: ?[]const u8,
-        env_map: *const std.process.Environ.Map,
-    ) !BridgeResponse {
-        _ = self;
-        var threaded = std.Io.Threaded.init(allocator, .{});
-        defer threaded.deinit();
-        const io = threaded.io();
-        runtime_log.diagnostic("cursor.spawn streaming bridge cwd={s}", .{bridge_cwd orelse "(inherit)"});
-        var child = try std.process.spawn(io, .{
-            .argv = &.{ executable, "--input-type=module", "--eval", BRIDGE_SCRIPT },
-            .cwd = if (bridge_cwd) |path| .{ .path = path } else .inherit,
-            .environ_map = env_map,
-            .stdin = .ignore,
+    fn resolveExecutable(self: *Client, allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+        return resolveCursorExecutableAlloc(allocator, env_map, self.config.executable);
+    }
+
+    fn spawnAcp(self: *Client, allocator: std.mem.Allocator, model_arg: ?[]const u8) !AcpProcess {
+        var env_map = try self.cursorEnvMap(allocator);
+        errdefer env_map.deinit();
+        const executable = try self.resolveExecutable(allocator, &env_map);
+        errdefer allocator.free(executable);
+
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        errdefer threaded.deinit();
+        const argv_with_model = [_][]const u8{ executable, "--model", model_arg orelse "", "acp" };
+        const argv_default = [_][]const u8{ executable, "acp" };
+        var child = try std.process.spawn(threaded.io(), .{
+            .argv = if (model_arg != null) argv_with_model[0..] else argv_default[0..],
+            .stdin = .pipe,
             .stdout = .pipe,
-            .stderr = .ignore,
+            .stderr = .inherit,
+            .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env_map,
         });
-        defer if (child.id != null) child.kill(io);
+        errdefer child.kill(threaded.io());
+        if (child.id) |pid| _ = std.c.setpgid(pid, pid);
 
-        var state: BridgeParseState = .{};
-        errdefer state.deinit(allocator);
+        return .{
+            .allocator = allocator,
+            .threaded = threaded,
+            .child = child,
+            .env_map = env_map,
+            .executable = executable,
+        };
+    }
 
-        var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = child.stdout.?.readerStreaming(io, &read_buffer);
-        while (try reader.interface.takeDelimiter('\n')) |raw_line| {
-            if (try processBridgeLine(allocator, raw_line, if (input.request) |request| request else null, &state)) {
-                break;
-            }
-            if (input.request) |send_request| {
-                if (send_request.on_should_stop) |should_stop| {
-                    if (should_stop(send_request.stream_context)) {
-                        runtime_log.diagnostic("cursor.streaming bridge stopping on shutdown request", .{});
-                        _ = child.kill(io);
-                        child.id = null;
-                        return error.CodexTurnInterrupted;
-                    }
-                }
-            }
-        }
+    fn cwdAbsoluteAlloc(self: *Client, allocator: std.mem.Allocator) ![]u8 {
+        if (self.config.cwd) |cwd| return std.fs.path.resolve(allocator, &.{cwd});
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        return std.process.currentPathAlloc(threaded.io(), allocator);
+    }
 
-        const term = if (child.id != null) try child.wait(io) else std.process.Child.Term{ .exited = 1 };
-        runtime_log.diagnostic("cursor.streaming bridge finished reply_len={d}", .{state.reply.items.len});
-        try finishBridgeResponse(term, state.saw_error);
-        if (state.response.thread_id.len == 0 and state.reply.items.len == 0) {
-            if (state.error_message) |message| {
-                runtime_log.diagnostic("cursor.streaming bridge empty response after error: {s}", .{message});
-            } else {
-                runtime_log.diagnostic("cursor.streaming bridge empty response without final event", .{});
-            }
-        }
-        state.response.reply_text = try state.reply.toOwnedSlice(allocator);
-        state.reply = .empty;
-        const response = state.response;
-        state.response = .{};
-        return response;
+    fn cwdAbsoluteAllocForRequest(self: *Client, allocator: std.mem.Allocator, request: provider_types.SendPromptRequest) ![]u8 {
+        if (request.cwd) |cwd| return std.fs.path.resolve(allocator, &.{cwd});
+        return self.cwdAbsoluteAlloc(allocator);
     }
 };
 
 pub fn shutdownOwnedServer() void {}
 
-fn resolveBridgeCwdAlloc(allocator: std.mem.Allocator, configured_cwd: ?[]const u8) !?[]u8 {
-    if (configured_cwd) |cwd| {
-        if (hasCursorSdkNodeModule(cwd)) return try allocator.dupe(u8, cwd);
+const AcpProcess = struct {
+    allocator: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    child: std.process.Child,
+    env_map: std.process.Environ.Map,
+    executable: []u8,
+    finished: bool = false,
+
+    fn writeLine(self: *AcpProcess, line: []u8) !void {
+        defer self.allocator.free(line);
+        const stdin = self.child.stdin orelse return error.ConnectionClosed;
+        try writeJsonLineToFile(self.allocator, stdin, line);
     }
 
-    const candidates = [_][]const u8{ ".", "..", "../.." };
-    for (candidates) |candidate| {
-        if (hasCursorSdkNodeModule(candidate)) return try allocator.dupe(u8, candidate);
+    fn closeStdin(self: *AcpProcess) !void {
+        if (self.child.stdin) |stdin| {
+            stdin.close(self.threaded.io());
+            self.child.stdin = null;
+        }
+    }
+
+    fn stop(self: *AcpProcess) void {
+        if (self.finished or self.child.id == null) return;
+        self.child.kill(self.threaded.io());
+        self.finished = true;
+        self.child.stdin = null;
+        self.child.stdout = null;
+    }
+
+    fn deinit(self: *AcpProcess) void {
+        unregisterActiveChild(&self.child);
+        if (!self.finished and self.child.id != null) {
+            self.child.kill(self.threaded.io());
+        }
+        if (self.child.stdin) |stdin| stdin.close(self.threaded.io());
+        self.env_map.deinit();
+        self.allocator.free(self.executable);
+        self.threaded.deinit();
+    }
+};
+
+fn registerActiveChild(child: *std.process.Child, stdin: ?std.Io.File, session_id: []const u8) void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    active_process_state.child = child;
+    active_process_state.stdin = stdin;
+    active_process_state.session_id = session_id;
+}
+
+fn unregisterActiveChild(child: *std.process.Child) void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    if (active_process_state.child == child) {
+        active_process_state.child = null;
+        active_process_state.stdin = null;
+        active_process_state.session_id = null;
+    }
+}
+
+fn takeAcpLineAlloc(allocator: std.mem.Allocator, reader: anytype) !?[]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+
+    _ = reader.interface.streamDelimiterLimit(&writer.writer, '\n', .limited(MAX_ACP_LINE_BYTES)) catch |err| switch (err) {
+        error.StreamTooLong => return error.CursorAcpMessageTooLarge,
+        else => return err,
+    };
+    const has_bytes = writer.written().len > 0;
+    _ = reader.interface.discardDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => {
+            if (!has_bytes) {
+                writer.deinit();
+                return null;
+            }
+        },
+        else => return err,
+    };
+    return try writer.toOwnedSlice();
+}
+
+const AcpCapabilities = struct {
+    image: bool = false,
+    load_session: bool = false,
+    list_sessions: bool = false,
+};
+
+const ListThreadsState = struct {
+    saw_initialize: bool = false,
+    threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty,
+
+    fn deinit(self: *ListThreadsState, allocator: std.mem.Allocator) void {
+        for (self.threads.items) |thread| {
+            allocator.free(thread.id);
+            allocator.free(thread.title);
+        }
+        self.threads.deinit(allocator);
+    }
+};
+
+const ReadThreadState = struct {
+    saw_initialize: bool = false,
+    messages: std.ArrayList(provider_types.ChatMessage) = .empty,
+    title: ?[]u8 = null,
+
+    fn deinit(self: *ReadThreadState, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| {
+            allocator.free(message.author);
+            allocator.free(message.body);
+        }
+        self.messages.deinit(allocator);
+        if (self.title) |title| allocator.free(title);
+    }
+};
+
+const SendPromptState = struct {
+    capabilities: AcpCapabilities = .{},
+    session_id: ?[]u8 = null,
+    reply: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *SendPromptState, allocator: std.mem.Allocator) void {
+        if (self.session_id) |session_id| allocator.free(session_id);
+        self.reply.deinit(allocator);
+    }
+};
+
+const SendLineAction = enum {
+    continue_reading,
+    session_ready,
+    prompt_done,
+};
+
+fn handleListThreadsLine(allocator: std.mem.Allocator, line: []const u8, state: *ListThreadsState) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try failIfJsonRpcError(parsed.value);
+    if (responseId(parsed.value)) |id| {
+        if (id == 1) {
+            const capabilities = parseCapabilities(parsed.value);
+            if (!capabilities.list_sessions) return error.UnsupportedOperation;
+            state.saw_initialize = true;
+            return false;
+        }
+        if (id == 2) {
+            try parseSessionListResponse(allocator, parsed.value, &state.threads);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn handleReadThreadLine(allocator: std.mem.Allocator, line: []const u8, thread_id: []const u8, state: *ReadThreadState) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try failIfJsonRpcError(parsed.value);
+    if (responseId(parsed.value)) |id| {
+        if (id == 1) {
+            const capabilities = parseCapabilities(parsed.value);
+            if (!capabilities.load_session) return error.UnsupportedOperation;
+            state.saw_initialize = true;
+            return false;
+        }
+        if (id == 2) {
+            if (state.title == null) state.title = try allocator.dupe(u8, thread_id);
+            return true;
+        }
+    }
+    if (isMethod(parsed.value, "session/update")) {
+        try handleReadSessionUpdate(allocator, parsed.value, state);
+    }
+    return false;
+}
+
+fn handleSendPromptLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    request: provider_types.SendPromptRequest,
+    state: *SendPromptState,
+    stdin: ?std.Io.File,
+) !SendLineAction {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    try failIfJsonRpcError(parsed.value);
+
+    if (responseId(parsed.value)) |id| {
+        if (id == 1) {
+            state.capabilities = parseCapabilities(parsed.value);
+            return .continue_reading;
+        }
+        if (id == 2) {
+            if (state.session_id == null) {
+                const session_id = parseSessionId(parsed.value) orelse request.thread_id orelse return error.CursorAcpFailed;
+                state.session_id = try allocator.dupe(u8, session_id);
+            }
+            return .session_ready;
+        }
+        if (id == 3) return .prompt_done;
+    }
+
+    if (isMethod(parsed.value, "session/request_permission")) {
+        try handlePermissionRequest(allocator, parsed.value, request, stdin);
+        return .continue_reading;
+    }
+    if (isMethod(parsed.value, "session/update")) {
+        try handleLiveSessionUpdate(allocator, parsed.value, request, state);
+        return .continue_reading;
+    }
+    return .continue_reading;
+}
+
+fn makeInitializeRequestAlloc(allocator: std.mem.Allocator, id: i64) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try writeJsonRpcHead(&stringify, id, "initialize");
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("protocolVersion");
+    try stringify.write(1);
+    try stringify.objectField("clientCapabilities");
+    try stringify.beginObject();
+    try stringify.objectField("fs");
+    try stringify.beginObject();
+    try stringify.objectField("readTextFile");
+    try stringify.write(false);
+    try stringify.objectField("writeTextFile");
+    try stringify.write(false);
+    try stringify.endObject();
+    try stringify.objectField("terminal");
+    try stringify.write(false);
+    try stringify.endObject();
+    try stringify.objectField("clientInfo");
+    try stringify.beginObject();
+    try stringify.objectField("name");
+    try stringify.write("verde");
+    try stringify.objectField("version");
+    try stringify.write("0.1.0");
+    try stringify.endObject();
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn makeSessionListRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd_owned: []u8) ![]u8 {
+    defer allocator.free(cwd_owned);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try writeJsonRpcHead(&stringify, id, "session/list");
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("cwd");
+    try stringify.write(cwd_owned);
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn makeSessionNewRequestAlloc(allocator: std.mem.Allocator, id: i64, cwd: []const u8) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/new", null, cwd);
+}
+
+fn makeSessionLoadRequestAlloc(allocator: std.mem.Allocator, id: i64, session_id: []const u8, cwd: []const u8) ![]u8 {
+    return makeSessionSetupRequestAlloc(allocator, id, "session/load", session_id, cwd);
+}
+
+fn makeSessionSetupRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    method: []const u8,
+    session_id: ?[]const u8,
+    cwd: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try writeJsonRpcHead(&stringify, id, method);
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    if (session_id) |sid| {
+        try stringify.objectField("sessionId");
+        try stringify.write(sid);
+    }
+    try stringify.objectField("cwd");
+    try stringify.write(cwd);
+    try stringify.objectField("mcpServers");
+    try stringify.beginArray();
+    try stringify.endArray();
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn makePromptRequestAlloc(
+    allocator: std.mem.Allocator,
+    id: i64,
+    session_id: []const u8,
+    request: provider_types.SendPromptRequest,
+    image_supported: bool,
+) ![]u8 {
+    const images = try collectImageAttachments(allocator, request);
+    defer allocator.free(images);
+    if (images.len > 0 and !image_supported) return error.CursorAttachmentsUnsupported;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try writeJsonRpcHead(&stringify, id, "session/prompt");
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("sessionId");
+    try stringify.write(session_id);
+    try stringify.objectField("prompt");
+    try stringify.beginArray();
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("text");
+    try stringify.objectField("text");
+    try stringify.write(request.prompt);
+    try stringify.endObject();
+    for (images) |image| {
+        try writeImageContentBlock(allocator, &stringify, image);
+    }
+    try stringify.endArray();
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn makeCancelNotificationAlloc(allocator: std.mem.Allocator, session_id: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("jsonrpc");
+    try stringify.write("2.0");
+    try stringify.objectField("method");
+    try stringify.write("session/cancel");
+    try stringify.objectField("params");
+    try stringify.beginObject();
+    try stringify.objectField("sessionId");
+    try stringify.write(session_id);
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn makePermissionResponseAlloc(allocator: std.mem.Allocator, id: i64, option_id: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.beginObject();
+    try stringify.objectField("jsonrpc");
+    try stringify.write("2.0");
+    try stringify.objectField("id");
+    try stringify.write(id);
+    try stringify.objectField("result");
+    try stringify.beginObject();
+    try stringify.objectField("outcome");
+    try stringify.beginObject();
+    try stringify.objectField("outcome");
+    try stringify.write("selected");
+    try stringify.objectField("optionId");
+    try stringify.write(option_id);
+    try stringify.endObject();
+    try stringify.endObject();
+    try stringify.endObject();
+    return writer.toOwnedSlice();
+}
+
+fn writeJsonRpcHead(stringify: *std.json.Stringify, id: i64, method: []const u8) !void {
+    try stringify.objectField("jsonrpc");
+    try stringify.write("2.0");
+    try stringify.objectField("id");
+    try stringify.write(id);
+    try stringify.objectField("method");
+    try stringify.write(method);
+}
+
+fn writeImageContentBlock(allocator: std.mem.Allocator, stringify: *std.json.Stringify, image: provider_types.ImageAttachment) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), image.path, allocator, .limited(20 * 1024 * 1024));
+    defer allocator.free(bytes);
+    const encoded = try encodeBase64Alloc(allocator, bytes);
+    defer allocator.free(encoded);
+
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("image");
+    try stringify.objectField("mimeType");
+    try stringify.write(mimeTypeForPath(image.path));
+    try stringify.objectField("data");
+    try stringify.write(encoded);
+    try stringify.endObject();
+}
+
+fn collectImageAttachments(allocator: std.mem.Allocator, request: provider_types.SendPromptRequest) ![]const provider_types.ImageAttachment {
+    const legacy_count: usize = if (request.image) |legacy|
+        if (containsImagePath(request.images, legacy.path)) 0 else 1
+    else
+        0;
+    const images = try allocator.alloc(provider_types.ImageAttachment, request.images.len + legacy_count);
+    @memcpy(images[0..request.images.len], request.images);
+    if (request.image) |legacy| {
+        if (legacy_count == 1) images[request.images.len] = legacy;
+    }
+    return images;
+}
+
+fn containsImagePath(images: []const provider_types.ImageAttachment, path: []const u8) bool {
+    for (images) |image| {
+        if (std.mem.eql(u8, image.path, path)) return true;
+    }
+    return false;
+}
+
+fn encodeBase64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const size = std.base64.standard.Encoder.calcSize(bytes.len);
+    const out = try allocator.alloc(u8, size);
+    _ = std.base64.standard.Encoder.encode(out, bytes);
+    return out;
+}
+
+fn mimeTypeForPath(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(ext, ".jpg") or std.ascii.eqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(ext, ".gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(ext, ".webp")) return "image/webp";
+    return "image/png";
+}
+
+fn writeJsonLineToFile(allocator: std.mem.Allocator, file: std.Io.File, line: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    var write_buffer: [16 * 1024]u8 = undefined;
+    var writer = file.writer(threaded.io(), &write_buffer);
+    try writer.interface.writeAll(line);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
+fn responseId(value: std.json.Value) ?i64 {
+    return getOptionalObjectInteger(value, "id");
+}
+
+fn isMethod(value: std.json.Value, method: []const u8) bool {
+    const actual = getOptionalObjectString(value, "method") orelse return false;
+    return std.mem.eql(u8, actual, method);
+}
+
+fn failIfJsonRpcError(value: std.json.Value) !void {
+    const error_value = getObjectField(value, "error") orelse return;
+    const message = getOptionalObjectString(error_value, "message") orelse "";
+    if (isAuthError(message)) return error.CursorSignedOut;
+    runtime_log.diagnostic("cursor.acp error: {s}", .{message});
+    return error.CursorAcpFailed;
+}
+
+fn parseCapabilities(value: std.json.Value) AcpCapabilities {
+    const result = getObjectField(value, "result") orelse return .{};
+    const agent = getObjectField(result, "agentCapabilities") orelse return .{};
+    const prompt = getObjectField(agent, "promptCapabilities");
+    const sessions = getObjectField(agent, "sessionCapabilities");
+    return .{
+        .image = if (prompt) |p| getOptionalObjectBool(p, "image") orelse false else false,
+        .load_session = getOptionalObjectBool(agent, "loadSession") orelse false,
+        .list_sessions = if (sessions) |s| getObjectField(s, "list") != null else false,
+    };
+}
+
+fn parseSessionId(value: std.json.Value) ?[]const u8 {
+    const result = getObjectField(value, "result") orelse return null;
+    return getOptionalObjectString(result, "sessionId");
+}
+
+fn parseSessionListResponse(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    threads: *std.ArrayList(provider_types.ChatThreadSummary),
+) !void {
+    const result = getObjectField(value, "result") orelse return;
+    const sessions = getObjectField(result, "sessions") orelse return;
+    if (sessions != .array) return;
+    for (sessions.array.items) |session| {
+        if (session != .object) continue;
+        const id = getOptionalObjectString(session, "sessionId") orelse continue;
+        const title = getOptionalObjectString(session, "title") orelse id;
+        try threads.append(allocator, .{
+            .id = try allocator.dupe(u8, id),
+            .title = try allocator.dupe(u8, title),
+        });
+    }
+}
+
+fn handleReadSessionUpdate(allocator: std.mem.Allocator, value: std.json.Value, state: *ReadThreadState) !void {
+    const update = sessionUpdateObject(value) orelse return;
+    const kind = getOptionalObjectString(update, "sessionUpdate") orelse return;
+    if (std.mem.eql(u8, kind, "session_info_update")) {
+        if (getOptionalObjectString(update, "title")) |title| {
+            if (state.title) |old| allocator.free(old);
+            state.title = try allocator.dupe(u8, title);
+        }
+        return;
+    }
+    const role: provider_types.MessageRole = if (std.mem.eql(u8, kind, "user_message_chunk"))
+        .user
+    else if (std.mem.eql(u8, kind, "agent_message_chunk"))
+        .assistant
+    else
+        return;
+    const text = contentText(update) orelse return;
+    try appendChatMessageChunk(allocator, &state.messages, role, text);
+}
+
+fn handleLiveSessionUpdate(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    request: provider_types.SendPromptRequest,
+    state: *SendPromptState,
+) !void {
+    const update = sessionUpdateObject(value) orelse return;
+    const kind = getOptionalObjectString(update, "sessionUpdate") orelse return;
+    if (std.mem.eql(u8, kind, "agent_message_chunk")) {
+        const text = contentText(update) orelse return;
+        if (text.len == 0) return;
+        try state.reply.appendSlice(allocator, text);
+        if (request.on_stream_delta) |on_stream_delta| {
+            on_stream_delta(request.stream_context, text);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
+        const event = (try cursorToolEventAlloc(allocator, update, kind)) orelse return;
+        defer event.deinit(allocator);
+        if (request.on_stream_event) |on_stream_event| {
+            on_stream_event(request.stream_context, .{ .message = .{ .title = event.title, .body = event.body } });
+        }
+    }
+}
+
+fn handlePermissionRequest(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    request: provider_types.SendPromptRequest,
+    stdin: ?std.Io.File,
+) !void {
+    const id = responseId(value) orelse return;
+    const params = getObjectField(value, "params") orelse value;
+    const title = getOptionalObjectString(params, "title") orelse "Cursor permission request";
+    const body = permissionBody(params);
+    const call_id = getOptionalObjectString(params, "toolCallId") orelse getOptionalObjectString(params, "permissionId") orelse "cursor-tool";
+    const decision = if (request.on_approval_request) |on_approval_request|
+        on_approval_request(request.stream_context, .{
+            .call_id = call_id,
+            .title = title,
+            .body = body,
+        })
+    else
+        .deny;
+    if (stdin) |file| {
+        const option_id = permissionOptionId(params, decision);
+        const response = try makePermissionResponseAlloc(allocator, id, option_id);
+        defer allocator.free(response);
+        try writeJsonLineToFile(allocator, file, response);
+    }
+}
+
+fn permissionOptionId(params: std.json.Value, decision: provider_types.ApprovalDecision) []const u8 {
+    const fallback = if (decision == .approve) "allow-once" else "reject-once";
+    const options = getObjectField(params, "options") orelse return fallback;
+    if (options != .array) return fallback;
+
+    var first: ?[]const u8 = null;
+    for (options.array.items) |option| {
+        if (option != .object) continue;
+        const id = getOptionalObjectString(option, "optionId") orelse getOptionalObjectString(option, "id") orelse continue;
+        if (first == null) first = id;
+        if (decision == .approve) {
+            if (containsAnyIgnoreCase(id, &.{ "allow", "approve", "accept" })) return id;
+        } else {
+            if (containsAnyIgnoreCase(id, &.{ "reject", "deny", "disallow" })) return id;
+        }
+    }
+    return first orelse fallback;
+}
+
+fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
+    }
+    return false;
+}
+
+fn permissionBody(params: std.json.Value) []const u8 {
+    if (getOptionalObjectString(params, "body")) |body| return body;
+    if (getOptionalObjectString(params, "description")) |description| return description;
+    if (getOptionalObjectString(params, "toolCallId")) |tool| return tool;
+    return "";
+}
+
+fn sessionUpdateObject(value: std.json.Value) ?std.json.Value {
+    const params = getObjectField(value, "params") orelse return null;
+    return getObjectField(params, "update");
+}
+
+fn contentText(update: std.json.Value) ?[]const u8 {
+    const content = getObjectField(update, "content") orelse return null;
+    if (content == .object) {
+        return getOptionalObjectString(content, "text");
     }
     return null;
 }
 
-fn hasCursorSdkNodeModule(cwd: []const u8) bool {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const manifest = std.fmt.allocPrint(
-        std.heap.page_allocator,
-        "{s}/node_modules/@cursor/sdk/package.json",
-        .{cwd},
-    ) catch return false;
-    defer std.heap.page_allocator.free(manifest);
-    std.Io.Dir.cwd().access(threaded.io(), manifest, .{}) catch return false;
-    return true;
+const CursorToolEvent = struct {
+    title: []u8,
+    body: []u8,
+
+    fn deinit(self: CursorToolEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.title);
+        allocator.free(self.body);
+    }
+};
+
+fn cursorToolEventAlloc(allocator: std.mem.Allocator, update: std.json.Value, kind: []const u8) !?CursorToolEvent {
+    const title_text = cursorToolTitle(update);
+    const body = try cursorToolBodyAlloc(allocator, update);
+    errdefer if (body) |text| allocator.free(text);
+    const status = getTrimmedObjectString(update, "status");
+
+    if (body) |text| {
+        if (isNoisyCursorToolStatus(text)) {
+            allocator.free(text);
+            return null;
+        }
+        return .{
+            .title = try allocator.dupe(u8, title_text),
+            .body = text,
+        };
+    }
+    if (status) |text| {
+        if (isNoisyCursorToolStatus(text)) return null;
+        return .{
+            .title = try allocator.dupe(u8, title_text),
+            .body = try allocator.dupe(u8, text),
+        };
+    }
+    if (std.mem.eql(u8, kind, "tool_call") and !std.mem.eql(u8, title_text, "Cursor tool")) {
+        return .{
+            .title = try allocator.dupe(u8, title_text),
+            .body = try allocator.dupe(u8, "Started"),
+        };
+    }
+    return null;
 }
 
-const BridgeResponse = struct {
-    thread_id: []u8 = &.{},
-    run_id: ?[]u8 = null,
-    reply_text: []u8 = &.{},
-    title: ?[]u8 = null,
-    items: ?[]u8 = null,
-    updated_at: ?i64 = null,
-
-    fn deinit(self: BridgeResponse, allocator: std.mem.Allocator) void {
-        if (self.thread_id.len > 0) allocator.free(self.thread_id);
-        if (self.run_id) |run_id| allocator.free(run_id);
-        if (self.reply_text.len > 0) allocator.free(self.reply_text);
-        if (self.title) |title| allocator.free(title);
-        if (self.items) |items| allocator.free(items);
+fn cursorToolTitle(update: std.json.Value) []const u8 {
+    if (getTrimmedObjectString(update, "title")) |title| return title;
+    if (getTrimmedObjectString(update, "name")) |name| return name;
+    if (getTrimmedObjectString(update, "toolName")) |tool_name| return tool_name;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        if (getTrimmedObjectString(tool_call, "title")) |title| return title;
+        if (getTrimmedObjectString(tool_call, "name")) |name| return name;
+        if (getTrimmedObjectString(tool_call, "toolName")) |tool_name| return tool_name;
     }
-};
+    return "Cursor tool";
+}
 
-const BridgeParseState = struct {
-    response: BridgeResponse = .{},
-    reply: std.ArrayList(u8) = .empty,
-    saw_error: bool = false,
-    error_message: ?[]u8 = null,
-
-    fn deinit(self: *BridgeParseState, allocator: std.mem.Allocator) void {
-        self.response.deinit(allocator);
-        self.reply.deinit(allocator);
-        if (self.error_message) |message| allocator.free(message);
+fn cursorToolBodyAlloc(allocator: std.mem.Allocator, update: std.json.Value) !?[]u8 {
+    if (getTrimmedObjectString(update, "command")) |command| return try toolBodyWithNameAlloc(allocator, update, command);
+    if (getTrimmedObjectString(update, "body")) |body| return try allocator.dupe(u8, body);
+    if (getTrimmedObjectString(update, "description")) |description| return try allocator.dupe(u8, description);
+    if (try cursorToolStructuredBodyAlloc(allocator, update)) |body| return body;
+    if (getObjectField(update, "toolCall")) |tool_call| {
+        if (getTrimmedObjectString(tool_call, "command")) |command| return try toolBodyWithNameAlloc(allocator, update, command);
+        if (getTrimmedObjectString(tool_call, "body")) |body| return try allocator.dupe(u8, body);
+        if (getTrimmedObjectString(tool_call, "description")) |description| return try allocator.dupe(u8, description);
+        if (try cursorToolStructuredBodyAlloc(allocator, tool_call)) |body| return body;
     }
-};
+    if (contentText(update)) |text| {
+        const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+        if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+    }
+    return null;
+}
 
-const BridgeCommand = enum {
-    auth,
-    list_threads,
-    list_models,
-    read_thread,
-    send_prompt,
-    interrupt_thread,
-};
-
-const BridgeInput = struct {
-    request: ?provider_types.SendPromptRequest = null,
-    thread_id: ?[]const u8 = null,
-    turn_id: ?[]const u8 = null,
-};
-
-fn makeBridgeRequestJsonAlloc(
-    allocator: std.mem.Allocator,
-    config: Config,
-    command: BridgeCommand,
-    input: BridgeInput,
-) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-
-    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
-    try stringify.beginObject();
-    try stringify.objectField("command");
-    try stringify.write(@tagName(command));
-    try stringify.objectField("cwd");
-    try stringify.write(if (input.request) |request| request.cwd orelse config.cwd else config.cwd);
-    try stringify.objectField("model");
-    try stringify.write(if (input.request) |request| request.model orelse config.model orelse DEFAULT_MODEL else config.model orelse DEFAULT_MODEL);
-    try stringify.objectField("modelParams");
-    if (input.request) |request| {
-        if (request.cursor_model_params_json) |params_json| {
-            var parsed_params = try std.json.parseFromSlice(std.json.Value, allocator, params_json, .{});
-            defer parsed_params.deinit();
-            try stringify.write(parsed_params.value);
-        } else {
-            try stringify.write(null);
+fn cursorToolStructuredBodyAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    const field_names = [_][]const u8{ "input", "args", "arguments", "rawInput", "params" };
+    for (field_names) |field_name| {
+        const field = getObjectField(value, field_name) orelse continue;
+        switch (field) {
+            .string => |text| {
+                const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+                if (trimmed.len > 0) return try toolBodyWithNameAlloc(allocator, value, trimmed);
+            },
+            .object, .array => {
+                const json = try jsonValueCompactAlloc(allocator, field);
+                errdefer allocator.free(json);
+                const trimmed = std.mem.trim(u8, json, &std.ascii.whitespace);
+                if (trimmed.len == 0) {
+                    allocator.free(json);
+                    continue;
+                }
+                return try toolBodyWithNameOwnedAlloc(allocator, value, json);
+            },
+            else => {},
         }
-    } else {
-        try stringify.write(null);
     }
-    try stringify.objectField("threadId");
-    try stringify.write(input.thread_id orelse if (input.request) |request| request.thread_id else null);
-    try stringify.objectField("turnId");
-    try stringify.write(input.turn_id);
-    try stringify.objectField("title");
-    try stringify.write(if (input.request) |request| request.thread_title else null);
-    try stringify.objectField("prompt");
-    try stringify.write(if (input.request) |request| request.prompt else null);
-    try stringify.objectField("images");
-    if (input.request) |request| {
-        try writePromptImages(&stringify, request);
-    } else {
-        try stringify.write(null);
-    }
-    try stringify.objectField("limit");
-    try stringify.write(IMPORT_MESSAGE_LIMIT);
-    try stringify.endObject();
+    return null;
+}
 
+fn toolBodyWithNameAlloc(allocator: std.mem.Allocator, update: std.json.Value, body: []const u8) ![]u8 {
+    const title = cursorToolTitle(update);
+    if (std.mem.eql(u8, title, "Cursor tool")) return allocator.dupe(u8, body);
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ title, body });
+}
+
+fn toolBodyWithNameOwnedAlloc(allocator: std.mem.Allocator, update: std.json.Value, body: []u8) ![]u8 {
+    const title = cursorToolTitle(update);
+    if (std.mem.eql(u8, title, "Cursor tool")) return body;
+    defer allocator.free(body);
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ title, body });
+}
+
+fn jsonValueCompactAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try stringify.write(value);
     return writer.toOwnedSlice();
 }
 
-fn writePromptImages(stringify: *std.json.Stringify, request: provider_types.SendPromptRequest) !void {
-    try stringify.beginArray();
-    if (request.image) |image| {
-        try writePromptImage(stringify, image);
-    }
-    for (request.images) |image| {
-        if (request.image) |legacy| {
-            if (std.mem.eql(u8, legacy.path, image.path)) continue;
-        }
-        try writePromptImage(stringify, image);
-    }
-    try stringify.endArray();
+fn getTrimmedObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
+    const text = getOptionalObjectString(value, key) orelse return null;
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    return if (trimmed.len > 0) trimmed else null;
 }
 
-fn writePromptImage(stringify: *std.json.Stringify, image: provider_types.ImageAttachment) !void {
-    try stringify.beginObject();
-    try stringify.objectField("path");
-    try stringify.write(image.path);
-    try stringify.endObject();
+fn isNoisyCursorToolStatus(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    return std.mem.eql(u8, trimmed, "pending") or
+        std.mem.eql(u8, trimmed, "in_progress") or
+        std.mem.eql(u8, trimmed, "completed");
 }
 
-fn parseBridgeEventsAlloc(
+fn appendChatMessageChunk(
     allocator: std.mem.Allocator,
-    payload: []const u8,
-    term: std.process.Child.Term,
-    request: ?provider_types.SendPromptRequest,
-) !BridgeResponse {
-    var state: BridgeParseState = .{};
-    errdefer state.deinit(allocator);
+    messages: *std.ArrayList(provider_types.ChatMessage),
+    role: provider_types.MessageRole,
+    text: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    if (messages.items.len > 0 and messages.items[messages.items.len - 1].role == role) {
+        const old = messages.items[messages.items.len - 1].body;
+        const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ old, text });
+        allocator.free(old);
+        messages.items[messages.items.len - 1].body = combined;
+        return;
+    }
+    try messages.append(allocator, .{
+        .role = role,
+        .author = try allocator.dupe(u8, switch (role) {
+            .user => "You",
+            .assistant => "Cursor",
+            .system => "System",
+        }),
+        .body = try allocator.dupe(u8, trimmed),
+    });
+}
+
+fn parseModelsTextAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ModelInfo {
+    var raw_models: std.ArrayList(RawCursorModel) = .empty;
+    defer raw_models.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, payload, '\n');
-    while (lines.next()) |raw_line| {
-        _ = try processBridgeLine(allocator, raw_line, request, &state);
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or std.mem.eql(u8, line, "Available models")) continue;
+        const sep = std.mem.indexOf(u8, line, " - ") orelse continue;
+        const id = std.mem.trim(u8, line[0..sep], " \t");
+        var name = std.mem.trim(u8, line[sep + 3 ..], " \t");
+        if (std.mem.endsWith(u8, name, " (current)")) name = name[0 .. name.len - " (current)".len];
+        if (std.mem.endsWith(u8, name, " (default)")) name = name[0 .. name.len - " (default)".len];
+        if (id.len == 0 or name.len == 0) continue;
+        try raw_models.append(allocator, .{ .id = id, .name = name });
+    }
+    if (raw_models.items.len == 0) return staticModelsAlloc(allocator);
+
+    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
+    errdefer {
+        for (models.items) |model| model.deinit(allocator);
+        models.deinit(allocator);
     }
 
-    try finishBridgeResponse(term, state.saw_error);
+    const consumed = try allocator.alloc(bool, raw_models.items.len);
+    defer allocator.free(consumed);
+    @memset(consumed, false);
 
-    state.response.reply_text = try state.reply.toOwnedSlice(allocator);
-    state.reply = .empty;
-    const response = state.response;
-    state.response = .{};
-    return response;
+    const pinned = [_][]const u8{ "auto", "composer-2.5", "composer-2" };
+    for (pinned) |id| {
+        _ = try appendCursorModelByBaseId(allocator, raw_models.items, consumed, &models, id);
+    }
+
+    for (raw_models.items, 0..) |raw, index| {
+        if (consumed[index]) continue;
+        if (stripFastSuffix(raw.id)) |base_id| {
+            if (rawModelIndex(raw_models.items, base_id) != null) {
+                _ = try appendCursorModelByBaseId(allocator, raw_models.items, consumed, &models, base_id);
+                continue;
+            }
+        }
+        try appendModel(allocator, &models, raw.id, raw.name, false);
+        consumed[index] = true;
+    }
+    return models.toOwnedSlice(allocator);
 }
 
-fn processBridgeLine(
+const RawCursorModel = struct {
+    id: []const u8,
+    name: []const u8,
+};
+
+fn appendCursorModelByBaseId(
     allocator: std.mem.Allocator,
-    raw_line: []const u8,
-    request: ?provider_types.SendPromptRequest,
-    state: *BridgeParseState,
+    raw_models: []const RawCursorModel,
+    consumed: []bool,
+    models: *std.ArrayList(provider_types.ModelInfo),
+    base_id: []const u8,
 ) !bool {
-    const line = std.mem.trim(u8, raw_line, " \t\r");
-    if (line.len == 0) return false;
+    const fast_id = try std.fmt.allocPrint(allocator, "{s}-fast", .{base_id});
+    defer allocator.free(fast_id);
+    const base_index = rawModelIndex(raw_models, base_id);
+    const fast_index = rawModelIndex(raw_models, fast_id);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-
-    const event_type = getOptionalObjectString(parsed.value, "type") orelse return false;
-    if (std.mem.eql(u8, event_type, "error")) {
-        state.saw_error = true;
-        if (getOptionalObjectString(parsed.value, "message")) |message| {
-            runtime_log.diagnostic("cursor.bridge error: {s}", .{message});
-            if (state.error_message == null) state.error_message = try allocator.dupe(u8, message);
-        }
-        if (isAuthError(getOptionalObjectString(parsed.value, "message"))) return error.CursorSignedOut;
-        return false;
+    if (base_index) |index| {
+        try appendModel(allocator, models, raw_models[index].id, raw_models[index].name, fast_index != null);
+        consumed[index] = true;
+        if (fast_index) |fi| consumed[fi] = true;
+        return true;
     }
-    if (std.mem.eql(u8, event_type, "thread")) {
-        if (state.response.thread_id.len == 0) {
-            const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse return false;
-            state.response.thread_id = try allocator.dupe(u8, thread_id);
-        }
-        if (state.response.title == null) {
-            if (getOptionalObjectString(parsed.value, "title")) |title| state.response.title = try allocator.dupe(u8, title);
-        }
-        state.response.updated_at = getOptionalObjectInteger(parsed.value, "updatedAt") orelse state.response.updated_at;
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "turn")) {
-        if (state.response.run_id == null) {
-            const run_id = getOptionalObjectString(parsed.value, "runId") orelse return false;
-            state.response.run_id = try allocator.dupe(u8, run_id);
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "delta")) {
-        const text = getOptionalObjectString(parsed.value, "text") orelse return false;
-        try state.reply.appendSlice(allocator, text);
-        if (request) |send_request| {
-            if (send_request.on_stream_delta) |on_stream_delta| {
-                on_stream_delta(send_request.stream_context, text);
-            }
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "command")) {
-        const body = getOptionalObjectString(parsed.value, "command") orelse getOptionalObjectString(parsed.value, "body") orelse return false;
-        const failed = getOptionalObjectBool(parsed.value, "failed") orelse false;
-        if (request) |send_request| {
-            if (send_request.on_stream_event) |on_stream_event| {
-                on_stream_event(send_request.stream_context, .{
-                    .message = .{
-                        .title = if (failed) "Command failed" else "Ran command",
-                        .body = body,
-                    },
-                });
-            }
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "debug")) {
-        const name = getOptionalObjectString(parsed.value, "name") orelse "unknown";
-        const value = getOptionalObjectInteger(parsed.value, "value") orelse 0;
-        runtime_log.diagnostic("cursor.bridge debug {s}={d}", .{ name, value });
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "items")) {
-        const json = getObjectField(parsed.value, "items") orelse return false;
-        state.response.items = try std.json.Stringify.valueAlloc(allocator, json, .{ .whitespace = .minified });
-        return false;
-    }
-    if (std.mem.eql(u8, event_type, "final")) {
-        if (getOptionalObjectString(parsed.value, "replyText")) |text| {
-            if (text.len > 0) {
-                state.reply.clearRetainingCapacity();
-                try state.reply.appendSlice(allocator, text);
-            }
-        }
-        if (state.response.thread_id.len == 0) {
-            const thread_id = getOptionalObjectString(parsed.value, "threadId") orelse getOptionalObjectString(parsed.value, "agentId") orelse "";
-            if (thread_id.len > 0) state.response.thread_id = try allocator.dupe(u8, thread_id);
-        }
-        if (state.response.run_id == null) {
-            if (getOptionalObjectString(parsed.value, "runId")) |run_id| state.response.run_id = try allocator.dupe(u8, run_id);
-        }
+    if (fast_index) |index| {
+        try appendModel(allocator, models, raw_models[index].id, raw_models[index].name, false);
+        consumed[index] = true;
         return true;
     }
     return false;
 }
 
-fn finishBridgeResponse(term: std.process.Child.Term, saw_error: bool) !void {
-    if (saw_error) return error.CursorBridgeFailed;
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            return error.CursorBridgeFailed;
-        },
-        else => return error.CursorBridgeFailed,
+fn rawModelIndex(raw_models: []const RawCursorModel, id: []const u8) ?usize {
+    for (raw_models, 0..) |model, index| {
+        if (std.mem.eql(u8, model.id, id)) return index;
     }
+    return null;
 }
 
-fn addBundledNodeModulesEnv(
+fn stripFastSuffix(id: []const u8) ?[]const u8 {
+    return if (std.mem.endsWith(u8, id, "-fast")) id[0 .. id.len - "-fast".len] else null;
+}
+
+fn staticModelsAlloc(allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
+    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
+    errdefer {
+        for (models.items) |model| model.deinit(allocator);
+        models.deinit(allocator);
+    }
+
+    try appendModel(allocator, &models, "auto", "Auto", false);
+    try appendModel(allocator, &models, "composer-2.5", "Composer 2.5", true);
+    try appendModel(allocator, &models, "composer-2", "Composer 2", true);
+    try appendModel(allocator, &models, "gpt-5.5-medium", "GPT-5.5", true);
+    try appendModel(allocator, &models, "gpt-5.4-medium", "GPT-5.4", true);
+    try appendModel(allocator, &models, "claude-opus-4-7-thinking-xhigh", "Claude Opus 4.7 Thinking", true);
+    try appendModel(allocator, &models, "claude-sonnet-4-6", "Claude Sonnet 4.6", false);
+    return models.toOwnedSlice(allocator);
+}
+
+fn appendModel(
     allocator: std.mem.Allocator,
-    env_map: *std.process.Environ.Map,
+    models: *std.ArrayList(provider_types.ModelInfo),
+    id: []const u8,
+    name: []const u8,
+    fast_supported: bool,
 ) !void {
-    const bundled = bundledNodeModulesPathAlloc(allocator) catch return;
-    defer allocator.free(bundled);
+    try models.append(allocator, .{
+        .provider_id = try allocator.dupe(u8, "cursor"),
+        .provider_name = try allocator.dupe(u8, "Cursor"),
+        .model_id = try allocator.dupe(u8, id),
+        .model_name = try allocator.dupe(u8, name),
+        .cursor_fast_supported = fast_supported,
+    });
+}
 
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().access(threaded.io(), bundled, .{}) catch return;
+fn cursorModelArgAlloc(allocator: std.mem.Allocator, model: []const u8, params_json: ?[]const u8) !?[]u8 {
+    const params = params_json orelse return try allocator.dupe(u8, model);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, params, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return try allocator.dupe(u8, model);
 
-    try env_map.put("VERDE_NODE_MODULES", bundled);
+    var fast: ?bool = null;
+    var reasoning: ?[]const u8 = null;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const id = getOptionalObjectString(item, "id") orelse continue;
+        const value = getOptionalObjectString(item, "value") orelse continue;
+        if (std.mem.eql(u8, id, "fast")) {
+            fast = std.mem.eql(u8, value, "true");
+        } else if (std.mem.eql(u8, id, "reasoning") or std.mem.eql(u8, id, "effort")) {
+            reasoning = value;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, model);
+    if (reasoning) |value| {
+        if (!std.mem.eql(u8, value, "medium") and std.mem.indexOf(u8, model, value) == null) {
+            try out.append(allocator, '-');
+            try out.appendSlice(allocator, value);
+        }
+    }
+    if (fast == true and !std.mem.endsWith(u8, out.items, "-fast")) {
+        try out.appendSlice(allocator, "-fast");
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn resolveCursorExecutableAlloc(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    configured: []const u8,
+) ![]u8 {
+    const candidates = [_][]const u8{ configured, DEFAULT_EXECUTABLE, FALLBACK_EXECUTABLE };
+    var tried: [3][]const u8 = .{ "", "", "" };
+    var tried_len: usize = 0;
+    for (candidates) |candidate| {
+        if (candidate.len == 0) continue;
+        var duplicate = false;
+        for (tried[0..tried_len]) |old| {
+            if (std.mem.eql(u8, old, candidate)) duplicate = true;
+        }
+        if (duplicate) continue;
+        tried[tried_len] = candidate;
+        tried_len += 1;
+        return process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, candidate) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied => continue,
+            else => return err,
+        };
+    }
+    runtime_log.diagnostic("cursor CLI not found; install with `curl https://cursor.com/install -fsS | bash`, ensure ~/.local/bin is on PATH, then run `agent login`.", .{});
+    return error.FileNotFound;
 }
 
 fn ensureCursorApiKeyEnv(
@@ -544,10 +1320,7 @@ fn loadCursorApiKeyFromUserEnvFilesAlloc(allocator: std.mem.Allocator) ![]u8 {
     for (candidates) |candidate| {
         const path = try std.fs.path.join(allocator, &.{ home, candidate });
         defer allocator.free(path);
-        const api_key = loadCursorApiKeyFromFileAlloc(allocator, path) catch |err| switch (err) {
-            error.FileNotFound, error.AccessDenied, error.IsDir => continue,
-            else => continue,
-        };
+        const api_key = loadCursorApiKeyFromFileAlloc(allocator, path) catch continue;
         if (api_key.len > 0) return api_key;
         allocator.free(api_key);
     }
@@ -593,42 +1366,6 @@ fn parseCursorApiKeyLine(line: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-fn bundledNodeModulesPathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const exe_path = try selfExePathAlloc(allocator);
-    defer allocator.free(exe_path);
-    const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
-
-    return switch (builtin.os.tag) {
-        .macos => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "node_modules" }),
-        else => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "node_modules" }),
-    };
-}
-
-fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
-            if (len < 0) return error.FileNotFound;
-            return allocator.dupe(u8, buffer[0..@intCast(len)]);
-        },
-        .macos => {
-            var size: u32 = std.fs.max_path_bytes;
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            if (_NSGetExecutablePath(&buffer, &size) != 0) {
-                const dynamic_buffer = try allocator.alloc(u8, size);
-                errdefer allocator.free(dynamic_buffer);
-                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
-                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
-            }
-            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
-        },
-        else => return error.FileNotFound,
-    }
-}
-
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
-
 fn getOptionalObjectString(value: std.json.Value, key: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const field = value.object.get(key) orelse return null;
@@ -659,518 +1396,188 @@ fn getOptionalObjectBool(value: std.json.Value, key: []const u8) ?bool {
     };
 }
 
-fn isAuthError(message: ?[]const u8) bool {
-    const text = message orelse return false;
-    return std.mem.indexOf(u8, text, "API key") != null or
-        std.mem.indexOf(u8, text, "unauthorized") != null or
-        std.mem.indexOf(u8, text, "Authentication") != null;
+fn isAuthError(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "auth") != null or
+        std.mem.indexOf(u8, message, "login") != null or
+        std.mem.indexOf(u8, message, "API key") != null or
+        std.mem.indexOf(u8, message, "unauthorized") != null;
 }
 
-fn parseThreadSummariesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ChatThreadSummary {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+test "makeInitializeRequestAlloc writes ACP initialize JSON-RPC" {
+    const json = try makeInitializeRequestAlloc(std.testing.allocator, 42);
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    if (parsed.value != .array) return allocator.alloc(provider_types.ChatThreadSummary, 0);
+    try std.testing.expectEqual(@as(i64, 42), responseId(parsed.value).?);
+    try std.testing.expectEqualStrings("initialize", getOptionalObjectString(parsed.value, "method").?);
+}
 
+test "makePromptRequestAlloc writes text and image content blocks" {
+    const request = provider_types.SendPromptRequest{ .prompt = "hello" };
+    const json = try makePromptRequestAlloc(std.testing.allocator, 3, "session-1", request, true);
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const params = getObjectField(parsed.value, "params").?;
+    try std.testing.expectEqualStrings("session-1", getOptionalObjectString(params, "sessionId").?);
+    const prompt = getObjectField(params, "prompt").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), prompt.len);
+    try std.testing.expectEqualStrings("text", getOptionalObjectString(prompt[0], "type").?);
+}
+
+test "parseSessionListResponse maps ACP sessions to thread summaries" {
+    const payload =
+        \\{"jsonrpc":"2.0","id":2,"result":{"sessions":[{"sessionId":"s1","cwd":"/tmp","title":"One"},{"sessionId":"s2","cwd":"/tmp"}]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
     var threads: std.ArrayList(provider_types.ChatThreadSummary) = .empty;
-    errdefer {
+    defer {
         for (threads.items) |thread| {
-            allocator.free(thread.id);
-            allocator.free(thread.title);
+            std.testing.allocator.free(thread.id);
+            std.testing.allocator.free(thread.title);
         }
-        threads.deinit(allocator);
+        threads.deinit(std.testing.allocator);
     }
-
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const id = getOptionalObjectString(item, "agentId") orelse getOptionalObjectString(item, "id") orelse continue;
-        const title = getOptionalObjectString(item, "name") orelse
-            getOptionalObjectString(item, "summary") orelse
-            id;
-        try threads.append(allocator, .{
-            .id = try allocator.dupe(u8, id),
-            .title = try allocator.dupe(u8, title),
-        });
-    }
-
-    return threads.toOwnedSlice(allocator);
+    try parseSessionListResponse(std.testing.allocator, parsed.value, &threads);
+    try std.testing.expectEqual(@as(usize, 2), threads.items.len);
+    try std.testing.expectEqualStrings("s1", threads.items[0].id);
+    try std.testing.expectEqualStrings("One", threads.items[0].title);
+    try std.testing.expectEqualStrings("s2", threads.items[1].title);
 }
 
-fn parseModelsAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ModelInfo {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return staticModelsAlloc(allocator);
-
-    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
-    errdefer {
-        for (models.items) |model| model.deinit(allocator);
-        models.deinit(allocator);
-    }
-
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const id = getOptionalObjectString(item, "id") orelse continue;
-        const name = getOptionalObjectString(item, "displayName") orelse id;
-        try appendCursorModelFromJson(allocator, &models, item, id, name);
-    }
-
-    if (models.items.len == 0) return staticModelsAlloc(allocator);
-    return models.toOwnedSlice(allocator);
+test "handleReadSessionUpdate combines consecutive role chunks" {
+    var state: ReadThreadState = .{};
+    defer state.deinit(std.testing.allocator);
+    const one =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hel"}}}}
+    ;
+    const two =
+        \\{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}}
+    ;
+    var parsed_one = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, one, .{});
+    defer parsed_one.deinit();
+    var parsed_two = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, two, .{});
+    defer parsed_two.deinit();
+    try handleReadSessionUpdate(std.testing.allocator, parsed_one.value, &state);
+    try handleReadSessionUpdate(std.testing.allocator, parsed_two.value, &state);
+    try std.testing.expectEqual(@as(usize, 1), state.messages.items.len);
+    try std.testing.expectEqualStrings("hello", state.messages.items[0].body);
 }
 
-fn staticModelsAlloc(allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-    var models: std.ArrayList(provider_types.ModelInfo) = .empty;
-    errdefer {
-        for (models.items) |model| model.deinit(allocator);
-        models.deinit(allocator);
-    }
-
-    try appendModel(allocator, &models, "default", "Auto");
-    try appendModel(allocator, &models, "composer-2.5", "Composer 2.5");
-    try appendModel(allocator, &models, "composer-2", "Composer 2");
-    try appendModel(allocator, &models, "gpt-5.5", "GPT-5.5");
-    try appendModel(allocator, &models, "gpt-5.4", "GPT-5.4");
-    try appendModel(allocator, &models, "claude-opus-4-7", "Claude Opus 4.7");
-    try appendModel(allocator, &models, "claude-sonnet-4-5", "Claude Sonnet 4.5");
-    return models.toOwnedSlice(allocator);
-}
-
-fn appendModel(
-    allocator: std.mem.Allocator,
-    models: *std.ArrayList(provider_types.ModelInfo),
-    id: []const u8,
-    name: []const u8,
-) !void {
-    try models.append(allocator, .{
-        .provider_id = try allocator.dupe(u8, "cursor"),
-        .provider_name = try allocator.dupe(u8, "Cursor"),
-        .model_id = try allocator.dupe(u8, id),
-        .model_name = try allocator.dupe(u8, name),
-    });
-}
-
-fn appendCursorModelFromJson(
-    allocator: std.mem.Allocator,
-    models: *std.ArrayList(provider_types.ModelInfo),
-    item: std.json.Value,
-    id: []const u8,
-    name: []const u8,
-) !void {
-    var fast_supported = false;
-    var reasoning_param_id: ?[]const u8 = null;
-    var reasoning_values: ?[][:0]const u8 = null;
-    var requires_thinking = false;
-
-    if (item.object.get("parameters")) |params_value| {
-        if (params_value == .array) {
-            var effort_values: ?std.json.Value = null;
-            var reasoning_param_values: ?std.json.Value = null;
-            var has_thinking = false;
-            for (params_value.array.items) |param| {
-                if (param != .object) continue;
-                const param_id = getOptionalObjectString(param, "id") orelse continue;
-                if (std.mem.eql(u8, param_id, "fast")) {
-                    fast_supported = true;
-                } else if (std.mem.eql(u8, param_id, "thinking")) {
-                    has_thinking = true;
-                } else if (std.mem.eql(u8, param_id, "reasoning")) {
-                    reasoning_param_values = param.object.get("values");
-                    reasoning_param_id = "reasoning";
-                } else if (std.mem.eql(u8, param_id, "effort")) {
-                    effort_values = param.object.get("values");
-                }
-            }
-            if (reasoning_param_values == null and effort_values != null) {
-                reasoning_param_values = effort_values;
-                reasoning_param_id = "effort";
-                requires_thinking = has_thinking;
-            }
-            if (reasoning_param_values) |values| {
-                reasoning_values = try cursorParamValuesAlloc(allocator, values);
-            }
-        }
-    }
-
-    errdefer if (reasoning_values) |values| {
-        for (values) |value| allocator.free(value);
-        allocator.free(values);
-    };
-
-    try models.append(allocator, .{
-        .provider_id = try allocator.dupe(u8, "cursor"),
-        .provider_name = try allocator.dupe(u8, "Cursor"),
-        .model_id = try allocator.dupe(u8, id),
-        .model_name = try allocator.dupe(u8, name),
-        .cursor_fast_supported = fast_supported,
-        .cursor_reasoning_param_id = if (reasoning_param_id) |param_id| try allocator.dupe(u8, param_id) else null,
-        .cursor_reasoning_values = reasoning_values,
-        .cursor_reasoning_requires_thinking = requires_thinking,
-    });
-}
-
-fn cursorParamValuesAlloc(allocator: std.mem.Allocator, values: std.json.Value) !?[][:0]const u8 {
-    if (values != .array) return null;
-    var out: std.ArrayList([:0]const u8) = .empty;
-    errdefer {
-        for (out.items) |value| allocator.free(value);
-        out.deinit(allocator);
-    }
-    for (values.array.items) |value_obj| {
-        if (value_obj != .object) continue;
-        const value = getOptionalObjectString(value_obj, "value") orelse continue;
-        if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "true")) continue;
-        try out.append(allocator, try allocator.dupeZ(u8, value));
-    }
-    if (out.items.len == 0) {
-        out.deinit(allocator);
-        return null;
-    }
-    return try out.toOwnedSlice(allocator);
-}
-
-fn parseMessagesAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]provider_types.ChatMessage {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
-    defer parsed.deinit();
-    if (parsed.value != .array) return allocator.alloc(provider_types.ChatMessage, 0);
-
-    var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
-    errdefer {
-        for (messages.items) |message| {
-            allocator.free(message.author);
-            allocator.free(message.body);
-        }
-        messages.deinit(allocator);
-    }
-
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const role_text = getOptionalObjectString(item, "role") orelse continue;
-        const body = getOptionalObjectString(item, "text") orelse continue;
-        const trimmed = std.mem.trim(u8, body, &std.ascii.whitespace);
-        if (trimmed.len == 0) continue;
-        const role: provider_types.MessageRole = if (std.mem.eql(u8, role_text, "user"))
-            .user
-        else if (std.mem.eql(u8, role_text, "assistant"))
-            .assistant
-        else
-            .system;
-        try messages.append(allocator, .{
-            .role = role,
-            .author = try allocator.dupe(u8, switch (role) {
-                .user => "You",
-                .assistant => "Cursor",
-                .system => "System",
-            }),
-            .body = try allocator.dupe(u8, trimmed),
-        });
-    }
-
-    return messages.toOwnedSlice(allocator);
-}
-
-const BRIDGE_SCRIPT =
-    \\import { createRequire } from "node:module";
-    \\import { readFile } from "node:fs/promises";
-    \\import { pathToFileURL } from "node:url";
-    \\const fail = (message) => {
-    \\  process.stdout.write(JSON.stringify({ type: "error", message }) + "\n");
-    \\  process.exit(1);
-    \\};
-    \\const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
-    \\const requireFromBundledModules = () => {
-    \\  const root = process.env.VERDE_NODE_MODULES;
-    \\  if (!root) return createRequire(import.meta.url);
-    \\  const normalized = root.replace(/\/+$/, "");
-    \\  return createRequire(pathToFileURL(`${normalized}/package.json`));
-    \\};
-    \\const withTimeout = (promise, ms, label) => new Promise((resolve, reject) => {
-    \\  const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    \\  promise.then((value) => {
-    \\    clearTimeout(timer);
-    \\    resolve(value);
-    \\  }, (error) => {
-    \\    clearTimeout(timer);
-    \\    reject(error);
-    \\  });
-    \\});
-    \\const modelSelection = (id, params) => id ? { id, ...(Array.isArray(params) && params.length ? { params } : {}) } : undefined;
-    \\const mimeTypeForPath = (path) => {
-    \\  const lower = String(path || "").toLowerCase();
-    \\  if (lower.endsWith(".png")) return "image/png";
-    \\  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-    \\  if (lower.endsWith(".webp")) return "image/webp";
-    \\  if (lower.endsWith(".gif")) return "image/gif";
-    \\  return "application/octet-stream";
-    \\};
-    \\const userMessageForInput = async () => {
-    \\  const images = [];
-    \\  for (const image of Array.isArray(input.images) ? input.images : []) {
-    \\    if (!image?.path) continue;
-    \\    const data = await readFile(image.path, { encoding: "base64" });
-    \\    images.push({ data, mimeType: mimeTypeForPath(image.path) });
-    \\  }
-    \\  return images.length ? { text: input.prompt || "", images } : (input.prompt || "");
-    \\};
-    \\const agentOptions = () => ({
-    \\  apiKey: process.env.CURSOR_API_KEY,
-    \\  model: modelSelection(input.model || "composer-2", input.modelParams),
-    \\  name: input.title || undefined,
-    \\  local: { cwd: input.cwd || process.cwd() },
-    \\});
-    \\const textFromContent = (content) =>
-    \\  Array.isArray(content)
-    \\    ? content.filter((part) => part?.type === "text" && typeof part.text === "string").map((part) => part.text).join("")
-    \\    : "";
-    \\const messageText = (message) => {
-    \\  if (typeof message?.text === "string") return message.text;
-    \\  if (typeof message?.content === "string") return message.content;
-    \\  return textFromContent(message?.content);
-    \\};
-    \\const messageRole = (message) => {
-    \\  if (message?.role === "user" || message?.role === "assistant") return message.role;
-    \\  if (message?.type === "user" || message?.type === "assistant") return message.type;
-    \\  return undefined;
-    \\};
-    \\const normalizeMessage = (item) => {
-    \\  const message = item?.message ?? item;
-    \\  const role = messageRole(message);
-    \\  const text = messageText(message);
-    \\  if (!role || !text) return null;
-    \\  return { role, text };
-    \\};
-    \\const agentId = (agent) => agent?.agentId || agent?.id;
-    \\const titleOf = (item) => item?.name || item?.summary || item?.agentId || item?.id || "";
-    \\
-    \\let input;
-    \\try {
-    \\  input = JSON.parse(process.env.VERDE_CURSOR_REQUEST || "{}");
-    \\} catch (error) {
-    \\  fail(`invalid request: ${error?.message || error}`);
-    \\}
-    \\
-    \\try {
-    \\  const require = requireFromBundledModules();
-    \\  const sdkModule = await import(require.resolve("@cursor/sdk"));
-    \\  const sdk = sdkModule.Agent ? sdkModule : (sdkModule.default || sdkModule);
-    \\  const { Agent, Cursor } = sdk;
-    \\  if (input.command === "auth") {
-    \\    await Cursor.me({ apiKey: process.env.CURSOR_API_KEY });
-    \\    emit({ type: "ok" });
-    \\  } else if (input.command === "list_models") {
-    \\    const models = await withTimeout(Cursor.models.list({ apiKey: process.env.CURSOR_API_KEY }), 5000, "Cursor model discovery");
-    \\    emit({ type: "items", items: models });
-    \\  } else if (input.command === "list_threads") {
-    \\    const result = await Agent.list({ runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 100 });
-    \\    emit({ type: "items", items: result.items });
-    \\  } else if (input.command === "read_thread") {
-    \\    if (!input.threadId) fail("threadId is required");
-    \\    const info = await Agent.get(input.threadId, { cwd: input.cwd || process.cwd(), apiKey: process.env.CURSOR_API_KEY });
-    \\    emit({ type: "thread", threadId: input.threadId, title: titleOf(info), updatedAt: info?.lastModified || null });
-    \\    const messages = await Agent.messages.list(input.threadId, { runtime: "local", cwd: input.cwd || process.cwd(), limit: input.limit || 1000 });
-    \\    emit({ type: "items", items: (Array.isArray(messages) ? messages : messages?.items || []).map(normalizeMessage).filter(Boolean) });
-    \\  } else if (input.command === "interrupt_thread") {
-    \\    if (!input.threadId || !input.turnId) fail("threadId and turnId are required");
-    \\    const run = await Agent.getRun(input.turnId, { runtime: "local", cwd: input.cwd || process.cwd(), agentId: input.threadId, apiKey: process.env.CURSOR_API_KEY });
-    \\    await run.cancel();
-    \\    emit({ type: "ok" });
-    \\  } else if (input.command === "send_prompt") {
-    \\  const agent = input.threadId
-    \\    ? await Agent.resume(input.threadId, agentOptions())
-    \\    : await Agent.create(agentOptions());
-    \\  emit({ type: "thread", threadId: agentId(agent), title: input.title || agentId(agent) });
-    \\  const run = await agent.send(await userMessageForInput(), { model: modelSelection(input.model || "composer-2", input.modelParams), local: { force: true } });
-    \\  emit({ type: "turn", runId: run.id });
-    \\  let deltaCount = 0;
-    \\  for await (const event of run.stream()) {
-    \\    if (event?.type === "assistant") {
-    \\      const content = Array.isArray(event.message?.content) ? event.message.content : [];
-    \\      const text = content
-    \\        .filter((block) => block?.type === "text" && typeof block.text === "string")
-    \\        .map((block) => block.text)
-    \\        .join("");
-    \\      if (!text) continue;
-    \\      deltaCount += 1;
-    \\      emit({ type: "delta", text });
-    \\      continue;
-    \\    }
-    \\    if (event?.type === "text-delta") {
-    \\      const text = typeof event.text === "string" ? event.text : "";
-    \\      if (!text) continue;
-    \\      deltaCount += 1;
-    \\      emit({ type: "delta", text });
-    \\      continue;
-    \\    }
-    \\    if (event?.type === "tool_call" && event.name) {
-    \\      emit({ type: "command", command: `${event.name} ${JSON.stringify(event.args ?? {})}`, failed: event.status === "error" });
-    \\    }
-    \\  }
-    \\  const result = await run.wait();
-    \\  emit({ type: "debug", name: "deltaCount", value: deltaCount });
-    \\  emit({ type: "final", threadId: agentId(agent) || run.agentId, runId: run.id, replyText: "" });
-    \\  } else {
-    \\    fail(`unsupported command: ${input.command}`);
-    \\  }
-    \\} catch (error) {
-    \\  fail(error?.stack || error?.message || String(error));
-    \\}
-;
-
-test "parseBridgeEventsAlloc reads cursor ids and reply" {
+test "cursorToolEvent suppresses status-only ACP tool updates" {
     const payload =
-        \\{"type":"thread","threadId":"agent_123"}
-        \\{"type":"turn","runId":"run_456"}
-        \\{"type":"delta","text":"do"}
-        \\{"type":"delta","text":"ne"}
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"in_progress"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update");
+    try std.testing.expect(event == null);
+}
+
+test "cursorToolEvent keeps meaningful ACP tool text" {
+    const payload =
+        \\{"sessionUpdate":"tool_call","title":"Shell","command":"git status --short","status":"pending"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Shell", event.title);
+    try std.testing.expectEqualStrings("Shell: git status --short", event.body);
+}
+
+test "cursorToolEvent keeps non-lifecycle status failures" {
+    const payload =
+        \\{"sessionUpdate":"tool_call_update","toolName":"edit","status":"failed"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call_update")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("edit", event.title);
+    try std.testing.expectEqualStrings("failed", event.body);
+}
+
+test "cursorToolEvent shows tool call starts with structured input" {
+    const payload =
+        \\{"sessionUpdate":"tool_call","toolName":"Read","input":{"path":"/tmp/a.txt"},"status":"pending"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    const event = (try cursorToolEventAlloc(std.testing.allocator, parsed.value, "tool_call")).?;
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Read", event.title);
+    try std.testing.expectEqualStrings("Read: {\"path\":\"/tmp/a.txt\"}", event.body);
+}
+
+test "handleSendPromptLine accepts session/load response without sessionId" {
+    var state: SendPromptState = .{};
+    defer state.deinit(std.testing.allocator);
+    const request = provider_types.SendPromptRequest{
+        .thread_id = "existing-session",
+        .prompt = "continue",
+    };
+    const line =
+        \\{"jsonrpc":"2.0","id":2,"result":{"models":{"currentModelId":"composer-2[fast=true]"}}}
+    ;
+    const action = try handleSendPromptLine(std.testing.allocator, line, request, &state, null);
+    try std.testing.expectEqual(SendLineAction.session_ready, action);
+    try std.testing.expectEqualStrings("existing-session", state.session_id.?);
+}
+
+test "makePermissionResponseAlloc writes selected ACP option id" {
+    const approve = try makePermissionResponseAlloc(std.testing.allocator, 9, "allow-always");
+    defer std.testing.allocator.free(approve);
+    const deny = try makePermissionResponseAlloc(std.testing.allocator, 10, "reject-once");
+    defer std.testing.allocator.free(deny);
+    try std.testing.expect(std.mem.indexOf(u8, approve, "allow-always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deny, "reject-once") != null);
+}
+
+test "permissionOptionId chooses matching ACP request options" {
+    const payload =
+        \\{"options":[{"optionId":"reject-once"},{"optionId":"allow-once"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("allow-once", permissionOptionId(parsed.value, .approve));
+    try std.testing.expectEqualStrings("reject-once", permissionOptionId(parsed.value, .deny));
+}
+
+test "resolveCursorExecutableAlloc falls back to cursor-agent after configured command" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("PATH", "/definitely/missing");
+    try std.testing.expectError(error.FileNotFound, resolveCursorExecutableAlloc(std.testing.allocator, &env_map, "missing-agent"));
+}
+
+test "cursorModelArgAlloc folds legacy SDK params into CLI model id" {
+    const params =
+        \\[{"id":"reasoning","value":"high"},{"id":"fast","value":"true"}]
+    ;
+    const arg = try cursorModelArgAlloc(std.testing.allocator, "gpt-5.5", params);
+    defer std.testing.allocator.free(arg.?);
+    try std.testing.expectEqualStrings("gpt-5.5-high-fast", arg.?);
+}
+
+test "parseModelsTextAlloc reads Cursor CLI model output" {
+    const output =
+        \\Available models
+        \\
+        \\composer-2-fast - Composer 2 Fast
+        \\composer-2 - Composer 2 (current)
+        \\gpt-5.3-codex - Codex 5.3
+        \\composer-2.5 - Composer 2.5
+        \\composer-2.5-fast - Composer 2.5 Fast (default)
         \\
     ;
-    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null);
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("agent_123", parsed.thread_id);
-    try std.testing.expectEqualStrings("run_456", parsed.run_id.?);
-    try std.testing.expectEqualStrings("done", parsed.reply_text);
-}
-
-test "parseBridgeEventsAlloc keeps streamed reply when final reply is empty" {
-    const payload =
-        \\{"type":"thread","threadId":"agent_123"}
-        \\{"type":"turn","runId":"run_456"}
-        \\{"type":"delta","text":"streamed"}
-        \\{"type":"final","threadId":"agent_123","runId":"run_456","replyText":""}
-        \\
-    ;
-    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null);
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("agent_123", parsed.thread_id);
-    try std.testing.expectEqualStrings("run_456", parsed.run_id.?);
-    try std.testing.expectEqualStrings("streamed", parsed.reply_text);
-}
-
-test "makeBridgeRequestJsonAlloc keeps cursor model and cwd" {
-    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
-        .request = .{
-            .prompt = "hello",
-            .cwd = "/tmp/project",
-            .model = "composer-2",
-        },
-    });
-    defer std.testing.allocator.free(json);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("hello", getOptionalObjectString(parsed.value, "prompt").?);
-    try std.testing.expectEqualStrings("/tmp/project", getOptionalObjectString(parsed.value, "cwd").?);
-    try std.testing.expectEqualStrings("composer-2", getOptionalObjectString(parsed.value, "model").?);
-    try std.testing.expectEqualStrings("send_prompt", getOptionalObjectString(parsed.value, "command").?);
-}
-
-test "makeBridgeRequestJsonAlloc maps legacy and multi image requests" {
-    const images = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/one.png" },
-        .{ .path = "/tmp/two.png" },
-    };
-
-    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
-        .request = .{
-            .prompt = "see attached",
-            .image = .{ .path = "/tmp/legacy.png" },
-            .images = images[0..],
-        },
-    });
-    defer std.testing.allocator.free(json);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-
-    const image_values = getObjectField(parsed.value, "images").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), image_values.len);
-    try std.testing.expectEqualStrings("/tmp/legacy.png", getOptionalObjectString(image_values[0], "path").?);
-    try std.testing.expectEqualStrings("/tmp/one.png", getOptionalObjectString(image_values[1], "path").?);
-    try std.testing.expectEqualStrings("/tmp/two.png", getOptionalObjectString(image_values[2], "path").?);
-}
-
-test "makeBridgeRequestJsonAlloc does not duplicate legacy image already in images" {
-    const images = [_]provider_types.ImageAttachment{
-        .{ .path = "/tmp/one.png" },
-        .{ .path = "/tmp/two.png" },
-    };
-
-    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
-        .request = .{
-            .prompt = "see attached",
-            .image = .{ .path = "/tmp/one.png" },
-            .images = images[0..],
-        },
-    });
-    defer std.testing.allocator.free(json);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-
-    const image_values = getObjectField(parsed.value, "images").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), image_values.len);
-    try std.testing.expectEqualStrings("/tmp/one.png", getOptionalObjectString(image_values[0], "path").?);
-    try std.testing.expectEqualStrings("/tmp/two.png", getOptionalObjectString(image_values[1], "path").?);
-}
-
-test "makeBridgeRequestJsonAlloc preserves text-only prompts with empty images" {
-    const json = try makeBridgeRequestJsonAlloc(std.testing.allocator, .{}, .send_prompt, .{
-        .request = .{
-            .prompt = "text only",
-            .cwd = "/tmp/project",
-        },
-    });
-    defer std.testing.allocator.free(json);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-    defer parsed.deinit();
-
-    try std.testing.expectEqualStrings("text only", getOptionalObjectString(parsed.value, "prompt").?);
-    try std.testing.expectEqual(@as(usize, 0), getObjectField(parsed.value, "images").?.array.items.len);
-}
-
-test "parseBridgeEventsAlloc maps command events to stream events" {
-    const Context = struct {
-        title: []const u8 = "",
-        body: []const u8 = "",
-
-        fn onEvent(raw: ?*anyopaque, event: provider_types.StreamEvent) void {
-            const ctx: *@This() = @ptrCast(@alignCast(raw orelse return));
-            switch (event) {
-                .message => |message| {
-                    ctx.title = message.title;
-                    ctx.body = message.body;
-                },
-                .diff => {},
-            }
-        }
-    };
-
-    var ctx: Context = .{};
-    const payload =
-        \\{"type":"thread","threadId":"agent_123"}
-        \\{"type":"command","command":"bash -lc zig build test","failed":true}
-        \\
-    ;
-    const parsed = try parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, .{
-        .prompt = "hello",
-        .stream_context = &ctx,
-        .on_stream_event = Context.onEvent,
-    });
-    defer parsed.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("Command failed", ctx.title);
-    try std.testing.expectEqualStrings("bash -lc zig build test", ctx.body);
-}
-
-test "parseBridgeEventsAlloc fails when bridge emits an error" {
-    const payload =
-        \\{"type":"error","message":"UnknownAgentError: already has active run"}
-        \\
-    ;
-    try std.testing.expectError(
-        error.CursorBridgeFailed,
-        parseBridgeEventsAlloc(std.testing.allocator, payload, .{ .exited = 0 }, null),
-    );
+    const models = try parseModelsTextAlloc(std.testing.allocator, output);
+    defer provider_types.freeModelInfos(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("composer-2.5", models[0].model_id);
+    try std.testing.expect(models[0].cursor_fast_supported);
+    try std.testing.expectEqualStrings("composer-2", models[1].model_id);
+    try std.testing.expect(models[1].cursor_fast_supported);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", models[2].model_id);
 }

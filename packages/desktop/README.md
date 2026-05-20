@@ -10,7 +10,7 @@ This package contains Verde's standalone Zig desktop app. It uses SDL3, SDL_GPU,
   - Codex: `codex` on your `PATH` and `codex login`
   - Claude Code: Claude Code installed and logged in locally; Verde talks to it through Anthropic's Claude Agent SDK
   - OpenCode: `opencode` on your `PATH`
-  - Cursor: `CURSOR_API_KEY` set in the environment used to launch Verde
+  - Cursor: Cursor CLI `agent` on your `PATH` and `agent login`, or `CURSOR_API_KEY` for headless environments
 
 ## Development
 
@@ -96,7 +96,7 @@ The desktop app talks to local provider runtimes rather than a hosted Verde back
 - Codex uses the local `codex` CLI and starts `codex app-server` automatically when needed.
 - Claude Code uses Anthropic's Claude Agent SDK and requires Claude Code to be installed and logged in on your machine.
 - OpenCode uses the local `opencode` CLI and can start `opencode serve` automatically when needed.
-- Cursor uses `@cursor/sdk` and requires `CURSOR_API_KEY`.
+- Cursor uses the local Cursor CLI ACP server (`agent acp`) and requires `agent login` or `CURSOR_API_KEY`.
 
 Requests run against the project directory selected in Verde. If prompt sending fails, check that the selected provider is installed, available to Verde's launch environment, and authenticated.
 
@@ -195,13 +195,12 @@ Third-party Zig dependencies are declared in [`build.zig.zon`](build.zig.zon):
 - `zig_markdown`
 - `ghostty`
 
-The repo also uses `@anthropic-ai/claude-agent-sdk` and `@cursor/sdk` from the root npm package for Claude Code and Cursor provider integration.
+The repo also uses `@anthropic-ai/claude-agent-sdk` from the root npm package for Claude Code provider integration.
 
 ## Third-Party Attribution
 
 Main upstream components used by the desktop app:
 
-- `@cursor/sdk` for Cursor provider integration.
 - `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for project-scoped file indexing and composer file search, vendored in [`../../vendor/fff`](../../vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.

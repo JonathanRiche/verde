@@ -113,10 +113,9 @@ EOF
 if [[ -e "$SCRIPT_DIR/share/verde/VERSION" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/VERSION" "$PREFIX/share/verde/VERSION"
 fi
-if [[ -d "$SCRIPT_DIR/share/verde/node_modules" ]]; then
-  rm -rf "$PREFIX/share/verde/node_modules"
-  mkdir -p "$PREFIX/share/verde/node_modules"
-  cp -a "$SCRIPT_DIR/share/verde/node_modules/." "$PREFIX/share/verde/node_modules/"
+rm -rf "$PREFIX/share/verde/node_modules"
+if [[ -e "$SCRIPT_DIR/share/verde/provider_bridge.mjs" ]]; then
+  install -m 644 "$SCRIPT_DIR/share/verde/provider_bridge.mjs" "$PREFIX/share/verde/provider_bridge.mjs"
 fi
 assert_no_cef_payload "$PREFIX"
 

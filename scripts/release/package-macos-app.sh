@@ -78,19 +78,6 @@ set_macos_build_version() {
   chmod 755 "$binary"
 }
 
-copy_node_runtime() {
-  local destination_dir="$1"
-  local source_dir="$REPO_ROOT/node_modules"
-
-  if [[ ! -d "$source_dir/@cursor/sdk" ]]; then
-    echo "missing Cursor SDK runtime dependencies; run bun install --production before packaging" >&2
-    exit 1
-  fi
-
-  mkdir -p "$destination_dir"
-  cp -a "$source_dir/." "$destination_dir/"
-}
-
 assert_no_cef_payload() {
   local app_dir="$1"
   local macos_dir="$app_dir/Contents/MacOS"
@@ -170,7 +157,11 @@ if [[ "$BROWSER_BACKEND" == "cef" ]]; then
   fi
 fi
 assert_no_cef_payload "$APP_DIR"
-copy_node_runtime "$APP_DIR/Contents/Resources/node_modules"
+install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/Resources/provider_bridge.mjs"
+if [[ -e "$APP_DIR/Contents/Resources/node_modules" ]]; then
+  echo "app unexpectedly contains Contents/Resources/node_modules" >&2
+  exit 1
+fi
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF

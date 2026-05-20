@@ -6,7 +6,6 @@ const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
 
-const BRIDGE_SOURCE = @embedFile("claude_bridge.mjs");
 const MAX_BRIDGE_LINE_BYTES = 8 * 1024 * 1024;
 
 const Mutex = struct {
@@ -48,7 +47,7 @@ pub const Client = struct {
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
-        var response = try self.runBridge(.{ .command = "auth", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .provider = "claude", .command = "auth", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return .unknown;
@@ -59,7 +58,7 @@ pub const Client = struct {
     }
 
     pub fn listThreads(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ChatThreadSummary {
-        var response = try self.runBridge(.{ .command = "list_threads", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .provider = "claude", .command = "list_threads", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return allocator.alloc(provider_types.ChatThreadSummary, 0);
@@ -81,7 +80,7 @@ pub const Client = struct {
     }
 
     pub fn listModels(self: *Client, allocator: std.mem.Allocator) ![]provider_types.ModelInfo {
-        var response = try self.runBridge(.{ .command = "list_models", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
+        var response = try self.runBridge(.{ .provider = "claude", .command = "list_models", .cwd = self.config.cwd, .claude_executable = self.config.claude_executable }, null);
         defer response.deinit(self.allocator);
 
         const result = response.result orelse return allocator.alloc(provider_types.ModelInfo, 0);
@@ -118,6 +117,7 @@ pub const Client = struct {
         thread_id: []const u8,
     ) !provider_types.ReadThreadResult {
         var response = try self.runBridge(.{
+            .provider = "claude",
             .command = "read_thread",
             .cwd = self.config.cwd,
             .thread_id = thread_id,
@@ -171,6 +171,7 @@ pub const Client = struct {
         defer allocator.free(image_attachments);
 
         const bridge_request = BridgeSendPromptRequest{
+            .provider = "claude",
             .command = "send_prompt",
             .thread_id = request.thread_id,
             .prompt = request.prompt,
@@ -223,12 +224,11 @@ pub const Client = struct {
     fn runBridge(self: *Client, payload: anytype, stream_request: ?provider_types.SendPromptRequest) !BridgeResponse {
         var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
         defer env_map.deinit();
-        try addBundledNodeModulesEnv(self.allocator, &env_map);
 
         const executable = try process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, self.config.executable);
         defer self.allocator.free(executable);
 
-        const bridge_path = try writeBridgeFile(self.allocator);
+        const bridge_path = try providerBridgePathAlloc(self.allocator);
         defer self.allocator.free(bridge_path);
 
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
@@ -410,6 +410,7 @@ const BridgeResponse = struct {
 };
 
 const BridgeSendPromptRequest = struct {
+    provider: []const u8,
     command: []const u8,
     thread_id: ?[]const u8 = null,
     prompt: []const u8,
@@ -445,55 +446,30 @@ fn containsImagePath(images: []const provider_types.ImageAttachment, path: []con
     return false;
 }
 
-fn writeBridgeFile(allocator: std.mem.Allocator) ![]u8 {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const root = tempRoot();
-    const dir_path = try std.fs.path.join(allocator, &.{ root, "verde" });
-    defer allocator.free(dir_path);
-    try std.Io.Dir.cwd().createDirPath(threaded.io(), dir_path);
-
-    const path = try std.fs.path.join(allocator, &.{ dir_path, "verde-claude-agent-sdk-bridge.mjs" });
-    errdefer allocator.free(path);
-
-    const file = try std.Io.Dir.createFileAbsolute(threaded.io(), path, .{ .truncate = true });
-    defer file.close(threaded.io());
-    var write_buffer: [16 * 1024]u8 = undefined;
-    var writer = file.writer(threaded.io(), &write_buffer);
-    try writer.interface.writeAll(BRIDGE_SOURCE);
-    try writer.interface.flush();
-    return path;
-}
-
-fn tempRoot() []const u8 {
-    if (std.c.getenv("TMPDIR")) |value| return std.mem.sliceTo(value, 0);
-    if (std.c.getenv("TMP")) |value| return std.mem.sliceTo(value, 0);
-    if (std.c.getenv("TEMP")) |value| return std.mem.sliceTo(value, 0);
-    return "/tmp";
-}
-
-fn addBundledNodeModulesEnv(
-    allocator: std.mem.Allocator,
-    env_map: *std.process.Environ.Map,
-) !void {
-    const bundled = bundledNodeModulesPathAlloc(allocator) catch return;
-    defer allocator.free(bundled);
-
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().access(threaded.io(), bundled, .{}) catch return;
-
-    try env_map.put("VERDE_NODE_MODULES", bundled);
-}
-
-fn bundledNodeModulesPathAlloc(allocator: std.mem.Allocator) ![]u8 {
+fn providerBridgePathAlloc(allocator: std.mem.Allocator) ![]u8 {
     const exe_path = try selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
 
-    return switch (builtin.os.tag) {
-        .macos => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "node_modules" }),
-        else => std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "node_modules" }),
+    const installed = switch (builtin.os.tag) {
+        .macos => try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "provider_bridge.mjs" }),
+        else => try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "provider_bridge.mjs" }),
     };
+    if (pathExists(allocator, installed)) return installed;
+    allocator.free(installed);
+
+    const dev = try std.fs.path.resolve(allocator, &.{ "zig-out", "share", "verde", "provider_bridge.mjs" });
+    if (pathExists(allocator, dev)) return dev;
+    allocator.free(dev);
+
+    return error.ProviderBridgeNotFound;
+}
+
+fn pathExists(allocator: std.mem.Allocator, path: []const u8) bool {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().access(threaded.io(), path, .{}) catch return false;
+    return true;
 }
 
 fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -616,6 +592,7 @@ test "BridgeSendPromptRequest serializes multiple images" {
         .{ .path = "/tmp/two.png" },
     };
     const payload = BridgeSendPromptRequest{
+        .provider = "claude",
         .command = "send_prompt",
         .prompt = "describe",
         .images = images[0..],
