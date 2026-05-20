@@ -357,11 +357,23 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 
 - App state is saved through SDL's pref path in `state.sqlite`.
 - User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json`.
+- On Omarchy systems, UI colors are loaded from an Omarchy-compatible `colors.toml`. Verde first honors `VERDE_OMARCHY_COLORS=/path/to/colors.toml`, then `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, then named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` or `~/.config/omarchy/themes/verde/colors.toml`. Missing values fall back to Verde defaults. See [`examples/omarchy/verde/colors.toml`](examples/omarchy/verde/colors.toml).
+- `theme.colors` in `verde.json` can override Verde theme tokens. Omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
 
 Example config:
 
 ```json
 {
+  "theme": {
+    "theme": "default",
+    "colors": {
+      "background": "#101820",
+      "panel": "#151b24",
+      "accent": "#50c878",
+      "text": "#f0f0f5",
+      "selection": "#58a6ff"
+    }
+  },
   "ui": {
     "font_size": 20
   },
@@ -375,7 +387,7 @@ Example config:
     ]
   },
   "keybinds": {
-    "refresh": ["CommandOrControl+R", "F5"],
+    "refresh": ["CommandOrControl+R", "CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
     "sidebar_hidden": "Alt+B",

@@ -97,6 +97,31 @@ pub const ComposerPromptConfig = struct {
     z_index: i32 = 0,
 };
 
+pub const ComposerPromptStyle = struct {
+    background_color: draw.Color,
+    border_color: draw.Color,
+    focus_border_color: ?draw.Color,
+    focus_border_width: ?f32,
+    control_background_color: draw.Color,
+    control_hover_color: draw.Color,
+    separator_color: draw.Color,
+    send_color: draw.Color,
+    send_hover_color: draw.Color,
+    stop_button_color: draw.Color,
+    stop_button_hover_color: draw.Color,
+    text_color: draw.Color,
+    placeholder_color: draw.Color,
+    icon_color: draw.Color,
+    cursor_color: draw.Color,
+    selection_color: draw.Color,
+    scrollbar_track_color: draw.Color,
+    scrollbar_thumb_color: draw.Color,
+    menu_background_color: draw.Color,
+    menu_border_color: draw.Color,
+    menu_selected_color: draw.Color,
+    menu_hover_color: draw.Color,
+};
+
 pub const ComposerPromptPart = enum {
     model,
     reasoning,
@@ -251,8 +276,10 @@ const Options = struct {
 pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
     return struct {
         const Component = @This();
+        pub const Style = ComposerPromptStyle;
 
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
+        style: Style = defaultStyle(),
         buffer: std.ArrayList(u8) = .empty,
         cursor: usize = 0,
         selection_anchor: ?usize = null,
@@ -311,6 +338,37 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn init() Component {
             return .{};
+        }
+
+        pub fn defaultStyle() Style {
+            return .{
+                .background_color = config.background_color,
+                .border_color = config.border_color,
+                .focus_border_color = config.focus_border_color,
+                .focus_border_width = config.focus_border_width,
+                .control_background_color = config.control_background_color,
+                .control_hover_color = config.control_hover_color,
+                .separator_color = config.separator_color,
+                .send_color = config.send_color,
+                .send_hover_color = config.send_hover_color,
+                .stop_button_color = config.stop_button_color,
+                .stop_button_hover_color = config.stop_button_hover_color,
+                .text_color = config.text_color,
+                .placeholder_color = config.placeholder_color,
+                .icon_color = config.icon_color,
+                .cursor_color = config.cursor_color,
+                .selection_color = config.selection_color,
+                .scrollbar_track_color = config.scrollbar_track_color,
+                .scrollbar_thumb_color = config.scrollbar_thumb_color,
+                .menu_background_color = config.menu_background_color,
+                .menu_border_color = config.menu_border_color,
+                .menu_selected_color = config.menu_selected_color,
+                .menu_hover_color = config.menu_hover_color,
+            };
+        }
+
+        pub fn setStyle(self: *Component, style: Style) void {
+            self.style = style;
         }
 
         pub fn deinit(self: *Component, allocator: std.mem.Allocator) void {
@@ -560,9 +618,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const previous_z = batch.setZIndex(self.z_index);
             defer batch.restoreZIndex(previous_z);
 
-            const active_border_color = if (self.focused) (config.focus_border_color orelse config.border_color) else config.border_color;
-            const active_border_width = if (self.focused) (config.focus_border_width orelse config.border_width) else config.border_width;
-            try batch.panel(allocator, self.bounds(), config.background_color, active_border_color, config.corner_radius, active_border_width);
+            const active_border_color = if (self.focused) (self.style.focus_border_color orelse self.style.border_color) else self.style.border_color;
+            const active_border_width = if (self.focused) (self.style.focus_border_width orelse config.border_width) else config.border_width;
+            try batch.panel(allocator, self.bounds(), self.style.background_color, active_border_color, config.corner_radius, active_border_width);
             try self.renderPromptText(allocator, batch);
             try self.renderToolbar(allocator, batch);
             try self.renderMenu(allocator, batch);
@@ -573,7 +631,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const rect = self.textRect();
             const placeholder = self.placeholderText();
             const value = if (self.buffer.items.len == 0) placeholder else self.buffer.items;
-            const color = if (self.buffer.items.len == 0) config.placeholder_color else config.text_color;
+            const color = if (self.buffer.items.len == 0) self.style.placeholder_color else self.style.text_color;
             const metrics = self.textMetrics();
             var runs: std.ArrayList(draw.TextRun) = .empty;
             defer runs.deinit(allocator);
@@ -588,7 +646,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 // Render cursor on focus regardless of buffer state so users
                 // get immediate visual feedback after clicking into the prompt.
                 const cursor = self.cursorRect();
-                if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, config.cursor_color);
+                if (clippedRect(cursor, rect)) |clipped| try batch.cursor(allocator, clipped, self.style.cursor_color);
             }
         }
 
@@ -648,13 +706,13 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
             const send_panel_color: draw.Color = blk: {
                 if (send_disabled)
-                    break :blk draw.Color{ .r = config.send_color.r, .g = config.send_color.g, .b = config.send_color.b, .a = 0.48 };
+                    break :blk draw.Color{ .r = self.style.send_color.r, .g = self.style.send_color.g, .b = self.style.send_color.b, .a = 0.48 };
                 if (self.send_state == .stop) {
-                    if (self.hovered_part == .send) break :blk config.stop_button_hover_color;
-                    break :blk config.stop_button_color;
+                    if (self.hovered_part == .send) break :blk self.style.stop_button_hover_color;
+                    break :blk self.style.stop_button_color;
                 }
-                if (self.hovered_part == .send) break :blk config.send_hover_color;
-                break :blk config.send_color;
+                if (self.hovered_part == .send) break :blk self.style.send_hover_color;
+                break :blk self.style.send_color;
             };
             try batch.panel(allocator, geometry.send, send_panel_color, null, geometry.send.h * 0.5, 0.0);
             if (self.send_state == .stop) {
@@ -668,7 +726,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, overlay_leading: bool, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
-            try batch.panel(allocator, rect, if (hovered) config.control_hover_color else config.control_background_color, null, rect.h * 0.5, 0.0);
+            try batch.panel(allocator, rect, if (hovered) self.style.control_hover_color else self.style.control_background_color, null, rect.h * 0.5, 0.0);
             const text_metrics = self.toolbarMetrics();
             const icon_metrics = self.iconMetrics();
             var runs: [3]draw.TextRun = undefined;
@@ -677,7 +735,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
                 x += config.pill_overlay_icon_reserve + config.pill_icon_gap;
             } else if (left_icon.len > 0) {
-                runs[count] = iconRun(left_icon, x, rect, icon_metrics, config.icon_color);
+                runs[count] = iconRun(left_icon, x, rect, icon_metrics, self.style.icon_color);
                 x += icon_metrics.measureSlice(left_icon) + config.pill_icon_gap;
                 count += 1;
             }
@@ -700,7 +758,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .y = rect.y + @max((rect.h - text_metrics.line_height) * 0.5, 0.0),
                 .font_size = text_metrics.font_size,
                 .line_height = text_metrics.line_height,
-                .color = config.text_color,
+                .color = self.style.text_color,
                 .clip = label_clip,
                 .font_role = config.bold_font_role,
                 .font_id = config.font_id,
@@ -712,9 +770,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 const cell_x = rect.x + rect.w - config.pill_padding_x - cell;
                 const cell_rect_full: draw.Rect = .{ .x = cell_x, .y = rect.y, .w = cell, .h = rect.h };
                 const cell_rect = clippedRect(rect, cell_rect_full) orelse cell_rect_full;
-                try renderDisclosureArrow(allocator, batch, cell_rect, config.icon_color);
+                try renderDisclosureArrow(allocator, batch, cell_rect, self.style.icon_color);
             }
-            try batch.textRuns(allocator, rect, label, runs[0..count], config.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
+            try batch.textRuns(allocator, rect, label, runs[0..count], self.style.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
         }
 
         fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
@@ -807,14 +865,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             );
         }
 
-        fn renderSeparator(_: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
+        fn renderSeparator(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, x: f32, toolbar: draw.Rect) !void {
             const sx = @round(x);
             try batch.rect(allocator, .{
                 .x = sx - config.separator_width * 0.5,
                 .y = @round(toolbar.y + 9.0),
                 .w = config.separator_width,
                 .h = @round(@max(toolbar.h - 18.0, 0.0)),
-            }, config.separator_color);
+            }, self.style.separator_color);
         }
 
         fn iconRun(value: []const u8, x: f32, rect: draw.Rect, metrics: text_layout.FontMetrics, color: draw.Color) draw.TextRun {
@@ -859,14 +917,14 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const menu_corner: f32 = 14.0;
             // Rounded shell (avoid `panel` + rectBorder sharp outer frame on top of rounded fills).
             const inset = @max(1.0, 1.0);
-            try batch.roundedRectClipped(allocator, rect, config.menu_border_color, menu_corner, rect);
+            try batch.roundedRectClipped(allocator, rect, self.style.menu_border_color, menu_corner, rect);
             if (rect.w > inset * 2.0 and rect.h > inset * 2.0) {
                 try batch.roundedRectClipped(allocator, .{
                     .x = rect.x + inset,
                     .y = rect.y + inset,
                     .w = rect.w - inset * 2.0,
                     .h = rect.h - inset * 2.0,
-                }, config.menu_background_color, @max(menu_corner - inset, 0.0), rect);
+                }, self.style.menu_background_color, @max(menu_corner - inset, 0.0), rect);
             }
             const metrics = self.toolbarMetrics();
             const row_corner = @min(9.0, @max(4.0, metrics.line_height * 0.38));
@@ -875,9 +933,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 const row = self.menuRowRect(target, index);
                 if (row.y + row.h < rect.y or row.y > rect.y + rect.h) continue;
                 if (self.selectedIndex(target) == index) {
-                    try batch.roundedRectClipped(allocator, row, config.menu_selected_color, row_corner, rect);
+                    try batch.roundedRectClipped(allocator, row, self.style.menu_selected_color, row_corner, rect);
                 } else if (self.hovered_menu_index == index) {
-                    try batch.roundedRectClipped(allocator, row, config.menu_hover_color, row_corner, rect);
+                    try batch.roundedRectClipped(allocator, row, self.style.menu_hover_color, row_corner, rect);
                 }
                 const label = options.labelFor(index) orelse continue;
                 const text_rect: draw.Rect = .{
@@ -894,12 +952,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                     .y = text_rect.y,
                     .font_size = metrics.font_size,
                     .line_height = metrics.line_height,
-                    .color = config.text_color,
+                    .color = self.style.text_color,
                     .clip = rect,
                     .font_role = config.font_role,
                     .font_id = config.font_id,
                 }};
-                try batch.textRuns(allocator, text_rect, label, &runs, config.text_color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
+                try batch.textRuns(allocator, text_rect, label, &runs, self.style.text_color, metrics.font_size, rect, metrics.line_height, metrics.fixedAdvance());
             }
             try self.renderMenuScrollbar(allocator, batch, target);
         }
@@ -999,7 +1057,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             if (self.textRect().contains(point)) {
                 self.setFocused(true);
-                self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, config.text_color), point);
+                self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, self.style.text_color), point);
                 self.selection_anchor = self.cursor;
                 self.selection_focus = self.cursor;
                 self.dragging_selection = true;
@@ -1042,7 +1100,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn handleMouseDrag(self: *Component, point: draw.Vec2) bool {
             if (!self.dragging_selection) return false;
             if (self.selection_anchor == null) self.selection_anchor = self.cursor;
-            self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, config.text_color), point);
+            self.cursor = text_layout.offsetForPoint(self.textLayoutOptions(self.buffer.items, self.style.text_color), point);
             self.selection_focus = self.cursor;
             self.autoScrollForDrag(point);
             self.ensureCursorVisible();
@@ -1206,7 +1264,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn cursorRect(self: *const Component) draw.Rect {
             const metrics = self.textMetrics();
-            const pos = text_layout.positionForOffset(self.textLayoutOptions(self.buffer.items, config.text_color), self.cursor);
+            const pos = text_layout.positionForOffset(self.textLayoutOptions(self.buffer.items, self.style.text_color), self.cursor);
             return .{ .x = pos.x, .y = pos.y, .w = 1.5, .h = metrics.line_height };
         }
 
@@ -1280,9 +1338,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             const metrics = self.menuScrollMetrics(target);
             if (scroll.maxOffsetY(metrics) <= 0.0) return;
             const track = self.menuScrollbarTrackRect(target);
-            try batch.scrollbar(allocator, track, config.scrollbar_track_color);
+            try batch.scrollbar(allocator, track, self.style.scrollbar_track_color);
             if (scroll.thumbRect(track, metrics, self.menu_scroll_y)) |thumb| {
-                try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
+                try batch.scrollbar(allocator, thumb, self.style.scrollbar_thumb_color);
             }
         }
 
@@ -1364,15 +1422,15 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn renderSelection(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, range: selection_input.Range) !void {
             var rects: std.ArrayList(draw.Rect) = .empty;
             defer rects.deinit(allocator);
-            try text_layout.appendSelectionRects(allocator, self.textLayoutOptions(self.buffer.items, config.text_color), range, &rects);
-            for (rects.items) |rect| try batch.selection(allocator, rect, config.selection_color);
+            try text_layout.appendSelectionRects(allocator, self.textLayoutOptions(self.buffer.items, self.style.text_color), range, &rects);
+            for (rects.items) |rect| try batch.selection(allocator, rect, self.style.selection_color);
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch) !void {
             if (!config.scroll_enabled or config.scrollbar_width <= 0.0 or self.maxScrollY() <= 0.0) return;
             const track = self.scrollbarTrackRect();
-            try batch.scrollbar(allocator, track, config.scrollbar_track_color);
-            if (self.scrollbarThumbRect()) |thumb| try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
+            try batch.scrollbar(allocator, track, self.style.scrollbar_track_color);
+            if (self.scrollbarThumbRect()) |thumb| try batch.scrollbar(allocator, thumb, self.style.scrollbar_thumb_color);
         }
 
         fn scrollbarTrackRect(self: *const Component) draw.Rect {

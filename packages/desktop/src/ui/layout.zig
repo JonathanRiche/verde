@@ -134,7 +134,7 @@ fn approach(current: f32, target: f32, t: f32) f32 {
 }
 
 fn queueRootBackground(state: *runtime.AppState, width: f32, height: f32) void {
-    state.palette_overlay_batch.rect(state.allocator, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(colors.CHAT_BLACK)) catch |err| {
+    state.palette_overlay_batch.rect(state.allocator, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, paletteColor(theme.background())) catch |err| {
         runtime.log.warn("failed to queue root palette background: {s}", .{@errorName(err)});
     };
 }
@@ -202,8 +202,8 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
     queuePaletteRoundedRect(state, scrim, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.46 }, 0.0);
-    queuePaletteRoundedRect(state, modal, paletteColor(colors.rgba(24, 25, 30, 248)), theme.scaledUi(16.0));
-    queuePaletteBorder(state, modal, paletteColor(colors.rgba(74, 78, 88, 255)), theme.scaledUi(16.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, modal, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)), theme.scaledUi(16.0));
+    queuePaletteBorder(state, modal, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(16.0), theme.scaledUi(1.0));
 }
 
 fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect, dismissible: bool) void {
@@ -238,7 +238,7 @@ fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8
                 state.palette_overlay_batch.rect(
                     state.allocator,
                     .{ .x = clamped_x0, .y = text_y, .w = clamped_x1 - clamped_x0, .h = theme.scaledUi(20.0) },
-                    paletteColor(colors.rgba(36, 92, 124, 200)),
+                    paletteColor(theme.withAlpha(theme.selection(), 200)),
                 ) catch {};
             }
         }
@@ -807,7 +807,7 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const content: palette.Rect = .{ .x = modal.x + modal_padding_x, .y = modal.y + modal_padding_y, .w = modal.w - modal_padding_x * 2.0, .h = modal.h - modal_padding_y * 2.0 };
     const header_text_width = @max(content.w - close_size - header_gap, 160.0);
     const close_rect: palette.Rect = .{ .x = content.x + content.w - close_size, .y = content.y, .w = close_size, .h = close_size };
-    drawActionButton(state, close_rect, "x", colors.rgba(46, 48, 56, 220));
+    drawActionButton(state, close_rect, "x", theme.withAlpha(theme.COLOR_PANEL_MUTED, 220));
     queuePaletteText(state, .{ .x = content.x, .y = content.y, .w = header_text_width, .h = theme.scaledUi(22.0) }, std.fs.path.basename(modal_path), paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), modal);
     queuePaletteText(state, .{ .x = content.x, .y = content.y + theme.scaledUi(24.0), .w = header_text_width, .h = theme.scaledUi(20.0) }, modal_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), modal);
 
@@ -962,7 +962,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
                 queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
             } else if (row_hovered) {
                 queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.14)), theme.scaledUi(6.0));
-                queuePaletteBorder(state, row, paletteColor(theme.lighten(colors.DARK_BLUE, 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+                queuePaletteBorder(state, row, paletteColor(theme.lighten(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
             }
             const title_col = paletteColor(theme.COLOR_WHITE);
             const id_col = paletteColor(if (row_hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE);

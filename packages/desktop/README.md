@@ -107,10 +107,19 @@ App state is stored through SDL's pref path in `state.sqlite`. User config is lo
 - `$XDG_CONFIG_HOME/verde/verde.json`
 - `~/.config/verde/verde.json`
 
+On Omarchy systems, Palette UI colors are loaded from Omarchy-compatible `colors.toml` files. Set `VERDE_OMARCHY_COLORS` to a specific file for testing, use the active Omarchy theme at `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, or place a theme at `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` / `~/.config/omarchy/themes/verde/colors.toml`. Verde maps `background`, `foreground`, `accent`, `selection_background`, and `color0` through `color8` into semantic UI tokens and keeps built-in fallbacks for missing keys. `theme.colors` in `verde.json` can override those tokens; omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
+
 Config supports UI and terminal font size, keybind overrides, and the default action behind the main `Open` button plus `Alt+O`.
 
 ```json
 {
+  "theme": {
+    "colors": {
+      "background": "#101820",
+      "accent": "#50c878",
+      "text": "#f0f0f5"
+    }
+  },
   "ui": {
     "font_size": 20
   },
@@ -121,7 +130,7 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
     "default": "editor"
   },
   "keybinds": {
-    "refresh": ["CommandOrControl+R", "F5"],
+    "refresh": ["CommandOrControl+R", "CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
     "open": "Alt+O",
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
