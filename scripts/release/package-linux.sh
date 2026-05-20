@@ -60,7 +60,9 @@ normalize_fff_dependency() {
     return
   fi
 
-  if ! readelf -d "$path" | grep -Fq "$original_needed"; then
+  local needed_entries
+  needed_entries="$(readelf -d "$path")"
+  if ! grep -Fq "$original_needed" <<<"$needed_entries"; then
     return
   fi
 
@@ -73,7 +75,7 @@ copy_runtime_library() {
   local library_path=""
 
   if command -v ldconfig >/dev/null 2>&1; then
-    library_path="$(ldconfig -p | awk -v name="$library_name" '$1 == name { print $NF; exit }')"
+    library_path="$(ldconfig -p | awk -v name="$library_name" '$1 == name && path == "" { path = $NF } END { print path }')"
   fi
 
   if [[ -z "$library_path" && -e "/usr/lib/x86_64-linux-gnu/$library_name" ]]; then
@@ -93,7 +95,7 @@ copy_runtime_library() {
   fi
   if command -v readelf >/dev/null 2>&1; then
     local soname
-    soname="$(readelf -d "$(readlink -f "$library_path")" | awk '/SONAME/ { gsub(/[\[\]]/, "", $5); print $5; exit }')"
+    soname="$(readelf -d "$(readlink -f "$library_path")" | awk '/SONAME/ && soname == "" { gsub(/[\[\]]/, "", $5); soname = $5 } END { print soname }')"
     if [[ -n "$soname" && "$soname" != "$real_name" ]]; then
       ln -sfn "$real_name" "$destination_dir/$soname"
     fi
