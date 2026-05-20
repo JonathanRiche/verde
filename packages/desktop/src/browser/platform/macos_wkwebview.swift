@@ -371,6 +371,16 @@ public func verde_macos_app_configure_foreground() {
     }
 }
 
+@_cdecl("verde_macos_host_window_order_out")
+public func verde_macos_host_window_order_out(_ nsWindow: UnsafeMutableRawPointer?) {
+    guard let nsWindow else { return }
+    onMain {
+        let window = Unmanaged<NSWindow>.fromOpaque(nsWindow).takeUnretainedValue()
+        window.orderOut(nil)
+        window.setIsVisible(false)
+    }
+}
+
 @_cdecl("verde_macos_webview_appkit_diagnostics")
 public func verde_macos_webview_appkit_diagnostics(_ handle: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? {
     onMain {
