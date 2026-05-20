@@ -26,6 +26,12 @@
 #define VERDE_BROWSER_LINUX_ACTIVE_AFTER_LOAD_US 2000000
 #define VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX 96
 
+#if WEBKIT_CHECK_VERSION(2, 52, 0)
+#define VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS 1
+#else
+#define VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS 0
+#endif
+
 enum verde_browser_linux_event_kind {
     VERDE_BROWSER_LINUX_EVENT_OPENED = 1,
     VERDE_BROWSER_LINUX_EVENT_CLOSED = 2,
@@ -350,12 +356,49 @@ static gboolean verde_browser_linux_context_stock_action_is_supported(WebKitCont
     }
 }
 
+static void verde_browser_linux_context_menu_get_position_compat(WebKitContextMenu *menu, gint *x, gint *y) {
+    if (x != NULL) *x = 0;
+    if (y != NULL) *y = 0;
+#if VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS
+    (void)webkit_context_menu_get_position(menu, x, y);
+#else
+    (void)menu;
+#endif
+}
+
+static const gchar *verde_browser_linux_context_menu_item_get_title_compat(WebKitContextMenuItem *item, WebKitContextMenuAction stock_action) {
+#if VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS
+    const gchar *title = webkit_context_menu_item_get_title(item);
+    if (title != NULL && title[0] != '\0') return title;
+#else
+    (void)item;
+#endif
+    return verde_browser_linux_context_action_label(stock_action);
+}
+
+static GVariant *verde_browser_linux_context_menu_item_get_target_compat(WebKitContextMenuItem *item) {
+#if VERDE_BROWSER_LINUX_HAS_CONTEXT_MENU_DETAILS
+    return webkit_context_menu_item_get_gaction_target(item);
+#else
+    (void)item;
+    return NULL;
+#endif
+}
+
+static void verde_browser_linux_toggle_inspector_compat(WebKitWebView *web_view) {
+#if WEBKIT_CHECK_VERSION(2, 52, 0)
+    webkit_web_view_toggle_inspector(web_view);
+#else
+    (void)web_view;
+#endif
+}
+
 static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux *browser, WebKitContextMenu *menu) {
     if (browser != NULL) verde_browser_linux_clear_context_items(browser);
     if (menu == NULL) return g_strdup("{\"x\":0,\"y\":0,\"items\":[]}");
     gint x = 0;
     gint y = 0;
-    (void)webkit_context_menu_get_position(menu, &x, &y);
+    verde_browser_linux_context_menu_get_position_compat(menu, &x, &y);
     GString *json = g_string_new(NULL);
     g_string_append_printf(json, "{\"x\":%d,\"y\":%d,\"items\":[", x, y);
 
@@ -371,21 +414,20 @@ static char *verde_browser_linux_context_menu_to_json(struct verde_browser_linux
         const gboolean separator = webkit_context_menu_item_is_separator(item);
         WebKitContextMenu *submenu = webkit_context_menu_item_get_submenu(item);
         GAction *action = webkit_context_menu_item_get_gaction(item);
-        const gchar *title = webkit_context_menu_item_get_title(item);
         WebKitContextMenuAction stock_action = webkit_context_menu_item_get_stock_action(item);
+        const gchar *title = verde_browser_linux_context_menu_item_get_title_compat(item, stock_action);
         if (stock_action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT &&
             !verde_browser_linux_remote_inspector_configured()) {
             continue;
         }
         const gboolean action_enabled = action != NULL && g_action_get_enabled(action);
         const gboolean enabled = !separator && submenu == NULL && (action_enabled || verde_browser_linux_context_stock_action_is_supported(stock_action));
-        if (title == NULL || title[0] == '\0') title = verde_browser_linux_context_action_label(stock_action);
         if (browser != NULL && index < VERDE_BROWSER_LINUX_CONTEXT_MENU_ITEM_MAX) {
             struct verde_browser_linux_context_menu_item *stored = &browser->context_items[index];
             stored->label = g_strdup(title);
             stored->stock_action = stock_action;
             stored->action = action != NULL ? g_object_ref(action) : NULL;
-            stored->target = webkit_context_menu_item_get_gaction_target(item);
+            stored->target = verde_browser_linux_context_menu_item_get_target_compat(item);
             if (stored->target != NULL) stored->target = g_variant_ref(stored->target);
             stored->enabled = enabled;
             stored->separator = separator;
@@ -1186,7 +1228,7 @@ static gboolean verde_browser_linux_perform_context_menu_stock_action(struct ver
             verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "WPE Inspect Element requires WEBKIT_INSPECTOR_SERVER or WEBKIT_INSPECTOR_HTTP_SERVER.");
             return TRUE;
         }
-        webkit_web_view_toggle_inspector(browser->web_view);
+        verde_browser_linux_toggle_inspector_compat(browser->web_view);
         return TRUE;
     default:
         return FALSE;
@@ -1245,7 +1287,7 @@ static gboolean verde_browser_linux_perform_context_menu_label_action(struct ver
             verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, "WPE Inspect Element requires WEBKIT_INSPECTOR_SERVER or WEBKIT_INSPECTOR_HTTP_SERVER.");
             return TRUE;
         }
-        webkit_web_view_toggle_inspector(browser->web_view);
+        verde_browser_linux_toggle_inspector_compat(browser->web_view);
         return TRUE;
     }
     return FALSE;
