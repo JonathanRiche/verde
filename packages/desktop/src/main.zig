@@ -1670,7 +1670,9 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
     };
 }
 
-fn handleWindowCloseRequested(_: *sdl.Window, state: *AppState) bool {
+extern fn SDL_HideWindow(window: *sdl.Window) bool;
+
+fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
         const now_ms = currentTimeMillis();
         if (macos_cmd_w_pane_close_until_ms >= now_ms) {
@@ -1686,6 +1688,10 @@ fn handleWindowCloseRequested(_: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
             return true;
         }
+    }
+    if (builtin.os.tag == .macos) {
+        _ = state.browser_state.controller.hide() catch {};
+        _ = SDL_HideWindow(window);
     }
     return false;
 }
