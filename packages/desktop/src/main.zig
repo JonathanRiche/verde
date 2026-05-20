@@ -113,7 +113,7 @@ var macos_last_text_input_timestamp_ns: u64 = 0;
 var macos_last_text_input_len: usize = 0;
 var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
 const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
-const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 1000;
+const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
 const WindowFrame = struct {
     x: c_int,
@@ -1682,6 +1682,7 @@ fn handleWindowCloseRequested(_: *sdl.Window, state: *AppState) bool {
             return true;
         }
         if (macos_launch_close_suppress_until_ms >= now_ms) {
+            macos_launch_close_suppress_until_ms = 0;
             runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
             return true;
         }
