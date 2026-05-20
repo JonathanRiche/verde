@@ -21,6 +21,115 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+linux_wpe_runtime_packages() {
+  if command -v pacman >/dev/null 2>&1; then
+    printf '%s\n' "wpewebkit wpebackend-fdo"
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf '%s\n' "libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libjavascriptcoregtk-6.0-1 libegl1 libgles2"
+  elif command -v dnf >/dev/null 2>&1; then
+    printf '%s\n' "wpewebkit wpebackend-fdo"
+  elif command -v zypper >/dev/null 2>&1; then
+    printf '%s\n' "libWPEWebKit-2_0-1 libwpebackend-fdo-1_0-1 libjavascriptcoregtk-6_0-1 libEGL1 libGLESv2-2"
+  fi
+}
+
+linux_wpe_runtime_install_cmd() {
+  packages="$(linux_wpe_runtime_packages || true)"
+  [ -n "$packages" ] || return 1
+
+  if command -v pacman >/dev/null 2>&1; then
+    printf '%s\n' "sudo pacman -S $packages"
+  elif command -v apt-get >/dev/null 2>&1; then
+    printf '%s\n' "sudo apt-get update && sudo apt-get install $packages"
+  elif command -v dnf >/dev/null 2>&1; then
+    printf '%s\n' "sudo dnf install $packages"
+  elif command -v zypper >/dev/null 2>&1; then
+    printf '%s\n' "sudo zypper install $packages"
+  else
+    return 1
+  fi
+}
+
+linux_has_library() {
+  library="$1"
+
+  if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig -p 2>/dev/null | grep -F "$library" >/dev/null 2>&1
+    return $?
+  fi
+
+  for dir in \
+    /lib /usr/lib /usr/local/lib \
+    /lib64 /usr/lib64 /usr/local/lib64 \
+    /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+    /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu
+  do
+    [ -e "$dir/$library" ] && return 0
+  done
+  return 1
+}
+
+linux_missing_wpe_runtime() {
+  missing=""
+  for library in \
+    libWPEWebKit-2.0.so \
+    libWPEBackend-fdo-1.0.so \
+    libjavascriptcoregtk-6.0.so \
+    libEGL.so.1 \
+    libGLESv2.so.2
+  do
+    if ! linux_has_library "$library"; then
+      missing="$missing $library"
+    fi
+  done
+
+  [ -n "$missing" ] || return 1
+  printf '%s\n' "$missing" | sed 's/^ //'
+}
+
+linux_wpe_runtime_hint() {
+  missing="$1"
+  say "Linux browser support uses the system WPE WebKit runtime."
+  say "Missing browser runtime libraries: $missing"
+  if install_cmd="$(linux_wpe_runtime_install_cmd 2>/dev/null)"; then
+    say "Install them with:"
+    say "  $install_cmd"
+    say "Set VERDE_INSTALL_BROWSER_DEPS=1 before running this installer to let it run that command for you."
+  else
+    say "Install WPE WebKit and WPEBackend-fdo packages for your Linux distribution."
+  fi
+}
+
+linux_install_wpe_runtime_if_requested() {
+  missing="$(linux_missing_wpe_runtime || true)"
+  [ -n "$missing" ] || return
+
+  if [ "${'${'}VERDE_INSTALL_BROWSER_DEPS:-0}" != "1" ]; then
+    linux_wpe_runtime_hint "$missing"
+    return
+  fi
+
+  packages="$(linux_wpe_runtime_packages || true)"
+  [ -n "$packages" ] || {
+    linux_wpe_runtime_hint "$missing"
+    return
+  }
+
+  say "Installing Linux browser runtime dependencies..."
+  if command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --needed $packages
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y $packages
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y $packages
+  elif command -v zypper >/dev/null 2>&1; then
+    sudo zypper install -y $packages
+  else
+    linux_wpe_runtime_hint "$missing"
+  fi
+}
+
 download() {
   url="$1"
   output="$2"
@@ -126,6 +235,10 @@ if [ "$platform" = "linux" ]; then
   installed_version="$(linux_installed_version || true)"
 else
   installed_version="$(macos_installed_version || true)"
+fi
+
+if [ "$platform" = "linux" ]; then
+  linux_install_wpe_runtime_if_requested
 fi
 
 if [ -n "$installed_version" ] && [ "$(normalize_version "$installed_version")" = "$latest_version" ]; then
