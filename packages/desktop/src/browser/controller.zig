@@ -256,6 +256,25 @@ pub const Controller = struct {
         };
     }
 
+    /// Activates a backend-owned context-menu row, when the platform exposes one.
+    pub fn activateContextMenuItem(self: *Controller, index: u32) !void {
+        const backend = try self.ensureBackend();
+        switch (backend.*) {
+            .native_webview => |*active| try active.activateContextMenuItem(index),
+            .cef, .stub => {},
+        }
+    }
+
+    /// Dismisses a backend-owned context menu, when the platform exposes one.
+    pub fn dismissContextMenu(self: *Controller) !void {
+        if (self.backend) |*backend| {
+            switch (backend.*) {
+                .native_webview => |*active| try active.dismissContextMenu(),
+                .cef, .stub => {},
+            }
+        }
+    }
+
     /// Reports which browser runtime family is currently configured.
     pub fn runtimeKind(self: *const Controller) browser_types.RuntimeKind {
         const backend = if (self.backend) |*backend| backend else {

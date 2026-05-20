@@ -16,6 +16,7 @@ required_payload=(
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   required_payload+=("verde-browser-linux")
+  required_payload+=("verde-browser-linux-wpe")
 fi
 
 for name in "${required_payload[@]}"; do

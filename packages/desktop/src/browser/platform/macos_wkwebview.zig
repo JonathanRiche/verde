@@ -213,6 +213,15 @@ pub const Controller = struct {
         return false;
     }
 
+    pub fn activateContextMenuItem(self: *Controller, index: u32) !void {
+        _ = self;
+        _ = index;
+    }
+
+    pub fn dismissContextMenu(self: *Controller) !void {
+        _ = self;
+    }
+
     pub fn popEvent(self: *Controller) ?browser_types.Event {
         const handle = self.handle orelse return null;
         var kind_int: c_int = 0;

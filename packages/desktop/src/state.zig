@@ -69,6 +69,28 @@ pub const PaletteModalHit = struct {
 /// offset/length pair is only valid until the next frame's text-buffer reset.
 pub const CodeCopyButtonHit = chat_markdown.CodeCopyButtonSink;
 
+pub const BrowserContextMenuItem = struct {
+    index: u32,
+    label: []u8,
+    enabled: bool,
+    separator: bool,
+    submenu: bool,
+};
+
+const BrowserContextMenuPayload = struct {
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    items: []const BrowserContextMenuPayloadItem = &.{},
+};
+
+const BrowserContextMenuPayloadItem = struct {
+    index: u32 = 0,
+    label: []const u8 = "",
+    enabled: bool = false,
+    separator: bool = false,
+    submenu: bool = false,
+};
+
 /// Kinds of expand/collapse cards that share the same per-frame hit list.
 pub const CardToggleKind = enum(u8) {
     command_card,
@@ -2680,6 +2702,10 @@ pub const AppState = struct {
     /// True while the user is dragging to extend the URL-bar selection.
     browser_address_drag_active: bool,
     browser_inspector_menu_open: bool,
+    browser_context_menu_open: bool,
+    browser_context_menu_anchor_x: f32,
+    browser_context_menu_anchor_y: f32,
+    browser_context_menu_items: std.ArrayList(BrowserContextMenuItem),
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
     sidebar_context_menu_open: bool,
@@ -2865,6 +2891,10 @@ pub const AppState = struct {
             .browser_address_selection_anchor = null,
             .browser_address_drag_active = false,
             .browser_inspector_menu_open = false,
+            .browser_context_menu_open = false,
+            .browser_context_menu_anchor_x = 0.0,
+            .browser_context_menu_anchor_y = 0.0,
+            .browser_context_menu_items = .empty,
             .workspace_header_open_menu_open = false,
             .sidebar_context_menu_open = false,
             .sidebar_context_menu_kind = .none,
@@ -6847,6 +6877,78 @@ pub const AppState = struct {
         };
     }
 
+    fn clearBrowserContextMenuLocal(self: *AppState) void {
+        for (self.browser_context_menu_items.items) |item| {
+            self.allocator.free(item.label);
+        }
+        self.browser_context_menu_items.clearRetainingCapacity();
+        self.browser_context_menu_open = false;
+        self.browser_context_menu_anchor_x = 0.0;
+        self.browser_context_menu_anchor_y = 0.0;
+    }
+
+    pub fn dismissBrowserContextMenu(self: *AppState) void {
+        const was_open = self.browser_context_menu_open;
+        self.clearBrowserContextMenuLocal();
+        if (was_open) {
+            self.browser_state.controller.dismissContextMenu() catch |err| {
+                log.warn("failed to dismiss browser context menu: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    pub fn activateBrowserContextMenuItem(self: *AppState, index: u32) void {
+        if (!self.browser_context_menu_open) return;
+        var enabled = false;
+        for (self.browser_context_menu_items.items) |item| {
+            if (item.index == index) {
+                enabled = item.enabled and !item.separator and !item.submenu;
+                break;
+            }
+        }
+        if (!enabled) return;
+        self.clearBrowserContextMenuLocal();
+        self.browser_state.controller.activateContextMenuItem(index) catch |err| {
+            log.warn("failed to activate browser context menu item: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn openBrowserContextMenuFromPayload(self: *AppState, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(BrowserContextMenuPayload, self.allocator, payload, .{ .allocate = .alloc_always }) catch |err| {
+            log.warn("failed to parse browser context menu payload: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+
+        self.clearBrowserContextMenuLocal();
+        const displayed_width = self.browser_pane_max[0] - self.browser_pane_min[0];
+        const displayed_height = self.browser_pane_max[1] - self.browser_pane_min[1];
+        const input_width = @max(self.browser_pane_input_size[0], 1.0);
+        const input_height = @max(self.browser_pane_input_size[1], 1.0);
+        self.browser_context_menu_anchor_x = self.browser_pane_min[0] + parsed.value.x * (@max(displayed_width, 1.0) / input_width);
+        self.browser_context_menu_anchor_y = self.browser_pane_min[1] + parsed.value.y * (@max(displayed_height, 1.0) / input_height);
+
+        for (parsed.value.items) |item| {
+            const label = self.allocator.dupe(u8, item.label) catch |err| {
+                log.warn("failed to retain browser context menu label: {s}", .{@errorName(err)});
+                continue;
+            };
+            self.browser_context_menu_items.append(self.allocator, .{
+                .index = item.index,
+                .label = label,
+                .enabled = item.enabled,
+                .separator = item.separator,
+                .submenu = item.submenu,
+            }) catch |err| {
+                self.allocator.free(label);
+                log.warn("failed to append browser context menu item: {s}", .{@errorName(err)});
+            };
+        }
+        self.browser_context_menu_open = self.browser_context_menu_items.items.len > 0;
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
+    }
+
     /// Re-shows the native browser window without changing dock visibility.
     pub fn reopenBrowserWindow(self: *AppState) void {
         if (!self.browser_state.controller.supportsPopout()) {
@@ -7004,6 +7106,7 @@ pub const AppState = struct {
                 },
                 .closed => {
                     self.browser_pane_focused = false;
+                    self.clearBrowserContextMenuLocal();
                     if (self.consumeSuppressedBrowserClosedEvent()) {
                         continue;
                     }
@@ -7011,6 +7114,7 @@ pub const AppState = struct {
                     self.setSidebarNotice("Browser window closed.");
                 },
                 .navigated => |url| {
+                    self.clearBrowserContextMenuLocal();
                     self.browser_state.status = .ready;
                     self.browser_state.setCurrentUrl(url) catch {};
                     self.browser_state.setAddress(url);
@@ -7066,6 +7170,12 @@ pub const AppState = struct {
                         continue;
                     }
                     self.setSidebarNotice("Browser script evaluation completed.");
+                },
+                .context_menu => |payload| {
+                    self.openBrowserContextMenuFromPayload(payload);
+                },
+                .context_menu_dismissed => {
+                    self.clearBrowserContextMenuLocal();
                 },
                 .failed => |message| {
                     self.browser_state.status = .failed;
@@ -9925,6 +10035,8 @@ pub const AppState = struct {
         self.closeTranscriptSelectionModal();
         self.clearProjects();
         self.transcript_markdown_entries.deinit(self.allocator);
+        self.clearBrowserContextMenuLocal();
+        self.browser_context_menu_items.deinit(self.allocator);
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);

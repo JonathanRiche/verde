@@ -70,6 +70,7 @@ install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
 copy_if_present "$SCRIPT_DIR/bin/libSDL3.so" "$PREFIX/bin/libSDL3.so"
 copy_glob_if_present "$SCRIPT_DIR/bin/libSDL3_ttf.so*" "$PREFIX/bin"
 copy_if_present "$SCRIPT_DIR/bin/verde-browser-linux" "$PREFIX/bin/verde-browser-linux"
+copy_if_present "$SCRIPT_DIR/bin/verde-browser-linux-wpe" "$PREFIX/bin/verde-browser-linux-wpe"
 if [[ "$BROWSER_BACKEND" == "cef" ]]; then
   copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef" "$PREFIX/bin/verde-browser-cef"
   copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef-process" "$PREFIX/bin/verde-browser-cef-process"

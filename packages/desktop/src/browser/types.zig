@@ -67,6 +67,8 @@ pub const Event = union(enum) {
     document_loaded,
     js_message: []u8,
     eval_result: []u8,
+    context_menu: []u8,
+    context_menu_dismissed,
     failed: []u8,
 
     /// Releases any heap-allocated payloads carried by the event.
@@ -76,6 +78,7 @@ pub const Event = union(enum) {
             .title_changed => |value| allocator.free(value),
             .js_message => |value| allocator.free(value),
             .eval_result => |value| allocator.free(value),
+            .context_menu => |value| allocator.free(value),
             .failed => |value| allocator.free(value),
             else => {},
         }
