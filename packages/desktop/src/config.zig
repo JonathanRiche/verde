@@ -69,6 +69,7 @@ pub const TerminalLaunchProfileConfig = struct {
 pub const AppConfig = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
+    theme_config: theme.ThemeConfig = .{},
     default_open_action: DefaultOpenAction = .folder,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
 
@@ -140,12 +141,97 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("ui")) |ui_value| {
         applyUiOverrides(config, ui_value);
     }
+    if (root.object.get("theme")) |theme_value| {
+        applyThemeOverrides(config, theme_value);
+    }
     if (root.object.get("open")) |open_value| {
         applyOpenOverrides(allocator, config, open_value);
     }
     if (root.object.get("terminal")) |terminal_value| {
         applyTerminalOverrides(allocator, config, terminal_value);
     }
+}
+
+fn applyThemeOverrides(config: *AppConfig, theme_value: std.json.Value) void {
+    if (theme_value != .object) {
+        log.warn("theme must be an object when provided", .{});
+        return;
+    }
+
+    if (theme_value.object.get("theme")) |source_value| {
+        if (source_value != .string) {
+            log.warn("theme.theme must be a string when provided", .{});
+        } else if (parseThemeSource(source_value.string)) |source| {
+            config.theme_config.source = source;
+        }
+    }
+
+    const colors_value = theme_value.object.get("colors") orelse return;
+    if (colors_value != .object) {
+        log.warn("theme.colors must be an object when provided", .{});
+        return;
+    }
+    applyThemeColorOverrides(config, colors_value.object);
+}
+
+fn parseThemeSource(raw: []const u8) ?theme.ThemeSource {
+    const value = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(value, "omarchy") or std.ascii.eqlIgnoreCase(value, "auto")) return .omarchy;
+    if (std.ascii.eqlIgnoreCase(value, "default") or std.ascii.eqlIgnoreCase(value, "verde")) return .default;
+    log.warn("ignoring unsupported theme.theme value: {s}", .{value});
+    return null;
+}
+
+fn applyThemeColorOverrides(config: *AppConfig, object: std.json.ObjectMap) void {
+    inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
+        if (object.get(field.name)) |value| {
+            if (parseConfigColor(value)) |parsed| {
+                @field(config.theme_config.colors, field.name) = parsed;
+            } else {
+                log.warn("theme.colors.{s} must be a hex string or RGB/RGBA number array", .{field.name});
+            }
+        }
+    }
+}
+
+fn parseConfigColor(value: std.json.Value) ?[4]f32 {
+    return switch (value) {
+        .string => |raw| parseHexConfigColor(raw),
+        .array => |array| parseArrayConfigColor(array),
+        else => null,
+    };
+}
+
+fn parseHexConfigColor(raw: []const u8) ?[4]f32 {
+    var value = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
+    if (value.len != 7 or value[0] != '#') return null;
+    return .{
+        @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[1..3], 16) catch return null)) / 255.0,
+        @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[3..5], 16) catch return null)) / 255.0,
+        @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[5..7], 16) catch return null)) / 255.0,
+        1.0,
+    };
+}
+
+fn parseArrayConfigColor(array: std.json.Array) ?[4]f32 {
+    if (array.items.len != 3 and array.items.len != 4) return null;
+    var result = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
+    for (array.items, 0..) |item, index| {
+        result[index] = switch (item) {
+            .integer => |value| colorChannelFromNumber(@floatFromInt(value)),
+            .float => |value| colorChannelFromNumber(@floatCast(value)),
+            else => return null,
+        } orelse return null;
+    }
+    return result;
+}
+
+fn colorChannelFromNumber(value: f32) ?f32 {
+    if (!std.math.isFinite(value)) return null;
+    if (value >= 0.0 and value <= 1.0) return value;
+    if (value >= 0.0 and value <= 255.0) return value / 255.0;
+    return null;
 }
 
 fn applyUiOverrides(config: *AppConfig, ui_value: std.json.Value) void {
@@ -342,100 +428,76 @@ fn applyFontSize(config: *AppConfig, value: f32) void {
 }
 
 test "app config accepts ui.font_size override" {
-    var root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
-
-            var ui = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer ui.deinit();
-            try ui.put("font_size", .{ .integer = 22 });
-
-            try object.put("ui", .{ .object = ui });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
+    var root = try parseTestRoot("{\"ui\":{\"font_size\":22}}");
+    defer root.deinit();
 
     var config: AppConfig = .{};
     defer config.deinit(std.testing.allocator);
-    applyAppOverrides(std.testing.allocator, &config, root);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(@as(f32, 22.0), config.font_size);
 }
 
 test "app config ignores out-of-range ui.font_size" {
-    var root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
-
-            var ui = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer ui.deinit();
-            try ui.put("font_size", .{ .integer = 64 });
-
-            try object.put("ui", .{ .object = ui });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
+    var root = try parseTestRoot("{\"ui\":{\"font_size\":64}}");
+    defer root.deinit();
 
     var config: AppConfig = .{};
     defer config.deinit(std.testing.allocator);
-    applyAppOverrides(std.testing.allocator, &config, root);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expectEqual(theme.DEFAULT_FONT_SIZE, config.font_size);
 }
 
-test "app config accepts named open default" {
-    var root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
-
-            var open = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer open.deinit();
-            try open.put("default", .{ .string = "cursor" });
-
-            try object.put("open", .{ .object = open });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
+test "app config accepts theme source and color overrides" {
+    var root = try parseTestRoot(
+        \\{
+        \\  "theme": {
+        \\    "theme": "default",
+        \\    "colors": {
+        \\      "background": "#101820",
+        \\      "accent": [80, 200, 120]
+        \\    }
+        \\  }
+        \\}
+    );
+    defer root.deinit();
 
     var config: AppConfig = .{};
     defer config.deinit(std.testing.allocator);
-    applyAppOverrides(std.testing.allocator, &config, root);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(theme.ThemeSource.default, config.theme_config.source);
+    try std.testing.expectEqual(@as(f32, 0x10) / 255.0, config.theme_config.colors.background.?[0]);
+    try std.testing.expectEqual(@as(f32, 80) / 255.0, config.theme_config.colors.accent.?[0]);
+}
+
+test "app config accepts named open default" {
+    var root = try parseTestRoot("{\"open\":{\"default\":\"cursor\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expect(config.default_open_action == .cursor);
 }
 
 test "app config accepts custom open default" {
-    var root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
-
-            var open = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer open.deinit();
-
-            var custom = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer custom.deinit();
-            try custom.put("label", .{ .string = "Workbench" });
-            try custom.put("action", .{ .string = "cursor ." });
-
-            try open.put("default", .{ .object = custom });
-            try object.put("open", .{ .object = open });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
+    var root = try parseTestRoot("{\"open\":{\"default\":{\"label\":\"Workbench\",\"action\":\"cursor .\"}}}");
+    defer root.deinit();
 
     var config: AppConfig = .{};
     defer config.deinit(std.testing.allocator);
-    applyAppOverrides(std.testing.allocator, &config, root);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expect(config.default_open_action == .custom);
     try std.testing.expectEqualStrings("Workbench", config.default_open_action.custom.label);
     try std.testing.expectEqualStrings("cursor .", config.default_open_action.custom.action);
+}
+
+fn parseTestRoot(raw: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{
+        .allocate = .alloc_always,
+    });
 }

@@ -498,7 +498,7 @@ fn renderInspectorSplitButton(
         .y = inspect_rect.y + divider_inset,
         .w = theme.scaledUi(1.0),
         .h = inspect_rect.h - divider_inset * 2.0,
-    }), paletteColor(colors.rgba(0, 0, 0, 70)));
+    }), paletteColor(theme.withAlpha(theme.background(), 70)));
 
     const icon_size = theme.scaledUi(TOOLBAR_ICON_SIZE);
     queuePaletteIcon(state, iconRectForButton(inspect_rect, icon_size), NF_COD_INSPECT, icon_size, paletteColor(icon_color));
@@ -522,7 +522,7 @@ fn renderToolbar(state: *app_state.AppState, dock_rect: palette.Rect) void {
     const field_width = @max(avail - buttons_width, theme.scaledUi(TOOLBAR_FIELD_MIN_WIDTH));
 
     palette_toolbar_rect = .{ .x = dock_rect.x, .y = dock_rect.y, .w = dock_rect.w, .h = toolbar_height };
-    queuePaletteRect(state, palette_toolbar_rect, paletteColor(colors.rgba(18, 20, 25, 255)));
+    queuePaletteRect(state, palette_toolbar_rect, paletteColor(theme.background()));
 
     const address_rect: palette.Rect = .{
         .x = dock_rect.x + pad_x,
@@ -595,8 +595,8 @@ fn renderInspectorModeMenu(state: *app_state.AppState, anchor: palette.Rect, ins
         .w = menu_width,
         .h = row_height * 3.0 + pad * 2.0,
     };
-    queuePaletteRoundedRect(state, palette_menu_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(12.0));
-    queuePaletteBorder(state, palette_menu_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
+    queuePaletteBorder(state, palette_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
     var y = palette_menu_rect.y + pad;
     renderInspectorModeMenuRow(state, .{ .x = palette_menu_rect.x + pad, .y = y, .w = palette_menu_rect.w - pad * 2.0, .h = row_height }, "Point", inspector_mode == .point, .inspect_mode_point);
@@ -650,8 +650,8 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
     y = theme.clampf(y, min_y, @max(min_y, max_y));
     palette_context_menu_rect = .{ .x = x, .y = y, .w = menu_width, .h = content_height };
 
-    queuePaletteRoundedRect(state, palette_context_menu_rect, paletteColor(colors.rgba(26, 28, 34, 245)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, palette_context_menu_rect, paletteColor(colors.rgba(70, 74, 86, 255)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, palette_context_menu_rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, palette_context_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
 
     var row_y = palette_context_menu_rect.y + pad;
     for (state.browser_context_menu_items.items) |item| {
@@ -661,7 +661,7 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
                 .y = row_y + separator_height * 0.5,
                 .w = palette_context_menu_rect.w - pad * 2.0,
                 .h = theme.scaledUi(1.0),
-            }), paletteColor(colors.rgba(82, 86, 98, 180)));
+            }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
             row_y += separator_height;
             continue;
         }
@@ -721,7 +721,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
     queuePaletteBorder(
         state,
         rect,
-        paletteColor(if (focused) theme.COLOR_SECONDARY_GREEN else colors.rgba(66, 68, 78, 255)),
+        paletteColor(if (focused) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_MUTED),
         theme.scaledUi(8.0),
         theme.scaledUi(1.0),
     );
@@ -739,7 +739,7 @@ fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) voi
                     .y = text_rect.y,
                     .w = clamped_x1 - clamped_x0,
                     .h = text_rect.h,
-                }, paletteColor(colors.rgba(36, 92, 124, 200)));
+                }, paletteColor(theme.withAlpha(theme.selection(), 200)));
             }
         }
     }
@@ -932,7 +932,7 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
         pane_hovered,
     );
 
-    queuePaletteRect(state, pane_rect, paletteColor(colors.rgba(9, 11, 16, 255)));
+    queuePaletteRect(state, pane_rect, paletteColor(theme.background()));
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {

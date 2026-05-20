@@ -598,8 +598,8 @@ pub fn renderThreadDropPreview(state: *runtime.AppState, x: f32, y: f32) void {
     const target = maybe_target orelse return;
     const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DROP_PREVIEW_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
-    queueRounded(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 54)), theme.scaledUi(6.0));
-    queueBorder(state, target.preview, paletteColor(colors.rgba(93, 223, 143, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
+    queueRounded(state, target.preview, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 54)), theme.scaledUi(6.0));
+    queueBorder(state, target.preview, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
 }
 
 pub fn clearThreadDropTarget() void {
@@ -679,7 +679,7 @@ fn renderNode(state: *runtime.AppState, node: *const runtime.WorkspaceNode, rect
 }
 
 fn renderSplitGutter(state: *runtime.AppState, first: *const runtime.WorkspaceNode, second: *const runtime.WorkspaceNode, axis: runtime.WorkspaceSplitAxis, rect: palette.Rect, split_rect: palette.Rect) void {
-    queueRect(state, rect, paletteColor(colors.rgba(44, 51, 58, 255)));
+    queueRect(state, rect, paletteColor(theme.COLOR_PANEL_MUTED));
     const hit_rect = if (axis == .vertical)
         palette.Rect{ .x = rect.x - theme.scaledUi(4.0), .y = rect.y, .w = rect.w + theme.scaledUi(8.0), .h = rect.h }
     else
@@ -778,16 +778,16 @@ fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId,
 fn renderSplitTriggerButton(state: *runtime.AppState, rect: palette.Rect, active: bool, emphasized: bool, clip: palette.Rect) void {
     _ = clip;
     if (active) {
-        queueRounded(state, rect, paletteColor(colors.rgba(40, 50, 58, 255)), theme.scaledUi(5.0));
+        queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
         queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(5.0), theme.scaledUi(1.0));
     } else if (emphasized) {
-        queueRounded(state, rect, paletteColor(colors.rgba(28, 32, 38, 255)), theme.scaledUi(5.0));
-        queueBorder(state, rect, paletteColor(colors.rgba(62, 70, 78, 255)), theme.scaledUi(5.0), theme.scaledUi(1.0));
+        queueRounded(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(5.0));
+        queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(5.0), theme.scaledUi(1.0));
     }
     const icon_color = if (active or emphasized)
         theme.COLOR_WHITE
     else
-        colors.rgba(120, 128, 138, 255);
+        theme.COLOR_TEXT_SUBTLE;
 
     const cell = theme.scaledUi(4.0);
     const gap = theme.scaledUi(2.0);
@@ -847,8 +847,8 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     split_menu_rect = menu_rect;
     split_submenu_rect = .{};
 
-    queueRounded(state, menu_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(10.0));
-    queueBorder(state, menu_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(10.0), theme.scaledUi(1.0));
+    queueRounded(state, menu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
+    queueBorder(state, menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
 
     const MenuRow = struct {
         action: WorkspacePaneAction,
@@ -887,8 +887,8 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const submenu_visible = rectContains(split_trigger_rect, state.palette_mouse_x, state.palette_mouse_y) or rectContains(submenu_rect, state.palette_mouse_x, state.palette_mouse_y);
     if (submenu_visible) {
         split_submenu_rect = submenu_rect;
-        queueRounded(state, submenu_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(10.0));
-        queueBorder(state, submenu_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(10.0), theme.scaledUi(1.0));
+        queueRounded(state, submenu_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(10.0));
+        queueBorder(state, submenu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
         y = submenu_rect.y + menu_pad_top;
         const submenu_row_w = submenu_rect.w - menu_pad_x * 2.0;
         for (rows) |row| {
@@ -909,7 +909,7 @@ fn renderContextMenuStaticRow(
 ) palette.Rect {
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
-    if (hovered) queueRounded(state, rect, paletteColor(colors.rgba(42, 50, 58, 255)), theme.scaledUi(5.0));
+    if (hovered) queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     queueText(state, .{
         .x = rect.x + theme.scaledUi(8.0),
         .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
@@ -941,7 +941,7 @@ fn renderContextMenuRow(
     const rect = palette.Rect{ .x = menu_rect.x + pad_x, .y = y, .w = w, .h = h };
     const hovered = rectContains(rect, state.palette_mouse_x, state.palette_mouse_y);
     if (hovered) {
-        queueRounded(state, rect, paletteColor(colors.rgba(42, 50, 58, 255)), theme.scaledUi(5.0));
+        queueRounded(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
     }
     const text_color = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
     queueText(state, .{
@@ -981,7 +981,7 @@ fn copyTranscriptSelectionToClipboard(state: *runtime.AppState) void {
 
 fn renderRestoreStrip(state: *runtime.AppState, rect: palette.Rect, minimized_count: usize) void {
     if (minimized_count == 0 or rect.h <= 0.0) return;
-    queueRect(state, rect, paletteColor(colors.rgba(14, 16, 19, 255)));
+    queueRect(state, rect, paletteColor(theme.background()));
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, theme.scaledUi(1.0));
 
     var x = rect.x + theme.scaledUi(10.0);
@@ -1011,8 +1011,8 @@ fn renderRestoreStrip(state: *runtime.AppState, rect: palette.Rect, minimized_co
 }
 
 fn renderRestoreChip(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool, clip: palette.Rect) void {
-    const bg = if (hovered) colors.rgba(40, 48, 56, 255) else colors.rgba(26, 30, 36, 255);
-    const border = if (hovered) colors.rgba(96, 108, 122, 255) else colors.rgba(58, 66, 76, 255);
+    const bg = if (hovered) theme.lighten(theme.COLOR_PANEL_ALT, 0.08) else theme.COLOR_PANEL_ALT;
+    const border = if (hovered) theme.COLOR_PANEL_MUTED else theme.borderMuted();
     queueRounded(state, rect, paletteColor(bg), theme.scaledUi(5.0));
     queueBorder(state, rect, paletteColor(border), theme.scaledUi(5.0), theme.scaledUi(1.0));
 

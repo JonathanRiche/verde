@@ -118,6 +118,37 @@ const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
 
+fn paletteColor(color: [4]f32) palette.Color {
+    return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
+}
+
+fn paletteComposerStyle() PaletteComposerPrompt.Style {
+    return .{
+        .background_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)),
+        .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
+        .focus_border_color = paletteColor(theme.COLOR_GREEN),
+        .focus_border_width = 1.5,
+        .control_background_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)),
+        .control_hover_color = paletteColor(theme.withAlpha(theme.lighten(theme.COLOR_PANEL_ALT, 0.08), 210)),
+        .separator_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 90)),
+        .send_color = paletteColor(theme.COLOR_GREEN),
+        .send_hover_color = paletteColor(theme.lighten(theme.COLOR_GREEN, 0.08)),
+        .stop_button_color = paletteColor(theme.COLOR_YELLOW),
+        .stop_button_hover_color = paletteColor(theme.lighten(theme.COLOR_YELLOW, 0.08)),
+        .text_color = paletteColor(theme.COLOR_WHITE),
+        .placeholder_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 220)),
+        .icon_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .cursor_color = paletteColor(theme.COLOR_WHITE),
+        .selection_color = paletteColor(theme.withAlpha(theme.selection(), 140)),
+        .scrollbar_track_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 110)),
+        .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)),
+        .menu_background_color = paletteColor(theme.COLOR_PANEL_ALT),
+        .menu_border_color = paletteColor(theme.COLOR_PANEL_MUTED),
+        .menu_selected_color = paletteColor(theme.withAlpha(theme.selection(), 218)),
+        .menu_hover_color = paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+    };
+}
+
 pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // Geometry retuned for the 15pt toolbar / 16pt body fonts. Earlier numbers
     // assumed ~24pt pills and looked over-padded after the type-scale change.
@@ -5047,6 +5078,15 @@ pub const AppState = struct {
         self.app_config = next_config;
     }
 
+    pub fn rethemeTerminalSessions(self: *AppState) !void {
+        for (self.projects.items) |*project| {
+            try project.terminal_dock.rethemeSessions(self.allocator);
+            for (project.terminal_docks.items) |*entry| {
+                try entry.dock.rethemeSessions(self.allocator);
+            }
+        }
+    }
+
     pub fn hasCustomTerminalLaunchProfile(self: *const AppState) bool {
         return self.app_config.terminal_launch_profiles.len > 0;
     }
@@ -8898,6 +8938,7 @@ pub const AppState = struct {
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
+        self.palette_composer.setStyle(paletteComposerStyle());
         // Composer font sizes are CSS units in the comptime config but the
         // runtime metrics need to be the actual pixel size, otherwise the
         // placeholder + selectors render at fixed pixel sizes while everything

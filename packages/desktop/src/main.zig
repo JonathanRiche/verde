@@ -191,6 +191,7 @@ fn mainInner(init: std.process.Init) !void {
         log.warn("failed to load app config: {s}", .{@errorName(err)});
         break :blk app_config.AppConfig{ .font_size = DEFAULT_FONT_SIZE };
     };
+    ui_theme.applyConfigTheme(allocator, loaded_app_config.theme_config);
 
     // Install the font metrics used by the Palette desktop UI.
     ui_theme.installFonts(
@@ -1828,28 +1829,27 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
 }
 
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
-    state.reloadFromStorage() catch |err| {
-        log.err("failed to refresh native app state: {s}", .{@errorName(err)});
-        state.setSidebarNotice("Refresh failed.");
-        return;
-    };
-
     const next_keyboard = keybinds.NativeKeyboardConfig.load(state.allocator) catch |err| {
         log.err("failed to refresh native keybinds: {s}", .{@errorName(err)});
-        state.setSidebarNotice("App refreshed, but keybinds failed to reload.");
+        state.setSidebarNotice("Refresh failed: keybinds did not reload.");
         return;
     };
     const next_app_config = app_config.loadAppConfig(state.allocator) catch |err| {
         log.err("failed to refresh native app config: {s}", .{@errorName(err)});
         keyboard.deinit();
         keyboard.* = next_keyboard;
-        state.setSidebarNotice("App refreshed, but config failed to reload.");
+        state.setSidebarNotice("Refresh failed: config did not reload.");
         return;
     };
     keyboard.deinit();
     keyboard.* = next_keyboard;
+    ui_theme.applyConfigTheme(state.allocator, next_app_config.theme_config);
     state.replaceAppConfig(next_app_config);
-    state.setSidebarNotice("App, config, and keybinds refreshed.");
+    state.rethemeTerminalSessions() catch |err| {
+        log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
+    };
+    state.markDirty();
+    state.setSidebarNotice("Config, keybinds, and theme refreshed.");
 }
 
 test {

@@ -224,7 +224,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     hit_cache.menu_count = 0;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
-    const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(colors.rgba(9, 12, 13, 255));
+    const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
 
@@ -358,7 +358,7 @@ fn renderTabs(state: *app_state.AppState, dock: anytype, header: palette.Rect) v
         const tab_w = theme.clampf(@as(f32, @floatFromInt(label.len)) * theme.scaledUi(7.0) + theme.scaledUi(24.0), theme.scaledUi(72.0), theme.scaledUi(180.0));
         const tab_rect = palette.Rect{ .x = x, .y = header.y + theme.scaledUi(5.0), .w = tab_w, .h = tab_h };
         appendTabHit(index, tab_rect);
-        if (index == dock.active_tab_index) queueRounded(state, tab_rect, paletteColor(colors.rgba(23, 30, 32, 255)), theme.scaledUi(6.0));
+        if (index == dock.active_tab_index) queueRounded(state, tab_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(6.0));
         queueText(state, .{ .x = tab_rect.x + theme.scaledUi(10.0), .y = tab_rect.y + theme.scaledUi(4.0), .w = tab_rect.w - theme.scaledUi(20.0), .h = tab_rect.h }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), tab_rect);
         x += tab_w + theme.scaledUi(6.0);
         if (x > header.x + header.w - theme.scaledUi(80.0)) break;
@@ -390,7 +390,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;
-        queueRect(state, rect, paletteColor(colors.rgba(7, 10, 11, 255)));
+        queueRect(state, rect, paletteColor(theme.background()));
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
@@ -589,8 +589,8 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     menu_y = @max(dock_rect.y + theme.scaledUi(4.0), menu_y);
     hit_cache.menu_panel = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
 
-    queueRounded(state, hit_cache.menu_panel, paletteColor(colors.rgba(24, 28, 30, 255)), theme.scaledUi(8.0));
-    queueBorder(state, hit_cache.menu_panel, paletteColor(colors.rgba(74, 84, 88, 255)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queueRounded(state, hit_cache.menu_panel, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
+    queueBorder(state, hit_cache.menu_panel, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
 
     hit_cache.menu_count = count;
     var i: usize = 0;
@@ -599,7 +599,7 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         const row = palette.Rect{ .x = menu_x + pad, .y = y, .w = menu_w - pad * 2.0, .h = row_h };
         hit_cache.menu_hits[i] = .{ .action = actions[i], .rect = row, .enabled = enabled[i] };
         const hovered = mouse_ok and enabled[i] and rectContains(row, mx, my);
-        if (hovered) queueRounded(state, row, paletteColor(colors.rgba(44, 52, 54, 255)), theme.scaledUi(6.0));
+        if (hovered) queueRounded(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(6.0));
         queueText(state, .{
             .x = row.x + theme.scaledUi(10.0),
             .y = row.y + theme.scaledUi(6.0),
