@@ -1696,6 +1696,10 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
             return true;
         }
+        if (!verde_macos_host_window_should_close(nativeBrowserHostWindow(window))) {
+            runtime_log.diagnostic("ignoring unsolicited macOS window close request", .{});
+            return true;
+        }
     }
     if (builtin.os.tag == .macos) {
         _ = state.browser_state.controller.hide() catch {};
