@@ -50,6 +50,7 @@ var palette_hits: [16]BrowserHit = undefined;
 var palette_hit_count: usize = 0;
 var palette_toolbar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+var palette_context_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_mouse_pos: [2]f32 = .{ -1.0, -1.0 };
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
@@ -58,6 +59,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     palette_hit_count = 0;
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+    palette_context_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
 
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
@@ -67,6 +69,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
         .h = @max(rect.h - toolbar_height, theme.scaledUi(180.0)),
     });
     renderToolbar(state, rect);
+    renderBrowserContextMenu(state);
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
@@ -90,9 +93,60 @@ fn findHit(kind: BrowserHitKind) ?BrowserHit {
     return null;
 }
 
+pub fn triggerPaletteToolbarHit(state: *app_state.AppState, name: []const u8) bool {
+    const kind = toolbarHitKindByName(name) orelse return false;
+    const hit = findHit(kind) orelse return false;
+    return handlePaletteMouseButton(
+        state,
+        hit.rect.x + hit.rect.w * 0.5,
+        hit.rect.y + hit.rect.h * 0.5,
+        true,
+        1,
+    );
+}
+
+fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
+    if (std.mem.eql(u8, name, "address")) return .address;
+    if (std.mem.eql(u8, name, "back")) return .back;
+    if (std.mem.eql(u8, name, "forward")) return .forward;
+    if (std.mem.eql(u8, name, "navigate") or std.mem.eql(u8, name, "reload")) return .navigate;
+    if (std.mem.eql(u8, name, "inspect-toggle")) return .inspect_toggle;
+    if (std.mem.eql(u8, name, "inspect-menu")) return .inspect_mode_menu;
+    if (std.mem.eql(u8, name, "inspect-point")) return .inspect_mode_point;
+    if (std.mem.eql(u8, name, "inspect-draw-box")) return .inspect_mode_draw_box;
+    if (std.mem.eql(u8, name, "inspect-draw-freeform")) return .inspect_mode_draw_freeform;
+    if (std.mem.eql(u8, name, "close")) return .close;
+    return null;
+}
+
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
+
+    if (state.browser_context_menu_open) {
+        if (!down) {
+            return rectContainsPoint(palette_context_menu_rect, x, y);
+        }
+        if (rectContainsPoint(palette_context_menu_rect, x, y)) {
+            if (browserContextMenuItemAtPoint(state, x, y)) |item| {
+                if (item.enabled and !item.separator and !item.submenu) {
+                    state.activateBrowserContextMenuItem(item.index);
+                }
+            }
+            state.noteInteraction();
+            return true;
+        }
+        state.dismissBrowserContextMenu();
+        if (!state.browserPaneContains(x, y)) return true;
+    }
+
+    if (down and (rectContainsPoint(palette_toolbar_rect, x, y) or
+        (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y))))
+    {
+        if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+            _ = state.focusCurrentProjectWorkspacePane(pane_id);
+        }
+    }
 
     if (!down) {
         state.browser_address_drag_active = false;
@@ -141,7 +195,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .navigate => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
-                state.navigateBrowserFromAddress();
+                state.navigateOrReloadBrowserFromAddress();
             },
             .inspect_toggle => {
                 blurAddress(state);
@@ -575,6 +629,77 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
     addPaletteHit(rect, kind);
 }
 
+fn renderBrowserContextMenu(state: *app_state.AppState) void {
+    if (!state.browser_context_menu_open or state.browser_context_menu_items.items.len == 0) return;
+    const menu_width = theme.scaledUi(230.0);
+    const row_height = theme.scaledUi(30.0);
+    const separator_height = theme.scaledUi(9.0);
+    const pad = theme.scaledUi(6.0);
+    var content_height = pad * 2.0;
+    for (state.browser_context_menu_items.items) |item| {
+        content_height += if (item.separator) separator_height else row_height;
+    }
+
+    var x = state.browser_context_menu_anchor_x;
+    var y = state.browser_context_menu_anchor_y;
+    const min_x = state.browser_pane_min[0] + theme.scaledUi(4.0);
+    const min_y = state.browser_pane_min[1] + theme.scaledUi(4.0);
+    const max_x = state.browser_pane_max[0] - menu_width - theme.scaledUi(4.0);
+    const max_y = state.browser_pane_max[1] - content_height - theme.scaledUi(4.0);
+    x = theme.clampf(x, min_x, @max(min_x, max_x));
+    y = theme.clampf(y, min_y, @max(min_y, max_y));
+    palette_context_menu_rect = .{ .x = x, .y = y, .w = menu_width, .h = content_height };
+
+    queuePaletteRoundedRect(state, palette_context_menu_rect, paletteColor(colors.rgba(26, 28, 34, 245)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, palette_context_menu_rect, paletteColor(colors.rgba(70, 74, 86, 255)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+
+    var row_y = palette_context_menu_rect.y + pad;
+    for (state.browser_context_menu_items.items) |item| {
+        if (item.separator) {
+            queuePaletteRect(state, snapRect(.{
+                .x = palette_context_menu_rect.x + pad,
+                .y = row_y + separator_height * 0.5,
+                .w = palette_context_menu_rect.w - pad * 2.0,
+                .h = theme.scaledUi(1.0),
+            }), paletteColor(colors.rgba(82, 86, 98, 180)));
+            row_y += separator_height;
+            continue;
+        }
+
+        const row_rect: palette.Rect = .{
+            .x = palette_context_menu_rect.x + pad,
+            .y = row_y,
+            .w = palette_context_menu_rect.w - pad * 2.0,
+            .h = row_height,
+        };
+        const usable = item.enabled and !item.submenu;
+        if (rectHovered(row_rect) and usable) {
+            queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        }
+        queuePaletteText(state, .{
+            .x = row_rect.x + theme.scaledUi(8.0),
+            .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+            .w = row_rect.w - theme.scaledUi(16.0),
+            .h = theme.scaledUi(13.0) * 1.25,
+        }, item.label, paletteColor(if (usable) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        row_y += row_height;
+    }
+}
+
+fn browserContextMenuItemAtPoint(state: *app_state.AppState, x: f32, y: f32) ?app_state.BrowserContextMenuItem {
+    if (!rectContainsPoint(palette_context_menu_rect, x, y)) return null;
+    const row_height = theme.scaledUi(30.0);
+    const separator_height = theme.scaledUi(9.0);
+    const pad = theme.scaledUi(6.0);
+    var row_y = palette_context_menu_rect.y + pad;
+    for (state.browser_context_menu_items.items) |item| {
+        const height = if (item.separator) separator_height else row_height;
+        if (!item.separator and y >= row_y and y <= row_y + height) return item;
+        row_y += height;
+    }
+    return null;
+}
+
 fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) void {
     const focused = state.browser_address_focused;
     const address = state.browserState().addressInput();
@@ -706,6 +831,7 @@ fn focusAddress(state: *app_state.AppState) void {
     state.browser_address_focused = true;
     state.terminal_focused = false;
     state.composer_focused = false;
+    state.blurPaletteComposer();
     state.unfocusBrowserPane();
     state.browser_inspector_menu_open = false;
     state.browser_address_cursor = @min(state.browser_address_cursor, state.browserState().addressInput().len);
@@ -798,25 +924,21 @@ fn isPrimaryModifierPressed(modifier_state: sdl.Keymod) bool {
 fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     const browser_state = state.browserState();
     const pane_hovered = rectHovered(pane_rect);
-    const width_px: u32 = @intFromFloat(@max(pane_rect.w, 1.0));
-    const height_px: u32 = @intFromFloat(@max(pane_rect.h, 1.0));
-    const input_size = .{ @as(f32, @floatFromInt(width_px)), @as(f32, @floatFromInt(height_px)) };
-    browser_state.controller.resizePane(width_px, height_px) catch {};
+    const input_size = state.browserPaneInputSize(pane_rect.w, pane_rect.h);
+    state.noteBrowserPaneRegion(
+        .{ pane_rect.x, pane_rect.y },
+        .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
+        input_size,
+        pane_hovered,
+    );
 
     queuePaletteRect(state, pane_rect, paletteColor(colors.rgba(9, 11, 16, 255)));
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {
-            // Fill the pane so the preview uses the full column (resizePane already matches pane_rect size).
-            state.noteBrowserPaneRegion(
-                .{ pane_rect.x, pane_rect.y },
-                .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
-                input_size,
-                pane_hovered,
-            );
             state.palette_overlay_batch.image(
                 state.allocator,
-                .{ .x = pane_rect.x, .y = pane_rect.y, .w = pane_rect.w, .h = pane_rect.h },
+                snapRect(pane_rect),
                 palette.TextureId.init(pane_texture.texture_id),
                 .{ .x = 0.0, .y = 0.0, .w = 1.0, .h = 1.0 },
                 paletteColor(theme.COLOR_WHITE),
@@ -827,13 +949,6 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     }
 
     // Fall back to the full pane bounds while the browser frame has not arrived yet.
-    state.noteBrowserPaneRegion(
-        .{ pane_rect.x, pane_rect.y },
-        .{ pane_rect.x + pane_rect.w, pane_rect.y + pane_rect.h },
-        input_size,
-        pane_hovered,
-    );
-
     renderPanePlaceholder();
 }
 

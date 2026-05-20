@@ -39,6 +39,9 @@ extern "C" void verde_cef_resize_browser(int width, int height);
 extern "C" int verde_cef_navigate(const char* url);
 extern "C" int verde_cef_eval(const char* js);
 extern "C" int verde_cef_post_json(const char* json);
+extern "C" int verde_cef_go_back();
+extern "C" int verde_cef_go_forward();
+extern "C" int verde_cef_reload();
 extern "C" int verde_cef_send_mouse_move(double x, double y, unsigned int modifiers);
 extern "C" int verde_cef_send_mouse_click(double x,
                                            double y,
@@ -619,6 +622,27 @@ bool applyCommand(RuntimeState& state, const Command& command) {
       emitEvent("failed", &message);
     } else {
       emitEvent("js_message", &command.payload);
+    }
+    return true;
+  }
+  if (command.kind == "go_back") {
+    if (!verde_cef_go_back()) {
+      const std::string message = "CEF back navigation failed.";
+      emitEvent("failed", &message);
+    }
+    return true;
+  }
+  if (command.kind == "go_forward") {
+    if (!verde_cef_go_forward()) {
+      const std::string message = "CEF forward navigation failed.";
+      emitEvent("failed", &message);
+    }
+    return true;
+  }
+  if (command.kind == "reload") {
+    if (!verde_cef_reload()) {
+      const std::string message = "CEF reload failed.";
+      emitEvent("failed", &message);
     }
     return true;
   }

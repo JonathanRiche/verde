@@ -361,6 +361,16 @@ fn applyCommand(state: *HelperState, io: std.Io, command: ipc.Command) !bool {
                 });
             }
         },
+        .go_back => {
+            if (!browser_native.goBack()) return error.NavigateFailed;
+        },
+        .go_forward => {
+            if (!browser_native.goForward()) return error.NavigateFailed;
+        },
+        .reload => {
+            if (!browser_native.reload()) return error.NavigateFailed;
+        },
+        .mouse_move, .mouse_button, .mouse_wheel, .key_input, .text_input => {},
         .quit => return false,
     }
 
