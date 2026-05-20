@@ -154,7 +154,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     file_search_hits = .{};
     process_dashboard_hit_count = 0;
     if (pane_id == null) transcript_hit_count = 0;
-    queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
+    queueRect(state, rect, paletteColor(theme.background()));
     if (state.projects.items.len == 0) {
         state.workspace_header_open_menu_open = false;
         renderEmptyProjects(state, rect);
@@ -931,8 +931,8 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     workspace_header_hits = .{};
     workspace_header_hits.header_rect = rect;
 
-    queueRect(state, rect, paletteColor(colors.CHAT_BLACK));
-    queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(colors.DARK_BLUE));
+    queueRect(state, rect, paletteColor(theme.background()));
+    queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(theme.borderMuted()));
 
     const padding_x = theme.scaledUi(28.0);
     const thread = state.currentThread();
@@ -1002,7 +1002,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const combo_radius = theme.scaledUi(10.0);
     queueRounded(state, open_combo_rect, paletteColor(combo_bg), combo_radius);
 
-    const sep_col = colors.rgba(22, 24, 28, 110);
+    const sep_col = theme.withAlpha(theme.background(), 110);
     queueRect(state, .{
         .x = chevron_rect.x,
         .y = chevron_rect.y + theme.scaledUi(5.0),
@@ -1120,8 +1120,8 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     workspace_header_hits.menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
 
     const menu_clip = workspace_header_hits.menu_panel_rect;
-    queueRounded(state, workspace_header_hits.menu_panel_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(12.0));
-    queueBorder(state, workspace_header_hits.menu_panel_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queueRounded(state, workspace_header_hits.menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
+    queueBorder(state, workspace_header_hits.menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
     workspace_header_hits.menu_row_count = count;
     var ri: usize = 0;
@@ -1140,7 +1140,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 
         const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
         if (row_hover) {
-            queueRounded(state, rr, paletteColor(colors.rgba(42, 44, 52, 255)), theme.scaledUi(8.0));
+            queueRounded(state, rr, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
         }
 
         const row_icon_x = rr.x + theme.scaledUi(12.0);
@@ -1226,7 +1226,7 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
     if (project.managed_processes.items.len == 0) return;
 
     const clip = snapRect(rect);
-    queuePanel(state, rect, paletteColor(colors.rgba(20, 28, 30, 232)), paletteColor(colors.rgba(64, 78, 84, 180)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+    queuePanel(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)), theme.scaledUi(6.0), theme.scaledUi(1.0));
     queueChromeLabel(state, .{
         .x = rect.x + theme.scaledUi(12.0),
         .y = rect.y + theme.scaledUi(10.0),
@@ -1241,7 +1241,7 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
         const item_w = theme.clampf(rect.w * 0.18, theme.scaledUi(120.0), theme.scaledUi(190.0));
         if (x + item_w > rect.x + rect.w - theme.scaledUi(8.0)) break;
         const item = palette.Rect{ .x = x, .y = row_y, .w = item_w, .h = rect.h - theme.scaledUi(14.0) };
-        queueRounded(state, item, paletteColor(colors.rgba(13, 18, 19, 210)), theme.scaledUi(5.0));
+        queueRounded(state, item, paletteColor(theme.withAlpha(theme.background(), 210)), theme.scaledUi(5.0));
         const dot = palette.Rect{ .x = item.x + theme.scaledUi(9.0), .y = item.y + theme.scaledUi(12.0), .w = theme.scaledUi(8.0), .h = theme.scaledUi(8.0) };
         queueRounded(state, dot, managedProcessStatusColor(process.status), theme.scaledUi(4.0));
         queueChromeLabel(state, .{
@@ -1288,7 +1288,7 @@ fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
 }
 
 fn renderProcessDashboardButton(state: *app_state.AppState, rect: palette.Rect, label: []const u8, process_index: usize, action: ProcessDashboardAction, clip: palette.Rect) void {
-    queueRounded(state, rect, paletteColor(colors.rgba(34, 43, 47, 230)), theme.scaledUi(4.0));
+    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 230)), theme.scaledUi(4.0));
     queueChromeLabel(state, .{
         .x = rect.x,
         .y = rect.y + theme.scaledUi(2.0),
@@ -1303,10 +1303,10 @@ fn renderProcessDashboardButton(state: *app_state.AppState, rect: palette.Rect, 
 
 fn managedProcessStatusColor(status: app_state.ManagedProcessStatus) palette.Color {
     return paletteColor(switch (status) {
-        .running => colors.rgba(80, 200, 120, 255),
-        .starting, .restarting => colors.rgba(236, 178, 70, 255),
-        .crashed => colors.rgba(228, 84, 84, 255),
-        .stopped => colors.rgba(125, 139, 145, 255),
+        .running => theme.COLOR_GREEN,
+        .starting, .restarting => theme.COLOR_YELLOW,
+        .crashed => theme.COLOR_DIFF_REMOVE,
+        .stopped => theme.COLOR_TEXT_SUBTLE,
     });
 }
 
@@ -1445,8 +1445,8 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         const thumb_h = @max(theme.scaledUi(32.0), column.h * (column.h / content_height));
         const thumb_y = track.y + (track.h - thumb_h) * (scroll_y / max_scroll);
         const thumb_rect = snapRect(.{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h });
-        queueRounded(state, track, paletteColor(colors.rgba(35, 42, 46, 160)), theme.scaledUi(2.0));
-        queueRounded(state, thumb_rect, paletteColor(colors.rgba(145, 163, 170, 210)), theme.scaledUi(2.0));
+        queueRounded(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 160)), theme.scaledUi(2.0));
+        queueRounded(state, thumb_rect, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 210)), theme.scaledUi(2.0));
         transcript_scrollbar_track = track;
         transcript_scrollbar_thumb = thumb_rect;
         transcript_scrollbar_max_scroll = max_scroll;
@@ -1847,8 +1847,8 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
         queueRoundedShellClipped(
             state,
             frame,
-            paletteColor(colors.rgba(15, 22, 24, 255)),
-            paletteColor(colors.rgba(74, 92, 99, 255)),
+            paletteColor(theme.background()),
+            paletteColor(theme.COLOR_PANEL_MUTED),
             theme.scaledUi(9.0),
             clip,
         );
@@ -1975,8 +1975,8 @@ fn renderDiffSummaryCard(
 
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
     const rr = transcriptBubbleCornerRadius();
-    const bg = colors.rgba(24, 26, 32, 255);
-    const border = colors.rgba(56, 64, 78, 255);
+    const bg = theme.COLOR_PANEL_ALT;
+    const border = theme.COLOR_PANEL_MUTED;
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(border), rr, clip);
 
     const pad_x = theme.scaledUi(14.0);
@@ -2016,7 +2016,7 @@ fn renderDiffSummaryCard(
         .y = header_y + header_h - 1.0,
         .w = bubble.w - pad_x * 2.0,
         .h = 1.0,
-    }), paletteColor(colors.rgba(46, 52, 64, 255)));
+    }), paletteColor(theme.COLOR_PANEL_MUTED));
 
     var row_y = bubble.y + pad_y + header_h;
     const file_font = theme.scaledUi(13.5);
@@ -2152,8 +2152,8 @@ fn renderCommandEventRow(
     queueRoundedShellClipped(
         state,
         bubble,
-        paletteColor(colors.rgba(28, 29, 34, 255)),
-        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else colors.DARK_BLUE),
+        paletteColor(theme.COLOR_PANEL_ALT),
+        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else theme.borderMuted()),
         rr,
         clip,
     );
@@ -2181,9 +2181,9 @@ fn renderCommandEventRow(
             const phase = @as(f32, @floatFromInt(@mod(t_ns, period_ns))) / @as(f32, @floatFromInt(period_ns));
             const sin_t = std.math.sin(phase * std.math.tau);
             const alpha = 0.45 + 0.55 * (sin_t * 0.5 + 0.5);
-            break :blk [4]f32{ 122.0 / 255.0, 202.0 / 255.0, 255.0 / 255.0, alpha };
+            break :blk theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(alpha * 255.0));
         }
-        break :blk [4]f32{ 100.0 / 255.0, 170.0 / 255.0, 130.0 / 255.0, 1.0 };
+        break :blk theme.COLOR_GREEN;
     };
     queueRounded(state, .{
         .x = status_cx - status_dia * 0.5,
@@ -2327,9 +2327,9 @@ fn renderTranscriptBubbleFromParts(
     const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
     const bubble = snapRect(palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height });
     const bg = switch (role) {
-        .user => colors.rgba(31, 48, 46, 255),
-        .assistant => colors.rgba(22, 30, 32, 242),
-        .system => colors.rgba(57, 43, 9, 235),
+        .user => theme.darken(theme.COLOR_SECONDARY_GREEN, 0.03),
+        .assistant => theme.withAlpha(theme.background(), 242),
+        .system => theme.withAlpha(theme.COLOR_YELLOW, 54),
     };
     const rr = transcriptBubbleCornerRadius();
     queueRoundedShellClipped(state, bubble, paletteColor(bg), paletteColor(theme.COLOR_PANEL_MUTED), rr, clip);
@@ -2537,8 +2537,8 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
     queueRoundedShellClipped(
         state,
         panel,
-        paletteColor(colors.rgba(16, 21, 23, 250)),
-        paletteColor(colors.rgba(76, 95, 101, 255)),
+        paletteColor(theme.withAlpha(theme.background(), 250)),
+        paletteColor(theme.COLOR_PANEL_MUTED),
         theme.scaledUi(12.0),
         panel,
     );
@@ -2579,7 +2579,7 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
 
         const hovered = mouse_ok and rectContains(row, mx, my);
         if (result_index == selected_index or hovered) {
-            queueRounded(state, row, paletteColor(if (result_index == selected_index) colors.rgba(42, 73, 85, 230) else colors.rgba(38, 46, 50, 230)), theme.scaledUi(8.0));
+            queueRounded(state, row, paletteColor(if (result_index == selected_index) theme.withAlpha(theme.selection(), 230) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 230)), theme.scaledUi(8.0));
         }
 
         const result = results[result_index];
@@ -2650,14 +2650,14 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
     queueRoundedShellClipped(
         state,
         preview,
-        paletteColor(colors.rgba(7, 13, 14, 255)),
-        paletteColor(colors.rgba(76, 95, 101, 255)),
+        paletteColor(theme.background()),
+        paletteColor(theme.COLOR_PANEL_MUTED),
         theme.scaledUi(9.0),
         preview,
     );
 
     const thumb = palette.Rect{ .x = preview.x + theme.scaledUi(6.0), .y = preview.y + (preview.h - thumb_max) * 0.5, .w = thumb_max, .h = thumb_max };
-    queueRounded(state, thumb, paletteColor(colors.rgba(17, 24, 26, 255)), theme.scaledUi(8.0));
+    queueRounded(state, thumb, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
     if (state.ensureImageTexture(image.path)) |cached| {
         const dims = runtime.scaledImageSize(cached.width, cached.height, thumb.w, thumb.h);
         queueImage(state, .{ .x = thumb.x + (thumb.w - dims[0]) * 0.5, .y = thumb.y + (thumb.h - dims[1]) * 0.5, .w = dims[0], .h = dims[1] }, cached, thumb);
@@ -2681,8 +2681,8 @@ fn renderComposerDraftImageChip(state: *app_state.AppState, image: app_state.Cha
     queueRoundedShellClipped(
         state,
         clear_rect,
-        paletteColor(colors.rgba(35, 42, 46, 255)),
-        paletteColor(colors.rgba(86, 105, 112, 255)),
+        paletteColor(theme.COLOR_PANEL_MUTED),
+        paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.08)),
         clear_size * 0.5,
         clear_rect,
     );
