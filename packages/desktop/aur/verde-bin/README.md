@@ -19,5 +19,7 @@ makepkg --printsrcinfo > .SRCINFO
 
 - The package installs the bundled runtime under `/usr/lib/verde`.
 - `/usr/bin/verde` is a thin wrapper that launches `/usr/lib/verde/verde`.
+- `/usr/bin/verde-launch` is a thin wrapper for desktop-file launches via
+  `/usr/lib/verde/verde-launch`.
 - Upstream ships a top-level MIT license, which the package installs to
   `/usr/share/licenses/verde-bin/LICENSE`.

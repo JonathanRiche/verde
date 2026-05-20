@@ -88,6 +88,27 @@ if ! grep -Fq "'zenity: native folder picker integration'" "${PKGBUILD}"; then
   mv "${PKGBUILD}.tmp" "${PKGBUILD}"
 fi
 
+if ! grep -Fq '${pkgdir}/usr/bin/verde-launch' "${PKGBUILD}"; then
+  awk '
+    {
+      print
+      if (saw_verde_wrapper_end && $0 == "EOF") {
+        print ""
+        print "  install -Dm755 /dev/stdin \"${pkgdir}/usr/bin/verde-launch\" <<'\''EOF'\''"
+        print "#!/usr/bin/env bash"
+        print "set -euo pipefail"
+        print "exec /usr/lib/verde/verde-launch \"$@\""
+        print "EOF"
+        saw_verde_wrapper_end = 0
+      }
+      if ($0 == "exec /usr/lib/verde/verde \"\$@\"") {
+        saw_verde_wrapper_end = 1
+      }
+    }
+  ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
+  mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+fi
+
 awk \
   -v version="${VERSION}" \
   -v linux_sha="${LINUX_SHA}" \

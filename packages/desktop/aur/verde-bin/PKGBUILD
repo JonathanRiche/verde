@@ -68,6 +68,12 @@ set -euo pipefail
 exec /usr/lib/verde/verde "$@"
 EOF
 
+  install -Dm755 /dev/stdin "${pkgdir}/usr/bin/verde-launch" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/lib/verde/verde-launch "$@"
+EOF
+
   install -Dm644 "${release_root}/share/applications/verde.desktop" \
     "${pkgdir}/usr/share/applications/verde.desktop"
   install -Dm644 "${release_root}/share/pixmaps/verde.png" \
