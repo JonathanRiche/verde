@@ -50,6 +50,7 @@ var palette_hits: [16]BrowserHit = undefined;
 var palette_hit_count: usize = 0;
 var palette_toolbar_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+var palette_context_menu_rect: palette.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 var palette_mouse_pos: [2]f32 = .{ -1.0, -1.0 };
 
 /// Renders the browser dock that manages the in-app browser pane and bridge controls.
@@ -58,6 +59,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
     palette_hit_count = 0;
     palette_toolbar_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
     palette_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+    palette_context_menu_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
 
     const toolbar_height = theme.scaledUi(TOOLBAR_HEIGHT);
     renderPaneCanvas(state, .{
@@ -67,6 +69,7 @@ pub fn renderDockAt(state: *app_state.AppState, rect: palette.Rect) void {
         .h = @max(rect.h - toolbar_height, theme.scaledUi(180.0)),
     });
     renderToolbar(state, rect);
+    renderBrowserContextMenu(state);
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) void {
@@ -119,6 +122,23 @@ fn toolbarHitKindByName(name: []const u8) ?BrowserHitKind {
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
     if (!state.isBrowserVisible()) return false;
     palette_mouse_pos = .{ x, y };
+
+    if (state.browser_context_menu_open) {
+        if (!down) {
+            return rectContainsPoint(palette_context_menu_rect, x, y);
+        }
+        if (rectContainsPoint(palette_context_menu_rect, x, y)) {
+            if (browserContextMenuItemAtPoint(state, x, y)) |item| {
+                if (item.enabled and !item.separator and !item.submenu) {
+                    state.activateBrowserContextMenuItem(item.index);
+                }
+            }
+            state.noteInteraction();
+            return true;
+        }
+        state.dismissBrowserContextMenu();
+        if (!state.browserPaneContains(x, y)) return true;
+    }
 
     if (down and (rectContainsPoint(palette_toolbar_rect, x, y) or
         (state.browser_inspector_menu_open and rectContainsPoint(palette_menu_rect, x, y))))
@@ -607,6 +627,77 @@ fn renderInspectorModeMenuRow(state: *app_state.AppState, rect: palette.Rect, la
         .h = theme.scaledUi(14.0) * 1.25,
     }, row_label, paletteColor(if (selected) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(14.0), rect);
     addPaletteHit(rect, kind);
+}
+
+fn renderBrowserContextMenu(state: *app_state.AppState) void {
+    if (!state.browser_context_menu_open or state.browser_context_menu_items.items.len == 0) return;
+    const menu_width = theme.scaledUi(230.0);
+    const row_height = theme.scaledUi(30.0);
+    const separator_height = theme.scaledUi(9.0);
+    const pad = theme.scaledUi(6.0);
+    var content_height = pad * 2.0;
+    for (state.browser_context_menu_items.items) |item| {
+        content_height += if (item.separator) separator_height else row_height;
+    }
+
+    var x = state.browser_context_menu_anchor_x;
+    var y = state.browser_context_menu_anchor_y;
+    const min_x = state.browser_pane_min[0] + theme.scaledUi(4.0);
+    const min_y = state.browser_pane_min[1] + theme.scaledUi(4.0);
+    const max_x = state.browser_pane_max[0] - menu_width - theme.scaledUi(4.0);
+    const max_y = state.browser_pane_max[1] - content_height - theme.scaledUi(4.0);
+    x = theme.clampf(x, min_x, @max(min_x, max_x));
+    y = theme.clampf(y, min_y, @max(min_y, max_y));
+    palette_context_menu_rect = .{ .x = x, .y = y, .w = menu_width, .h = content_height };
+
+    queuePaletteRoundedRect(state, palette_context_menu_rect, paletteColor(colors.rgba(26, 28, 34, 245)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, palette_context_menu_rect, paletteColor(colors.rgba(70, 74, 86, 255)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+
+    var row_y = palette_context_menu_rect.y + pad;
+    for (state.browser_context_menu_items.items) |item| {
+        if (item.separator) {
+            queuePaletteRect(state, snapRect(.{
+                .x = palette_context_menu_rect.x + pad,
+                .y = row_y + separator_height * 0.5,
+                .w = palette_context_menu_rect.w - pad * 2.0,
+                .h = theme.scaledUi(1.0),
+            }), paletteColor(colors.rgba(82, 86, 98, 180)));
+            row_y += separator_height;
+            continue;
+        }
+
+        const row_rect: palette.Rect = .{
+            .x = palette_context_menu_rect.x + pad,
+            .y = row_y,
+            .w = palette_context_menu_rect.w - pad * 2.0,
+            .h = row_height,
+        };
+        const usable = item.enabled and !item.submenu;
+        if (rectHovered(row_rect) and usable) {
+            queuePaletteRoundedRect(state, row_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        }
+        queuePaletteText(state, .{
+            .x = row_rect.x + theme.scaledUi(8.0),
+            .y = row_rect.y + (row_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+            .w = row_rect.w - theme.scaledUi(16.0),
+            .h = theme.scaledUi(13.0) * 1.25,
+        }, item.label, paletteColor(if (usable) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
+        row_y += row_height;
+    }
+}
+
+fn browserContextMenuItemAtPoint(state: *app_state.AppState, x: f32, y: f32) ?app_state.BrowserContextMenuItem {
+    if (!rectContainsPoint(palette_context_menu_rect, x, y)) return null;
+    const row_height = theme.scaledUi(30.0);
+    const separator_height = theme.scaledUi(9.0);
+    const pad = theme.scaledUi(6.0);
+    var row_y = palette_context_menu_rect.y + pad;
+    for (state.browser_context_menu_items.items) |item| {
+        const height = if (item.separator) separator_height else row_height;
+        if (!item.separator and y >= row_y and y <= row_y + height) return item;
+        row_y += height;
+    }
+    return null;
 }
 
 fn renderPaletteAddressField(state: *app_state.AppState, rect: palette.Rect) void {

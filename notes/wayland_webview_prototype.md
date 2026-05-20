@@ -263,6 +263,7 @@ What is implemented:
 - Pointer move/button, wheel, keyboard, navigation, reload/history, eval, and the Verde JS bridge are wired through the existing helper protocol.
 - WPE frame publication is throttled to roughly one frame per display tick so the app does not ingest the full WPE export stream.
 - Verde passes the pane's logical viewport plus the app window device scale through the helper protocol. WPE applies that value with `wpe_view_backend_dispatch_set_device_scale_factor()`, so HiDPI outputs can render physical-pixel frames while exposing logical CSS coordinates to the page and input pipeline.
+- WPE context menus are routed through Verde's Palette UI. Basic actions such as Reload now activate through the helper protocol. WPE `Inspect Element` is remote-inspector-only and is hidden unless `WEBKIT_INSPECTOR_SERVER` or `WEBKIT_INSPECTOR_HTTP_SERVER` is explicitly configured before launching Verde.
 
 Verification commands:
 
@@ -300,7 +301,8 @@ Current WPE limitations:
 - The integrated path is still a CPU readback into shared memory, not a final zero-copy EGL texture import into Verde's renderer.
 - The HiDPI viewport/device-scale contract is now wired for WPE, but it still needs repeated subjective testing across monitors and resize/move cases.
 - The page reports `prefers-color-scheme: dark` as false. A WPE platform `WPE_SETTING_DARK_MODE` attempt was tested after WPE view creation, but it did not flip the media query and made the captured page render mostly blank, so that change was removed. Do not re-add it without proving visible page rendering and `scheme:true`.
-- Popup/window creation, downloads, context menus, IME composition, clipboard integration, and WebKit process crash recovery are not hardened yet.
+- WPE devtools are not enabled by default. Attempts to auto-enable `WEBKIT_INSPECTOR_HTTP_SERVER` from the helper made the WPE browser stop responding on Hyprland. Keep inspector support env-gated until a stable WPE remote-inspector launch flow is proven.
+- Popup/window creation, downloads, IME composition, clipboard integration, and WebKit process crash recovery are not hardened yet.
 - `snapshot_texture` remains the default until WPE scale, input, clipping, and subjective scroll feel pass repeated app-level testing.
 
 ## Current Blocker

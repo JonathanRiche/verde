@@ -790,6 +790,17 @@ int verde_browser_linux_text_input(struct verde_browser_linux *browser, const ch
     return 1;
 }
 
+int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browser, unsigned int index) {
+    (void)browser;
+    (void)index;
+    return 0;
+}
+
+int verde_browser_linux_context_menu_dismiss(struct verde_browser_linux *browser) {
+    (void)browser;
+    return 1;
+}
+
 void verde_browser_linux_free_string(char *payload) {
     g_free(payload);
 }

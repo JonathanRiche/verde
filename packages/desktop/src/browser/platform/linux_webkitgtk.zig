@@ -643,6 +643,16 @@ pub const Controller = struct {
         return true;
     }
 
+    /// Activates a context-menu item previously reported by the helper.
+    pub fn activateContextMenuItem(self: *Controller, index: u32) !void {
+        try self.sendCommand(.{ .kind = .context_menu_activate, .width = index });
+    }
+
+    /// Dismisses the helper's active context menu, if any.
+    pub fn dismissContextMenu(self: *Controller) !void {
+        try self.sendCommand(.{ .kind = .context_menu_dismiss });
+    }
+
     /// Returns the next browser event received from the Linux browser helper, if available.
     pub fn popEvent(self: *Controller) ?browser_types.Event {
         return self.queue.pop();
@@ -898,6 +908,8 @@ fn convertHelperEvent(allocator: std.mem.Allocator, event: ipc.Event) !browser_t
         .document_loaded => .document_loaded,
         .js_message => .{ .js_message = try allocator.dupe(u8, event.payload orelse "{}") },
         .eval_result => .{ .eval_result = try allocator.dupe(u8, event.payload orelse "null") },
+        .context_menu => .{ .context_menu = try allocator.dupe(u8, event.payload orelse "{}") },
+        .context_menu_dismissed => .context_menu_dismissed,
         .failed => .{ .failed = try allocator.dupe(u8, event.payload orelse "Linux browser helper failed.") },
         .frame_ready => unreachable,
     };
@@ -915,8 +927,14 @@ fn execHelperChild(
     if (std.c.dup2(stdin_pipe[0], std.c.STDIN_FILENO) < 0) std.c._exit(126);
     if (std.c.dup2(stdout_pipe[1], std.c.STDOUT_FILENO) < 0) std.c._exit(126);
     if (frame_fds) |fds| {
+        var temporary_fds: [FRAME_SLOT_COUNT]std.posix.fd_t = undefined;
         inline for (fds, 0..) |frame_fd, index| {
-            if (std.c.dup2(frame_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) < 0) std.c._exit(126);
+            const temporary_fd = std.c.fcntl(frame_fd, std.c.F.DUPFD, @as(c_int, FRAME_FD_BASE + FRAME_SLOT_COUNT));
+            if (temporary_fd < 0) std.c._exit(126);
+            temporary_fds[index] = temporary_fd;
+        }
+        inline for (temporary_fds, 0..) |temporary_fd, index| {
+            if (std.c.dup2(temporary_fd, FRAME_FD_BASE + @as(std.posix.fd_t, @intCast(index))) < 0) std.c._exit(126);
         }
     }
 
@@ -924,9 +942,6 @@ fn execHelperChild(
     _ = std.c.close(stdin_pipe[1]);
     _ = std.c.close(stdout_pipe[0]);
     _ = std.c.close(stdout_pipe[1]);
-    if (frame_fds) |fds| {
-        for (fds) |frame_fd| _ = std.c.close(frame_fd);
-    }
     closeInheritedFileDescriptors();
 
     var empty_signal_mask = std.posix.sigemptyset();

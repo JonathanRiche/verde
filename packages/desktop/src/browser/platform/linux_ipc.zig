@@ -20,6 +20,8 @@ pub const CommandKind = enum {
     mouse_wheel,
     key_input,
     text_input,
+    context_menu_activate,
+    context_menu_dismiss,
     quit,
 };
 
@@ -55,6 +57,8 @@ pub const EventKind = enum {
     document_loaded,
     js_message,
     eval_result,
+    context_menu,
+    context_menu_dismissed,
     frame_ready,
     failed,
 };

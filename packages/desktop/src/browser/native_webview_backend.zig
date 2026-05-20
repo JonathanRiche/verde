@@ -245,6 +245,18 @@ pub const Backend = struct {
         return self.platform.handleKey(event);
     }
 
+    /// Activates a platform-provided context-menu row.
+    pub fn activateContextMenuItem(self: *Backend, index: u32) !void {
+        if (builtin.os.tag != .linux) return;
+        try self.platform.activateContextMenuItem(index);
+    }
+
+    /// Dismisses a platform-provided context menu.
+    pub fn dismissContextMenu(self: *Backend) !void {
+        if (builtin.os.tag != .linux) return;
+        try self.platform.dismissContextMenu();
+    }
+
     /// Returns the next event from the native platform backend, if available.
     pub fn popEvent(self: *Backend) ?browser_types.Event {
         return self.platform.popEvent();

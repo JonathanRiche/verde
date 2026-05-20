@@ -191,6 +191,17 @@ pub const Controller = struct {
         return false;
     }
 
+    /// Stub context menus are not implemented.
+    pub fn activateContextMenuItem(self: *Controller, index: u32) !void {
+        _ = self;
+        _ = index;
+    }
+
+    /// Stub context menus are not implemented.
+    pub fn dismissContextMenu(self: *Controller) !void {
+        _ = self;
+    }
+
     /// Returns the next queued backend event, if one is available.
     pub fn popEvent(self: *Controller) ?browser_types.Event {
         return self.queue.pop();

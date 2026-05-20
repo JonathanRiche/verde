@@ -166,6 +166,9 @@ copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
 if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
 fi
+if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux-wpe" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-linux-wpe" "$PACKAGE_ROOT/bin/verde-browser-linux-wpe"
+fi
 if [[ "$BROWSER_BACKEND" == "cef" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
   install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"

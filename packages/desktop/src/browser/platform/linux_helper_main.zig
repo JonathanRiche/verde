@@ -29,6 +29,8 @@ extern fn verde_browser_linux_mouse_button(browser: ?*RawBrowser, x: f64, y: f64
 extern fn verde_browser_linux_mouse_wheel(browser: ?*RawBrowser, x: f64, y: f64, delta_x: f64, delta_y: f64, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_key_input(browser: ?*RawBrowser, key_code: c_uint, down: c_int, modifiers: c_uint) c_int;
 extern fn verde_browser_linux_text_input(browser: ?*RawBrowser, text: [*:0]const u8, modifiers: c_uint) c_int;
+extern fn verde_browser_linux_context_menu_activate(browser: ?*RawBrowser, index: c_uint) c_int;
+extern fn verde_browser_linux_context_menu_dismiss(browser: ?*RawBrowser) c_int;
 extern fn verde_browser_linux_poll_event(browser: ?*RawBrowser, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_browser_linux_poll_frame(browser: ?*RawBrowser, path: *?[*:0]u8, sequence: *u64, slot: *c_int, width: *c_int, height: *c_int, byte_len: *usize) c_int;
 extern fn verde_browser_linux_free_string(payload: ?[*:0]u8) void;
@@ -289,6 +291,14 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
             defer allocator.free(owned);
             _ = verde_browser_linux_text_input(browser, owned, encodeModifierMask(command));
         },
+        .context_menu_activate => {
+            const index: c_uint = if (command.payload) |payload|
+                std.fmt.parseUnsigned(c_uint, payload, 10) catch return true
+            else
+                @intCast(command.width);
+            _ = verde_browser_linux_context_menu_activate(browser, index);
+        },
+        .context_menu_dismiss => _ = verde_browser_linux_context_menu_dismiss(browser),
         .quit => return false,
     }
     return true;
@@ -367,6 +377,8 @@ fn mapEventKind(raw_kind: c_int) ipc.EventKind {
         5 => .document_loaded,
         6 => .js_message,
         7 => .eval_result,
+        9 => .context_menu,
+        10 => .context_menu_dismissed,
         else => .failed,
     };
 }
