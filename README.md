@@ -39,16 +39,6 @@ missing. On Arch-based systems, install `wpewebkit` and `wpebackend-fdo`; on
 Debian 13+ systems, install `libwpewebkit-2.0-1`, `libwpebackend-fdo-1.0-1`,
 `libjavascriptcoregtk-6.0-1`, `libegl1`, and `libgles2`.
 
-Verde can also be installed through the platform-specific npm launcher:
-
-```bash
-npx verde-app
-npm install -g verde-app
-verde
-```
-
-The npm package is intended for macOS Apple Silicon, macOS Intel, and Linux x86_64 developer machines.
-
 ## Source Builds
 
 Source builds require Zig `0.16.0` and SDL3 development files for your platform.
