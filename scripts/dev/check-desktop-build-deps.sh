@@ -17,8 +17,8 @@ need_cmd() {
 
 need_cmd bun
 
-if [[ ! -d "$REPO_ROOT/node_modules/@cursor/sdk" ]]; then
-  echo "missing Cursor SDK runtime dependencies: node_modules/@cursor/sdk" >&2
+if [[ ! -d "$REPO_ROOT/node_modules/@anthropic-ai/claude-agent-sdk" ]]; then
+  echo "missing provider bridge build dependencies in node_modules" >&2
   echo "run: BUN_TMPDIR=/tmp/verde-bun-tmp bun install --production" >&2
   exit 1
 fi

@@ -489,6 +489,7 @@ fn transcriptMarkdownBubbleHit(
     var content_y = column.y - scroll_y;
 
     for (thread.messages.items, 0..) |message, msg_idx| {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
             content_y += item_h + theme.scaledUi(12.0);
@@ -507,6 +508,7 @@ fn transcriptMarkdownBubbleHit(
 
     const base_idx = thread.messages.items.len;
     for (send_state.pending_events.items, 0..) |event, pi| {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
         const msg_idx = base_idx + pi;
         const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
@@ -706,6 +708,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const n = thread.messages.items.len;
     if (message_index < n) {
         const m = thread.messages.items[message_index];
+        if (m.role == .system and shouldHideCursorLifecycleSystemEvent(m.author, m.body)) return null;
         if (m.role == .system and shouldRenderPaletteCommandRow(m.author, m.body)) return null;
         if (m.role != .assistant) return null;
         const body_trim = std.mem.trim(u8, m.body, "\n\r\t ");
@@ -721,6 +724,7 @@ fn transcriptMarkdownMessageSnapshot(state: *app_state.AppState, message_index: 
     const pi = message_index - n;
     if (pi < send_state.pending_events.items.len) {
         const ev = send_state.pending_events.items[pi];
+        if (ev.role == .system and shouldHideCursorLifecycleSystemEvent(ev.author, ev.body)) return null;
         if (ev.role == .system and shouldRenderPaletteCommandRow(ev.author, ev.body)) return null;
         if (ev.role != .assistant) return null;
         const body_trim = std.mem.trim(u8, ev.body, "\n\r\t ");
@@ -1426,6 +1430,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     var content_y = column.y - scroll_y;
     for (thread.messages.items, 0..) |message, msg_idx| {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
             renderTranscriptMessage(state, column, content_y, item_h, message, clip, msg_idx);
@@ -1481,6 +1486,7 @@ fn snapTranscriptScrollY(value: f32, max_scroll: ?f32) f32 {
 fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f32) f32 {
     var total: f32 = theme.scaledUi(4.0);
     for (thread.messages.items, 0..) |message, message_index| {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
         total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
     }
     total += transcriptPendingStreamHeight(state, thread, width);
@@ -1496,6 +1502,7 @@ fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_
     const base = thread.messages.items.len;
     var total: f32 = 0;
     for (send_state.pending_events.items, 0..) |event, pi| {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
         const msg_idx = base + pi;
         total += transcriptMessageHeight(state, msg_idx, event.body, event.role, column_width, event.author, false) + theme.scaledUi(12.0);
     }
@@ -1515,6 +1522,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
     var y = content_y;
     const pending_count = send_state.pending_events.items.len;
     for (send_state.pending_events.items, 0..) |event, pi| {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
         const msg_idx = base_message_index + pi;
         const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
@@ -1591,12 +1599,54 @@ fn isCommandLikeShellBody(body_raw: []const u8) bool {
 
 fn shouldRenderPaletteCommandRow(author: []const u8, body_raw: []const u8) bool {
     if (isCommandSystemEvent(author)) return true;
+    if (isCursorToolSystemEvent(author, body_raw)) return true;
     return isCommandLikeShellBody(body_raw);
 }
 
-/// Label shown after `>_` in the compact command row (Codex-native titles preserved; shell-like bodies default to "Ran command").
+fn isCursorToolSystemEvent(author_raw: []const u8, body_raw: []const u8) bool {
+    const author = std.mem.trim(u8, author_raw, "\n\r\t ");
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    if (author.len == 0 or body.len == 0) return false;
+    if (std.mem.eql(u8, author, "System") or
+        std.mem.eql(u8, author, "Conversation interrupted") or
+        std.mem.eql(u8, author, "Cursor"))
+    {
+        return false;
+    }
+
+    const known_tools = [_][]const u8{
+        "Read",
+        "Read File",
+        "Grep",
+        "Glob",
+        "Shell",
+        "Edit",
+        "Write",
+        "LS",
+        "List",
+        "WebFetch",
+        "Web Search",
+    };
+    for (known_tools) |tool| {
+        if (std.ascii.eqlIgnoreCase(author, tool)) return true;
+    }
+    if (std.mem.indexOf(u8, body, "{\"command\"") != null) return true;
+    if (std.mem.endsWith(u8, body, ": {}")) return true;
+    return false;
+}
+
+fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8) bool {
+    _ = author;
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    return std.mem.eql(u8, body, "pending") or
+        std.mem.eql(u8, body, "in_progress") or
+        std.mem.eql(u8, body, "completed");
+}
+
+/// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
 fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
     if (isCommandSystemEvent(original_author)) return original_author;
+    if (isCursorToolSystemEvent(original_author, body_raw)) return "Ran command";
     if (isCommandLikeShellBody(body_raw)) return "Ran command";
     return original_author;
 }
@@ -1767,7 +1817,7 @@ fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: 
     const role_label = switch (message.role) {
         .user => "You",
         .assistant => if (message.author.len > 0) message.author else "Assistant",
-        .system => "System",
+        .system => if (message.author.len > 0) message.author else "System",
     };
     renderTranscriptBubbleFromParts(state, column, y, height, message.role, role_label, message.body, false, false, clip, message_index, false);
     renderTranscriptImages(state, column, y, height, message, clip);
@@ -2148,21 +2198,63 @@ fn renderCommandEventRow(
     queueCardChevron(state, chev_cx, chev_cy, expanded, paletteColor(theme.COLOR_TEXT_SUBTLE));
 
     const text_x = status_cx + status_dia * 0.5 + theme.scaledUi(10.0);
-    const text_w = @max((bubble.x + bubble.w - pad_x - chev_box_w - theme.scaledUi(6.0)) - text_x, theme.scaledUi(40.0));
+    const text_right = bubble.x + bubble.w - pad_x - chev_box_w - theme.scaledUi(6.0);
+    const text_w = @max(text_right - text_x, theme.scaledUi(40.0));
+    const header_text_clip = intersectClipRect(clip, .{
+        .x = text_x,
+        .y = bubble.y,
+        .w = @max(text_right - text_x, 0.0),
+        .h = header_h,
+    });
     const text_color = if (failed) paletteColor(theme.COLOR_DIFF_REMOVE) else paletteColor(theme.COLOR_TEXT_MUTED);
 
-    const header_text = std.fmt.allocPrint(state.allocator, ">_ {s} - {s}", .{ label, body }) catch null;
-    defer if (header_text) |t| state.allocator.free(t);
-
-    const display_text = truncateMonoToWidth(state.allocator, header_text orelse body, text_w, font_size);
-    defer if (display_text.allocated) state.allocator.free(display_text.text);
+    const mono_w = font_size * 0.55;
+    const text_y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5;
+    const icon_text = ">_";
+    const icon_w = @as(f32, @floatFromInt(icon_text.len)) * mono_w;
+    const gap = theme.scaledUi(7.0);
+    const label_x = text_x + icon_w + gap;
+    const label_w = @as(f32, @floatFromInt(label.len)) * mono_w;
+    const separator_gap = theme.scaledUi(8.0);
+    const separator = "-";
+    const separator_w = @as(f32, @floatFromInt(separator.len)) * mono_w;
+    const separator_x = label_x + label_w + separator_gap;
+    const body_x = separator_x + separator_w + separator_gap;
+    const body_w = @max(text_right - body_x, 0.0);
 
     queueFixedTextLine(state, snapRect(.{
         .x = text_x,
-        .y = bubble.y + pad_y + (line_h - font_size * 1.25) * 0.5,
-        .w = text_w,
+        .y = text_y,
+        .w = @min(icon_w, text_w),
         .h = font_size * 1.25,
-    }), display_text.text, text_color, font_size, clip);
+    }), icon_text, text_color, font_size, header_text_clip);
+
+    if (label_x < text_right) {
+        queueFixedTextLine(state, snapRect(.{
+            .x = label_x,
+            .y = text_y,
+            .w = @min(label_w, @max(text_right - label_x, 0.0)),
+            .h = font_size * 1.25,
+        }), label, text_color, font_size, header_text_clip);
+    }
+
+    if (body_w > mono_w * 3.0 and body.len > 0) {
+        queueFixedTextLine(state, snapRect(.{
+            .x = separator_x,
+            .y = text_y,
+            .w = @min(separator_w, @max(text_right - separator_x, 0.0)),
+            .h = font_size * 1.25,
+        }), separator, text_color, font_size, header_text_clip);
+
+        const display_body = truncateMonoToWidth(state.allocator, body, body_w, font_size);
+        defer if (display_body.allocated) state.allocator.free(display_body.text);
+        queueFixedTextLine(state, snapRect(.{
+            .x = body_x,
+            .y = text_y,
+            .w = body_w,
+            .h = font_size * 1.25,
+        }), display_body.text, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, header_text_clip);
+    }
 
     state.recordCardToggleHit(.{
         .rect = .{ .x = bubble.x, .y = bubble.y, .w = bubble.w, .h = header_h },
@@ -2179,6 +2271,20 @@ fn renderCommandEventRow(
         };
         renderWrappedBody(state, inner, body, paletteColor(theme.COLOR_TEXT_MUTED), font_size, clip);
     }
+}
+
+fn intersectClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
+    const p = parent orelse return child;
+    const x = @max(p.x, child.x);
+    const y = @max(p.y, child.y);
+    const right = @min(p.x + p.w, child.x + child.w);
+    const bottom = @min(p.y + p.h, child.y + child.h);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(right - x, 0.0),
+        .h = @max(bottom - y, 0.0),
+    };
 }
 
 /// Right-pointing triangle when collapsed, down-pointing when expanded.
