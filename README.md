@@ -13,12 +13,12 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 - Codex: install [Codex CLI](https://github.com/openai/codex) and run `codex login`.
 - Claude Code: install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in on your machine. Verde uses Anthropic's Claude Agent SDK to talk to the local Claude Code runtime.
 - OpenCode: install [OpenCode](https://github.com/anomalyco/opencode) and make sure `opencode` is on your `PATH`.
-- Cursor: set `CURSOR_API_KEY` in the environment used to launch Verde. The Cursor provider uses `@cursor/sdk`, which requires this API key.
+- Cursor: install the [Cursor CLI](https://cursor.com/docs/cli/installation), make sure `agent` is on your `PATH`, and run `agent login`. `CURSOR_API_KEY` is also supported for headless environments.
 
 Cursor example:
 
 ```bash
-export CURSOR_API_KEY=...
+agent login
 verde
 ```
 
@@ -332,7 +332,7 @@ verde live process inspect --focused [--json]
 - Codex threads use the local `codex` CLI and start `codex app-server` automatically when needed.
 - Claude Code threads use Anthropic's Claude Agent SDK and require Claude Code to be installed and logged in locally.
 - OpenCode threads use the local `opencode` CLI and can start `opencode serve` automatically when needed.
-- Cursor threads use `@cursor/sdk` and require `CURSOR_API_KEY`.
+- Cursor threads use the local Cursor CLI ACP server (`agent acp`) and require `agent login` or `CURSOR_API_KEY`.
 - Providers run against the project directory you import into Verde.
 
 If prompt sending fails, first check that the selected provider is installed, available to Verde's launch environment, and authenticated.
@@ -424,7 +424,6 @@ Those files capture Zig panic output, provider helper stderr, and the last panic
 
 Main third-party components used by the desktop app:
 
-- `@cursor/sdk` for Cursor provider integration.
 - `@anthropic-ai/claude-agent-sdk` for Claude Code provider integration.
 - `fff.nvim` / `fff-c` / `fff-search` for fast file indexing and search, vendored in [`vendor/fff`](vendor/fff). License: MIT.
 - Ghostty / `libghostty-vt` for terminal emulation and VT parsing. License: MIT.

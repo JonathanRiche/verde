@@ -659,6 +659,17 @@ const PersistedCursorModelOption = struct {
     reasoning_requires_thinking: bool = false,
 };
 
+fn persistedCursorModelCacheNeedsRefresh(options: []const PersistedCursorModelOption) bool {
+    for (options) |option| {
+        if (std.mem.eql(u8, option.value, "composer-2.5-fast") or
+            std.mem.eql(u8, option.value, "composer-2-fast"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn cursorReasoningValueLabel(value: []const u8) []const u8 {
     if (std.mem.eql(u8, value, "low")) return "Low";
     if (std.mem.eql(u8, value, "medium")) return "Medium";
@@ -786,10 +797,11 @@ pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
 };
 
 pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Auto", .value = "default" },
-    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL },
-    .{ .label = "GPT-5.5", .value = "gpt-5.5" },
-    .{ .label = "GPT-5.4", .value = "gpt-5.4" },
+    .{ .label = "Auto", .value = "auto" },
+    .{ .label = "Composer 2.5", .value = "composer-2.5", .cursor_fast_supported = true },
+    .{ .label = "Composer 2", .value = DEFAULT_CURSOR_MODEL, .cursor_fast_supported = true },
+    .{ .label = "GPT-5.5", .value = "gpt-5.5-medium", .cursor_fast_supported = true },
+    .{ .label = "GPT-5.4", .value = "gpt-5.4-medium", .cursor_fast_supported = true },
     .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7" },
     .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
 };
@@ -3529,6 +3541,8 @@ pub const AppState = struct {
             .allocate = .alloc_always,
         });
         defer parsed.deinit();
+
+        if (persistedCursorModelCacheNeedsRefresh(parsed.value)) return;
 
         self.clearCursorModelOptions();
         errdefer self.clearCursorModelOptions();
@@ -8520,7 +8534,7 @@ pub const AppState = struct {
                 break :blk std.fmt.allocPrint(self.allocator, "opencode --session {s}\n", .{thread_id});
             },
             .claude => std.fmt.allocPrint(self.allocator, "claude --resume {s}\n", .{thread_id}),
-            .cursor => std.fmt.allocPrint(self.allocator, "cursor-agent --resume {s}\n", .{thread_id}),
+            .cursor => std.fmt.allocPrint(self.allocator, "agent --resume {s}\n", .{thread_id}),
         };
     }
 
@@ -11115,9 +11129,9 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             else => "Failed to load Claude threads.",
         },
         .cursor => switch (err) {
-            error.FileNotFound => "Node was not found on PATH for Cursor.",
-            error.CursorSignedOut => "Cursor is not authenticated.",
-            error.UnsupportedOperation => "Cursor thread imports are not supported yet.",
+            error.FileNotFound => "Cursor CLI `agent` was not found on PATH.",
+            error.CursorSignedOut => "Cursor is not authenticated. Run `agent login` or set CURSOR_API_KEY.",
+            error.UnsupportedOperation => "Cursor CLI does not support thread imports in this version.",
             else => "Failed to load Cursor threads.",
         },
     };
@@ -11239,9 +11253,9 @@ fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             else => "Failed to sync the Claude thread.",
         },
         .cursor => switch (err) {
-            error.FileNotFound => "Node was not found on PATH for Cursor.",
-            error.CursorSignedOut => "Cursor is not authenticated.",
-            error.UnsupportedOperation => "Cursor thread sync is not supported yet.",
+            error.FileNotFound => "Cursor CLI `agent` was not found on PATH.",
+            error.CursorSignedOut => "Cursor is not authenticated. Run `agent login` or set CURSOR_API_KEY.",
+            error.UnsupportedOperation => "Cursor CLI does not support thread sync in this version.",
             else => "Failed to sync the Cursor thread.",
         },
     };

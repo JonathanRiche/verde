@@ -1160,10 +1160,24 @@ fn formatSendWorkerError(
     err: anyerror,
 ) ![]u8 {
     return switch (err) {
-        error.FileNotFound => std.fmt.allocPrint(
-            allocator,
-            "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
-            .{providerLabel(provider)},
+        error.FileNotFound => switch (provider) {
+            .claude => allocator.dupe(
+                u8,
+                "Node was not found on PATH. Install Node.js and make sure packaged app launches can find the node executable.",
+            ),
+            .cursor => allocator.dupe(
+                u8,
+                "Cursor CLI was not found. Install Cursor CLI, make sure `agent` is on PATH, then run `agent login`.",
+            ),
+            else => std.fmt.allocPrint(
+                allocator,
+                "{s} CLI was not found. Install it and make sure it is available on PATH for packaged app launches.",
+                .{providerLabel(provider)},
+            ),
+        },
+        error.ProviderBridgeNotFound => allocator.dupe(
+            u8,
+            "The bundled Claude provider bridge was not found. Rebuild or reinstall Verde so provider_bridge.mjs is installed.",
         ),
         error.OpencodeServerUnavailable => allocator.dupe(
             u8,
@@ -1179,11 +1193,11 @@ fn formatSendWorkerError(
         ),
         error.CursorSignedOut => allocator.dupe(
             u8,
-            "Cursor is not authenticated. Set CURSOR_API_KEY or sign in before sending.",
+            "Cursor is not authenticated. Run `agent login` or set CURSOR_API_KEY before sending.",
         ),
-        error.CursorBridgeFailed => allocator.dupe(
+        error.CursorAcpFailed => allocator.dupe(
             u8,
-            "Cursor provider request failed. Check Cursor authentication and @cursor/sdk availability.",
+            "Cursor ACP request failed. Check that the Cursor CLI works with `agent status` and `agent acp`.",
         ),
         else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
     };
