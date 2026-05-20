@@ -14,20 +14,20 @@ const log = std.log.scoped(.native_webview);
 const PlatformController = switch (builtin.os.tag) {
     .windows => @import("platform/windows_webview2.zig").Controller,
     .macos => @import("platform/macos_wkwebview.zig").Controller,
-    else => @import("platform/linux_webkitgtk.zig").Controller,
+    else => @import("platform/linux_wpe.zig").Controller,
 };
 
 pub fn configuredPresentationKind() browser_types.PresentationKind {
     return switch (builtin.os.tag) {
         .windows, .macos => .native_child_view,
-        .linux => @import("platform/linux_webkitgtk.zig").configuredPresentationKind(),
+        .linux => @import("platform/linux_wpe.zig").configuredPresentationKind(),
         else => .stub,
     };
 }
 
 pub fn configuredSupportsInspector() bool {
     return switch (builtin.os.tag) {
-        .linux => @import("platform/linux_webkitgtk.zig").configuredSupportsInspector(),
+        .linux => @import("platform/linux_wpe.zig").configuredSupportsInspector(),
         .macos, .windows => true,
         else => false,
     };

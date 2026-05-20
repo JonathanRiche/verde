@@ -16,10 +16,6 @@ if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
 fi
 ARCH="$(uname -m)"
-BROWSER_BACKEND="${VERDE_BROWSER_BACKEND:-native_webview}"
-if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-  source "$SCRIPT_DIR/cef-common.sh"
-fi
 
 case "$ARCH" in
   x86_64) ARCH="x86_64" ;;
@@ -118,10 +114,6 @@ assert_no_cef_payload() {
     "locales"
   )
 
-  if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-    return
-  fi
-
   for name in "${cef_payload[@]}"; do
     if [[ -e "$root_dir/bin/$name" ]]; then
       echo "native webview package unexpectedly contains CEF payload: bin/$name" >&2
@@ -130,13 +122,42 @@ assert_no_cef_payload() {
   done
 }
 
-mkdir -p "$OUTPUT_DIR"
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" "-Dbrowser-backend=$BROWSER_BACKEND")
-if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-  need_cmake
-  verde_cef_ensure_sdk linux "$ARCH"
-  BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
+write_linux_launcher() {
+  local launcher_path="$1"
+
+  cat > "$launcher_path" <<'EOF'
+#!/usr/bin/env sh
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+check_wpe_runtime() {
+  helper="$script_dir/verde-browser-linux"
+  if [ ! -x "$helper" ] || ! command -v ldd >/dev/null 2>&1; then
+    return
+  fi
+  missing="$(ldd "$helper" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
+  if [ -z "$missing" ]; then
+    return
+  fi
+  message="Verde's Linux browser pane needs WPE WebKit runtime libraries. Missing: $missing"
+  echo "$message" >&2
+  echo "Install WPE WebKit packages for your distro, then reopen Verde." >&2
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Verde needs WPE WebKit" "$message"
+  fi
+}
+
+check_wpe_runtime
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$script_dir/verde" >/dev/null 2>&1 &
+else
+  "$script_dir/verde" >/dev/null 2>&1 &
 fi
+EOF
+  chmod 755 "$launcher_path"
+}
+
+mkdir -p "$OUTPUT_DIR"
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview)
 
 cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
@@ -152,40 +173,11 @@ install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
 install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
 copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
-if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
+if [[ -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
   install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
 fi
-if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux-wpe" ]]; then
-  install -m 755 "$PREFIX_DIR/bin/verde-browser-linux-wpe" "$PACKAGE_ROOT/bin/verde-browser-linux-wpe"
-fi
-if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
-  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"
-  install -m 755 "$PREFIX_DIR/bin/libcef.so" "$PACKAGE_ROOT/bin/libcef.so"
-  install -m 755 "$PREFIX_DIR/bin/libEGL.so" "$PACKAGE_ROOT/bin/libEGL.so"
-  install -m 755 "$PREFIX_DIR/bin/libGLESv2.so" "$PACKAGE_ROOT/bin/libGLESv2.so"
-  install -m 755 "$PREFIX_DIR/bin/libvk_swiftshader.so" "$PACKAGE_ROOT/bin/libvk_swiftshader.so"
-  install -m 755 "$PREFIX_DIR/bin/libvulkan.so.1" "$PACKAGE_ROOT/bin/libvulkan.so.1"
-  install -m 755 "$PREFIX_DIR/bin/v8_context_snapshot.bin" "$PACKAGE_ROOT/bin/v8_context_snapshot.bin"
-  install -m 755 "$PREFIX_DIR/bin/vk_swiftshader_icd.json" "$PACKAGE_ROOT/bin/vk_swiftshader_icd.json"
-  install -m 755 "$PREFIX_DIR/bin/chrome-sandbox" "$PACKAGE_ROOT/bin/chrome-sandbox"
-  install -m 644 "$PREFIX_DIR/bin/chrome_100_percent.pak" "$PACKAGE_ROOT/bin/chrome_100_percent.pak"
-  install -m 644 "$PREFIX_DIR/bin/chrome_200_percent.pak" "$PACKAGE_ROOT/bin/chrome_200_percent.pak"
-  install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
-  install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
-  cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
-fi
 assert_no_cef_payload "$PACKAGE_ROOT"
-cat > "$PACKAGE_ROOT/bin/verde-launch" <<'EOF'
-#!/usr/bin/env sh
-script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-if command -v setsid >/dev/null 2>&1; then
-  setsid "$script_dir/verde" >/dev/null 2>&1 &
-else
-  "$script_dir/verde" >/dev/null 2>&1 &
-fi
-EOF
-chmod 755 "$PACKAGE_ROOT/bin/verde-launch"
+write_linux_launcher "$PACKAGE_ROOT/bin/verde-launch"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/pixmaps/verde.png"
 install -m 644 "$REPO_ROOT/packages/desktop/src/assets/verde_logo.png" "$PACKAGE_ROOT/share/icons/hicolor/256x256/apps/verde.png"
 printf '%s\n' "$VERSION" > "$PACKAGE_ROOT/share/verde/VERSION"
@@ -206,15 +198,8 @@ normalize_fff_dependency \
 strip_debug_symbols "$PACKAGE_ROOT/bin/verde"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3.so"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libSDL3_ttf.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef"
-strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-cef-process"
+strip_debug_symbols "$PACKAGE_ROOT/bin/verde-browser-linux"
 strip_debug_symbols "$PACKAGE_ROOT/bin/libfff_c.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libcef.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libEGL.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libGLESv2.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libvk_swiftshader.so"
-strip_debug_symbols "$PACKAGE_ROOT/bin/libvulkan.so.1"
-strip_debug_symbols "$PACKAGE_ROOT/bin/chrome-sandbox"
 
 cat > "$PACKAGE_ROOT/share/applications/verde.desktop" <<'EOF'
 [Desktop Entry]

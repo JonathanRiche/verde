@@ -3,7 +3,6 @@ set -euo pipefail
 
 PREFIX="${1:-$HOME/.local}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BROWSER_BACKEND="${VERDE_BROWSER_BACKEND:-native_webview}"
 
 mkdir -p \
   "$PREFIX/bin" \
@@ -44,10 +43,6 @@ assert_no_cef_payload() {
     "locales"
   )
 
-  if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-    return
-  fi
-
   for name in "${cef_payload[@]}"; do
     if [[ -e "$prefix/bin/$name" ]]; then
       echo "native webview install unexpectedly contains CEF payload: bin/$name" >&2
@@ -56,9 +51,56 @@ assert_no_cef_payload() {
   done
 }
 
+wpe_runtime_hint() {
+  cat >&2 <<'EOF'
+Verde's Linux browser pane uses WPE WebKit.
+Install the WPE WebKit runtime packages for your distro if the browser pane does not open:
+  Debian 13+: sudo apt install libwpewebkit-2.0-1 libwpebackend-fdo-1.0-1 libjavascriptcoregtk-6.0-1 libegl1 libgles2
+  Arch:       sudo pacman -S wpewebkit wpebackend-fdo
+  Fedora:     sudo dnf install wpewebkit wpebackend-fdo
+EOF
+}
+
+warn_missing_wpe_runtime() {
+  local helper_path="$1"
+
+  if [[ ! -x "$helper_path" ]]; then
+    return
+  fi
+  if ! command -v ldd >/dev/null 2>&1; then
+    return
+  fi
+
+  local missing
+  missing="$(ldd "$helper_path" 2>/dev/null | awk '/not found/ { print $1 }' | sort -u | tr '\n' ' ')"
+  if [[ -n "$missing" ]]; then
+    echo "warning: Verde browser helper is missing runtime libraries: $missing" >&2
+    wpe_runtime_hint
+  fi
+}
+
 install -m 755 "$SCRIPT_DIR/bin/verde" "$PREFIX/bin/verde"
 cat > "$PREFIX/bin/verde-launch" <<EOF
 #!/usr/bin/env sh
+script_dir="$PREFIX/bin"
+check_wpe_runtime() {
+  helper="\$script_dir/verde-browser-linux"
+  if [ ! -x "\$helper" ] || ! command -v ldd >/dev/null 2>&1; then
+    return
+  fi
+  missing="\$(ldd "\$helper" 2>/dev/null | awk '/not found/ { print \$1 }' | sort -u | tr '\n' ' ')"
+  if [ -z "\$missing" ]; then
+    return
+  fi
+  message="Verde's Linux browser pane needs WPE WebKit runtime libraries. Missing: \$missing"
+  echo "\$message" >&2
+  echo "Install WPE WebKit packages for your distro, then reopen Verde." >&2
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Verde needs WPE WebKit" "\$message"
+  fi
+}
+
+check_wpe_runtime
 if command -v setsid >/dev/null 2>&1; then
   setsid "$PREFIX/bin/verde" >/dev/null 2>&1 &
 else
@@ -70,27 +112,6 @@ install -m 755 "$SCRIPT_DIR/bin/libfff_c.so" "$PREFIX/bin/libfff_c.so"
 copy_if_present "$SCRIPT_DIR/bin/libSDL3.so" "$PREFIX/bin/libSDL3.so"
 copy_glob_if_present "$SCRIPT_DIR/bin/libSDL3_ttf.so*" "$PREFIX/bin"
 copy_if_present "$SCRIPT_DIR/bin/verde-browser-linux" "$PREFIX/bin/verde-browser-linux"
-copy_if_present "$SCRIPT_DIR/bin/verde-browser-linux-wpe" "$PREFIX/bin/verde-browser-linux-wpe"
-if [[ "$BROWSER_BACKEND" == "cef" ]]; then
-  copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef" "$PREFIX/bin/verde-browser-cef"
-  copy_if_present "$SCRIPT_DIR/bin/verde-browser-cef-process" "$PREFIX/bin/verde-browser-cef-process"
-  copy_if_present "$SCRIPT_DIR/bin/libcef.so" "$PREFIX/bin/libcef.so"
-  copy_if_present "$SCRIPT_DIR/bin/libEGL.so" "$PREFIX/bin/libEGL.so"
-  copy_if_present "$SCRIPT_DIR/bin/libGLESv2.so" "$PREFIX/bin/libGLESv2.so"
-  copy_if_present "$SCRIPT_DIR/bin/libvk_swiftshader.so" "$PREFIX/bin/libvk_swiftshader.so"
-  copy_if_present "$SCRIPT_DIR/bin/libvulkan.so.1" "$PREFIX/bin/libvulkan.so.1"
-  copy_if_present "$SCRIPT_DIR/bin/v8_context_snapshot.bin" "$PREFIX/bin/v8_context_snapshot.bin"
-  copy_if_present "$SCRIPT_DIR/bin/vk_swiftshader_icd.json" "$PREFIX/bin/vk_swiftshader_icd.json"
-  copy_if_present "$SCRIPT_DIR/bin/chrome-sandbox" "$PREFIX/bin/chrome-sandbox"
-  copy_if_present "$SCRIPT_DIR/bin/chrome_100_percent.pak" "$PREFIX/bin/chrome_100_percent.pak"
-  copy_if_present "$SCRIPT_DIR/bin/chrome_200_percent.pak" "$PREFIX/bin/chrome_200_percent.pak"
-  copy_if_present "$SCRIPT_DIR/bin/resources.pak" "$PREFIX/bin/resources.pak"
-  copy_if_present "$SCRIPT_DIR/bin/icudtl.dat" "$PREFIX/bin/icudtl.dat"
-  if [[ -d "$SCRIPT_DIR/bin/locales" ]]; then
-    mkdir -p "$PREFIX/bin/locales"
-    cp -a "$SCRIPT_DIR/bin/locales/." "$PREFIX/bin/locales/"
-  fi
-fi
 install -m 644 "$SCRIPT_DIR/share/pixmaps/verde.png" "$PREFIX/share/pixmaps/verde.png"
 if [[ -e "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" ]]; then
   install -m 644 "$SCRIPT_DIR/share/icons/hicolor/256x256/apps/verde.png" "$PREFIX/share/icons/hicolor/256x256/apps/verde.png"
@@ -118,6 +139,7 @@ if [[ -e "$SCRIPT_DIR/share/verde/provider_bridge.mjs" ]]; then
   install -m 644 "$SCRIPT_DIR/share/verde/provider_bridge.mjs" "$PREFIX/share/verde/provider_bridge.mjs"
 fi
 assert_no_cef_payload "$PREFIX"
+warn_missing_wpe_runtime "$PREFIX/bin/verde-browser-linux"
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
@@ -132,3 +154,4 @@ fi
 echo "Installed Verde into $PREFIX"
 echo "Binary: $PREFIX/bin/verde"
 echo "Desktop entry: $PREFIX/share/applications/verde.desktop"
+echo "Linux browser runtime: WPE WebKit"

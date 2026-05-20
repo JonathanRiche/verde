@@ -72,7 +72,7 @@ test "browser backends satisfy app-facing contract" {
     comptime {
         BrowserBackend.assertImplementation(@import("controller.zig").Controller);
         BrowserBackend.assertImplementation(@import("native_webview_backend.zig").Backend);
-        BrowserBackend.assertImplementation(@import("platform/linux_webkitgtk.zig").Controller);
+        BrowserBackend.assertImplementation(@import("platform/linux_wpe.zig").Controller);
         BrowserBackend.assertImplementation(@import("platform/macos_wkwebview.zig").Controller);
         BrowserBackend.assertImplementation(@import("platform/windows_webview2.zig").Controller);
         BrowserBackend.assertImplementation(@import("cef/backend.zig").Backend);

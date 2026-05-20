@@ -184,7 +184,7 @@ static void verde_browser_linux_open_remote_inspector(struct verde_browser_linux
     }
 
     if (verde_browser_linux_frame_log_enabled()) {
-        fprintf(stderr, "verde-browser-linux-wpe opening inspector uri=%s\n", uri);
+        fprintf(stderr, "verde-browser-linux opening WPE inspector uri=%s\n", uri);
         fflush(stderr);
     }
 
@@ -192,7 +192,7 @@ static void verde_browser_linux_open_remote_inspector(struct verde_browser_linux
     GError *error = NULL;
     if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &error)) {
         if (verde_browser_linux_frame_log_enabled() && error != NULL) {
-            fprintf(stderr, "verde-browser-linux-wpe inspector open failed: %s\n", error->message);
+            fprintf(stderr, "verde-browser-linux WPE inspector open failed: %s\n", error->message);
             fflush(stderr);
         }
         if (error != NULL) {
@@ -647,7 +647,7 @@ static void verde_browser_linux_export_fdo_egl_image(void *data, struct wpe_fdo_
     }
     browser->last_frame_published_us = now_us;
     if (verde_browser_linux_frame_log_enabled()) {
-        fprintf(stderr, "verde-browser-linux-wpe frame seq=%" G_GUINT64_FORMAT " shared_slot=%d size=%dx%d bytes=%zu\n",
+        fprintf(stderr, "verde-browser-linux WPE frame seq=%" G_GUINT64_FORMAT " shared_slot=%d size=%dx%d bytes=%zu\n",
             browser->frame_ready_sequence,
             browser->frame_ready_slot,
             browser->frame_width,
@@ -720,7 +720,7 @@ static void verde_browser_linux_on_web_process_terminated(WebKitWebView *web_vie
     default:
         break;
     }
-    fprintf(stderr, "verde-browser-linux-wpe: %s\n", message);
+    fprintf(stderr, "verde-browser-linux WPE: %s\n", message);
     fflush(stderr);
     verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_FAILED, message);
 }
@@ -735,7 +735,7 @@ static gboolean verde_browser_linux_on_context_menu(WebKitWebView *web_view, Web
     browser->context_menu = g_object_ref(menu);
     char *payload = verde_browser_linux_context_menu_to_json(browser, menu);
     if (verde_browser_linux_frame_log_enabled()) {
-        fprintf(stderr, "verde-browser-linux-wpe context-menu items=%u\n", browser->context_item_count);
+        fprintf(stderr, "verde-browser-linux WPE context-menu items=%u\n", browser->context_item_count);
         fflush(stderr);
     }
     verde_browser_linux_queue_event(browser, VERDE_BROWSER_LINUX_EVENT_CONTEXT_MENU, payload);
@@ -1255,7 +1255,7 @@ int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browse
     if (browser == NULL) return 0;
     if (index >= browser->context_item_count) {
         if (verde_browser_linux_frame_log_enabled()) {
-            fprintf(stderr, "verde-browser-linux-wpe context-menu activate ignored index=%u count=%u\n", index, browser->context_item_count);
+            fprintf(stderr, "verde-browser-linux WPE context-menu activate ignored index=%u count=%u\n", index, browser->context_item_count);
             fflush(stderr);
         }
         return 0;
@@ -1263,7 +1263,7 @@ int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browse
     struct verde_browser_linux_context_menu_item *item = &browser->context_items[index];
     if (!item->enabled || item->separator || item->submenu) {
         if (verde_browser_linux_frame_log_enabled()) {
-            fprintf(stderr, "verde-browser-linux-wpe context-menu activate disabled index=%u enabled=%d separator=%d submenu=%d\n",
+            fprintf(stderr, "verde-browser-linux WPE context-menu activate disabled index=%u enabled=%d separator=%d submenu=%d\n",
                 index,
                 item->enabled,
                 item->separator,
@@ -1291,7 +1291,7 @@ int verde_browser_linux_context_menu_activate(struct verde_browser_linux *browse
     if (is_inspect) verde_browser_linux_open_remote_inspector(browser);
     verde_browser_linux_mark_active(browser);
     if (verde_browser_linux_frame_log_enabled()) {
-        fprintf(stderr, "verde-browser-linux-wpe context-menu activate index=%u handled=%d label=%s\n",
+        fprintf(stderr, "verde-browser-linux WPE context-menu activate index=%u handled=%d label=%s\n",
             index,
             handled,
             item->label != NULL ? item->label : ""

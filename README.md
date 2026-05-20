@@ -36,6 +36,10 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 - macOS: download the `.dmg` or `.zip` for your architecture, then move `Verde.app` into `Applications`.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
 
+Linux browser support uses the system WPE WebKit runtime. AUR installs it as a
+package dependency; tarball installs will warn if required WPE libraries are
+missing.
+
 Verde can also be installed through the platform-specific npm launcher:
 
 ```bash
@@ -50,7 +54,7 @@ The npm package is intended for macOS Apple Silicon, macOS Intel, and Linux x86_
 
 Source builds require Zig `0.16.0` and SDL3 development files for your platform.
 The default browser backend uses the host platform webview instead of bundled
-Chromium. Linux builds also require GTK 3 and WebKitGTK 4.1 development
+Chromium. Linux builds also require WPE WebKit development
 packages. Windows native-webview builds require the Microsoft WebView2 SDK
 headers at compile time and `WebView2Loader.dll` next to `verde.exe` or on the
 DLL search path.
@@ -71,8 +75,8 @@ mise run build-cef
 zig build --release=safe -Dbrowser-backend=cef -Dcef-sdk-path=/path/to/cef
 ```
 
-The native browser runtime targets the host platform webview stack: WebKitGTK on
-Linux, WKWebView on macOS, and WebView2 on Windows. Linux requires WebKitGTK 4.1
+The native browser runtime targets the host platform webview stack: WPE WebKit on
+Linux, WKWebView on macOS, and WebView2 on Windows. Linux requires WPE WebKit
 runtime packages. Windows systems that do not include WebView2 need the
 Microsoft WebView2 Runtime installed separately, and packaged builds must ship
 or locate `WebView2Loader.dll`.

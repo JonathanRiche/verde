@@ -1,4 +1,4 @@
-//! Linux browser backend implemented as an offscreen WebKitGTK helper process.
+//! Linux browser backend implemented as an offscreen WPE WebKit helper process.
 
 const std = @import("std");
 const browser_input = @import("../input.zig");
@@ -7,7 +7,7 @@ const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
 const ipc = @import("linux_ipc.zig");
 
-const log = std.log.scoped(.linux_webkitgtk);
+const log = std.log.scoped(.linux_wpe);
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -21,7 +21,7 @@ extern fn unsetenv(name: [*:0]const u8) c_int;
 
 const RawWaylandSubsurface = opaque {};
 const WAYLAND_SUBSURFACE_PROBE_MESSAGE =
-    "Wayland subsurface probe is attached, but WebKitGTK content is not embedded in it yet.";
+    "Wayland subsurface probe is attached, but WPE WebKit content is not embedded in it yet.";
 
 extern fn verde_wayland_subsurface_create(display: ?*anyopaque, parent_surface: ?*anyopaque) ?*RawWaylandSubsurface;
 extern fn verde_wayland_subsurface_destroy(handle: ?*RawWaylandSubsurface) void;
@@ -51,19 +51,11 @@ fn frameLogEnabled() bool {
 }
 
 pub fn configuredPresentationKind() browser_types.PresentationKind {
-    if (wpeEnabled()) return .offscreen_texture;
-    if (waylandSubsurfaceEnabled()) return .native_wayland_surface;
-    return if (visibleHelperEnabled()) .helper_window else .snapshot_texture;
+    return .offscreen_texture;
 }
 
 pub fn configuredSupportsInspector() bool {
-    if (waylandSubsurfaceEnabled()) return false;
     return true;
-}
-
-fn wpeEnabled() bool {
-    const value = std.c.getenv("VERDE_BROWSER_LINUX_WPE") orelse return false;
-    return std.mem.eql(u8, std.mem.span(value), "1");
 }
 
 fn waylandSubsurfaceEnabled() bool {
@@ -544,19 +536,19 @@ pub const Controller = struct {
         try self.sendCommand(.{ .kind = .post_json, .payload = json });
     }
 
-    /// Navigates backward through the helper using WebKitGTK history.
+    /// Navigates backward through the helper using WPE WebKit history.
     pub fn goBack(self: *Controller) !void {
         if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .go_back });
     }
 
-    /// Navigates forward through the helper using WebKitGTK history.
+    /// Navigates forward through the helper using WPE WebKit history.
     pub fn goForward(self: *Controller) !void {
         if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .go_forward });
     }
 
-    /// Reloads the helper page using WebKitGTK navigation.
+    /// Reloads the helper page using WPE WebKit navigation.
     pub fn reload(self: *Controller) !void {
         if (waylandSubsurfaceEnabled()) return;
         try self.sendCommand(.{ .kind = .reload });
@@ -673,7 +665,7 @@ pub const Controller = struct {
 
     // Launches the installed browser helper binary beside the desktop executable.
     fn spawnHelper(self: *Controller) !void {
-        const helper_path = try browserHelperPath(self.allocator, wpeEnabled());
+        const helper_path = try browserHelperPath(self.allocator);
         defer self.allocator.free(helper_path);
 
         var stdin_pipe: [2]std.posix.fd_t = undefined;
@@ -862,11 +854,11 @@ test "Wayland diagnostic helper selection requires explicit Wayland opt-in" {
 }
 
 /// Resolves the installed Linux browser helper path beside the running desktop executable.
-fn browserHelperPath(allocator: std.mem.Allocator, use_wpe: bool) ![]u8 {
+fn browserHelperPath(allocator: std.mem.Allocator) ![]u8 {
     var threaded = std.Io.Threaded.init_single_threaded;
     const exe_dir = try std.process.executableDirPathAlloc(threaded.io(), allocator);
     defer allocator.free(exe_dir);
-    return try std.fs.path.join(allocator, &.{ exe_dir, if (use_wpe) "verde-browser-linux-wpe" else "verde-browser-linux" });
+    return try std.fs.path.join(allocator, &.{ exe_dir, "verde-browser-linux" });
 }
 
 /// Reads JSON-line events from the helper stdout pipe and stores them in thread-safe queues.

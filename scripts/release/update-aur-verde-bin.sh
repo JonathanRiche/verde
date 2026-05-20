@@ -43,6 +43,11 @@ fi
 
 PKGBUILD="${AUR_REPO_DIR}/PKGBUILD"
 SRCINFO="${AUR_REPO_DIR}/.SRCINFO"
+REQUIRED_DEPENDS=(
+  "libwpe"
+  "wpebackend-fdo"
+  "wpewebkit"
+)
 
 sed -i -E "s/^pkgver=.*/pkgver=${VERSION}/" "${PKGBUILD}"
 sed -i -E "/^sha256sums=\(/,/^\)/c\\sha256sums=(\\n  '${LINUX_SHA}'\\n  '${LICENSE_SHA}'\\n)" "${PKGBUILD}"
@@ -56,6 +61,20 @@ awk '
   { print }
 ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
 mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+
+for dep in "${REQUIRED_DEPENDS[@]}"; do
+  if ! grep -Fq "'${dep}'" "${PKGBUILD}"; then
+    awk -v dep="${dep}" '
+      /^\)/ && in_depends {
+        print "  '\''" dep "'\''"
+        in_depends = 0
+      }
+      /^depends=\(/ { in_depends = 1 }
+      { print }
+    ' "${PKGBUILD}" > "${PKGBUILD}.tmp"
+    mv "${PKGBUILD}.tmp" "${PKGBUILD}"
+  fi
+done
 
 if ! grep -Fq "'zenity: native folder picker integration'" "${PKGBUILD}"; then
   awk '
@@ -112,6 +131,22 @@ awk '
   { print }
 ' "${SRCINFO}" > "${SRCINFO}.tmp"
 mv "${SRCINFO}.tmp" "${SRCINFO}"
+
+for dep in "${REQUIRED_DEPENDS[@]}"; do
+  if ! grep -Fq $'\tdepends = '"${dep}" "${SRCINFO}"; then
+    awk -v dep="${dep}" '
+      /^\toptdepends = / && !inserted {
+        print "\tdepends = " dep
+        inserted = 1
+      }
+      { print }
+      END {
+        if (!inserted) print "\tdepends = " dep
+      }
+    ' "${SRCINFO}" > "${SRCINFO}.tmp"
+    mv "${SRCINFO}.tmp" "${SRCINFO}"
+  fi
+done
 
 if ! grep -Fq $'\toptdepends = zenity: native folder picker integration' "${SRCINFO}"; then
   awk '

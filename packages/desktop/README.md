@@ -50,13 +50,13 @@ Use the same approximate window size for before/after captures. For fractional-s
 
 ## Browser Pane
 
-The in-app browser pane defaults to the host platform webview stack: WebKitGTK on
+The in-app browser pane defaults to the host platform webview stack: WPE WebKit on
 Linux, WKWebView on macOS, and WebView2 on Windows. Default development and
 release-style builds do not download or package CEF.
 
 Native-webview source build requirements:
 
-- Linux: GTK 3 and WebKitGTK 4.1 development/runtime packages.
+- Linux: WPE WebKit development/runtime packages.
 - macOS: AppKit and WebKit from the platform SDK.
 - Windows: Microsoft WebView2 SDK headers at compile time, the WebView2 Runtime
   at runtime, and `WebView2Loader.dll` next to `verde.exe` or on the DLL search
