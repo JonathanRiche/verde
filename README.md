@@ -32,13 +32,15 @@ curl -fsSL https://openverde.ai/install.sh | sh
 
 Or download a release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).
 
-- Linux: download `verde-<version>-linux-x86_64.tar.gz`, extract it, then run `./install-local.sh`.
+- Linux: download `verde-v<version>-linux-x86_64.tar.gz`, extract it, then run `./install-local.sh`.
 - macOS: download the `.dmg` or `.zip` for your architecture, then move `Verde.app` into `Applications`.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
 
 Linux browser support uses the system WPE WebKit runtime. AUR installs it as a
 package dependency; tarball installs will warn if required WPE libraries are
-missing.
+missing. On Arch-based systems, install `wpewebkit` and `wpebackend-fdo`; on
+Debian 13+ systems, install `libwpewebkit-2.0-1`, `libwpebackend-fdo-1.0-1`,
+`libjavascriptcoregtk-6.0-1`, `libegl1`, and `libgles2`.
 
 Verde can also be installed through the platform-specific npm launcher:
 
