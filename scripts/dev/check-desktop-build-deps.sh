@@ -24,9 +24,9 @@ if [[ ! -d "$REPO_ROOT/node_modules/@anthropic-ai/claude-agent-sdk" ]]; then
 fi
 
 if [[ "$(uname -s)" == "Linux" && "${VERDE_BROWSER_BACKEND:-native_webview}" == "native_webview" ]]; then
-  if ! pkg-config --exists gtk+-3.0 webkit2gtk-4.1; then
-    echo "missing native webview build dependencies: gtk+-3.0 and webkit2gtk-4.1" >&2
-    echo "install the GTK 3 and WebKitGTK 4.1 development packages for your distro" >&2
+  if ! pkg-config --exists wpe-webkit-2.0 wpebackend-fdo-1.0 egl glesv2 javascriptcoregtk-6.0; then
+    echo "missing native webview build dependencies: WPE WebKit, WPEBackend-fdo, EGL, GLESv2, and JavaScriptCoreGTK 6.0" >&2
+    echo "install the WPE WebKit development packages for your distro" >&2
     exit 1
   fi
 fi

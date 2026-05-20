@@ -14,21 +14,203 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
+    timeout-minutes: 180
+    runs-on: ubuntu-24.04
+    container:
+      image: node:24-trixie
+    env:
+      ZIG_VERSION: 0.16.0
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vendor/fff/target
+          key: linux-x86_64-zig-${{ env.ZIG_VERSION }}-release-build-cache-${{ hashFiles('packages/desktop/build.zig.zon', 'packages/desktop/build.zig', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml', 'scripts/release/package-linux.sh') }}
+          restore-keys: |
+            linux-x86_64-zig-${{ env.ZIG_VERSION }}-release-build-cache-
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            g++ \
+            git \
+            libasound2-dev \
+            libatk1.0-dev \
+            libatspi2.0-dev \
+            libcairo2-dev \
+            libcups2-dev \
+            libdbus-1-dev \
+            libdrm-dev \
+            libegl-dev \
+            libfreetype-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libgles-dev \
+            libglib2.0-dev \
+            libharfbuzz-dev \
+            libjavascriptcoregtk-6.0-dev \
+            libnspr4-dev \
+            libnss3-dev \
+            libtree-sitter-dev \
+            libwayland-dev \
+            libwpebackend-fdo-1.0-dev \
+            libwpewebkit-2.0-dev \
+            libxcomposite-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libclang-dev \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            python3 \
+            xz-utils
+
+      - name: Install Zig
+        shell: bash
+        run: |
+          ZIG_DOWNLOAD="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          ZIG_DIR="zig-x86_64-linux-${ZIG_VERSION}"
+          curl -fL --retry 5 --retry-delay 2 "${ZIG_DOWNLOAD}" -o zig.tar.xz
+          python3 -c "import tarfile; tarfile.open('zig.tar.xz').extractall('.')"
+          echo "$PWD/${ZIG_DIR}" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -fL --retry 5 --retry-delay 2 https://sh.rustup.rs -o rustup-init.sh
+            sh rustup-init.sh -y --profile minimal --default-toolchain stable
+          fi
+
+          for attempt in 1 2 3; do
+            if rustup toolchain install stable --profile minimal --no-self-update; then
+              rustup default stable
+              echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+              cargo --version
+              rustc --version
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            echo "Retrying Rust toolchain install after transient failure (attempt $attempt)"
+            sleep 15
+          done
+
+      - name: Install Bun
+        shell: bash
+        run: |
+          export BUN_INSTALL="${RUNNER_TEMP:-/tmp}/.bun"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+
+          if ! command -v bun >/dev/null 2>&1; then
+            curl -fsSL https://bun.sh/install | bash
+          fi
+
+          echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
+          bun --version
+
+      - name: Install Node runtime dependencies
+        shell: bash
+        run: bun install --frozen-lockfile --production
+
+      - name: Install SDL3 and SDL3_ttf
+        shell: bash
+        run: |
+          SDL_VERSION=3.2.26
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://www.libsdl.org/release/SDL3-${SDL_VERSION}.tar.gz" \
+            -o SDL3.tar.gz
+          tar -xf SDL3.tar.gz
+          cmake -S "SDL3-${SDL_VERSION}" -B SDL3-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TEST_LIBRARY=OFF
+          cmake --build SDL3-build --parallel
+          cmake --install SDL3-build
+          ldconfig
+
+          SDL_TTF_VERSION=3.2.2
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://github.com/libsdl-org/SDL_ttf/releases/download/release-${SDL_TTF_VERSION}/SDL3_ttf-${SDL_TTF_VERSION}.tar.gz" \
+            -o SDL3_ttf.tar.gz
+          tar -xf SDL3_ttf.tar.gz
+          cmake -S "SDL3_ttf-${SDL_TTF_VERSION}" -B SDL3_ttf-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DSDLTTF_VENDORED=OFF
+          cmake --build SDL3_ttf-build --parallel
+          cmake --install SDL3_ttf-build
+          ldconfig
+
+      - name: Compute release version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
+            fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
+            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3; do
+            if bash scripts/release/package-linux.sh "${{ steps.version.outputs.value }}" dist; then
+              exit 0
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              exit 1
+            fi
+            echo "Retrying release build after transient failure (attempt $attempt)"
+            sleep 15
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: dist/*
+
+  build-macos:
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         target:
-          - linux-x86_64
           - macos-arm64
           - macos-x86_64
 
-    runs-on: ${{ matrix.target == 'linux-x86_64' && 'ubuntu-24.04' || matrix.target == 'macos-x86_64' && 'macos-15-intel' || 'macos-14' }}
+    runs-on: ${{ matrix.target == 'macos-x86_64' && 'macos-15-intel' || 'macos-14' }}
     env:
       ZIG_VERSION: 0.16.0
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
-      VERDE_CEF_CACHE_DIR: ${{ github.workspace }}/.cache/verde/cef-sdk
 
     steps:
       - uses: actions/checkout@v4
@@ -43,22 +225,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-zig-${{ env.ZIG_VERSION }}-release-build-cache-
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            .cache/verde/cef-sdk
-          key: ${{ runner.os }}-${{ runner.arch }}-release-cef-sdk-${{ hashFiles('scripts/release/cef-common.sh') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-release-cef-sdk-
-
       - name: Install Zig
         shell: bash
         run: |
           case "${{ matrix.target }}" in
-            linux-x86_64)
-              ZIG_DOWNLOAD="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-              ZIG_DIR="zig-x86_64-linux-${ZIG_VERSION}"
-              ;;
             macos-x86_64)
               ZIG_DOWNLOAD="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-macos-${ZIG_VERSION}.tar.xz"
               ZIG_DIR="zig-x86_64-macos-${ZIG_VERSION}"
@@ -126,87 +296,6 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install tree-sitter sdl3_ttf
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          SUDO=""
-          if command -v sudo >/dev/null 2>&1; then
-            SUDO="sudo"
-          fi
-
-          $SUDO apt-get update
-          $SUDO apt-get install -y \
-            build-essential \
-            clang \
-            g++ \
-            cmake \
-            libtree-sitter-dev \
-            ninja-build \
-            patchelf \
-            pkg-config \
-            curl \
-            libasound2-dev \
-            libatk1.0-dev \
-            libatspi2.0-dev \
-            libcairo2-dev \
-            libcups2-dev \
-            libdbus-1-dev \
-            libdrm-dev \
-            libgl1-mesa-dev \
-            libgbm-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libfreetype-dev \
-            libharfbuzz-dev \
-            libnspr4-dev \
-            libnss3-dev \
-            libxcomposite-dev \
-            libxdamage-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxrender-dev \
-            libclang-dev
-
-      - name: Install SDL3 and SDL3_ttf
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          SUDO=""
-          if command -v sudo >/dev/null 2>&1; then
-            SUDO="sudo"
-          fi
-
-          SDL_VERSION=3.2.26
-          curl -fL --retry 5 --retry-delay 2 \
-            "https://www.libsdl.org/release/SDL3-${SDL_VERSION}.tar.gz" \
-            -o SDL3.tar.gz
-          tar -xf SDL3.tar.gz
-          cmake -S "SDL3-${SDL_VERSION}" -B SDL3-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DSDL_SHARED=ON \
-            -DSDL_STATIC=OFF \
-            -DSDL_TEST_LIBRARY=OFF
-          cmake --build SDL3-build --parallel
-          $SUDO cmake --install SDL3-build
-          $SUDO ldconfig
-
-          SDL_TTF_VERSION=3.2.2
-          curl -fL --retry 5 --retry-delay 2 \
-            "https://github.com/libsdl-org/SDL_ttf/releases/download/release-${SDL_TTF_VERSION}/SDL3_ttf-${SDL_TTF_VERSION}.tar.gz" \
-            -o SDL3_ttf.tar.gz
-          tar -xf SDL3_ttf.tar.gz
-          cmake -S "SDL3_ttf-${SDL_TTF_VERSION}" -B SDL3_ttf-build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DSDLTTF_VENDORED=OFF
-          cmake --build SDL3_ttf-build --parallel
-          $SUDO cmake --install SDL3_ttf-build
-          $SUDO ldconfig
-
       - name: Compute release version
         id: version
         shell: bash
@@ -223,9 +312,6 @@ jobs:
         shell: bash
         run: |
           case "${{ matrix.target }}" in
-            linux-x86_64)
-              PACKAGE_SCRIPT="scripts/release/package-linux.sh"
-              ;;
             macos-x86_64|macos-arm64)
               PACKAGE_SCRIPT="scripts/release/package-macos-app.sh"
               ;;
@@ -254,7 +340,9 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: build
+    needs:
+      - build-linux
+      - build-macos
     runs-on: ubuntu-24.04
 
     steps:

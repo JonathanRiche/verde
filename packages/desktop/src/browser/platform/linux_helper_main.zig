@@ -1,4 +1,4 @@
-//! Linux browser helper process that owns an offscreen WebKitGTK surface outside the SDL app.
+//! Linux browser helper process that owns an offscreen WPE WebKit surface outside the SDL app.
 
 const std = @import("std");
 const ipc = @import("linux_ipc.zig");
@@ -190,7 +190,7 @@ fn stdinReaderMain(context: *ReaderContext) !void {
     context.queue.markClosed();
 }
 
-/// Applies one helper command on the GTK/WebKit side.
+/// Applies one helper command on the WPE WebKit side.
 fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc.Command) !bool {
     switch (command.kind) {
         .show => {
@@ -304,7 +304,7 @@ fn applyCommand(allocator: std.mem.Allocator, browser: *RawBrowser, command: ipc
     return true;
 }
 
-/// Serializes any pending GTK/WebKit events onto stdout as JSON lines.
+/// Serializes any pending WPE WebKit events onto stdout as JSON lines.
 fn flushBrowserEvents(allocator: std.mem.Allocator, io: std.Io, browser: *RawBrowser) !usize {
     const stdout_file = std.Io.File.stdout();
     var write_buffer: [16 * 1024]u8 = undefined;

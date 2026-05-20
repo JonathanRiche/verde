@@ -194,7 +194,7 @@ pub fn build(b: *std.Build) void {
                 .file = b.path("src/platform/macos_clipboard.m"),
                 .flags = &.{},
             });
-            addMacOSSwiftWebView(b, exe);
+            addMacOSSwiftWebView(b, exe, target.result.cpu.arch);
             if (macOSHomebrewPrefix(b)) |prefix| {
                 exe.root_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
                 exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
@@ -239,33 +239,15 @@ pub fn build(b: *std.Build) void {
         browser_helper.build_id = .sha1;
         browser_helper.root_module.link_libc = true;
         browser_helper.root_module.addCSourceFile(.{
-            .file = b.path("src/browser/platform/linux_webkitgtk.c"),
-            .flags = &.{},
-        });
-        browser_helper.root_module.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
-        browser_helper.root_module.linkSystemLibrary("webkitgtk-6.0", .{ .use_pkg_config = .force });
-        b.installArtifact(browser_helper);
-
-        const browser_wpe_helper = b.addExecutable(.{
-            .name = "verde-browser-linux-wpe",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/browser/platform/linux_helper_main.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        browser_wpe_helper.build_id = .sha1;
-        browser_wpe_helper.root_module.link_libc = true;
-        browser_wpe_helper.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/linux_wpe.c"),
             .flags = &.{},
         });
-        browser_wpe_helper.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
-        browser_wpe_helper.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
-        browser_wpe_helper.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
-        browser_wpe_helper.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
-        browser_wpe_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
-        b.installArtifact(browser_wpe_helper);
+        browser_helper.root_module.linkSystemLibrary("wpe-webkit-2.0", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("wpebackend-fdo-1.0", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("egl", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("glesv2", .{ .use_pkg_config = .force });
+        browser_helper.root_module.linkSystemLibrary("javascriptcoregtk-6.0", .{ .use_pkg_config = .force });
+        b.installArtifact(browser_helper);
     }
     if (build_cef_backend) {
         const build_cef_helper = b.addSystemCommand(&.{
@@ -454,7 +436,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{},
         });
         if (browser_backend == .native_webview) {
-            addMacOSSwiftWebView(b, exe_tests);
+            addMacOSSwiftWebView(b, exe_tests, target.result.cpu.arch);
         } else {
             addMacOSWebViewTestStub(b, exe_tests);
         }
@@ -492,7 +474,12 @@ const BrowserBackendKind = enum {
     stub,
 };
 
-fn addMacOSSwiftWebView(b: *std.Build, compile: *std.Build.Step.Compile) void {
+fn addMacOSSwiftWebView(b: *std.Build, compile: *std.Build.Step.Compile, arch: std.Target.Cpu.Arch) void {
+    const swift_target = switch (arch) {
+        .aarch64 => "arm64-apple-macosx13.0",
+        .x86_64 => "x86_64-apple-macosx13.0",
+        else => @panic("unsupported macOS Swift architecture"),
+    };
     const swift_obj = b.addSystemCommand(&.{
         "xcrun",
         "swiftc",
@@ -502,13 +489,13 @@ fn addMacOSSwiftWebView(b: *std.Build, compile: *std.Build.Step.Compile) void {
         "-sdk",
         macOSSDKRoot(b),
         "-target",
-        "arm64-apple-macosx13.0",
+        swift_target,
         "-module-name",
         "VerdeMacWebView",
     });
     swift_obj.addFileArg(b.path("src/browser/platform/macos_wkwebview.swift"));
     swift_obj.addArg("-o");
-    const object_path = swift_obj.addOutputFileArg("macos_wkwebview.o");
+    const object_path = swift_obj.addOutputFileArg(b.fmt("macos_wkwebview-{s}.o", .{@tagName(arch)}));
     compile.root_module.addObjectFile(object_path);
     compile.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ macOSSDKRoot(b), "usr", "lib", "swift" }) });
     compile.root_module.addLibraryPath(.{ .cwd_relative = "/Library/Developer/CommandLineTools/usr/lib/swift/macosx" });
