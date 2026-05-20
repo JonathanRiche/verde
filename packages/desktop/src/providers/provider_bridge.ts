@@ -1,33 +1,42 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
-import { createRequire } from "node:module";
-import { dirname, extname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { extname } from "node:path";
+import * as claudeSdkStatic from "@anthropic-ai/claude-agent-sdk";
 
-async function loadSdk() {
-  try {
-    const require = requireFromBundledModules();
-    if (require) {
-      return await import(require.resolve("@anthropic-ai/claude-agent-sdk"));
-    }
-    return await import("@anthropic-ai/claude-agent-sdk");
-  } catch (err) {
-    throw new Error(
-      `Unable to load @anthropic-ai/claude-agent-sdk. Install it for the desktop package or provide bundled node_modules. ${err?.message ?? err}`,
-    );
+const write = (message) => {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+};
+
+const fail = (message) => {
+  write({ type: "error", message });
+  process.exitCode = 1;
+};
+
+function mimeTypeForPath(path) {
+  switch (extname(String(path || "")).toLowerCase()) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".png":
+      return "image/png";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    default:
+      return undefined;
   }
 }
 
-function requireFromBundledModules() {
-  const root = process.env.VERDE_NODE_MODULES;
-  if (!root) return null;
-  const normalized = root.replace(/\/+$/, "");
-  return createRequire(pathToFileURL(`${normalized}/package.json`));
-}
-
-function write(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const chunks = [];
+  for (const item of content) {
+    if (item?.type === "text" && typeof item.text === "string") chunks.push(item.text);
+  }
+  return chunks.join("");
 }
 
 let nextApprovalRequestId = 1;
@@ -49,8 +58,7 @@ function handleInputLine(line) {
 
 function approvalRequestBody(toolName, input, options) {
   if (options?.description) return options.description;
-  const parts = [];
-  parts.push(`Tool: ${toolName}`);
+  const parts = [`Tool: ${toolName}`];
   if (options?.blockedPath) parts.push(`Path: ${options.blockedPath}`);
   if (options?.decisionReason) parts.push(`Reason: ${options.decisionReason}`);
   try {
@@ -85,40 +93,14 @@ async function requestToolApproval(toolName, input, options) {
     : { behavior: "deny", message: "Denied by user", toolUseID: options?.toolUseID, decisionClassification: "user_reject" };
 }
 
-function roleFromSdkMessage(message) {
+function claudeRoleFromSdkMessage(message) {
   if (message?.type === "user") return "user";
   if (message?.type === "assistant") return "assistant";
   if (message?.type === "system") return "system";
   return undefined;
 }
 
-function textFromContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const chunks = [];
-  for (const item of content) {
-    if (item?.type === "text" && typeof item.text === "string") chunks.push(item.text);
-  }
-  return chunks.join("");
-}
-
-function mimeTypeForPath(path) {
-  switch (extname(path).toLowerCase()) {
-    case ".jpg":
-    case ".jpeg":
-      return "image/jpeg";
-    case ".png":
-      return "image/png";
-    case ".gif":
-      return "image/gif";
-    case ".webp":
-      return "image/webp";
-    default:
-      return undefined;
-  }
-}
-
-async function buildPrompt(request) {
+async function buildClaudePrompt(request) {
   const images = Array.isArray(request.images) ? request.images : [];
   if (images.length === 0) return request.prompt;
 
@@ -140,13 +122,13 @@ async function buildPrompt(request) {
   return lines.join("\n");
 }
 
-function emitSdkMessage(message) {
-  const role = roleFromSdkMessage(message);
+function emitClaudeSdkMessage(message) {
+  const role = claudeRoleFromSdkMessage(message);
   const text = textFromContent(message?.message?.content ?? message?.content);
   if (role && text) write({ type: "message", role, text });
 }
 
-function commandFromToolUse(item) {
+function commandFromClaudeToolUse(item) {
   if (item?.type !== "tool_use") return null;
   const name = String(item.name ?? "").toLowerCase();
   if (name !== "bash" && name !== "shell") return null;
@@ -173,12 +155,12 @@ function scheduleBackgroundTask(query, toolUseId, command) {
   }, 4000).unref?.();
 }
 
-function emitToolEvents(message, commandByToolUseId, query) {
+function emitClaudeToolEvents(message, commandByToolUseId, query) {
   const content = message?.message?.content ?? message?.content;
   if (!Array.isArray(content)) return false;
   let sawBackgroundableCommand = false;
   for (const item of content) {
-    const command = commandFromToolUse(item);
+    const command = commandFromClaudeToolUse(item);
     if (typeof command === "string" && command.length > 0) {
       if (typeof item.id === "string") commandByToolUseId.set(item.id, command);
       write({ type: "stream_event", title: "Ran command", body: command });
@@ -198,46 +180,22 @@ function emitToolEvents(message, commandByToolUseId, query) {
   return sawBackgroundableCommand;
 }
 
-function permissionMode(approvalPolicy, sandboxMode) {
-  if (approvalPolicy === "never" && sandboxMode === "danger_full_access") {
-    return "bypassPermissions";
-  }
+function claudePermissionMode(approvalPolicy, sandboxMode) {
+  if (approvalPolicy === "never" && sandboxMode === "danger_full_access") return "bypassPermissions";
   if (approvalPolicy === "on_request") return "default";
   if (approvalPolicy === "never") return "dontAsk";
   return undefined;
 }
 
-function bundledClaudePackageName() {
-  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : null;
-  if (!arch) return null;
-  if (process.platform === "darwin") return `@anthropic-ai/claude-agent-sdk-darwin-${arch}`;
-  if (process.platform === "linux") return `@anthropic-ai/claude-agent-sdk-linux-${arch}`;
-  if (process.platform === "win32") return `@anthropic-ai/claude-agent-sdk-win32-${arch}`;
-  return null;
-}
-
-function bundledClaudeCodeExecutable() {
-  const require = requireFromBundledModules();
-  const packageName = bundledClaudePackageName();
-  if (!require || !packageName) return undefined;
-  try {
-    const manifest = require.resolve(`${packageName}/package.json`);
-    return join(dirname(manifest), process.platform === "win32" ? "claude.exe" : "claude");
-  } catch {
-    return undefined;
-  }
-}
-
 function pathToClaudeCodeExecutable(request) {
   if (request?.claude_executable && request.claude_executable !== "claude") return request.claude_executable;
   return process.env.VERDE_CLAUDE_CODE_EXECUTABLE ||
-    bundledClaudeCodeExecutable() ||
     process.env.CLAUDE_CODE_EXECUTABLE ||
     request?.claude_executable ||
     "claude";
 }
 
-function buildOptions(request) {
+function buildClaudeOptions(request) {
   const options = {
     cwd: request.cwd ?? undefined,
     resume: request.thread_id ?? undefined,
@@ -246,7 +204,7 @@ function buildOptions(request) {
     pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request),
   };
 
-  const mode = permissionMode(request.approval_policy, request.sandbox_mode);
+  const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
   if (mode) {
     options.permissionMode = mode;
     if (mode === "bypassPermissions") options.allowDangerouslySkipPermissions = true;
@@ -254,28 +212,6 @@ function buildOptions(request) {
   }
 
   return Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
-}
-
-async function handleAuth(sdk, request) {
-  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
-  const info = await query.accountInfo();
-  query.close?.();
-  write({ type: "result", state: info ? "signed_in" : "signed_out" });
-}
-
-async function handleListModels(sdk, request) {
-  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
-  const models = await query.supportedModels();
-  query.close?.();
-  write({
-    type: "result",
-    models: (models ?? []).map((model) => ({
-      id: model.value ?? model.id ?? model.name ?? String(model),
-      name: claudeModelDisplayName(model),
-      reasoning_supported: model.supportsEffort ?? false,
-      supported_effort_levels: Array.isArray(model.supportedEffortLevels) ? model.supportedEffortLevels : null,
-    })),
-  });
 }
 
 function claudeModelDisplayName(model) {
@@ -290,7 +226,33 @@ function claudeModelDisplayName(model) {
   return version;
 }
 
-async function handleListThreads(sdk, request) {
+async function loadClaudeSdk() {
+  return claudeSdkStatic;
+}
+
+async function handleClaudeAuth(sdk, request) {
+  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
+  const info = await query.accountInfo();
+  query.close?.();
+  write({ type: "result", state: info ? "signed_in" : "signed_out" });
+}
+
+async function handleClaudeListModels(sdk, request) {
+  const query = sdk.query({ prompt: "", options: { maxTurns: 0, pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request) } });
+  const models = await query.supportedModels();
+  query.close?.();
+  write({
+    type: "result",
+    models: (models ?? []).map((model) => ({
+      id: model.value ?? model.id ?? model.name ?? String(model),
+      name: claudeModelDisplayName(model),
+      reasoning_supported: model.supportsEffort ?? false,
+      supported_effort_levels: Array.isArray(model.supportedEffortLevels) ? model.supportedEffortLevels : null,
+    })),
+  });
+}
+
+async function handleClaudeListThreads(sdk, request) {
   if (typeof sdk.listSessions !== "function") {
     write({ type: "result", threads: [] });
     return;
@@ -306,7 +268,7 @@ async function handleListThreads(sdk, request) {
   });
 }
 
-async function handleReadThread(sdk, request) {
+async function handleClaudeReadThread(sdk, request) {
   if (typeof sdk.getSessionMessages !== "function") {
     throw new Error("Claude Agent SDK does not expose getSessionMessages");
   }
@@ -316,21 +278,21 @@ async function handleReadThread(sdk, request) {
     thread_id: request.thread_id,
     title: request.thread_id,
     messages: (messages ?? []).map((message) => ({
-      role: roleFromSdkMessage(message) ?? "assistant",
+      role: claudeRoleFromSdkMessage(message) ?? "assistant",
       text: textFromContent(message?.message?.content ?? message?.content),
     })).filter((message) => message.text),
   });
 }
 
-async function handleSendPrompt(sdk, request) {
+async function handleClaudeSendPrompt(sdk, request) {
   const stderrChunks = [];
-  const options = buildOptions(request);
+  const options = buildClaudeOptions(request);
   options.stderr = (data) => {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
   };
 
   const query = sdk.query({
-    prompt: await buildPrompt(request),
+    prompt: await buildClaudePrompt(request),
     options,
   });
 
@@ -351,8 +313,8 @@ async function handleSendPrompt(sdk, request) {
         if (typeof message.result === "string") reply = message.result;
         continue;
       }
-      emitSdkMessage(message);
-      sawBackgroundableCommand = emitToolEvents(message, commandByToolUseId, query) || sawBackgroundableCommand;
+      emitClaudeSdkMessage(message);
+      sawBackgroundableCommand = emitClaudeToolEvents(message, commandByToolUseId, query) || sawBackgroundableCommand;
       const delta = textFromContent(message?.message?.content ?? message?.content);
       if (message?.type === "assistant" && delta) {
         reply += delta;
@@ -377,33 +339,60 @@ async function handleSendPrompt(sdk, request) {
   }
 }
 
-async function dispatch(request) {
-  const sdk = await loadSdk();
+async function dispatchClaude(request) {
+  const sdk = await loadClaudeSdk();
   switch (request.command) {
     case "auth":
-      return handleAuth(sdk, request);
+      return handleClaudeAuth(sdk, request);
     case "list_models":
-      return handleListModels(sdk, request);
+      return handleClaudeListModels(sdk, request);
     case "list_threads":
-      return handleListThreads(sdk, request);
+      return handleClaudeListThreads(sdk, request);
     case "read_thread":
-      return handleReadThread(sdk, request);
+      return handleClaudeReadThread(sdk, request);
     case "send_prompt":
-      return handleSendPrompt(sdk, request);
+      return handleClaudeSendPrompt(sdk, request);
     default:
-      throw new Error(`Unknown command: ${request.command}`);
+      throw new Error(`Unknown Claude command: ${request.command}`);
   }
 }
 
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-rl.on("line", handleInputLine);
-rl.once("line", async (line) => {
-  try {
-    await dispatch(JSON.parse(line));
-  } catch (err) {
-    write({ type: "error", message: err?.message ?? String(err) });
-    process.exitCode = 1;
-  } finally {
-    if (pendingApprovals.size === 0) rl.close();
+function providerFromRequest(request) {
+  if (request?.provider === "claude") return request.provider;
+  return "claude";
+}
+
+async function dispatch(request) {
+  const provider = providerFromRequest(request);
+  return dispatchClaude(request);
+}
+
+function parseEnvRequest() {
+  const raw = process.env.VERDE_PROVIDER_REQUEST;
+  if (!raw) return null;
+  return JSON.parse(raw);
+}
+
+async function main() {
+  const envRequest = parseEnvRequest();
+  if (envRequest) {
+    await dispatch(envRequest);
+    return;
   }
+
+  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  rl.on("line", handleInputLine);
+  rl.once("line", async (line) => {
+    try {
+      await dispatch(JSON.parse(line));
+    } catch (err) {
+      fail(err?.message ?? String(err));
+    } finally {
+      if (pendingApprovals.size === 0) rl.close();
+    }
+  });
+}
+
+main().catch((err) => {
+  fail(err?.stack || err?.message || String(err));
 });
