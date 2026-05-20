@@ -15,13 +15,6 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 - OpenCode: install [OpenCode](https://github.com/anomalyco/opencode) and make sure `opencode` is on your `PATH`.
 - Cursor: install the [Cursor CLI](https://cursor.com/docs/cli/installation), make sure `agent` is on your `PATH`, and run `agent login`. `CURSOR_API_KEY` is also supported for headless environments.
 
-Cursor example:
-
-```bash
-agent login
-verde
-```
-
 ## Install
 
 Install the latest release from the website:
@@ -35,6 +28,10 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 - Linux: download `verde-v<version>-linux-x86_64.tar.gz`, extract it, then run `./install-local.sh`.
 - macOS: download the `.dmg` or `.zip` for your architecture, then move `Verde.app` into `Applications`.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
+
+```bash
+yay -S verde-bin
+```
 
 Linux browser support uses the system WPE WebKit runtime. AUR installs it as a
 package dependency; tarball installs will warn if required WPE libraries are
