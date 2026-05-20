@@ -27,6 +27,46 @@ private final class VerdeFocusSinkView: NSView {
     override var acceptsFirstResponder: Bool { true }
 }
 
+private final class VerdeHostWindowCloseMonitor {
+    private weak var window: NSWindow?
+    private var monitor: Any?
+    private var closeRequested = false
+
+    init(window: NSWindow) {
+        self.window = window
+        self.monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self, let window = self.window, event.window === window else { return event }
+            guard let closeButton = window.standardWindowButton(.closeButton) else { return event }
+            let closeFrame = closeButton.convert(closeButton.bounds, to: nil)
+            if closeFrame.insetBy(dx: -4, dy: -4).contains(event.locationInWindow) {
+                self.closeRequested = true
+                window.orderOut(nil)
+                window.setIsVisible(false)
+                return nil
+            }
+            return event
+        }
+    }
+
+    deinit {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+
+    func shouldClose() -> Bool {
+        return closeRequested
+    }
+
+    func orderOut() {
+        guard let window else { return }
+        window.orderOut(nil)
+        window.setIsVisible(false)
+    }
+}
+
+private var verdeHostWindowCloseMonitors: [ObjectIdentifier: VerdeHostWindowCloseMonitor] = [:]
+
 private final class VerdeMacBrowser: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private weak var window: NSWindow?
     private let focusSink: VerdeFocusSinkView
@@ -371,13 +411,38 @@ public func verde_macos_app_configure_foreground() {
     }
 }
 
+@_cdecl("verde_macos_host_window_install_close_monitor")
+public func verde_macos_host_window_install_close_monitor(_ nsWindow: UnsafeMutableRawPointer?) {
+    guard let nsWindow else { return }
+    onMain {
+        let window = Unmanaged<NSWindow>.fromOpaque(nsWindow).takeUnretainedValue()
+        let key = ObjectIdentifier(window)
+        if verdeHostWindowCloseMonitors[key] == nil {
+            verdeHostWindowCloseMonitors[key] = VerdeHostWindowCloseMonitor(window: window)
+        }
+    }
+}
+
+@_cdecl("verde_macos_host_window_should_close")
+public func verde_macos_host_window_should_close(_ nsWindow: UnsafeMutableRawPointer?) -> Bool {
+    guard let nsWindow else { return false }
+    return onMain {
+        let window = Unmanaged<NSWindow>.fromOpaque(nsWindow).takeUnretainedValue()
+        return verdeHostWindowCloseMonitors[ObjectIdentifier(window)]?.shouldClose() ?? false
+    }
+}
+
 @_cdecl("verde_macos_host_window_order_out")
 public func verde_macos_host_window_order_out(_ nsWindow: UnsafeMutableRawPointer?) {
     guard let nsWindow else { return }
     onMain {
         let window = Unmanaged<NSWindow>.fromOpaque(nsWindow).takeUnretainedValue()
-        window.orderOut(nil)
-        window.setIsVisible(false)
+        if let monitor = verdeHostWindowCloseMonitors.removeValue(forKey: ObjectIdentifier(window)) {
+            monitor.orderOut()
+        } else {
+            window.orderOut(nil)
+            window.setIsVisible(false)
+        }
     }
 }
 
