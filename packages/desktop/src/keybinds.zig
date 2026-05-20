@@ -729,6 +729,7 @@ fn cloneDefaultKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+R"),
         try parseDefaultAccelerator("CommandOrControl+Shift+R"),
+        try parseDefaultAccelerator("Ctrl+Shift+R"),
         try parseDefaultAccelerator("F5"),
     });
 }

@@ -99,7 +99,7 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
         .y = rect.y,
         .w = theme.scaledUi(1.0),
         .h = rect.h,
-    }, paletteColor(colors.DARK_BLUE));
+    }, paletteColor(theme.borderMuted()));
 
     if (state.isSidebarCollapsed()) {
         renderPaletteCollapsedSidebar(state, rect);
@@ -368,8 +368,8 @@ fn renderThreadDragPreview(state: *runtime.AppState) void {
         .w = w,
         .h = h,
     };
-    queuePaletteRoundedRect(state, rect, paletteColor(colors.rgba(27, 35, 34, 232)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, rect, paletteColor(colors.rgba(93, 223, 143, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
     queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, rect);
     var title_buf = std.mem.zeroes([64:0]u8);
     const row_label = truncatedThreadTitle(&title_buf, thread.title, 24);
@@ -512,8 +512,8 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     sidebar_menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
     const clip = sidebar_menu_panel_rect;
 
-    queuePaletteRoundedRect(state, sidebar_menu_panel_rect, paletteColor(colors.rgba(26, 28, 34, 255)), theme.scaledUi(12.0));
-    queuePaletteBorder(state, sidebar_menu_panel_rect, paletteColor(colors.rgba(66, 68, 78, 255)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
+    queuePaletteBorder(state, sidebar_menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
     const mx = state.palette_mouse_x;
     const my = state.palette_mouse_y;
@@ -532,7 +532,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
 
         const row_hover = mouse_ok and sidebar_menu_row_enabled[ri] and rectContainsPoint(rr, mx, my);
         if (row_hover) {
-            queuePaletteRoundedRect(state, rr, paletteColor(colors.rgba(42, 44, 52, 255)), theme.scaledUi(8.0));
+            queuePaletteRoundedRect(state, rr, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(8.0));
         }
 
         const row_col = paletteColor(if (!sidebar_menu_row_enabled[ri])
@@ -589,13 +589,13 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                 state.palette_overlay_batch.panel(
                     state.allocator,
                     snapRect(row_rect),
-                    paletteColor(colors.CHAT_BLACK),
+                    paletteColor(theme.background()),
                     paletteColor(theme.COLOR_PANEL_MUTED),
                     theme.scaledUi(6.0),
                     theme.scaledUi(1.0),
                 ) catch {};
             } else if (project_hovered) {
-                queuePaletteRoundedRect(state, row_rect, paletteColor(colors.rgba(36, 49, 45, 180)), theme.scaledUi(6.0));
+                queuePaletteRoundedRect(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(6.0));
             }
         }
         if (project_visible) addPaletteHit(row_rect, .project_row, project_index, 0);
@@ -617,7 +617,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const new_hovered = state.sidebar_new_thread_hover == project_index;
         if (project_visible) {
             if (new_hovered) {
-                queuePaletteRoundedRect(state, new_rect, paletteColor(colors.rgba(36, 49, 45, 200)), theme.scaledUi(6.0));
+                queuePaletteRoundedRect(state, new_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 200)), theme.scaledUi(6.0));
             }
             queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, if (new_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
             addPaletteHit(new_rect, .new_thread, project_index, 0);
@@ -675,8 +675,8 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const track: palette.Rect = .{ .x = rect.x + rect.w - theme.scaledUi(4.0), .y = list_clip.y + theme.scaledUi(4.0), .w = theme.scaledUi(3.0), .h = list_clip.h - theme.scaledUi(8.0) };
         const thumb_h = @max(theme.scaledUi(34.0), track.h * (track.h / (track.h + sidebar_max_scroll_y)));
         const thumb_y = track.y + (track.h - thumb_h) * (sidebar_scroll_y / sidebar_max_scroll_y);
-        queuePaletteRoundedRect(state, track, paletteColor(colors.rgba(35, 42, 46, 120)), theme.scaledUi(2.0));
-        queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(colors.rgba(145, 163, 170, 200)), theme.scaledUi(2.0));
+        queuePaletteRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
+        queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
     }
 
     // Pinned header — painted last so any scrolled rows in the header band
@@ -738,12 +738,12 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const hovered = if (state.sidebar_thread_hover) |h| h.project_index == project_index and h.thread_index == thread_index else false;
     if (selected) {
         const bg = if (hovered)
-            paletteColor(theme.lighten(colors.DARK_BLUE, 0.09))
+            paletteColor(theme.lighten(theme.borderMuted(), 0.09))
         else
-            paletteColor(colors.DARK_BLUE);
+            paletteColor(theme.borderMuted());
         queuePaletteRoundedRect(state, snapRect(rect), bg, theme.scaledUi(7.0));
     } else if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(colors.rgba(36, 49, 45, 210)), theme.scaledUi(7.0));
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)), theme.scaledUi(7.0));
     }
     addPaletteHit(rect, .thread_row, project_index, thread_index);
 
@@ -790,7 +790,7 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
         .y = title_y,
         .w = theme.scaledUi(58.0),
         .h = title_line,
-    }, relative_time, paletteColor(colors.TIME_LABEL), title_font, clip);
+    }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), title_font, clip);
 }
 
 fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {

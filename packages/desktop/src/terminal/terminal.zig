@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
+const theme = @import("../ui/theme.zig");
 
 const log = std.log.scoped(.native_terminal);
 
@@ -257,6 +258,12 @@ pub const Dock = struct {
             changed = (try pollPaneNode(tab.root, allocator)) or changed;
         }
         return changed;
+    }
+
+    pub fn rethemeSessions(self: *Dock, allocator: std.mem.Allocator) !void {
+        for (self.tabs.items) |*tab| {
+            try rethemePaneNode(tab.root, allocator);
+        }
     }
 
     pub fn resizePaneToFit(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, width: f32, height: f32) !void {
@@ -835,6 +842,18 @@ fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !bool {
     }
 }
 
+fn rethemePaneNode(node: *PaneNode, allocator: std.mem.Allocator) !void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.session) |session| try session.retheme(allocator);
+        },
+        .split => |*split| {
+            try rethemePaneNode(split.first, allocator);
+            try rethemePaneNode(split.second, allocator);
+        },
+    }
+}
+
 fn paneNodeHasRunningSession(node: *const PaneNode) bool {
     return switch (node.*) {
         .leaf => |leaf| if (leaf.session) |session| session.isRunning() else false,
@@ -1133,6 +1152,8 @@ const UnsupportedSession = struct {
 
     pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16, _: u32, _: u32) !void {}
 
+    pub fn retheme(_: *UnsupportedSession, _: std.mem.Allocator) !void {}
+
     pub fn displayText(_: *const UnsupportedSession) []const u8 {
         return "";
     }
@@ -1313,6 +1334,12 @@ const UnixSession = struct {
 
     pub fn renderState(self: *const UnixSession) *const ghostty_vt.RenderState {
         return &self.render_state;
+    }
+
+    pub fn retheme(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        configureTerminalTheme(allocator, &self.terminal);
+        try self.refreshRenderState(allocator);
+        self.render_state.dirty = .full;
     }
 
     pub fn markRendered(self: *UnixSession) void {
@@ -1606,14 +1633,14 @@ const UnixSession = struct {
     }
 
     const TerminalTheme = struct {
-        background: ghostty_vt.color.RGB = terminalRgb(0x2c, 0x25, 0x25),
-        foreground: ghostty_vt.color.RGB = terminalRgb(0xe6, 0xd9, 0xdb),
-        cursor: ghostty_vt.color.RGB = terminalRgb(0xc3, 0xb7, 0xb8),
-        palette: [256]ghostty_vt.color.RGB = defaultTerminalPalette(),
+        background: ghostty_vt.color.RGB,
+        foreground: ghostty_vt.color.RGB,
+        cursor: ghostty_vt.color.RGB,
+        palette: [256]ghostty_vt.color.RGB,
     };
 
     fn configureTerminalTheme(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal) void {
-        var terminal_theme = TerminalTheme{};
+        var terminal_theme = defaultTerminalTheme();
         loadGhosttyTheme(allocator, &terminal_theme) catch |err| {
             log.debug("using built-in terminal theme fallback: {s}", .{@errorName(err)});
         };
@@ -1624,25 +1651,34 @@ const UnixSession = struct {
         terminal.colors.palette.changeDefault(terminal_theme.palette);
     }
 
+    fn defaultTerminalTheme() TerminalTheme {
+        return .{
+            .background = terminalRgbFromTheme(theme.background()),
+            .foreground = terminalRgbFromTheme(theme.COLOR_WHITE),
+            .cursor = terminalRgbFromTheme(theme.COLOR_TEXT_MUTED),
+            .palette = defaultTerminalPalette(),
+        };
+    }
+
     fn defaultTerminalPalette() [256]ghostty_vt.color.RGB {
         var palette = ghostty_vt.color.default;
         const ansi = [_]ghostty_vt.color.RGB{
-            terminalRgb(0x72, 0x69, 0x6a),
-            terminalRgb(0xfd, 0x68, 0x83),
-            terminalRgb(0xad, 0xda, 0x78),
-            terminalRgb(0xf9, 0xcc, 0x6c),
-            terminalRgb(0xf3, 0x8d, 0x70),
-            terminalRgb(0xa8, 0xa9, 0xeb),
-            terminalRgb(0x85, 0xda, 0xcc),
-            terminalRgb(0xe6, 0xd9, 0xdb),
-            terminalRgb(0x94, 0x8a, 0x8b),
-            terminalRgb(0xff, 0x82, 0x97),
-            terminalRgb(0xc8, 0xe2, 0x92),
-            terminalRgb(0xfc, 0xd6, 0x75),
-            terminalRgb(0xf8, 0xa7, 0x88),
-            terminalRgb(0xbe, 0xbf, 0xfd),
-            terminalRgb(0x9b, 0xf1, 0xe1),
-            terminalRgb(0xf1, 0xe5, 0xe7),
+            terminalRgbFromTheme(theme.COLOR_TEXT_SUBTLE),
+            terminalRgbFromTheme(theme.COLOR_DIFF_REMOVE),
+            terminalRgbFromTheme(theme.COLOR_GREEN),
+            terminalRgbFromTheme(theme.COLOR_YELLOW),
+            terminalRgbFromTheme(theme.COLOR_SECONDARY_GREEN),
+            terminalRgbFromTheme(theme.COLOR_ACCENT_DIM),
+            terminalRgbFromTheme(theme.COLOR_TEXT_MUTED),
+            terminalRgbFromTheme(theme.COLOR_WHITE),
+            terminalRgbFromTheme(theme.COLOR_TEXT_MUTED),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_DIFF_REMOVE, 0.12)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_GREEN, 0.12)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_YELLOW, 0.12)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.12)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_ACCENT_DIM, 0.2)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_TEXT_MUTED, 0.14)),
+            terminalRgbFromTheme(theme.lighten(theme.COLOR_WHITE, 0.04)),
         };
         @memcpy(palette[0..ansi.len], &ansi);
         return palette;
@@ -1733,6 +1769,15 @@ const UnixSession = struct {
 
     fn terminalRgb(r: u8, g: u8, b: u8) ghostty_vt.color.RGB {
         return .{ .r = r, .g = g, .b = b };
+    }
+
+    fn terminalRgbFromTheme(color: [4]f32) ghostty_vt.color.RGB {
+        return terminalRgb(floatChannelToU8(color[0]), floatChannelToU8(color[1]), floatChannelToU8(color[2]));
+    }
+
+    fn floatChannelToU8(value: f32) u8 {
+        const clamped = @max(0.0, @min(value, 1.0));
+        return @intFromFloat(@round(clamped * 255.0));
     }
 
     fn captureExitStatus(self: *UnixSession) bool {
