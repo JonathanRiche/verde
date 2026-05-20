@@ -4,7 +4,7 @@ Use this workflow when checking the native UI blur issue on Hyprland.
 
 1. Build the desktop app:
    ```bash
-   zig build --release=safe -Dcef-sdk-path=/home/rtg/.cache/verde/cef-sdk/cef_binary_146.0.9+g3ca6a87+chromium-146.0.7680.165_linux64_minimal
+   zig build --release=safe
    ```
 
 2. Open the app from this worktree:
@@ -61,3 +61,82 @@ magick /tmp/verde-arena-15pageup.png -filter point -crop 360x760+0+80 -resize 30
 ```
 
 The 15-PageUp capture keeps the sidebar, transcript, and composer text readable and stable.
+
+# Browser Webview Smoke Checklist
+
+Use this checklist for the native webview migration. For the current macOS
+WKWebView handoff, `mac_webview.md` is the authoritative signoff document.
+
+1. Start the default native webview path without downloading CEF:
+   ```bash
+   mise run dev
+   ```
+
+2. Verify the default native install payload excludes CEF:
+   ```bash
+   scripts/dev/check-native-webview-install.sh
+   ```
+
+3. Start with the browser pane opened lazily by environment request:
+   ```bash
+   VERDE_OPEN_BROWSER_ON_START=1 mise run dev
+   ```
+   To smoke-test startup navigation without manual URL entry, add a startup
+   URL:
+   ```bash
+   VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_URL=https://example.com mise run dev
+   ```
+   To smoke-test eval reporting, add:
+   ```bash
+   VERDE_OPEN_BROWSER_ON_START=1 VERDE_BROWSER_START_EVAL='JSON.stringify({title:document.title,url:location.href})' mise run dev
+   ```
+
+4. Verify basic pane behavior: open, hide, close, resize the main window, resize split panes, focus browser, focus terminal, focus composer, and open a modal/menu above the browser.
+
+5. Verify navigation: enter `example.com` and confirm `https://example.com`, enter `about:blank`, enter a localhost URL, use toolbar back/forward, use mouse buttons 4/5, and use the refresh button.
+
+6. Verify input: click page controls, type into inputs/textareas, paste, select all, copy, cut, use arrow/Home/End/Backspace/Delete/Enter/Tab/Escape, scroll with the wheel, and use modifier-click/wheel.
+
+7. Verify bridge and scripts: run the default eval string, post the default JSON payload, receive page-to-host `js_message`, confirm eval results for JSON/string/null values, and confirm failed eval reports an error.
+   Page-to-host bridge messages are accepted by default only from `app://`,
+   `localhost`, `127.0.0.1`, and `[::1]` pages. For local diagnostics against
+   arbitrary pages or `data:` URLs, launch Verde with
+   `VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE=1`.
+   The CLI can drive repeatable eval and host-to-page bridge checks while the
+   browser is open:
+   ```bash
+   verde live browser eval --script 'JSON.stringify({title:document.title,url:location.href})' --json
+   verde live browser post-json --json-payload '{"type":"ping"}' --json
+   verde live status --json
+   ```
+
+8. Verify inspector: enable the inspector, switch Point/Draw Box/Draw Freeform modes, select an element, submit an inspector prompt to the current draft, navigate while armed and confirm it reapplies, then disable the inspector.
+
+9. Verify shutdown: close the app with the browser open, reopen after a browser failure, and confirm no browser helper process remains after exit.
+
+10. For Hyprland Wayland overlay work, capture screenshots with:
+   ```bash
+   hyprctl clients -j
+   grim -g '<x>,<y> <w>x<h>' /tmp/verde-browser-native-webview.png
+   ```
+
+11. Before release, repeat the checklist on each native runtime:
+    - Linux WebKitGTK on the normal Hyprland Wayland session, plus X11 where available. Linux should report `presentation_kind: "snapshot_texture"` on Wayland by default and `presentation_kind: "helper_window"` on X11 unless `VERDE_BROWSER_LINUX_SHOW_HELPER=0` is set. On Wayland, `VERDE_BROWSER_LINUX_SHOW_HELPER=1` must still report `snapshot_texture` unless paired with the diagnostic-only `VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER=1` flag. On X11, verify native focus, click, wheel, and key input in the helper window in addition to the default snapshot path.
+    - macOS WKWebView. Run the automated gate:
+      ```bash
+      mise run check-mac-webview
+      ```
+      This refreshes the installed local macOS app before checking installed
+      Swift symbols, codesign, CEF-free contents, source-level native-keyboard
+      ownership checks for the doubled-key fix, runtime startup, and the
+      manual-evidence validator self-test for doubled text, address-focus,
+      inspector status, URL-match, and generated unavailable-evidence handling.
+      Then complete the direct keyboard/trackpad checklist in
+      `notes/mac-webview-smoke/manual-input-checklist.md` and run the
+      run-specific completion command printed by
+      `scripts/dev/run-macos-wkwebview-manual-signoff.sh`. The automated gate
+      does not prove real keypresses, Command-key shortcuts, modifier
+      click/wheel, IME/composition, or physical inspector gestures.
+    - Windows WebView2 with and without the runtime/loader preinstalled to confirm clear failure reporting.
+
+Pass criteria: the webview is clipped to the browser content area only, never covers Palette toolbar/sidebar/terminal/chat/modal UI, follows pane resize/split changes, does not show blank/stale/offset content after navigation, mouse hit testing matches the visible page, and `verde` live status reports the selected runtime kind, presentation kind, initialization state, focused/visible state, URL, last browser error, last bridge message, and last eval result.

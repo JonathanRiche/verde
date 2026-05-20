@@ -205,7 +205,9 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         .h = @max(body.h - process_strip_height, theme.scaledUi(96.0)),
     } else body;
 
-    const split_chat_browser = state.isBrowserVisible() and transcript_body.w >= theme.scaledUi(900.0);
+    const browser_visible = state.isBrowserVisible() and pane_id == null;
+    const split_chat_browser = browser_visible and transcript_body.w >= theme.scaledUi(900.0);
+    const stacked_chat_browser = browser_visible and !split_chat_browser and transcript_body.h >= theme.scaledUi(300.0);
     const browser_width = if (split_chat_browser) state.browserPanelWidth(transcript_body.w) else 0.0;
     const composer_lane_w = if (split_chat_browser) transcript_body.w - browser_width else transcript_body.w;
     const composer_lane_x = transcript_body.x;
@@ -229,6 +231,18 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
             .y = transcript_body.y,
             .w = browser_width,
             .h = @max(browser_dock_h, theme.scaledUi(120.0)),
+        });
+    } else if (stacked_chat_browser) {
+        const browser_gap = theme.scaledUi(10.0);
+        const browser_height = @min(state.browserPanelHeight(transcript_body.h), transcript_body.h * 0.48);
+        const chat_h = @max(transcript_body.h - browser_height - browser_gap, theme.scaledUi(96.0));
+        const chat_rect = palette.Rect{ .x = transcript_body.x, .y = transcript_body.y, .w = transcript_body.w, .h = chat_h };
+        renderTranscript(state, chat_rect, pane_id);
+        browser_panel.renderDockAt(state, .{
+            .x = transcript_body.x,
+            .y = transcript_body.y + chat_h + browser_gap,
+            .w = transcript_body.w,
+            .h = @max(browser_height, theme.scaledUi(120.0)),
         });
     } else {
         renderTranscript(state, transcript_body, pane_id);

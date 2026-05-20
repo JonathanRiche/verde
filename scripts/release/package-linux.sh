@@ -16,7 +16,10 @@ if [[ "$OUTPUT_DIR" != /* ]]; then
   OUTPUT_DIR="$CALLER_ROOT/$OUTPUT_DIR"
 fi
 ARCH="$(uname -m)"
-source "$SCRIPT_DIR/cef-common.sh"
+BROWSER_BACKEND="${VERDE_BROWSER_BACKEND:-native_webview}"
+if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+  source "$SCRIPT_DIR/cef-common.sh"
+fi
 
 case "$ARCH" in
   x86_64) ARCH="x86_64" ;;
@@ -57,7 +60,9 @@ normalize_fff_dependency() {
     return
   fi
 
-  if ! readelf -d "$path" | grep -Fq "$original_needed"; then
+  local needed_entries
+  needed_entries="$(readelf -d "$path")"
+  if ! grep -Fq "$original_needed" <<<"$needed_entries"; then
     return
   fi
 
@@ -70,7 +75,7 @@ copy_runtime_library() {
   local library_path=""
 
   if command -v ldconfig >/dev/null 2>&1; then
-    library_path="$(ldconfig -p | awk -v name="$library_name" '$1 == name { print $NF; exit }')"
+    library_path="$(ldconfig -p | awk -v name="$library_name" '$1 == name && path == "" { path = $NF } END { print path }')"
   fi
 
   if [[ -z "$library_path" && -e "/usr/lib/x86_64-linux-gnu/$library_name" ]]; then
@@ -90,7 +95,7 @@ copy_runtime_library() {
   fi
   if command -v readelf >/dev/null 2>&1; then
     local soname
-    soname="$(readelf -d "$(readlink -f "$library_path")" | awk '/SONAME/ { gsub(/[\[\]]/, "", $5); print $5; exit }')"
+    soname="$(readelf -d "$(readlink -f "$library_path")" | awk '/SONAME/ && soname == "" { gsub(/[\[\]]/, "", $5); soname = $5 } END { print soname }')"
     if [[ -n "$soname" && "$soname" != "$real_name" ]]; then
       ln -sfn "$real_name" "$destination_dir/$soname"
     fi
@@ -110,12 +115,44 @@ copy_node_runtime() {
   cp -a "$source_dir/." "$destination_dir/"
 }
 
+assert_no_cef_payload() {
+  local root_dir="$1"
+  local cef_payload=(
+    "verde-browser-cef"
+    "verde-browser-cef-process"
+    "libcef.so"
+    "chrome-sandbox"
+    "chrome_100_percent.pak"
+    "chrome_200_percent.pak"
+    "resources.pak"
+    "icudtl.dat"
+    "v8_context_snapshot.bin"
+    "vk_swiftshader_icd.json"
+    "locales"
+  )
+
+  if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+    return
+  fi
+
+  for name in "${cef_payload[@]}"; do
+    if [[ -e "$root_dir/bin/$name" ]]; then
+      echo "native webview package unexpectedly contains CEF payload: bin/$name" >&2
+      exit 1
+    fi
+  done
+}
+
 mkdir -p "$OUTPUT_DIR"
-need_cmake
-verde_cef_ensure_sdk linux "$ARCH"
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" "-Dbrowser-backend=$BROWSER_BACKEND")
+if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+  need_cmake
+  verde_cef_ensure_sdk linux "$ARCH"
+  BUILD_ARGS+=("-Dcef-sdk-path=$VERDE_CEF_SDK_PATH_RESOLVED")
+fi
 
 cd "$DESKTOP_ROOT"
-zig build --release=safe -p "$PREFIX_DIR" -Dcef-sdk-path="$VERDE_CEF_SDK_PATH_RESOLVED"
+"${BUILD_ARGS[@]}"
 
 mkdir -p \
   "$PACKAGE_ROOT/bin" \
@@ -128,21 +165,30 @@ install -m 755 "$PREFIX_DIR/bin/verde" "$PACKAGE_ROOT/bin/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.so" "$PACKAGE_ROOT/bin/libfff_c.so"
 install -m 755 "$PREFIX_DIR/bin/libSDL3.so" "$PACKAGE_ROOT/bin/libSDL3.so"
 copy_runtime_library "libSDL3_ttf.so" "$PACKAGE_ROOT/bin"
-install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
-install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"
-install -m 755 "$PREFIX_DIR/bin/libcef.so" "$PACKAGE_ROOT/bin/libcef.so"
-install -m 755 "$PREFIX_DIR/bin/libEGL.so" "$PACKAGE_ROOT/bin/libEGL.so"
-install -m 755 "$PREFIX_DIR/bin/libGLESv2.so" "$PACKAGE_ROOT/bin/libGLESv2.so"
-install -m 755 "$PREFIX_DIR/bin/libvk_swiftshader.so" "$PACKAGE_ROOT/bin/libvk_swiftshader.so"
-install -m 755 "$PREFIX_DIR/bin/libvulkan.so.1" "$PACKAGE_ROOT/bin/libvulkan.so.1"
-install -m 755 "$PREFIX_DIR/bin/v8_context_snapshot.bin" "$PACKAGE_ROOT/bin/v8_context_snapshot.bin"
-install -m 755 "$PREFIX_DIR/bin/vk_swiftshader_icd.json" "$PACKAGE_ROOT/bin/vk_swiftshader_icd.json"
-install -m 755 "$PREFIX_DIR/bin/chrome-sandbox" "$PACKAGE_ROOT/bin/chrome-sandbox"
-install -m 644 "$PREFIX_DIR/bin/chrome_100_percent.pak" "$PACKAGE_ROOT/bin/chrome_100_percent.pak"
-install -m 644 "$PREFIX_DIR/bin/chrome_200_percent.pak" "$PACKAGE_ROOT/bin/chrome_200_percent.pak"
-install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
-install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
-cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
+if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-linux" "$PACKAGE_ROOT/bin/verde-browser-linux"
+fi
+if [[ "$BROWSER_BACKEND" == "native_webview" && -x "$PREFIX_DIR/bin/verde-browser-linux-wpe" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-linux-wpe" "$PACKAGE_ROOT/bin/verde-browser-linux-wpe"
+fi
+if [[ "$BROWSER_BACKEND" == "cef" ]]; then
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef" "$PACKAGE_ROOT/bin/verde-browser-cef"
+  install -m 755 "$PREFIX_DIR/bin/verde-browser-cef-process" "$PACKAGE_ROOT/bin/verde-browser-cef-process"
+  install -m 755 "$PREFIX_DIR/bin/libcef.so" "$PACKAGE_ROOT/bin/libcef.so"
+  install -m 755 "$PREFIX_DIR/bin/libEGL.so" "$PACKAGE_ROOT/bin/libEGL.so"
+  install -m 755 "$PREFIX_DIR/bin/libGLESv2.so" "$PACKAGE_ROOT/bin/libGLESv2.so"
+  install -m 755 "$PREFIX_DIR/bin/libvk_swiftshader.so" "$PACKAGE_ROOT/bin/libvk_swiftshader.so"
+  install -m 755 "$PREFIX_DIR/bin/libvulkan.so.1" "$PACKAGE_ROOT/bin/libvulkan.so.1"
+  install -m 755 "$PREFIX_DIR/bin/v8_context_snapshot.bin" "$PACKAGE_ROOT/bin/v8_context_snapshot.bin"
+  install -m 755 "$PREFIX_DIR/bin/vk_swiftshader_icd.json" "$PACKAGE_ROOT/bin/vk_swiftshader_icd.json"
+  install -m 755 "$PREFIX_DIR/bin/chrome-sandbox" "$PACKAGE_ROOT/bin/chrome-sandbox"
+  install -m 644 "$PREFIX_DIR/bin/chrome_100_percent.pak" "$PACKAGE_ROOT/bin/chrome_100_percent.pak"
+  install -m 644 "$PREFIX_DIR/bin/chrome_200_percent.pak" "$PACKAGE_ROOT/bin/chrome_200_percent.pak"
+  install -m 644 "$PREFIX_DIR/bin/resources.pak" "$PACKAGE_ROOT/bin/resources.pak"
+  install -m 644 "$PREFIX_DIR/bin/icudtl.dat" "$PACKAGE_ROOT/bin/icudtl.dat"
+  cp -a "$PREFIX_DIR/bin/locales" "$PACKAGE_ROOT/bin/locales"
+fi
+assert_no_cef_payload "$PACKAGE_ROOT"
 cat > "$PACKAGE_ROOT/bin/verde-launch" <<'EOF'
 #!/usr/bin/env sh
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"

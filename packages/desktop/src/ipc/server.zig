@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const app_state = @import("../state.zig");
+const browser_runtime = @import("../browser/mod.zig");
+const browser_ui = @import("../ui/browser.zig");
 const provider_types = @import("../provider_types.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -188,6 +190,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
     if (std.mem.startsWith(u8, method, "chat.")) return try chatCommandResponse(allocator, id_value, state, params, method["chat.".len..]);
+    if (std.mem.startsWith(u8, method, "browser.")) return try browserCommandResponse(allocator, id_value, state, params, method["browser.".len..]);
     if (std.mem.startsWith(u8, method, "terminal.")) return try terminalCommandResponse(allocator, id_value, state, params, method["terminal.".len..]);
     if (std.mem.startsWith(u8, method, "process.")) return try processCommandResponse(allocator, id_value, state, params, method["process.".len..]);
     if (std.mem.startsWith(u8, method, "stack.")) return try stackCommandResponse(allocator, id_value, state, params, method["stack.".len..]);
@@ -218,6 +221,10 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     }
     try s.objectField("pending_send_count");
     try s.write(state.pending_send_count);
+    try s.objectField("focus");
+    try writeFocusStatus(&s, state);
+    try s.objectField("browser");
+    try writeBrowserStatus(&s, state);
     try s.objectField("panes");
     try writeSelectedProjectPanes(&s, state);
     try s.objectField("terminals");
@@ -229,20 +236,106 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     return try writer.toOwnedSlice();
 }
 
+fn writeFocusStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
+    try s.beginObject();
+    try s.objectField("browser_pane_focused");
+    try s.write(state.isBrowserPaneFocused());
+    try s.objectField("native_browser_surface_focused");
+    try s.write(state.isNativeBrowserSurfaceFocused());
+    try s.objectField("browser_address_focused");
+    try s.write(state.browser_address_focused);
+    try s.objectField("composer_focused");
+    try s.write(state.composer_focused);
+    try s.objectField("terminal_focused");
+    try s.write(state.terminal_focused);
+    try s.objectField("palette_modal_text_focus");
+    try s.write(state.paletteModalTextFocusName());
+    try s.endObject();
+}
+
+fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
+    const browser = state.browserStateConst();
+    try s.beginObject();
+    try s.objectField("runtime_kind");
+    try s.write(@tagName(browser.controller.runtimeKind()));
+    try s.objectField("presentation_kind");
+    try s.write(@tagName(browser.controller.presentationKind()));
+    try s.objectField("runtime_initialized");
+    try s.write(browser.controller.runtimeInitialized());
+    try s.objectField("status");
+    try s.write(browser.statusLabel());
+    try s.objectField("visible");
+    try s.write(state.isBrowserVisible());
+    try s.objectField("pane_focused");
+    try s.write(state.isBrowserPaneFocused());
+    try s.objectField("address_focused");
+    try s.write(state.browser_address_focused);
+    try s.objectField("url");
+    if (browser.current_url) |url| try s.write(url) else try s.write(null);
+    try s.objectField("address");
+    try s.write(browser.addressInput());
+    try s.objectField("inspector_enabled");
+    try s.write(browser.inspectorEnabled());
+    try s.objectField("inspector_mode");
+    try s.write(browser.inspectorMode().jsValue());
+    try s.objectField("inspector_menu_open");
+    try s.write(state.isBrowserInspectorMenuOpen());
+    try s.objectField("surface_suspended_for_palette_overlay");
+    try s.write(state.isBrowserSurfaceSuspendedForPaletteOverlay());
+    try s.objectField("surface_suspended_for_layout");
+    try s.write(state.isBrowserSurfaceSuspendedForLayout());
+    try s.objectField("workspace_header_open_menu_open");
+    try s.write(state.isWorkspaceHeaderOpenMenuOpen());
+    try s.objectField("sidebar_context_menu_open");
+    try s.write(state.isSidebarContextMenuOpen());
+    try s.objectField("composer_menu_open");
+    try s.write(state.isComposerMenuOpen());
+    try s.objectField("project_import_modal_open");
+    try s.write(state.isProjectImportModalOpen());
+    try s.objectField("thread_import_modal_open");
+    try s.write(state.isThreadImportModalOpen());
+    try s.objectField("image_modal_open");
+    try s.write(state.isImageModalOpen());
+    try s.objectField("transcript_selection_modal_open");
+    try s.write(state.isTranscriptSelectionModalOpen());
+    try s.objectField("palette_modal_text_focus");
+    try s.write(state.paletteModalTextFocusName());
+    try s.objectField("last_error");
+    if (browser.last_error) |message| try s.write(message) else try s.write(null);
+    try s.objectField("last_js_message");
+    if (browser.last_js_message) |message| try s.write(message) else try s.write(null);
+    try s.objectField("last_eval_result");
+    if (browser.last_eval_result) |result| try s.write(result) else try s.write(null);
+    if (browser.controller.macosAppKitDiagnostics(state.allocator)) |diagnostics| {
+        defer state.allocator.free(diagnostics);
+        try s.objectField("macos_appkit_diagnostics");
+        try s.write(diagnostics);
+    }
+    try s.endObject();
+}
+
 fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",         "capabilities",    "projects",       "panes",
-            "active",         "inspect",         "threads",        "terminals",
-            "processes",      "pane.focus",      "pane.split",     "pane.resize",
-            "pane.minimize",  "pane.maximize",   "pane.restore",   "pane.close",
-            "chat.status",    "chat.transcript", "chat.draft.set", "chat.draft.append",
-            "chat.send",      "chat.followup",   "chat.stop",      "chat.approve",
-            "terminal.write", "terminal.tail",   "terminal.screen", "process.list",
-            "process.inspect", "process.start",  "process.stop",    "process.restart",
-            "process.logs",   "stack.status",    "stack.start",     "stack.stop",
-            "stack.restart",
+            "status",                            "capabilities",                        "projects",                             "panes",
+            "active",                            "inspect",                             "threads",                              "terminals",
+            "processes",                         "pane.focus",                          "pane.split",                           "pane.resize",
+            "pane.minimize",                     "pane.maximize",                       "pane.restore",                         "pane.close",
+            "chat.status",                       "chat.transcript",                     "chat.draft.set",                       "chat.draft.append",
+            "chat.send",                         "chat.followup",                       "chat.stop",                            "chat.approve",
+            "browser.open",                      "browser.close",                       "browser.toggle",                       "browser.back",
+            "browser.forward",                   "browser.reload",                      "browser.focus",                        "browser.blur",
+            "browser.toolbarHit",                "browser.selectAllFocused",            "browser.copyFocused",                  "browser.cutFocused",
+            "browser.pasteTextFocused",          "browser.eval",                        "browser.postJson",                     "browser.inspector.enable",
+            "browser.inspector.disable",         "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",
+            "browser.inspector.menuClose",       "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",
+            "browser.overlay.sidebarMenuClose",  "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.projectModalOpen",
+            "browser.overlay.projectModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
+            "browser.overlay.imageModalClose",   "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "terminal.write",
+            "terminal.tail",                     "terminal.screen",                     "process.list",                         "process.inspect",
+            "process.start",                     "process.stop",                        "process.restart",                      "process.logs",
+            "stack.status",                      "stack.start",                         "stack.stop",                           "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -438,6 +531,201 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 
     if (!accepted) return try errorResponseAlloc(allocator, id_value, "rejected", "chat operation did not apply");
     return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
+}
+
+fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "open")) {
+        if (!state.isBrowserVisible()) state.toggleBrowser();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "close")) {
+        if (state.isBrowserVisible()) state.closeBrowser();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "toggle")) {
+        state.toggleBrowser();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (!state.isBrowserVisible()) {
+        return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible");
+    }
+
+    if (std.mem.eql(u8, command, "back")) {
+        state.navigateBrowserHistory(-1);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "forward")) {
+        state.navigateBrowserHistory(1);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "reload")) {
+        state.reloadBrowser();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "focus")) {
+        state.focusBrowserPane();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "blur")) {
+        state.unfocusBrowserPane();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "toolbarHit")) {
+        const target = stringParam(params, "target") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.toolbarHit requires target");
+        const accepted = browser_ui.triggerPaletteToolbarHit(state, target);
+        return try okValueResponse(allocator, id_value, .{ .accepted = accepted });
+    }
+
+    if (std.mem.eql(u8, command, "selectAllFocused")) {
+        state.selectAllBrowserFocusedElement();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "copyFocused")) {
+        state.copyBrowserFocusedSelection(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "cutFocused")) {
+        state.copyBrowserFocusedSelection(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "pasteTextFocused")) {
+        const text = stringParam(params, "text") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.pasteTextFocused requires text");
+        state.pasteBrowserTextIntoFocusedElement(text);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.enable")) {
+        state.enableBrowserInspector(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.disable")) {
+        state.disableBrowserInspector(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.toggle")) {
+        state.toggleBrowserInspector();
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.mode")) {
+        const raw_mode = stringParam(params, "mode") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.inspector.mode requires mode");
+        const mode = parseInspectorMode(raw_mode) orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid browser inspector mode");
+        state.setBrowserInspectorMode(mode);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.menuOpen")) {
+        if (!state.setBrowserInspectorMenuOpen(true)) return try errorResponseAlloc(allocator, id_value, "rejected", "browser inspector menu cannot be opened");
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "inspector.menuClose")) {
+        _ = state.setBrowserInspectorMenuOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.workspaceMenuOpen")) {
+        state.setWorkspaceHeaderOpenMenuOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.workspaceMenuClose")) {
+        state.setWorkspaceHeaderOpenMenuOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.sidebarMenuOpen")) {
+        state.setSidebarContextMenuOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.sidebarMenuClose")) {
+        state.setSidebarContextMenuOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.composerMenuOpen")) {
+        state.setComposerMenuOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.composerMenuClose")) {
+        state.setComposerMenuOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.projectModalOpen")) {
+        state.setProjectImportModalOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.projectModalClose")) {
+        state.setProjectImportModalOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.threadModalOpen")) {
+        state.setThreadImportModalOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.threadModalClose")) {
+        state.setThreadImportModalOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.imageModalOpen")) {
+        state.setImageModalOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.imageModalClose")) {
+        state.setImageModalOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.transcriptModalOpen")) {
+        state.setTranscriptSelectionModalOpen(true);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "overlay.transcriptModalClose")) {
+        state.setTranscriptSelectionModalOpen(false);
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "eval")) {
+        const script = stringParam(params, "script") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
+        if (script.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.eval requires script");
+        state.browserState().controller.eval(script) catch |err| {
+            return try errorResponseAlloc(allocator, id_value, "browser_eval_failed", @errorName(err));
+        };
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    if (std.mem.eql(u8, command, "postJson")) {
+        const payload = stringParam(params, "json") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.post-json requires json payload");
+        if (payload.len == 0) return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.post-json requires json payload");
+        state.browserState().controller.postJson(payload) catch |err| {
+            return try errorResponseAlloc(allocator, id_value, "browser_post_json_failed", @errorName(err));
+        };
+        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+    }
+
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
 }
 
 fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
@@ -685,6 +973,12 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
             try s.write(attention);
             try s.objectField("attention_reasons");
             try writeTerminalAttentionReasons(s, project, ref.dock_id);
+        },
+        .browser => {
+            try s.objectField("kind");
+            try s.write("browser");
+            try s.objectField("visible");
+            try s.write(state.isBrowserVisible());
         },
     }
     try s.endObject();
@@ -1139,6 +1433,13 @@ fn boolParam(params: std.json.Value, name: []const u8) ?bool {
         .bool => |value| value,
         else => null,
     };
+}
+
+fn parseInspectorMode(value: []const u8) ?browser_runtime.InspectorMode {
+    if (std.mem.eql(u8, value, "point")) return .point;
+    if (std.mem.eql(u8, value, "draw-box") or std.mem.eql(u8, value, "draw_box")) return .draw_box;
+    if (std.mem.eql(u8, value, "draw-freeform") or std.mem.eql(u8, value, "draw_freeform")) return .draw_freeform;
+    return null;
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {

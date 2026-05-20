@@ -1245,6 +1245,7 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
         runtime_log.diagnostic("failed to store provisional thread id len={d}: {s}", .{ thread_id.len, @errorName(err) });
         return;
     };
+    send_state.ui_revision +%= 1;
 }
 fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1265,6 +1266,7 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
         runtime_log.diagnostic("failed to store active turn id len={d}: {s}", .{ turn_id.len, @errorName(err) });
         return;
     };
+    send_state.ui_revision +%= 1;
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1284,6 +1286,7 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
         );
         return;
     };
+    send_state.ui_revision +%= 1;
 }
 fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1315,11 +1318,14 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
             }) catch {
                 page_alloc.free(owned_author);
                 page_alloc.free(owned_body);
+                return;
             };
+            send_state.ui_revision +%= 1;
         },
         .diff => |diff| {
             flushPendingAssistantTextLocked(send_state, page_alloc);
             mergePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files, diff.files);
+            send_state.ui_revision +%= 1;
         },
     }
 }
@@ -1337,6 +1343,7 @@ pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocat
     const trimmed = std.mem.trim(u8, send_state.partial_text.items, &std.ascii.whitespace);
     if (trimmed.len == 0) {
         send_state.partial_text.clearRetainingCapacity();
+        send_state.ui_revision +%= 1;
         return;
     }
 
@@ -1356,6 +1363,7 @@ pub fn flushPendingAssistantTextLocked(send_state: *app_state.SendState, allocat
     };
 
     send_state.partial_text.clearRetainingCapacity();
+    send_state.ui_revision +%= 1;
 }
 fn mergePendingDiffFilesLocked(
     allocator: std.mem.Allocator,
@@ -1424,6 +1432,7 @@ fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalR
         .body = owned_body,
     };
     send_state.approval_decision = null;
+    send_state.ui_revision +%= 1;
 
     while (send_state.status == .pending and send_state.approval_decision == null) {
         send_state.condition.wait(&send_state.mutex);
@@ -1432,6 +1441,7 @@ fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalR
     const decision = send_state.approval_decision orelse .deny;
     send_state.approval_decision = null;
     freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
+    send_state.ui_revision +%= 1;
     return decision;
 }
 pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?app_state.PendingApproval) void {

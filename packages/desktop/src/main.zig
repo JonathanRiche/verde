@@ -36,8 +36,14 @@ const Storage = native_state.Storage;
 const log = native_state.log;
 
 extern fn SDL_GetWindowSizeInPixels(window: *sdl.Window, w: ?*c_int, h: ?*c_int) bool;
+extern fn SDL_GetWindowProperties(window: *sdl.Window) sdl.PropertiesID;
+extern fn SDL_GetWindowFlags(window: *sdl.Window) sdl.Window.Flags;
 extern fn SDL_GetModState() sdl.Keymod;
 extern fn SDL_SetHint(name: [*:0]const u8, value: [*:0]const u8) bool;
+extern fn SDL_ShowWindow(window: *sdl.Window) bool;
+extern fn SDL_RaiseWindow(window: *sdl.Window) bool;
+extern fn SDL_SetWindowFocusable(window: *sdl.Window, focusable: bool) bool;
+extern fn SDL_SyncWindow(window: *sdl.Window) bool;
 extern fn SDL_WaitEventTimeout(event: *sdl.Event, timeout_ms: c_int) bool;
 extern fn SDL_TextInputActive(window: *sdl.Window) bool;
 
@@ -59,6 +65,7 @@ const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
+var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
     "packages/desktop/src/assets/fonts/CalSans-Regular.ttf",
@@ -101,6 +108,12 @@ const CODICON_BYTES = @embedFile("assets/fonts/Codicon.ttf");
 const NERD_SYMBOLS_BYTES = @embedFile("assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 
 var macos_cmd_w_pane_close_until_ms: i64 = 0;
+var macos_launch_close_suppress_until_ms: i64 = 0;
+var macos_last_text_input_timestamp_ns: u64 = 0;
+var macos_last_text_input_len: usize = 0;
+var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
+const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
+const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
 const WindowFrame = struct {
     x: c_int,
@@ -134,6 +147,9 @@ fn mainInner(init: std.process.Init) !void {
 
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
     if (builtin.os.tag == .macos) {
+        _ = SDL_SetHint("SDL_MAC_BACKGROUND_APP", "0");
+        _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_SHOWN", "1");
+        _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_RAISED", "1");
         _ = SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
     }
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
@@ -163,7 +179,11 @@ fn mainInner(init: std.process.Init) !void {
     );
     defer window.destroy();
     window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
-    sdl.startTextInput(window) catch {};
+    activateMacosHostWindow(window);
+    if (builtin.os.tag == .macos) {
+        macos_launch_close_suppress_until_ms = currentTimeMillis() + MACOS_LAUNCH_CLOSE_SUPPRESS_MS;
+        verde_macos_host_window_install_close_monitor(nativeBrowserHostWindow(window));
+    }
     defer sdl.stopTextInput(window) catch {};
     installWindowIcon(window);
 
@@ -283,7 +303,9 @@ fn mainInner(init: std.process.Init) !void {
         .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
     });
     defer state.deinit();
+    state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
+    state.restorePersistedBrowserPaneOnLaunch();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
@@ -312,6 +334,10 @@ fn mainInner(init: std.process.Init) !void {
     var last_framebuffer_width: c_int = 0;
     var last_framebuffer_height: c_int = 0;
     while (running) {
+        if (macosHostWindowRequestedClose(window, &state)) {
+            running = false;
+            break;
+        }
         var frame_sample = profiler.FrameSample{};
         syncWindowTextInput(window, &state);
         var event_flags = EventFlags{};
@@ -345,16 +371,18 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollSend();
             }
         }.run, .{ &state, &send_needs_render });
+        var browser_needs_render = false;
         recordSpan(&frame_sample, .poll_browser, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollBrowser();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollBrowser();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &browser_needs_render });
+        var terminal_needs_render = false;
         recordSpan(&frame_sample, .poll_terminals, struct {
-            fn run(app_state: *AppState) void {
-                app_state.pollTerminals();
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollTerminals();
             }
-        }.run, .{&state});
+        }.run, .{ &state, &terminal_needs_render });
         if (live_server) |*server| {
             if (server.processPending(&state)) needs_render = true;
         }
@@ -384,7 +412,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or send_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -410,6 +438,10 @@ fn mainInner(init: std.process.Init) !void {
                 }
             }
         }.run, .{ window, &fb_width, &fb_height, &ui_scale });
+        var window_screen_x: c_int = 0;
+        var window_screen_y: c_int = 0;
+        window.getPosition(&window_screen_x, &window_screen_y) catch {};
+        state.noteAppWindowFrame(window_screen_x, window_screen_y, ui_scale);
         state.palette_overlay_batch.clear();
         state.palette_frame_text.clearRetainingCapacity();
         _ = state.palette_frame_text_arena.reset(.retain_capacity);
@@ -589,8 +621,9 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
 
     const snapshot = profiler.snapshot();
     if (snapshot.count == 0) return;
+    const sections = recentRenderedSectionStats();
     runtime_log.diagnostic(
-        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2}",
+        "frame-profile backend={s} samples={d} avg_ms={d:.2} max_ms={d:.2} slow={d} hitch={d} latest_ms={d:.2} rendered={d} render_root_avg_ms={d:.2} draw_backend_avg_ms={d:.2} poll_terminals_avg_ms={d:.2}",
         .{
             @tagName(palette_renderer.activeBackend()),
             snapshot.count,
@@ -599,11 +632,49 @@ fn maybeLogFrameProfile(enabled: bool, last_log_ms: *i64, palette_renderer: *con
             snapshot.slow_count,
             snapshot.hitch_count,
             profiler.nsToMs(snapshot.latest.active_ns),
+            sections.rendered_count,
+            profiler.nsToMs(sections.render_root_avg_ns),
+            profiler.nsToMs(sections.draw_backend_avg_ns),
+            profiler.nsToMs(sections.poll_terminals_avg_ns),
         },
     );
     if (palette_renderer.lastSdlGpuFrameStats()) |stats| {
         if (stats.hasWork()) logSdlGpuFrameStats(stats);
     }
+}
+
+const RenderedSectionStats = struct {
+    rendered_count: usize = 0,
+    render_root_avg_ns: u64 = 0,
+    draw_backend_avg_ns: u64 = 0,
+    poll_terminals_avg_ns: u64 = 0,
+};
+
+fn recentRenderedSectionStats() RenderedSectionStats {
+    const count = profiler.frameCount();
+    if (count == 0) return .{};
+
+    var rendered_count: usize = 0;
+    var render_root_sum: u128 = 0;
+    var draw_backend_sum: u128 = 0;
+    var poll_terminals_sum: u128 = 0;
+
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        const frame = profiler.frameAt(index) orelse continue;
+        if (!frame.rendered) continue;
+        rendered_count += 1;
+        render_root_sum += frame.sectionNs(.render_root);
+        draw_backend_sum += frame.sectionNs(.draw_backend);
+        poll_terminals_sum += frame.sectionNs(.poll_terminals);
+    }
+    if (rendered_count == 0) return .{};
+    return .{
+        .rendered_count = rendered_count,
+        .render_root_avg_ns = @intCast(render_root_sum / rendered_count),
+        .draw_backend_avg_ns = @intCast(draw_backend_sum / rendered_count),
+        .poll_terminals_avg_ns = @intCast(poll_terminals_sum / rendered_count),
+    };
 }
 
 fn logSdlGpuFrameStats(stats: palette.renderer.FrameStats) void {
@@ -701,6 +772,31 @@ fn currentWindowDisplayScale(window: *sdl.Window) f32 {
     const scale = window.getDisplayScale() catch return 1.0;
     if (!std.math.isFinite(scale) or scale <= 0.0) return 1.0;
     return clampf(scale, 1.0, 2.5);
+}
+
+fn nativeBrowserHostWindow(window: *sdl.Window) ?*anyopaque {
+    const property_name: [:0]const u8 = switch (builtin.os.tag) {
+        .macos => "SDL.window.cocoa.window",
+        .windows => "SDL.window.win32.hwnd",
+        .linux => {
+            const properties = SDL_GetWindowProperties(window);
+            const wayland_display = sdl.getPointerProperty(properties, "SDL.window.wayland.display", null);
+            const wayland_surface = sdl.getPointerProperty(properties, "SDL.window.wayland.surface", null);
+            if (wayland_display != null and wayland_surface != null) {
+                linux_wayland_browser_host = .{
+                    .display = wayland_display,
+                    .surface = wayland_surface,
+                };
+                return &linux_wayland_browser_host;
+            }
+            const x11_window = sdl.getNumberProperty(properties, "SDL.window.x11.window", 0);
+            if (x11_window <= 0) return null;
+            return @ptrFromInt(@as(usize, @intCast(x11_window)));
+        },
+        else => return null,
+    };
+    const properties = SDL_GetWindowProperties(window);
+    return sdl.getPointerProperty(properties, property_name, null);
 }
 
 fn clampInt(value: c_int, min_value: c_int, max_value: c_int) c_int {
@@ -820,22 +916,22 @@ fn processOneEvent(
         else => {},
     }
     const keep_running = handleEvent(window, state, keyboard, ui_scale, event);
+    if (!keep_running) {
+        runtime_log.diagnostic("event requested shutdown type={s}", .{@tagName(event.type)});
+    }
     frame_sample.add(.event_handling, profiler.elapsedNs(start));
     return keep_running;
 }
 
 fn appNeedsContinuousFrames(state: *AppState) bool {
-    return state.hasAnyPendingSends() or
-        state.isPickerPending() or
-        state.isBrowserVisible() or
-        state.hasVisibleTerminalSessions() or
+    return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.hasAnyPendingSends() or state.isPickerPending() or state.isBrowserVisible() or state.hasVisibleTerminalSessions() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
+    return if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
         ACTIVE_WAIT_TIMEOUT_MS
     else
         IDLE_WAIT_TIMEOUT_MS;
@@ -843,8 +939,21 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
     switch (event.type) {
-        .quit => return false,
-        .window_close_requested => return handleWindowCloseRequested(state),
+        .quit => {
+            runtime_log.diagnostic("shutdown requested by SDL quit event", .{});
+            return false;
+        },
+        .window_close_requested => {
+            const keep_running = handleWindowCloseRequested(window, state);
+            runtime_log.diagnostic("window close requested keep_running={} window_id={d}", .{ keep_running, @intFromEnum(event.window.window_id) });
+            return keep_running;
+        },
+        .window_hidden, .window_minimized => {
+            state.suspendBrowserForHostWindowHidden();
+        },
+        .window_shown, .window_restored => {
+            state.resumeBrowserAfterHostWindowShown();
+        },
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(
@@ -879,7 +988,29 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (browser_ui.handlePaletteKeyDown(state, &event.key)) {
+            if (state.routePaletteComposerKeyDown(&event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Pane-level bindings must stay app-owned even when a native webview
+            // or embedded terminal has keyboard focus.
+            if (action) |resolved_workspace_action| {
+                if (isWorkspacePaneAction(resolved_workspace_action)) {
+                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
+                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
+            const native_browser_focused = state.isNativeBrowserSurfaceFocused();
+            if (native_browser_focused) {
+                state.browser_address_focused = false;
+            }
+            if (macosNativeBrowserShouldOwnKeyboard(state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (!native_browser_focused and browser_ui.handlePaletteKeyDown(state, &event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -892,35 +1023,13 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleBrowserClipboardShortcut(state, &event.key)) {
                 return true;
             }
+            if (native_browser_focused and !state.palette_composer.focused) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.isBrowserPaneFocused() and handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
-            // Workspace pane shortcuts pre-empt the terminal handler so the
-            // embedded terminal (and anything running inside it, like tmux)
-            // can't swallow Alt-prefixed bindings.
-            if (action) |resolved_workspace_action| switch (resolved_workspace_action) {
-                .workspace_focus_left,
-                .workspace_focus_right,
-                .workspace_focus_up,
-                .workspace_focus_down,
-                .workspace_grow_left,
-                .workspace_grow_right,
-                .workspace_grow_up,
-                .workspace_grow_down,
-                .workspace_split_chat_vertical,
-                .workspace_split_chat_horizontal,
-                .workspace_split_terminal_vertical,
-                .workspace_split_terminal_horizontal,
-                .workspace_toggle_maximize,
-                .workspace_minimize,
-                .workspace_close,
-                => {
-                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
-                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
-                    return true;
-                },
-                else => {},
-            };
             if (action) |resolved_app_action| switch (resolved_app_action) {
                 .toggle_terminal,
                 .toggle_browser,
@@ -962,9 +1071,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (handleTranscriptMarkdownSelectAllShortcut(state, &event.key)) {
                 return true;
             }
-            if (state.routePaletteComposerKeyDown(&event.key)) {
-                return true;
-            }
             if (event.key.repeat) {
                 if (keyboard.transcriptScrollActionForEvent(&event.key)) |repeat_action| {
                     handleKeyboardAction(state, keyboard, repeat_action);
@@ -982,21 +1088,45 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     .{ @intFromEnum(event.key.key), @intFromEnum(event.key.scancode), state.isBrowserPaneFocused(), state.isBrowserVisible() },
                 );
             }
+            if (state.isNativeBrowserSurfaceFocused()) {
+                state.browser_address_focused = false;
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (macosNativeBrowserShouldOwnKeyboard(state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (handleBrowserKeyboardEvent(state, &event.key)) {
                 return true;
             }
         },
         .text_input => {
             const text_input = std.mem.sliceTo(event.text.text, 0);
-            if (browserInputDebugEnabled()) {
-                log.info(
-                    "browser-input sdl text_input text=\"{s}\" focused={} visible={}",
-                    .{ text_input, state.isBrowserPaneFocused(), state.isBrowserVisible() },
-                );
-            }
+            if (suppressDuplicateMacosTextInput(text_input, event.text.timestamp)) return true;
             if (ui_layout.handlePaletteTextInput(state, text_input)) {
                 syncWindowTextInput(window, state);
                 return true;
+            }
+            if (state.routePaletteComposerTextInput(text_input)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            const native_browser_focused = state.isNativeBrowserSurfaceFocused();
+            if (native_browser_focused) {
+                state.browser_address_focused = false;
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (macosNativeBrowserShouldOwnKeyboard(state)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (browserInputDebugEnabled()) {
+                log.info(
+                    "browser-input sdl text_input text=\"{s}\" timestamp={} focused={} native_focused={} visible={}",
+                    .{ text_input, event.text.timestamp, state.isBrowserPaneFocused(), native_browser_focused, state.isBrowserVisible() },
+                );
             }
             const browser_text_handled = state.handleBrowserKey(.{
                 .key_code = 0,
@@ -1013,9 +1143,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const terminal_text_handled = state.handleTerminalTextInput(event.text.text);
             state.noteTerminalTextRouting(text_input, terminal_text_handled);
             if (terminal_text_handled) {
-                return true;
-            }
-            if (state.routePaletteComposerTextInput(text_input)) {
                 return true;
             }
         },
@@ -1073,11 +1200,17 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (event.button.down and macosBrowserClickWillFocusNativeSurface(state, event.button.x, event.button.y)) {
+                if (SDL_TextInputActive(window)) {
+                    sdl.stopTextInput(window) catch {};
+                }
+            }
             const handled = state.handleBrowserMouse(browserMouseButtonEvent(&event.button));
             if (!handled and event.button.down) {
                 state.unfocusBrowserPane();
             }
             if (handled) {
+                syncWindowTextInput(window, state);
                 return true;
             }
             if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
@@ -1170,11 +1303,27 @@ fn browserInputDebugEnabled() bool {
 }
 
 fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
-    if (!state.isBrowserPaneFocused() and !state.terminal_focused and !state.palette_composer.focused and !state.browser_address_focused and state.palette_modal_text_focus == .none) return;
+    if (macosNativeBrowserShouldOwnKeyboard(state)) {
+        if (SDL_TextInputActive(window)) {
+            sdl.stopTextInput(window) catch {};
+        }
+        return;
+    }
+    const needs_sdl_text_input = state.terminal_focused or
+        state.palette_composer.focused or
+        state.browser_address_focused or
+        state.palette_modal_text_focus != .none or
+        (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));
+    if (!needs_sdl_text_input) {
+        if (SDL_TextInputActive(window)) {
+            sdl.stopTextInput(window) catch {};
+        }
+        return;
+    }
     if (SDL_TextInputActive(window)) return;
     sdl.startTextInput(window) catch {};
     if (browserInputDebugEnabled()) {
-        log.info("browser-input forced SDL_StartTextInput for browser pane focus", .{});
+        log.info("browser-input enabled SDL text input for Verde-owned text focus", .{});
     }
 }
 
@@ -1191,6 +1340,7 @@ fn handleBrowserKeyboardEvent(state: *AppState, event: *const sdl.KeyboardEvent)
 }
 
 fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
@@ -1213,6 +1363,7 @@ fn handleBrowserClipboardShortcut(state: *AppState, event: *const sdl.KeyboardEv
 }
 
 fn handleBrowserSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
@@ -1223,6 +1374,7 @@ fn handleBrowserSelectAllShortcut(state: *AppState, event: *const sdl.KeyboardEv
 }
 
 fn handleBrowserCopyCutShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (state.isNativeBrowserSurfaceFocused()) return false;
     if (!state.isBrowserPaneFocused()) return false;
     if (!event.down or event.repeat) return false;
     if (!isPrimaryModifierPressed(event.mod)) return false;
@@ -1501,9 +1653,36 @@ fn handleKeyboardAction(
     }
 }
 
-fn handleWindowCloseRequested(state: *AppState) bool {
+fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
+    return switch (action) {
+        .workspace_focus_left,
+        .workspace_focus_right,
+        .workspace_focus_up,
+        .workspace_focus_down,
+        .workspace_grow_left,
+        .workspace_grow_right,
+        .workspace_grow_up,
+        .workspace_grow_down,
+        .workspace_split_chat_vertical,
+        .workspace_split_chat_horizontal,
+        .workspace_split_terminal_vertical,
+        .workspace_split_terminal_horizontal,
+        .workspace_toggle_maximize,
+        .workspace_minimize,
+        .workspace_close,
+        => true,
+        else => false,
+    };
+}
+
+extern fn SDL_HideWindow(window: *sdl.Window) bool;
+extern fn verde_macos_host_window_install_close_monitor(ns_window: ?*anyopaque) void;
+extern fn verde_macos_host_window_order_out(ns_window: ?*anyopaque) void;
+extern fn verde_macos_host_window_should_close(ns_window: ?*anyopaque) bool;
+
+fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     if (builtin.os.tag == .macos) {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = currentTimeMillis();
         if (macos_cmd_w_pane_close_until_ms >= now_ms) {
             macos_cmd_w_pane_close_until_ms = 0;
             return true;
@@ -1512,8 +1691,43 @@ fn handleWindowCloseRequested(state: *AppState) bool {
             _ = state.closeFocusedWorkspacePane();
             return true;
         }
+        if (macos_launch_close_suppress_until_ms >= now_ms) {
+            macos_launch_close_suppress_until_ms = 0;
+            runtime_log.diagnostic("ignoring window close request during macOS launch grace", .{});
+            return true;
+        }
+        if (!verde_macos_host_window_should_close(nativeBrowserHostWindow(window))) {
+            runtime_log.diagnostic("ignoring unsolicited macOS window close request", .{});
+            return true;
+        }
+    }
+    if (builtin.os.tag == .macos) {
+        _ = state.browser_state.controller.hide() catch {};
+        verde_macos_host_window_order_out(nativeBrowserHostWindow(window));
+        _ = SDL_HideWindow(window);
+    }
+    if (builtin.os.tag == .linux) {
+        const window_flags = SDL_GetWindowFlags(window);
+        if (!window_flags.input_focus or !window_flags.mouse_focus or window_flags.hidden or window_flags.minimized or window_flags.occluded) {
+            runtime_log.diagnostic(
+                "ignoring linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
+                .{ window_flags.input_focus, window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
+            );
+            return true;
+        }
     }
     return false;
+}
+
+fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {
+    if (builtin.os.tag != .macos) return false;
+    const host_window = nativeBrowserHostWindow(window);
+    if (!verde_macos_host_window_should_close(host_window)) return false;
+    _ = state.browser_state.controller.hide() catch {};
+    verde_macos_host_window_order_out(host_window);
+    _ = SDL_HideWindow(window);
+    runtime_log.diagnostic("shutdown requested by macOS close button monitor", .{});
+    return true;
 }
 
 fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keybinds.NativeKeyboardAction) void {
@@ -1526,7 +1740,58 @@ fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keyb
     {
         return;
     }
-    macos_cmd_w_pane_close_until_ms = std.time.milliTimestamp() + MACOS_CMD_W_CLOSE_SUPPRESS_MS;
+    macos_cmd_w_pane_close_until_ms = currentTimeMillis() + MACOS_CMD_W_CLOSE_SUPPRESS_MS;
+}
+
+fn currentTimeMillis() i64 {
+    var tv: std.c.timeval = undefined;
+    if (std.c.gettimeofday(&tv, null) != 0) return 0;
+    return (@as(i64, @intCast(tv.sec)) * std.time.ms_per_s) + @divTrunc(@as(i64, @intCast(tv.usec)), std.time.us_per_ms);
+}
+
+fn activateMacosHostWindow(window: *sdl.Window) void {
+    if (builtin.os.tag != .macos) return;
+    _ = SDL_SetWindowFocusable(window, true);
+    _ = SDL_ShowWindow(window);
+    _ = SDL_RaiseWindow(window);
+    _ = SDL_SyncWindow(window);
+}
+
+fn suppressDuplicateMacosTextInput(text: []const u8, timestamp_ns: u64) bool {
+    if (builtin.os.tag != .macos) return false;
+    const previous = macos_last_text_input[0..macos_last_text_input_len];
+    const duplicate = text.len == previous.len and
+        timestamp_ns != 0 and
+        macos_last_text_input_timestamp_ns != 0 and
+        timestamp_ns >= macos_last_text_input_timestamp_ns and
+        timestamp_ns - macos_last_text_input_timestamp_ns <= MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS and
+        std.mem.eql(u8, text, previous);
+
+    macos_last_text_input_timestamp_ns = timestamp_ns;
+    macos_last_text_input_len = @min(text.len, macos_last_text_input.len);
+    @memcpy(macos_last_text_input[0..macos_last_text_input_len], text[0..macos_last_text_input_len]);
+
+    if (duplicate) {
+        runtime_log.diagnostic("suppressed duplicate macOS text_input text=\"{s}\" timestamp={}", .{ text, timestamp_ns });
+    }
+    return duplicate;
+}
+
+fn macosNativeBrowserShouldOwnKeyboard(state: *AppState) bool {
+    if (builtin.os.tag != .macos) return false;
+    if (!state.isBrowserVisible() or !state.isBrowserPaneFocused()) return false;
+    if (!state.browserPaneUsesNativeKeyboardSurface()) return false;
+    if (state.palette_composer.focused or state.composer_focused) return false;
+    if (state.browser_address_focused or state.palette_modal_text_focus != .none) return false;
+    return true;
+}
+
+fn macosBrowserClickWillFocusNativeSurface(state: *const AppState, x: f32, y: f32) bool {
+    if (builtin.os.tag != .macos) return false;
+    if (!state.isBrowserVisible()) return false;
+    if (!state.browserPaneUsesNativeKeyboardSurface()) return false;
+    if (state.palette_modal_text_focus != .none) return false;
+    return state.browserPaneContains(x, y);
 }
 
 fn handleFontSizeShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

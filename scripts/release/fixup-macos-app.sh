@@ -51,6 +51,11 @@ if [[ -z "$CODESIGN" ]]; then
   exit 1
 fi
 
+if ! command -v perl >/dev/null 2>&1; then
+  echo "perl is required" >&2
+  exit 1
+fi
+
 if [[ ! -f "$FFF_LIB" ]]; then
   echo "missing bundled libfff_c.dylib at $FFF_LIB" >&2
   exit 1
@@ -58,6 +63,28 @@ fi
 
 OTOOL_TMP="$(mktemp /tmp/verde-macos-otool.XXXXXX)"
 trap 'rm -f "$OTOOL_TMP"' EXIT
+
+run_install_name_tool() {
+  "$INSTALL_NAME_TOOL" "$@"
+}
+
+neutralize_swift_modhash_segment() {
+  local binary="$1"
+
+  if ! "$OTOOL" -l "$binary" >"$OTOOL_TMP" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! grep -q '__swift_modhash' "$OTOOL_TMP"; then
+    return 0
+  fi
+
+  # Swift emits a tiny __LLVM,__swift_modhash section in object files. Apple's
+  # install_name_tool/bitcode_strip can mistake that non-bitcode section for a
+  # bitcode archive and refuse to edit the binary. Rename only the segment label
+  # before dependency fixups; codesigning runs after this mutation.
+  LC_ALL=C perl -0pi -e 's/__LLVM/__SWFT/g' "$binary"
+}
 
 extract_dependency_ref() {
   local candidate="$1"
@@ -80,7 +107,7 @@ rewrite_dependency_refs() {
       continue
     fi
 
-    "$INSTALL_NAME_TOOL" -change "$current_ref" "$desired_ref" "$candidate"
+    run_install_name_tool -change "$current_ref" "$desired_ref" "$candidate"
   done < <(find "$MACOS_DIR" -maxdepth 1 -type f -print0)
 }
 
@@ -96,7 +123,7 @@ rewrite_sdl3_dylib_refs_to_framework() {
 
     while IFS= read -r current_ref; do
       [[ -n "$current_ref" && "$current_ref" != "$DESIRED_SDL3_FRAMEWORK_REF" ]] || continue
-      "$INSTALL_NAME_TOOL" -change "$current_ref" "$DESIRED_SDL3_FRAMEWORK_REF" "$candidate"
+      run_install_name_tool -change "$current_ref" "$DESIRED_SDL3_FRAMEWORK_REF" "$candidate"
     done < <(awk '$1 ~ /(^|\/)libSDL3\.[^[:space:]]*dylib$/ { print $1 }' "$OTOOL_TMP")
   done < <(find "$MACOS_DIR" -type f -print0)
 }
@@ -133,14 +160,14 @@ bundle_external_dylib_dependencies() {
                 fi
 
                 install -m 755 "$current_ref" "$bundled_path"
-                "$INSTALL_NAME_TOOL" -id "$desired_ref" "$bundled_path"
+                run_install_name_tool -id "$desired_ref" "$bundled_path"
                 changed=1
               else
-                "$INSTALL_NAME_TOOL" -id "$desired_ref" "$bundled_path"
+                run_install_name_tool -id "$desired_ref" "$bundled_path"
               fi
             fi
 
-            "$INSTALL_NAME_TOOL" -change "$current_ref" "$desired_ref" "$candidate"
+            run_install_name_tool -change "$current_ref" "$desired_ref" "$candidate"
             ;;
         esac
       done < <(awk 'NR > 1 { print $1 }' "$OTOOL_TMP")
@@ -158,7 +185,7 @@ ensure_bundled_dependency() {
     exit 1
   fi
 
-  "$INSTALL_NAME_TOOL" -id "$desired_ref" "$bundled_path"
+  run_install_name_tool -id "$desired_ref" "$bundled_path"
   rewrite_dependency_refs "$pattern" "$desired_ref"
 }
 
@@ -235,6 +262,7 @@ sign_app_bundle() {
   fi
 }
 
+neutralize_swift_modhash_segment "$MACOS_DIR/verde"
 ensure_bundled_dependency 'libfff_c\.dylib' "$FFF_LIB" "$DESIRED_FFF_REF"
 bundle_dependency_from_existing_ref "$TREE_SITTER_PATTERN"
 bundle_dependency_from_existing_ref "$SDL3_TTF_PATTERN"

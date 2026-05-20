@@ -24,12 +24,17 @@ mise run dev
 
 Common tasks:
 
-- `mise run setup`: downloads the CEF SDK into the local build cache.
-- `mise run dev`: builds and runs Verde from the repo-local Zig build output.
+- `mise run setup`: checks desktop build dependencies.
+- `mise run dev`: builds and runs Verde from the repo-local Zig build output with the native webview backend.
 - `mise run run`: builds and launches Verde in development mode.
 - `mise run debug`: launches Verde with the in-app diagnostics window enabled.
 - `mise run build`: creates a local release-style build for the current platform.
+- `mise run check-mac-webview`: on macOS, rebuilds/installs the WKWebView app and runs automated package/runtime readiness checks, including Swift/CEF-free packaging and native-keyboard ownership guards.
+- `mise run mac-webview-manual-signoff`: on macOS, runs the guided foreground physical-input signoff flow and writes a timestamped evidence run.
+- `mise run check-mac-webview-manual`: on macOS, checks the latest timestamped physical-input evidence run required for final WKWebView signoff.
 - `mise run dev-sdl-gpu`: runs with the SDL_GPU Palette renderer.
+- `mise run dev-cef`: builds and runs Verde with the legacy CEF backend.
+- `mise run build-cef`: creates a release-style build with the legacy CEF backend.
 
 ### Hyprland UI Polish Checks
 
@@ -43,15 +48,33 @@ grim -g "$(slurp)" goal_samples/chat-after.png
 
 Use the same approximate window size for before/after captures. For fractional-scale checks, adjust your Hyprland monitor scale, restart `mise run dev`, then capture another image such as `goal_samples/chat-after-1-25x.png`.
 
-## CEF Browser Pane
+## Browser Pane
 
-The in-app browser pane uses CEF when a CEF SDK is available. The `mise` tasks and release install scripts use the repo's CEF helper scripts so developers do not need to pass CEF build flags manually.
+The in-app browser pane defaults to the host platform webview stack: WebKitGTK on
+Linux, WKWebView on macOS, and WebView2 on Windows. Default development and
+release-style builds do not download or package CEF.
+
+Native-webview source build requirements:
+
+- Linux: GTK 3 and WebKitGTK 4.1 development/runtime packages.
+- macOS: AppKit and WebKit from the platform SDK.
+- Windows: Microsoft WebView2 SDK headers at compile time, the WebView2 Runtime
+  at runtime, and `WebView2Loader.dll` next to `verde.exe` or on the DLL search
+  path.
+
+CEF remains available as an explicit fallback through `mise run dev-cef`,
+`mise run build-cef`, or `zig build -Dbrowser-backend=cef -Dcef-sdk-path=/path/to/cef`.
 
 Useful environment variables:
 
 - `VERDE_CEF_SDK_PATH`: use a specific cached CEF SDK.
-- `VERDE_CEF_DISABLE_DOWNLOAD=1`: skip the CEF download and build without CEF for faster local iteration.
+- `VERDE_CEF_DISABLE_DOWNLOAD=1`: skip automatic CEF SDK download when explicitly building the CEF backend.
 - `VERDE_OPEN_BROWSER_ON_START=1`: smoke-test the browser pane during startup.
+- `VERDE_BROWSER_START_URL=https://example.com`: navigate the startup browser smoke to a specific URL; bare hostnames are normalized the same way as the URL bar.
+- `VERDE_BROWSER_START_EVAL='document.title'`: run one JavaScript eval after the startup smoke page loads.
+- `VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE=1`: explicitly allow page-to-host bridge messages from non-app and non-localhost pages for local diagnostics. By default, privileged bridge messages are accepted only from `app://`, `localhost`, `127.0.0.1`, and `[::1]` pages.
+- `VERDE_BROWSER_LINUX_SHOW_HELPER=1`: force the Linux visible helper window on X11-style sessions.
+- `VERDE_BROWSER_LINUX_UNSAFE_WAYLAND_HELPER=1`: allow the diagnostic Linux helper window on Wayland; Hyprland uses `snapshot_texture` by default because this helper is not release parity there.
 
 Keep the CEF SDK in a persistent directory such as `$HOME/.cache/verde/cef-sdk`; do not keep it under `/tmp`.
 
