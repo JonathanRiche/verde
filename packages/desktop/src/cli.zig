@@ -929,16 +929,16 @@ fn handleSessionAttach(
     const session_id = try resolveAttachSessionId(allocator, out, argv);
     defer allocator.free(session_id);
 
-    const attach_id = try attachSessionClient(allocator, io, session_id, "verde-cli");
-    defer allocator.free(attach_id);
-    defer detachSessionClient(allocator, io, session_id, attach_id);
+    const attach_id = attachSessionClient(allocator, io, session_id, "verde-cli") catch null;
+    defer if (attach_id) |id| allocator.free(id);
+    defer if (attach_id) |id| detachSessionClient(allocator, io, session_id, id);
 
     const explicit_cols = parseOptionalU32(args.optionValue(argv, "--cols"));
     const explicit_rows = parseOptionalU32(args.optionValue(argv, "--rows"));
     var current_size = terminalAttachSize(explicit_cols, explicit_rows);
     const resize_response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
         .id = session_id,
-        .attach_id = attach_id,
+        .attach_id = attach_id orelse "",
         .cols = current_size.cols,
         .rows = current_size.rows,
     }, 1);
@@ -960,7 +960,7 @@ fn handleSessionAttach(
                 current_size = next_size;
                 const response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
                     .id = session_id,
-                    .attach_id = attach_id,
+                    .attach_id = attach_id orelse "",
                     .cols = current_size.cols,
                     .rows = current_size.rows,
                 }, 1);
@@ -968,10 +968,10 @@ fn handleSessionAttach(
             }
         }
 
-        try drainAttachInput(allocator, io, session_id, attach_id, &stdin_eof, &detach_requested);
+        try drainAttachInput(allocator, io, session_id, attach_id orelse "", &stdin_eof, &detach_requested);
         if (detach_requested) break;
 
-        var read_result = try readSessionOutput(allocator, io, session_id, attach_id, next_offset);
+        var read_result = try readSessionOutput(allocator, io, session_id, attach_id orelse "", next_offset);
         defer read_result.deinit(allocator);
         if (read_result.text.len > 0) {
             try writeStdout(read_result.text);

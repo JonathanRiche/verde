@@ -1823,12 +1823,20 @@ const UnixSession = struct {
             try ensureSessionResponseOk(allocator, create_response);
         }
 
-        const attach_response = try sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
+        const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
             .label = "verde-ui",
-        }, 1);
-        defer allocator.free(attach_response);
-        self.attach_id = try sessionResultStringAlloc(allocator, attach_response, "attach_id");
+        }, 1) catch |err| blk: {
+            log.debug("daemon terminal session {s} does not support attach registration: {s}", .{ session_id, @errorName(err) });
+            break :blk null;
+        };
+        if (attach_response) |response| {
+            defer allocator.free(response);
+            self.attach_id = sessionResultStringAlloc(allocator, response, "attach_id") catch |err| blk: {
+                log.debug("daemon terminal session {s} attach registration failed: {s}", .{ session_id, @errorName(err) });
+                break :blk null;
+            };
+        }
 
         try self.resizeDaemon(allocator);
         _ = try self.drainDaemonOutput(allocator);
