@@ -1074,26 +1074,30 @@ fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []co
 }
 
 fn queuePowerlineGlyph(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) void {
+    // Overdraw the *base* (wide) edge by a fraction of a pixel to hide the AA
+    // seam against the adjacent same-colored segment. The apex stays exactly on
+    // the cell boundary: extending it would poke the triangle's color into the
+    // next segment, which reads as the segments "bleeding" into each other.
     const bleed = theme.scaledUi(0.2);
-    const left = rect.x - bleed;
-    const right = rect.x + rect.w + bleed;
+    const x0 = rect.x;
+    const x1 = rect.x + rect.w;
     const top = rect.y;
     const bottom = rect.y + rect.h;
     const mid_y = rect.y + rect.h * 0.5;
     switch (cp) {
         0xe0b0, 0xe0b4, 0xe0b8, 0xe0bc, 0xe0c0, 0xe0c4 => queueTriangle(
             state,
-            .{ .x = left, .y = top },
-            .{ .x = left, .y = bottom },
-            .{ .x = right, .y = mid_y },
+            .{ .x = x0 - bleed, .y = top },
+            .{ .x = x0 - bleed, .y = bottom },
+            .{ .x = x1, .y = mid_y },
             color,
             clip,
         ),
         0xe0b2, 0xe0b6, 0xe0ba, 0xe0be, 0xe0c2, 0xe0c6 => queueTriangle(
             state,
-            .{ .x = right, .y = top },
-            .{ .x = right, .y = bottom },
-            .{ .x = left, .y = mid_y },
+            .{ .x = x1 + bleed, .y = top },
+            .{ .x = x1 + bleed, .y = bottom },
+            .{ .x = x0, .y = mid_y },
             color,
             clip,
         ),
@@ -1282,6 +1286,16 @@ fn queueMiscSymbol(state: *app_state.AppState, rect: palette.Rect, cp: u21, colo
             color,
             clip,
         ),
+        // ⎿ — the corner connector TUIs like Claude Code draw under a tool/tree
+        // node. Box-drawing (0x2500..0x257f) doesn't cover it, so without this it
+        // falls back to the font and renders as tofu. Draw a bottom-left elbow:
+        // a full-height vertical that joins the line above, plus a short foot.
+        0x23bf => {
+            const stroke = @max(@round(@min(rect.w, rect.h) * 0.105), 1.0);
+            const lx = rect.x + rect.w * 0.5 - stroke * 0.5;
+            queueClippedRect(state, .{ .x = lx, .y = rect.y, .w = stroke, .h = rect.h }, color, clip);
+            queueClippedRect(state, .{ .x = lx, .y = rect.y + rect.h - stroke, .w = rect.w * 0.5 + stroke * 0.5, .h = stroke }, color, clip);
+        },
         else => return false,
     }
     return true;
