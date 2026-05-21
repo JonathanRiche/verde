@@ -73,10 +73,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Bun prints a bundle summary to stdout; ZLS expects pure JSON from its build runner.
     const build_inspector_bundle = b.addSystemCommand(&.{
-        "bun",
-        "run",
-        "build",
+        "sh",
+        "-c",
+        "bun run build 1>&2",
     });
     build_inspector_bundle.setCwd(b.path("../browser_extensions/inspector"));
 

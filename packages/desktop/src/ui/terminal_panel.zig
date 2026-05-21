@@ -194,6 +194,7 @@ const TerminalHitCache = struct {
     menu_panel: palette.Rect = .{},
     menu_count: usize = 0,
     menu_hits: [14]ContextMenuHit = [_]ContextMenuHit{.{}} ** 14,
+    menu_dock_id: u32 = 0,
     dock_id: u32 = 0,
 };
 
@@ -221,7 +222,6 @@ pub fn renderDockAtForDock(state: *app_state.AppState, rect: palette.Rect, dock_
 
 pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.Rect, dock_id: u32, _: f32) void {
     if (state.projects.items.len == 0) return;
-    hit_cache.menu_count = 0;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
@@ -233,7 +233,9 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     } else {
         renderStatus(state, rect, "Starting shell...");
     }
-    renderContextMenu(state, dock, rect);
+    if (hit_cache.menu_open and hit_cache.menu_dock_id == dock_id) {
+        renderContextMenu(state, dock, rect);
+    }
     if (dock.takeFocusRequest()) {
         state.requestTerminalDockFocus(dock_id);
     }
@@ -254,20 +256,9 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (state.projects.items.len == 0) return false;
-    if (button == 1) {
-        if (down) {
-            if (startSelection(state, x, y)) return true;
-        } else if (selection_state.dragging) {
-            _ = updateSelectionFocus(state, x, y);
-            selection_state.dragging = false;
-            if (!selection_state.moved) selection_state.active = false;
-            state.markDirty();
-            return true;
-        }
-    }
-    if (!down) return false;
     if (button == 1 and hit_cache.menu_open) {
-        const dock = state.currentProjectTerminalDockMutable(hit_cache.dock_id) orelse return false;
+        if (!down) return true;
+        const dock = state.currentProjectTerminalDockMutable(hit_cache.menu_dock_id) orelse return false;
         var i: usize = 0;
         while (i < hit_cache.menu_count) : (i += 1) {
             const hit = hit_cache.menu_hits[i];
@@ -284,6 +275,18 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
         }
         return true;
     }
+    if (button == 1) {
+        if (down) {
+            if (startSelection(state, x, y)) return true;
+        } else if (selection_state.dragging) {
+            _ = updateSelectionFocus(state, x, y);
+            selection_state.dragging = false;
+            if (!selection_state.moved) selection_state.active = false;
+            state.markDirty();
+            return true;
+        }
+    }
+    if (!down) return false;
 
     if (button == 1) {
         if (tabAtPoint(x, y)) |target| {
@@ -322,6 +325,9 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             hit_cache.dock_id = target.dock_id;
             var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
             dock.focusPane(target.pane_id);
+            if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
+                _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
+            }
             focusTerminal(state);
             clearSelection();
             openContextMenu(.pane, 0, target.pane_id, x, y);
@@ -531,27 +537,28 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     var labels: [14][]const u8 = undefined;
     var enabled: [14]bool = undefined;
     var count: usize = 0;
-
-    actions[count] = .new_tab;
-    labels[count] = "New Tab";
-    enabled[count] = true;
-    count += 1;
-    actions[count] = .new_claude_tab;
-    labels[count] = "New Claude Tab";
-    enabled[count] = true;
-    count += 1;
-    actions[count] = .new_opencode_tab;
-    labels[count] = "New OpenCode Tab";
-    enabled[count] = true;
-    count += 1;
-    actions[count] = .new_codex_tab;
-    labels[count] = "New Codex Tab";
-    enabled[count] = true;
-    count += 1;
-    actions[count] = .new_cursor_tab;
-    labels[count] = "New Cursor Tab";
-    enabled[count] = true;
-    count += 1;
+    //NOTE: DIsabled for now b/c we dont to tradional tabs
+    // actions[count] = .new_tab;
+    // labels[count] = "New Tab";
+    // enabled[count] = true;
+    // count += 1;
+    //NOTE: Didabling rihgt click agents since users is already in terminal
+    // actions[count] = .new_claude_tab;
+    // labels[count] = "New Claude Tab";
+    // enabled[count] = true;
+    // count += 1;
+    // actions[count] = .new_opencode_tab;
+    // labels[count] = "New OpenCode Tab";
+    // enabled[count] = true;
+    // count += 1;
+    // actions[count] = .new_codex_tab;
+    // labels[count] = "New Codex Tab";
+    // enabled[count] = true;
+    // count += 1;
+    // actions[count] = .new_cursor_tab;
+    // labels[count] = "New Cursor Tab";
+    // enabled[count] = true;
+    // count += 1;
     if (state.hasCustomTerminalLaunchProfile()) {
         actions[count] = .new_custom_tab;
         labels[count] = state.customTerminalLaunchProfileLabel();
@@ -568,25 +575,26 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         enabled[count] = dock.tabs.items.len > 1;
         count += 1;
     } else {
+        const has_workspace_pane = workspacePaneIdForDock(state, hit_cache.menu_dock_id) != null;
         actions[count] = .split_up;
         labels[count] = "New Pane Above";
-        enabled[count] = true;
+        enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_down;
         labels[count] = "New Pane Below";
-        enabled[count] = true;
+        enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_left;
         labels[count] = "New Pane Left";
-        enabled[count] = true;
+        enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .split_right;
         labels[count] = "New Pane Right";
-        enabled[count] = true;
+        enabled[count] = has_workspace_pane;
         count += 1;
         actions[count] = .close_pane;
         labels[count] = "Close Pane";
-        enabled[count] = true;
+        enabled[count] = has_workspace_pane;
         count += 1;
     }
 
@@ -598,6 +606,7 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     var menu_y = hit_cache.menu_anchor.y;
     if (menu_x + menu_w > dock_rect.x + dock_rect.w) menu_x = dock_rect.x + dock_rect.w - menu_w - theme.scaledUi(4.0);
     if (menu_y + menu_h > dock_rect.y + dock_rect.h) menu_y = dock_rect.y + dock_rect.h - menu_h - theme.scaledUi(4.0);
+
     menu_x = @max(dock_rect.x + theme.scaledUi(4.0), menu_x);
     menu_y = @max(dock_rect.y + theme.scaledUi(4.0), menu_y);
     hit_cache.menu_panel = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
@@ -625,8 +634,12 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
 
 fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: TerminalContextMenuAction) void {
     const focus_menu_dock_after = switch (action) {
-        .split_up, .split_down, .split_left, .split_right => false,
+        .split_up, .split_down, .split_left, .split_right, .close_pane => false,
         else => true,
+    };
+    const uses_workspace_pane_action = switch (action) {
+        .split_up, .split_down, .split_left, .split_right, .close_pane => true,
+        else => false,
     };
     switch (action) {
         .new_tab => dock.createTab(state.allocator) catch |err| app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)}),
@@ -639,18 +652,41 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         },
         .rename_tab => if (dock.activeTab()) |tab| dock.beginRenameTab(tab.id),
         .close_tab => dock.closeTab(state.allocator, hit_cache.menu_tab_index) catch |err| app_state.log.warn("failed to close terminal tab: {s}", .{@errorName(err)}),
-        .split_up => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
-        .split_down => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
-        .split_left => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
-        .split_right => _ = state.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, true),
-        .close_pane => dock.closeActivePaneOrTab(state.allocator) catch |err| app_state.log.warn("failed to close terminal pane: {s}", .{@errorName(err)}),
+        .split_up => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, false);
+        },
+        .split_down => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
+        },
+        .split_left => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .vertical, false);
+        },
+        .split_right => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .vertical, true);
+        },
+        .close_pane => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.closeCurrentProjectWorkspacePane(pane_id);
+        },
     }
     if (focus_menu_dock_after) focusTerminal(state);
-    if (dock.consumeWorkspaceChange()) state.markDirty();
+    if (!uses_workspace_pane_action and dock.consumeWorkspaceChange()) state.markDirty();
+}
+
+fn workspacePaneIdForDock(state: *const app_state.AppState, dock_id: u32) ?app_state.WorkspacePaneId {
+    if (state.projects.items.len == 0) return null;
+    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
+    for (layout.panes.items) |pane| {
+        if (pane.minimized) continue;
+        switch (pane.ref) {
+            .terminal => |ref| if (ref.dock_id == dock_id) return pane.id,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn focusTerminal(state: *app_state.AppState) void {
-    state.requestTerminalDockFocus(hit_cache.dock_id);
+    state.requestTerminalDockFocus(if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id);
 }
 
 fn startSelection(state: *app_state.AppState, x: f32, y: f32) bool {
@@ -793,6 +829,7 @@ fn selectedRenderStateText(allocator: std.mem.Allocator, render_state: *const gh
 fn openContextMenu(kind: TerminalContextMenuKind, tab_index: usize, pane_id: u32, x: f32, y: f32) void {
     hit_cache.menu_open = true;
     hit_cache.menu_kind = kind;
+    hit_cache.menu_dock_id = hit_cache.dock_id;
     hit_cache.menu_tab_index = tab_index;
     hit_cache.menu_pane_id = pane_id;
     hit_cache.menu_anchor = .{ .x = x, .y = y, .w = 1.0, .h = 1.0 };
