@@ -2006,7 +2006,12 @@ const UnixSession = struct {
     }
 
     fn streamXtVersion(_: *TerminalHandler) []const u8 {
-        return "verde";
+        // Report a Ghostty-style identity so adaptive TUIs (Codex, etc.) that
+        // match a known-terminal list enable their themed surfaces. This must
+        // stay consistent with the TERM_PROGRAM/TERM_PROGRAM_VERSION env vars
+        // set in childExec; reporting "verde" here left us unrecognized and the
+        // apps fell back to a flat, surface-less theme.
+        return "ghostty 1.1.0";
     }
 
     fn streamColorScheme(_: *TerminalHandler) ?ColorScheme {
