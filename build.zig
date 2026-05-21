@@ -137,9 +137,7 @@ fn appendInstallArgs(b: *std.Build, argv: *std.ArrayList([]const u8)) void {
     const default_include_dir = b.pathJoin(&.{ default_install_path, "include" });
     defer b.allocator.free(default_include_dir);
 
-    if (!std.mem.eql(u8, b.install_prefix, default_install_prefix)) {
-        argv.appendSlice(b.allocator, &.{ "-p", b.install_prefix }) catch @panic("OOM");
-    }
+    argv.appendSlice(b.allocator, &.{ "-p", b.install_prefix }) catch @panic("OOM");
     if (!std.mem.eql(u8, b.lib_dir, default_lib_dir)) {
         argv.appendSlice(b.allocator, &.{ "--prefix-lib-dir", b.lib_dir }) catch @panic("OOM");
     }

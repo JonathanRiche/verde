@@ -1177,7 +1177,7 @@ fn formatSendWorkerError(
         },
         error.ProviderBridgeNotFound => allocator.dupe(
             u8,
-            "The bundled Claude provider bridge was not found. Rebuild or reinstall Verde so provider_bridge.mjs is installed.",
+            "The bundled provider bridge was not found. Rebuild or reinstall Verde so provider_bridge.mjs is installed.",
         ),
         error.OpencodeServerUnavailable => allocator.dupe(
             u8,

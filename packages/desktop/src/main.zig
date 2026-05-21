@@ -995,6 +995,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
+            if (handleFileSearchAccept(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (!state.palette_composer.focused and keyboard.workspaceFocusPromptForEvent(&event.key)) {
                 if (state.focusPromptForFocusedChatWorkspacePane()) {
                     syncWindowTextInput(window, state);
@@ -1519,6 +1523,23 @@ fn handleFileSearchNavigation(state: *AppState, event: *const sdl.KeyboardEvent)
         return state.moveFileSearchSelection(1);
     }
     return false;
+}
+
+fn handleFileSearchAccept(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.composer_focused) return false;
+    if (!state.hasActiveFileSearch()) return false;
+    if (!event.down or event.repeat) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return false;
+    }
+    if (event.scancode != .tab and event.scancode != .@"return" and event.scancode != .kp_enter) return false;
+
+    _ = state.acceptPrimaryFileSearchResult();
+    return true;
 }
 
 fn handlePendingThreadFollowupShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {

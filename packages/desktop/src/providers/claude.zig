@@ -462,6 +462,10 @@ fn providerBridgePathAlloc(allocator: std.mem.Allocator) ![]u8 {
     if (pathExists(allocator, dev)) return dev;
     allocator.free(dev);
 
+    const desktop_dev = try std.fs.path.resolve(allocator, &.{ "packages", "desktop", "zig-out", "share", "verde", "provider_bridge.mjs" });
+    if (pathExists(allocator, desktop_dev)) return desktop_dev;
+    allocator.free(desktop_dev);
+
     return error.ProviderBridgeNotFound;
 }
 
