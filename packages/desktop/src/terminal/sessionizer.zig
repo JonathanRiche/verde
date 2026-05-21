@@ -360,6 +360,13 @@ const PtySession = struct {
         return true;
     }
 
+    fn foregroundProcessGroup(self: *const PtySession) ?std.posix.pid_t {
+        if (!self.running) return null;
+        var pgrp: c_int = 0;
+        if (std.c.ioctl(self.master_fd, std.c.T.IOCGPGRP, &pgrp) != 0 or pgrp <= 0) return null;
+        return @intCast(pgrp);
+    }
+
     fn attach(self: *PtySession, allocator: std.mem.Allocator, label: []const u8) ![]u8 {
         const now = nowMs();
         self.cleanupStaleAttaches(allocator, now);
@@ -727,6 +734,8 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{
             .id = session.session_id,
             .running = session.running,
+            .pid = session.child_pid,
+            .foreground_process_group = session.foregroundProcessGroup(),
             .text = text,
             .offset = text_range.start,
             .next_offset = session.output_ring.items.len,
@@ -941,6 +950,8 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.command_label);
     try s.objectField("pid");
     try s.write(session.child_pid);
+    try s.objectField("foreground_process_group");
+    if (session.foregroundProcessGroup()) |pgrp| try s.write(pgrp) else try s.write(null);
     try s.objectField("child_process_count");
     try s.write(childProcessCount(session.child_pid));
     try s.objectField("running");

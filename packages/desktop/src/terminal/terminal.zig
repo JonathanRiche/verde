@@ -1889,10 +1889,12 @@ const UnixSession = struct {
         if (result != .object) return error.InvalidSessionResponse;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         const suppress_replay_responses = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
-        const child_process_count = jsonUsize(result.object.get("child_process_count") orelse .null);
+        const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
+        const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
         const stale_alt_screen_replay = suppress_replay_responses and
-            child_process_count != null and
-            child_process_count.? == 0 and
+            shell_pid != null and
+            foreground_process_group != null and
+            foreground_process_group.? == shell_pid.? and
             looksLikeStaleFullScreenReplay(text);
         self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
         self.suppress_next_daemon_replay = false;
