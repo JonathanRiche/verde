@@ -28,6 +28,7 @@ const FONT_SCALE_STEP: f32 = 0.125;
 const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
+const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -1414,6 +1415,8 @@ const UnixSession = struct {
     attach_id: ?[]u8 = null,
     pref_path: ?[]u8 = null,
     remote_output_offset: usize = 0,
+    suppress_next_daemon_replay: bool = false,
+    suppress_pty_responses: bool = false,
     output_ring: std.ArrayList(u8) = .empty,
 
     const Backend = enum {
@@ -1800,10 +1803,12 @@ const UnixSession = struct {
             const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch null;
             if (kill_response) |response| allocator.free(response);
         }
+        var attached_existing_session = false;
         if (options.revive_policy == .attach_only or options.revive_policy == .manual) {
             const inspect_response = try sessionizer.requestAlloc(allocator, pref_path, "session.inspect", .{ .id = session_id }, 1);
             defer allocator.free(inspect_response);
             try ensureSessionResponseOk(allocator, inspect_response);
+            attached_existing_session = true;
         } else {
             const command = try daemonCommandForProfile(allocator, options.profile);
             defer allocator.free(command);
@@ -1821,7 +1826,9 @@ const UnixSession = struct {
             }, 1);
             defer allocator.free(create_response);
             try ensureSessionResponseOk(allocator, create_response);
+            attached_existing_session = !(sessionResultBool(allocator, create_response, "created") catch true);
         }
+        self.suppress_next_daemon_replay = attached_existing_session;
 
         const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
@@ -1849,6 +1856,7 @@ const UnixSession = struct {
             .id = session_id,
             .attach_id = self.attach_id orelse "",
             .offset = self.remote_output_offset,
+            .max_bytes = DAEMON_REPLAY_MAX_BYTES,
         }, 1) catch |err| {
             log.debug("failed to poll daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
             self.daemon_state = .unavailable;
@@ -1868,11 +1876,16 @@ const UnixSession = struct {
         const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
         if (result != .object) return error.InvalidSessionResponse;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
+        const suppress_replay_responses = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
+        self.suppress_next_daemon_replay = false;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
         self.daemon_state = .attached;
         if (text.len == 0) return false;
         try self.appendOutput(allocator, text);
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = previous_suppression or suppress_replay_responses;
+        defer self.suppress_pty_responses = previous_suppression;
         self.stream.nextSlice(text);
         try self.repairTerminalState(allocator);
         return true;
@@ -1994,6 +2007,7 @@ const UnixSession = struct {
 
     fn streamWritePty(handler: *TerminalHandler, data: [:0]const u8) void {
         const session: *UnixSession = @fieldParentPtr("terminal", handler.terminal);
+        if (session.suppress_pty_responses) return;
         _ = session.writeRawInput(std.mem.sliceTo(data, 0)) catch |err| {
             log.warn("failed to write terminal response to PTY: {s}", .{@errorName(err)});
         };
@@ -2400,6 +2414,16 @@ fn sessionResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, 
     if (result != .object) return error.InvalidSessionResponse;
     const text = jsonString(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
     return try allocator.dupe(u8, text);
+}
+
+fn sessionResultBool(allocator: std.mem.Allocator, response: []const u8, field: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    return jsonBool(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {
