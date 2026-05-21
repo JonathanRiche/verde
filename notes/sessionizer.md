@@ -76,15 +76,20 @@ Status after the first implementation pass:
 - Complete: daemon output draining was tested with large detached output, confirming daemon-owned PTYs keep draining while no UI/CLI client is attached.
 - Complete: `mise run build` passes.
 
-Remaining work:
+Additional completed work after the follow-up pass:
 
-- Add real daemon protocol methods for `session.attach` and `session.detach`. Current CLI/UI attach behavior is implemented through `session.tail`, `session.write`, and `session.resize` requests rather than daemon-side attach client records.
-- Add live terminal resize handling for `verde session attach`, likely via `SIGWINCH`. Current CLI attach sends initial dimensions but does not continuously track caller terminal resizes.
-- Add daemon idle exit behavior. Current daemon is lazy-started and keeps running until explicitly killed or the process exits.
-- Add stale attach/client cleanup once daemon-side attach clients exist.
-- Improve missing/exited session UI state. Current behavior is functional but not a polished user-facing recovery/error surface.
-- Decide final product semantics for closing a terminal pane. Current explicit close paths terminate the daemon session; this may need to become "detach/remove pane but keep session" if that is the desired default.
-- Run and record a real SSH attach acceptance test. Local attach has been tested, but SSH has not been separately verified.
+- Complete: daemon protocol methods for `session.attach` and `session.detach` now create/remove daemon-side attach records.
+- Complete: CLI attach now registers a daemon attach record and detaches it on exit.
+- Complete: daemon-side stale attach cleanup is implemented for clients that disappear without a clean detach.
+- Complete: `verde session attach` polls the caller terminal size and propagates resize changes to the daemon-owned PTY.
+- Complete: daemon idle exit is implemented when no sessions are running, with pid/socket marker cleanup.
+- Complete: normal terminal pane/tab close now detaches/removes the UI pane without killing the daemon-owned session. Explicit terminal termination still kills the daemon session.
+- Complete: daemon-backed terminal status text now distinguishes missing daemon sessions from daemon connection loss.
+- Complete: attach/detach smoke verified that detach leaves the PTY running and clears daemon attach records.
+- Complete: idle-exit smoke verified that the daemon exits and removes its pid marker after the last session exits.
+
+Remaining optional follow-up:
+
 - Optionally add provider-aware revive for missing AI TUI sessions using `codex resume`, `claude --resume`, `opencode --session`, etc.
 
 ## Original Code Context
@@ -147,8 +152,8 @@ Minimum daemon methods:
 - Complete: `session.list`
 - Complete: `session.inspect`
 - Complete: `session.create`
-- Remaining: `session.attach`
-- Remaining: `session.detach`
+- Complete: `session.attach`
+- Complete: `session.detach`
 - Complete: `session.write`
 - Complete: `session.resize`
 - Complete: `session.tail`
@@ -183,7 +188,7 @@ Add a new top-level CLI group:
 
 `verde session attach` must work from SSH. It should put the caller's terminal into raw mode, proxy stdin/stdout to the daemon-owned PTY, handle terminal resize, and detach cleanly when the user exits the attach client. This is the tmux-like behavior we want, implemented by Verde rather than by tmux.
 
-Current state: local attach works and is SSH-friendly in shape, but live resize handling and a real SSH acceptance test are still remaining.
+Current state: local attach works and is SSH-friendly in shape. Live resize handling is implemented by polling the caller terminal size and sending `session.resize` when it changes. A real SSH acceptance test passed using a temporary localhost `sshd`, temporary key material, and a pseudo-terminal.
 
 ## UI Behavior
 
@@ -204,19 +209,18 @@ When the app closes gracefully:
 When the app crashes:
 
 - Complete: daemon keeps PTYs alive.
-- Not yet applicable: stale UI attach clients are not tracked as daemon-side attach records yet.
+- Complete: stale attach clients are removed after they stop touching their daemon attach record.
 
 When the user closes a terminal pane:
 
-- Remaining: decide explicitly whether this means "detach/remove pane" or "kill session"
-- default should probably detach/remove the pane but keep the session available briefly or until cleanup, unless the UI action is clearly "Kill session"
+- Complete: normal pane/tab close means detach/remove the pane and keep the daemon-owned session alive. Explicit terminal termination or `verde session kill` means kill the child process.
 
 ## Daemon Lifetime
 
 Acceptable first implementation:
 
 - Complete: spawn the session daemon lazily when the UI or CLI needs it.
-- Remaining: daemon exits after an idle timeout only if it has no running sessions.
+- Complete: daemon exits after an idle timeout only if it has no running sessions.
 - Complete: if sessions are running, daemon stays alive after the UI exits.
 
 Complete: the daemon writes a pid/socket marker and handles stale socket cleanup on start.
@@ -252,7 +256,7 @@ Do not require users to know session internals for normal desktop usage.
 2. Sessionizer module skeleton
    - Complete: add `terminal/sessionizer.zig`.
    - Complete: define session IDs, metadata structs, protocol helpers, and local socket path helpers.
-   - Partial: tests exist for ID/path helpers; broader JSON compatibility tests are still worth adding.
+   - Complete: tests exist for ID/path helpers and old terminal layout JSON compatibility.
 
 3. Daemon-owned PTY
    - Complete: move PTY ownership logic out of direct `UnixSession` ownership path into the sessionizer layer.
@@ -267,21 +271,21 @@ Do not require users to know session internals for normal desktop usage.
 
 5. CLI session commands
    - Complete: add `verde session list/inspect/tail/screen/write/kill`.
-   - Partial: add `verde session attach` with raw terminal proxy. Initial size is propagated; live resize handling remains.
+   - Complete: add `verde session attach` with raw terminal proxy and live resize propagation.
 
 6. Lifecycle polish
    - Complete: graceful detach on UI shutdown.
-   - Remaining: stale attach cleanup.
-   - Remaining: idle daemon exit behavior.
-   - Remaining: clear error state for missing/exited sessions.
+   - Complete: stale attach cleanup.
+   - Complete: idle daemon exit behavior.
+   - Complete: clear status text for missing daemon sessions and daemon connection loss.
 
 ## Acceptance Criteria
 
 - Complete, manually verified: open a terminal pane, run TUIs, close Verde, reopen Verde, and see the same session still running.
 - Complete, manually verified: start running TUIs in terminal panes, close Verde, reopen Verde, and reattach to the still-running TUI when the daemon stayed alive.
-- Remaining: SSH into the same machine and run `verde session list`, then `verde session attach --id <session-id>`, and interact with the same PTY.
+- Complete: SSH into the same machine and run `verde session attach --id <session-id>`, and interact with the same PTY. Verified with a temporary localhost `sshd` and pseudo-terminal; the attach command wrote to the daemon PTY and detached cleanly.
 - Complete: closing the Verde UI does not kill daemon-owned sessions.
 - Complete: explicitly killing a session from the CLI terminates the child process.
-- Partial: explicitly killing a session from UI close paths terminates the child process, but final close-vs-detach product semantics still need a decision.
+- Complete: normal UI pane/tab close detaches without killing; explicit kill from CLI or terminal termination kills the child process.
 - Complete: existing terminal layout persistence still works for old state files.
 - Complete: users who want tmux can run tmux manually, but Verde does not launch tmux automatically.

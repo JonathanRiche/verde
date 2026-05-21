@@ -11,6 +11,10 @@ const sessionizer = @import("terminal/sessionizer.zig");
 
 const VERSION = "0.0.0";
 const SOCKET_NAME = "verde.sock";
+const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
+    .macos => @bitCast(@as(u32, 0x40087468)),
+    else => @intCast(std.c.T.IOCGWINSZ),
+};
 
 pub const Result = enum {
     handled,
@@ -909,6 +913,11 @@ const SessionReadResult = struct {
     }
 };
 
+const AttachSize = struct {
+    cols: u16,
+    rows: u16,
+};
+
 fn handleSessionAttach(
     allocator: std.mem.Allocator,
     out: output.Output,
@@ -916,18 +925,22 @@ fn handleSessionAttach(
     exe_path: []const u8,
     argv: []const []const u8,
 ) !void {
-    // First pass attach keeps the protocol JSON-line based: stdin is proxied
-    // through session.write and stdout is replayed from offset-aware tail calls.
     try ensureSessionDaemon(allocator, io, exe_path);
     const session_id = try resolveAttachSessionId(allocator, out, argv);
     defer allocator.free(session_id);
 
-    const cols = parseOptionalU32(args.optionValue(argv, "--cols")) orelse sessionizer.DEFAULT_COLS;
-    const rows = parseOptionalU32(args.optionValue(argv, "--rows")) orelse sessionizer.DEFAULT_ROWS;
+    const attach_id = try attachSessionClient(allocator, io, session_id, "verde-cli");
+    defer allocator.free(attach_id);
+    defer detachSessionClient(allocator, io, session_id, attach_id);
+
+    const explicit_cols = parseOptionalU32(args.optionValue(argv, "--cols"));
+    const explicit_rows = parseOptionalU32(args.optionValue(argv, "--rows"));
+    var current_size = terminalAttachSize(explicit_cols, explicit_rows);
     const resize_response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
         .id = session_id,
-        .cols = cols,
-        .rows = rows,
+        .attach_id = attach_id,
+        .cols = current_size.cols,
+        .rows = current_size.rows,
     }, 1);
     allocator.free(resize_response);
 
@@ -941,10 +954,24 @@ fn handleSessionAttach(
     var stdin_eof = false;
     var detach_requested = false;
     while (true) {
-        try drainAttachInput(allocator, io, session_id, &stdin_eof, &detach_requested);
+        if (explicit_cols == null or explicit_rows == null) {
+            const next_size = terminalAttachSize(explicit_cols, explicit_rows);
+            if (next_size.cols != current_size.cols or next_size.rows != current_size.rows) {
+                current_size = next_size;
+                const response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
+                    .id = session_id,
+                    .attach_id = attach_id,
+                    .cols = current_size.cols,
+                    .rows = current_size.rows,
+                }, 1);
+                allocator.free(response);
+            }
+        }
+
+        try drainAttachInput(allocator, io, session_id, attach_id, &stdin_eof, &detach_requested);
         if (detach_requested) break;
 
-        var read_result = try readSessionOutput(allocator, io, session_id, next_offset);
+        var read_result = try readSessionOutput(allocator, io, session_id, attach_id, next_offset);
         defer read_result.deinit(allocator);
         if (read_result.text.len > 0) {
             try writeStdout(read_result.text);
@@ -957,6 +984,38 @@ fn handleSessionAttach(
         if (!read_result.running and read_result.text.len == 0) break;
         try std.Io.sleep(io, .fromMilliseconds(20), .awake);
     }
+}
+
+fn attachSessionClient(allocator: std.mem.Allocator, io: std.Io, session_id: []const u8, label: []const u8) ![]u8 {
+    const response = try sendSessionRequestAlloc(allocator, io, "session.attach", .{ .id = session_id, .label = label }, 1);
+    defer allocator.free(response);
+    return try sessionResultStringAlloc(allocator, response, "attach_id");
+}
+
+fn detachSessionClient(allocator: std.mem.Allocator, io: std.Io, session_id: []const u8, attach_id: []const u8) void {
+    const response = sendSessionRequestAlloc(allocator, io, "session.detach", .{ .id = session_id, .attach_id = attach_id }, 1) catch return;
+    allocator.free(response);
+}
+
+fn terminalAttachSize(explicit_cols: ?u32, explicit_rows: ?u32) AttachSize {
+    const detected = readTerminalAttachSize();
+    const cols = explicit_cols orelse if (detected) |size| size.cols else sessionizer.DEFAULT_COLS;
+    const rows = explicit_rows orelse if (detected) |size| size.rows else sessionizer.DEFAULT_ROWS;
+    return .{
+        .cols = @intCast(@max(@min(cols, std.math.maxInt(u16)), 1)),
+        .rows = @intCast(@max(@min(rows, std.math.maxInt(u16)), 1)),
+    };
+}
+
+fn readTerminalAttachSize() ?AttachSize {
+    var winsize: std.posix.winsize = undefined;
+    if (std.c.ioctl(std.posix.STDOUT_FILENO, TERMINAL_GET_WINSIZE_IOCTL, &winsize) != 0 and
+        std.c.ioctl(std.posix.STDIN_FILENO, TERMINAL_GET_WINSIZE_IOCTL, &winsize) != 0)
+    {
+        return null;
+    }
+    if (winsize.col == 0 or winsize.row == 0) return null;
+    return .{ .cols = winsize.col, .rows = winsize.row };
 }
 
 fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) ![]u8 {
@@ -995,6 +1054,7 @@ fn drainAttachInput(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_id: []const u8,
+    attach_id: []const u8,
     stdin_eof: *bool,
     detach_requested: *bool,
 ) !void {
@@ -1020,7 +1080,7 @@ fn drainAttachInput(
                 stdin_eof.* = true;
                 return;
             }
-            const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{ .id = session_id, .text = input }, 1);
+            const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{ .id = session_id, .attach_id = attach_id, .text = input }, 1);
             allocator.free(response);
             continue;
         }
@@ -1036,8 +1096,8 @@ fn drainAttachInput(
     }
 }
 
-fn readSessionOutput(allocator: std.mem.Allocator, io: std.Io, session_id: []const u8, offset: usize) !SessionReadResult {
-    const response = try sendSessionRequestAlloc(allocator, io, "session.tail", .{ .id = session_id, .offset = offset }, 1);
+fn readSessionOutput(allocator: std.mem.Allocator, io: std.Io, session_id: []const u8, attach_id: []const u8, offset: usize) !SessionReadResult {
+    const response = try sendSessionRequestAlloc(allocator, io, "session.tail", .{ .id = session_id, .attach_id = attach_id, .offset = offset }, 1);
     defer allocator.free(response);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
     defer parsed.deinit();
@@ -1362,6 +1422,17 @@ fn writeJsonValue(s: *std.json.Stringify, value: std.json.Value) !void {
         .null => try s.write(null),
         else => try s.write(null),
     }
+}
+
+fn sessionResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, field: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    const text = jsonString(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
+    return try allocator.dupe(u8, text);
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {
