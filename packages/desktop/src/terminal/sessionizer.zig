@@ -730,6 +730,7 @@ pub const Daemon = struct {
             .text = text,
             .offset = text_range.start,
             .next_offset = session.output_ring.items.len,
+            .child_process_count = childProcessCount(session.child_pid),
         });
     }
 
@@ -940,6 +941,8 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.command_label);
     try s.objectField("pid");
     try s.write(session.child_pid);
+    try s.objectField("child_process_count");
+    try s.write(childProcessCount(session.child_pid));
     try s.objectField("running");
     try s.write(session.running);
     try s.objectField("status");
@@ -1119,6 +1122,33 @@ fn bytesRangeForTailLines(bytes: []const u8, lines: u32, max_bytes: ?usize) Byte
 fn bytesFromOffset(allocator: std.mem.Allocator, bytes: []const u8, offset: usize) ![]u8 {
     const start = @min(offset, bytes.len);
     return allocator.dupe(u8, bytes[start..]);
+}
+
+fn childProcessCount(pid: std.posix.pid_t) ?usize {
+    if (builtin.os.tag != .linux or pid <= 0) return null;
+
+    var path_buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch return null;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.c.close(fd);
+
+    var buffer: [4096]u8 = undefined;
+    const read_raw = std.c.read(fd, &buffer, buffer.len);
+    if (read_raw <= 0) return 0;
+
+    var count: usize = 0;
+    var in_number = false;
+    for (buffer[0..@intCast(read_raw)]) |byte| {
+        if (byte >= '0' and byte <= '9') {
+            if (!in_number) {
+                count += 1;
+                in_number = true;
+            }
+        } else {
+            in_number = false;
+        }
+    }
+    return count;
 }
 
 pub fn nowMs() i64 {
