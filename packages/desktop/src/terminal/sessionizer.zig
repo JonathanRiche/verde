@@ -14,6 +14,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
+const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
+const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
 const TERMINAL_WINSIZE_IOCTL = switch (builtin.os.tag) {
     .macos => 0x80087467,
     else => std.c.T.IOCSWINSZ,
@@ -235,6 +237,13 @@ pub const CreateOptions = struct {
 };
 
 const PtySession = struct {
+    const AttachClient = struct {
+        attach_id: []u8,
+        label: []u8,
+        created_at_ms: i64,
+        last_seen_at_ms: i64,
+    };
+
     session_id: []u8,
     project_id: []u8,
     project_path: []u8,
@@ -250,6 +259,7 @@ const PtySession = struct {
     exit_status: ?u32 = null,
     created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
+    attach_clients: std.ArrayList(AttachClient) = .empty,
 
     const SpawnResult = struct {
         master_fd: std.posix.fd_t,
@@ -308,6 +318,11 @@ const PtySession = struct {
         allocator.free(self.cwd);
         allocator.free(self.label);
         allocator.free(self.command_label);
+        for (self.attach_clients.items) |client| {
+            allocator.free(client.attach_id);
+            allocator.free(client.label);
+        }
+        self.attach_clients.deinit(allocator);
         self.output_ring.deinit(allocator);
         allocator.destroy(self);
     }
@@ -342,6 +357,56 @@ const PtySession = struct {
         self.running = false;
         _ = self.captureExitStatus();
         return true;
+    }
+
+    fn attach(self: *PtySession, allocator: std.mem.Allocator, label: []const u8) ![]u8 {
+        const now = nowMs();
+        self.cleanupStaleAttaches(allocator, now);
+        const attach_id = try std.fmt.allocPrint(allocator, "{s}:attach:{d}:{d}", .{ self.session_id, now, self.attach_clients.items.len });
+        errdefer allocator.free(attach_id);
+        try self.attach_clients.append(allocator, .{
+            .attach_id = attach_id,
+            .label = try allocator.dupe(u8, if (label.len > 0) label else "client"),
+            .created_at_ms = now,
+            .last_seen_at_ms = now,
+        });
+        self.last_attached_at_ms = now;
+        return try allocator.dupe(u8, attach_id);
+    }
+
+    fn detach(self: *PtySession, allocator: std.mem.Allocator, attach_id: []const u8) bool {
+        for (self.attach_clients.items, 0..) |client, index| {
+            if (!std.mem.eql(u8, client.attach_id, attach_id)) continue;
+            const removed = self.attach_clients.orderedRemove(index);
+            allocator.free(removed.attach_id);
+            allocator.free(removed.label);
+            return true;
+        }
+        return false;
+    }
+
+    fn touchAttach(self: *PtySession, attach_id: []const u8) bool {
+        const now = nowMs();
+        for (self.attach_clients.items) |*client| {
+            if (!std.mem.eql(u8, client.attach_id, attach_id)) continue;
+            client.last_seen_at_ms = now;
+            return true;
+        }
+        return false;
+    }
+
+    fn cleanupStaleAttaches(self: *PtySession, allocator: std.mem.Allocator, now: i64) void {
+        var index: usize = 0;
+        while (index < self.attach_clients.items.len) {
+            const client = self.attach_clients.items[index];
+            if (now - client.last_seen_at_ms <= ATTACH_STALE_MS) {
+                index += 1;
+                continue;
+            }
+            const removed = self.attach_clients.orderedRemove(index);
+            allocator.free(removed.attach_id);
+            allocator.free(removed.label);
+        }
     }
 
     fn drainOutput(self: *PtySession, allocator: std.mem.Allocator) !void {
@@ -436,6 +501,7 @@ pub const Daemon = struct {
     allocator: std.mem.Allocator,
     sessions: std.ArrayList(*PtySession) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
+    idle_since_ms: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator) Daemon {
         return .{ .allocator = allocator };
@@ -447,7 +513,26 @@ pub const Daemon = struct {
     }
 
     fn pollSessions(self: *Daemon) void {
-        for (self.sessions.items) |session| session.poll(self.allocator) catch {};
+        const now = nowMs();
+        for (self.sessions.items) |session| {
+            session.poll(self.allocator) catch {};
+            session.cleanupStaleAttaches(self.allocator, now);
+        }
+    }
+
+    fn shouldExitForIdle(self: *Daemon) bool {
+        for (self.sessions.items) |session| {
+            if (session.running) {
+                self.idle_since_ms = null;
+                return false;
+            }
+        }
+        const now = nowMs();
+        if (self.idle_since_ms == null) {
+            self.idle_since_ms = now;
+            return false;
+        }
+        return now - self.idle_since_ms.? >= IDLE_EXIT_MS;
     }
 
     fn find(self: *Daemon, session_id: []const u8) ?*PtySession {
@@ -475,6 +560,8 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.list")) return try self.listResponse(id_value);
         if (std.mem.eql(u8, method, "session.inspect")) return try self.inspectResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.create")) return try self.createResponse(id_value, params);
+        if (std.mem.eql(u8, method, "session.attach")) return try self.attachResponse(id_value, params);
+        if (std.mem.eql(u8, method, "session.detach")) return try self.detachResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.write")) return try self.writeResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.resize")) return try self.resizeResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.tail")) return try self.tailResponse(id_value, params, false);
@@ -490,6 +577,7 @@ pub const Daemon = struct {
             .protocol_version = PROTOCOL_VERSION,
             .pid = std.c.getpid(),
             .session_count = self.sessions.items.len,
+            .idle_exit_ms = IDLE_EXIT_MS,
         });
     }
 
@@ -529,6 +617,21 @@ pub const Daemon = struct {
         try s.write(session.cwd);
         try s.objectField("command");
         try s.write(session.command_label);
+        try s.objectField("attached_clients");
+        try s.beginArray();
+        for (session.attach_clients.items) |client| {
+            try s.beginObject();
+            try s.objectField("attach_id");
+            try s.write(client.attach_id);
+            try s.objectField("label");
+            try s.write(client.label);
+            try s.objectField("created_at_ms");
+            try s.write(client.created_at_ms);
+            try s.objectField("last_seen_at_ms");
+            try s.write(client.last_seen_at_ms);
+            try s.endObject();
+        }
+        try s.endArray();
         try s.endObject();
         try s.endObject();
         return try writer.toOwnedSlice();
@@ -561,9 +664,36 @@ pub const Daemon = struct {
         return try okSessionResponse(self.allocator, id_value, session, true);
     }
 
+    fn attachResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const session = try self.requiredSession(id_value, params);
+        if (params != .object) unreachable;
+        const label = jsonString(params.object.get("label") orelse .null) orelse "";
+        const attach_id = try session.attach(self.allocator, label);
+        defer self.allocator.free(attach_id);
+        return try okValueResponse(self.allocator, id_value, .{
+            .id = session.session_id,
+            .attach_id = attach_id,
+            .running = session.running,
+            .attached_clients = session.attach_clients.items.len,
+        });
+    }
+
+    fn detachResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const session = try self.requiredSession(id_value, params);
+        if (params != .object) unreachable;
+        const attach_id = jsonString(params.object.get("attach_id") orelse .null) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing attach_id");
+        const detached = session.detach(self.allocator, attach_id);
+        return try okValueResponse(self.allocator, id_value, .{
+            .accepted = detached,
+            .attached_clients = session.attach_clients.items.len,
+        });
+    }
+
     fn writeResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
+        touchAttachFromParams(session, params);
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
         const wrote = try session.writeInput(text);
         return try okValueResponse(self.allocator, id_value, .{ .accepted = wrote, .bytes = text.len });
@@ -572,6 +702,7 @@ pub const Daemon = struct {
     fn resizeResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
+        touchAttachFromParams(session, params);
         session.resize(
             jsonU16(params.object.get("cols") orelse .null) orelse session.cols,
             jsonU16(params.object.get("rows") orelse .null) orelse session.rows,
@@ -582,6 +713,7 @@ pub const Daemon = struct {
     fn tailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value, screen: bool) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
+        touchAttachFromParams(session, params);
         const lines = jsonU32(params.object.get("lines") orelse .null) orelse if (screen) DEFAULT_ROWS else 80;
         const start_offset = jsonUsize(params.object.get("offset") orelse .null);
         const text = if (start_offset) |offset|
@@ -658,7 +790,11 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
 
     var daemon = Daemon.init(allocator);
     defer daemon.deinit();
-    const drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{&daemon});
+    const drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
+        .daemon = &daemon,
+        .socket_path = socket_path,
+        .pid_path = pid_path,
+    }});
     drain_thread.detach();
 
     while (true) {
@@ -670,11 +806,25 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     }
 }
 
-fn drainSessionsThread(daemon: *Daemon) void {
+const DrainThreadContext = struct {
+    daemon: *Daemon,
+    socket_path: []const u8,
+    pid_path: []const u8,
+};
+
+fn drainSessionsThread(context: DrainThreadContext) void {
     while (true) {
+        const daemon = context.daemon;
         lockDaemon(daemon);
         daemon.pollSessions();
+        const should_exit = daemon.shouldExitForIdle();
         daemon.mutex.unlock();
+        if (should_exit) {
+            deleteSocketPath(context.socket_path);
+            var cleanup_threaded = std.Io.Threaded.init_single_threaded;
+            deleteFilePath(cleanup_threaded.io(), context.pid_path);
+            std.c.exit(0);
+        }
         sleepMs(20);
     }
 }
@@ -799,7 +949,15 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.created_at_ms);
     try s.objectField("last_attached_at_ms");
     if (session.last_attached_at_ms) |value| try s.write(value) else try s.write(null);
+    try s.objectField("attached_clients");
+    try s.write(session.attach_clients.items.len);
     try s.endObject();
+}
+
+fn touchAttachFromParams(session: *PtySession, params: std.json.Value) void {
+    if (params != .object) return;
+    const attach_id = jsonString(params.object.get("attach_id") orelse .null) orelse return;
+    _ = session.touchAttach(attach_id);
 }
 
 fn writeJsonValue(s: *std.json.Stringify, value: std.json.Value) !void {

@@ -588,7 +588,6 @@ pub const Dock = struct {
     pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
         if (index >= self.tabs.items.len) return;
         var removed = self.tabs.orderedRemove(index);
-        terminatePaneNodeSessions(removed.root);
         removed.deinit(allocator);
         if (self.tabs.items.len == 0) {
             try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
@@ -1063,7 +1062,6 @@ fn removePaneFromTree(allocator: std.mem.Allocator, root: **PaneNode, pane_id: u
         .split => |*split| {
             if (paneNodeContains(split.first, pane_id)) {
                 if (split.first.* == .leaf and split.first.leaf.id == pane_id) {
-                    terminatePaneNodeSessions(split.first);
                     deinitPaneNode(split.first, allocator);
                     const sibling = split.second;
                     allocator.destroy(node);
@@ -1074,7 +1072,6 @@ fn removePaneFromTree(allocator: std.mem.Allocator, root: **PaneNode, pane_id: u
             }
             if (paneNodeContains(split.second, pane_id)) {
                 if (split.second.* == .leaf and split.second.leaf.id == pane_id) {
-                    terminatePaneNodeSessions(split.second);
                     deinitPaneNode(split.second, allocator);
                     const sibling = split.first;
                     allocator.destroy(node);
@@ -1410,9 +1407,11 @@ const UnixSession = struct {
     cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
+    daemon_state: DaemonState = .attached,
     launch_kind: TerminalLaunchKind = .shell,
     launch_label: []u8,
     session_id: ?[]u8 = null,
+    attach_id: ?[]u8 = null,
     pref_path: ?[]u8 = null,
     remote_output_offset: usize = 0,
     output_ring: std.ArrayList(u8) = .empty,
@@ -1420,6 +1419,12 @@ const UnixSession = struct {
     const Backend = enum {
         local,
         daemon,
+    };
+
+    const DaemonState = enum {
+        attached,
+        missing,
+        unavailable,
     };
 
     const SpawnResult = struct {
@@ -1474,6 +1479,7 @@ const UnixSession = struct {
             self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
             errdefer self.stream.deinit();
             errdefer if (self.session_id) |session_id| allocator.free(session_id);
+            errdefer if (self.attach_id) |attach_id| allocator.free(attach_id);
             errdefer if (self.pref_path) |pref_path| allocator.free(pref_path);
 
             try self.attachDaemonSession(allocator, options);
@@ -1519,11 +1525,13 @@ const UnixSession = struct {
         }
         if (self.backend == .local) _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
+        if (self.backend == .daemon) self.detachDaemon(allocator);
         self.stream.deinit();
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
         allocator.free(self.launch_label);
         if (self.session_id) |session_id| allocator.free(session_id);
+        if (self.attach_id) |attach_id| allocator.free(attach_id);
         if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
     }
@@ -1582,6 +1590,13 @@ const UnixSession = struct {
     pub fn statusText(self: *const UnixSession, buf: *[192]u8) []const u8 {
         if (self.running) {
             return std.fmt.bufPrint(buf, "{d}x{d} {s} attached", .{ self.cols, self.rows, self.launch_label }) catch "Terminal attached";
+        }
+        if (self.backend == .daemon) {
+            switch (self.daemon_state) {
+                .attached => {},
+                .missing => return std.fmt.bufPrint(buf, "{s} session missing. Restart or attach another session.", .{self.launch_label}) catch "Terminal session missing.",
+                .unavailable => return "Terminal session daemon unavailable. Session may still be running.",
+            }
         }
         if (self.exit_status) |status| {
             if (std.c.W.IFEXITED(status)) {
@@ -1808,6 +1823,13 @@ const UnixSession = struct {
             try ensureSessionResponseOk(allocator, create_response);
         }
 
+        const attach_response = try sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
+            .id = session_id,
+            .label = "verde-ui",
+        }, 1);
+        defer allocator.free(attach_response);
+        self.attach_id = try sessionResultStringAlloc(allocator, attach_response, "attach_id");
+
         try self.resizeDaemon(allocator);
         _ = try self.drainDaemonOutput(allocator);
     }
@@ -1817,9 +1839,11 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return false;
         const response = sessionizer.requestAlloc(allocator, pref_path, "session.tail", .{
             .id = session_id,
+            .attach_id = self.attach_id orelse "",
             .offset = self.remote_output_offset,
         }, 1) catch |err| {
             log.debug("failed to poll daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
+            self.daemon_state = .unavailable;
             self.running = false;
             return false;
         };
@@ -1829,6 +1853,7 @@ const UnixSession = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSessionResponse;
         if (parsed.value.object.get("error")) |_| {
+            self.daemon_state = .missing;
             self.running = false;
             return false;
         }
@@ -1837,6 +1862,7 @@ const UnixSession = struct {
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
+        self.daemon_state = .attached;
         if (text.len == 0) return false;
         try self.appendOutput(allocator, text);
         self.stream.nextSlice(text);
@@ -1849,6 +1875,7 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return;
         const response = try sessionizer.requestAlloc(allocator, pref_path, "session.resize", .{
             .id = session_id,
+            .attach_id = self.attach_id orelse "",
             .cols = self.cols,
             .rows = self.rows,
         }, 1);
@@ -1872,10 +1899,22 @@ const UnixSession = struct {
         const session_id = self.session_id orelse return false;
         const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.write", .{
             .id = session_id,
+            .attach_id = self.attach_id orelse "",
             .text = bytes,
         }, 1);
         defer std.heap.smp_allocator.free(response);
         return true;
+    }
+
+    fn detachDaemon(self: *UnixSession, allocator: std.mem.Allocator) void {
+        const pref_path = self.pref_path orelse return;
+        const session_id = self.session_id orelse return;
+        const attach_id = self.attach_id orelse return;
+        const response = sessionizer.requestAlloc(allocator, pref_path, "session.detach", .{
+            .id = session_id,
+            .attach_id = attach_id,
+        }, 1) catch return;
+        allocator.free(response);
     }
 
     fn appendOutput(self: *UnixSession, allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -2337,6 +2376,17 @@ fn ensureSessionResponseOk(allocator: std.mem.Allocator, response: []const u8) !
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidSessionResponse;
     if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+}
+
+fn sessionResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, field: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    const text = jsonString(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
+    return try allocator.dupe(u8, text);
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {
@@ -2876,6 +2926,35 @@ test "focus adjacent pane uses split direction" {
     try std.testing.expectEqual(left_id, dock.activePaneConst().?.id);
     try std.testing.expect(try dock.focusAdjacentPane(allocator, .right));
     try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
+}
+
+test "persisted layout accepts leaves without session metadata" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    const old_layout_json =
+        \\{
+        \\  "active_tab_index": 0,
+        \\  "tabs": [{
+        \\    "title": "old",
+        \\    "active_pane_id": 7,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 7
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    try dock.applyPersistedLayoutJson(allocator, old_layout_json);
+    const pane = dock.activePaneConst().?;
+    try std.testing.expectEqual(@as(u32, 7), pane.id);
+    try std.testing.expectEqual(@as(?[]u8, null), pane.session_id);
+    try std.testing.expectEqual(@as(?TerminalLaunchKind, null), pane.launch_kind);
+    try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, pane.revive_policy);
 }
 
 test "unix session PTY smoke" {
