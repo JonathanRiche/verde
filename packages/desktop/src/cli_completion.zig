@@ -116,7 +116,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --axis) COMPREPLY=( $(compgen -W "$axis_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --project|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
+        \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -130,15 +130,15 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\      state)
         \\        case "$sub" in
         \\          panes|threads) COMPREPLY=( $(compgen -W "$project_json_flags" -- "$cur") ) ;;
-        \\          transcript) COMPREPLY=( $(compgen -W "--project --thread --json" -- "$cur") ) ;;
+        \\          transcript) COMPREPLY=( $(compgen -W "--workspace --thread --json" -- "$cur") ) ;;
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
         \\      session)
         \\        case "$sub" in
         \\          inspect|screen) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
-        \\          new) COMPREPLY=( $(compgen -W "--project --name --json" -- "$cur") ) ;;
-        \\          attach) COMPREPLY=( $(compgen -W "--id --project --pane" -- "$cur") ) ;;
+        \\          new) COMPREPLY=( $(compgen -W "--workspace --name --json" -- "$cur") ) ;;
+        \\          attach) COMPREPLY=( $(compgen -W "--id --workspace --pane" -- "$cur") ) ;;
         \\          write) COMPREPLY=( $(compgen -W "--id --text --json" -- "$cur") ) ;;
         \\          tail) COMPREPLY=( $(compgen -W "--id --lines --json" -- "$cur") ) ;;
         \\          kill) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
@@ -297,7 +297,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --axis) compadd -- ${(s: :)axis_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --project|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
+        \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -311,15 +311,15 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\      state)
         \\        case "$sub" in
         \\          panes|threads) compadd -- ${(s: :)project_json_flags} ;;
-        \\          transcript) compadd -- --project --thread --json ;;
+        \\          transcript) compadd -- --workspace --thread --json ;;
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
         \\      session)
         \\        case "$sub" in
         \\          inspect|screen) compadd -- --id --json ;;
-        \\          new) compadd -- --project --name --json ;;
-        \\          attach) compadd -- --id --project --pane ;;
+        \\          new) compadd -- --workspace --name --json ;;
+        \\          attach) compadd -- --id --workspace --pane ;;
         \\          write) compadd -- --id --text --json ;;
         \\          tail) compadd -- --id --lines --json ;;
         \\          kill) compadd -- --id --json ;;
@@ -441,7 +441,7 @@ fn writeFish(w: *std.Io.Writer) !void {
     try w.writeAll("'\n\ncomplete -c verde -l json -d 'Print JSON output'\n");
     try w.writeAll(
         \\complete -c verde -l id -r -d 'Persistent session id'
-        \\complete -c verde -l project -r -d 'Project id, index, path, or current'
+        \\complete -c verde -l workspace -r -d 'Workspace id, index, path, or current'
         \\complete -c verde -l thread -r -d 'Thread index or provider id'
         \\complete -c verde -l pane -r -d 'Workspace pane id'
         \\complete -c verde -l focused -d 'Use the focused pane'

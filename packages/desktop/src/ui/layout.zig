@@ -29,8 +29,8 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     state.palette_modal_hits.clearRetainingCapacity();
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
-    registerProjectAddModalHits(state, width, height);
-    registerProjectRenameModalHits(state, width, height);
+    registerWorkspaceAddModalHits(state, width, height);
+    registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
 }
 
@@ -83,8 +83,8 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     sidebar.renderFloatingDragPreview(state);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
-    renderProjectAddModal(state, width, height);
-    renderProjectRenameModal(state, width, height);
+    renderWorkspaceAddModal(state, width, height);
+    renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     debug_window.render(state, width, height);
 }
@@ -406,7 +406,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         const hit = state.palette_modal_hits.items[i];
         if (!pointInRect(x, y, hit.rect)) continue;
         if (hit.action == .project_import_browse) {
-            runtime.log.info("project import browse hit down={} x={d:.1} y={d:.1}", .{ down, x, y });
+            runtime.log.info("workspace import browse hit down={} x={d:.1} y={d:.1}", .{ down, x, y });
             if (!down) state.requestBrowseForProjectDirectory();
             return true;
         }
@@ -423,7 +423,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .project_import_browse => unreachable,
             .project_import_submit => {
                 state.importProjectFromInput() catch |err| {
-                    runtime.log.warn("project import failed: {s}", .{@errorName(err)});
+                    runtime.log.warn("workspace import failed: {s}", .{@errorName(err)});
                     state.setSidebarNotice("Could not add that directory path.");
                 };
             },
@@ -515,7 +515,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             }
             if (state.palette_modal_text_focus == .project_import) {
                 state.importProjectFromInput() catch |err| {
-                    runtime.log.warn("project import failed: {s}", .{@errorName(err)});
+                    runtime.log.warn("workspace import failed: {s}", .{@errorName(err)});
                     state.setSidebarNotice("Could not add that directory path.");
                 };
                 return true;
@@ -708,7 +708,7 @@ fn registerTranscriptSelectionModalHits(state: *runtime.AppState, width: f32, he
     queueModalHit(state, close_rect, .transcript_close, 0);
 }
 
-fn registerProjectAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.show_project_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
     const notice_h: f32 = if (state.sidebarNotice().len > 0) theme.scaledUi(24.0) else 0.0;
@@ -733,7 +733,7 @@ fn registerProjectAddModalHits(state: *runtime.AppState, width: f32, height: f32
     queueModalHit(state, cancel_rect, .project_import_cancel, 0);
 }
 
-fn registerProjectRenameModalHits(state: *runtime.AppState, width: f32, height: f32) void {
+fn registerWorkspaceRenameModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     const rename_index = state.rename_project_index orelse return;
     if (rename_index >= state.projects.items.len) return;
     const modal_w = theme.clampf(width * 0.28, theme.scaledUi(320.0), theme.scaledUi(420.0));
@@ -840,8 +840,8 @@ fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     }
 }
 
-/// Shows the modal used to rename the active project.
-fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) void {
+/// Shows the modal used to rename the active workspace.
+fn renderWorkspaceRenameModal(state: *runtime.AppState, width: f32, height: f32) void {
     const rename_index = state.rename_project_index orelse return;
     if (rename_index >= state.projects.items.len) {
         state.rename_project_index = null;
@@ -852,10 +852,10 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
     const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
     drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Rename project", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + pad, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Rename workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(44.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, state.projects.items[rename_index].path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + theme.scaledUi(76.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(34.0) };
-    drawTextField(state, input_rect, state.renameInputPublic(), "Project label", state.palette_modal_text_focus == .project_rename, state.project_rename_cursor);
+    drawTextField(state, input_rect, state.renameInputPublic(), "Workspace label", state.palette_modal_text_focus == .project_rename, state.project_rename_cursor);
     const gap = theme.scaledUi(10.0);
     const button_w = (input_rect.w - gap) * 0.5;
     const cancel_rect: palette.Rect = .{ .x = input_rect.x, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = button_w, .h = theme.scaledUi(34.0) };
@@ -864,7 +864,7 @@ fn renderProjectRenameModal(state: *runtime.AppState, width: f32, height: f32) v
     drawActionButton(state, submit_rect, "Rename", theme.COLOR_SECONDARY_GREEN);
 }
 
-fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void {
+fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.show_project_creator) return;
     const modal_w = theme.clampf(width * 0.34, theme.scaledUi(360.0), theme.scaledUi(500.0));
     const notice = state.sidebarNotice();
@@ -874,7 +874,7 @@ fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void
     drawModalChromeVisual(state, width, height, modal);
     const pad = theme.scaledUi(18.0);
     var y = modal.y + pad;
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add project", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     y += theme.scaledUi(30.0);
     queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Choose a directory for a new workspace, or paste a path below.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
     y += theme.scaledUi(48.0);
@@ -885,7 +885,7 @@ fn renderProjectAddModal(state: *runtime.AppState, width: f32, height: f32) void
     const row_gap = theme.scaledUi(10.0);
     const input_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0 - add_w - row_gap, .h = theme.scaledUi(34.0) };
     const add_rect: palette.Rect = .{ .x = input_rect.x + input_rect.w + row_gap, .y = y, .w = add_w, .h = theme.scaledUi(34.0) };
-    drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/project", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
+    drawTextField(state, input_rect, state.importDirectoryDraft(), "/path/to/workspace", state.palette_modal_text_focus == .project_import, state.project_import_cursor);
     drawActionButton(state, add_rect, "Add", theme.COLOR_SECONDARY_GREEN);
     y += theme.scaledUi(46.0);
     const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = theme.scaledUi(120.0), .h = theme.scaledUi(34.0) };
@@ -994,10 +994,10 @@ fn threadImportHeading(provider: runtime.Provider) []const u8 {
 
 fn threadImportDescription(provider: runtime.Provider) []const u8 {
     return switch (provider) {
-        .codex => "Import loads the existing Codex transcript into this project and binds future turns to the same thread.",
-        .opencode => "Import loads the existing OpenCode transcript into this project and binds future turns to the same thread.",
-        .claude => "Import loads the existing Claude transcript into this project and binds future turns to the same thread.",
-        .cursor => "Import loads the existing Cursor transcript into this project and binds future turns to the same thread.",
+        .codex => "Import loads the existing Codex transcript into this workspace and binds future turns to the same thread.",
+        .opencode => "Import loads the existing OpenCode transcript into this workspace and binds future turns to the same thread.",
+        .claude => "Import loads the existing Claude transcript into this workspace and binds future turns to the same thread.",
+        .cursor => "Import loads the existing Cursor transcript into this workspace and binds future turns to the same thread.",
     };
 }
 

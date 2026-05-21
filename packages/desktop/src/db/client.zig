@@ -50,7 +50,7 @@ pub const Client = struct {
 
     pub fn load(self: *const Self, backing_allocator: std.mem.Allocator) !?LoadedState {
         const row = try self.conn.row(
-            "select selected_project_index, sidebar_collapsed from app_state where id = 1",
+            "select selected_workspace_index, sidebar_collapsed from app_state where id = 1",
             .{},
         );
         if (row == null) return null;
@@ -66,37 +66,37 @@ pub const Client = struct {
         }
 
         const arena = loaded.allocator();
-        var projects: std.ArrayList(PersistedProject) = .empty;
-        defer projects.deinit(arena);
+        var workspaces: std.ArrayList(PersistedProject) = .empty;
+        defer workspaces.deinit(arena);
 
-        var project_rows = try self.conn.rows(
-            "select id, project_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index " ++
-                "from projects order by sort_index",
+        var workspace_rows = try self.conn.rows(
+            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index " ++
+                "from workspaces order by sort_index",
             .{},
         );
-        defer project_rows.deinit();
+        defer workspace_rows.deinit();
 
-        while (project_rows.next()) |project_row| {
-            const project_id = project_row.int(0);
-            try projects.append(arena, .{
-                .id = try arena.dupe(u8, project_row.text(1)),
-                .label = try arena.dupe(u8, project_row.text(2)),
-                .path = try arena.dupe(u8, project_row.text(3)),
-                .archived = project_row.int(4) != 0,
-                .unread_count = @intCast(project_row.int(5)),
-                .collapsed = project_row.int(6) != 0,
-                .thread_list_expanded = project_row.int(7) != 0,
-                .terminal_height = if (project_row.nullableFloat(8)) |value| @floatCast(value) else null,
-                .terminal_layout_json = try dupeOptionalText(arena, project_row.nullableText(9)),
-                .terminal_docks_json = try dupeOptionalText(arena, project_row.nullableText(10)),
-                .workspace_layout_json = try dupeOptionalText(arena, project_row.nullableText(11)),
-                .selected_thread_index = @intCast(project_row.int(12)),
-                .threads = try self.loadThreads(arena, project_id),
+        while (workspace_rows.next()) |workspace_row| {
+            const workspace_id = workspace_row.int(0);
+            try workspaces.append(arena, .{
+                .id = try arena.dupe(u8, workspace_row.text(1)),
+                .label = try arena.dupe(u8, workspace_row.text(2)),
+                .path = try arena.dupe(u8, workspace_row.text(3)),
+                .archived = workspace_row.int(4) != 0,
+                .unread_count = @intCast(workspace_row.int(5)),
+                .collapsed = workspace_row.int(6) != 0,
+                .thread_list_expanded = workspace_row.int(7) != 0,
+                .terminal_height = if (workspace_row.nullableFloat(8)) |value| @floatCast(value) else null,
+                .terminal_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(9)),
+                .terminal_docks_json = try dupeOptionalText(arena, workspace_row.nullableText(10)),
+                .workspace_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(11)),
+                .selected_thread_index = @intCast(workspace_row.int(12)),
+                .threads = try self.loadThreads(arena, workspace_id),
             });
         }
-        if (project_rows.err) |err| return err;
+        if (workspace_rows.err) |err| return err;
 
-        loaded.value.projects = try projects.toOwnedSlice(arena);
+        loaded.value.projects = try workspaces.toOwnedSlice(arena);
         return loaded;
     }
 
@@ -108,11 +108,11 @@ pub const Client = struct {
             \\delete from messages;
             \\delete from threads;
             \\delete from app_state;
-            \\delete from projects;
+            \\delete from workspaces;
         );
 
         try self.conn.exec(
-            "insert into app_state (id, selected_project_index, sidebar_collapsed) values (1, ?1, ?2)",
+            "insert into app_state (id, selected_workspace_index, sidebar_collapsed) values (1, ?1, ?2)",
             .{
                 @as(i64, @intCast(state.selected_project_index)),
                 boolToInt(state.sidebar_collapsed),
@@ -121,7 +121,7 @@ pub const Client = struct {
 
         for (state.projects, 0..) |project, project_index| {
             try self.conn.exec(
-                "insert into projects (project_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index) " ++
+                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index) " ++
                     "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 .{
                     project.id orelse project.path,
@@ -139,8 +139,8 @@ pub const Client = struct {
                     @as(i64, @intCast(project.selected_thread_index)),
                 },
             );
-            const project_row_id = self.conn.lastInsertedRowId();
-            try self.saveProjectThreads(project_row_id, state, project, project_index);
+            const workspace_row_id = self.conn.lastInsertedRowId();
+            try self.saveWorkspaceThreads(workspace_row_id, state, project, project_index);
         }
 
         try self.conn.commit();
@@ -152,7 +152,7 @@ pub const Client = struct {
 
         var thread_rows = try self.conn.rows(
             "select id, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
-                "from threads where project_id = ?1 order by sort_index",
+                "from threads where workspace_id = ?1 order by sort_index",
             .{project_id},
         );
         defer thread_rows.deinit();
@@ -217,7 +217,7 @@ pub const Client = struct {
         return try messages.toOwnedSlice(allocator);
     }
 
-    fn saveProjectThreads(
+    fn saveWorkspaceThreads(
         self: *const Self,
         project_id: i64,
         state: PersistedState,
@@ -253,7 +253,7 @@ pub const Client = struct {
         for (threads, 0..) |thread, thread_index| {
             const draft_image = thread.draft_image;
             try self.conn.exec(
-                "insert into threads (project_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                "insert into threads (workspace_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
                     "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 .{
                     project_id,
@@ -363,7 +363,7 @@ test "save clears orphaned threads left behind by manual db edits" {
         .selected_project_index = 0,
         .projects = &.{.{
             .id = "project-1",
-            .label = "Project",
+            .label = "Workspace",
             .path = "/tmp/project",
             .selected_thread_index = 0,
             .threads = &.{.{
@@ -384,9 +384,9 @@ test "save clears orphaned threads left behind by manual db edits" {
     try client.conn.execNoArgs(
         \\pragma foreign_keys = off;
         \\delete from app_state;
-        \\delete from projects;
+        \\delete from workspaces;
         \\insert into threads (
-        \\    project_id,
+        \\    workspace_id,
         \\    sort_index,
         \\    title,
         \\    committed,
@@ -409,7 +409,7 @@ test "save clears orphaned threads left behind by manual db edits" {
         .selected_project_index = 0,
         .projects = &.{.{
             .id = "project-1",
-            .label = "Project",
+            .label = "Workspace",
             .path = "/tmp/project",
             .selected_thread_index = 0,
             .threads = &.{.{
@@ -452,7 +452,7 @@ test "save and load preserve archived projects and threads" {
         .projects = &.{
             .{
                 .id = "project-active",
-                .label = "Active Project",
+                .label = "Active Workspace",
                 .path = "/tmp/project-active",
                 .selected_thread_index = 0,
                 .threads = &.{
@@ -483,7 +483,7 @@ test "save and load preserve archived projects and threads" {
             },
             .{
                 .id = "project-archived",
-                .label = "Archived Project",
+                .label = "Archived Workspace",
                 .path = "/tmp/project-archived",
                 .archived = true,
                 .selected_thread_index = 0,
