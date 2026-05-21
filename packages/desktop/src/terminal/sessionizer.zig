@@ -163,8 +163,9 @@ pub fn requestAlloc(
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
-    var read_buffer: [256 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
+    const read_buffer = try allocator.alloc(u8, 8 * 1024 * 1024);
+    defer allocator.free(read_buffer);
+    var reader = stream.reader(io, read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
     return try allocator.dupe(u8, std.mem.trim(u8, line, "\r"));
 }
@@ -716,16 +717,18 @@ pub const Daemon = struct {
         touchAttachFromParams(session, params);
         const lines = jsonU32(params.object.get("lines") orelse .null) orelse if (screen) DEFAULT_ROWS else 80;
         const start_offset = jsonUsize(params.object.get("offset") orelse .null);
-        const text = if (start_offset) |offset|
-            try bytesFromOffset(self.allocator, session.output_ring.items, offset)
+        const max_bytes = jsonUsize(params.object.get("max_bytes") orelse .null);
+        const text_range = if (start_offset) |offset|
+            bytesRangeFromOffset(session.output_ring.items, offset, max_bytes)
         else
-            try tailLines(self.allocator, session.output_ring.items, lines);
+            bytesRangeForTailLines(session.output_ring.items, lines, max_bytes);
+        const text = try self.allocator.dupe(u8, session.output_ring.items[text_range.start..text_range.end]);
         defer self.allocator.free(text);
         return try okValueResponse(self.allocator, id_value, .{
             .id = session.session_id,
             .running = session.running,
             .text = text,
-            .offset = start_offset orelse 0,
+            .offset = text_range.start,
             .next_offset = session.output_ring.items.len,
         });
     }
@@ -1083,6 +1086,34 @@ fn tailLines(allocator: std.mem.Allocator, bytes: []const u8, lines: u32) ![]u8 
     }
     if (start < bytes.len and bytes[start] == '\n') start += 1;
     return allocator.dupe(u8, bytes[start..]);
+}
+
+const ByteRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn bytesRangeFromOffset(bytes: []const u8, offset: usize, max_bytes: ?usize) ByteRange {
+    var start = @min(offset, bytes.len);
+    if (max_bytes) |limit| {
+        if (limit > 0 and bytes.len - start > limit) start = bytes.len - limit;
+    }
+    return .{ .start = start, .end = bytes.len };
+}
+
+fn bytesRangeForTailLines(bytes: []const u8, lines: u32, max_bytes: ?usize) ByteRange {
+    if (bytes.len == 0 or lines == 0) return .{ .start = bytes.len, .end = bytes.len };
+    var remaining = lines;
+    var start = bytes.len;
+    while (start > 0 and remaining > 0) {
+        start -= 1;
+        if (bytes[start] == '\n') remaining -= 1;
+    }
+    if (start < bytes.len and bytes[start] == '\n') start += 1;
+    if (max_bytes) |limit| {
+        if (limit > 0 and bytes.len - start > limit) start = bytes.len - limit;
+    }
+    return .{ .start = start, .end = bytes.len };
 }
 
 fn bytesFromOffset(allocator: std.mem.Allocator, bytes: []const u8, offset: usize) ![]u8 {
