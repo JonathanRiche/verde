@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("terminal_options");
 const testing = std.testing;
 const apc = @import("apc.zig");
+const color = @import("color.zig");
 const csi = @import("csi.zig");
 const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
@@ -9,6 +10,7 @@ const stream = @import("stream.zig");
 const Action = stream.Action;
 const Screen = @import("Screen.zig");
 const modes = @import("modes.zig");
+const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_color = @import("kitty/color.zig");
 const size_report = @import("size_report.zig");
@@ -233,7 +235,7 @@ pub const Handler = struct {
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
             .mouse_shape => self.terminal.mouse_shape = value,
-            .color_operation => try self.colorOperation(value.op, &value.requests),
+            .color_operation => try self.colorOperation(value.op, &value.requests, value.terminator),
             .kitty_color_report => try self.kittyColorOperation(value),
 
             // APC
@@ -552,6 +554,7 @@ pub const Handler = struct {
         self: *Handler,
         op: osc_color.Operation,
         requests: *const osc_color.List,
+        terminator: osc.Terminator,
     ) !void {
         _ = op;
         if (requests.items.len == 0) return;
@@ -612,11 +615,68 @@ pub const Handler = struct {
                     mask.* = .initEmpty();
                 },
 
-                .query,
+                .query => |target| self.reportColor(target, terminator),
+
                 .reset_special,
                 => {},
             }
         }
+    }
+
+    /// Respond to an OSC color query (e.g. `OSC 11 ; ? ST`) by reporting the
+    /// current color back to the pty. Apps such as opencode use this to detect
+    /// the terminal's background/foreground/palette and theme themselves to
+    /// match; without a reply they fall back to a built-in default theme.
+    fn reportColor(
+        self: *Handler,
+        target: osc_color.Target,
+        terminator: osc.Terminator,
+    ) void {
+        // Reporting requires a way to write back to the pty.
+        if (self.effects.write_pty == null) return;
+
+        // Resolve the queried target to a concrete color and the OSC code we
+        // echo back. We only report the targets we actually track; anything
+        // else is silently ignored (matching how unknown queries are dropped).
+        const Resolved = struct { code: u16, index: ?u8, rgb: color.RGB };
+        const resolved: Resolved = switch (target) {
+            .palette => |idx| .{
+                .code = 4,
+                .index = idx,
+                .rgb = self.terminal.colors.palette.current[idx],
+            },
+            .dynamic => |dynamic| switch (dynamic) {
+                .foreground => .{ .code = 10, .index = null, .rgb = self.terminal.colors.foreground.get() orelse return },
+                .background => .{ .code = 11, .index = null, .rgb = self.terminal.colors.background.get() orelse return },
+                .cursor => .{ .code = 12, .index = null, .rgb = self.terminal.colors.cursor.get() orelse return },
+                else => return,
+            },
+            .special => return,
+        };
+
+        // xterm reports each channel as 16-bit; scale the 8-bit value by 0x101
+        // (e.g. 0xab -> 0xabab) so parsers reading the high byte get the right
+        // value. Format: `OSC <code> [; <index>] ; rgb:RRRR/GGGG/BBBB <term>`.
+        var buf: [64]u8 = undefined;
+        const resp = if (resolved.index) |idx|
+            std.fmt.bufPrintZ(&buf, "\x1b]{d};{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}", .{
+                resolved.code,
+                idx,
+                @as(u16, resolved.rgb.r) * 0x101,
+                @as(u16, resolved.rgb.g) * 0x101,
+                @as(u16, resolved.rgb.b) * 0x101,
+                terminator.string(),
+            }) catch return
+        else
+            std.fmt.bufPrintZ(&buf, "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}", .{
+                resolved.code,
+                @as(u16, resolved.rgb.r) * 0x101,
+                @as(u16, resolved.rgb.g) * 0x101,
+                @as(u16, resolved.rgb.b) * 0x101,
+                terminator.string(),
+            }) catch return;
+
+        self.writePty(resp);
     }
 
     fn kittyColorOperation(
