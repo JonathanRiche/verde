@@ -29,6 +29,7 @@ const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
+const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -1888,10 +1889,21 @@ const UnixSession = struct {
         if (result != .object) return error.InvalidSessionResponse;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         const suppress_replay_responses = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
+        const child_process_count = jsonUsize(result.object.get("child_process_count") orelse .null);
+        const stale_alt_screen_replay = suppress_replay_responses and
+            child_process_count != null and
+            child_process_count.? == 0 and
+            looksLikeStaleFullScreenReplay(text);
         self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
         self.suppress_next_daemon_replay = false;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
         self.daemon_state = .attached;
+        if (stale_alt_screen_replay) {
+            self.resetLocalTerminalView(allocator) catch |err| {
+                log.warn("failed to reset stale daemon terminal replay for {s}: {s}", .{ session_id, @errorName(err) });
+            };
+            return true;
+        }
         if (text.len == 0) return false;
         try self.appendOutput(allocator, text);
         const previous_suppression = self.suppress_pty_responses;
@@ -1900,6 +1912,14 @@ const UnixSession = struct {
         self.stream.nextSlice(text);
         try self.repairTerminalState(allocator);
         return true;
+    }
+
+    fn resetLocalTerminalView(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = true;
+        defer self.suppress_pty_responses = previous_suppression;
+        self.stream.nextSlice(LOCAL_TERMINAL_VIEW_RESET);
+        try self.repairTerminalState(allocator);
     }
 
     fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -2457,6 +2477,53 @@ fn jsonUsize(value: std.json.Value) ?usize {
         .number_string => |text| std.fmt.parseInt(usize, text, 10) catch null,
         else => null,
     };
+}
+
+fn looksLikeStaleFullScreenReplay(bytes: []const u8) bool {
+    if (hasUnclosedAlternateScreen(bytes)) return true;
+    if (bytes.len < DAEMON_REPLAY_MAX_BYTES) return false;
+
+    var csi_count: usize = 0;
+    var newline_count: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) : (index += 1) {
+        if (bytes[index] == '\n') newline_count += 1;
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') csi_count += 1;
+    }
+    return csi_count >= 256 and newline_count * 8 < csi_count;
+}
+
+fn hasUnclosedAlternateScreen(bytes: []const u8) bool {
+    const enter = maxOptionalIndex(&.{
+        lastIndexOf(bytes, "\x1b[?1049h"),
+        lastIndexOf(bytes, "\x1b[?1047h"),
+        lastIndexOf(bytes, "\x1b[?47h"),
+    });
+    const leave = maxOptionalIndex(&.{
+        lastIndexOf(bytes, "\x1b[?1049l"),
+        lastIndexOf(bytes, "\x1b[?1047l"),
+        lastIndexOf(bytes, "\x1b[?47l"),
+    });
+    return if (enter) |enter_index| leave == null or enter_index > leave.? else false;
+}
+
+fn maxOptionalIndex(values: []const ?usize) ?usize {
+    var result: ?usize = null;
+    for (values) |value| {
+        const index = value orelse continue;
+        if (result == null or index > result.?) result = index;
+    }
+    return result;
+}
+
+fn lastIndexOf(haystack: []const u8, needle: []const u8) ?usize {
+    var result: ?usize = null;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |index| {
+        result = index;
+        start = index + 1;
+    }
+    return result;
 }
 
 fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
