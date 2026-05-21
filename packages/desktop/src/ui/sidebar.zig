@@ -28,6 +28,10 @@ const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
 const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
 const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
+/// Reserved band at the bottom of the rail for sticky chrome (settings, etc.).
+/// The scrolling workspace list stops short of this so its last row never
+/// slides under — or past — the pinned footer.
+const SIDEBAR_FOOTER_RESERVE_CSS: f32 = 56.0;
 const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
 const THREAD_DRAG_FLOATING_Z: i32 = 160;
 
@@ -567,7 +571,13 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const header_top = rect.y + theme.scaledUi(31.0);
     const projects_label_y = header_top + theme.scaledUi(92.0);
     const list_top = projects_label_y + theme.scaledUi(38.0);
-    const list_clip: palette.Rect = .{ .x = rect.x, .y = list_top, .w = rect.w, .h = @max(rect.y + rect.h - list_top, 0.0) };
+    // Reserve a band at the bottom of the rail for sticky chrome. Clipping the
+    // list short here also caps `sidebar_max_scroll_y` (computed below from
+    // `list_clip.y + list_clip.h`), so the list scrolls to rest above the
+    // footer instead of running off the bottom edge.
+    const footer_reserve = theme.scaledUi(SIDEBAR_FOOTER_RESERVE_CSS);
+    const list_bottom = @max(rect.y + rect.h - footer_reserve, list_top);
+    const list_clip: palette.Rect = .{ .x = rect.x, .y = list_top, .w = rect.w, .h = @max(list_bottom - list_top, 0.0) };
     const clip = list_clip;
     var y = list_top - sidebar_scroll_y;
 
@@ -677,6 +687,36 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const thumb_y = track.y + (track.h - thumb_h) * (sidebar_scroll_y / sidebar_max_scroll_y);
         queuePaletteRoundedRect(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), theme.scaledUi(2.0));
         queuePaletteRoundedRect(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 200)), theme.scaledUi(2.0));
+    }
+
+    // Pinned footer band — painted after the list so any row scrolled into the
+    // reserved band is covered by the panel-colored strip. A divider marks the
+    // top edge so the boundary is visible; sticky chrome (settings, etc.) lands
+    // here later.
+    if (list_bottom < rect.y + rect.h) {
+        const footer_rect: palette.Rect = .{
+            .x = rect.x,
+            .y = list_bottom,
+            .w = rect.w - theme.scaledUi(1.0),
+            .h = rect.y + rect.h - list_bottom,
+        };
+        // Distinct shade (not COLOR_PANEL) so the reserved band is visibly
+        // separate from the scrolling list above. Placeholder until the real
+        // sticky settings chrome lands here.
+        queuePaletteRect(state, footer_rect, paletteColor(theme.COLOR_PANEL_ALT));
+        queuePaletteRect(state, .{
+            .x = rect.x,
+            .y = list_bottom,
+            .w = rect.w - theme.scaledUi(1.0),
+            .h = theme.scaledUi(1.0),
+        }, paletteColor(theme.borderMuted()));
+        const footer_font = theme.scaledUi(13.0);
+        queuePaletteText(state, .{
+            .x = footer_rect.x + theme.scaledUi(25.0),
+            .y = footer_rect.y + (footer_rect.h - footer_font * 1.25) * 0.5,
+            .w = footer_rect.w - theme.scaledUi(50.0),
+            .h = footer_font * 1.25,
+        }, "Settings", paletteColor(theme.COLOR_TEXT_MUTED), footer_font, footer_rect);
     }
 
     // Pinned header — painted last so any scrolled rows in the header band

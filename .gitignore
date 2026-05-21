@@ -7,4 +7,5 @@ node_modules/
 .agent-ci/
 .env
 .claude/
+.tmp_video_review/
 notes/mac-webview-smoke/manual-evidence/
