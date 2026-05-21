@@ -9,6 +9,7 @@ pub const top_level_commands = [_][]const u8{
     "version",
     "capabilities",
     "state",
+    "session",
     "live",
     "mcp",
     "completion",
@@ -20,6 +21,18 @@ pub const state_commands = [_][]const u8{
     "panes",
     "threads",
     "transcript",
+};
+
+pub const session_commands = [_][]const u8{
+    "list",
+    "inspect",
+    "new",
+    "attach",
+    "write",
+    "tail",
+    "screen",
+    "kill",
+    "cleanup",
 };
 
 pub const live_commands = [_][]const u8{
@@ -183,6 +196,7 @@ pub const all_flags = [_][]const u8{
     "--help",
     "-h",
     "--json",
+    "--id",
     "--project",
     "--thread",
     "--pane",
@@ -204,6 +218,11 @@ pub const all_flags = [_][]const u8{
 
 pub const json_flags = [_][]const u8{"--json"};
 pub const project_json_flags = [_][]const u8{ "--project", "--json" };
+pub const session_id_json_flags = [_][]const u8{ "--id", "--json" };
+pub const session_new_flags = [_][]const u8{ "--project", "--name", "--json" };
+pub const session_attach_flags = [_][]const u8{ "--id", "--project", "--pane" };
+pub const session_write_flags = [_][]const u8{ "--id", "--text", "--json" };
+pub const session_tail_flags = [_][]const u8{ "--id", "--lines", "--json" };
 pub const pane_flags = [_][]const u8{ "--project", "--pane", "--focused", "--json" };
 pub const pane_split_flags = [_][]const u8{ "--project", "--pane", "--focused", "--kind", "--axis", "--json" };
 pub const pane_resize_flags = [_][]const u8{ "--project", "--pane", "--focused", "--first", "--second", "--axis", "--ratio", "--json" };

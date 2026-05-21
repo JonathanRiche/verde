@@ -4843,7 +4843,11 @@ pub const AppState = struct {
     fn persistedProjectSnapshot(self: *const AppState, allocator: std.mem.Allocator, project: *const Project) !PersistedProject {
         var threads: std.ArrayList(PersistedThread) = .empty;
         defer threads.deinit(allocator);
-        const terminal_layout_json = try project.terminal_dock.persistedLayoutJson(allocator);
+        const terminal_layout_json = try project.terminal_dock.persistedLayoutJsonWithContext(allocator, .{
+            .project_id = project.id,
+            .project_path = project.path,
+            .dock_id = 0,
+        });
         errdefer if (terminal_layout_json) |value| allocator.free(value);
         const terminal_docks_json = try self.persistedTerminalDocksJson(allocator, project);
         errdefer if (terminal_docks_json) |value| allocator.free(value);
@@ -4883,7 +4887,11 @@ pub const AppState = struct {
         var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
         try stringify.beginArray();
         for (project.terminal_docks.items) |*entry| {
-            const layout_json = try entry.dock.persistedLayoutJson(allocator);
+            const layout_json = try entry.dock.persistedLayoutJsonWithContext(allocator, .{
+                .project_id = project.id,
+                .project_path = project.path,
+                .dock_id = entry.id,
+            });
             defer if (layout_json) |value| allocator.free(value);
             if (layout_json == null and !entry.dock.hasRunningSession()) continue;
             try stringify.beginObject();
@@ -6093,7 +6101,7 @@ pub const AppState = struct {
         var dock = self.currentProjectTerminalMutable();
         const project_path = self.currentProject().path;
         if (!dock.hasRunningSession()) {
-            dock.ensureSession(self.allocator, project_path) catch |err| {
+            dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, 0) catch |err| {
                 log.err("failed to start terminal dock: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to start terminal.");
                 return;
@@ -6137,7 +6145,7 @@ pub const AppState = struct {
         var dock = self.currentProjectTerminalMutable();
         if (!dock.visible) {
             const project_path = self.currentProject().path;
-            dock.ensureSession(self.allocator, project_path) catch |err| {
+            dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, 0) catch |err| {
                 log.err("failed to start terminal dock: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to start terminal.");
                 return;
@@ -6159,7 +6167,7 @@ pub const AppState = struct {
         for (self.projects.items, 0..) |*project, project_index| {
             const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
             if (base_visible and !project.terminal_dock.hasRunningSession()) {
-                project.terminal_dock.ensureSession(self.allocator, project.path) catch |err| {
+                project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0) catch |err| {
                     log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
                     if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                 };
@@ -6180,7 +6188,7 @@ pub const AppState = struct {
             for (project.terminal_docks.items) |*entry| {
                 const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
                 if (dock_visible and !entry.dock.hasRunningSession()) {
-                    entry.dock.ensureSession(self.allocator, project.path) catch |err| {
+                    entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id) catch |err| {
                         log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                         if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                     };
@@ -7758,7 +7766,7 @@ pub const AppState = struct {
             else => return false,
         };
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        try dock.ensureSession(self.allocator, project.path);
+        try dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id);
         return try dock.writeInputToActivePane(bytes);
     }
 
@@ -7917,11 +7925,11 @@ pub const AppState = struct {
         defer self.allocator.free(cwd);
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const command_args = [_][]const u8{ "/bin/sh", "-lc", process.command };
-        try dock.restartWithProfile(self.allocator, cwd, .{
+        try dock.restartWithProfilePersistent(self.allocator, cwd, .{
             .kind = .custom,
             .label = process.name,
             .command = &command_args,
-        });
+        }, self.storage.pref_path, dock_id);
         process.status = .running;
         process.exit_code = null;
         process.signal = null;
@@ -8519,7 +8527,7 @@ pub const AppState = struct {
         };
         thread.tui_dock_id = dock_id;
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
-        dock.ensureSession(self.allocator, project.path) catch |err| {
+        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
             log.err("failed to start TUI terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start TUI terminal.");
             return;
@@ -8595,7 +8603,7 @@ pub const AppState = struct {
         };
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const project_path = self.currentProject().path;
-        dock.ensureSession(self.allocator, project_path) catch |err| {
+        dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, dock_id) catch |err| {
             log.err("failed to start terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start terminal.");
             return false;

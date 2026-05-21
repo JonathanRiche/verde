@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
+pub const sessionizer = @import("sessionizer.zig");
 const theme = @import("../ui/theme.zig");
 
 const log = std.log.scoped(.native_terminal);
@@ -27,6 +28,8 @@ const FONT_SCALE_STEP: f32 = 0.125;
 const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
+const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
+const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -45,6 +48,7 @@ const ColorScheme = std.meta.Child(
 );
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const MIN_SPLIT_RATIO: f32 = 0.12;
@@ -76,6 +80,8 @@ pub const TerminalLaunchProfile = struct {
     command: []const []const u8 = &.{},
 };
 
+pub const TerminalRevivePolicy = sessionizer.RevivePolicy;
+
 pub const SessionSnapshot = struct {
     running: bool,
     exit_code: ?u32 = null,
@@ -87,6 +93,13 @@ const SessionCreateOptions = struct {
     cols: u16,
     rows: u16,
     profile: TerminalLaunchProfile = .{},
+    session_id: ?[]const u8 = null,
+    pref_path: ?[]const u8 = null,
+    project_id: []const u8 = "",
+    project_path: []const u8 = "",
+    dock_id: u32 = 0,
+    pane_id: u32 = 0,
+    revive_policy: TerminalRevivePolicy = .attach_or_create,
 };
 
 pub const PersistedWorkspace = struct {
@@ -111,6 +124,11 @@ pub const PersistedNode = struct {
     node_id: u32,
     kind: PersistedNodeKind,
     pane_id: u32 = 0,
+    session_id: ?[]const u8 = null,
+    launch_kind: ?TerminalLaunchKind = null,
+    launch_label: ?[]const u8 = null,
+    launch_command: []const []const u8 = &.{},
+    revive_policy: ?TerminalRevivePolicy = null,
     axis: ?SplitAxis = null,
     ratio: ?f32 = null,
     first_node_id: ?u32 = null,
@@ -120,6 +138,11 @@ pub const PersistedNode = struct {
 pub const PaneLeaf = struct {
     id: u32,
     session: ?*Session = null,
+    session_id: ?[]u8 = null,
+    launch_kind: ?TerminalLaunchKind = null,
+    launch_label: ?[]u8 = null,
+    launch_command: []const []const u8 = &.{},
+    revive_policy: TerminalRevivePolicy = .attach_or_create,
 };
 
 pub const PaneSplit = struct {
@@ -164,6 +187,8 @@ pub const Dock = struct {
     preferred_height: f32 = DEFAULT_DOCK_HEIGHT,
     font_scale: f32 = DEFAULT_FONT_SCALE,
     cwd: ?[]u8 = null,
+    pref_path: ?[]u8 = null,
+    session_dock_id: u32 = 0,
     tabs: std.ArrayList(Tab) = .empty,
     active_tab_index: usize = 0,
     next_tab_id: u32 = 1,
@@ -186,6 +211,10 @@ pub const Dock = struct {
         if (self.cwd) |cwd| {
             allocator.free(cwd);
             self.cwd = null;
+        }
+        if (self.pref_path) |pref_path| {
+            allocator.free(pref_path);
+            self.pref_path = null;
         }
         for (self.tabs.items) |*tab| {
             tab.deinit(allocator);
@@ -223,6 +252,26 @@ pub const Dock = struct {
     }
 
     pub fn ensureSession(self: *Dock, allocator: std.mem.Allocator, project_path: []const u8) !void {
+        try self.ensureSessionWithContext(allocator, project_path, null, self.session_dock_id);
+    }
+
+    pub fn ensureSessionPersistent(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        project_path: []const u8,
+        pref_path: []const u8,
+        dock_id: u32,
+    ) !void {
+        try self.ensureSessionWithContext(allocator, project_path, pref_path, dock_id);
+    }
+
+    fn ensureSessionWithContext(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        project_path: []const u8,
+        pref_path: ?[]const u8,
+        dock_id: u32,
+    ) !void {
         const cwd_changed = if (self.cwd) |cwd|
             !std.mem.eql(u8, cwd, project_path)
         else
@@ -233,12 +282,58 @@ pub const Dock = struct {
             self.cwd = try allocator.dupe(u8, project_path);
         }
 
+        self.session_dock_id = dock_id;
+        if (pref_path) |path| {
+            const pref_changed = if (self.pref_path) |existing|
+                !std.mem.eql(u8, existing, path)
+            else
+                true;
+            if (pref_changed) {
+                if (self.pref_path) |existing| allocator.free(existing);
+                self.pref_path = try allocator.dupe(u8, path);
+            }
+        }
+
         try self.ensureWorkspace(allocator);
     }
 
     pub fn restartWithProfile(self: *Dock, allocator: std.mem.Allocator, cwd: []const u8, profile: TerminalLaunchProfile) !void {
+        try self.restartWithProfileContext(allocator, cwd, profile, null, self.session_dock_id);
+    }
+
+    pub fn restartWithProfilePersistent(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        cwd: []const u8,
+        profile: TerminalLaunchProfile,
+        pref_path: []const u8,
+        dock_id: u32,
+    ) !void {
+        try self.restartWithProfileContext(allocator, cwd, profile, pref_path, dock_id);
+    }
+
+    fn restartWithProfileContext(
+        self: *Dock,
+        allocator: std.mem.Allocator,
+        cwd: []const u8,
+        profile: TerminalLaunchProfile,
+        pref_path: ?[]const u8,
+        dock_id: u32,
+    ) !void {
         if (self.cwd) |old_cwd| allocator.free(old_cwd);
         self.cwd = try allocator.dupe(u8, cwd);
+        self.session_dock_id = dock_id;
+        if (pref_path) |path| {
+            const pref_changed = if (self.pref_path) |existing|
+                !std.mem.eql(u8, existing, path)
+            else
+                true;
+            if (pref_changed) {
+                if (self.pref_path) |existing| allocator.free(existing);
+                self.pref_path = try allocator.dupe(u8, path);
+            }
+        }
+        for (self.tabs.items) |*tab| terminatePaneNodeSessions(tab.root);
         self.clearTabs(allocator);
 
         const previous_profile = self.launch_profile;
@@ -591,6 +686,14 @@ pub const Dock = struct {
     }
 
     pub fn persistedLayoutJson(self: *const Dock, allocator: std.mem.Allocator) !?[]u8 {
+        return self.persistedLayoutJsonWithContext(allocator, null);
+    }
+
+    pub fn persistedLayoutJsonWithContext(
+        self: *const Dock,
+        allocator: std.mem.Allocator,
+        context: ?sessionizer.LayoutContext,
+    ) !?[]u8 {
         if (self.tabs.items.len == 0) return null;
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -604,7 +707,7 @@ pub const Dock = struct {
             var nodes: std.ArrayList(PersistedNode) = .empty;
             defer nodes.deinit(arena_allocator);
             var next_node_id: u32 = 1;
-            const root_node_id = try serializePaneNode(arena_allocator, tab.root, &nodes, &next_node_id);
+            const root_node_id = try serializePaneNode(arena_allocator, tab.root, &nodes, &next_node_id, context);
             try persisted_tabs.append(arena_allocator, .{
                 .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
                 .active_pane_id = tab.active_pane_id,
@@ -703,11 +806,39 @@ pub const Dock = struct {
     fn ensureLeafSession(self: *Dock, allocator: std.mem.Allocator, leaf: *PaneLeaf) !void {
         if (leaf.session != null) return;
         const cwd = self.cwd orelse return;
+
+        const profile = TerminalLaunchProfile{
+            .kind = leaf.launch_kind orelse self.launch_profile.kind,
+            .label = if (leaf.launch_label) |label| label else self.launch_profile.label,
+            .command = if (leaf.launch_command.len > 0) leaf.launch_command else self.launch_profile.command,
+        };
+        if (leaf.launch_kind == null) leaf.launch_kind = profile.kind;
+        if (leaf.launch_label == null and profile.label.len > 0) {
+            leaf.launch_label = try allocator.dupe(u8, profile.label);
+        }
+        if (leaf.launch_command.len == 0 and profile.command.len > 0) {
+            leaf.launch_command = try dupeStringSlice(allocator, profile.command);
+        }
+        if (self.pref_path != null and leaf.session_id == null) {
+            leaf.session_id = try sessionizer.stableSessionId(
+                allocator,
+                cwd,
+                self.session_dock_id,
+                leaf.id,
+            );
+        }
         leaf.session = try Session.create(allocator, .{
             .cwd = cwd,
             .cols = INITIAL_COLS,
             .rows = INITIAL_ROWS,
-            .profile = self.launch_profile,
+            .profile = profile,
+            .session_id = leaf.session_id,
+            .pref_path = self.pref_path,
+            .project_id = cwd,
+            .project_path = cwd,
+            .dock_id = self.session_dock_id,
+            .pane_id = leaf.id,
+            .revive_policy = leaf.revive_policy,
         });
     }
 
@@ -814,11 +945,7 @@ pub const Dock = struct {
 fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
     switch (node.*) {
         .leaf => |*leaf| {
-            if (leaf.session) |session| {
-                session.deinit(allocator);
-                allocator.destroy(session);
-                leaf.session = null;
-            }
+            deinitPaneLeaf(leaf, allocator);
             allocator.destroy(node);
         },
         .split => |*split| {
@@ -827,6 +954,36 @@ fn deinitPaneNode(node: *PaneNode, allocator: std.mem.Allocator) void {
             allocator.destroy(node);
         },
     }
+}
+
+fn terminatePaneNodeSessions(node: *PaneNode) void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.session) |session| _ = session.terminate();
+        },
+        .split => |*split| {
+            terminatePaneNodeSessions(split.first);
+            terminatePaneNodeSessions(split.second);
+        },
+    }
+}
+
+fn deinitPaneLeaf(leaf: *PaneLeaf, allocator: std.mem.Allocator) void {
+    if (leaf.session) |session| {
+        session.deinit(allocator);
+        allocator.destroy(session);
+        leaf.session = null;
+    }
+    if (leaf.session_id) |session_id| {
+        allocator.free(session_id);
+        leaf.session_id = null;
+    }
+    if (leaf.launch_label) |launch_label| {
+        allocator.free(launch_label);
+        leaf.launch_label = null;
+    }
+    freeStringSlice(allocator, leaf.launch_command);
+    leaf.launch_command = &.{};
 }
 
 fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !bool {
@@ -1066,21 +1223,35 @@ fn serializePaneNode(
     node: *const PaneNode,
     nodes: *std.ArrayList(PersistedNode),
     next_node_id: *u32,
+    context: ?sessionizer.LayoutContext,
 ) !u32 {
     const node_id = next_node_id.*;
     next_node_id.* += 1;
 
     switch (node.*) {
         .leaf => |leaf| {
+            const session_id = try sessionizer.sessionIdForLeaf(allocator, context, leaf.id, leaf.session_id);
+            const launch_kind: ?TerminalLaunchKind = leaf.launch_kind orelse if (leaf.session) |session| session.launch_kind else null;
+            const launch_label: ?[]const u8 = if (leaf.launch_label) |label|
+                try allocator.dupe(u8, label)
+            else if (leaf.session) |session|
+                try allocator.dupe(u8, session.launch_label)
+            else
+                null;
             try nodes.append(allocator, .{
                 .node_id = node_id,
                 .kind = .leaf,
                 .pane_id = leaf.id,
+                .session_id = session_id,
+                .launch_kind = launch_kind,
+                .launch_label = launch_label,
+                .launch_command = try dupeStringSlice(allocator, leaf.launch_command),
+                .revive_policy = leaf.revive_policy,
             });
         },
         .split => |split| {
-            const first_node_id = try serializePaneNode(allocator, split.first, nodes, next_node_id);
-            const second_node_id = try serializePaneNode(allocator, split.second, nodes, next_node_id);
+            const first_node_id = try serializePaneNode(allocator, split.first, nodes, next_node_id, context);
+            const second_node_id = try serializePaneNode(allocator, split.second, nodes, next_node_id, context);
             try nodes.append(allocator, .{
                 .node_id = node_id,
                 .kind = .split,
@@ -1108,7 +1279,15 @@ fn buildPaneNodeFromPersisted(
         switch (persisted.kind) {
             .leaf => {
                 max_pane_id.* = @max(max_pane_id.*, persisted.pane_id);
-                node.* = .{ .leaf = .{ .id = @max(persisted.pane_id, 1), .session = null } };
+                node.* = .{ .leaf = .{
+                    .id = @max(persisted.pane_id, 1),
+                    .session = null,
+                    .session_id = if (persisted.session_id) |session_id| try allocator.dupe(u8, session_id) else null,
+                    .launch_kind = persisted.launch_kind,
+                    .launch_label = if (persisted.launch_label) |label| try allocator.dupe(u8, label) else null,
+                    .launch_command = try dupeStringSlice(allocator, persisted.launch_command),
+                    .revive_policy = persisted.revive_policy orelse .attach_or_create,
+                } };
             },
             .split => {
                 const first_id = persisted.first_node_id orelse return error.InvalidPersistedTerminalLayout;
@@ -1218,6 +1397,7 @@ const TerminalScroll = union(enum) {
 };
 
 const UnixSession = struct {
+    backend: Backend = .local,
     master_fd: std.posix.fd_t,
     child_pid: std.posix.pid_t,
     terminal: ghostty_vt.Terminal,
@@ -1229,9 +1409,28 @@ const UnixSession = struct {
     cell_height: u32,
     running: bool = true,
     exit_status: ?u32 = null,
+    daemon_state: DaemonState = .attached,
     launch_kind: TerminalLaunchKind = .shell,
     launch_label: []u8,
+    session_id: ?[]u8 = null,
+    attach_id: ?[]u8 = null,
+    pref_path: ?[]u8 = null,
+    remote_output_offset: usize = 0,
+    suppress_next_daemon_replay: bool = false,
+    suppress_pty_responses: bool = false,
+    defer_daemon_replay_until_resize: bool = false,
     output_ring: std.ArrayList(u8) = .empty,
+
+    const Backend = enum {
+        local,
+        daemon,
+    };
+
+    const DaemonState = enum {
+        attached,
+        missing,
+        unavailable,
+    };
 
     const SpawnResult = struct {
         master_fd: std.posix.fd_t,
@@ -1260,6 +1459,39 @@ const UnixSession = struct {
         const launch_label = try launchLabel(allocator, options.profile);
         errdefer allocator.free(launch_label);
 
+        if (options.pref_path != null and options.session_id != null) {
+            self.* = .{
+                .backend = .daemon,
+                .master_fd = -1,
+                .child_pid = 0,
+                .terminal = terminal,
+                .stream = undefined,
+                .render_state = .empty,
+                .cols = options.cols,
+                .rows = options.rows,
+                .cell_width = CELL_PIXEL_WIDTH,
+                .cell_height = CELL_PIXEL_HEIGHT,
+                .launch_kind = options.profile.kind,
+                .launch_label = launch_label,
+                .session_id = try allocator.dupe(u8, options.session_id.?),
+                .pref_path = try allocator.dupe(u8, options.pref_path.?),
+            };
+            self.stream = self.terminal.vtStream();
+            self.stream.handler.effects.write_pty = &UnixSession.streamWritePty;
+            self.stream.handler.effects.device_attributes = &UnixSession.streamDeviceAttributes;
+            self.stream.handler.effects.size = &UnixSession.streamSize;
+            self.stream.handler.effects.xtversion = &UnixSession.streamXtVersion;
+            self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
+            errdefer self.stream.deinit();
+            errdefer if (self.session_id) |session_id| allocator.free(session_id);
+            errdefer if (self.attach_id) |attach_id| allocator.free(attach_id);
+            errdefer if (self.pref_path) |pref_path| allocator.free(pref_path);
+
+            try self.attachDaemonSession(allocator, options);
+            try self.refreshRenderState(allocator);
+            return self;
+        }
+
         const child = try spawnCommand(allocator, options.cwd, options.cols, options.rows, options.profile);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
@@ -1267,6 +1499,7 @@ const UnixSession = struct {
         }
 
         self.* = .{
+            .backend = .local,
             .master_fd = child.master_fd,
             .child_pid = child.child_pid,
             .terminal = terminal,
@@ -1292,20 +1525,27 @@ const UnixSession = struct {
     }
 
     pub fn deinit(self: *UnixSession, allocator: std.mem.Allocator) void {
-        if (self.running) {
+        if (self.backend == .local and self.running) {
             std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
         }
-        _ = std.c.close(self.master_fd);
+        if (self.backend == .local) _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
+        if (self.backend == .daemon) self.detachDaemon(allocator);
         self.stream.deinit();
         self.render_state.deinit(allocator);
         self.terminal.deinit(allocator);
         allocator.free(self.launch_label);
+        if (self.session_id) |session_id| allocator.free(session_id);
+        if (self.attach_id) |attach_id| allocator.free(attach_id);
+        if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
-        const changed = try self.drainOutput(allocator);
+        const changed = switch (self.backend) {
+            .local => try self.drainOutput(allocator),
+            .daemon => try self.drainDaemonOutput(allocator),
+        };
         const exited = self.captureExitStatus();
         if (changed or exited) {
             try self.refreshRenderState(allocator);
@@ -1320,7 +1560,10 @@ const UnixSession = struct {
         const next_cell_height = @max(cell_height, 1);
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
-        if (!size_changed and !metrics_changed) return;
+        if (!size_changed and !metrics_changed) {
+            if (self.backend == .daemon) self.defer_daemon_replay_until_resize = false;
+            return;
+        }
         self.cols = next_cols;
         self.rows = next_rows;
         self.cell_width = next_cell_width;
@@ -1328,7 +1571,13 @@ const UnixSession = struct {
         if (size_changed) {
             try self.terminal.resize(allocator, next_cols, next_rows);
         }
-        self.applyWinsize();
+        switch (self.backend) {
+            .local => self.applyWinsize(),
+            .daemon => {
+                try self.resizeDaemon(allocator);
+                self.defer_daemon_replay_until_resize = false;
+            },
+        }
         try self.refreshRenderState(allocator);
     }
 
@@ -1353,6 +1602,13 @@ const UnixSession = struct {
         if (self.running) {
             return std.fmt.bufPrint(buf, "{d}x{d} {s} attached", .{ self.cols, self.rows, self.launch_label }) catch "Terminal attached";
         }
+        if (self.backend == .daemon) {
+            switch (self.daemon_state) {
+                .attached => {},
+                .missing => return std.fmt.bufPrint(buf, "{s} session missing. Restart or attach another session.", .{self.launch_label}) catch "Terminal session missing.",
+                .unavailable => return "Terminal session daemon unavailable. Session may still be running.",
+            }
+        }
         if (self.exit_status) |status| {
             if (std.c.W.IFEXITED(status)) {
                 return std.fmt.bufPrint(buf, "{s} exited with code {d}", .{ self.launch_label, std.c.W.EXITSTATUS(status) }) catch "Terminal exited";
@@ -1366,7 +1622,7 @@ const UnixSession = struct {
 
     pub fn tabTitle(self: *const UnixSession, buffer: *[96]u8) []const u8 {
         if (self.launch_kind != .shell) return self.launch_label;
-        if (builtin.os.tag == .linux) {
+        if (self.backend == .local and builtin.os.tag == .linux) {
             var proc_path_buf: [64]u8 = undefined;
             const proc_path = std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/cwd", .{self.child_pid}) catch "";
             if (proc_path.len > 0) {
@@ -1413,12 +1669,16 @@ const UnixSession = struct {
 
     pub fn writeInput(self: *UnixSession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
-        try writeAll(self.master_fd, bytes);
-        return true;
+        return try self.writeRawInput(bytes);
     }
 
     pub fn terminate(self: *UnixSession) bool {
         if (!self.running) return false;
+        if (self.backend == .daemon) {
+            self.killDaemon() catch return false;
+            self.running = false;
+            return true;
+        }
         std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
         self.running = false;
         _ = self.captureExitStatus();
@@ -1457,8 +1717,7 @@ const UnixSession = struct {
         try ghostty_vt.input.encodeKey(&writer, key_event, options);
         const encoded = writer.buffered();
         if (encoded.len == 0) return true;
-        try writeAll(self.master_fd, encoded);
-        return true;
+        return try self.writeRawInput(encoded);
     }
 
     pub fn handleWheel(self: *UnixSession, allocator: std.mem.Allocator, wheel_y: f32) !bool {
@@ -1485,8 +1744,13 @@ const UnixSession = struct {
         const clipboard_text = std.mem.sliceTo(clipboard_ptr, 0);
         if (clipboard_text.len == 0) return false;
 
-        try writeTerminalPaste(allocator, self.master_fd, clipboard_text, self.terminal.modes.get(.bracketed_paste));
-        return true;
+        if (self.backend == .local) {
+            try writeTerminalPaste(allocator, self.master_fd, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+            return true;
+        }
+        const encoded = try terminalPasteBytesAlloc(allocator, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+        defer allocator.free(encoded);
+        return try self.writeRawInput(encoded);
     }
 
     pub fn copyScreenToClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
@@ -1534,6 +1798,177 @@ const UnixSession = struct {
         }
 
         return changed;
+    }
+
+    fn attachDaemonSession(self: *UnixSession, allocator: std.mem.Allocator, options: SessionCreateOptions) !void {
+        const pref_path = self.pref_path orelse return error.MissingSessionPrefPath;
+        const session_id = self.session_id orelse return error.MissingSessionId;
+        const exe_path = try selfExePathAlloc(allocator);
+        defer allocator.free(exe_path);
+        try sessionizer.ensureDaemon(allocator, pref_path, exe_path);
+
+        if (options.revive_policy == .restart) {
+            const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch null;
+            if (kill_response) |response| allocator.free(response);
+        }
+        var attached_existing_session = false;
+        if (options.revive_policy == .attach_only or options.revive_policy == .manual) {
+            const inspect_response = try sessionizer.requestAlloc(allocator, pref_path, "session.inspect", .{ .id = session_id }, 1);
+            defer allocator.free(inspect_response);
+            try ensureSessionResponseOk(allocator, inspect_response);
+            attached_existing_session = true;
+        } else {
+            const command = try daemonCommandForProfile(allocator, options.profile);
+            defer allocator.free(command);
+            const create_response = try sessionizer.requestAlloc(allocator, pref_path, "session.create", .{
+                .id = session_id,
+                .project_id = options.project_id,
+                .project_path = options.project_path,
+                .cwd = options.cwd,
+                .label = self.launch_label,
+                .command = command,
+                .cols = options.cols,
+                .rows = options.rows,
+                .dock_id = options.dock_id,
+                .pane_id = options.pane_id,
+            }, 1);
+            defer allocator.free(create_response);
+            try ensureSessionResponseOk(allocator, create_response);
+            attached_existing_session = !(sessionResultBool(allocator, create_response, "created") catch true);
+        }
+        self.suppress_next_daemon_replay = attached_existing_session;
+        self.defer_daemon_replay_until_resize = attached_existing_session;
+
+        const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
+            .id = session_id,
+            .label = "verde-ui",
+        }, 1) catch |err| blk: {
+            log.debug("daemon terminal session {s} does not support attach registration: {s}", .{ session_id, @errorName(err) });
+            break :blk null;
+        };
+        if (attach_response) |response| {
+            defer allocator.free(response);
+            self.attach_id = sessionResultStringAlloc(allocator, response, "attach_id") catch |err| blk: {
+                log.debug("daemon terminal session {s} attach registration failed: {s}", .{ session_id, @errorName(err) });
+                break :blk null;
+            };
+        }
+
+        if (!attached_existing_session) {
+            try self.resizeDaemon(allocator);
+            _ = try self.drainDaemonOutput(allocator);
+        }
+    }
+
+    fn drainDaemonOutput(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        if (self.defer_daemon_replay_until_resize) return false;
+        const pref_path = self.pref_path orelse return false;
+        const session_id = self.session_id orelse return false;
+        const response = sessionizer.requestAlloc(allocator, pref_path, "session.tail", .{
+            .id = session_id,
+            .attach_id = self.attach_id orelse "",
+            .offset = self.remote_output_offset,
+            .max_bytes = DAEMON_REPLAY_MAX_BYTES,
+        }, 1) catch |err| {
+            log.debug("failed to poll daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
+            self.daemon_state = .unavailable;
+            self.running = false;
+            return false;
+        };
+        defer allocator.free(response);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSessionResponse;
+        if (parsed.value.object.get("error")) |_| {
+            self.daemon_state = .missing;
+            self.running = false;
+            return false;
+        }
+        const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+        if (result != .object) return error.InvalidSessionResponse;
+        const text = jsonString(result.object.get("text") orelse .null) orelse "";
+        const suppress_replay_responses = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
+        const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
+        const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
+        const stale_alt_screen_replay = suppress_replay_responses and
+            shell_pid != null and
+            foreground_process_group != null and
+            foreground_process_group.? == shell_pid.? and
+            looksLikeStaleFullScreenReplay(text);
+        self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
+        self.suppress_next_daemon_replay = false;
+        self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
+        self.daemon_state = .attached;
+        if (stale_alt_screen_replay) {
+            self.resetLocalTerminalView(allocator) catch |err| {
+                log.warn("failed to reset stale daemon terminal replay for {s}: {s}", .{ session_id, @errorName(err) });
+            };
+            return true;
+        }
+        if (text.len == 0) return false;
+        try self.appendOutput(allocator, text);
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = previous_suppression or suppress_replay_responses;
+        defer self.suppress_pty_responses = previous_suppression;
+        self.stream.nextSlice(text);
+        try self.repairTerminalState(allocator);
+        return true;
+    }
+
+    fn resetLocalTerminalView(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = true;
+        defer self.suppress_pty_responses = previous_suppression;
+        self.stream.nextSlice(LOCAL_TERMINAL_VIEW_RESET);
+        try self.repairTerminalState(allocator);
+    }
+
+    fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        const pref_path = self.pref_path orelse return;
+        const session_id = self.session_id orelse return;
+        const response = try sessionizer.requestAlloc(allocator, pref_path, "session.resize", .{
+            .id = session_id,
+            .attach_id = self.attach_id orelse "",
+            .cols = self.cols,
+            .rows = self.rows,
+        }, 1);
+        defer allocator.free(response);
+        try ensureSessionResponseOk(allocator, response);
+    }
+
+    fn killDaemon(self: *UnixSession) !void {
+        const pref_path = self.pref_path orelse return error.MissingSessionPrefPath;
+        const session_id = self.session_id orelse return error.MissingSessionId;
+        const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.kill", .{ .id = session_id }, 1);
+        defer std.heap.smp_allocator.free(response);
+    }
+
+    fn writeRawInput(self: *UnixSession, bytes: []const u8) !bool {
+        if (self.backend == .local) {
+            try writeAll(self.master_fd, bytes);
+            return true;
+        }
+        const pref_path = self.pref_path orelse return false;
+        const session_id = self.session_id orelse return false;
+        const response = try sessionizer.requestAlloc(std.heap.smp_allocator, pref_path, "session.write", .{
+            .id = session_id,
+            .attach_id = self.attach_id orelse "",
+            .text = bytes,
+        }, 1);
+        defer std.heap.smp_allocator.free(response);
+        return true;
+    }
+
+    fn detachDaemon(self: *UnixSession, allocator: std.mem.Allocator) void {
+        const pref_path = self.pref_path orelse return;
+        const session_id = self.session_id orelse return;
+        const attach_id = self.attach_id orelse return;
+        const response = sessionizer.requestAlloc(allocator, pref_path, "session.detach", .{
+            .id = session_id,
+            .attach_id = attach_id,
+        }, 1) catch return;
+        allocator.free(response);
     }
 
     fn appendOutput(self: *UnixSession, allocator: std.mem.Allocator, bytes: []const u8) !void {
@@ -1605,7 +2040,8 @@ const UnixSession = struct {
 
     fn streamWritePty(handler: *TerminalHandler, data: [:0]const u8) void {
         const session: *UnixSession = @fieldParentPtr("terminal", handler.terminal);
-        writeAll(session.master_fd, std.mem.sliceTo(data, 0)) catch |err| {
+        if (session.suppress_pty_responses) return;
+        _ = session.writeRawInput(std.mem.sliceTo(data, 0)) catch |err| {
             log.warn("failed to write terminal response to PTY: {s}", .{@errorName(err)});
         };
     }
@@ -1786,6 +2222,7 @@ const UnixSession = struct {
     }
 
     fn captureExitStatus(self: *UnixSession) bool {
+        if (self.backend == .daemon) return false;
         if (self.exit_status != null) return false;
 
         var status: c_int = 0;
@@ -1798,7 +2235,7 @@ const UnixSession = struct {
     }
 
     fn applyWinsize(self: *UnixSession) void {
-        if (!self.running) return;
+        if (!self.running or self.backend == .daemon) return;
 
         var winsize = std.posix.winsize{
             .row = self.rows,
@@ -1888,8 +2325,14 @@ fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 }
 
 fn writeTerminalPaste(allocator: std.mem.Allocator, fd: std.posix.fd_t, text: []const u8, bracketed: bool) !void {
+    const encoded = try terminalPasteBytesAlloc(allocator, text, bracketed);
+    defer allocator.free(encoded);
+    try writeAll(fd, encoded);
+}
+
+fn terminalPasteBytesAlloc(allocator: std.mem.Allocator, text: []const u8, bracketed: bool) ![]u8 {
     var encoded: std.ArrayList(u8) = .empty;
-    defer encoded.deinit(allocator);
+    errdefer encoded.deinit(allocator);
 
     if (bracketed) try encoded.appendSlice(allocator, "\x1b[200~");
     for (text) |byte| {
@@ -1901,7 +2344,7 @@ fn writeTerminalPaste(allocator: std.mem.Allocator, fd: std.posix.fd_t, text: []
             byte);
     }
     if (bracketed) try encoded.appendSlice(allocator, "\x1b[201~");
-    try writeAll(fd, encoded.items);
+    return try encoded.toOwnedSlice(allocator);
 }
 
 fn copyableRenderStateText(allocator: std.mem.Allocator, render_state: *const ghostty_vt.RenderState) ![]u8 {
@@ -1961,6 +2404,151 @@ fn terminalPasteUnsafeByte(byte: u8) bool {
         0x00, 0x08, 0x05, 0x04, 0x1B, 0x7F, 0x03, 0x1C, 0x15, 0x1A, 0x11, 0x13, 0x17, 0x16, 0x12, 0x0F => true,
         else => false,
     };
+}
+
+fn daemonCommandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![][]const u8 {
+    if (profile.command.len > 0) {
+        const command = try allocator.alloc([]const u8, profile.command.len);
+        @memcpy(command, profile.command);
+        return command;
+    }
+    if (profile.kind == .shell) {
+        const command = try allocator.alloc([]const u8, 2);
+        command[0] = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
+        command[1] = "-i";
+        return command;
+    }
+    const args: []const []const u8 = switch (profile.kind) {
+        .shell => unreachable,
+        .claude => &.{"claude"},
+        .opencode => &.{"opencode"},
+        .codex => &.{"codex"},
+        .cursor => &.{"agent"},
+        .custom => &.{},
+    };
+    const command = try allocator.alloc([]const u8, args.len);
+    @memcpy(command, args);
+    return command;
+}
+
+fn ensureSessionResponseOk(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+}
+
+fn sessionResultStringAlloc(allocator: std.mem.Allocator, response: []const u8, field: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    const text = jsonString(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
+    return try allocator.dupe(u8, text);
+}
+
+fn sessionResultBool(allocator: std.mem.Allocator, response: []const u8, field: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionResponse;
+    if (parsed.value.object.get("error")) |_| return error.SessionRequestFailed;
+    const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
+    if (result != .object) return error.InvalidSessionResponse;
+    return jsonBool(result.object.get(field) orelse .null) orelse return error.InvalidSessionResponse;
+}
+
+fn jsonString(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBool(value: std.json.Value) ?bool {
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn jsonUsize(value: std.json.Value) ?usize {
+    return switch (value) {
+        .integer => |int| if (int >= 0) @intCast(int) else null,
+        .number_string => |text| std.fmt.parseInt(usize, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn looksLikeStaleFullScreenReplay(bytes: []const u8) bool {
+    if (hasUnclosedAlternateScreen(bytes)) return true;
+    if (bytes.len < DAEMON_REPLAY_MAX_BYTES) return false;
+
+    var csi_count: usize = 0;
+    var newline_count: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) : (index += 1) {
+        if (bytes[index] == '\n') newline_count += 1;
+        if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '[') csi_count += 1;
+    }
+    return csi_count >= 256 and newline_count * 8 < csi_count;
+}
+
+fn hasUnclosedAlternateScreen(bytes: []const u8) bool {
+    const enter = maxOptionalIndex(&.{
+        lastIndexOf(bytes, "\x1b[?1049h"),
+        lastIndexOf(bytes, "\x1b[?1047h"),
+        lastIndexOf(bytes, "\x1b[?47h"),
+    });
+    const leave = maxOptionalIndex(&.{
+        lastIndexOf(bytes, "\x1b[?1049l"),
+        lastIndexOf(bytes, "\x1b[?1047l"),
+        lastIndexOf(bytes, "\x1b[?47l"),
+    });
+    return if (enter) |enter_index| leave == null or enter_index > leave.? else false;
+}
+
+fn maxOptionalIndex(values: []const ?usize) ?usize {
+    var result: ?usize = null;
+    for (values) |value| {
+        const index = value orelse continue;
+        if (result == null or index > result.?) result = index;
+    }
+    return result;
+}
+
+fn lastIndexOf(haystack: []const u8, needle: []const u8) ?usize {
+    var result: ?usize = null;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |index| {
+        result = index;
+        start = index + 1;
+    }
+    return result;
+}
+
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
+            if (len < 0) return error.FileNotFound;
+            return allocator.dupe(u8, buffer[0..@intCast(len)]);
+        },
+        .macos => {
+            var size: u32 = std.fs.max_path_bytes;
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            if (_NSGetExecutablePath(&buffer, &size) != 0) {
+                const dynamic_buffer = try allocator.alloc(u8, size);
+                defer allocator.free(dynamic_buffer);
+                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
+                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
+            }
+            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
+        },
+        else => return error.FileNotFound,
+    }
 }
 
 fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
@@ -2411,6 +2999,26 @@ fn dupeCommand(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8
     return command;
 }
 
+fn dupeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const owned = try allocator.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |value| allocator.free(value);
+        allocator.free(owned);
+    }
+    for (values, 0..) |value, index| {
+        owned[index] = try allocator.dupe(u8, value);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    if (values.len > 0) allocator.free(values);
+}
+
 fn freeCommand(allocator: std.mem.Allocator, command: [][:0]u8) void {
     for (command) |arg| allocator.free(arg);
     allocator.free(command);
@@ -2435,6 +3043,35 @@ test "focus adjacent pane uses split direction" {
     try std.testing.expectEqual(left_id, dock.activePaneConst().?.id);
     try std.testing.expect(try dock.focusAdjacentPane(allocator, .right));
     try std.testing.expectEqual(right_id, dock.activePaneConst().?.id);
+}
+
+test "persisted layout accepts leaves without session metadata" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    const old_layout_json =
+        \\{
+        \\  "active_tab_index": 0,
+        \\  "tabs": [{
+        \\    "title": "old",
+        \\    "active_pane_id": 7,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 7
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    try dock.applyPersistedLayoutJson(allocator, old_layout_json);
+    const pane = dock.activePaneConst().?;
+    try std.testing.expectEqual(@as(u32, 7), pane.id);
+    try std.testing.expectEqual(@as(?[]u8, null), pane.session_id);
+    try std.testing.expectEqual(@as(?TerminalLaunchKind, null), pane.launch_kind);
+    try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, pane.revive_policy);
 }
 
 test "unix session PTY smoke" {

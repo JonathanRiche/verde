@@ -48,6 +48,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local session=\"");
+    try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("\"\n  local pane=\"");
@@ -114,7 +116,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --axis) COMPREPLY=( $(compgen -W "$axis_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --project|--thread|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
+        \\    --project|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -129,6 +131,17 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\        case "$sub" in
         \\          panes|threads) COMPREPLY=( $(compgen -W "$project_json_flags" -- "$cur") ) ;;
         \\          transcript) COMPREPLY=( $(compgen -W "--project --thread --json" -- "$cur") ) ;;
+        \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\        esac
+        \\        ;;
+        \\      session)
+        \\        case "$sub" in
+        \\          inspect|screen) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
+        \\          new) COMPREPLY=( $(compgen -W "--project --name --json" -- "$cur") ) ;;
+        \\          attach) COMPREPLY=( $(compgen -W "--id --project --pane" -- "$cur") ) ;;
+        \\          write) COMPREPLY=( $(compgen -W "--id --text --json" -- "$cur") ) ;;
+        \\          tail) COMPREPLY=( $(compgen -W "--id --lines --json" -- "$cur") ) ;;
+        \\          kill) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
@@ -182,6 +195,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    1:*) COMPREPLY=( $(compgen -W "$top --help -h" -- "$cur") ) ;;
         \\    2:completion:*) COMPREPLY=( $(compgen -W "$shells" -- "$cur") ) ;;
         \\    2:state:*) COMPREPLY=( $(compgen -W "$state" -- "$cur") ) ;;
+        \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
         \\    3:live:pane:*) COMPREPLY=( $(compgen -W "$pane" -- "$cur") ) ;;
         \\    3:live:chat:*) COMPREPLY=( $(compgen -W "$chat" -- "$cur") ) ;;
@@ -217,6 +231,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local session=\"");
+    try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("\"\n  local pane=\"");
@@ -281,7 +297,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --axis) compadd -- ${(s: :)axis_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --project|--thread|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
+        \\    --project|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -296,6 +312,17 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\        case "$sub" in
         \\          panes|threads) compadd -- ${(s: :)project_json_flags} ;;
         \\          transcript) compadd -- --project --thread --json ;;
+        \\          *) compadd -- ${(s: :)json_flags} ;;
+        \\        esac
+        \\        ;;
+        \\      session)
+        \\        case "$sub" in
+        \\          inspect|screen) compadd -- --id --json ;;
+        \\          new) compadd -- --project --name --json ;;
+        \\          attach) compadd -- --id --project --pane ;;
+        \\          write) compadd -- --id --text --json ;;
+        \\          tail) compadd -- --id --lines --json ;;
+        \\          kill) compadd -- --id --json ;;
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
@@ -349,6 +376,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    2:*) compadd -- ${(s: :)top} --help -h ;;
         \\    3:completion:*) compadd -- ${(s: :)shells} ;;
         \\    3:state:*) compadd -- ${(s: :)state} ;;
+        \\    3:session:*) compadd -- ${(s: :)session} ;;
         \\    3:live:*) compadd -- ${(s: :)live} ;;
         \\    4:live:pane:*) compadd -- ${(s: :)pane} ;;
         \\    4:live:chat:*) compadd -- ${(s: :)chat} ;;
@@ -392,6 +420,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after state' -a '");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after session' -a '");
+    try writeWords(w, &spec.session_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live' -a '");
     try writeWords(w, &spec.live_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live pane' -a '");
@@ -410,6 +440,7 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.stack_commands);
     try w.writeAll("'\n\ncomplete -c verde -l json -d 'Print JSON output'\n");
     try w.writeAll(
+        \\complete -c verde -l id -r -d 'Persistent session id'
         \\complete -c verde -l project -r -d 'Project id, index, path, or current'
         \\complete -c verde -l thread -r -d 'Thread index or provider id'
         \\complete -c verde -l pane -r -d 'Workspace pane id'
