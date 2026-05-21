@@ -20,6 +20,7 @@ const theme = @import("theme.zig");
 const FOCUS_ANIM_DURATION_MS: i64 = 160;
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
 const PANE_CONTEXT_MENU_Z: i32 = 180;
+const INACTIVE_PANE_FADE_ALPHA: u8 = 72;
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -202,6 +203,9 @@ fn focusPaneInDirectionFromRects(
     const target = best_id orelse return false;
     if (clear_maximized) _ = state.clearCurrentProjectWorkspacePaneMaximized();
     _ = state.focusCurrentProjectWorkspacePane(target);
+    if (state.workspaceChatThreadIndexByPane(target) != null) {
+        _ = state.focusPromptForFocusedChatWorkspacePane();
+    }
     state.markDirty();
     return true;
 }
@@ -336,6 +340,31 @@ pub fn growPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
     return state.nudgeCurrentProjectWorkspaceSplit(first_id, second_id, axis, delta);
 }
 
+pub fn movePaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
+    if (pane_rect_count == 0) return false;
+    if (state.projects.items.len == 0) return false;
+    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
+    const current_id = layout.focused_pane_id orelse return false;
+
+    var current_rect: ?palette.Rect = null;
+    var i: usize = 0;
+    while (i < pane_rect_count) : (i += 1) {
+        if (pane_rects[i].pane_id == current_id) {
+            current_rect = pane_rects[i].rect;
+            break;
+        }
+    }
+    const cur = current_rect orelse return false;
+    const target = findNeighborId(current_id, cur, dir) orelse return false;
+    if (!state.swapCurrentProjectWorkspacePanes(current_id, target)) return false;
+    _ = state.focusCurrentProjectWorkspacePane(target);
+    if (state.workspaceChatThreadIndexByPane(target) != null) {
+        _ = state.focusPromptForFocusedChatWorkspacePane();
+    }
+    state.markDirty();
+    return true;
+}
+
 fn tickFocusAnimation(state: *runtime.AppState) void {
     if (state.projects.items.len == 0) return;
     const focused = state.projects.items[state.selected_project_index].workspace_layout.focused_pane_id;
@@ -408,7 +437,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (button == 3 and down) {
-        // Right-click on a pane opens the chat thread context menu anchored at the cursor.
+        // Right-click on a pane opens the pane context menu anchored at the cursor.
         var ri: usize = hit_cache.count;
         while (ri > 0) {
             ri -= 1;
@@ -433,7 +462,6 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
             ri -= 1;
             const pane_rect = pane_rects[ri];
             if (!rectContains(pane_rect.rect, x, y)) continue;
-            if (state.workspacePaneKindById(pane_rect.pane_id) != .chat) return false;
             _ = state.focusCurrentProjectWorkspacePane(pane_rect.pane_id);
             split_menu_show_paste = false;
             split_menu_kind = .chat_context;
@@ -734,6 +762,7 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
             browser_panel.renderDockAt(state, rect);
         },
     }
+    renderInactivePaneFade(state, pane_id, rect);
     if (kind == .chat and header_h > 0.0) {
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
         renderPaneOverlay(state, pane_id, header_rect, reserve);
@@ -744,6 +773,12 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         border_color[3] *= alpha;
         queueBorder(state, rect, paletteColor(border_color), 0.0, theme.scaledUi(2.0));
     }
+}
+
+fn renderInactivePaneFade(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: palette.Rect) void {
+    if (state.currentProjectWorkspaceVisiblePaneCount() <= 1) return;
+    if (state.isCurrentProjectWorkspacePaneFocused(pane_id)) return;
+    queueRect(state, rect, paletteColor(theme.withAlpha(theme.background(), INACTIVE_PANE_FADE_ALPHA)));
 }
 
 fn renderPaneOverlay(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, header_rect: palette.Rect, reserve: f32) void {
@@ -821,12 +856,12 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const menu_pad_x = theme.scaledUi(14.0);
     const menu_pad_top = theme.scaledUi(12.0);
     const menu_pad_bottom = theme.scaledUi(12.0);
-    const copy_count: usize = if (split_menu_kind == .chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
-    const paste_count: usize = if (split_menu_kind == .chat_context and split_menu_show_paste) 1 else 0;
-    const command_count: usize = switch (split_menu_kind) {
-        .chat_context => copy_count + paste_count + 3,
-        .split_button => 1,
-    };
+    const pane_kind = state.workspacePaneKindById(pane_id);
+    const is_chat_context = split_menu_kind == .chat_context and pane_kind == .chat;
+    const copy_count: usize = if (is_chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
+    const paste_count: usize = if (is_chat_context and split_menu_show_paste) 1 else 0;
+    const chat_command_count: usize = if (is_chat_context) copy_count + paste_count + 2 else 0;
+    const command_count: usize = chat_command_count + 2;
     const split_count: usize = 8;
     const menu_h = menu_pad_top + menu_pad_bottom +
         @as(f32, @floatFromInt(command_count)) * row_h +
@@ -856,12 +891,14 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     };
     var y = menu_rect.y + menu_pad_top;
     const row_rect_w = menu_rect.w - menu_pad_x * 2.0;
-    if (split_menu_kind == .chat_context) {
+    if (is_chat_context) {
         if (copy_count > 0) y = renderContextMenuRow(state, pane_id, .copy_selection, "Copy", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         if (paste_count > 0) y = renderContextMenuRow(state, pane_id, .paste_into_prompt, "Paste", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         y = renderContextMenuRow(state, pane_id, .new_chat_thread, "New Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
         y = renderContextMenuRow(state, pane_id, .refresh_chat_thread, "Refresh Chat Thread", menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     }
+    const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
+    y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
 
     const rows = [_]MenuRow{

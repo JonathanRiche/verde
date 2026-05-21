@@ -33,6 +33,7 @@ const TerminalContextMenuAction = enum {
     split_down,
     split_left,
     split_right,
+    zoom_pane,
     close_pane,
 };
 
@@ -575,7 +576,15 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
         enabled[count] = dock.tabs.items.len > 1;
         count += 1;
     } else {
-        const has_workspace_pane = workspacePaneIdForDock(state, hit_cache.menu_dock_id) != null;
+        const workspace_pane_id = workspacePaneIdForDock(state, hit_cache.menu_dock_id);
+        const has_workspace_pane = workspace_pane_id != null;
+        actions[count] = .zoom_pane;
+        labels[count] = if (workspace_pane_id) |pane_id|
+            if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane"
+        else
+            "Zoom Pane";
+        enabled[count] = has_workspace_pane;
+        count += 1;
         actions[count] = .split_up;
         labels[count] = "New Pane Above";
         enabled[count] = has_workspace_pane;
@@ -634,11 +643,11 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
 
 fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: TerminalContextMenuAction) void {
     const focus_menu_dock_after = switch (action) {
-        .split_up, .split_down, .split_left, .split_right, .close_pane => false,
+        .split_up, .split_down, .split_left, .split_right, .zoom_pane, .close_pane => false,
         else => true,
     };
     const uses_workspace_pane_action = switch (action) {
-        .split_up, .split_down, .split_left, .split_right, .close_pane => true,
+        .split_up, .split_down, .split_left, .split_right, .zoom_pane, .close_pane => true,
         else => false,
     };
     switch (action) {
@@ -663,6 +672,9 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         },
         .split_right => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
             _ = state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .vertical, true);
+        },
+        .zoom_pane => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
+            _ = state.toggleCurrentProjectWorkspacePaneMaximized(pane_id);
         },
         .close_pane => if (workspacePaneIdForDock(state, hit_cache.menu_dock_id)) |pane_id| {
             _ = state.closeCurrentProjectWorkspacePane(pane_id);

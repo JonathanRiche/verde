@@ -335,8 +335,11 @@ If prompt sending fails, first check that the selected provider is installed, av
 Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` terminal engine.
 
 - Create a new chat thread with `CommandOrControl+T`, or split a terminal pane below the focused workspace pane with `CommandOrControl+Shift+T`.
+- Switch workspaces by sidebar order with `Alt+1` through `Alt+9`, and `Alt+0` for the tenth workspace.
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
-- Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), maximize or restore a pane, minimize it into the restore strip, or close it.
+- Move the focused workspace pane by swapping it with the adjacent pane using `Ctrl+Shift+H/J/K/L`.
+- In a focused chat thread pane, press `Tab` to return keyboard focus to the prompt box.
+- Workspace pane headers can split chat or terminal panes vertically (`C|`, `T|`) or horizontally (`C-`, `T-`), zoom or unzoom a pane, minimize it into the restore strip, or close it.
 - Drag the divider between workspace panes to resize the split.
 - Right-click inside a terminal pane to create normal shell tabs, launch-profile tabs for Claude, OpenCode, Codex, and Cursor, or new workspace terminal panes around the focused pane.
 - Terminal-internal tabs remain inside the focused terminal pane. Terminal split actions create workspace terminal panes.
@@ -390,9 +393,26 @@ Example config:
       "focus_down": ["Alt+Down", "Ctrl+J"],
       "focus_left": ["Alt+Left", "Ctrl+H"],
       "focus_right": ["Alt+Right", "Ctrl+L"],
+      "focus_prompt": "Tab",
+      "move_up": "Ctrl+Shift+K",
+      "move_down": "Ctrl+Shift+J",
+      "move_left": "Ctrl+Shift+H",
+      "move_right": "Ctrl+Shift+L",
       "toggle_maximize": "CommandOrControl+Alt+M",
       "minimize": "CommandOrControl+Alt+Minus",
-      "close": ["CommandOrControl+W", "Alt+X"]
+      "close": ["CommandOrControl+W", "Alt+X"],
+      "select": [
+        "Alt+1",
+        "Alt+2",
+        "Alt+3",
+        "Alt+4",
+        "Alt+5",
+        "Alt+6",
+        "Alt+7",
+        "Alt+8",
+        "Alt+9",
+        "Alt+0"
+      ]
     },
     "terminal": {
       "toggle": null,
