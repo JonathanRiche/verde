@@ -1709,9 +1709,14 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
     }
     if (builtin.os.tag == .linux) {
         const window_flags = SDL_GetWindowFlags(window);
-        if (!window_flags.input_focus or !window_flags.mouse_focus or window_flags.hidden or window_flags.minimized or window_flags.occluded) {
+        const suspicious_close = !window_flags.input_focus or
+            !window_flags.mouse_focus or
+            window_flags.hidden or
+            window_flags.minimized or
+            window_flags.occluded;
+        if (suspicious_close) {
             runtime_log.diagnostic(
-                "ignoring linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
+                "ignoring suspicious linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
                 .{ window_flags.input_focus, window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
             );
             return true;
