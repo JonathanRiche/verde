@@ -440,6 +440,19 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
             var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
 
+            // Apply the SGR inverse (reverse-video) attribute. ghostty's
+            // Style.bg/fg deliberately return the raw colors; swapping for
+            // `flags.inverse` is the renderer's job. Both values are already
+            // resolved to concrete defaults above, so a plain swap is correct.
+            // This also restores app-drawn cursors (e.g. Claude Code / Ink),
+            // which paint the caret cell as inverse video rather than relying
+            // on the hardware (DECTCEM) cursor handled below.
+            if (cell_style.flags.inverse) {
+                const swap = bg;
+                bg = fg;
+                fg = swap;
+            }
+
             if (selection) |range| {
                 if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
             }
