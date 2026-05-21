@@ -17,7 +17,7 @@ pub const top_level_commands = [_][]const u8{
 
 pub const state_commands = [_][]const u8{
     "path",
-    "projects",
+    "workspaces",
     "panes",
     "threads",
     "transcript",
@@ -38,7 +38,7 @@ pub const session_commands = [_][]const u8{
 pub const live_commands = [_][]const u8{
     "status",
     "capabilities",
-    "projects",
+    "workspaces",
     "panes",
     "active",
     "threads",
@@ -56,7 +56,7 @@ pub const live_commands = [_][]const u8{
 pub const live_capabilities = [_][]const u8{
     "status",
     "capabilities",
-    "projects",
+    "workspaces",
     "panes",
     "active",
     "inspect",
@@ -105,8 +105,8 @@ pub const live_capabilities = [_][]const u8{
     "browser.overlay.sidebarMenuClose",
     "browser.overlay.composerMenuOpen",
     "browser.overlay.composerMenuClose",
-    "browser.overlay.projectModalOpen",
-    "browser.overlay.projectModalClose",
+    "browser.overlay.workspaceModalOpen",
+    "browser.overlay.workspaceModalClose",
     "browser.overlay.threadModalOpen",
     "browser.overlay.threadModalClose",
     "browser.overlay.imageModalOpen",
@@ -178,8 +178,8 @@ pub const browser_commands = [_][]const u8{
     "sidebar-menu-close",
     "composer-menu-open",
     "composer-menu-close",
-    "project-modal-open",
-    "project-modal-close",
+    "workspace-modal-open",
+    "workspace-modal-close",
     "thread-modal-open",
     "thread-modal-close",
     "image-modal-open",
@@ -197,6 +197,7 @@ pub const all_flags = [_][]const u8{
     "-h",
     "--json",
     "--id",
+    "--workspace",
     "--project",
     "--thread",
     "--pane",
@@ -217,26 +218,27 @@ pub const all_flags = [_][]const u8{
 };
 
 pub const json_flags = [_][]const u8{"--json"};
-pub const project_json_flags = [_][]const u8{ "--project", "--json" };
+pub const workspace_json_flags = [_][]const u8{ "--workspace", "--json" };
+pub const project_json_flags = workspace_json_flags;
 pub const session_id_json_flags = [_][]const u8{ "--id", "--json" };
-pub const session_new_flags = [_][]const u8{ "--project", "--name", "--json" };
-pub const session_attach_flags = [_][]const u8{ "--id", "--project", "--pane" };
+pub const session_new_flags = [_][]const u8{ "--workspace", "--name", "--json" };
+pub const session_attach_flags = [_][]const u8{ "--id", "--workspace", "--pane" };
 pub const session_write_flags = [_][]const u8{ "--id", "--text", "--json" };
 pub const session_tail_flags = [_][]const u8{ "--id", "--lines", "--json" };
-pub const pane_flags = [_][]const u8{ "--project", "--pane", "--focused", "--json" };
-pub const pane_split_flags = [_][]const u8{ "--project", "--pane", "--focused", "--kind", "--axis", "--json" };
-pub const pane_resize_flags = [_][]const u8{ "--project", "--pane", "--focused", "--first", "--second", "--axis", "--ratio", "--json" };
-pub const chat_draft_flags = [_][]const u8{ "--project", "--pane", "--focused", "--text", "--json" };
-pub const chat_send_flags = [_][]const u8{ "--project", "--pane", "--focused", "--prompt", "--text", "--json" };
-pub const chat_approve_flags = [_][]const u8{ "--project", "--pane", "--focused", "--call", "--decision", "--json" };
-pub const terminal_write_flags = [_][]const u8{ "--project", "--pane", "--focused", "--text", "--json" };
+pub const pane_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--json" };
+pub const pane_split_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--kind", "--axis", "--json" };
+pub const pane_resize_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--first", "--second", "--axis", "--ratio", "--json" };
+pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
+pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--prompt", "--text", "--json" };
+pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
+pub const terminal_write_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
 pub const browser_eval_flags = [_][]const u8{ "--script", "--json" };
 pub const browser_post_json_flags = [_][]const u8{ "--json-payload", "--json" };
 pub const browser_toolbar_hit_flags = [_][]const u8{ "--target", "--json" };
 pub const browser_paste_text_flags = [_][]const u8{ "--text", "--json" };
 pub const browser_inspector_mode_flags = [_][]const u8{ "--mode", "--json" };
-pub const terminal_tail_flags = [_][]const u8{ "--project", "--pane", "--focused", "--lines", "--json" };
-pub const process_flags = [_][]const u8{ "--project", "--pane", "--focused", "--name", "--lines", "--json" };
+pub const terminal_tail_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--lines", "--json" };
+pub const process_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--name", "--lines", "--json" };
 
 pub const kind_values = [_][]const u8{ "chat", "terminal" };
 pub const axis_values = [_][]const u8{ "horizontal", "vertical" };

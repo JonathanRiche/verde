@@ -665,8 +665,8 @@ pub const Daemon = struct {
         const cwd = jsonString(params.object.get("cwd") orelse .null) orelse ".";
         const session = try PtySession.create(self.allocator, .{
             .session_id = session_id,
-            .project_id = jsonString(params.object.get("project_id") orelse .null) orelse "",
-            .project_path = jsonString(params.object.get("project_path") orelse .null) orelse "",
+            .project_id = jsonString(params.object.get("workspace_id") orelse params.object.get("project_id") orelse .null) orelse "",
+            .project_path = jsonString(params.object.get("workspace_path") orelse params.object.get("project_path") orelse .null) orelse "",
             .cwd = cwd,
             .label = jsonString(params.object.get("label") orelse .null) orelse "",
             .command = command,
@@ -944,9 +944,9 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.session_id);
     try s.objectField("session_id");
     try s.write(session.session_id);
-    try s.objectField("project_id");
+    try s.objectField("workspace_id");
     try s.write(session.project_id);
-    try s.objectField("project_path");
+    try s.objectField("workspace_path");
     try s.write(session.project_path);
     try s.objectField("cwd");
     try s.write(session.cwd);

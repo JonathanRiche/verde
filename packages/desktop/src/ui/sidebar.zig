@@ -1,4 +1,4 @@
-//! Project rail rendering for the native shell.
+//! Workspace rail rendering for the native shell.
 
 const std = @import("std");
 const palette = @import("palette");
@@ -34,9 +34,9 @@ const THREAD_DRAG_FLOATING_Z: i32 = 160;
 const SidebarHitKind = enum {
     collapse,
     expand,
-    add_project,
+    add_workspace,
     new_thread,
-    project_row,
+    workspace_row,
     thread_row,
     toggle_threads,
 };
@@ -55,13 +55,13 @@ var sidebar_scroll_y: f32 = 0.0;
 var sidebar_max_scroll_y: f32 = 0.0;
 
 const SidebarContextMenuAction = enum {
-    project_new_chat,
-    project_open_terminal,
-    project_rename,
-    project_import_codex,
-    project_import_opencode,
-    project_import_claude,
-    project_archive,
+    workspace_new_chat,
+    workspace_open_terminal,
+    workspace_rename,
+    workspace_import_codex,
+    workspace_import_opencode,
+    workspace_import_claude,
+    workspace_archive,
     thread_open_tui,
     thread_open_chat,
     thread_sync,
@@ -140,7 +140,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                         new_thread_hover = .{ .project_index = hit.project_index, .thread_index = hit.thread_index };
                     }
                 },
-                .project_row => {
+                .workspace_row => {
                     if (new_project_hover == null) new_project_hover = hit.project_index;
                 },
                 .new_thread => {
@@ -188,7 +188,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         switch (hit.kind) {
             .collapse => state.setSidebarCollapsed(true),
             .expand => state.setSidebarCollapsed(false),
-            .add_project => {
+            .add_workspace => {
                 state.show_project_creator = true;
                 state.setSidebarCollapsed(false);
                 state.clearImportPath();
@@ -200,7 +200,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .new_thread => {
                 if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
             },
-            .project_row => {
+            .workspace_row => {
                 if (hit.project_index < state.projects.items.len) {
                     state.noteInteraction();
                     state.selected_project_index = hit.project_index;
@@ -258,7 +258,7 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
         switch (hit.kind) {
-            .project_row => {
+            .workspace_row => {
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
                 state.sidebar_context_menu_anchor_y = y;
@@ -400,15 +400,15 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
             state.blurPaletteComposer();
             state.noteInteraction();
             switch (action) {
-                .project_new_chat => {
+                .workspace_new_chat => {
                     if (pi < state.projects.items.len) state.createThreadForProject(pi);
                 },
-                .project_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
-                .project_rename => state.beginProjectRename(pi),
-                .project_import_codex => state.beginThreadImport(pi, .codex),
-                .project_import_opencode => state.beginThreadImport(pi, .opencode),
-                .project_import_claude => state.beginThreadImport(pi, .claude),
-                .project_archive => state.archiveProjectAtIndex(pi),
+                .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
+                .workspace_rename => state.beginProjectRename(pi),
+                .workspace_import_codex => state.beginThreadImport(pi, .codex),
+                .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
+                .workspace_import_claude => state.beginThreadImport(pi, .claude),
+                .workspace_archive => state.archiveProjectAtIndex(pi),
                 .thread_open_tui => state.openThreadInTui(pi, ti),
                 .thread_open_chat => state.openThreadInChat(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
@@ -457,12 +457,12 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .none => return,
         .project => {
             const pi = state.sidebar_context_menu_project_index;
-            appendSidebarContextMenuRow(.project_new_chat, true, "Start a new chat");
-            appendSidebarContextMenuRow(.project_open_terminal, pi < state.projects.items.len, "Open terminal");
-            appendSidebarContextMenuRow(.project_rename, true, "Rename project");
-            appendSidebarContextMenuRow(.project_import_codex, true, "Import Codex thread");
-            appendSidebarContextMenuRow(.project_import_opencode, true, "Import OpenCode thread");
-            appendSidebarContextMenuRow(.project_import_claude, true, "Import Claude thread");
+            appendSidebarContextMenuRow(.workspace_new_chat, true, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.projects.items.len, "Open terminal");
+            appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
+            appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
+            appendSidebarContextMenuRow(.workspace_import_opencode, true, "Import OpenCode thread");
+            appendSidebarContextMenuRow(.workspace_import_claude, true, "Import Claude thread");
             var busy = false;
             if (pi < state.projects.items.len) {
                 for (state.projects.items[pi].threads.items) |*th| {
@@ -472,7 +472,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                     }
                 }
             }
-            appendSidebarContextMenuRow(.project_archive, !busy, "Archive project");
+            appendSidebarContextMenuRow(.workspace_archive, !busy, "Archive workspace");
         },
         .thread => {
             const pi = state.sidebar_context_menu_project_index;
@@ -559,8 +559,8 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const rail_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(140.0));
     const x = rect.x + pad_x;
 
-    // The logo, sidebar-collapse toggle, "PROJECTS" label, and add-project
-    // button stay pinned at the top of the rail; only the project list
+    // The logo, sidebar-collapse toggle, "WORKSPACES" label, and add-workspace
+    // button stay pinned at the top of the rail; only the workspace list
     // scrolls beneath them. The header is rendered AFTER the list (with a
     // background strip first) so any list rows scrolled into the header band
     // are visually overwritten — no z-index plumbing required.
@@ -585,7 +585,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             if (selected) {
                 // Darker than the sidebar panel itself (matches the chat
                 // transcript's CHAT_BLACK) plus a muted border so the active
-                // project reads as a recessed card.
+                // workspace reads as a recessed card.
                 state.palette_overlay_batch.panel(
                     state.allocator,
                     snapRect(row_rect),
@@ -598,7 +598,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                 queuePaletteRoundedRect(state, row_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(6.0));
             }
         }
-        if (project_visible) addPaletteHit(row_rect, .project_row, project_index, 0);
+        if (project_visible) addPaletteHit(row_rect, .workspace_row, project_index, 0);
 
         const cy = y + row_h * 0.5;
         // Inset the chevron from the bordered row's left edge so the chevron
@@ -689,10 +689,10 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     queuePaletteButton(state, toggle_rect, "<", false);
     addPaletteHit(toggle_rect, .collapse, 0, 0);
 
-    queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(130.0), .h = theme.scaledUi(24.0) }, "PROJECTS", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
+    queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(150.0), .h = theme.scaledUi(24.0) }, "WORKSPACES", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
     const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
     queuePaletteButton(state, add_rect, "+", true);
-    addPaletteHit(add_rect, .add_project, 0, 0);
+    addPaletteHit(add_rect, .add_workspace, 0, 0);
 }
 
 fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) void {
@@ -711,7 +711,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     y += theme.scaledUi(40.0);
     const add_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteButton(state, add_rect, "+", true);
-    addPaletteHit(add_rect, .add_project, 0, 0);
+    addPaletteHit(add_rect, .add_workspace, 0, 0);
 }
 
 fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {

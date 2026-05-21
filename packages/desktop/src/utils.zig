@@ -241,7 +241,7 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
         allocator,
         \\try
         \\set defaultLocation to POSIX file "{s}"
-        \\return POSIX path of (choose folder with prompt "Select project folder" default location defaultLocation)
+        \\return POSIX path of (choose folder with prompt "Select workspace folder" default location defaultLocation)
         \\on error number -128
         \\error "User cancelled" number 1
         \\end try
@@ -279,25 +279,25 @@ pub fn pickDirectoryMacOS(allocator: std.mem.Allocator, start_path: []const u8) 
 pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) PickDirectoryError![]u8 {
     if (commandExists("zenity")) {
         return runLinuxGuiDirectoryPickerCommand(allocator,
-            \\zenity --file-selection --directory --filename "$1" --title "Select project folder"
+            \\zenity --file-selection --directory --filename "$1" --title "Select workspace folder"
         , start_path, null);
     }
 
     if (commandExists("kdialog")) {
         return runLinuxGuiDirectoryPickerCommand(allocator,
-            \\kdialog --getexistingdirectory "$1" --title "Select project folder"
+            \\kdialog --getexistingdirectory "$1" --title "Select workspace folder"
         , start_path, null);
     }
 
     if (commandExists("yad")) {
         return runLinuxGuiDirectoryPickerCommand(allocator,
-            \\yad --file-selection --directory --filename "$1" --title "Select project folder"
+            \\yad --file-selection --directory --filename "$1" --title "Select workspace folder"
         , start_path, null);
     }
 
     if (commandExists("qarma")) {
         return runLinuxGuiDirectoryPickerCommand(allocator,
-            \\qarma --file-selection --directory --filename "$1" --title "Select project folder"
+            \\qarma --file-selection --directory --filename "$1" --title "Select workspace folder"
         , start_path, null);
     }
 
@@ -316,7 +316,7 @@ pub fn pickDirectoryLinux(allocator: std.mem.Allocator, start_path: []const u8) 
             \\root.attributes("-topmost", True)
             \\path = filedialog.askdirectory(
             \\    initialdir=sys.argv[1],
-            \\    title="Select project folder",
+            \\    title="Select workspace folder",
             \\    mustexist=True,
             \\)
             \\root.update()

@@ -1215,9 +1215,9 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
 fn renderEmptyProjects(state: *app_state.AppState, rect: palette.Rect) void {
     const x = rect.x + theme.scaledUi(44.0);
     var y = rect.y + theme.scaledUi(86.0);
-    queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(38.0) }, "No projects yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(28.0), rect);
+    queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(38.0) }, "No workspaces yet", paletteColor(theme.COLOR_WHITE), theme.scaledUi(28.0), rect);
     y += theme.scaledUi(42.0);
-    queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the project rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
+    queueText(state, .{ .x = x, .y = y, .w = rect.w - theme.scaledUi(88.0), .h = theme.scaledUi(28.0) }, "Use the workspace rail to add a folder and start chatting.", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
 }
 
 fn renderProcessDashboard(state: *app_state.AppState, rect: palette.Rect) void {
@@ -2544,7 +2544,7 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
     );
 
     if (results.len == 0) {
-        const message = if (state.fileSearchIsScanning()) "Indexing project files..." else "No matching files";
+        const message = if (state.fileSearchIsScanning()) "Indexing workspace files..." else "No matching files";
         queueText(state, .{
             .x = panel.x + theme.scaledUi(14.0),
             .y = panel.y + pad + theme.scaledUi(9.0),

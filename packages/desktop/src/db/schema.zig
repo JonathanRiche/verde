@@ -8,12 +8,12 @@ pub const INIT_SQL: [:0]const u8 =
     \\pragma journal_mode = wal;
     \\create table if not exists app_state (
     \\    id integer primary key check (id = 1),
-    \\    selected_project_index integer not null,
+    \\    selected_workspace_index integer not null,
     \\    sidebar_collapsed integer not null default 0
     \\);
-    \\create table if not exists projects (
+    \\create table if not exists workspaces (
     \\    id integer primary key,
-    \\    project_id text not null unique,
+    \\    workspace_id text not null unique,
     \\    sort_index integer not null,
     \\    label text not null,
     \\    path text not null,
@@ -27,10 +27,10 @@ pub const INIT_SQL: [:0]const u8 =
     \\    workspace_layout_json text,
     \\    selected_thread_index integer not null default 0
     \\);
-    \\create unique index if not exists projects_sort_index_idx on projects(sort_index);
+    \\create unique index if not exists workspaces_sort_index_idx on workspaces(sort_index);
     \\create table if not exists threads (
     \\    id integer primary key,
-    \\    project_id integer not null references projects(id) on delete cascade,
+    \\    workspace_id integer not null references workspaces(id) on delete cascade,
     \\    sort_index integer not null,
     \\    title text not null,
     \\    archived integer not null default 0,
@@ -48,7 +48,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    draft_image_path text,
     \\    draft_image_mime text,
     \\    draft_image_byte_size integer,
-    \\    unique(project_id, sort_index)
+    \\    unique(workspace_id, sort_index)
     \\);
     \\create table if not exists messages (
     \\    id integer primary key,
@@ -68,11 +68,11 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try conn.busyTimeout(5000);
     try conn.execNoArgs(INIT_SQL);
     try ensureColumn(conn, "app_state", "sidebar_collapsed", "alter table app_state add column sidebar_collapsed integer not null default 0");
-    try ensureColumn(conn, "projects", "archived", "alter table projects add column archived integer not null default 0");
-    try ensureColumn(conn, "projects", "terminal_height", "alter table projects add column terminal_height real");
-    try ensureColumn(conn, "projects", "terminal_layout_json", "alter table projects add column terminal_layout_json text");
-    try ensureColumn(conn, "projects", "terminal_docks_json", "alter table projects add column terminal_docks_json text");
-    try ensureColumn(conn, "projects", "workspace_layout_json", "alter table projects add column workspace_layout_json text");
+    try ensureColumn(conn, "workspaces", "archived", "alter table workspaces add column archived integer not null default 0");
+    try ensureColumn(conn, "workspaces", "terminal_height", "alter table workspaces add column terminal_height real");
+    try ensureColumn(conn, "workspaces", "terminal_layout_json", "alter table workspaces add column terminal_layout_json text");
+    try ensureColumn(conn, "workspaces", "terminal_docks_json", "alter table workspaces add column terminal_docks_json text");
+    try ensureColumn(conn, "workspaces", "workspace_layout_json", "alter table workspaces add column workspace_layout_json text");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
     try ensureColumn(conn, "threads", "tui_dock_id", "alter table threads add column tui_dock_id integer");

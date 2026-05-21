@@ -3714,7 +3714,7 @@ pub const AppState = struct {
     pub fn importProjectFromInput(self: *AppState) !void {
         const trimmed = std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace);
         if (trimmed.len == 0) {
-            self.setSidebarNotice("Enter a project directory path first.");
+            self.setSidebarNotice("Enter a workspace directory path first.");
             return;
         }
 
@@ -3722,7 +3722,7 @@ pub const AppState = struct {
         defer self.allocator.free(resolved);
 
         if (self.findProjectIndexByPath(resolved) != null) {
-            self.setSidebarNotice("That directory is already in the project rail.");
+            self.setSidebarNotice("That directory is already in the workspace rail.");
             return;
         }
 
@@ -3732,7 +3732,7 @@ pub const AppState = struct {
         self.clearImportPath();
         self.project_import_cursor = 0;
         self.syncRenameBuffer();
-        self.setSidebarNotice(if (add_result == .restored) "Project restored from archive." else "Project imported.");
+        self.setSidebarNotice(if (add_result == .restored) "Workspace restored from archive." else "Workspace imported.");
         self.show_project_creator = false;
         self.palette_modal_text_focus = .none;
         self.markDirty();
@@ -3750,16 +3750,16 @@ pub const AppState = struct {
     }
 
     pub fn browseForProjectDirectory(self: *AppState) void {
-        runtime_log.diagnostic("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
-        log.info("browseForProjectDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        runtime_log.diagnostic("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
+        log.info("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
-            runtime_log.diagnostic("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
-            log.warn("browseForProjectDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            runtime_log.diagnostic("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            log.warn("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             self.setSidebarNotice(@errorName(err));
             return;
         };
-        runtime_log.diagnostic("browseForProjectDirectory target_path={s}", .{target_path});
-        log.info("browseForProjectDirectory target_path={s}", .{target_path});
+        runtime_log.diagnostic("browseForWorkspaceDirectory target_path={s}", .{target_path});
+        log.info("browseForWorkspaceDirectory target_path={s}", .{target_path});
         const page_alloc = std.heap.page_allocator;
         const owned_target = page_alloc.dupe(u8, target_path) catch {
             self.allocator.free(target_path);
@@ -3772,8 +3772,8 @@ pub const AppState = struct {
         defer self.picker_state.mutex.unlock();
 
         if (self.picker_state.status == .pending) {
-            runtime_log.diagnostic("browseForProjectDirectory ignored: picker already pending", .{});
-            log.info("browseForProjectDirectory ignored: picker already pending", .{});
+            runtime_log.diagnostic("browseForWorkspaceDirectory ignored: picker already pending", .{});
+            log.info("browseForWorkspaceDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
             self.setSidebarNotice("Folder picker already open.");
             return;
@@ -3784,27 +3784,27 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
-            runtime_log.diagnostic("browseForProjectDirectory failed to spawn picker worker", .{});
-            log.warn("browseForProjectDirectory failed to spawn picker worker", .{});
+            runtime_log.diagnostic("browseForWorkspaceDirectory failed to spawn picker worker", .{});
+            log.warn("browseForWorkspaceDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
             return;
         };
-        runtime_log.diagnostic("browseForProjectDirectory spawned picker worker", .{});
-        log.info("browseForProjectDirectory spawned picker worker", .{});
+        runtime_log.diagnostic("browseForWorkspaceDirectory spawned picker worker", .{});
+        log.info("browseForWorkspaceDirectory spawned picker worker", .{});
         self.setSidebarNotice("Waiting for folder selection...");
     }
 
     pub fn requestBrowseForProjectDirectory(self: *AppState) void {
-        runtime_log.diagnostic("requestBrowseForProjectDirectory queued", .{});
-        log.info("requestBrowseForProjectDirectory queued", .{});
+        runtime_log.diagnostic("requestBrowseForWorkspaceDirectory queued", .{});
+        log.info("requestBrowseForWorkspaceDirectory queued", .{});
         self.project_directory_browse_requested = true;
         self.markDirty();
     }
 
     pub fn processDeferredProjectDirectoryBrowse(self: *AppState) void {
         if (!self.project_directory_browse_requested) return;
-        runtime_log.diagnostic("processDeferredProjectDirectoryBrowse running", .{});
-        log.info("processDeferredProjectDirectoryBrowse running", .{});
+        runtime_log.diagnostic("processDeferredWorkspaceDirectoryBrowse running", .{});
+        log.info("processDeferredWorkspaceDirectoryBrowse running", .{});
         self.project_directory_browse_requested = false;
         self.browseForProjectDirectory();
     }
@@ -3813,7 +3813,7 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return;
         const trimmed = std.mem.trim(u8, self.renameInput(), &std.ascii.whitespace);
         if (trimmed.len == 0) {
-            self.setSidebarNotice("Project name cannot be empty.");
+            self.setSidebarNotice("Workspace name cannot be empty.");
             return;
         }
 
@@ -3823,7 +3823,7 @@ pub const AppState = struct {
             self.setSidebarNotice("Rename failed.");
             return;
         };
-        self.setSidebarNotice("Project renamed.");
+        self.setSidebarNotice("Workspace renamed.");
         self.markDirty();
     }
 
@@ -4063,7 +4063,7 @@ pub const AppState = struct {
 
     pub fn syncThreadFromProvider(self: *AppState, project_index: usize, thread_index: usize) void {
         if (project_index >= self.projects.items.len) {
-            self.setSidebarNotice("Project not found.");
+            self.setSidebarNotice("Workspace not found.");
             return;
         }
 
@@ -4163,7 +4163,7 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return;
         for (self.projects.items[self.selected_project_index].threads.items) |*thread| {
             if (thread.isSendPending()) {
-                self.setSidebarNotice("Finish this project's running provider requests before archiving it.");
+                self.setSidebarNotice("Finish this workspace's running provider requests before archiving it.");
                 return;
             }
         }
@@ -4173,7 +4173,7 @@ pub const AppState = struct {
         removed.terminal_dock.visible = false;
         removed.archiveAllThreads(self.allocator) catch {
             removed.deinit(self.allocator);
-            self.setSidebarNotice("Failed to archive the project.");
+            self.setSidebarNotice("Failed to archive the workspace.");
             return;
         };
         self.archived_projects.append(self.allocator, removed) catch |err| {
@@ -4190,13 +4190,13 @@ pub const AppState = struct {
         }
 
         self.syncRenameBuffer();
-        self.setSidebarNotice("Project archived.");
+        self.setSidebarNotice("Workspace archived.");
         self.markDirty();
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
         if (project_index >= self.projects.items.len) {
-            self.setSidebarNotice("Project not found.");
+            self.setSidebarNotice("Workspace not found.");
             return;
         }
 
@@ -5039,11 +5039,11 @@ pub const AppState = struct {
 
     pub fn defaultOpenTooltip(self: *const AppState) []const u8 {
         return switch (self.app_config.default_open_action) {
-            .folder => if (self.canOpenCurrentProjectDirectory()) "Open this project's folder" else "No system folder opener was found",
-            .editor => if (self.canOpenCurrentProjectEditor(.configured)) "Open this project in the configured editor" else "Configured editor is unavailable",
-            .cursor => if (self.canOpenCurrentProjectEditor(.cursor)) "Open this project in Cursor" else "Cursor is unavailable",
-            .vscode => if (self.canOpenCurrentProjectEditor(.vscode)) "Open this project in VS Code" else "VS Code is unavailable",
-            .zed => if (self.canOpenCurrentProjectEditor(.zed)) "Open this project in Zed" else "Zed is unavailable",
+            .folder => if (self.canOpenCurrentProjectDirectory()) "Open this workspace's folder" else "No system folder opener was found",
+            .editor => if (self.canOpenCurrentProjectEditor(.configured)) "Open this workspace in the configured editor" else "Configured editor is unavailable",
+            .cursor => if (self.canOpenCurrentProjectEditor(.cursor)) "Open this workspace in Cursor" else "Cursor is unavailable",
+            .vscode => if (self.canOpenCurrentProjectEditor(.vscode)) "Open this workspace in VS Code" else "VS Code is unavailable",
+            .zed => if (self.canOpenCurrentProjectEditor(.zed)) "Open this workspace in Zed" else "Zed is unavailable",
             .custom => |custom| if (custom.action.len > 0) custom.label else "Custom open action is unavailable",
         };
     }
@@ -5065,11 +5065,11 @@ pub const AppState = struct {
 
     pub fn runDefaultOpenAction(self: *AppState) void {
         if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No project selected.");
+            self.setSidebarNotice("No workspace selected.");
             return;
         }
 
-        log.info("runDefaultOpenAction invoked for project path={s}", .{self.currentProject().path});
+        log.info("runDefaultOpenAction invoked for workspace path={s}", .{self.currentProject().path});
 
         switch (self.app_config.default_open_action) {
             .folder => self.openCurrentProjectDirectory(),
@@ -5139,28 +5139,28 @@ pub const AppState = struct {
 
     pub fn openCurrentProjectDirectory(self: *AppState) void {
         if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No project selected.");
+            self.setSidebarNotice("No workspace selected.");
             return;
         }
 
         utils.openProjectDirectory(self.allocator, self.currentProject().path) catch |err| {
-            log.warn("failed to open project directory: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to open project folder.");
+            log.warn("failed to open workspace directory: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open workspace folder.");
             return;
         };
         log.info("openCurrentProjectDirectory completed", .{});
-        self.setSidebarNotice("Opened project folder.");
+        self.setSidebarNotice("Opened workspace folder.");
     }
 
     pub fn openCurrentProjectEditor(self: *AppState, target: ProjectEditorTarget) void {
         if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No project selected.");
+            self.setSidebarNotice("No workspace selected.");
             return;
         }
 
         utils.openProjectEditor(self.allocator, self.currentProject().path, target) catch |err| {
-            log.warn("failed to open project editor: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to open project editor.");
+            log.warn("failed to open workspace editor: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open workspace editor.");
             return;
         };
         log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
@@ -6093,7 +6093,7 @@ pub const AppState = struct {
 
     pub fn toggleCurrentProjectTerminal(self: *AppState) void {
         if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No project selected.");
+            self.setSidebarNotice("No workspace selected.");
             return;
         }
 
@@ -6138,7 +6138,7 @@ pub const AppState = struct {
 
     pub fn toggleCurrentProjectTerminalLegacy(self: *AppState) void {
         if (self.projects.items.len == 0) {
-            self.setSidebarNotice("No project selected.");
+            self.setSidebarNotice("No workspace selected.");
             return;
         }
 
@@ -10181,8 +10181,8 @@ pub const AppState = struct {
                     } else {
                         self.setImportPath(path);
                         self.importProjectFromInput() catch |err| {
-                            log.warn("failed to import selected project: {s}", .{@errorName(err)});
-                            self.setSidebarNotice("Folder selected, but project import failed.");
+                            log.warn("failed to import selected workspace: {s}", .{@errorName(err)});
+                            self.setSidebarNotice("Folder selected, but workspace import failed.");
                         };
                     }
                 }
@@ -11348,10 +11348,10 @@ fn emptyThreadImportIdNotice(provider: Provider) []const u8 {
 
 fn duplicateThreadNotice(provider: Provider) []const u8 {
     return switch (provider) {
-        .codex => "Codex thread already exists in this project.",
-        .opencode => "OpenCode thread already exists in this project.",
-        .claude => "Claude thread already exists in this project.",
-        .cursor => "Cursor thread already exists in this project.",
+        .codex => "Codex thread already exists in this workspace.",
+        .opencode => "OpenCode thread already exists in this workspace.",
+        .claude => "Claude thread already exists in this workspace.",
+        .cursor => "Cursor thread already exists in this workspace.",
     };
 }
 
@@ -11393,10 +11393,10 @@ fn threadSyncedNotice(provider: Provider) []const u8 {
 
 fn projectEditorOpenedNotice(target: ProjectEditorTarget) []const u8 {
     return switch (target) {
-        .configured => "Opened project in the configured editor.",
-        .cursor => "Opened project in Cursor.",
-        .vscode => "Opened project in VS Code.",
-        .zed => "Opened project in Zed.",
+        .configured => "Opened workspace in the configured editor.",
+        .cursor => "Opened workspace in Cursor.",
+        .vscode => "Opened workspace in VS Code.",
+        .zed => "Opened workspace in Zed.",
     };
 }
 

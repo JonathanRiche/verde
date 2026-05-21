@@ -100,17 +100,17 @@ fn printHelp(out: output.Output) !void {
         \\
         \\State commands:
         \\  path
-        \\  projects [--json]
-        \\  panes --project <id|index|current> [--json]
-        \\  threads --project <id|index|current> [--json]
-        \\  transcript --project <id|index|current> --thread <index|provider-id> [--json]
+        \\  workspaces [--json]
+        \\  panes --workspace <id|index|current> [--json]
+        \\  threads --workspace <id|index|current> [--json]
+        \\  transcript --workspace <id|index|current> --thread <index|provider-id> [--json]
         \\
         \\Session commands:
         \\  list [--json]
         \\  inspect --id <session-id> [--json]
-        \\  new --project <id|index|current> [--name <name>] [-- <command>...]
+        \\  new --workspace <id|index|current> [--name <name>] [-- <command>...]
         \\  attach --id <session-id>
-        \\  attach --project <id|index|current> --pane <pane-id>
+        \\  attach --workspace <id|index|current> --pane <pane-id>
         \\  write --id <session-id> --text <text>
         \\  tail --id <session-id> [--lines <n>] [--json]
         \\  screen --id <session-id> [--json]
@@ -120,12 +120,12 @@ fn printHelp(out: output.Output) !void {
         \\Live commands:
         \\  status [--json]
         \\  capabilities [--json]
-        \\  projects [--json]
-        \\  panes [--project <id|index|current>] [--json]
+        \\  workspaces [--json]
+        \\  panes [--workspace <id|index|current>] [--json]
         \\  active [--json]
-        \\  threads [--project <id|index|current>] [--json]
-        \\  terminals [--project <id|index|current>] [--json]
-        \\  inspect --pane <id> [--project <id|index|current>] [--json]
+        \\  threads [--workspace <id|index|current>] [--json]
+        \\  terminals [--workspace <id|index|current>] [--json]
+        \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
         \\  pane focus|split|resize|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
         \\  browser open|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
@@ -178,14 +178,18 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
     try out.stdout(
         \\verde CLI capabilities
         \\  protocol: 1
-        \\  state: path, projects, panes, threads, transcript
+        \\  state: path, workspaces, panes, threads, transcript
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
-        \\  live: status, projects, panes, pane control, chat control, terminal/process control
+        \\  live: status, workspaces, panes, pane control, chat control, terminal/process control
         \\  completion: bash, zsh, fish
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
         \\
     , .{});
+}
+
+fn workspaceOption(argv: []const []const u8) ?[]const u8 {
+    return args.optionValue(argv, "--workspace") orelse args.optionValue(argv, "--project");
 }
 
 fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -241,7 +245,7 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
     defer client.deinit();
     var loaded = try client.load(allocator) orelse {
         if (json) {
-            try out.jsonValue(allocator, .{ .projects = &.{} });
+            try out.jsonValue(allocator, .{ .workspaces = &.{} });
         } else {
             try out.stdout("No persisted Verde state found at {s}\n", .{client.path});
         }
@@ -249,16 +253,16 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
     };
     defer loaded.deinit();
 
-    if (std.mem.eql(u8, command, "projects")) {
+    if (std.mem.eql(u8, command, "workspaces") or std.mem.eql(u8, command, "projects")) {
         try writeStateProjects(allocator, out, loaded.value, json);
     } else if (std.mem.eql(u8, command, "panes")) {
-        const project_index = try resolvePersistedProject(out, loaded.value, args.optionValue(argv, "--project") orelse "current");
+        const project_index = try resolvePersistedProject(out, loaded.value, workspaceOption(argv) orelse "current");
         try writeStatePanes(allocator, out, loaded.value, project_index, json);
     } else if (std.mem.eql(u8, command, "threads")) {
-        const project_index = try resolvePersistedProject(out, loaded.value, args.optionValue(argv, "--project") orelse "current");
+        const project_index = try resolvePersistedProject(out, loaded.value, workspaceOption(argv) orelse "current");
         try writeStateThreads(allocator, out, loaded.value, project_index, json);
     } else if (std.mem.eql(u8, command, "transcript")) {
-        const project_index = try resolvePersistedProject(out, loaded.value, args.optionValue(argv, "--project") orelse "current");
+        const project_index = try resolvePersistedProject(out, loaded.value, workspaceOption(argv) orelse "current");
         const thread_ref = args.optionValue(argv, "--thread") orelse {
             try out.stderr("state transcript requires --thread\n", .{});
             std.process.exit(2);
@@ -272,9 +276,9 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
 
 const PersistedSessionRef = struct {
     session_id: []const u8,
-    project_index: usize,
-    project_id: []const u8,
-    project_path: []const u8,
+    workspace_index: usize,
+    workspace_id: []const u8,
+    workspace_path: []const u8,
     dock_id: u32,
     pane_id: u32,
     label: []const u8 = "",
@@ -338,11 +342,11 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
                 });
                 return;
             }
-            try out.stdout("SESSION_ID  PROJECT  DOCK  PANE  STATUS  LABEL\n", .{});
+            try out.stdout("SESSION_ID  WORKSPACE  DOCK  PANE  STATUS  LABEL\n", .{});
             for (sessions) |session| {
                 try out.stdout("{s}  {s}  {d}  {d}  {s}  {s}\n", .{
                     session.session_id,
-                    session.project_id,
+                    session.workspace_id,
                     session.dock_id,
                     session.pane_id,
                     session.daemon_status,
@@ -366,7 +370,7 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
             } else {
                 try out.stdout(
                     \\Session: {s}
-                    \\Project: {s}
+                    \\Workspace: {s}
                     \\Path: {s}
                     \\Dock: {d}
                     \\Pane: {d}
@@ -376,8 +380,8 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
                     \\
                 , .{
                     session.session_id,
-                    session.project_id,
-                    session.project_path,
+                    session.workspace_id,
+                    session.workspace_path,
                     session.dock_id,
                     session.pane_id,
                     session.daemon_status,
@@ -395,12 +399,13 @@ fn handleSession(allocator: std.mem.Allocator, out: output.Output, io: std.Io, e
         try ensureSessionDaemon(allocator, io, exe_path);
         const session_id = try sessionIdForNewCommand(allocator, argv);
         defer allocator.free(session_id);
-        const cwd = args.optionValue(argv, "--cwd") orelse args.optionValue(argv, "--project") orelse ".";
+        const workspace_ref = workspaceOption(argv);
+        const cwd = args.optionValue(argv, "--cwd") orelse workspace_ref orelse ".";
         const command_argv = commandAfterDoubleDash(argv);
         const response = try sendSessionRequestAlloc(allocator, io, "session.create", .{
             .id = session_id,
-            .project_id = args.optionValue(argv, "--project") orelse "",
-            .project_path = cwd,
+            .workspace_id = workspace_ref orelse "",
+            .workspace_path = cwd,
             .cwd = cwd,
             .label = args.optionValue(argv, "--name") orelse "",
             .command = command_argv,
@@ -481,6 +486,7 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         return;
     }
     if (std.mem.eql(u8, command, "status") or
+        std.mem.eql(u8, command, "workspaces") or
         std.mem.eql(u8, command, "projects") or
         std.mem.eql(u8, command, "active") or
         std.mem.eql(u8, command, "processes"))
@@ -492,7 +498,7 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         std.mem.eql(u8, command, "threads") or
         std.mem.eql(u8, command, "terminals"))
     {
-        try sendLiveRequest(allocator, out, io, command, .{ .project = args.optionValue(argv, "--project") }, json);
+        try sendLiveRequest(allocator, out, io, command, .{ .workspace = workspaceOption(argv) }, json);
         return;
     }
     if (std.mem.eql(u8, command, "inspect")) {
@@ -534,7 +540,7 @@ fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     };
     if (std.mem.eql(u8, subcommand, "split")) {
         try sendLiveRequest(allocator, out, io, "pane.split", .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .kind = args.optionValue(argv, "--kind") orelse "chat",
@@ -544,7 +550,7 @@ fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     }
     if (std.mem.eql(u8, subcommand, "resize")) {
         try sendLiveRequest(allocator, out, io, "pane.resize", .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .first = try requiredIntOption(out, argv, "--first"),
@@ -578,7 +584,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             std.process.exit(2);
         };
         try sendLiveRequest(allocator, out, io, method, .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .text = args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 3) orelse "",
@@ -589,7 +595,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
         const prompt = args.optionValue(argv, "--prompt") orelse args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2);
         const method = if (std.mem.eql(u8, subcommand, "send")) "chat.send" else "chat.followup";
         try sendLiveRequest(allocator, out, io, method, .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .prompt = prompt,
@@ -598,7 +604,7 @@ fn handleLiveChat(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
     }
     if (std.mem.eql(u8, subcommand, "approve")) {
         try sendLiveRequest(allocator, out, io, "chat.approve", .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .call_id = args.optionValue(argv, "--call"),
@@ -722,12 +728,12 @@ fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.I
         try sendLiveRequest(allocator, out, io, "browser.overlay.composerMenuClose", .{}, json);
         return;
     }
-    if (std.mem.eql(u8, subcommand, "project-modal-open")) {
-        try sendLiveRequest(allocator, out, io, "browser.overlay.projectModalOpen", .{}, json);
+    if (std.mem.eql(u8, subcommand, "workspace-modal-open")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.workspaceModalOpen", .{}, json);
         return;
     }
-    if (std.mem.eql(u8, subcommand, "project-modal-close")) {
-        try sendLiveRequest(allocator, out, io, "browser.overlay.projectModalClose", .{}, json);
+    if (std.mem.eql(u8, subcommand, "workspace-modal-close")) {
+        try sendLiveRequest(allocator, out, io, "browser.overlay.workspaceModalClose", .{}, json);
         return;
     }
     if (std.mem.eql(u8, subcommand, "thread-modal-open")) {
@@ -777,7 +783,7 @@ fn handleLiveTerminal(allocator: std.mem.Allocator, out: output.Output, io: std.
     };
     if (std.mem.eql(u8, subcommand, "write")) {
         try sendLiveRequest(allocator, out, io, "terminal.write", .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .text = args.optionValue(argv, "--text") orelse trailingFreeArg(argv, 2) orelse "",
@@ -786,7 +792,7 @@ fn handleLiveTerminal(allocator: std.mem.Allocator, out: output.Output, io: std.
     }
     if (std.mem.eql(u8, subcommand, "tail")) {
         try sendLiveRequest(allocator, out, io, "terminal.tail", .{
-            .project = args.optionValue(argv, "--project"),
+            .workspace = workspaceOption(argv),
             .pane = try paneOption(out, argv),
             .focused = args.hasFlag(argv, "--focused"),
             .lines = parseOptionalU32(args.optionValue(argv, "--lines")),
@@ -838,7 +844,7 @@ fn handleLiveStack(allocator: std.mem.Allocator, out: output.Output, io: std.Io,
     {
         const method = try std.fmt.allocPrint(allocator, "stack.{s}", .{subcommand});
         defer allocator.free(method);
-        try sendLiveRequest(allocator, out, io, method, .{ .project = args.optionValue(argv, "--project") }, json);
+        try sendLiveRequest(allocator, out, io, method, .{ .workspace = workspaceOption(argv) }, json);
         return;
     }
     try out.stderr("unknown live stack command: {s}\n", .{subcommand});
@@ -1022,7 +1028,7 @@ fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv
     if (args.optionValue(argv, "--id")) |id| return allocator.dupe(u8, id);
 
     const pane_value = args.optionValue(argv, "--pane") orelse {
-        try out.stderr("session attach requires --id or --project and --pane\n", .{});
+        try out.stderr("session attach requires --id or --workspace and --pane\n", .{});
         std.process.exit(2);
     };
     const pane_id = std.fmt.parseInt(u32, pane_value, 10) catch {
@@ -1042,11 +1048,11 @@ fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const sessions = try collectPersistedSessionRefs(arena.allocator(), loaded.value);
-    const project_index = try resolvePersistedProject(out, loaded.value, args.optionValue(argv, "--project") orelse "current");
+    const project_index = try resolvePersistedProject(out, loaded.value, workspaceOption(argv) orelse "current");
     for (sessions) |session| {
-        if (session.project_index == project_index and session.pane_id == pane_id) return allocator.dupe(u8, session.session_id);
+        if (session.workspace_index == project_index and session.pane_id == pane_id) return allocator.dupe(u8, session.session_id);
     }
-    try out.stderr("session not found for project {d} pane {d}\n", .{ project_index, pane_id });
+    try out.stderr("session not found for workspace {d} pane {d}\n", .{ project_index, pane_id });
     std.process.exit(4);
 }
 
@@ -1312,33 +1318,33 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     const tool_name = jsonString(params.object.get("name") orelse .null) orelse
         return try mcpError(allocator, out, id_value, -32602, "tools/call requires name");
     const arguments = params.object.get("arguments") orelse .null;
-    const project = mcpArgString(arguments, "project");
+    const workspace = mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project");
     const process_name = mcpArgString(arguments, "name");
     const lines = mcpArgU32(arguments, "lines");
 
     const response = blk: {
         if (std.mem.eql(u8, tool_name, "list_processes")) {
-            break :blk sendLiveRequestAlloc(allocator, io, "processes", .{ .project = project }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "processes", .{ .workspace = workspace }, 1);
         }
         if (std.mem.eql(u8, tool_name, "inspect_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "inspect_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.inspect", .{ .project = project, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.inspect", .{ .workspace = workspace, .name = name }, 1);
         }
         if (std.mem.eql(u8, tool_name, "tail_process_logs")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "tail_process_logs requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.logs", .{ .project = project, .name = name, .lines = lines }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.logs", .{ .workspace = workspace, .name = name, .lines = lines }, 1);
         }
         if (std.mem.eql(u8, tool_name, "restart_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "restart_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.restart", .{ .project = project, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.restart", .{ .workspace = workspace, .name = name }, 1);
         }
         if (std.mem.eql(u8, tool_name, "stop_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "stop_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.stop", .{ .project = project, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.stop", .{ .workspace = workspace, .name = name }, 1);
         }
         if (std.mem.eql(u8, tool_name, "start_process")) {
             const name = process_name orelse return try mcpError(allocator, out, id_value, -32602, "start_process requires name");
-            break :blk sendLiveRequestAlloc(allocator, io, "process.start", .{ .project = project, .name = name }, 1);
+            break :blk sendLiveRequestAlloc(allocator, io, "process.start", .{ .workspace = workspace, .name = name }, 1);
         }
         return try mcpError(allocator, out, id_value, -32602, "unknown tool");
     } catch |err| {
@@ -1471,17 +1477,17 @@ fn liveUnavailable(out: output.Output, err: anyerror) noreturn {
     std.process.exit(3);
 }
 
-fn commonPaneParams(argv: []const []const u8) struct { project: ?[]const u8, pane: ?u32, focused: bool } {
+fn commonPaneParams(argv: []const []const u8) struct { workspace: ?[]const u8, pane: ?u32, focused: bool } {
     return .{
-        .project = args.optionValue(argv, "--project"),
+        .workspace = workspaceOption(argv),
         .pane = parseOptionalU32(args.optionValue(argv, "--pane")),
         .focused = args.hasFlag(argv, "--focused"),
     };
 }
 
-fn processParams(argv: []const []const u8) struct { project: ?[]const u8, pane: ?u32, focused: bool, name: ?[]const u8, lines: ?u32 } {
+fn processParams(argv: []const []const u8) struct { workspace: ?[]const u8, pane: ?u32, focused: bool, name: ?[]const u8, lines: ?u32 } {
     return .{
-        .project = args.optionValue(argv, "--project"),
+        .workspace = workspaceOption(argv),
         .pane = parseOptionalU32(args.optionValue(argv, "--pane")),
         .focused = args.hasFlag(argv, "--focused"),
         .name = args.optionValue(argv, "--name"),
@@ -1551,7 +1557,8 @@ fn trailingFreeArg(argv: []const []const u8, positional_commands: usize) ?[]cons
 }
 
 fn optionConsumesValue(name: []const u8) bool {
-    return std.mem.eql(u8, name, "--project") or
+    return std.mem.eql(u8, name, "--workspace") or
+        std.mem.eql(u8, name, "--project") or
         std.mem.eql(u8, name, "--id") or
         std.mem.eql(u8, name, "--pane") or
         std.mem.eql(u8, name, "--kind") or
@@ -1636,9 +1643,9 @@ fn collectLayoutSessionRefs(
             const revive_policy = jsonString(node.object.get("revive_policy") orelse .null) orelse "attach_or_create";
             try sessions.append(allocator, .{
                 .session_id = session_id,
-                .project_index = project_index,
-                .project_id = try allocator.dupe(u8, project_id),
-                .project_path = try allocator.dupe(u8, project.path),
+                .workspace_index = project_index,
+                .workspace_id = try allocator.dupe(u8, project_id),
+                .workspace_path = try allocator.dupe(u8, project.path),
                 .dock_id = dock_id,
                 .pane_id = pane_id,
                 .label = try allocator.dupe(u8, label),
@@ -1668,14 +1675,14 @@ fn writeStatePanes(allocator: std.mem.Allocator, out: output.Output, state: db_t
     const project = state.projects[project_index];
     if (json) {
         try out.jsonValue(allocator, .{
-            .project = project.id orelse project.path,
+            .workspace = project.id orelse project.path,
             .workspace_layout_json = project.workspace_layout_json,
             .terminal_docks_json = project.terminal_docks_json,
             .live = false,
         });
         return;
     }
-    try out.stdout("Project: {s}\n", .{project.label});
+    try out.stdout("Workspace: {s}\n", .{project.label});
     if (project.workspace_layout_json) |layout| {
         try out.stdout("{s}\n", .{layout});
     } else {
@@ -1713,7 +1720,7 @@ fn writeStateTranscript(
     const thread = threads[thread_index];
     if (json) {
         try out.jsonValue(allocator, .{
-            .project = project.id orelse project.path,
+            .workspace = project.id orelse project.path,
             .thread_index = thread_index,
             .thread = thread,
         });
@@ -1727,7 +1734,7 @@ fn writeStateTranscript(
 
 fn resolvePersistedProject(out: output.Output, state: db_types.PersistedState, ref: []const u8) !usize {
     if (state.projects.len == 0) {
-        try out.stderr("no projects in persisted state\n", .{});
+        try out.stderr("no workspaces in persisted state\n", .{});
         std.process.exit(4);
     }
     if (std.mem.eql(u8, ref, "current")) return @min(state.selected_project_index, state.projects.len - 1);
@@ -1740,7 +1747,7 @@ fn resolvePersistedProject(out: output.Output, state: db_types.PersistedState, r
         }
         if (std.mem.eql(u8, project.path, ref)) return index;
     }
-    try out.stderr("project not found: {s}\n", .{ref});
+    try out.stderr("workspace not found: {s}\n", .{ref});
     std.process.exit(4);
 }
 
@@ -1782,7 +1789,7 @@ fn envVarOwned(allocator: std.mem.Allocator, comptime name: [:0]const u8) ![]u8 
 }
 
 test "cli args parse command and json flag" {
-    const argv = [_][]const u8{ "verde", "state", "projects", "--json" };
+    const argv = [_][]const u8{ "verde", "state", "workspaces", "--json" };
     const parsed = args.parse(&argv);
     try std.testing.expectEqualStrings("state", parsed.command);
     try std.testing.expect(parsed.json);
