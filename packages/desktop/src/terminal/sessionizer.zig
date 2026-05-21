@@ -16,9 +16,14 @@ pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
-const TERMINAL_WINSIZE_IOCTL = switch (builtin.os.tag) {
-    .macos => 0x80087467,
-    else => std.c.T.IOCSWINSZ,
+const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
+    .macos => @bitCast(@as(u32, 0x80087467)),
+    else => @intCast(std.c.T.IOCSWINSZ),
+};
+const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
+    .linux => @intCast(std.c.T.IOCGPGRP),
+    .macos => @bitCast(@as(u32, 0x40047477)),
+    else => null,
 };
 
 pub const RevivePolicy = enum {
@@ -362,8 +367,9 @@ const PtySession = struct {
 
     fn foregroundProcessGroup(self: *const PtySession) ?std.posix.pid_t {
         if (!self.running) return null;
+        const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
         var pgrp: c_int = 0;
-        if (std.c.ioctl(self.master_fd, std.c.T.IOCGPGRP, &pgrp) != 0 or pgrp <= 0) return null;
+        if (std.c.ioctl(self.master_fd, ioctl_value, &pgrp) != 0 or pgrp <= 0) return null;
         return @intCast(pgrp);
     }
 
