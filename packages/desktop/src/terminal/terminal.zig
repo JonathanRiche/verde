@@ -1417,6 +1417,7 @@ const UnixSession = struct {
     remote_output_offset: usize = 0,
     suppress_next_daemon_replay: bool = false,
     suppress_pty_responses: bool = false,
+    defer_daemon_replay_until_resize: bool = false,
     output_ring: std.ArrayList(u8) = .empty,
 
     const Backend = enum {
@@ -1558,7 +1559,10 @@ const UnixSession = struct {
         const next_cell_height = @max(cell_height, 1);
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
-        if (!size_changed and !metrics_changed) return;
+        if (!size_changed and !metrics_changed) {
+            if (self.backend == .daemon) self.defer_daemon_replay_until_resize = false;
+            return;
+        }
         self.cols = next_cols;
         self.rows = next_rows;
         self.cell_width = next_cell_width;
@@ -1568,7 +1572,10 @@ const UnixSession = struct {
         }
         switch (self.backend) {
             .local => self.applyWinsize(),
-            .daemon => try self.resizeDaemon(allocator),
+            .daemon => {
+                try self.resizeDaemon(allocator);
+                self.defer_daemon_replay_until_resize = false;
+            },
         }
         try self.refreshRenderState(allocator);
     }
@@ -1829,6 +1836,7 @@ const UnixSession = struct {
             attached_existing_session = !(sessionResultBool(allocator, create_response, "created") catch true);
         }
         self.suppress_next_daemon_replay = attached_existing_session;
+        self.defer_daemon_replay_until_resize = attached_existing_session;
 
         const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
@@ -1845,11 +1853,14 @@ const UnixSession = struct {
             };
         }
 
-        try self.resizeDaemon(allocator);
-        _ = try self.drainDaemonOutput(allocator);
+        if (!attached_existing_session) {
+            try self.resizeDaemon(allocator);
+            _ = try self.drainDaemonOutput(allocator);
+        }
     }
 
     fn drainDaemonOutput(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        if (self.defer_daemon_replay_until_resize) return false;
         const pref_path = self.pref_path orelse return false;
         const session_id = self.session_id orelse return false;
         const response = sessionizer.requestAlloc(allocator, pref_path, "session.tail", .{
