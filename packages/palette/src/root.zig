@@ -65,6 +65,7 @@ pub const CascadeMenuEvent = cascade_menu_component.CascadeMenuEvent;
 pub const CascadeMenuInput = cascade_menu_component.Input;
 pub const CascadeMenuItemLabelFn = cascade_menu_component.ItemLabelFn;
 pub const CascadeMenuRootPlacement = cascade_menu_component.RootPlacement;
+pub const CascadeMenuStyle = cascade_menu_component.CascadeMenuStyle;
 pub const CascadeMenuSubmenuPlacement = cascade_menu_component.SubmenuPlacement;
 pub const IconButtonConfig = button_component.IconButtonConfig;
 pub const ImageConfig = image_component.ImageConfig;

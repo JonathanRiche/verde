@@ -106,6 +106,48 @@ pub fn syncLegacyColors() void {
     COLOR_DIFF_ADD = current_colors.diff_add;
     COLOR_DIFF_REMOVE = current_colors.diff_remove;
     COLOR_ACCENT_DIM = current_colors.accent_dim;
+    syncMarkdownColors();
+}
+
+fn syncMarkdownColors() void {
+    md.text_body = current_colors.text;
+    md.text_h1 = mix(current_colors.warning, current_colors.text, 0.18);
+    md.text_h2 = mix(current_colors.warning, current_colors.text, 0.32);
+    md.text_h3 = mix(current_colors.accent, current_colors.text, 0.45);
+    md.text_h4_h6 = mix(current_colors.text, current_colors.background, 0.14);
+    md.text_quote = current_colors.text_muted;
+
+    md.inline_code = mix(current_colors.warning, current_colors.text, 0.18);
+    md.link = mix(current_colors.accent, current_colors.text, 0.18);
+    md.selection_fill = withAlpha(current_colors.selection, 210);
+
+    md.quote_bg = withAlpha(current_colors.panel_alt, 180);
+    md.quote_accent = md.link;
+    md.code_bg = darken(current_colors.panel, 0.035);
+    md.code_border = current_colors.panel_muted;
+    md.inline_code_pill = withAlpha(current_colors.panel_alt, 235);
+    md.rule = current_colors.panel_muted;
+    md.table_border = current_colors.panel_muted;
+    md.table_header_bg = withAlpha(current_colors.panel_alt, 210);
+
+    md.tok_plain = md.text_body;
+    md.tok_comment = current_colors.text_subtle;
+    md.tok_string = mix(current_colors.diff_add, current_colors.text, 0.12);
+    md.tok_number = mix(current_colors.warning, current_colors.text, 0.18);
+    md.tok_keyword = mix(current_colors.warning, current_colors.text, 0.05);
+    md.tok_type = md.link;
+    md.tok_function = mix(current_colors.accent, current_colors.text, 0.10);
+    md.tok_property = mix(current_colors.selection, current_colors.text, 0.22);
+    md.tok_variable = md.text_body;
+    md.tok_constant = mix(current_colors.warning, current_colors.text, 0.24);
+    md.tok_punct = current_colors.text_muted;
+
+    md.copy_bg_idle = withAlpha(current_colors.panel_alt, 210);
+    md.copy_bg_hover = withAlpha(lighten(current_colors.panel_alt, 0.10), 240);
+    md.copy_bg_recent = withAlpha(mix(current_colors.accent, current_colors.background, 0.34), 235);
+    md.copy_glyph_idle = current_colors.text_muted;
+    md.copy_glyph_hover = current_colors.text;
+    md.copy_glyph_recent = mix(current_colors.accent, current_colors.text, 0.22);
 }
 
 pub const TRANSCRIPT_BUBBLE_PADDING_X: f32 = 18.0;
@@ -116,56 +158,56 @@ pub const TRANSCRIPT_BUBBLE_ROUNDING: f32 = 14.0;
 /// the whole table in one place. All values are RGBA [4]f32 in 0..1 space.
 pub const md = struct {
     // Prose body and headings.
-    pub const text_body = rgb(0xE2, 0xE4, 0xE9);
-    pub const text_h1 = rgb(0xFF, 0xF2, 0xA8);
-    pub const text_h2 = rgb(0xF2, 0xE6, 0x8D);
-    pub const text_h3 = rgb(0xDE, 0xE8, 0xFF);
-    pub const text_h4_h6 = rgb(0xCF, 0xD7, 0xE5);
-    pub const text_quote = rgb(0xB3, 0xBE, 0xD4);
+    pub var text_body = rgb(0xE2, 0xE4, 0xE9);
+    pub var text_h1 = rgb(0xFF, 0xF2, 0xA8);
+    pub var text_h2 = rgb(0xF2, 0xE6, 0x8D);
+    pub var text_h3 = rgb(0xDE, 0xE8, 0xFF);
+    pub var text_h4_h6 = rgb(0xCF, 0xD7, 0xE5);
+    pub var text_quote = rgb(0xB3, 0xBE, 0xD4);
 
     // Inline-style overrides.
-    pub const inline_code = rgb(0xF5, 0xD0, 0x7A);
-    pub const link = rgb(0x7A, 0xCA, 0xFF);
+    pub var inline_code = rgb(0xF5, 0xD0, 0x7A);
+    pub var link = rgb(0x7A, 0xCA, 0xFF);
 
     // Selection / chrome.
-    pub const selection_fill = rgba(88, 166, 255, 255);
+    pub var selection_fill = rgba(88, 166, 255, 255);
 
     // Blockquote chrome.
-    pub const quote_bg = rgba(38, 41, 48, 140);
-    pub const quote_accent = link;
+    pub var quote_bg = rgba(38, 41, 48, 140);
+    pub var quote_accent = rgb(0x7A, 0xCA, 0xFF);
 
     // Fenced code block frame.
-    pub const code_bg = rgba(24, 24, 28, 255);
-    pub const code_border = rgba(52, 54, 62, 255);
-    pub const inline_code_pill = rgba(38, 41, 48, 235);
+    pub var code_bg = rgba(24, 24, 28, 255);
+    pub var code_border = rgba(52, 54, 62, 255);
+    pub var inline_code_pill = rgba(38, 41, 48, 235);
 
     // Thematic rule (`---`).
-    pub const rule = rgba(68, 72, 82, 255);
+    pub var rule = rgba(68, 72, 82, 255);
 
     // GFM tables.
-    pub const table_border = rgba(68, 72, 82, 255);
-    pub const table_header_bg = rgba(38, 41, 48, 200);
+    pub var table_border = rgba(68, 72, 82, 255);
+    pub var table_header_bg = rgba(38, 41, 48, 200);
 
     // Syntax tokens.
-    pub const tok_plain = text_body;
-    pub const tok_comment = rgb(0x8A, 0x91, 0xA0);
-    pub const tok_string = rgb(0x66, 0xDC, 0xAA);
-    pub const tok_number = rgb(0xF5, 0xB4, 0x78);
-    pub const tok_keyword = rgb(0xFF, 0xD6, 0x66);
-    pub const tok_type = rgb(0x7A, 0xCA, 0xFF);
-    pub const tok_function = rgb(0x60, 0xDB, 0xDB);
-    pub const tok_property = rgb(0x6B, 0xA8, 0xFF);
-    pub const tok_variable = text_body;
-    pub const tok_constant = rgb(0xF1, 0xC4, 0x6B);
-    pub const tok_punct = rgb(0xB6, 0xBB, 0xC5);
+    pub var tok_plain = rgb(0xE2, 0xE4, 0xE9);
+    pub var tok_comment = rgb(0x8A, 0x91, 0xA0);
+    pub var tok_string = rgb(0x66, 0xDC, 0xAA);
+    pub var tok_number = rgb(0xF5, 0xB4, 0x78);
+    pub var tok_keyword = rgb(0xFF, 0xD6, 0x66);
+    pub var tok_type = rgb(0x7A, 0xCA, 0xFF);
+    pub var tok_function = rgb(0x60, 0xDB, 0xDB);
+    pub var tok_property = rgb(0x6B, 0xA8, 0xFF);
+    pub var tok_variable = rgb(0xE2, 0xE4, 0xE9);
+    pub var tok_constant = rgb(0xF1, 0xC4, 0x6B);
+    pub var tok_punct = rgb(0xB6, 0xBB, 0xC5);
 
     // Copy-button states (idle / hover / recently-clicked).
-    pub const copy_bg_idle = rgba(38, 41, 48, 200);
-    pub const copy_bg_hover = rgba(64, 70, 82, 235);
-    pub const copy_bg_recent = rgba(46, 110, 70, 230);
-    pub const copy_glyph_idle = rgba(190, 195, 205, 255);
-    pub const copy_glyph_hover = rgba(245, 245, 250, 255);
-    pub const copy_glyph_recent = rgba(220, 246, 200, 255);
+    pub var copy_bg_idle = rgba(38, 41, 48, 200);
+    pub var copy_bg_hover = rgba(64, 70, 82, 235);
+    pub var copy_bg_recent = rgba(46, 110, 70, 230);
+    pub var copy_glyph_idle = rgba(190, 195, 205, 255);
+    pub var copy_glyph_hover = rgba(245, 245, 250, 255);
+    pub var copy_glyph_recent = rgba(220, 246, 200, 255);
 };
 
 pub var heading_font_size: f32 = DEFAULT_FONT_SIZE * 1.28;
