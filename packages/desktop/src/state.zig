@@ -551,6 +551,18 @@ fn paletteModelCascadeRenderRowLeading(
     }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
 }
 
+fn paletteModelCascadeStyle() palette.CascadeMenuStyle {
+    return .{
+        .background_color = paletteColor(theme.COLOR_PANEL_ALT),
+        .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
+        .highlighted_color = paletteColor(theme.withAlpha(theme.selection(), 190)),
+        .text_color = paletteColor(theme.COLOR_WHITE),
+        .icon_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .scrollbar_track_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 110)),
+        .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 220)),
+    };
+}
+
 pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
     .width = COMPOSER_MODEL_CASCADE_WIDTH,
     .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
@@ -2599,7 +2611,7 @@ pub const SidebarContextMenuKind = enum {
 };
 
 pub const AppState = struct {
-    const DRAFT_CAPACITY = 8192;
+    const DRAFT_CAPACITY = 64 * 1024;
     const SAVE_DEBOUNCE_MS: i64 = 750;
 
     allocator: std.mem.Allocator,
@@ -5275,13 +5287,49 @@ pub const AppState = struct {
         };
     }
 
+    fn paletteComposerSelectionByteLen(self: *const AppState) usize {
+        const anchor = self.palette_composer.selection_anchor orelse return 0;
+        const focus = self.palette_composer.selection_focus orelse return 0;
+        const text_len = self.palette_composer.text().len;
+        const start = @min(@min(anchor, focus), text_len);
+        const end = @min(@max(anchor, focus), text_len);
+        return end - start;
+    }
+
+    fn utf8PrefixLen(value: []const u8, limit: usize) usize {
+        const capped = @min(value.len, limit);
+        if (capped >= value.len) return value.len;
+        var end = capped;
+        while (end > 0 and (value[end] & 0b1100_0000) == 0b1000_0000) {
+            end -= 1;
+        }
+        return end;
+    }
+
+    fn clampPaletteComposerInsertText(self: *AppState, text: []const u8) []const u8 {
+        const max_len = DRAFT_CAPACITY - 1;
+        const current_len = self.palette_composer.text().len;
+        const selected_len = self.paletteComposerSelectionByteLen();
+        const retained_len = current_len - selected_len;
+        if (retained_len >= max_len) return "";
+        const available = max_len - retained_len;
+        if (text.len <= available) return text;
+        return text[0..utf8PrefixLen(text, available)];
+    }
+
     fn insertTextIntoPaletteComposer(self: *AppState, text: []const u8) bool {
         if (text.len == 0) return false;
         self.palette_composer.focused = true;
         self.composer_focused = true;
         self.terminal_focused = false;
         self.unfocusBrowserPane();
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+        const insert_text = self.clampPaletteComposerInsertText(text);
+        if (insert_text.len == 0) {
+            self.setSidebarNotice("Prompt is full");
+            return true;
+        }
+        if (insert_text.len < text.len) self.setSidebarNotice("Pasted text was truncated to fit the prompt");
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
             log.warn("palette composer paste failed: {s}", .{@errorName(err)});
             return false;
         };
@@ -9057,6 +9105,7 @@ pub const AppState = struct {
 
     pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
         self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
+        self.palette_model_cascade.setStyle(paletteModelCascadeStyle());
         self.palette_model_cascade.setFontMetrics(paletteEstimatedFontMetrics(20.0));
         self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
     }
@@ -9143,7 +9192,9 @@ pub const AppState = struct {
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
         if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = text }) catch |err| {
+        const insert_text = self.clampPaletteComposerInsertText(text);
+        if (insert_text.len == 0) return true;
+        const handled = self.palette_composer.handleInput(self.allocator, .{ .text = insert_text }) catch |err| {
             log.warn("palette composer text input failed: {s}", .{@errorName(err)});
             return false;
         };

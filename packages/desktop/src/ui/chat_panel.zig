@@ -32,6 +32,7 @@ const COMPOSER_TOOLBAR_PILL_PAD_X: f32 = 13.0;
 const COMPOSER_PROVIDER_LOGO_SLOT_CSS: f32 = 26.0;
 const TRANSCRIPT_MAX_WIDTH: f32 = 900.0;
 const TRANSCRIPT_LINE_HEIGHT: f32 = 22.0;
+const TRANSCRIPT_MARKDOWN_FONT_SIZE: f32 = 15.5;
 /// Direct wheel scroll (no inertia); larger than legacy 64 for faster scanning.
 const TRANSCRIPT_WHEEL_PIXELS: f32 = 96.0;
 const TRANSCRIPT_PAGE_VIEW_FRAC: f32 = 0.88;
@@ -453,9 +454,9 @@ fn assistantTranscriptMarkdownHit(
 
     const body_rect = palette.Rect{
         .x = bubble.x + theme.scaledUi(14.0),
-        .y = bubble.y + theme.scaledUi(32.0),
+        .y = bubble.y + theme.scaledUi(34.0),
         .w = bubble.w - theme.scaledUi(28.0),
-        .h = bubble.h - theme.scaledUi(38.0),
+        .h = bubble.h - theme.scaledUi(42.0),
     };
     if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
 
@@ -465,7 +466,7 @@ fn assistantTranscriptMarkdownHit(
     const pt = chat_markdown.hitTestSelectablePaletteBody(
         state.allocator,
         view,
-        markdownOptions(theme.scaledUi(16.0)),
+        transcriptMarkdownOptions(),
         body_rect,
         body_rect.w,
         mouse_x,
@@ -555,7 +556,7 @@ fn applyTranscriptMarkdownMulticlick(state: *app_state.AppState, hit: Transcript
     const snap = transcriptMarkdownMessageSnapshot(state, hit.message_index) orelse return;
     var view = chat_markdown.buildBodyView(state.allocator, snap.body_trim) catch return;
     defer view.deinit(state.allocator);
-    const md = markdownOptions(theme.scaledUi(16.0));
+    const md = transcriptMarkdownOptions();
     const range = chat_markdown.selectionRangeForClickCount(
         state.allocator,
         view,
@@ -679,7 +680,7 @@ pub fn selectAllTranscriptMarkdownInThread(state: *app_state.AppState) bool {
 
     var last_view = chat_markdown.buildBodyView(state.allocator, last_snap.body_trim) catch return false;
     defer last_view.deinit(state.allocator);
-    const md = markdownOptions(theme.scaledUi(16.0));
+    const md = transcriptMarkdownOptions();
     const last_pt = chat_markdown.lastSelectablePointInBody(
         state.allocator,
         last_view,
@@ -771,7 +772,7 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
             mi,
             view,
             snap.body_inner_w,
-            markdownOptions(theme.scaledUi(16.0)),
+            transcriptMarkdownOptions(),
         ) orelse continue;
 
         var scratch_batch = palette.RenderBatch{};
@@ -793,7 +794,7 @@ pub fn transcriptMarkdownSelectionPlainText(state: *app_state.AppState) std.mem.
             &ctx,
             state.allocator,
             view,
-            markdownOptions(theme.scaledUi(16.0)),
+            transcriptMarkdownOptions(),
             local,
             true,
         );
@@ -1748,7 +1749,7 @@ fn transcriptMessageHeightStream(
         return diffSummaryHeight(state, message_index, body_raw, column_width);
     }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
-    const font_size = theme.scaledUi(15.5);
+    const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
     const body_width = if (role == .user) column_width * 0.62 else column_width;
     const body_inner_width = @max(body_width - theme.scaledUi(28.0), theme.scaledUi(80.0));
     if (role == .assistant and !assistant_plain_layout) {
@@ -2345,7 +2346,7 @@ fn renderTranscriptBubbleFromParts(
     if (role == .assistant and !muted_body and !assistant_plain_layout) {
         renderMarkdownBody(state, message_index, body_rect, body_text, clip, streaming);
     } else {
-        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(15.5), clip);
+        renderWrappedBody(state, body_rect, body_text, body_color, theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE), clip);
     }
 }
 
@@ -2356,6 +2357,10 @@ fn markdownOptions(font_size: f32) chat_markdown.RenderOptions {
         .glyph_width = font_size * 0.53,
         .code_font_size = font_size * 0.88,
     };
+}
+
+fn transcriptMarkdownOptions() chat_markdown.RenderOptions {
+    return markdownOptions(theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE));
 }
 
 fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: palette.Rect, body: []const u8, clip: palette.Rect, streaming: bool) void {
@@ -2381,8 +2386,7 @@ fn renderMarkdownBody(state: *app_state.AppState, message_index: usize, rect: pa
 }
 
 fn renderMarkdownBodyView(state: *app_state.AppState, message_index: usize, rect: palette.Rect, view: chat_markdown.BodyView, clip: palette.Rect) void {
-    const font_size = theme.scaledUi(15.5);
-    const md_opts = markdownOptions(font_size);
+    const md_opts = transcriptMarkdownOptions();
     const local_sel: ?chat_markdown.SelectionRange = if (state.transcriptMarkdownSelection()) |s| blk: {
         break :blk chat_markdown.localMarkdownSelectionRangeForMessage(
             state.allocator,

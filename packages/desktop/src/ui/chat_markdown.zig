@@ -52,8 +52,6 @@ fn inlineWhitespaceWidth(font_size: f32, text: []const u8) ?f32 {
 const Allocator = std.mem.Allocator;
 
 /// Opaque fill: translucent alpha looked muddy over dark transcript bubbles under GL blending.
-const markdown_selection_fill_rgba = theme.md.selection_fill;
-
 /// Central spacing table for markdown rendering. Helpers below scale these
 /// against `defaultLineHeight(options)` (a function of `base_font_size`), so
 /// every spacing decision is reducible to one of: a line-height ratio, a
@@ -2020,6 +2018,8 @@ const SelectableLineChunk = struct {
     block_style: TextStyle,
     inline_style: InlineStyle,
     font_spec: FontSpec,
+    font_size: f32,
+    font_role: palette.FontRole,
     x: f32,
     width: f32,
     line_height: f32,
@@ -2265,7 +2265,7 @@ pub fn hitTestSelectablePaletteBody(
                     const top = content_start[1] + line.y;
                     const bottom = top + line.height;
                     if (mouse[1] >= top and mouse[1] <= bottom) {
-                        const col = hoveredColumnForCodeLine(line, mouse[0] - content_start[0]);
+                        const col = hoveredColumnForCodeLine(line, mouse[0] - content_start[0], options);
                         return .{ .line_index = global_line_index + index, .column = col };
                     }
                 }
@@ -2341,11 +2341,11 @@ fn sliceForColumns(text: []const u8, start_column: usize, end_column: usize) []c
     return text[start..@min(end, text.len)];
 }
 
-fn textWidthForColumns(spec: FontSpec, text: []const u8, column: usize) f32 {
-    return textWidthForSpec(spec, text[0..byteOffsetForColumn(text, column)]);
+fn textWidthForColumns(font_size: f32, role: palette.FontRole, text: []const u8, column: usize) f32 {
+    return transcriptTextWidthForRole(font_size, role, text[0..byteOffsetForColumn(text, column)]);
 }
 
-fn columnForX(spec: FontSpec, text: []const u8, x: f32) usize {
+fn columnForX(font_size: f32, role: palette.FontRole, text: []const u8, x: f32) usize {
     if (x <= 0.0) return 0;
     const total_columns = countColumns(text);
     if (total_columns == 0) return 0;
@@ -2354,7 +2354,7 @@ fn columnForX(spec: FontSpec, text: []const u8, x: f32) usize {
     var high: usize = total_columns;
     while (low < high) {
         const mid = (low + high + 1) / 2;
-        if (textWidthForColumns(spec, text, mid) <= x) {
+        if (textWidthForColumns(font_size, role, text, mid) <= x) {
             low = mid;
         } else {
             high = mid - 1;
@@ -2363,8 +2363,8 @@ fn columnForX(spec: FontSpec, text: []const u8, x: f32) usize {
 
     if (low >= total_columns) return total_columns;
 
-    const current_width = textWidthForColumns(spec, text, low);
-    const next_width = textWidthForColumns(spec, text, low + 1);
+    const current_width = textWidthForColumns(font_size, role, text, low);
+    const next_width = textWidthForColumns(font_size, role, text, low + 1);
     return if (@abs(x - current_width) <= @abs(next_width - x)) low else low + 1;
 }
 
@@ -2482,6 +2482,7 @@ fn buildSelectableTextLines(
         current_y: ?f32 = null,
         current_height: f32 = 0.0,
         current_columns: usize = 0,
+        options: RenderOptions,
         failed: ?Allocator.Error = null,
 
         fn finalize(self: *@This()) void {
@@ -2527,6 +2528,8 @@ fn buildSelectableTextLines(
                 .block_style = step.block_style,
                 .inline_style = step.inline_style,
                 .font_spec = step.font_spec,
+                .font_size = fontSizeForSpecWithOptions(step.font_spec, self.options),
+                .font_role = markdownFontRole(step.block_style, step.inline_style),
                 .x = step.x,
                 .width = step.width,
                 .line_height = step.line_height,
@@ -2541,7 +2544,7 @@ fn buildSelectableTextLines(
         }
     };
 
-    var builder: Builder = .{ .allocator = allocator };
+    var builder: Builder = .{ .allocator = allocator, .options = options };
     errdefer {
         builder.current_chunks.deinit(allocator);
         deinitSelectableLines(allocator, builder.lines.items);
@@ -2589,7 +2592,7 @@ fn hoveredColumnForLine(line: SelectableLine, local_x: f32) usize {
 
         const chunk_end_x = chunk.x + chunk.width;
         if (x <= chunk_end_x) {
-            return chunk.start_column + columnForX(chunk.font_spec, chunk.text, x - chunk.x);
+            return chunk.start_column + columnForX(chunk.font_size, chunk.font_role, chunk.text, x - chunk.x);
         }
 
         previous_end_x = chunk_end_x;
@@ -2627,14 +2630,14 @@ fn renderSelectableLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = paletteColor(markdown_selection_fill_rgba);
+                const selection_col = paletteColor(theme.md.selection_fill);
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
                     if (chunk_start >= chunk_end) continue;
 
-                    const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
-                    const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
+                    const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_size, chunk.font_role, chunk.text, chunk_start - chunk.start_column);
+                    const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_size, chunk.font_role, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
                         queuePaletteRoundedRect(context, .{ .x = x0, .y = top, .w = x1 - x0, .h = bottom - top }, selection_col, 2.0);
                     }
@@ -2845,7 +2848,7 @@ fn buildSelectableCodeLinesWithWrap(
     return lines.toOwnedSlice(allocator);
 }
 
-fn hoveredColumnForCodeLine(line: SelectableCodeLine, local_x: f32) usize {
+fn hoveredColumnForCodeLine(line: SelectableCodeLine, local_x: f32, options: RenderOptions) usize {
     if (line.chunks.len == 0) return 0;
 
     const x = @max(local_x, 0.0);
@@ -2861,7 +2864,7 @@ fn hoveredColumnForCodeLine(line: SelectableCodeLine, local_x: f32) usize {
 
         const chunk_end_x = chunk.x + chunk.width;
         if (x <= chunk_end_x) {
-            return chunk.start_column + columnForX(chunk.font_spec, chunk.text, x - chunk.x);
+            return chunk.start_column + columnForX(codeFontSize(options), .mono, chunk.text, x - chunk.x);
         }
 
         previous_end_x = chunk_end_x;
@@ -2893,7 +2896,7 @@ fn renderSelectableCodeLine(
     if (hovered and output.hovered_point == null and mouse_pos[1] >= top and mouse_pos[1] <= bottom) {
         output.hovered_point = .{
             .line_index = line_index,
-            .column = hoveredColumnForCodeLine(line, mouse_pos[0] - start[0]),
+            .column = hoveredColumnForCodeLine(line, mouse_pos[0] - start[0], options),
         };
     }
 
@@ -2902,14 +2905,14 @@ fn renderSelectableCodeLine(
     if (selection) |ordered| {
         if (selectionColumnsForLine(ordered, line_index, line.total_columns)) |columns| {
             if (columns.start != columns.end) {
-                const selection_col = paletteColor(markdown_selection_fill_rgba);
+                const selection_col = paletteColor(theme.md.selection_fill);
                 for (line.chunks) |chunk| {
                     const chunk_start = @max(columns.start, chunk.start_column);
                     const chunk_end = @min(columns.end, chunk.end_column);
                     if (chunk_start >= chunk_end) continue;
 
-                    const x0 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_start - chunk.start_column);
-                    const x1 = start[0] + chunk.x + textWidthForColumns(chunk.font_spec, chunk.text, chunk_end - chunk.start_column);
+                    const x0 = start[0] + chunk.x + textWidthForColumns(codeFontSize(options), .mono, chunk.text, chunk_start - chunk.start_column);
+                    const x1 = start[0] + chunk.x + textWidthForColumns(codeFontSize(options), .mono, chunk.text, chunk_end - chunk.start_column);
                     if (x1 > x0) {
                         const chunk_top = top + chunk.y_offset;
                         queuePaletteRoundedRect(context, .{ .x = x0, .y = chunk_top, .w = x1 - x0, .h = lh }, selection_col, 2.0);
@@ -3074,7 +3077,7 @@ fn renderSelectableTableBlock(
                     .y = row_top,
                     .w = width,
                     .h = row_h,
-                }, paletteColor(markdown_selection_fill_rgba));
+                }, paletteColor(theme.md.selection_fill));
             }
         }
 

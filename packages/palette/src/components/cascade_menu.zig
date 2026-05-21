@@ -123,6 +123,16 @@ pub const CascadeMenuCallbacks = struct {
     on_event: ?*const fn (context: ?*anyopaque, event: CascadeMenuEvent) void = null,
 };
 
+pub const CascadeMenuStyle = struct {
+    background_color: draw.Color,
+    border_color: draw.Color,
+    highlighted_color: draw.Color,
+    text_color: draw.Color,
+    icon_color: draw.Color,
+    scrollbar_track_color: draw.Color,
+    scrollbar_thumb_color: draw.Color,
+};
+
 pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
     if (config.max_depth == 0) @compileError("CascadeMenuConfig.max_depth must be greater than zero");
 
@@ -144,6 +154,15 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
         anchor_rect: ?draw.Rect = config.anchor_rect,
         forbidden_rect: ?draw.Rect = config.forbidden_rect,
         z_index: i32 = config.z_index,
+        style: CascadeMenuStyle = .{
+            .background_color = config.background_color,
+            .border_color = config.border_color,
+            .highlighted_color = config.highlighted_color,
+            .text_color = config.text_color,
+            .icon_color = config.icon_color,
+            .scrollbar_track_color = config.scrollbar_track_color,
+            .scrollbar_thumb_color = config.scrollbar_thumb_color,
+        },
         callbacks: CascadeMenuCallbacks = .{},
 
         pub fn init(item_count: usize) Component {
@@ -160,6 +179,10 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
 
         pub fn setCallbacks(self: *Component, callbacks: CascadeMenuCallbacks) void {
             self.callbacks = callbacks;
+        }
+
+        pub fn setStyle(self: *Component, style: CascadeMenuStyle) void {
+            self.style = style;
         }
 
         pub fn setFontMetrics(self: *Component, metrics_value: text_layout.FontMetrics) void {
@@ -354,14 +377,14 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                 _ = batch.setZIndex(self.z_index + @as(i32, @intCast(depth)) * config.submenu_z_offset);
                 const menu = self.menuRect(depth);
                 const inset = @max(config.border_width, 1.0);
-                try batch.roundedRectClipped(allocator, menu, config.border_color, config.corner_radius, menu);
+                try batch.roundedRectClipped(allocator, menu, self.style.border_color, config.corner_radius, menu);
                 if (menu.w > inset * 2.0 and menu.h > inset * 2.0) {
                     try batch.roundedRectClipped(allocator, .{
                         .x = menu.x + inset,
                         .y = menu.y + inset,
                         .w = menu.w - inset * 2.0,
                         .h = menu.h - inset * 2.0,
-                    }, config.background_color, @max(config.corner_radius - inset, 0.0), menu);
+                    }, self.style.background_color, @max(config.corner_radius - inset, 0.0), menu);
                 }
 
                 const range = self.visibleRange(depth);
@@ -370,7 +393,7 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                     const row = self.rowRect(depth, index);
                     const row_corner = @min(9.0, @max(4.0, config.row_height * 0.38));
                     if (self.highlighted[depth] == index) {
-                        try batch.roundedRectClipped(allocator, row, config.highlighted_color, row_corner, self.menuContentRect(depth));
+                        try batch.roundedRectClipped(allocator, row, self.style.highlighted_color, row_corner, self.menuContentRect(depth));
                     }
                     if (config.render_row_leading) |render_leading| {
                         if (config.row_leading_width > 0.0) {
@@ -678,7 +701,7 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                 .y = text_y,
                 .w = label_w,
                 .h = metrics_value.line_height,
-            }, label, config.text_color, metrics_value.font_size, config.font_role, config.font_id, label_clip);
+            }, label, self.style.text_color, metrics_value.font_size, config.font_role, config.font_id, label_clip);
             if (has_children and config.chevron_icon.len > 0) {
                 const chevron_x = row.x + leading_pad + label_w + config.icon_gap;
                 const chevron_clip = draw.Rect{
@@ -692,15 +715,15 @@ pub fn CascadeMenu(comptime config: CascadeMenuConfig) type {
                     .y = row.y + @max((row.h - icon_metrics.line_height) * 0.5, 0.0),
                     .w = chevron_w,
                     .h = icon_metrics.line_height,
-                }, config.chevron_icon, config.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, chevron_clip);
+                }, config.chevron_icon, self.style.icon_color, icon_metrics.font_size, config.icon_font_role, config.icon_font_id, chevron_clip);
             }
         }
 
         fn renderScrollbar(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, depth: usize) !void {
             if (!config.scroll_enabled or scroll.maxOffsetY(self.scrollMetrics(depth)) <= 0.0 or config.scrollbar_width <= 0.0) return;
             const track = self.scrollbarTrackRect(depth);
-            try batch.scrollbar(allocator, track, config.scrollbar_track_color);
-            if (self.scrollbarThumbRect(depth)) |thumb| try batch.scrollbar(allocator, thumb, config.scrollbar_thumb_color);
+            try batch.scrollbar(allocator, track, self.style.scrollbar_track_color);
+            if (self.scrollbarThumbRect(depth)) |thumb| try batch.scrollbar(allocator, thumb, self.style.scrollbar_thumb_color);
         }
 
         fn scrollbarTrackRect(self: *const Component, depth: usize) draw.Rect {
