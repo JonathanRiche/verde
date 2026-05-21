@@ -43,6 +43,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    access_mode integer,
     \\    provider integer not null,
     \\    harness integer not null,
+    \\    tui_dock_id integer,
     \\    draft text not null default '',
     \\    draft_image_path text,
     \\    draft_image_mime text,
@@ -74,6 +75,7 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "projects", "workspace_layout_json", "alter table projects add column workspace_layout_json text");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
+    try ensureColumn(conn, "threads", "tui_dock_id", "alter table threads add column tui_dock_id integer");
 }
 
 fn ensureColumn(conn: zqlite.Conn, table_name: []const u8, column_name: []const u8, alter_sql: [*:0]const u8) !void {
