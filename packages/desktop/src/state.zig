@@ -8309,6 +8309,41 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn focusPromptForFocusedChatWorkspacePane(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        var project = &self.projects.items[self.selected_project_index];
+        const pane_id = project.workspace_layout.focused_pane_id orelse return false;
+        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+        const thread_index = switch (pane.ref) {
+            .chat => |ref| ref.thread_index,
+            else => return false,
+        };
+        if (thread_index >= project.threads.items.len) return false;
+        project.selected_thread_index = thread_index;
+        self.syncPaletteComposerFromDraft();
+        self.palette_composer.focused = true;
+        self.composer_focused = true;
+        self.terminal_focused = false;
+        self.unfocusBrowserPane();
+        self.browser_address_focused = false;
+        self.ensurePaletteComposerCursorVisible();
+        self.markDirty();
+        return true;
+    }
+
+    pub fn swapCurrentProjectWorkspacePanes(self: *AppState, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const first_index = layout.paneIndexById(first_pane_id) orelse return false;
+        const second_index = layout.paneIndexById(second_pane_id) orelse return false;
+        if (layout.panes.items[first_index].minimized or layout.panes.items[second_index].minimized) return false;
+        const first_ref = layout.panes.items[first_index].ref;
+        layout.panes.items[first_index].ref = layout.panes.items[second_index].ref;
+        layout.panes.items[second_index].ref = first_ref;
+        self.markDirty();
+        return true;
+    }
+
     pub fn toggleCurrentProjectWorkspacePaneMaximized(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;

@@ -989,6 +989,18 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
+                if (selectWorkspaceBySidebarOrdinal(state, workspace_ordinal)) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
+            if (!state.palette_composer.focused and keyboard.workspaceFocusPromptForEvent(&event.key)) {
+                if (state.focusPromptForFocusedChatWorkspacePane()) {
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             if (state.routePaletteComposerKeyDown(&event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -1647,11 +1659,26 @@ fn handleKeyboardAction(
         .workspace_focus_right => _ = workspace_panes_ui.focusPaneInDirection(state, .right),
         .workspace_focus_up => _ = workspace_panes_ui.focusPaneInDirection(state, .up),
         .workspace_focus_down => _ = workspace_panes_ui.focusPaneInDirection(state, .down),
+        .workspace_move_left => _ = workspace_panes_ui.movePaneInDirection(state, .left),
+        .workspace_move_right => _ = workspace_panes_ui.movePaneInDirection(state, .right),
+        .workspace_move_up => _ = workspace_panes_ui.movePaneInDirection(state, .up),
+        .workspace_move_down => _ = workspace_panes_ui.movePaneInDirection(state, .down),
         .workspace_grow_left => _ = workspace_panes_ui.growPaneInDirection(state, .left),
         .workspace_grow_right => _ = workspace_panes_ui.growPaneInDirection(state, .right),
         .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
         .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
+}
+
+fn selectWorkspaceBySidebarOrdinal(state: *AppState, ordinal: usize) bool {
+    if (ordinal >= state.projects.items.len) return false;
+    if (state.selected_project_index == ordinal) return true;
+    state.selected_project_index = ordinal;
+    state.ensureCurrentProjectWorkspace();
+    state.workspace_header_open_menu_open = false;
+    state.sidebar_context_menu_open = false;
+    state.markDirty();
+    return true;
 }
 
 fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
@@ -1660,6 +1687,10 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
         .workspace_focus_right,
         .workspace_focus_up,
         .workspace_focus_down,
+        .workspace_move_left,
+        .workspace_move_right,
+        .workspace_move_up,
+        .workspace_move_down,
         .workspace_grow_left,
         .workspace_grow_right,
         .workspace_grow_up,
