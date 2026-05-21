@@ -1012,6 +1012,15 @@ pub const Renderer = struct {
         if (c.TTF_FontHasGlyph(mono, codepoint)) return font_role;
         const icon = self.fontForRoleAndSize(font_size, .icon) catch return font_role;
         if (c.TTF_FontHasGlyph(icon, codepoint)) return .icon;
+        // Last resort: the prose face (Noto Sans) has broad Unicode coverage —
+        // notably the Dingbats block (U+2700..U+27BF) that the mono/icon Nerd
+        // faces only partially carry. This is what rescues e.g. Claude Code's
+        // ✻/✽/✶ spinner frames, which otherwise render inconsistently (some
+        // present in JetBrains Mono, others falling through to tofu).
+        if (self.prose_font != null) {
+            const prose = self.fontForRoleAndSize(font_size, .prose) catch return font_role;
+            if (c.TTF_FontHasGlyph(prose, codepoint)) return .prose;
+        }
         return font_role;
     }
 
