@@ -1310,6 +1310,9 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (state.handleBrowserMouse(browserMouseWheelEvent(&event.wheel))) {
                 return true;
             }
+            if (chat_panel_ui.handleFocusedTranscriptPaletteWheel(state, event.wheel.y)) {
+                return true;
+            }
         },
         else => {},
     }

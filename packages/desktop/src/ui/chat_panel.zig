@@ -418,6 +418,23 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
     if (wheel_y == 0.0) return false;
     const hit = findTranscriptHit(x, y) orelse return false;
     const pane_id = hit.pane_id;
+    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    return true;
+}
+
+/// Fallback for precise trackpad gestures that begin over the focused chat
+/// pane's lower chrome instead of the transcript body. Primary scrollable
+/// widgets are offered the event first; this keeps the active transcript
+/// responsive without stealing wheel input from text fields, terminals, or the
+/// browser pane.
+pub fn handleFocusedTranscriptPaletteWheel(state: *app_state.AppState, wheel_y: f32) bool {
+    if (wheel_y == 0.0) return false;
+    const pane_id = state.focusedWorkspaceChatPaneId() orelse if (state.focusedWorkspacePaneKind() == .chat) null else return false;
+    scrollTranscriptByWheel(state, pane_id, wheel_y);
+    return true;
+}
+
+fn scrollTranscriptByWheel(state: *app_state.AppState, pane_id: ?app_state.WorkspacePaneId, wheel_y: f32) void {
     if (pane_id) |id| _ = state.focusCurrentProjectWorkspacePane(id);
     state.transcript_focused = true;
     const current = currentTranscriptScrollY(state, pane_id) orelse state.transcript_palette_scroll_y;
@@ -426,7 +443,6 @@ pub fn handleTranscriptPaletteWheel(state: *app_state.AppState, x: f32, y: f32, 
     state.transcript_auto_follow_pending = false;
     state.scroll_transcript_to_bottom_frames = 0;
     state.markDirty();
-    return true;
 }
 
 const TranscriptMarkdownHit = struct {

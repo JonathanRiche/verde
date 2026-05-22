@@ -117,6 +117,7 @@ const PALETTE_COMPOSER_FONT_SIZE: f32 = 22.0;
 const PALETTE_COMPOSER_TOOLBAR_FONT_SIZE: f32 = 15.0;
 const PALETTE_COMPOSER_ICON_FONT_SIZE: f32 = 18.0;
 const PALETTE_COMPOSER_TEXT_ADVANCE_SCALE: f32 = 1.0;
+const PALETTE_GPU_TEXT_FONT_SCALE: f32 = 0.86;
 
 fn paletteColor(color: [4]f32) palette.Color {
     return .{ .r = color[0], .g = color[1], .b = color[2], .a = color[3] };
@@ -236,17 +237,21 @@ fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: us
     if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
     const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
     const end = @min(byte_offset + seq_len, text.len);
-    _ = std.unicode.utf8Decode(text[byte_offset..end]) catch {
+    const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
         return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
+    return .{ .byte_len = end - byte_offset, .width = estimatedUiCodepointAdvance(cp, font_size) };
+}
 
-    var line_start: usize = byte_offset;
-    while (line_start > 0 and text[line_start - 1] != '\n') : (line_start -= 1) {}
-    const line = text[line_start..];
-    const before = text_measure.textPrefixWidth(.ui, line, font_size, byte_offset - line_start);
-    const through = text_measure.textPrefixWidth(.ui, line, font_size, end - line_start);
-    const w = through - before;
-    return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
+fn estimatedUiCodepointAdvance(cp: u21, font_size: f32) f32 {
+    const render_size = font_size * PALETTE_GPU_TEXT_FONT_SCALE;
+    return switch (cp) {
+        'i', 'l', 'I', '.', ',', ':', ';', '!', '|', '\'' => render_size * 0.28,
+        'm', 'w', 'M', 'W' => render_size * 0.78,
+        ' ' => render_size * 0.30,
+        '\t' => render_size * 1.20,
+        else => render_size * 0.62,
+    };
 }
 
 fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
@@ -7681,6 +7686,13 @@ pub const AppState = struct {
             .terminal => .terminal,
             .browser => .browser,
         };
+    }
+
+    pub fn focusedWorkspaceChatPaneId(self: *const AppState) ?WorkspacePaneId {
+        if (self.projects.items.len == 0) return null;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse return null;
+        return if (self.workspaceChatThreadIndexByPane(pane_id) != null) pane_id else null;
     }
 
     pub fn currentProjectHasVisibleWorkspaceTerminalPane(self: *const AppState) bool {
