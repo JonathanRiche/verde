@@ -8,6 +8,7 @@ const sdl = @import("zsdl3");
 const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
+const terminal = @import("../terminal/terminal.zig");
 
 const MAX_PANE_HITS = 64;
 const MAX_TAB_HITS = 32;
@@ -79,6 +80,7 @@ const TerminalPaneDrawCache = struct {
     rect: palette.Rect = .{},
     rows: u16 = 0,
     cols: u16 = 0,
+    font_scale: f32 = 0.0,
     arena: ?std.heap.ArenaAllocator = null,
     commands: std.ArrayList(CachedDrawCommand) = .empty,
 
@@ -86,21 +88,23 @@ const TerminalPaneDrawCache = struct {
         return self.active and self.dock_id == dock_id and self.pane_id == pane_id;
     }
 
-    fn validFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) bool {
+    fn validFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) bool {
         return self.active and
             rectEql(self.rect, rect) and
             self.rows == render_state.rows and
             self.cols == render_state.cols and
+            self.font_scale == font_scale and
             render_state.dirty == .false;
     }
 
-    fn beginRebuild(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, dock_id: u32, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
+    fn beginRebuild(self: *TerminalPaneDrawCache, allocator: std.mem.Allocator, dock_id: u32, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) void {
         self.active = true;
         self.dock_id = dock_id;
         self.pane_id = pane_id;
         self.rect = rect;
         self.rows = render_state.rows;
         self.cols = render_state.cols;
+        self.font_scale = font_scale;
         if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(allocator);
         _ = self.arena.?.reset(.retain_capacity);
         self.commands.clearRetainingCapacity();
@@ -425,29 +429,35 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, pane_id, render_state, rect);
+    renderViewport(state, pane_id, render_state, rect, dock.font_scale);
     dock.markPaneRendered(pane_id);
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
 
-fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
+fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
     const dock_id = hit_cache.dock_id;
     const cache = draw_cache.entryFor(dock_id, pane_id);
     const selection_dynamic = selectionAffectsPane(dock_id, pane_id);
-    if (!selection_dynamic and cache.validFor(render_state, rect)) {
+    if (!selection_dynamic and cache.validFor(render_state, rect, font_scale)) {
         replayCachedViewport(state, cache);
         return;
     }
 
-    cache.beginRebuild(state.allocator, dock_id, pane_id, render_state, rect);
+    cache.beginRebuild(state.allocator, dock_id, pane_id, render_state, rect, font_scale);
     active_capture = cache;
     defer active_capture = null;
 
     const cols_f = @as(f32, @floatFromInt(render_state.cols));
     const rows_f = @as(f32, @floatFromInt(render_state.rows));
-    const cell_w = @max(rect.w / cols_f, 1.0);
-    const cell_h = @max(rect.h / rows_f, 1.0);
+    const cell_w = terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale);
+    const cell_h = terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, font_scale);
+    const grid_rect = palette.Rect{
+        .x = rect.x,
+        .y = rect.y,
+        .w = @min(cell_w * cols_f, rect.w),
+        .h = @min(cell_h * rows_f, rect.h),
+    };
     const font_size = terminalFontSizeForCell(cell_w, cell_h);
     const text_y_offset = @max((cell_h - font_size) * 0.34, 0.0);
 
@@ -461,12 +471,12 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
         const raw_cells = cells_slice.items(.raw);
         const row_styles = cells_slice.items(.style);
         const row_graphemes = cells_slice.items(.grapheme);
-        const row_y = rect.y + @as(f32, @floatFromInt(y)) * cell_h;
+        const row_y = grid_rect.y + @as(f32, @floatFromInt(y)) * cell_h;
         if (row_y > rect.y + rect.h) break;
 
         for (raw_cells, 0..) |raw_cell, x| {
             const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
-            const cell_rect = terminalCellRect(rect, cell_w, cell_h, x, y, span);
+            const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, y, span);
             const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
             var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
@@ -1053,6 +1063,10 @@ fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyph
             .h = rect.h * 1.28,
         },
     };
+}
+
+fn terminalRenderCellSize(base: u32, font_scale: f32) f32 {
+    return @max(@round(@as(f32, @floatFromInt(base)) * font_scale), 1.0);
 }
 
 fn terminalTextFontSize(font_size: f32, glyph_kind: TerminalGlyphKind) f32 {
