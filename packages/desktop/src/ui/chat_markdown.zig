@@ -3705,6 +3705,25 @@ fn queuePaletteRoleText(
     clip: ?palette.Rect,
 ) void {
     const stable = stablePaletteText(context, value) catch return;
+    // Palette renders `.mono` text through fixed cells; use the measured mono
+    // advance so code layout and glyph placement do not drift apart.
+    if (font_role == .mono) {
+        context.batch.fixedRoleText(
+            context.allocator,
+            rect,
+            stable,
+            color,
+            font_size,
+            .mono,
+            null,
+            clip,
+            .{},
+            monoGlyphWidth(font_size),
+            @max(rect.h, font_size * 1.25),
+            false,
+        ) catch {};
+        return;
+    }
     context.batch.roleText(
         context.allocator,
         rect,
@@ -3715,6 +3734,10 @@ fn queuePaletteRoleText(
         null,
         clip,
     ) catch {};
+}
+
+fn monoGlyphWidth(font_size: f32) f32 {
+    return @max(text_measure.textWidth(.mono, font_size, "M"), font_size * 0.45);
 }
 
 fn stablePaletteText(context: *PaletteRenderContext, value: []const u8) ![]const u8 {
