@@ -29,7 +29,7 @@ const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
-const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 32 * 1024;
+const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
@@ -1595,9 +1595,11 @@ const UnixSession = struct {
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
         if (!size_changed and !metrics_changed) {
             if (self.backend == .daemon and self.defer_daemon_replay_until_resize) {
+                try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
                 _ = try self.drainDaemonOutput(allocator);
                 try self.refreshRenderState(allocator);
+                self.render_state.dirty = .full;
             }
             return;
         }
@@ -1617,6 +1619,7 @@ const UnixSession = struct {
             },
         }
         try self.refreshRenderState(allocator);
+        self.render_state.dirty = .full;
     }
 
     pub fn renderState(self: *const UnixSession) *const ghostty_vt.RenderState {
