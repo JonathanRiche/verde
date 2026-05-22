@@ -29,6 +29,7 @@ const WHEEL_SCROLL_LINES: f32 = 3.0;
 const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
+const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 32 * 1024;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
@@ -1608,6 +1609,7 @@ const UnixSession = struct {
             .daemon => {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
+                _ = try self.drainDaemonOutput(allocator);
             },
         }
         try self.refreshRenderState(allocator);
@@ -1971,11 +1973,13 @@ const UnixSession = struct {
         if (self.defer_daemon_replay_until_resize) return false;
         const pref_path = self.pref_path orelse return false;
         const session_id = self.session_id orelse return false;
+        const initial_attach_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
+        const max_replay_bytes = if (initial_attach_replay) DAEMON_ATTACH_REPLAY_MAX_BYTES else DAEMON_REPLAY_MAX_BYTES;
         const response = sessionizer.requestAlloc(allocator, pref_path, "session.tail", .{
             .id = session_id,
             .attach_id = self.attach_id orelse "",
             .offset = self.remote_output_offset,
-            .max_bytes = DAEMON_REPLAY_MAX_BYTES,
+            .max_bytes = max_replay_bytes,
         }, 1) catch |err| {
             log.debug("failed to poll daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
             self.daemon_state = .unavailable;
@@ -1995,7 +1999,7 @@ const UnixSession = struct {
         const result = parsed.value.object.get("result") orelse return error.InvalidSessionResponse;
         if (result != .object) return error.InvalidSessionResponse;
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
-        const suppress_replay_responses = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
+        const suppress_replay_responses = initial_attach_replay;
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
         const stale_alt_screen_replay = suppress_replay_responses and
