@@ -1594,7 +1594,11 @@ const UnixSession = struct {
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
         if (!size_changed and !metrics_changed) {
-            if (self.backend == .daemon) self.defer_daemon_replay_until_resize = false;
+            if (self.backend == .daemon and self.defer_daemon_replay_until_resize) {
+                self.defer_daemon_replay_until_resize = false;
+                _ = try self.drainDaemonOutput(allocator);
+                try self.refreshRenderState(allocator);
+            }
             return;
         }
         self.cols = next_cols;
