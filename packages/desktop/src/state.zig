@@ -4170,6 +4170,42 @@ pub const AppState = struct {
         self.syncRenameBuffer();
     }
 
+    /// Reorders the workspace list, moving the project at `from` so it lands
+    /// immediately before slot `before` (in current array coordinates; pass
+    /// `projects.items.len` to drop at the end). Keeps `selected_project_index`
+    /// pointing at the same logical workspace and persists the new order.
+    pub fn moveProject(self: *AppState, from: usize, before: usize) void {
+        const len = self.projects.items.len;
+        if (from >= len) return;
+
+        var insert_at = before;
+        if (insert_at > from) insert_at -= 1;
+        if (insert_at >= len) insert_at = len - 1;
+        if (insert_at == from) return;
+
+        const sel_is_from = self.selected_project_index == from;
+        const moved = self.projects.orderedRemove(from);
+        self.projects.insert(self.allocator, insert_at, moved) catch {
+            // Best effort: restore near the original slot so we never drop it.
+            self.projects.insert(self.allocator, from, moved) catch {
+                self.projects.append(self.allocator, moved) catch {};
+            };
+            return;
+        };
+
+        if (sel_is_from) {
+            self.selected_project_index = insert_at;
+        } else {
+            var s = self.selected_project_index;
+            if (s > from) s -= 1;
+            if (s >= insert_at) s += 1;
+            self.selected_project_index = s;
+        }
+
+        self.syncRenameBuffer();
+        self.markDirty();
+    }
+
     pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
         if (index >= self.projects.items.len) return;
         self.selected_project_index = index;
