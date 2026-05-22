@@ -31,6 +31,7 @@ const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
+const TUI_REDRAW_INPUT = "\x0c";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -1449,6 +1450,8 @@ const UnixSession = struct {
     attach_id: ?[]u8 = null,
     pref_path: ?[]u8 = null,
     remote_output_offset: usize = 0,
+    daemon_shell_pid: ?usize = null,
+    daemon_foreground_process_group: ?usize = null,
     suppress_next_daemon_replay: bool = false,
     suppress_pty_responses: bool = false,
     defer_daemon_replay_until_resize: bool = false,
@@ -1611,10 +1614,14 @@ const UnixSession = struct {
             try self.terminal.resize(allocator, next_cols, next_rows);
         }
         switch (self.backend) {
-            .local => self.applyWinsize(),
+            .local => {
+                self.applyWinsize();
+                if (size_changed) self.requestTuiRedrawAfterResize();
+            },
             .daemon => {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
+                if (size_changed) self.requestTuiRedrawAfterResize();
                 _ = try self.drainDaemonOutput(allocator);
             },
         }
@@ -1790,12 +1797,32 @@ const UnixSession = struct {
         return true;
     }
 
+    fn shouldRequestTuiRedrawAfterResize(self: *const UnixSession) bool {
+        if (self.terminal.screens.active_key == .alternate) return true;
+        return self.hasForegroundProcessAwayFromShell();
+    }
+
+    fn requestTuiRedrawAfterResize(self: *UnixSession) void {
+        if (!self.shouldRequestTuiRedrawAfterResize()) return;
+        _ = self.writeRawInput(TUI_REDRAW_INPUT) catch |err| {
+            log.debug("failed to request terminal redraw after resize: {s}", .{@errorName(err)});
+        };
+    }
+
     fn hasForegroundProcessAwayFromShell(self: *const UnixSession) bool {
-        if (self.backend != .local) return false;
-        const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return false;
-        var foreground_process_group: c_int = 0;
-        if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return false;
-        return foreground_process_group > 0 and foreground_process_group != self.child_pid;
+        switch (self.backend) {
+            .local => {
+                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return false;
+                var foreground_process_group: c_int = 0;
+                if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return false;
+                return foreground_process_group > 0 and foreground_process_group != self.child_pid;
+            },
+            .daemon => {
+                const shell_pid = self.daemon_shell_pid orelse return false;
+                const foreground_process_group = self.daemon_foreground_process_group orelse return false;
+                return foreground_process_group > 0 and foreground_process_group != shell_pid;
+            },
+        }
     }
 
     fn writeWheelMouseInput(self: *UnixSession, local_x: f32, local_y: f32, width: f32, height: f32, wheel_y: f32, line_count: isize) !void {
@@ -2009,6 +2036,8 @@ const UnixSession = struct {
         const suppress_replay_responses = initial_attach_replay;
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
+        self.daemon_shell_pid = shell_pid;
+        self.daemon_foreground_process_group = foreground_process_group;
         const stale_alt_screen_replay = suppress_replay_responses and
             shell_pid != null and
             foreground_process_group != null and
