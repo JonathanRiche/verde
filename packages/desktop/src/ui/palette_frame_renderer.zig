@@ -92,6 +92,12 @@ pub const Renderer = struct {
         return result;
     }
 
+    pub fn configureTextMeasureRenderer(self: *Renderer) void {
+        if (self.active_backend == .sdl_gpu) {
+            if (self.gpu) |*gpu| text_measure.configureRenderer(gpu);
+        }
+    }
+
     pub fn deinit(self: *Renderer, allocator: std.mem.Allocator) void {
         _ = allocator;
         if (self.active_backend == .sdl_gpu) {

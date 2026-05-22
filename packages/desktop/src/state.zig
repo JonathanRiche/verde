@@ -236,10 +236,16 @@ fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: us
     if (text[byte_offset] == '\n') return .{ .byte_len = 1, .width = 0.0 };
     const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
     const end = @min(byte_offset + seq_len, text.len);
-    const cp = std.unicode.utf8Decode(text[byte_offset..end]) catch {
+    _ = std.unicode.utf8Decode(text[byte_offset..end]) catch {
         return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
-    const w = text_measure.codepointWidth(.ui, cp, font_size);
+
+    var line_start: usize = byte_offset;
+    while (line_start > 0 and text[line_start - 1] != '\n') : (line_start -= 1) {}
+    const line = text[line_start..];
+    const before = text_measure.textPrefixWidth(.ui, line, font_size, byte_offset - line_start);
+    const through = text_measure.textPrefixWidth(.ui, line, font_size, end - line_start);
+    const w = through - before;
     return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
 }
 
@@ -9371,7 +9377,7 @@ pub const AppState = struct {
 
         if (key.code != .up and key.code != .down) return false;
         const text = self.palette_composer.text();
-        const metrics = paletteComposerTextFontMetrics(PALETTE_COMPOSER_FONT_SIZE);
+        const metrics = paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE));
         const text_rect = self.palette_composer.textRect();
         const cell = palette.TextLayout.visualCellForOffset(text, self.palette_composer.cursor, metrics, text_rect.w, true);
         const target_row = switch (key.code) {

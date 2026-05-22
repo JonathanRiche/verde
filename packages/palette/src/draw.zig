@@ -155,6 +155,33 @@ pub const RenderBatch = struct {
         self.current_z_index = 0;
     }
 
+    pub fn appendStableBatch(self: *RenderBatch, allocator: std.mem.Allocator, text_allocator: std.mem.Allocator, source: *const RenderBatch) !void {
+        for (source.commands.items) |command| {
+            var next = command;
+            if (next.text.len > 0) {
+                next.text = try text_allocator.dupe(u8, next.text);
+            }
+            if (command.text_run_count > 0) {
+                const start = self.text_runs.items.len;
+                try self.text_runs.ensureUnusedCapacity(allocator, command.text_run_count);
+                for (command.text_runs) |run| {
+                    var stable_run = run;
+                    if (next.text.len > 0 and run.byte_start <= run.byte_end and run.byte_end <= next.text.len) {
+                        stable_run.text = next.text[run.byte_start..run.byte_end];
+                    } else if (run.text.len > 0) {
+                        stable_run.text = try text_allocator.dupe(u8, run.text);
+                    }
+                    self.text_runs.appendAssumeCapacity(stable_run);
+                }
+                next.text_run_start = start;
+                next.text_run_count = command.text_run_count;
+                next.text_runs = self.text_runs.items[start .. start + command.text_run_count];
+            }
+            try self.appendCommandPreservingZ(allocator, next);
+        }
+        self.refreshTextRunSlices();
+    }
+
     pub fn setZIndex(self: *RenderBatch, z_index: i32) i32 {
         const previous = self.current_z_index;
         self.current_z_index = z_index;
@@ -382,6 +409,11 @@ pub const RenderBatch = struct {
     fn appendCommand(self: *RenderBatch, allocator: std.mem.Allocator, command: Command) !void {
         var next = command;
         next.z_index = self.current_z_index;
+        try self.appendCommandPreservingZ(allocator, next);
+    }
+
+    fn appendCommandPreservingZ(self: *RenderBatch, allocator: std.mem.Allocator, command: Command) !void {
+        const next = command;
         try self.commands.append(allocator, next);
         var index = self.commands.items.len - 1;
         while (index > 0 and self.commands.items[index - 1].z_index > next.z_index) : (index -= 1) {

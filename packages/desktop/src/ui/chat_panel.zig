@@ -2502,8 +2502,13 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     state.syncPaletteComposerControls();
     state.setPaletteComposerBounds(.{ rect.x, rect.y }, .{ rect.x + rect.w, rect.y + rect.h });
     state.updateFileSearch();
-    state.palette_composer.render(state.allocator, &state.palette_overlay_batch) catch |err| {
+    var composer_batch: palette.RenderBatch = .{};
+    defer composer_batch.deinit(state.allocator);
+    state.palette_composer.render(state.allocator, &composer_batch) catch |err| {
         app_state.log.warn("failed to render palette composer: {s}", .{@errorName(err)});
+    };
+    state.palette_overlay_batch.appendStableBatch(state.allocator, state.palette_frame_text_arena.allocator(), &composer_batch) catch |err| {
+        app_state.log.warn("failed to stage palette composer render commands: {s}", .{@errorName(err)});
     };
     renderComposerFileSearchResults(state);
     renderComposerDraftImage(state);

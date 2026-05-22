@@ -74,6 +74,8 @@ pub const Renderer = opaque {
 
 pub const Texture = opaque {};
 pub const Font = opaque {};
+const TextEngine = opaque {};
+const Text = opaque {};
 
 pub const Color = extern struct {
     r: u8,
@@ -387,9 +389,16 @@ pub fn renderPresent(renderer: *Renderer) void {
 
 pub fn ttfInit() Error!void {
     if (!TTF_Init()) return error.SdlError;
+    ttf_measure_engine = TTF_CreateSurfaceTextEngine();
 }
 
-pub const ttfQuit = TTF_Quit;
+pub fn ttfQuit() void {
+    if (ttf_measure_engine) |engine| {
+        TTF_DestroySurfaceTextEngine(engine);
+        ttf_measure_engine = null;
+    }
+    TTF_Quit();
+}
 
 pub fn ttfOpenFont(path: [:0]const u8, point_size: f32) Error!*Font {
     return TTF_OpenFont(path.ptr, point_size) orelse error.SdlError;
@@ -408,6 +417,53 @@ pub fn ttfMeasureText(font: *Font, text: []const u8, point_size: f32) Error!f32 
     var height: c_int = 0;
     if (!TTF_GetStringSize(font, text.ptr, text.len, &width, &height)) return error.SdlError;
     return @floatFromInt(width);
+}
+
+pub fn ttfMeasureTextOffset(font: *Font, text: []const u8, point_size: f32, offset: usize) Error!f32 {
+    if (text.len == 0 or offset == 0) return 0.0;
+    const layout = try createMeasureText(font, text, point_size);
+    defer TTF_DestroyText(layout);
+    const end: c_int = @intCast(@min(offset, text.len));
+    if (end >= text.len and text.len > 0 and !isWhitespace(text[text.len - 1])) {
+        return ttfMeasureTextInkRange(layout, end) catch ttfMeasureTextCaretOffset(layout, end);
+    }
+    return ttfMeasureTextCaretOffset(layout, end);
+}
+
+fn createMeasureText(font: *Font, text: []const u8, point_size: f32) Error!*Text {
+    try ttfSetFontSize(font, point_size);
+    const engine = ttf_measure_engine orelse TTF_CreateSurfaceTextEngine() orelse return error.SdlError;
+    if (ttf_measure_engine == null) ttf_measure_engine = engine;
+    const layout = TTF_CreateText(engine, font, text.ptr, text.len) orelse return error.SdlError;
+    if (!TTF_UpdateText(layout)) {
+        TTF_DestroyText(layout);
+        return error.SdlError;
+    }
+    return layout;
+}
+
+fn ttfMeasureTextCaretOffset(layout: *Text, offset: c_int) Error!f32 {
+    var substring: TTF_SubString = .{};
+    if (!TTF_GetTextSubString(layout, offset, &substring)) return error.SdlError;
+    return @floatFromInt(substring.rect.x);
+}
+
+fn ttfMeasureTextInkRange(layout: *Text, end: c_int) Error!f32 {
+    var count: c_int = 0;
+    const raw = TTF_GetTextSubStringsForRange(layout, 0, end, &count) orelse return error.SdlError;
+    const raw_mem: ?*anyopaque = @ptrCast(raw);
+    defer SDL_free(raw_mem);
+    var max_x: c_int = 0;
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(@max(count, 0)))) : (i += 1) {
+        const substring = raw[i] orelse continue;
+        max_x = @max(max_x, substring.rect.x + substring.rect.w);
+    }
+    return @floatFromInt(max_x);
+}
+
+fn isWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
 }
 
 pub fn ttfRenderTextBlended(font: *Font, text: []const u8, color: Color) Error!*Surface {
@@ -456,10 +512,28 @@ extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
 extern fn TTF_CloseFont(font: *Font) void;
 extern fn TTF_SetFontSize(font: *Font, ptsize: f32) bool;
 extern fn TTF_GetStringSize(font: *Font, text: [*]const u8, length: usize, w: *c_int, h: *c_int) bool;
+extern fn TTF_CreateSurfaceTextEngine() ?*TextEngine;
+extern fn TTF_DestroySurfaceTextEngine(engine: ?*TextEngine) void;
+extern fn TTF_CreateText(engine: ?*TextEngine, font: *Font, text: [*]const u8, length: usize) ?*Text;
+extern fn TTF_DestroyText(text: *Text) void;
+extern fn TTF_UpdateText(text: *Text) bool;
+extern fn TTF_GetTextSubString(text: *Text, offset: c_int, substring: *TTF_SubString) bool;
+extern fn TTF_GetTextSubStringsForRange(text: *Text, offset: c_int, length: c_int, count: *c_int) ?[*]?*TTF_SubString;
 extern fn TTF_RenderText_Blended(font: *Font, text: [*]const u8, length: usize, fg: Color) ?*Surface;
 extern fn SDL_SetClipboardText(text: [*:0]const u8) bool;
 extern fn SDL_GetClipboardText() ?[*:0]u8;
 extern fn SDL_free(mem: ?*anyopaque) void;
+
+const TTF_SubString = extern struct {
+    flags: u32 = 0,
+    offset: c_int = 0,
+    length: c_int = 0,
+    line_index: c_int = 0,
+    cluster_index: c_int = 0,
+    rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+};
+
+var ttf_measure_engine: ?*TextEngine = null;
 
 test "event union stays SDL sized" {
     try std.testing.expect(@sizeOf(Event) >= 128);
