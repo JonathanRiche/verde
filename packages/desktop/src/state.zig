@@ -56,6 +56,25 @@ pub const PaletteModalAction = enum {
     project_rename_input,
     thread_import_input,
     project_import_input,
+    settings_cancel,
+    settings_save,
+    settings_control,
+};
+
+pub const SettingsOpenAction = enum {
+    folder,
+    editor,
+    cursor,
+    vscode,
+    zed,
+    custom,
+};
+
+pub const SettingsDraft = struct {
+    font_size: f32 = theme.DEFAULT_FONT_SIZE,
+    terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
+    theme_source: theme.ThemeSource = .omarchy,
+    open_action: SettingsOpenAction = .folder,
 };
 
 pub const PaletteModalHit = struct {
@@ -2731,6 +2750,11 @@ pub const AppState = struct {
     thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
     show_project_creator: bool,
+    show_settings_modal: bool,
+    settings_draft: SettingsDraft,
+    settings_hover_index: ?usize,
+    app_config_file_mtime: i128,
+    app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
     picker_state: PickerState,
     opencode_model_cache_state: OpencodeModelCacheState,
@@ -2924,6 +2948,11 @@ pub const AppState = struct {
             .thread_import_hover_index = null,
             .thread_import_threads = .empty,
             .show_project_creator = false,
+            .show_settings_modal = false,
+            .settings_draft = .{},
+            .settings_hover_index = null,
+            .app_config_file_mtime = -1,
+            .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
             .picker_state = .{},
             .opencode_model_cache_state = .{},
@@ -5140,6 +5169,97 @@ pub const AppState = struct {
         self.app_config = next_config;
     }
 
+    pub fn syncSettingsDraftFromConfig(self: *AppState) void {
+        self.settings_draft = .{
+            .font_size = self.app_config.font_size,
+            .terminal_font_size = self.app_config.terminal_font_size,
+            .theme_source = self.app_config.theme_config.source,
+            .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
+        };
+    }
+
+    pub fn openSettingsModal(self: *AppState) void {
+        self.closeSidebarContextMenu();
+        self.workspace_header_open_menu_open = false;
+        self.browser_inspector_menu_open = false;
+        self.syncSettingsDraftFromConfig();
+        self.settings_hover_index = null;
+        self.show_settings_modal = true;
+        self.palette_modal_text_focus = .none;
+        self.blurPaletteComposer();
+        self.noteInteraction();
+        self.markDirty();
+    }
+
+    pub fn cancelSettingsModal(self: *AppState) void {
+        self.show_settings_modal = false;
+        self.settings_hover_index = null;
+        self.syncSettingsDraftFromConfig();
+        self.palette_modal_text_focus = .none;
+        self.markDirty();
+    }
+
+    pub fn saveSettingsModal(self: *AppState) !void {
+        self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
+        self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
+        self.app_config.theme_config.source = self.settings_draft.theme_source;
+        try self.applySettingsDraftOpenAction();
+
+        try app_config.saveAppConfig(self.allocator, &self.app_config);
+        self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
+        self.applyTerminalFontSizesFromConfig();
+        self.app_config_runtime_sync_pending = true;
+        self.show_settings_modal = false;
+        self.settings_hover_index = null;
+        self.palette_modal_text_focus = .none;
+        self.markDirty();
+    }
+
+    pub fn applyTerminalFontSizesFromConfig(self: *AppState) void {
+        for (self.projects.items) |*project| {
+            project.applyDefaultTerminalFontSize(self.app_config.terminal_font_size);
+        }
+    }
+
+    pub fn reloadAppConfigFromDisk(self: *AppState) !void {
+        const next_config = try app_config.loadAppConfig(self.allocator);
+        self.replaceAppConfig(next_config);
+        self.applyTerminalFontSizesFromConfig();
+        if (self.show_settings_modal) self.syncSettingsDraftFromConfig();
+    }
+
+    pub fn isSettingsModalOpen(self: *const AppState) bool {
+        return self.show_settings_modal;
+    }
+
+    fn applySettingsDraftOpenAction(self: *AppState) !void {
+        if (self.settings_draft.open_action == .custom) return;
+
+        const next: app_config.DefaultOpenAction = switch (self.settings_draft.open_action) {
+            .folder => .folder,
+            .editor => .editor,
+            .cursor => .cursor,
+            .vscode => .vscode,
+            .zed => .zed,
+            .custom => unreachable,
+        };
+        const next_tag = std.meta.activeTag(next);
+        if (std.meta.activeTag(self.app_config.default_open_action) == next_tag) return;
+        self.app_config.default_open_action.deinit(self.allocator);
+        self.app_config.default_open_action = next;
+    }
+
+    fn settingsOpenActionFromConfig(action: app_config.DefaultOpenAction) SettingsOpenAction {
+        return switch (action) {
+            .folder => .folder,
+            .editor => .editor,
+            .cursor => .cursor,
+            .vscode => .vscode,
+            .zed => .zed,
+            .custom => .custom,
+        };
+    }
+
     pub fn rethemeTerminalSessions(self: *AppState) !void {
         for (self.projects.items) |*project| {
             try project.terminal_dock.rethemeSessions(self.allocator);
@@ -6890,6 +7010,7 @@ pub const AppState = struct {
 
     fn browserBlockedByPaletteOverlay(self: *const AppState) bool {
         return self.show_project_creator or
+            self.show_settings_modal or
             self.rename_project_index != null or
             self.thread_import_provider != null or
             self.modal_image_path != null or

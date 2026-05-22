@@ -5,11 +5,11 @@ const theme = @import("./ui/theme.zig");
 
 const log = std.log.scoped(.native_config);
 const VERDE_CONFIG_RELATIVE_PATH = ".config/verde/verde.json";
-const MIN_FONT_SIZE: f32 = 10.0;
-const MAX_FONT_SIZE: f32 = 32.0;
+pub const MIN_FONT_SIZE: f32 = 10.0;
+pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
-const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
-const MAX_TERMINAL_FONT_SIZE: f32 = 60.0;
+pub const MIN_TERMINAL_FONT_SIZE: f32 = 13.5;
+pub const MAX_TERMINAL_FONT_SIZE: f32 = 60.0;
 
 pub const CustomOpenAction = struct {
     label: []u8,
@@ -108,6 +108,165 @@ pub fn readRootValue(allocator: std.mem.Allocator) !?std.json.Parsed(std.json.Va
     return try std.json.parseFromSlice(std.json.Value, allocator, raw_bytes, .{
         .allocate = .alloc_always,
     });
+}
+
+pub fn configFileMtime(allocator: std.mem.Allocator) !i128 {
+    const config_path = try resolveConfigPath(allocator);
+    defer allocator.free(config_path);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const stat = blk: {
+        var file = std.Io.Dir.cwd().openFile(threaded.io(), config_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return -1,
+            else => return err,
+        };
+        defer file.close(threaded.io());
+        break :blk try file.stat(threaded.io());
+    };
+    return @intCast(stat.mtime.toNanoseconds());
+}
+
+pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !void {
+    const config_path = try resolveConfigPath(allocator);
+    defer allocator.free(config_path);
+
+    var parsed = try readRootValue(allocator);
+    defer if (parsed) |*value| value.deinit();
+
+    var root: std.json.Value = if (parsed) |*value| blk: {
+        const existing = value.value;
+        value.value = .{ .object = .empty };
+        break :blk existing;
+    } else .{ .object = .empty };
+    defer switch (root) {
+        .object => |*map| map.deinit(allocator),
+        else => {},
+    };
+
+    if (root != .object) {
+        root = .{ .object = .empty };
+    }
+
+    try writeUiSection(allocator, &root.object, config);
+    try writeThemeSection(allocator, &root.object, config);
+    try writeOpenSection(allocator, &root.object, config);
+    try writeTerminalSection(allocator, &root.object, config);
+
+    const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
+    defer allocator.free(encoded);
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    if (std.fs.path.dirname(config_path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{config_path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+        defer file.close(io);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+        try writer.interface.writeAll(encoded);
+        try writer.interface.flush();
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.rename(tmp_path, cwd, config_path, io);
+}
+
+fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var ui_object: std.json.Value = object.get("ui") orelse .{ .object = .empty };
+    if (ui_object != .object) ui_object = .{ .object = .empty };
+    try ui_object.object.put(allocator, "font_size", .{ .float = config.font_size });
+    try object.put(allocator, "ui", ui_object);
+}
+
+fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var theme_object: std.json.Value = object.get("theme") orelse .{ .object = .empty };
+    if (theme_object != .object) theme_object = .{ .object = .empty };
+
+    const source_name = switch (config.theme_config.source) {
+        .omarchy => "omarchy",
+        .default => "default",
+    };
+    try theme_object.object.put(allocator, "theme", .{ .string = source_name });
+
+    var has_color_override = false;
+    inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
+        if (@field(config.theme_config.colors, field.name) != null) has_color_override = true;
+    }
+
+    if (has_color_override) {
+        var colors_object: std.json.ObjectMap = .empty;
+        inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
+            if (@field(config.theme_config.colors, field.name)) |value| {
+                const hex = try colorToHex(allocator, value);
+                defer allocator.free(hex);
+                try colors_object.put(allocator, field.name, .{ .string = hex });
+            }
+        }
+        try theme_object.object.put(allocator, "colors", .{ .object = colors_object });
+    }
+
+    try object.put(allocator, "theme", theme_object);
+}
+
+fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var open_object: std.json.Value = object.get("open") orelse .{ .object = .empty };
+    if (open_object != .object) open_object = .{ .object = .empty };
+
+    const default_value: std.json.Value = switch (config.default_open_action) {
+        .folder => .{ .string = "folder" },
+        .editor => .{ .string = "editor" },
+        .cursor => .{ .string = "cursor" },
+        .vscode => .{ .string = "vscode" },
+        .zed => .{ .string = "zed" },
+        .custom => |custom| blk: {
+            var custom_object: std.json.ObjectMap = .empty;
+            try custom_object.put(allocator, "label", .{ .string = custom.label });
+            try custom_object.put(allocator, "action", .{ .string = custom.action });
+            break :blk .{ .object = custom_object };
+        },
+    };
+
+    try open_object.object.put(allocator, "default", default_value);
+    try object.put(allocator, "open", open_object);
+}
+
+fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var terminal_object: std.json.Value = object.get("terminal") orelse .{ .object = .empty };
+    if (terminal_object != .object) terminal_object = .{ .object = .empty };
+
+    try terminal_object.object.put(allocator, "font_size", .{ .float = config.terminal_font_size });
+
+    var profiles = std.json.Array.init(allocator);
+    for (config.terminal_launch_profiles) |profile| {
+        var command = std.json.Array.init(allocator);
+        for (profile.command) |arg| {
+            try command.append(.{ .string = arg });
+        }
+        var profile_object: std.json.ObjectMap = .empty;
+        try profile_object.put(allocator, "label", .{ .string = profile.label });
+        try profile_object.put(allocator, "command", .{ .array = command });
+        try profiles.append(.{ .object = profile_object });
+    }
+
+    try terminal_object.object.put(allocator, "profiles", .{ .array = profiles });
+    try object.put(allocator, "terminal", terminal_object);
+}
+
+fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
+    const r: u8 = @intFromFloat(@round(theme.clampf(color[0], 0.0, 1.0) * 255.0));
+    const g: u8 = @intFromFloat(@round(theme.clampf(color[1], 0.0, 1.0) * 255.0));
+    const b: u8 = @intFromFloat(@round(theme.clampf(color[2], 0.0, 1.0) * 255.0));
+    return std.fmt.allocPrint(allocator, "#{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b });
 }
 
 pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {

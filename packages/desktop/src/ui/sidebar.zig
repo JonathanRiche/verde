@@ -269,9 +269,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 }
             },
             .settings => {
-                // TODO: open the settings view once it exists.
-                state.noteInteraction();
-                state.markDirty();
+                state.openSettingsModal();
             },
         }
         return true;
