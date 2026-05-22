@@ -8451,8 +8451,14 @@ pub const AppState = struct {
         switch (removed_ref) {
             .chat => self.setSidebarNotice("Chat pane closed."),
             .terminal => |ref| {
-                if (ref.dock_id != 0 and !layout.hasTerminalDockPane(ref.dock_id)) {
-                    _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
+                if (!layout.hasTerminalDockPane(ref.dock_id)) {
+                    if (ref.dock_id == 0) {
+                        project.terminal_dock.terminateAllSessions();
+                        project.terminal_dock.visible = false;
+                    } else if (project.terminalDockEntryById(ref.dock_id)) |entry| {
+                        entry.dock.terminateAllSessions();
+                        _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
+                    }
                 }
                 if (!layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
                 self.setSidebarNotice("Terminal pane closed.");
