@@ -279,6 +279,7 @@ fn mainInner(init: std.process.Init) !void {
         .mono_font_path = palette_gpu_mono_font_path,
         .icon_font_path = palette_gpu_icon_font_path,
     });
+    palette_renderer.configureTextMeasureRenderer();
     defer palette_renderer.deinit(allocator);
     if (palette_renderer.usingFallback()) {
         log.warn("requested SDL_GPU palette renderer, falling back to GL until texture interop is available", .{});

@@ -1004,6 +1004,41 @@ pub const Renderer = struct {
         try self.text_cache.put(key, cache_entry);
     }
 
+    pub fn measureTextOffset(self: *Renderer, value: []const u8, font_size: f32, offset: usize, font_role: ?draw.FontRole) !f32 {
+        const end = @min(offset, value.len);
+        if (value.len == 0 or end == 0) return 0.0;
+
+        const font = try self.fontForRoleAndSize(font_size, font_role);
+        if (end >= value.len) {
+            var visible_end = end;
+            while (visible_end > 0 and isAsciiTextSpace(value[visible_end - 1])) : (visible_end -= 1) {}
+            if (visible_end < end) {
+                const base = if (visible_end == 0) 0.0 else try self.measureTextOffset(value[0..visible_end], font_size, visible_end, font_role);
+                return base + try measureWhitespaceAdvance(font, value[visible_end..end]);
+            }
+        }
+
+        const text = c.TTF_CreateText(self.text_engine.?, font, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
+        defer c.TTF_DestroyText(text);
+        if (!c.TTF_UpdateText(text)) return error.SdlTtfTextFailed;
+
+        if (end >= value.len and !isTextSpace(value[value.len - 1 .. value.len])) {
+            const sequence_head = c.TTF_GetGPUTextDrawData(text) orelse return 0.0;
+            var max_x: f32 = -std.math.floatMax(f32);
+            var sequence: ?*c.TTF_GPUAtlasDrawSequence = sequence_head;
+            while (sequence) |seq| : (sequence = seq.next) {
+                if (seq.num_vertices <= 0) continue;
+                const xy = @as([*]const c.SDL_FPoint, @ptrCast(seq.xy))[0..@intCast(seq.num_vertices)];
+                for (xy) |point| max_x = @max(max_x, point.x);
+            }
+            if (std.math.isFinite(max_x)) return @max(max_x, 0.0);
+        }
+
+        var substring: c.TTF_SubString = undefined;
+        if (!c.TTF_GetTextSubString(text, @intCast(end), &substring)) return error.SdlTtfTextFailed;
+        return @floatFromInt(substring.rect.x);
+    }
+
     fn fallbackFontRoleForGlyph(self: *Renderer, value: []const u8, font_size: f32, font_role: ?draw.FontRole) ?draw.FontRole {
         if (font_role != .mono or self.icon_font == null) return font_role;
         if (value.len == 0 or value[0] < 0x80) return font_role;
@@ -1373,8 +1408,38 @@ fn utf8ByteLen(first: u8, remaining: usize) usize {
     return @min(requested, @max(remaining, 1));
 }
 
+fn measureWhitespaceAdvance(font: *c.TTF_Font, value: []const u8) !f32 {
+    const space = try measureInteriorSpaceAdvance(font);
+    var width: f32 = 0.0;
+    for (value) |byte| {
+        width += switch (byte) {
+            ' ', '\r' => space,
+            '\t' => space * 4.0,
+            else => 0.0,
+        };
+    }
+    return width;
+}
+
+fn measureInteriorSpaceAdvance(font: *c.TTF_Font) !f32 {
+    const with_space = try measureStringWidth(font, "x x");
+    const without_space = try measureStringWidth(font, "xx");
+    return @max(with_space - without_space, 0.0);
+}
+
+fn measureStringWidth(font: *c.TTF_Font, value: []const u8) !f32 {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    if (!c.TTF_GetStringSize(font, value.ptr, value.len, &width, &height)) return error.SdlTtfTextFailed;
+    return @floatFromInt(width);
+}
+
+fn isAsciiTextSpace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r';
+}
+
 fn isTextSpace(value: []const u8) bool {
-    if (value.len == 1) return value[0] == ' ' or value[0] == '\t' or value[0] == '\r';
+    if (value.len == 1) return isAsciiTextSpace(value[0]);
     return std.mem.eql(u8, value, "\xc2\xa0");
 }
 
