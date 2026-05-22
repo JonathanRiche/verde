@@ -378,11 +378,6 @@ const FontSpec = struct {
     size: ?f32 = null,
 };
 
-const Chunk = struct {
-    text: []const u8,
-    is_whitespace: bool,
-};
-
 /// Parses markdown into a reusable body view with flattened text, rule, and code blocks.
 pub fn buildBodyView(allocator: Allocator, source: []const u8) !BodyView {
     return buildBodyViewImpl(allocator, source, false);
@@ -1765,6 +1760,43 @@ const TextBlockLayoutStep = struct {
     line_height: f32,
 };
 
+/// Single-space advance for a role/size, isolated via an interior measurement
+/// (`"x x"` minus `"xx"`). `TTF_GetStringSize` trims trailing whitespace, so a
+/// space can't be measured directly at the end of a string — measuring it
+/// *between* glyphs recovers the real advance on the same scale as every other
+/// measured glyph.
+fn spaceAdvanceForRole(role: palette.FontRole, font_size: f32) f32 {
+    const with_space = text_measure.textWidth(role, font_size, "x x");
+    const without = text_measure.textWidth(role, font_size, "xx");
+    return @max(with_space - without, 0.0);
+}
+
+/// Advance width of an all-whitespace slice, derived from the real space
+/// advance. Tabs count as four spaces, matching the rest of the layout.
+fn whitespaceAdvanceForRole(role: palette.FontRole, font_size: f32, ws: []const u8) f32 {
+    if (ws.len == 0) return 0.0;
+    const unit = spaceAdvanceForRole(role, font_size);
+    var w: f32 = 0.0;
+    for (ws) |c| w += if (c == '\t') unit * 4.0 else unit;
+    return w;
+}
+
+/// Advance width of a layout segment `slice[start..end]` that may carry leading
+/// or trailing whitespace at a style/line boundary. The trimmed core (words and
+/// the interior spaces between them) is measured by TTF in one call so it
+/// matches the rendered glyph run exactly; only the boundary whitespace — which
+/// TTF would trim — falls back to the derived space advance.
+fn segmentAdvance(role: palette.FontRole, font_size: f32, slice: []const u8, start: usize, end: usize) f32 {
+    var a = start;
+    while (a < end and isInlineWhitespace(slice[a])) : (a += 1) {}
+    var b = end;
+    while (b > a and isInlineWhitespace(slice[b - 1])) : (b -= 1) {}
+    var w = whitespaceAdvanceForRole(role, font_size, slice[start..a]);
+    if (b > a) w += text_measure.textWidth(role, font_size, slice[a..b]);
+    w += whitespaceAdvanceForRole(role, font_size, slice[b..end]);
+    return w;
+}
+
 fn walkTextBlockLayout(
     block: TextBlockView,
     available_width: f32,
@@ -1785,33 +1817,116 @@ fn walkTextBlockLayout(
                 const slice = block.text[text_run.start..text_run.end];
                 const layout_font_size = fontSizeForSpecWithOptions(spec, options);
                 const measure_role = markdownFontRole(block.style, text_run.style);
-                var chunk_start: usize = 0;
-                while (nextChunk(slice, &chunk_start)) |chunk| {
-                    const chunk_width = transcriptTextWidthForRole(layout_font_size, measure_role, chunk.text);
 
-                    if (chunk.is_whitespace and state.line_start) {
+                // Emit one step per (style-run ∩ visual-line) instead of one
+                // per whitespace-delimited word. Internal spaces ride inside
+                // the contiguous slice so the renderer advances them with real
+                // glyph metrics; only a segment's start position depends on our
+                // measurement, so per-word rounding no longer compounds across
+                // the line. We still split at wrap points (and, implicitly, at
+                // style boundaries, since each run is its own slice).
+                var i: usize = 0;
+                var seg_active = false;
+                var seg_start: usize = 0;
+                var seg_end: usize = 0;
+                var seg_x: f32 = 0.0;
+
+                while (i < slice.len) {
+                    const ws_start = i;
+                    while (i < slice.len and isInlineWhitespace(slice[i])) : (i += 1) {}
+                    const word_start = i;
+                    while (i < slice.len and !isInlineWhitespace(slice[i])) : (i += 1) {}
+                    const word_end = i;
+
+                    if (word_start == word_end) {
+                        // Run tail is whitespace only.
+                        if (seg_active) {
+                            // Keep trailing whitespace inside the current
+                            // segment so the next run continues at the right x.
+                            seg_end = slice.len;
+                        } else if (!state.line_start and ws_start < slice.len) {
+                            // A run that is purely whitespace, sitting mid-line
+                            // between two styled spans (e.g. `*a* *b*`): emit it
+                            // on its own so the spans keep their gap.
+                            const ws = slice[ws_start..slice.len];
+                            const ws_w = whitespaceAdvanceForRole(measure_role, layout_font_size, ws);
+                            on_step(context, .{
+                                .text = ws,
+                                .block_style = block.style,
+                                .inline_style = text_run.style,
+                                .font_spec = spec,
+                                .x = state.x,
+                                .y = state.y,
+                                .width = ws_w,
+                                .line_height = chunk_line_height,
+                            });
+                            state.x += ws_w;
+                            state.line_height = @max(state.line_height, chunk_line_height);
+                        }
+                        break;
+                    }
+
+                    if (!seg_active) {
+                        // Begin a new segment with this word. Mid-line, wrap
+                        // first if even the leading space + word overflows.
+                        if (!state.line_start) {
+                            const lead_w = segmentAdvance(measure_role, layout_font_size, slice, ws_start, word_end);
+                            if (state.x + lead_w > width) {
+                                state.line_height = @max(state.line_height, chunk_line_height);
+                                state.advanceLine();
+                            }
+                        }
+                        // Drop leading whitespace at the true start of a line;
+                        // keep the inter-run space when continuing mid-line.
+                        seg_start = if (state.line_start) word_start else ws_start;
+                        seg_x = state.x;
+                        seg_end = word_end;
+                        seg_active = true;
                         continue;
                     }
 
-                    if (!chunk.is_whitespace and !state.line_start and state.x + chunk_width > width) {
-                        state.advanceLine();
-                    } else if (chunk.is_whitespace and state.x + chunk_width > width) {
-                        state.advanceLine();
+                    // Try to extend the current segment to include this word.
+                    const candidate_w = segmentAdvance(measure_role, layout_font_size, slice, seg_start, word_end);
+                    if (seg_x + candidate_w <= width) {
+                        seg_end = word_end;
                         continue;
                     }
 
+                    // Overflow: flush the committed segment, then wrap. The
+                    // whitespace at the break is consumed (not rendered).
+                    const flush = slice[seg_start..seg_end];
+                    const flush_w = segmentAdvance(measure_role, layout_font_size, slice, seg_start, seg_end);
                     on_step(context, .{
-                        .text = chunk.text,
+                        .text = flush,
                         .block_style = block.style,
                         .inline_style = text_run.style,
                         .font_spec = spec,
-                        .x = state.x,
+                        .x = seg_x,
                         .y = state.y,
-                        .width = chunk_width,
+                        .width = flush_w,
                         .line_height = chunk_line_height,
                     });
+                    state.line_height = @max(state.line_height, chunk_line_height);
+                    state.advanceLine();
+                    seg_start = word_start;
+                    seg_x = state.x;
+                    seg_end = word_end;
+                }
 
-                    state.x += chunk_width;
+                if (seg_active) {
+                    const seg = slice[seg_start..seg_end];
+                    const seg_w = segmentAdvance(measure_role, layout_font_size, slice, seg_start, seg_end);
+                    on_step(context, .{
+                        .text = seg,
+                        .block_style = block.style,
+                        .inline_style = text_run.style,
+                        .font_spec = spec,
+                        .x = seg_x,
+                        .y = state.y,
+                        .width = seg_w,
+                        .line_height = chunk_line_height,
+                    });
+                    state.x = seg_x + seg_w;
                     state.line_height = @max(state.line_height, chunk_line_height);
                     state.line_start = false;
                 }
@@ -3327,20 +3442,6 @@ fn lineHeightForSpec(spec: FontSpec, options: RenderOptions) f32 {
 
 fn textWidthForSpec(spec: FontSpec, text: []const u8) f32 {
     return @as(f32, @floatFromInt(countColumns(text))) * glyphWidthForSpec(spec, .{});
-}
-
-fn nextChunk(text: []const u8, index: *usize) ?Chunk {
-    if (index.* >= text.len) return null;
-
-    const start = index.*;
-    const initial_is_whitespace = isInlineWhitespace(text[start]);
-    var end = start + 1;
-    while (end < text.len and isInlineWhitespace(text[end]) == initial_is_whitespace) : (end += 1) {}
-    index.* = end;
-    return .{
-        .text = text[start..end],
-        .is_whitespace = initial_is_whitespace,
-    };
 }
 
 fn isInlineWhitespace(byte: u8) bool {
