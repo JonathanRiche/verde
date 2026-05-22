@@ -1951,6 +1951,13 @@ fn renderOptionsGlyphWidth(options: RenderOptions) f32 {
     return options.glyph_width orelse options.base_font_size * 0.55;
 }
 
+fn inlineBaselineYOffset(block_style: TextStyle, role: palette.FontRole, font_size: f32, options: RenderOptions) f32 {
+    const reference_spec = textBlockFontSpecWithOptions(block_style, options);
+    const reference_size = fontSizeForSpecWithOptions(reference_spec, options);
+    const reference_role = markdownFontRole(block_style, .{});
+    return text_measure.baselineOffset(reference_role, reference_size, role, font_size);
+}
+
 const MarkdownUnderlineSpec = struct {
     rect: palette.Rect,
     color: palette.Color,
@@ -1983,24 +1990,13 @@ fn renderPaletteTextBlockLayout(
             const px = ctx.start[0] + step.x;
 
             const draw_font_size = fontSizeForSpecWithOptions(step.font_spec, ctx.options);
-            const block_font = textBlockFontSpecWithOptions(step.block_style, ctx.options);
-            const block_line_height = lineHeightForSpec(block_font, ctx.options);
-            // Bottom-align small chunks (inline code) so their baseline sits on
-            // the surrounding prose baseline instead of floating mid-line. The
-            // text run is top-positioned, so shifting `py` by the line-height
-            // delta brings the smaller box down to share the larger box's
-            // bottom edge.
-            const py_offset: f32 = if (step.line_height < block_line_height)
-                (block_line_height - step.line_height)
-            else
-                0.0;
-            const py = ctx.start[1] + step.y + py_offset;
+            const role = markdownFontRole(step.block_style, step.inline_style);
+            const py = ctx.start[1] + step.y + inlineBaselineYOffset(step.block_style, role, draw_font_size, ctx.options);
 
             const color = paletteColor(inlineTextColor(textBlockColor(step.block_style), step.inline_style));
             const clip = ctx.palette_context.clip;
             const byte_start = subsliceByteOffset(ctx.block_text, step.text);
             const byte_end = byte_start + step.text.len;
-            const role = markdownFontRole(step.block_style, step.inline_style);
 
             // Inline-code pill: collect a per-chunk rect; adjacent code chunks
             // (including whitespace inside the span) tile edge-to-edge and read
@@ -3259,10 +3255,11 @@ fn renderPaletteStyledChunk(
     const color = inlineTextColor(textBlockColor(block_style), inline_style);
     const draw_font_size = fontSizeForSpecWithOptions(font_spec, options);
     const role = markdownFontRole(block_style, inline_style);
+    const y = position[1] + inlineBaselineYOffset(block_style, role, draw_font_size, options);
 
     queuePaletteRoleText(context, .{
         .x = position[0],
-        .y = position[1],
+        .y = y,
         .w = width,
         .h = line_height,
     }, text, paletteColor(color), draw_font_size, role, context.clip);
@@ -3271,7 +3268,7 @@ fn renderPaletteStyledChunk(
         const underline_color = if (inline_style.link) paletteColor(theme.md.link) else paletteColor(color);
         queuePaletteRect(context, .{
             .x = position[0],
-            .y = position[1] + line_height - 2.0,
+            .y = y + line_height - 2.0,
             .w = width,
             .h = if (inline_style.link) 1.5 else 1.0,
         }, underline_color);
@@ -3280,7 +3277,7 @@ fn renderPaletteStyledChunk(
     if (inline_style.strike) {
         queuePaletteRect(context, .{
             .x = position[0],
-            .y = position[1] + line_height * 0.55,
+            .y = y + line_height * 0.55,
             .w = width,
             .h = @max(line_height * 0.06, 1.0),
         }, paletteColor(color));

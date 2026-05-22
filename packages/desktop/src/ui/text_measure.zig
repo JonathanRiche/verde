@@ -45,6 +45,18 @@ pub fn textWidth(role: palette.FontRole, font_size: f32, text: []const u8) f32 {
     return estimatedTextWidth(render_size, text);
 }
 
+pub fn fontAscent(role: palette.FontRole, font_size: f32) f32 {
+    const render_size = font_size * GPU_TEXT_FONT_SCALE;
+    if (fonts) |configured| {
+        return palette.sdl.ttfFontAscent(fontForRole(configured, role), render_size) catch fallbackAscent(render_size);
+    }
+    return fallbackAscent(render_size);
+}
+
+pub fn baselineOffset(reference_role: palette.FontRole, reference_size: f32, role: palette.FontRole, font_size: f32) f32 {
+    return fontAscent(reference_role, reference_size) - fontAscent(role, font_size);
+}
+
 pub fn textPrefixWidth(role: palette.FontRole, text: []const u8, font_size: f32, end: usize) f32 {
     const e = @min(end, text.len);
     if (e == 0) return 0.0;
@@ -132,4 +144,8 @@ fn estimatedTextWidth(font_size: f32, text: []const u8) f32 {
         };
     }
     return width;
+}
+
+fn fallbackAscent(font_size: f32) f32 {
+    return font_size * 0.82;
 }

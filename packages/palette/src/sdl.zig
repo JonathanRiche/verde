@@ -419,6 +419,11 @@ pub fn ttfMeasureText(font: *Font, text: []const u8, point_size: f32) Error!f32 
     return @floatFromInt(width);
 }
 
+pub fn ttfFontAscent(font: *Font, point_size: f32) Error!f32 {
+    try ttfSetFontSize(font, point_size);
+    return @floatFromInt(TTF_GetFontAscent(font));
+}
+
 pub fn ttfMeasureTextOffset(font: *Font, text: []const u8, point_size: f32, offset: usize) Error!f32 {
     if (text.len == 0 or offset == 0) return 0.0;
     const layout = try createMeasureText(font, text, point_size);
@@ -512,6 +517,7 @@ extern fn TTF_OpenFont(file: [*:0]const u8, ptsize: f32) ?*Font;
 extern fn TTF_CloseFont(font: *Font) void;
 extern fn TTF_SetFontSize(font: *Font, ptsize: f32) bool;
 extern fn TTF_GetStringSize(font: *Font, text: [*]const u8, length: usize, w: *c_int, h: *c_int) bool;
+extern fn TTF_GetFontAscent(font: *Font) c_int;
 extern fn TTF_CreateSurfaceTextEngine() ?*TextEngine;
 extern fn TTF_DestroySurfaceTextEngine(engine: ?*TextEngine) void;
 extern fn TTF_CreateText(engine: ?*TextEngine, font: *Font, text: [*]const u8, length: usize) ?*Text;
