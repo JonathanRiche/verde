@@ -6375,8 +6375,13 @@ pub const AppState = struct {
     pub fn pollTerminals(self: *AppState) bool {
         var visible_changed = false;
         for (self.projects.items, 0..) |*project, project_index| {
+            const project_selected = project_index == self.selected_project_index;
             const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
-            if (base_visible and !project.terminal_dock.hasRunningSession()) {
+            if (!project_selected) {
+                self.pollManagedProcesses(project_index);
+                continue;
+            }
+            if (project_selected and base_visible and !project.terminal_dock.hasRunningSession()) {
                 project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0) catch |err| {
                     log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
                     if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
@@ -6397,7 +6402,7 @@ pub const AppState = struct {
             }
             for (project.terminal_docks.items) |*entry| {
                 const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
-                if (dock_visible and !entry.dock.hasRunningSession()) {
+                if (project_selected and dock_visible and !entry.dock.hasRunningSession()) {
                     entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id) catch |err| {
                         log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                         if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
@@ -6417,19 +6422,6 @@ pub const AppState = struct {
                 if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
             }
             self.pollManagedProcesses(project_index);
-        }
-        for (self.archived_projects.items) |*project| {
-            if (project.terminal_dock.visible or project.terminal_dock.hasRunningSession()) {
-                _ = project.terminal_dock.poll(self.allocator) catch |err| {
-                    log.err("failed to poll archived terminal session: {s}", .{@errorName(err)});
-                };
-            }
-            for (project.terminal_docks.items) |*entry| {
-                if (!entry.dock.visible and !entry.dock.hasRunningSession()) continue;
-                _ = entry.dock.poll(self.allocator) catch |err| {
-                    log.err("failed to poll archived terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
-                };
-            }
         }
         return visible_changed;
     }
