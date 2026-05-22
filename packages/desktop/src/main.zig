@@ -305,6 +305,7 @@ fn mainInner(init: std.process.Init) !void {
         .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
     });
     defer state.deinit();
+    state.app_config_file_mtime = app_config.configFileMtime(allocator) catch -1;
     state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
     state.restorePersistedBrowserPaneOnLaunch();
@@ -385,6 +386,11 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
+        pollAppConfigFileChanges(&state);
+        if (state.app_config_runtime_sync_pending) {
+            state.app_config_runtime_sync_pending = false;
+            applyAppConfigRuntime(&state);
+        }
         if (live_server) |*server| {
             if (server.processPending(&state)) needs_render = true;
         }
@@ -1171,6 +1177,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
+            ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
@@ -1889,6 +1896,40 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
     return !state.composer_focused and state.palette_modal_text_focus == .none;
 }
 
+fn applyAppConfigRuntime(state: *AppState) void {
+    ui_theme.applyConfigTheme(state.allocator, state.app_config.theme_config);
+    ui_theme.installFonts(
+        CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
+        NOTO_SANS_BOLD_BYTES[0..NOTO_SANS_BOLD_BYTES.len],
+        NOTO_SANS_ITALIC_BYTES[0..NOTO_SANS_ITALIC_BYTES.len],
+        NOTO_SANS_BOLD_ITALIC_BYTES[0..NOTO_SANS_BOLD_ITALIC_BYTES.len],
+        CODICON_BYTES[0..CODICON_BYTES.len],
+        NERD_SYMBOLS_BYTES[0..NERD_SYMBOLS_BYTES.len],
+        state.app_config.font_size,
+    );
+    state.applyTerminalFontSizesFromConfig();
+    state.rethemeTerminalSessions() catch |err| {
+        log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
+    };
+    state.markDirty();
+}
+
+fn pollAppConfigFileChanges(state: *AppState) void {
+    const next_mtime = app_config.configFileMtime(state.allocator) catch return;
+    if (state.app_config_file_mtime < 0) {
+        state.app_config_file_mtime = next_mtime;
+        return;
+    }
+    if (next_mtime == state.app_config_file_mtime) return;
+
+    state.app_config_file_mtime = next_mtime;
+    state.reloadAppConfigFromDisk() catch |err| {
+        log.warn("failed to reload app config: {s}", .{@errorName(err)});
+        return;
+    };
+    applyAppConfigRuntime(state);
+}
+
 fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig) void {
     const next_keyboard = keybinds.NativeKeyboardConfig.load(state.allocator) catch |err| {
         log.err("failed to refresh native keybinds: {s}", .{@errorName(err)});
@@ -1906,10 +1947,8 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
     keyboard.* = next_keyboard;
     ui_theme.applyConfigTheme(state.allocator, next_app_config.theme_config);
     state.replaceAppConfig(next_app_config);
-    state.rethemeTerminalSessions() catch |err| {
-        log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
-    };
-    state.markDirty();
+    state.app_config_file_mtime = app_config.configFileMtime(state.allocator) catch state.app_config_file_mtime;
+    applyAppConfigRuntime(state);
     state.setSidebarNotice("Config, keybinds, and theme refreshed.");
 }
 

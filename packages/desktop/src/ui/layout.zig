@@ -9,6 +9,7 @@ const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
+const settings_modal = @import("settings_modal.zig");
 const profiler = @import("../profiler.zig");
 
 const RootLayout = struct {
@@ -17,11 +18,18 @@ const RootLayout = struct {
 };
 
 const SIDEBAR_ANIM_DURATION_MS: i64 = 180;
+/// Above composer overlays (150), pane menus (180), and model cascade (1400).
+const PALETTE_MODAL_Z: i32 = 2000;
 
 var sidebar_anim_width: f32 = -1.0;
 var sidebar_anim_x: f32 = 0.0;
 var sidebar_anim_last_ms: i64 = 0;
 var sidebar_animating: bool = false;
+
+/// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
+pub fn updateSettingsModalHover(state: *runtime.AppState, x: f32, y: f32) void {
+    settings_modal.updateHover(state, x, y);
+}
 
 /// Rebuilds palette modal hit targets from the current window size **before** SDL input is
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
@@ -32,6 +40,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
+    settings_modal.registerHits(state, width, height, queueModalHit);
 }
 
 /// Updates import-modal thread list hover using hits from `refreshPaletteModalHits`.
@@ -81,11 +90,14 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     }
     sidebar.renderWorkspaceDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
+    const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
+    defer state.palette_overlay_batch.restoreZIndex(modal_z);
     renderImageModal(state, width, height);
     renderTranscriptSelectionModal(state, width, height);
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
+    settings_modal.render(state, width, height);
     debug_window.render(state, width, height);
 }
 
@@ -428,6 +440,16 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 };
             },
             .project_import_cancel => state.cancelProjectImport(),
+            .settings_cancel => state.cancelSettingsModal(),
+            .settings_save => {
+                if (state.saveSettingsModal()) {
+                    state.setSidebarNotice("Settings saved.");
+                } else |err| {
+                    runtime.log.warn("settings save failed: {s}", .{@errorName(err)});
+                    state.setSidebarNotice("Could not save settings to verde.json.");
+                }
+            },
+            .settings_control => settings_modal.applyControl(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
             .modal_block => state.palette_modal_text_focus = .none,
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
@@ -496,7 +518,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator) return false;
+    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator and !state.show_settings_modal) return false;
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {
@@ -604,6 +626,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
         state.cancelThreadImport();
+    } else if (state.show_settings_modal) {
+        state.cancelSettingsModal();
     }
     state.palette_modal_text_focus = .none;
 }
