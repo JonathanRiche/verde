@@ -448,6 +448,10 @@ pub const Dock = struct {
         return session.terminate();
     }
 
+    pub fn terminateAllSessions(self: *Dock) void {
+        for (self.tabs.items) |*tab| terminatePaneNodeSessions(tab.root);
+    }
+
     pub fn activeSessionSnapshot(self: *const Dock) ?SessionSnapshot {
         const pane = self.activePaneConst() orelse return null;
         const session = pane.session orelse return null;
@@ -606,6 +610,7 @@ pub const Dock = struct {
     pub fn closeTab(self: *Dock, allocator: std.mem.Allocator, index: usize) !void {
         if (index >= self.tabs.items.len) return;
         var removed = self.tabs.orderedRemove(index);
+        terminatePaneNodeSessions(removed.root);
         removed.deinit(allocator);
         if (self.tabs.items.len == 0) {
             try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
@@ -643,6 +648,9 @@ pub const Dock = struct {
     pub fn closeActivePane(self: *Dock, allocator: std.mem.Allocator) !void {
         const tab = self.activeTab() orelse return;
         if (isSinglePaneTree(tab.root)) return;
+        if (findPaneLeaf(tab.root, tab.active_pane_id)) |leaf| {
+            if (leaf.session) |session| _ = session.terminate();
+        }
         try removePaneFromTree(allocator, &tab.root, tab.active_pane_id);
         if (findPaneLeaf(tab.root, tab.active_pane_id) == null) {
             if (findFirstPaneLeaf(tab.root)) |leaf| tab.active_pane_id = leaf.id;
