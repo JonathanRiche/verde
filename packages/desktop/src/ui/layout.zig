@@ -441,6 +441,7 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .project_import_cancel => state.cancelProjectImport(),
             .settings_cancel => state.cancelSettingsModal(),
+            .settings_close => state.cancelSettingsModal(),
             .settings_save => {
                 if (state.saveSettingsModal()) {
                     state.setSidebarNotice("Settings saved.");
