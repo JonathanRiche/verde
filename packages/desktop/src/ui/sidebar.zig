@@ -94,6 +94,23 @@ const ThreadDragState = struct {
 var thread_drag: ThreadDragState = .{};
 var settings_hovered: bool = false;
 
+const WorkspaceDragState = struct {
+    pending: bool = false,
+    active: bool = false,
+    project_index: usize = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+};
+
+var workspace_drag: WorkspaceDragState = .{};
+/// Drop slot computed during an active workspace drag: insert the dragged
+/// project immediately before `workspace_drop_before` (array coordinates).
+var workspace_drop_before: usize = 0;
+var workspace_drop_line_y: f32 = 0.0;
+var workspace_drop_valid: bool = false;
+
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     palette_sidebar_rect = rect;
@@ -128,6 +145,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     }
 
     updateThreadDrag(state, x, y);
+    updateWorkspaceDrag(state, x, y);
 
     var new_thread_hover: ?native_state.SidebarThreadHover = null;
     var new_project_hover: ?usize = null;
@@ -180,6 +198,7 @@ fn threadHoverEq(a: ?native_state.SidebarThreadHover, b: ?native_state.SidebarTh
 
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) {
+        if (workspace_drag.pending or workspace_drag.active) return finishWorkspaceDrag(state, x, y);
         if (thread_drag.pending or thread_drag.active) return finishThreadDrag(state, x, y);
         return rectContainsPoint(palette_sidebar_rect, x, y);
     }
@@ -212,12 +231,20 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .workspace_row => {
                 if (hit.project_index < state.projects.items.len) {
-                    state.noteInteraction();
-                    state.selected_project_index = hit.project_index;
-                    state.projects.items[hit.project_index].collapsed = !state.projects.items[hit.project_index].collapsed;
-                    state.syncRenameBuffer();
-                    state.requestTranscriptScrollToBottom();
-                    state.markDirty();
+                    // Begin a pending drag; a release without movement is
+                    // treated as a click (select + collapse toggle) in
+                    // finishWorkspaceDrag, while movement past the threshold
+                    // promotes to a reorder drag.
+                    workspace_drop_valid = false;
+                    workspace_drag = .{
+                        .pending = true,
+                        .project_index = hit.project_index,
+                        .start_x = x,
+                        .start_y = y,
+                        .x = x,
+                        .y = y,
+                    };
+                    _ = sdl.captureMouse(true);
                 }
             },
             .thread_row => {
@@ -312,16 +339,138 @@ pub fn renderWorkspaceDragPreview(state: *runtime.AppState) void {
 
 pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
     renderThreadDragPreview(state);
+    renderWorkspaceDragOverlay(state);
 }
 
 pub fn hasActiveThreadDrag() bool {
-    return thread_drag.pending or thread_drag.active;
+    return thread_drag.pending or thread_drag.active or
+        workspace_drag.pending or workspace_drag.active;
 }
 
 pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+    if (workspace_drag.pending or workspace_drag.active) {
+        if (buttons.left != 0) return false;
+        return finishWorkspaceDrag(state, x, y);
+    }
     if (!thread_drag.pending and !thread_drag.active) return false;
     if (buttons.left != 0) return false;
     return finishThreadDrag(state, x, y);
+}
+
+fn updateWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) void {
+    if (!workspace_drag.pending and !workspace_drag.active) return;
+    workspace_drag.x = x;
+    workspace_drag.y = y;
+    if (workspace_drag.pending) {
+        const dx = x - workspace_drag.start_x;
+        const dy = y - workspace_drag.start_y;
+        const threshold = theme.scaledUi(THREAD_DRAG_THRESHOLD_CSS);
+        if (dx * dx + dy * dy >= threshold * threshold) {
+            workspace_drag.pending = false;
+            workspace_drag.active = true;
+        }
+    }
+    if (workspace_drag.active) computeWorkspaceDropTarget(y);
+    state.markDirty();
+}
+
+/// Scans the retained workspace-row hit rects (in project order) to find where
+/// a drop at vertical position `y` should insert.
+fn computeWorkspaceDropTarget(y: f32) void {
+    workspace_drop_valid = false;
+    var index: usize = 0;
+    while (index < palette_hit_count) : (index += 1) {
+        const hit = palette_hits[index];
+        if (hit.kind != .workspace_row) continue;
+        const r = hit.rect;
+        if (y < r.y) {
+            workspace_drop_before = hit.project_index;
+            workspace_drop_line_y = r.y;
+            workspace_drop_valid = true;
+            return;
+        }
+        if (y <= r.y + r.h) {
+            if (y < r.y + r.h * 0.5) {
+                workspace_drop_before = hit.project_index;
+                workspace_drop_line_y = r.y;
+            } else {
+                workspace_drop_before = hit.project_index + 1;
+                workspace_drop_line_y = r.y + r.h;
+            }
+            workspace_drop_valid = true;
+            return;
+        }
+        // Cursor is below this row; remember it as the running candidate so a
+        // drop past the last row lands at the end.
+        workspace_drop_before = hit.project_index + 1;
+        workspace_drop_line_y = r.y + r.h;
+        workspace_drop_valid = true;
+    }
+}
+
+fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
+    _ = x;
+    _ = y;
+    const drag = workspace_drag;
+    workspace_drag = .{};
+    _ = sdl.captureMouse(false);
+
+    if (!drag.active) {
+        // No meaningful movement — treat as a plain click on the row.
+        if (drag.project_index < state.projects.items.len) {
+            state.noteInteraction();
+            state.selected_project_index = drag.project_index;
+            state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
+            state.syncRenameBuffer();
+            state.requestTranscriptScrollToBottom();
+            state.markDirty();
+        }
+        workspace_drop_valid = false;
+        return true;
+    }
+
+    if (workspace_drop_valid) state.moveProject(drag.project_index, workspace_drop_before);
+    workspace_drop_valid = false;
+    state.markDirty();
+    return true;
+}
+
+fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
+    if (!workspace_drag.active) return;
+    if (workspace_drag.project_index >= state.projects.items.len) return;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    if (workspace_drop_valid) {
+        const line_h = theme.scaledUi(2.0);
+        const inset = theme.scaledUi(25.0);
+        queuePaletteRoundedRect(state, .{
+            .x = palette_sidebar_rect.x + inset,
+            .y = workspace_drop_line_y - line_h * 0.5,
+            .w = palette_sidebar_rect.w - inset * 2.0,
+            .h = line_h,
+        }, paletteColor(theme.COLOR_GREEN), line_h * 0.5);
+    }
+
+    const project = &state.projects.items[workspace_drag.project_index];
+    const w = theme.scaledUi(200.0);
+    const h = theme.scaledUi(30.0);
+    const rect: palette.Rect = .{
+        .x = workspace_drag.x + theme.scaledUi(12.0),
+        .y = workspace_drag.y + theme.scaledUi(8.0),
+        .w = w,
+        .h = h,
+    };
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    const font = theme.scaledUi(13.5);
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(12.0),
+        .y = rect.y + (rect.h - font * 1.25) * 0.5,
+        .w = rect.w - theme.scaledUi(20.0),
+        .h = font * 1.25,
+    }, project.label, paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
 fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
@@ -725,7 +874,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         // hover-highlight matching the rest of the sidebar's row language.
         const btn = theme.scaledUi(34.0);
         const btn_rect: palette.Rect = .{
-            .x = x,
+            .x = rect.x + rect.w - pad_x - btn,
             .y = footer_rect.y + (footer_rect.h - btn) * 0.5,
             .w = btn,
             .h = btn,
