@@ -5883,6 +5883,8 @@ pub const AppState = struct {
 
     pub fn blurPaletteComposer(self: *AppState) void {
         self.palette_composer.focused = false;
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
         self.composer_focused = false;
     }
 

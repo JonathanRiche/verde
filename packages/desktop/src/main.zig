@@ -1012,6 +1012,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
+            if (handleComposerBlurShortcut(state, &event.key)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (state.routePaletteComposerKeyDown(&event.key)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -1599,6 +1603,27 @@ fn handleComposerFocusShortcut(state: *AppState, event: *const sdl.KeyboardEvent
     }
 
     state.requestComposerFocus();
+    return true;
+}
+
+fn handleComposerBlurShortcut(state: *AppState, event: *const sdl.KeyboardEvent) bool {
+    if (!state.composer_focused) return false;
+    if (state.focusedWorkspaceChatPaneId() == null) return false;
+    if (state.terminal_focused) return false;
+    if (state.isBrowserPaneFocused() or state.browser_address_focused) return false;
+    if (state.palette_modal_text_focus != .none) return false;
+    if (!event.down or event.repeat) return false;
+    if (event.scancode != .escape and event.key != .escape) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.ctrl) or
+        isKeymodPressed(event.mod, sdl.Keymod.alt) or
+        isKeymodPressed(event.mod, sdl.Keymod.gui) or
+        isKeymodPressed(event.mod, sdl.Keymod.shift))
+    {
+        return false;
+    }
+
+    state.blurPaletteComposer();
+    state.markDirty();
     return true;
 }
 
