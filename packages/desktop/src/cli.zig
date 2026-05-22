@@ -156,7 +156,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
     const caps = .{
         .app = "verde",
         .version = VERSION,
-        .protocol_version = 1,
+        .protocol_version = 2,
         .cli = .{
             .state = spec.state_commands[0..],
             .session = spec.session_commands[0..],
