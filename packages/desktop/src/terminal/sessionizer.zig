@@ -10,7 +10,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -175,24 +175,47 @@ pub fn requestAlloc(
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
     return try allocator.dupe(u8, std.mem.trim(u8, line, "\r"));
 }
+const DaemonStatus = struct {
+    protocol_version: u32,
+    pid: ?std.posix.pid_t = null,
+};
+
+fn parseDaemonStatus(allocator: std.mem.Allocator, response: []const u8) ?DaemonStatus {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const result = parsed.value.object.get("result") orelse return null;
+    if (result != .object) return null;
+    const protocol_version = jsonU32(result.object.get("protocol_version") orelse .null) orelse return null;
+    const pid = if (jsonUsize(result.object.get("pid") orelse .null)) |value| @as(std.posix.pid_t, @intCast(value)) else null;
+    return .{ .protocol_version = protocol_version, .pid = pid };
+}
 
 pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_path: []const u8) !void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+
     if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
-        allocator.free(response);
-        return;
+        defer allocator.free(response);
+        if (parseDaemonStatus(allocator, response)) |status| {
+            if (status.protocol_version == PROTOCOL_VERSION) return;
+            if (status.pid) |pid| {
+                std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+                std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+            }
+        }
     } else |_| {}
 
     try spawnDaemon(allocator, exe_path);
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const io = threaded.io();
     var attempts: usize = 0;
     while (attempts < 250) : (attempts += 1) {
         if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
-            allocator.free(response);
-            return;
-        } else |_| {
-            std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
-        }
+            defer allocator.free(response);
+            if (parseDaemonStatus(allocator, response)) |status| {
+                if (status.protocol_version == PROTOCOL_VERSION) return;
+            }
+        } else |_| {}
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
     }
     return error.SessionDaemonUnavailable;
 }
