@@ -43,6 +43,7 @@ const SidebarHitKind = enum {
     workspace_row,
     thread_row,
     toggle_threads,
+    settings,
 };
 
 const SidebarHit = struct {
@@ -91,6 +92,7 @@ const ThreadDragState = struct {
 };
 
 var thread_drag: ThreadDragState = .{};
+var settings_hovered: bool = false;
 
 /// Renders the sidebar with Palette-owned drawing and retained hit regions.
 pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
@@ -130,6 +132,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_thread_hover: ?native_state.SidebarThreadHover = null;
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
+    var new_settings_hover = false;
     if (!state.isSidebarCollapsed() and rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
         // overlapping during scroll edge cases.
@@ -150,6 +153,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                 .new_thread => {
                     if (new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
                 },
+                .settings => new_settings_hover = true,
                 else => {},
             }
         }
@@ -158,7 +162,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     const thread_changed = !threadHoverEq(state.sidebar_thread_hover, new_thread_hover);
     const project_changed = state.sidebar_project_hover != new_project_hover;
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
-    if (!thread_changed and !project_changed and !new_thread_changed) return;
+    const settings_changed = settings_hovered != new_settings_hover;
+    settings_hovered = new_settings_hover;
+    if (!thread_changed and !project_changed and !new_thread_changed and !settings_changed) return;
 
     state.sidebar_thread_hover = new_thread_hover;
     state.sidebar_project_hover = new_project_hover;
@@ -234,6 +240,11 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.projects.items[hit.project_index].thread_list_expanded = !state.projects.items[hit.project_index].thread_list_expanded;
                     state.markDirty();
                 }
+            },
+            .settings => {
+                // TODO: open the settings view once it exists.
+                state.noteInteraction();
+                state.markDirty();
             },
         }
         return true;
@@ -700,23 +711,38 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             .w = rect.w - theme.scaledUi(1.0),
             .h = rect.y + rect.h - list_bottom,
         };
-        // Distinct shade (not COLOR_PANEL) so the reserved band is visibly
-        // separate from the scrolling list above. Placeholder until the real
-        // sticky settings chrome lands here.
-        queuePaletteRect(state, footer_rect, paletteColor(theme.COLOR_PANEL_ALT));
+        // Blend with the sidebar (COLOR_PANEL) so the band reads as part of the
+        // rail, with just a hairline divider separating it from the list.
+        queuePaletteRect(state, footer_rect, paletteColor(theme.COLOR_PANEL));
         queuePaletteRect(state, .{
             .x = rect.x,
             .y = list_bottom,
             .w = rect.w - theme.scaledUi(1.0),
             .h = theme.scaledUi(1.0),
         }, paletteColor(theme.borderMuted()));
-        const footer_font = theme.scaledUi(13.0);
-        queuePaletteText(state, .{
-            .x = footer_rect.x + theme.scaledUi(25.0),
-            .y = footer_rect.y + (footer_rect.h - footer_font * 1.25) * 0.5,
-            .w = footer_rect.w - theme.scaledUi(50.0),
-            .h = footer_font * 1.25,
-        }, "Settings", paletteColor(theme.COLOR_TEXT_MUTED), footer_font, footer_rect);
+
+        // Compact gear icon button aligned to the rail, with a square
+        // hover-highlight matching the rest of the sidebar's row language.
+        const btn = theme.scaledUi(34.0);
+        const btn_rect: palette.Rect = .{
+            .x = x,
+            .y = footer_rect.y + (footer_rect.h - btn) * 0.5,
+            .w = btn,
+            .h = btn,
+        };
+        const settings_hover = state.palette_mouse_in_workspace and rectContainsPoint(btn_rect, state.palette_mouse_x, state.palette_mouse_y);
+        if (settings_hover) {
+            queuePaletteRoundedRect(state, btn_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+        }
+        const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+        const icon_font = theme.scaledUi(17.0);
+        queuePaletteIcon(state, .{
+            .x = btn_rect.x + (btn_rect.w - icon_font) * 0.5,
+            .y = btn_rect.y + (btn_rect.h - icon_font) * 0.5,
+            .w = icon_font,
+            .h = icon_font,
+        }, NF_COD_GEAR, icon_font, paletteColor(fg), footer_rect);
+        addPaletteHit(btn_rect, .settings, 0, 0);
     }
 
     // Pinned header — painted last so any scrolled rows in the header band
@@ -891,6 +917,7 @@ fn queuePaletteFolderIcon(state: *runtime.AppState, x: f32, center_y: f32, width
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_EDIT = "\u{EA73}";
+const NF_COD_GEAR = "\u{EB51}";
 
 /// Renders a centered codicon glyph through the icon font. Replaces the
 /// hand-drawn shapes / PNGs we used before.
