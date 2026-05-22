@@ -14,6 +14,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
+const DAEMON_POLL_READ_BUDGET: usize = 64 * 1024;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -334,7 +335,7 @@ const PtySession = struct {
     }
 
     fn poll(self: *PtySession, allocator: std.mem.Allocator) !void {
-        try self.drainOutput(allocator);
+        try self.drainOutput(allocator, DAEMON_POLL_READ_BUDGET);
         _ = self.captureExitStatus();
     }
 
@@ -423,12 +424,15 @@ const PtySession = struct {
         }
     }
 
-    fn drainOutput(self: *PtySession, allocator: std.mem.Allocator) !void {
+    fn drainOutput(self: *PtySession, allocator: std.mem.Allocator, max_bytes: usize) !void {
         var buffer: [8192]u8 = undefined;
-        while (true) {
+        var read_total: usize = 0;
+        while (read_total < max_bytes) {
             const read_raw = std.c.read(self.master_fd, &buffer, buffer.len);
             if (read_raw > 0) {
-                try self.appendOutput(allocator, buffer[0..@intCast(read_raw)]);
+                const read_len: usize = @intCast(read_raw);
+                try self.appendOutput(allocator, buffer[0..read_len]);
+                read_total += read_len;
                 continue;
             }
             if (read_raw == 0) {
@@ -562,7 +566,6 @@ pub const Daemon = struct {
     }
 
     fn handleRequest(self: *Daemon, request_json: []const u8) ![]u8 {
-        self.pollSessions();
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, request_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return try errorResponseAlloc(self.allocator, .null, "invalid_request", "request must be an object");
