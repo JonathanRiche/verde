@@ -57,6 +57,7 @@ pub const PaletteModalAction = enum {
     thread_import_input,
     project_import_input,
     settings_cancel,
+    settings_close,
     settings_save,
     settings_control,
 };
@@ -2752,7 +2753,8 @@ pub const AppState = struct {
     show_project_creator: bool,
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
-    settings_hover_index: ?usize,
+    settings_hover_control: ?u8,
+    settings_close_hovered: bool,
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -2950,7 +2952,8 @@ pub const AppState = struct {
             .show_project_creator = false,
             .show_settings_modal = false,
             .settings_draft = .{},
-            .settings_hover_index = null,
+            .settings_hover_control = null,
+            .settings_close_hovered = false,
             .app_config_file_mtime = -1,
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
@@ -5178,12 +5181,21 @@ pub const AppState = struct {
         };
     }
 
+    pub fn isSettingsDraftDirty(self: *const AppState) bool {
+        const draft = self.settings_draft;
+        if (draft.font_size != self.app_config.font_size) return true;
+        if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
+        if (draft.theme_source != self.app_config.theme_config.source) return true;
+        return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
+    }
+
     pub fn openSettingsModal(self: *AppState) void {
         self.closeSidebarContextMenu();
         self.workspace_header_open_menu_open = false;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
-        self.settings_hover_index = null;
+        self.settings_hover_control = null;
+        self.settings_close_hovered = false;
         self.show_settings_modal = true;
         self.palette_modal_text_focus = .none;
         self.blurPaletteComposer();
@@ -5193,7 +5205,8 @@ pub const AppState = struct {
 
     pub fn cancelSettingsModal(self: *AppState) void {
         self.show_settings_modal = false;
-        self.settings_hover_index = null;
+        self.settings_hover_control = null;
+        self.settings_close_hovered = false;
         self.syncSettingsDraftFromConfig();
         self.palette_modal_text_focus = .none;
         self.markDirty();
@@ -5210,7 +5223,8 @@ pub const AppState = struct {
         self.applyTerminalFontSizesFromConfig();
         self.app_config_runtime_sync_pending = true;
         self.show_settings_modal = false;
-        self.settings_hover_index = null;
+        self.settings_hover_control = null;
+        self.settings_close_hovered = false;
         self.palette_modal_text_focus = .none;
         self.markDirty();
     }
