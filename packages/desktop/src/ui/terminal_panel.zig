@@ -156,6 +156,8 @@ const TerminalSelection = struct {
     moved: bool = false,
     dock_id: u32 = 0,
     pane_id: u32 = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
     anchor: TerminalCellCoord = .{},
     focus: TerminalCellCoord = .{},
 };
@@ -169,6 +171,7 @@ const TabHit = struct {
 const PaneHitTarget = struct {
     dock_id: u32,
     pane_id: u32,
+    rect: palette.Rect = .{},
 };
 
 const TabHitTarget = struct {
@@ -251,6 +254,9 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool
     if (!selection_state.dragging) return false;
     updateSelectionFocus(state, x, y) orelse return true;
     selection_state.moved = true;
+    if (!selection_state.active and selectionDragDistanceExceeded(x, y)) {
+        selection_state.active = true;
+    }
     state.markDirty();
     return true;
 }
@@ -276,10 +282,9 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
         }
         return true;
     }
-    if (button == 1) {
-        if (down) {
-            if (startSelection(state, x, y)) return true;
-        } else if (selection_state.dragging) {
+    if (routeTerminalMouseButton(state, x, y, button, down)) return true;
+    if (button == 1 and selection_state.dragging) {
+        if (!down) {
             _ = updateSelectionFocus(state, x, y);
             selection_state.dragging = false;
             if (!selection_state.moved) selection_state.active = false;
@@ -339,6 +344,25 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
     return false;
 }
 
+fn routeTerminalMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    hit_cache.dock_id = target.dock_id;
+    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    dock.focusPane(target.pane_id);
+    if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
+        _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
+    }
+    focusTerminal(state);
+    if (!dock.handleMouseButton(target.pane_id, button, down, x - target.rect.x, y - target.rect.y, target.rect.w, target.rect.h)) {
+        return false;
+    }
+    clearSelection();
+    hit_cache.menu_open = false;
+    if (dock.consumeWorkspaceChange()) state.markDirty();
+    state.markDirty();
+    return true;
+}
+
 pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f32) bool {
     if (wheel_y == 0.0 or state.projects.items.len == 0) return false;
     if (paneAtPoint(x, y)) |target| {
@@ -347,7 +371,7 @@ pub fn handlePaletteWheel(state: *app_state.AppState, x: f32, y: f32, wheel_y: f
         dock.focusPane(target.pane_id);
         focusTerminal(state);
         hit_cache.menu_open = false;
-        if (dock.handleWheel(state.allocator, target.pane_id, wheel_y)) {
+        if (dock.handleWheel(state.allocator, target.pane_id, wheel_y, x - target.rect.x, y - target.rect.y, target.rect.w, target.rect.h)) {
             state.markDirty();
         }
         if (dock.consumeWorkspaceChange()) state.markDirty();
@@ -701,7 +725,7 @@ fn focusTerminal(state: *app_state.AppState) void {
     state.requestTerminalDockFocus(if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id);
 }
 
-fn startSelection(state: *app_state.AppState, x: f32, y: f32) bool {
+fn beginSelectionCandidate(state: *app_state.AppState, x: f32, y: f32) bool {
     const target = paneAtPoint(x, y) orelse return false;
     const coord = cellAtPoint(state, target, x, y) orelse return false;
     hit_cache.dock_id = target.dock_id;
@@ -709,11 +733,13 @@ fn startSelection(state: *app_state.AppState, x: f32, y: f32) bool {
     dock.focusPane(target.pane_id);
     focusTerminal(state);
     selection_state = .{
-        .active = true,
+        .active = false,
         .dragging = true,
         .moved = false,
         .dock_id = target.dock_id,
         .pane_id = target.pane_id,
+        .start_x = x,
+        .start_y = y,
         .anchor = coord,
         .focus = coord,
     };
@@ -721,6 +747,12 @@ fn startSelection(state: *app_state.AppState, x: f32, y: f32) bool {
     if (dock.consumeWorkspaceChange()) state.markDirty();
     state.markDirty();
     return true;
+}
+
+fn selectionDragDistanceExceeded(x: f32, y: f32) bool {
+    const dx = x - selection_state.start_x;
+    const dy = y - selection_state.start_y;
+    return dx * dx + dy * dy >= 16.0;
 }
 
 fn updateSelectionFocus(state: *app_state.AppState, x: f32, y: f32) ?void {
@@ -869,7 +901,7 @@ fn paneAtPoint(x: f32, y: f32) ?PaneHitTarget {
     var i: usize = 0;
     while (i < hit_cache.pane_count) : (i += 1) {
         const hit = hit_cache.panes[i];
-        if (rectContains(hit.rect, x, y)) return .{ .dock_id = hit.dock_id, .pane_id = hit.pane_id };
+        if (rectContains(hit.rect, x, y)) return .{ .dock_id = hit.dock_id, .pane_id = hit.pane_id, .rect = hit.rect };
     }
     return null;
 }

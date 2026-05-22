@@ -36,6 +36,11 @@ const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
     else => @intCast(std.c.T.IOCSWINSZ),
 };
+const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
+    .linux => @intCast(std.c.T.IOCGPGRP),
+    .macos => @bitCast(@as(u32, 0x40047477)),
+    else => null,
+};
 const TerminalStream = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtStream());
 const TerminalHandler = @TypeOf((@as(*ghostty_vt.Terminal, undefined)).vtHandler());
 const DeviceAttributes = @typeInfo(
@@ -517,11 +522,22 @@ pub const Dock = struct {
         return false;
     }
 
-    pub fn handleWheel(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, wheel_y: f32) bool {
+    pub fn handleWheel(self: *Dock, allocator: std.mem.Allocator, pane_id: u32, wheel_y: f32, local_x: f32, local_y: f32, width: f32, height: f32) bool {
         const pane = self.findPaneById(pane_id) orelse return false;
         if (pane.session) |session| {
-            return session.handleWheel(allocator, wheel_y) catch |err| {
+            return session.handleWheel(allocator, wheel_y, local_x, local_y, width, height) catch |err| {
                 log.warn("terminal wheel scroll failed: {s}", .{@errorName(err)});
+                return false;
+            };
+        }
+        return false;
+    }
+
+    pub fn handleMouseButton(self: *Dock, pane_id: u32, button: u8, down: bool, local_x: f32, local_y: f32, width: f32, height: f32) bool {
+        const pane = self.findPaneById(pane_id) orelse return false;
+        if (pane.session) |session| {
+            return session.handleMouseButton(button, down, local_x, local_y, width, height) catch |err| {
+                log.warn("terminal mouse button failed: {s}", .{@errorName(err)});
                 return false;
             };
         }
@@ -1375,6 +1391,14 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn handleWheel(_: *UnsupportedSession, _: std.mem.Allocator, _: f32, _: f32, _: f32, _: f32, _: f32) !bool {
+        return false;
+    }
+
+    pub fn handleMouseButton(_: *UnsupportedSession, _: u8, _: bool, _: f32, _: f32, _: f32, _: f32) !bool {
+        return false;
+    }
+
     pub fn scrollViewport(_: *UnsupportedSession, _: std.mem.Allocator, _: TerminalScroll) !void {}
 
     pub fn pasteClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
@@ -1720,12 +1744,87 @@ const UnixSession = struct {
         return try self.writeRawInput(encoded);
     }
 
-    pub fn handleWheel(self: *UnixSession, allocator: std.mem.Allocator, wheel_y: f32) !bool {
+    pub fn handleWheel(self: *UnixSession, allocator: std.mem.Allocator, wheel_y: f32, local_x: f32, local_y: f32, width: f32, height: f32) !bool {
         if (wheel_y == 0.0) return false;
         const line_count_float = @max(@round(@abs(wheel_y) * WHEEL_SCROLL_LINES), 1.0);
         const line_count: isize = @intFromFloat(line_count_float);
+        if (self.terminal.flags.mouse_event != .none) {
+            try self.writeWheelMouseInput(local_x, local_y, width, height, wheel_y, line_count);
+            return true;
+        }
+        if (self.terminal.screens.active_key == .alternate) {
+            if (self.terminal.modes.get(.mouse_alternate_scroll)) {
+                try self.writeAlternateScrollInput(wheel_y, line_count);
+            }
+            return true;
+        }
         try self.scrollViewport(allocator, .{ .delta = if (wheel_y > 0.0) -line_count else line_count });
         return true;
+    }
+
+    pub fn handleMouseButton(self: *UnixSession, button: u8, down: bool, local_x: f32, local_y: f32, width: f32, height: f32) !bool {
+        const mouse_button = terminalMouseButton(button) orelse return false;
+        if (self.terminal.flags.mouse_event != .none) {
+            try self.writeMouseInput(mouse_button, if (down) .press else .release, local_x, local_y, width, height, false);
+            return true;
+        }
+        if (self.terminal.screens.active_key != .alternate and !self.hasForegroundProcessAwayFromShell()) return false;
+        try self.writeMouseInput(mouse_button, if (down) .press else .release, local_x, local_y, width, height, true);
+        return true;
+    }
+
+    fn hasForegroundProcessAwayFromShell(self: *const UnixSession) bool {
+        if (self.backend != .local) return false;
+        const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return false;
+        var foreground_process_group: c_int = 0;
+        if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return false;
+        return foreground_process_group > 0 and foreground_process_group != self.child_pid;
+    }
+
+    fn writeWheelMouseInput(self: *UnixSession, local_x: f32, local_y: f32, width: f32, height: f32, wheel_y: f32, line_count: isize) !void {
+        const button: ghostty_vt.input.MouseButton = if (wheel_y > 0.0) .four else .five;
+        var i: isize = 0;
+        while (i < line_count) : (i += 1) {
+            try self.writeMouseInput(button, .press, local_x, local_y, width, height, false);
+        }
+    }
+
+    fn writeMouseInput(self: *UnixSession, button: ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32, force_sgr: bool) !void {
+        const screen_width: u32 = @intFromFloat(@max(@round(width), 1.0));
+        const screen_height: u32 = @intFromFloat(@max(@round(height), 1.0));
+        const cols_f = @as(f32, @floatFromInt(@max(self.cols, 1)));
+        const rows_f = @as(f32, @floatFromInt(@max(self.rows, 1)));
+        const cell_width: u32 = @intFromFloat(@max(@round(width / cols_f), 1.0));
+        const cell_height: u32 = @intFromFloat(@max(@round(height / rows_f), 1.0));
+        var options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
+            .screen = .{ .width = screen_width, .height = screen_height },
+            .cell = .{ .width = cell_width, .height = cell_height },
+            .padding = .{},
+        });
+        if (force_sgr) {
+            options.event = .normal;
+            options.format = .sgr;
+        }
+        var buffer: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try ghostty_vt.input.encodeMouse(&writer, .{
+            .button = button,
+            .action = action,
+            .pos = .{ .x = local_x, .y = local_y },
+        }, options);
+        const encoded = writer.buffered();
+        if (encoded.len == 0) return;
+        _ = try self.writeRawInput(encoded);
+    }
+
+    fn writeAlternateScrollInput(self: *UnixSession, wheel_y: f32, line_count: isize) !void {
+        const sequence = if (self.terminal.modes.get(.cursor_keys))
+            if (wheel_y > 0.0) "\x1bOA" else "\x1bOB"
+        else if (wheel_y > 0.0) "\x1b[A" else "\x1b[B";
+        var i: isize = 0;
+        while (i < line_count) : (i += 1) {
+            _ = try self.writeRawInput(sequence);
+        }
     }
 
     pub fn scrollViewport(self: *UnixSession, allocator: std.mem.Allocator, scroll: TerminalScroll) !void {
@@ -2679,6 +2778,21 @@ fn modsFromKeyboardEvent(event: *const sdl.KeyboardEvent) ghostty_vt.input.KeyMo
         .super = modifierPressed(event.mod, sdl.Keymod.gui),
         .caps_lock = modifierPressed(event.mod, sdl.Keymod.caps),
         .num_lock = modifierPressed(event.mod, sdl.Keymod.num),
+    };
+}
+
+fn terminalMouseButton(button: u8) ?ghostty_vt.input.MouseButton {
+    return switch (button) {
+        1 => .left,
+        2 => .middle,
+        3 => .right,
+        4 => .four,
+        5 => .five,
+        6 => .six,
+        7 => .seven,
+        8 => .eight,
+        9 => .nine,
+        else => null,
     };
 }
 
