@@ -8,6 +8,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+const log = std.log.scoped(.sessionizer);
+
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -362,6 +364,20 @@ const PtySession = struct {
         _ = self.captureExitStatus();
     }
 
+    fn pollSettle(self: *PtySession, allocator: std.mem.Allocator) !usize {
+        const before = self.output_ring.items.len;
+        try self.poll(allocator);
+        var previous_len = self.output_ring.items.len;
+        var index: usize = 0;
+        while (index < 3) : (index += 1) {
+            sleepMs(5);
+            try self.poll(allocator);
+            if (self.output_ring.items.len == previous_len) break;
+            previous_len = self.output_ring.items.len;
+        }
+        return self.output_ring.items.len -| before;
+    }
+
     fn writeInput(self: *PtySession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
         try writeAll(self.master_fd, bytes);
@@ -370,15 +386,43 @@ const PtySession = struct {
 
     fn resize(self: *PtySession, cols: u16, rows: u16) void {
         if (!self.running) return;
+        const previous_cols = self.cols;
+        const previous_rows = self.rows;
         self.cols = @max(cols, 1);
         self.rows = @max(rows, 1);
+        const foreground_process_group = self.foregroundProcessGroup();
         var winsize = std.posix.winsize{
             .row = self.rows,
             .col = self.cols,
             .xpixel = 0,
             .ypixel = 0,
         };
-        _ = std.c.ioctl(self.master_fd, TERMINAL_WINSIZE_IOCTL, &winsize);
+        const ioctl_result = std.c.ioctl(self.master_fd, TERMINAL_WINSIZE_IOCTL, &winsize);
+        const ioctl_errno = if (ioctl_result == 0) 0 else std.c._errno().*;
+        var sigwinch_result: c_int = -1;
+        var sigwinch_errno: c_int = 0;
+        if (foreground_process_group) |pgrp| {
+            sigwinch_result = std.c.kill(-pgrp, std.c.SIG.WINCH);
+            if (sigwinch_result != 0) sigwinch_errno = std.c._errno().*;
+        }
+        const descendant_sigwinch_count = signalDescendantProcessGroups(std.heap.smp_allocator, self.child_pid, foreground_process_group, std.c.SIG.WINCH);
+        log.info(
+            "resize id={s} pid={d} pgrp={?d} {d}x{d}->{d}x{d} ioctl_result={d} ioctl_errno={d} sigwinch_result={d} sigwinch_errno={d} descendant_sigwinch_count={d}",
+            .{
+                self.session_id,
+                self.child_pid,
+                foreground_process_group,
+                previous_cols,
+                previous_rows,
+                self.cols,
+                self.rows,
+                ioctl_result,
+                ioctl_errno,
+                sigwinch_result,
+                sigwinch_errno,
+                descendant_sigwinch_count,
+            },
+        );
     }
 
     fn terminate(self: *PtySession) bool {
@@ -735,25 +779,60 @@ pub const Daemon = struct {
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
+        const start_offset = session.output_ring.items.len;
         const wrote = try session.writeInput(text);
-        return try okValueResponse(self.allocator, id_value, .{ .accepted = wrote, .bytes = text.len });
+        const output_bytes = if (wrote) try session.pollSettle(self.allocator) else 0;
+        const output_text = try self.allocator.dupe(u8, session.output_ring.items[start_offset..]);
+        defer self.allocator.free(output_text);
+        log.info(
+            "write id={s} pid={d} pgrp={?d} input_bytes={d} output_bytes={d}",
+            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), text.len, output_bytes },
+        );
+        return try okValueResponse(self.allocator, id_value, .{
+            .accepted = wrote,
+            .bytes = text.len,
+            .running = session.running,
+            .pid = session.child_pid,
+            .foreground_process_group = session.foregroundProcessGroup(),
+            .text = output_text,
+            .offset = start_offset,
+            .next_offset = session.output_ring.items.len,
+        });
     }
 
     fn resizeResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
+        const start_offset = session.output_ring.items.len;
         session.resize(
             jsonU16(params.object.get("cols") orelse .null) orelse session.cols,
             jsonU16(params.object.get("rows") orelse .null) orelse session.rows,
         );
-        return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+        const output_bytes = try session.pollSettle(self.allocator);
+        const output_text = try self.allocator.dupe(u8, session.output_ring.items[start_offset..]);
+        defer self.allocator.free(output_text);
+        log.info(
+            "resize-poll id={s} pid={d} pgrp={?d} output_bytes={d}",
+            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), output_bytes },
+        );
+        return try okValueResponse(self.allocator, id_value, .{
+            .accepted = true,
+            .running = session.running,
+            .pid = session.child_pid,
+            .foreground_process_group = session.foregroundProcessGroup(),
+            .child_process_count = childProcessCount(session.child_pid),
+            .text = output_text,
+            .offset = start_offset,
+            .next_offset = session.output_ring.items.len,
+        });
     }
 
     fn tailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value, screen: bool) ![]u8 {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
+        try session.poll(self.allocator);
         const lines = jsonU32(params.object.get("lines") orelse .null) orelse if (screen) DEFAULT_ROWS else 80;
         const start_offset = jsonUsize(params.object.get("offset") orelse .null);
         const max_bytes = jsonUsize(params.object.get("max_bytes") orelse .null);
@@ -1192,6 +1271,84 @@ fn childProcessCount(pid: std.posix.pid_t) ?usize {
         }
     }
     return count;
+}
+
+fn signalDescendantProcessGroups(
+    allocator: std.mem.Allocator,
+    root_pid: std.posix.pid_t,
+    foreground_process_group: ?std.posix.pid_t,
+    signal: std.c.SIG,
+) usize {
+    if (builtin.os.tag != .linux or root_pid <= 0) return 0;
+
+    var processes: std.ArrayList(std.posix.pid_t) = .empty;
+    defer processes.deinit(allocator);
+    var process_groups: std.ArrayList(std.posix.pid_t) = .empty;
+    defer process_groups.deinit(allocator);
+
+    appendProcessChildren(allocator, &processes, root_pid) catch return 0;
+    var index: usize = 0;
+    while (index < processes.items.len) : (index += 1) {
+        const pid = processes.items[index];
+        appendProcessChildren(allocator, &processes, pid) catch {};
+        const pgrp = processGroupForPid(pid) orelse continue;
+        if (pgrp <= 0 or pgrp == root_pid) continue;
+        if (foreground_process_group) |foreground| {
+            if (pgrp == foreground) continue;
+        }
+        if (containsPid(process_groups.items, pgrp)) continue;
+        process_groups.append(allocator, pgrp) catch continue;
+    }
+
+    var signaled: usize = 0;
+    for (process_groups.items) |pgrp| {
+        if (std.c.kill(-pgrp, signal) == 0) signaled += 1;
+    }
+    return signaled;
+}
+
+fn appendProcessChildren(allocator: std.mem.Allocator, processes: *std.ArrayList(std.posix.pid_t), pid: std.posix.pid_t) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/proc/{d}/task/{d}/children", .{ pid, pid });
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.c.close(fd);
+
+    var buffer: [4096]u8 = undefined;
+    const read_raw = std.c.read(fd, &buffer, buffer.len);
+    if (read_raw <= 0) return;
+
+    var iterator = std.mem.tokenizeAny(u8, buffer[0..@intCast(read_raw)], " \t\r\n");
+    while (iterator.next()) |token| {
+        const child_pid = std.fmt.parseInt(std.posix.pid_t, token, 10) catch continue;
+        if (child_pid > 0 and !containsPid(processes.items, child_pid)) try processes.append(allocator, child_pid);
+    }
+}
+
+fn processGroupForPid(pid: std.posix.pid_t) ?std.posix.pid_t {
+    var path_buffer: [128]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/proc/{d}/stat", .{pid}) catch return null;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.c.close(fd);
+
+    var buffer: [1024]u8 = undefined;
+    const read_raw = std.c.read(fd, &buffer, buffer.len);
+    if (read_raw <= 0) return null;
+    const stat = buffer[0..@intCast(read_raw)];
+    const comm_end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    if (comm_end + 2 >= stat.len) return null;
+
+    var fields = std.mem.tokenizeScalar(u8, stat[comm_end + 2 ..], ' ');
+    _ = fields.next() orelse return null; // state
+    _ = fields.next() orelse return null; // parent pid
+    const pgrp_text = fields.next() orelse return null;
+    return std.fmt.parseInt(std.posix.pid_t, pgrp_text, 10) catch null;
+}
+
+fn containsPid(items: []const std.posix.pid_t, pid: std.posix.pid_t) bool {
+    for (items) |item| {
+        if (item == pid) return true;
+    }
+    return false;
 }
 
 pub fn nowMs() i64 {

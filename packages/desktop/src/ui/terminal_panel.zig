@@ -9,6 +9,9 @@ const app_state = @import("../state.zig");
 const colors = @import("colors.zig");
 const theme = @import("theme.zig");
 const terminal = @import("../terminal/terminal.zig");
+const runtime_log = @import("../runtime_log.zig");
+
+const log = std.log.scoped(.terminal_panel);
 
 const MAX_PANE_HITS = 64;
 const MAX_TAB_HITS = 32;
@@ -210,6 +213,7 @@ var hit_cache: TerminalHitCache = .{};
 var selection_state: TerminalSelection = .{};
 var draw_cache: TerminalDrawCache = .{};
 var active_capture: ?*TerminalPaneDrawCache = null;
+var terminal_layout_log_enabled: ?bool = null;
 
 pub fn renderDock(state: *app_state.AppState, width: f32, height: f32) void {
     renderDockAt(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height });
@@ -232,6 +236,11 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     if (state.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
+    if (dock.activePaneConst()) |active| {
+        dock.resizePaneToFit(state.allocator, active.id, rect.w, rect.h) catch |err| {
+            runtime_log.diagnostic("terminal workspace pre-resize failed dock={d} pane={d}: {s}", .{ dock_id, active.id, @errorName(err) });
+        };
+    }
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
@@ -458,6 +467,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
         .w = @min(cell_w * cols_f, rect.w),
         .h = @min(cell_h * rows_f, rect.h),
     };
+    logTerminalViewport("rebuild", dock_id, pane_id, rect, render_state, font_scale);
     const font_size = terminalFontSizeForCell(cell_w, cell_h);
     const text_y_offset = @max((cell_h - font_size) * 0.34, 0.0);
 
@@ -465,18 +475,22 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const row_data = render_state.row_data.slice();
     const row_cells = row_data.items(.cells);
     const row_selections = row_data.items(.selection);
+    const visible_rows = @min(row_cells.len, @as(usize, @intFromFloat(@ceil(rect.h / cell_h))));
+    const visible_cols = @min(@as(usize, render_state.cols), @as(usize, @intFromFloat(@ceil(rect.w / cell_w))));
 
-    for (row_cells, row_selections, 0..) |cells, selection, y| {
+    for (row_cells[0..visible_rows], row_selections[0..visible_rows], 0..) |cells, selection, y| {
         const cells_slice = cells.slice();
         const raw_cells = cells_slice.items(.raw);
         const row_styles = cells_slice.items(.style);
         const row_graphemes = cells_slice.items(.grapheme);
         const row_y = grid_rect.y + @as(f32, @floatFromInt(y)) * cell_h;
-        if (row_y > rect.y + rect.h) break;
+        if (row_y >= rect.y + rect.h) break;
 
-        for (raw_cells, 0..) |raw_cell, x| {
+        const row_visible_cols = @min(raw_cells.len, visible_cols);
+        for (raw_cells[0..row_visible_cols], 0..) |raw_cell, x| {
             const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
             const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, y, span);
+            if (cell_rect.x >= rect.x + rect.w) break;
             const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
             var fg = cell_style.fg(.{ .default = render_state.colors.foreground, .palette = &render_state.colors.palette, .bold = .bright });
@@ -507,13 +521,13 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
                         bg = blendRgb(bg, cursor_fill, 0.62);
                         fg = render_state.colors.background;
                     } else {
-                        drawCursor(state, render_state, cell_rect);
+                        drawCursor(state, render_state, cell_rect, rect);
                     }
                 }
             }
 
             if (!rgbEql(bg, render_state.colors.background) or rawCellNeedsFill(raw_cell)) {
-                queueRect(state, cell_rect, rgbPaletteColor(bg, 1.0));
+                queueClippedRect(state, cell_rect, rgbPaletteColor(bg, 1.0), rect);
             }
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
             var text_buf: [128]u8 = undefined;
@@ -533,7 +547,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
                 .y = text_rect.y,
                 .w = text_rect.w,
                 .h = text_rect.h,
-            }, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, glyph_kind);
+            }, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, intersectRect(if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, rect), glyph_kind);
         }
     }
 }
@@ -943,13 +957,13 @@ fn modifierPressed(state: sdl.Keymod, mask: u16) bool {
     return (state_bits & mask) != 0;
 }
 
-fn drawCursor(state: *app_state.AppState, render_state: *const ghostty_vt.RenderState, rect: palette.Rect) void {
+fn drawCursor(state: *app_state.AppState, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, clip: palette.Rect) void {
     const color = rgbPaletteColor(render_state.colors.cursor orelse render_state.colors.foreground, 0.95);
     switch (render_state.cursor.visual_style) {
-        .block => queueRect(state, rect, color),
-        .block_hollow => queueBorder(state, rect, color, 0.0, theme.scaledUi(1.5)),
-        .bar => queueRect(state, .{ .x = rect.x, .y = rect.y, .w = @max(rect.w * 0.12, theme.scaledUi(2.0)), .h = rect.h }, color),
-        .underline => queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - @max(rect.h * 0.1, theme.scaledUi(2.0)), .w = rect.w, .h = @max(rect.h * 0.1, theme.scaledUi(2.0)) }, color),
+        .block => queueClippedRect(state, rect, color, clip),
+        .block_hollow => queueBorder(state, intersectRect(rect, clip) orelse return, color, 0.0, theme.scaledUi(1.5)),
+        .bar => queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = @max(rect.w * 0.12, theme.scaledUi(2.0)), .h = rect.h }, color, clip),
+        .underline => queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h - @max(rect.h * 0.1, theme.scaledUi(2.0)), .w = rect.w, .h = @max(rect.h * 0.1, theme.scaledUi(2.0)) }, color, clip),
     }
 }
 
@@ -1067,6 +1081,65 @@ fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyph
 
 fn terminalRenderCellSize(base: u32, font_scale: f32) f32 {
     return @max(@round(@as(f32, @floatFromInt(base)) * font_scale), 1.0);
+}
+
+fn intersectRect(a: palette.Rect, b: palette.Rect) ?palette.Rect {
+    const x = @max(a.x, b.x);
+    const y = @max(a.y, b.y);
+    const right = @min(a.x + a.w, b.x + b.w);
+    const bottom = @min(a.y + a.h, b.y + b.h);
+    if (right <= x or bottom <= y) return null;
+    return .{
+        .x = x,
+        .y = y,
+        .w = right - x,
+        .h = bottom - y,
+    };
+}
+
+fn terminalLayoutLogEnabled() bool {
+    if (terminal_layout_log_enabled) |enabled| return enabled;
+    const enabled = if (std.c.getenv("VERDE_TERMINAL_LAYOUT_LOG")) |value_ptr| blk: {
+        const value = std.mem.span(value_ptr);
+        break :blk value.len > 0 and !std.mem.eql(u8, value, "0");
+    } else false;
+    terminal_layout_log_enabled = enabled;
+    return enabled;
+}
+
+fn logTerminalViewport(
+    comptime event: []const u8,
+    dock_id: u32,
+    pane_id: u32,
+    rect: palette.Rect,
+    render_state: *const ghostty_vt.RenderState,
+    font_scale: f32,
+) void {
+    if (!terminalLayoutLogEnabled()) return;
+    const cell_w = terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale);
+    const cell_h = terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, font_scale);
+    const grid_w = @min(cell_w * @as(f32, @floatFromInt(render_state.cols)), rect.w);
+    const grid_h = @min(cell_h * @as(f32, @floatFromInt(render_state.rows)), rect.h);
+    log.info(
+        "{s} dock={d} pane={d} rect=({d:.1},{d:.1} {d:.1}x{d:.1}) grid={d:.1}x{d:.1} cells={d}x{d} cell={d:.1}x{d:.1} font_scale={d:.3} dirty={s}",
+        .{
+            event,
+            dock_id,
+            pane_id,
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            grid_w,
+            grid_h,
+            render_state.cols,
+            render_state.rows,
+            cell_w,
+            cell_h,
+            font_scale,
+            @tagName(render_state.dirty),
+        },
+    );
 }
 
 fn terminalTextFontSize(font_size: f32, glyph_kind: TerminalGlyphKind) f32 {
