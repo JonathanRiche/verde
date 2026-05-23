@@ -5,6 +5,7 @@ const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
 pub const sessionizer = @import("sessionizer.zig");
 const theme = @import("../ui/theme.zig");
+const runtime_log = @import("../runtime_log.zig");
 
 const log = std.log.scoped(.native_terminal);
 
@@ -31,6 +32,7 @@ const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
+const LOCAL_TERMINAL_SCREEN_CLEAR = "\x1b[0m\x1b[2J\x1b[H";
 const TUI_REDRAW_INPUT = "\x0c";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
@@ -384,6 +386,12 @@ pub const Dock = struct {
                 scaledCellPixelWidth(self.font_scale),
                 scaledCellPixelHeight(self.font_scale),
             );
+            if (terminalLayoutDiagnosticsEnabled()) {
+                runtime_log.diagnostic(
+                    "terminal resizePaneToFit pane={d} rect={d:.1}x{d:.1} cells={d}x{d} session={d}x{d}",
+                    .{ pane_id, width, height, cols, rows, session.cols, session.rows },
+                );
+            }
         }
     }
 
@@ -1594,6 +1602,8 @@ const UnixSession = struct {
         const next_rows = sanitizeCellCount(rows, MIN_ROWS);
         const next_cell_width = @max(cell_width, 1);
         const next_cell_height = @max(cell_height, 1);
+        const shrinking_rows = next_rows < self.rows;
+        const growing_rows = next_rows > self.rows;
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
         if (!size_changed and !metrics_changed) {
@@ -1612,16 +1622,26 @@ const UnixSession = struct {
         self.cell_height = next_cell_height;
         if (size_changed) {
             try self.terminal.resize(allocator, next_cols, next_rows);
+            self.terminal.modes.set(.synchronized_output, false);
+            if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
+                self.resetAlternateViewport();
+            }
         }
         switch (self.backend) {
             .local => {
                 self.applyWinsize();
-                if (size_changed) self.requestTuiRedrawAfterResize();
+                if (size_changed) {
+                    if (growing_rows) self.sendInBandSizeReportAfterResize();
+                    self.requestTuiRedrawAfterResize();
+                }
             },
             .daemon => {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
-                if (size_changed) self.requestTuiRedrawAfterResize();
+                if (size_changed) {
+                    if (growing_rows) self.sendInBandSizeReportAfterResize();
+                    self.requestTuiRedrawAfterResize();
+                }
                 _ = try self.drainDaemonOutput(allocator);
             },
         }
@@ -1803,9 +1823,39 @@ const UnixSession = struct {
     }
 
     fn requestTuiRedrawAfterResize(self: *UnixSession) void {
-        if (!self.shouldRequestTuiRedrawAfterResize()) return;
+        const should_request = self.shouldRequestTuiRedrawAfterResize();
+        log.info(
+            "resize-redraw-check session={?s} backend={s} active_screen={s} shell_pid={?d} pgrp={?d} should={}",
+            .{
+                self.session_id,
+                @tagName(self.backend),
+                @tagName(self.terminal.screens.active_key),
+                self.daemon_shell_pid,
+                self.daemon_foreground_process_group,
+                should_request,
+            },
+        );
+        if (!should_request) return;
         _ = self.writeRawInput(TUI_REDRAW_INPUT) catch |err| {
             log.debug("failed to request terminal redraw after resize: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn sendInBandSizeReportAfterResize(self: *UnixSession) void {
+        if (!self.terminal.modes.get(.in_band_size_reports)) return;
+        var buffer: [128]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        ghostty_vt.size_report.encode(&writer, .mode_2048, .{
+            .rows = self.rows,
+            .columns = self.cols,
+            .cell_width = self.cell_width,
+            .cell_height = self.cell_height,
+        }) catch |err| {
+            log.debug("failed to encode terminal size report after resize: {s}", .{@errorName(err)});
+            return;
+        };
+        _ = self.writeRawInput(writer.buffered()) catch |err| {
+            log.debug("failed to send terminal size report after resize: {s}", .{@errorName(err)});
         };
     }
 
@@ -1913,6 +1963,34 @@ const UnixSession = struct {
 
     fn refreshRenderState(self: *UnixSession, allocator: std.mem.Allocator) !void {
         try self.render_state.update(allocator, &self.terminal);
+        try self.logRenderStateSnapshot(allocator);
+    }
+
+    fn logRenderStateSnapshot(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        if (!terminalLayoutDiagnosticsEnabled()) return;
+        const screen_text = try copyableRenderStateText(allocator, &self.render_state);
+        defer allocator.free(screen_text);
+        var lines = std.mem.splitScalar(u8, screen_text, '\n');
+        const first = lines.next() orelse "";
+        const second = lines.next() orelse "";
+        const third = lines.next() orelse "";
+        const first_trimmed = std.mem.trim(u8, first, " \r\t");
+        const second_trimmed = std.mem.trim(u8, second, " \r\t");
+        const third_trimmed = std.mem.trim(u8, third, " \r\t");
+        runtime_log.diagnostic(
+            "terminal render snapshot session={?s} screen={s} cells={d}x{d} cursor_viewport=({?d},{?d}) row1=\"{s}\" row2=\"{s}\" row3=\"{s}\"",
+            .{
+                self.session_id,
+                @tagName(self.terminal.screens.active_key),
+                self.cols,
+                self.rows,
+                if (self.render_state.cursor.viewport) |cursor| cursor.x else null,
+                if (self.render_state.cursor.viewport) |cursor| cursor.y else null,
+                clippedLogText(first_trimmed),
+                clippedLogText(second_trimmed),
+                clippedLogText(third_trimmed),
+            },
+        );
     }
 
     fn drainOutput(self: *UnixSession, allocator: std.mem.Allocator) !bool {
@@ -2036,6 +2114,20 @@ const UnixSession = struct {
         const suppress_replay_responses = initial_attach_replay;
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
+        const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
+        log.info(
+            "daemon-tail session={s} offset={d}->{d} text_len={d} shell_pid={?d} pgrp={?d} suppress={} active_screen={s}",
+            .{
+                session_id,
+                self.remote_output_offset,
+                next_offset,
+                text.len,
+                shell_pid,
+                foreground_process_group,
+                suppress_replay_responses,
+                @tagName(self.terminal.screens.active_key),
+            },
+        );
         self.daemon_shell_pid = shell_pid;
         self.daemon_foreground_process_group = foreground_process_group;
         const stale_alt_screen_replay = suppress_replay_responses and
@@ -2043,7 +2135,7 @@ const UnixSession = struct {
             foreground_process_group != null and
             foreground_process_group.? == shell_pid.? and
             looksLikeStaleFullScreenReplay(text);
-        self.remote_output_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
+        self.remote_output_offset = next_offset;
         self.suppress_next_daemon_replay = false;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
         self.daemon_state = .attached;
@@ -2060,6 +2152,7 @@ const UnixSession = struct {
         defer self.suppress_pty_responses = previous_suppression;
         self.stream.nextSlice(text);
         try self.repairTerminalState(allocator);
+        self.resetAlternateViewport();
         return true;
     }
 
@@ -2069,6 +2162,27 @@ const UnixSession = struct {
         defer self.suppress_pty_responses = previous_suppression;
         self.stream.nextSlice(LOCAL_TERMINAL_VIEW_RESET);
         try self.repairTerminalState(allocator);
+    }
+
+    fn clearLocalTerminalScreen(self: *UnixSession, allocator: std.mem.Allocator) !void {
+        const previous_suppression = self.suppress_pty_responses;
+        self.suppress_pty_responses = true;
+        defer self.suppress_pty_responses = previous_suppression;
+        self.stream.nextSlice(LOCAL_TERMINAL_SCREEN_CLEAR);
+        try self.repairTerminalState(allocator);
+        self.resetAlternateViewport();
+    }
+
+    fn resetAlternateViewport(self: *UnixSession) void {
+        if (self.terminal.screens.active_key == .alternate) {
+            self.terminal.scrollViewport(.{ .top = {} });
+            if (terminalLayoutDiagnosticsEnabled()) {
+                runtime_log.diagnostic(
+                    "terminal alternate viewport reset session={?s} anchor=top cells={d}x{d}",
+                    .{ self.session_id, self.cols, self.rows },
+                );
+            }
+        }
     }
 
     fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -2082,6 +2196,42 @@ const UnixSession = struct {
         }, 1);
         defer allocator.free(response);
         try ensureSessionResponseOk(allocator, response);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const result = parsed.value.object.get("result") orelse return;
+        if (result != .object) return;
+        if (jsonUsize(result.object.get("pid") orelse .null)) |pid| {
+            self.daemon_shell_pid = pid;
+        }
+        if (jsonUsize(result.object.get("foreground_process_group") orelse .null)) |pgrp| {
+            self.daemon_foreground_process_group = pgrp;
+        }
+        const text = jsonString(result.object.get("text") orelse .null) orelse "";
+        const next_offset = jsonUsize(result.object.get("next_offset") orelse .null);
+        log.info(
+            "daemon-resize-response session={s} cols={d} rows={d} shell_pid={?d} pgrp={?d} text_len={d} next_offset={?d} active_screen={s}",
+            .{
+                session_id,
+                self.cols,
+                self.rows,
+                self.daemon_shell_pid,
+                self.daemon_foreground_process_group,
+                text.len,
+                next_offset,
+                @tagName(self.terminal.screens.active_key),
+            },
+        );
+        if (next_offset) |offset| {
+            if (offset > self.remote_output_offset) self.remote_output_offset = offset;
+        }
+        if (text.len > 0) {
+            try self.appendOutput(allocator, text);
+            self.stream.nextSlice(text);
+            try self.repairTerminalState(allocator);
+            self.resetAlternateViewport();
+        }
     }
 
     fn killDaemon(self: *UnixSession) !void {
@@ -2104,7 +2254,38 @@ const UnixSession = struct {
             .text = bytes,
         }, 1);
         defer std.heap.smp_allocator.free(response);
+        try self.applyDaemonWriteResponse(response);
         return true;
+    }
+
+    fn applyDaemonWriteResponse(self: *UnixSession, response: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.smp_allocator, response, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const result = parsed.value.object.get("result") orelse return;
+        if (result != .object) return;
+        if (jsonUsize(result.object.get("pid") orelse .null)) |pid| {
+            self.daemon_shell_pid = pid;
+        }
+        if (jsonUsize(result.object.get("foreground_process_group") orelse .null)) |pgrp| {
+            self.daemon_foreground_process_group = pgrp;
+        }
+        const text = jsonString(result.object.get("text") orelse .null) orelse "";
+        const next_offset = jsonUsize(result.object.get("next_offset") orelse .null);
+        if (next_offset) |offset| {
+            if (offset > self.remote_output_offset) self.remote_output_offset = offset;
+        }
+        if (text.len == 0) return;
+        log.info(
+            "daemon-write-apply session={?s} text_len={d} next_offset={?d} active_screen={s}",
+            .{ self.session_id, text.len, next_offset, @tagName(self.terminal.screens.active_key) },
+        );
+        try self.appendOutput(std.heap.smp_allocator, text);
+        self.stream.nextSlice(text);
+        try self.repairTerminalState(std.heap.smp_allocator);
+        self.resetAlternateViewport();
+        try self.refreshRenderState(std.heap.smp_allocator);
+        self.render_state.dirty = .full;
     }
 
     fn detachDaemon(self: *UnixSession, allocator: std.mem.Allocator) void {
@@ -3103,6 +3284,16 @@ fn sanitizeViewportDimension(value: f32) ?f32 {
     if (!std.math.isFinite(value)) return null;
     if (value <= 1.0) return null;
     return value;
+}
+
+fn terminalLayoutDiagnosticsEnabled() bool {
+    const value_ptr = std.c.getenv("VERDE_TERMINAL_LAYOUT_LOG") orelse return false;
+    const value = std.mem.span(value_ptr);
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
+fn clippedLogText(value: []const u8) []const u8 {
+    return value[0..@min(value.len, 96)];
 }
 
 fn sanitizeCellCount(value: u16, min_value: u16) u16 {
