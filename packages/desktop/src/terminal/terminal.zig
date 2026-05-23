@@ -1464,6 +1464,12 @@ const UnixSession = struct {
     suppress_pty_responses: bool = false,
     defer_daemon_replay_until_resize: bool = false,
     output_ring: std.ArrayList(u8) = .empty,
+    /// Opt-in parser-boundary diagnostics, toggled by VERDE_TERMINAL_PARSER_LOG=1.
+    /// When set, drainOutput logs the moments a chunk ends with an ESC near the
+    /// boundary (likely mid-sequence) and the head of the next chunk — that's
+    /// where a desync (visible SGR params like `5;174m`, stray `\e`) manifests.
+    parser_log_enabled: bool = false,
+    parser_log_prev_tail_had_esc: bool = false,
 
     const Backend = enum {
         local,
@@ -1532,6 +1538,7 @@ const UnixSession = struct {
             errdefer if (self.pref_path) |pref_path| allocator.free(pref_path);
 
             try self.attachDaemonSession(allocator, options);
+            self.parser_log_enabled = std.c.getenv("VERDE_TERMINAL_PARSER_LOG") != null;
             try self.refreshRenderState(allocator);
             return self;
         }
@@ -1564,6 +1571,7 @@ const UnixSession = struct {
         self.stream.handler.effects.color_scheme = &UnixSession.streamColorScheme;
         errdefer self.stream.deinit();
 
+        self.parser_log_enabled = std.c.getenv("VERDE_TERMINAL_PARSER_LOG") != null;
         try self.refreshRenderState(allocator);
         return self;
     }
@@ -1621,6 +1629,19 @@ const UnixSession = struct {
         self.cell_width = next_cell_width;
         self.cell_height = next_cell_height;
         if (size_changed) {
+            // libghostty's PageList.resizeWithoutReflow keeps the BOTTOM
+            // `next_rows` of the active area on a row shrink (alt screen has
+            // no scrollback, so the upper rows are dropped via eraseHistory).
+            // For TUIs that draw top-down (Neovim/LazyVim), the lower
+            // dashboard rows ("Find Text", etc.) become the new top rows
+            // BEFORE the app has a chance to repaint. We wipe the alt screen
+            // so the kept rows are all blank and the TUI's SIGWINCH redraw
+            // plus the Ctrl-L kick are the sole source of small-pane content.
+            // Using the Terminal model API (not stream bytes) avoids the
+            // ESC[2J replay regression that caused blank-pane-with-cursor.
+            if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
+                self.clearAltShrinkKeepRegion(next_rows);
+            }
             try self.terminal.resize(allocator, next_cols, next_rows);
             self.terminal.modes.set(.synchronized_output, false);
             if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
@@ -2013,12 +2034,57 @@ const UnixSession = struct {
             }
 
             try self.appendOutput(allocator, buffer[0..read_len]);
+            if (self.parser_log_enabled) self.logParserBoundary(buffer[0..read_len]);
             self.stream.nextSlice(buffer[0..read_len]);
             try self.repairTerminalState(allocator);
             changed = true;
         }
 
         return changed;
+    }
+
+    /// Diagnostic: dump suspicious chunk boundaries so we can catch parser
+    /// desync (e.g. visible `5;174m` leaks, stray `\e`) in the act. Two cases:
+    ///   1. The previous chunk ended with an ESC near its tail (potentially
+    ///      mid-sequence). The continuation arrives at the head of THIS chunk
+    ///      — log it, because that's where a desync becomes visible.
+    ///   2. THIS chunk ends with an ESC near its tail. Remember it so we can
+    ///      log case (1) on the next iteration, and dump the tail itself for
+    ///      context.
+    /// Bytes are formatted printable-ASCII-with-\xNN escapes; one line per event.
+    fn logParserBoundary(self: *UnixSession, chunk: []const u8) void {
+        if (chunk.len == 0) return;
+
+        if (self.parser_log_prev_tail_had_esc) {
+            var buf: [256]u8 = undefined;
+            const head_len = @min(chunk.len, 48);
+            const formatted = formatBytesForLog(chunk[0..head_len], &buf);
+            log.warn("parser-boundary: continuation chunk head len={d} bytes='{s}'", .{ chunk.len, formatted });
+        }
+
+        var last_esc: ?usize = null;
+        var esc_count: usize = 0;
+        for (chunk, 0..) |b, i| {
+            if (b == 0x1b) {
+                last_esc = i;
+                esc_count += 1;
+            }
+        }
+
+        if (last_esc) |pos| {
+            const dist_from_end = chunk.len - pos;
+            if (dist_from_end <= 32) {
+                var buf: [256]u8 = undefined;
+                const tail = chunk[pos..];
+                const formatted = formatBytesForLog(tail, &buf);
+                log.warn("parser-boundary: ESC near chunk end chunk_len={d} esc_count={d} last_esc_at={d} dist_from_end={d} tail='{s}'", .{
+                    chunk.len, esc_count, pos, dist_from_end, formatted,
+                });
+                self.parser_log_prev_tail_had_esc = true;
+                return;
+            }
+        }
+        self.parser_log_prev_tail_had_esc = false;
     }
 
     fn attachDaemonSession(self: *UnixSession, allocator: std.mem.Allocator, options: SessionCreateOptions) !void {
@@ -2182,6 +2248,37 @@ const UnixSession = struct {
                     .{ self.session_id, self.cols, self.rows },
                 );
             }
+        }
+    }
+
+    /// Wipe the alternate screen before a row shrink so that libghostty's
+    /// keep-bottom-N-rows behavior cannot leak stale tall-layout content into
+    /// the small pane. With every active row blank, `trimTrailingBlankRows`
+    /// inside `PageList.resizeWithoutReflow` eats `old_rows - next_rows`
+    /// trailing rows, the kept `next_rows` are all blank, and the TUI's own
+    /// SIGWINCH-triggered redraw (plus the Ctrl-L kick we send after resize)
+    /// is the only thing that paints content. No surviving rows means nothing
+    /// to misposition.
+    ///
+    /// Prior attempts (scroll-down-by-29 to shift the top into the keep
+    /// region, blank-only-the-bottom-then-resize) both lost content in
+    /// different ways: the shift attempt kept the dashboard's empty top
+    /// padding and discarded the menu items, and the blank-only-bottom
+    /// attempt got the kept region shifted up by trimTrailingBlankRows.
+    /// A full-screen erase sidesteps both: there's nothing to misposition
+    /// because there's nothing left.
+    ///
+    /// Must be called only when the alternate screen is active and the current
+    /// terminal row count is strictly larger than `next_rows`.
+    fn clearAltShrinkKeepRegion(self: *UnixSession, next_rows: u16) void {
+        const old_rows = self.terminal.rows;
+        if (old_rows <= next_rows) return;
+        self.terminal.eraseDisplay(.complete, false);
+        if (terminalLayoutDiagnosticsEnabled()) {
+            runtime_log.diagnostic(
+                "terminal alt shrink pre-erase session={?s} old_rows={d} new_rows={d}",
+                .{ self.session_id, old_rows, next_rows },
+            );
         }
     }
 
@@ -2633,6 +2730,37 @@ const UnixSession = struct {
         std.c._exit(127);
     }
 };
+
+/// Format a byte slice for diagnostic logging: printable ASCII passes through
+/// (except `\` itself, which is escaped to disambiguate), ESC renders as `\e`,
+/// everything else as `\xNN`. Writes into the caller-provided buffer and
+/// returns the populated prefix; truncates silently if the buffer is too small.
+fn formatBytesForLog(bytes: []const u8, buf: []u8) []const u8 {
+    const hex = "0123456789abcdef";
+    var idx: usize = 0;
+    for (bytes) |b| {
+        if (idx + 4 > buf.len) break;
+        if (b == 0x1b) {
+            buf[idx] = '\\';
+            buf[idx + 1] = 'e';
+            idx += 2;
+        } else if (b == '\\') {
+            buf[idx] = '\\';
+            buf[idx + 1] = '\\';
+            idx += 2;
+        } else if (b >= 0x20 and b < 0x7f) {
+            buf[idx] = b;
+            idx += 1;
+        } else {
+            buf[idx] = '\\';
+            buf[idx + 1] = 'x';
+            buf[idx + 2] = hex[b >> 4];
+            buf[idx + 3] = hex[b & 0x0f];
+            idx += 4;
+        }
+    }
+    return buf[0..idx];
+}
 
 fn setNonBlocking(fd: std.posix.fd_t) !void {
     const current = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));

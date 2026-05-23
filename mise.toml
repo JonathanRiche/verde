@@ -19,6 +19,10 @@ run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && case \"$(uname 
 description = "Builds and runs Verde from the repo-local Zig build output with WPE on Linux."
 run = "bash -lc 'bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_LINUX_WPE=1 zig build run --release=safe -Dbrowser-backend=native_webview'"
 
+[tasks.dev-term]
+description = "Like dev, but kills any running verde daemon/app first and exports terminal layout + parser debug logs so the freshly-spawned daemon picks them up. Use this for diagnosing terminal-pane issues (parser desync, freezes, render corruption)."
+run = "bash -lc 'pkill -x verde 2>/dev/null; sleep 0.3; bash scripts/dev/check-desktop-build-deps.sh && VERDE_BROWSER_LINUX_WPE=1 VERDE_TERMINAL_LAYOUT_LOG=1 VERDE_TERMINAL_PARSER_LOG=1 zig build run --release=safe -Dbrowser-backend=native_webview'"
+
 [tasks.dev-mac]
 description = "Builds and runs Verde from the repo-local Zig build output with native WKWebView on macOS."
 run = "VERDE_BROWSER_BACKEND=native_webview zig build run --release=safe -Dbrowser-backend=native_webview"
