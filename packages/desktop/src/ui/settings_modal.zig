@@ -98,6 +98,26 @@ const SettingsLayout = struct {
 
 const log = std.log.scoped(.native_ui_settings);
 
+fn radiusSm() f32 {
+    return theme.scaledUi(6.0);
+}
+
+fn radiusMd() f32 {
+    return theme.scaledUi(8.0);
+}
+
+fn radiusLg() f32 {
+    return theme.scaledUi(12.0);
+}
+
+fn textLabel() [4]f32 {
+    return theme.COLOR_TEXT_MUTED;
+}
+
+fn textHint() [4]f32 {
+    return theme.lighten(theme.COLOR_TEXT_SUBTLE, 0.18);
+}
+
 fn metrics() Metrics {
     return Metrics.init();
 }
@@ -310,7 +330,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .y = layout.terminal_hint_y,
         .w = layout.terminal_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, profile_line, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(10.5), layout.modal);
+    }, profile_line, paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
 
     // Workspace
     drawCardTitle(state, layout.workspace_card, "Workspace", layout.modal);
@@ -386,13 +406,13 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
 
 fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     queueRoundedRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.68 }, 0.0);
-    queueRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), theme.scaledUi(12.0));
-    queueBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 200)), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    queueRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), radiusLg());
+    queueBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 110)), radiusLg(), theme.scaledUi(1.0));
 }
 
 fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) void {
     const m = metrics();
-    queueRoundedRect(state, layout.header, paletteColor(theme.lighten(theme.COLOR_PANEL, 0.025)), theme.scaledUi(12.0));
+    queueRoundedRect(state, layout.header, paletteColor(theme.lighten(theme.COLOR_PANEL, 0.02)), 0.0);
     drawHairline(state, layout.header.x, layout.header.y + layout.header.h - 1.0, layout.header.w);
 
     queueText(state, .{
@@ -400,14 +420,14 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
         .y = layout.header.y + theme.scaledUi(14.0),
         .w = theme.scaledUi(140.0),
         .h = theme.scaledUi(20.0),
-    }, "Settings", paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.0), layout.modal);
+    }, "Settings", paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), layout.modal);
 
     queueText(state, .{
         .x = layout.modal.x + m.modal_pad,
         .y = layout.header.y + theme.scaledUi(34.0),
         .w = layout.close.x - layout.modal.x - m.modal_pad - theme.scaledUi(8.0),
         .h = theme.scaledUi(16.0),
-    }, "Stored in verde.json", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), layout.modal);
+    }, "Stored in verde.json", paletteColor(textLabel()), theme.scaledUi(12.0), layout.modal);
 
     if (dirty) {
         const pill_w = theme.scaledUi(72.0);
@@ -418,8 +438,7 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
             .w = pill_w,
             .h = pill_h,
         };
-        queueRoundedRect(state, pill, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 28)), theme.scaledUi(9.0));
-        queueBorder(state, pill, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 80)), theme.scaledUi(9.0), theme.scaledUi(1.0));
+        queueRoundedRect(state, pill, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 36)), radiusSm());
         queueCenteredText(state, pill, "Unsaved", paletteColor(theme.COLOR_YELLOW), theme.scaledUi(10.5), layout.modal);
     }
 
@@ -428,7 +447,7 @@ fn drawHeaderBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
 
 fn drawFooterBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) void {
     const m = metrics();
-    queueRoundedRect(state, layout.footer, paletteColor(theme.darken(theme.COLOR_PANEL, 0.035)), theme.scaledUi(12.0));
+    queueRoundedRect(state, layout.footer, paletteColor(theme.darken(theme.COLOR_PANEL, 0.03)), 0.0);
     drawHairline(state, layout.footer.x, layout.footer.y, layout.footer.w);
 
     if (app_config.resolveConfigPath(state.allocator)) |config_path| {
@@ -438,18 +457,17 @@ fn drawFooterBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
             .y = layout.footer.y + theme.scaledUi(19.0),
             .w = layout.cancel.x - layout.footer.x - m.modal_pad - theme.scaledUi(10.0),
             .h = theme.scaledUi(16.0),
-        }, config_path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(10.0), layout.modal);
+        }, config_path, paletteColor(textHint()), theme.scaledUi(11.0), layout.modal);
     } else |_| {}
 
     drawFooterButton(state, layout.cancel, "Cancel", .secondary);
-    drawFooterButton(state, layout.save, "Save", if (dirty) .primary else .muted);
+    drawFooterButton(state, layout.save, "Save", if (dirty) .primary else .secondary);
 }
 
-const FooterStyle = enum { primary, secondary, muted };
+const FooterStyle = enum { primary, secondary };
 
 fn drawCard(state: *runtime.AppState, rect: palette.Rect) void {
-    queueRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.04)), theme.scaledUi(8.0));
-    queueBorder(state, rect, paletteColor(theme.withAlpha(theme.borderMuted(), 130)), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    queueRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), radiusMd());
 }
 
 fn drawCardTitle(state: *runtime.AppState, card: palette.Rect, title: []const u8, clip: palette.Rect) void {
@@ -459,7 +477,7 @@ fn drawCardTitle(state: *runtime.AppState, card: palette.Rect, title: []const u8
         .y = card.y + m.card_pad,
         .w = card.w - m.card_pad * 2.0,
         .h = m.title_h,
-    }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+    }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
 }
 
 fn drawFieldLabel(state: *runtime.AppState, card: palette.Rect, m: Metrics, label: []const u8) void {
@@ -468,36 +486,31 @@ fn drawFieldLabel(state: *runtime.AppState, card: palette.Rect, m: Metrics, labe
         .y = card.y + m.card_pad + m.title_h + m.row_gap,
         .w = card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), card);
+    }, label, paletteColor(textLabel()), theme.scaledUi(12.0), card);
 }
 
 fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
     const bg = if (selected)
-        theme.withAlpha(theme.COLOR_GREEN, 32)
+        theme.withAlpha(theme.COLOR_GREEN, 44)
     else if (hovered)
-        theme.lighten(theme.COLOR_PANEL_MUTED, 0.05)
+        theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)
     else
-        theme.darken(theme.COLOR_PANEL, 0.02);
-    queueRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(6.0));
-    const border = if (selected) theme.withAlpha(theme.COLOR_GREEN, 150) else theme.withAlpha(theme.borderMuted(), 130);
-    queueBorder(state, rect, paletteColor(border), theme.scaledUi(6.0), theme.scaledUi(1.0));
+        theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
+    queueRoundedRect(state, rect, paletteColor(bg), radiusSm());
 
     const dot_size = theme.scaledUi(7.0);
     const dot_x = rect.x + theme.scaledUi(9.0);
     const dot_y = rect.y + (rect.h - dot_size) * 0.5;
-    if (selected) {
-        queueRoundedRect(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(theme.COLOR_GREEN), theme.scaledUi(3.5));
-    } else {
-        queueBorder(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 160)), theme.scaledUi(3.5), theme.scaledUi(1.0));
-    }
+    const dot_color = if (selected) theme.COLOR_GREEN else theme.withAlpha(theme.COLOR_TEXT_MUTED, 180);
+    queueRoundedRect(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(dot_color), theme.scaledUi(3.5));
 
-    const text_color = if (selected) theme.COLOR_WHITE else if (hovered) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE;
+    const text_color = if (selected or hovered) theme.COLOR_WHITE else textLabel();
     queueText(state, .{
         .x = rect.x + theme.scaledUi(22.0),
-        .y = rect.y + (rect.h - theme.scaledUi(14.0)) * 0.5,
+        .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
         .w = rect.w - theme.scaledUi(26.0),
-        .h = theme.scaledUi(14.0),
-    }, label, paletteColor(text_color), theme.scaledUi(12.0), clip);
+        .h = theme.scaledUi(15.0),
+    }, label, paletteColor(text_color), theme.scaledUi(12.5), clip);
 }
 
 fn drawStepperRow(
@@ -517,22 +530,21 @@ fn drawStepperRow(
 ) void {
     queueText(state, .{
         .x = card.x + m.card_pad,
-        .y = row_y + (m.row_h - theme.scaledUi(14.0)) * 0.5,
+        .y = row_y + (m.row_h - theme.scaledUi(15.0)) * 0.5,
         .w = card.w * 0.5,
-        .h = theme.scaledUi(14.0),
-    }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
+        .h = theme.scaledUi(15.0),
+    }, label, paletteColor(textLabel()), theme.scaledUi(13.0), clip);
 
     const pill_x = dec_rect.x;
     const pill: palette.Rect = .{ .x = pill_x, .y = row_y, .w = m.stepperW(), .h = m.row_h };
-    queueRoundedRect(state, pill, paletteColor(theme.darken(theme.COLOR_PANEL, 0.02)), theme.scaledUi(6.0));
-    queueBorder(state, pill, paletteColor(theme.withAlpha(theme.borderMuted(), 120)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+    queueRoundedRect(state, pill, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), radiusSm());
 
     var value_buf: [8]u8 = undefined;
     const value_text = std.fmt.bufPrint(&value_buf, "{d:.0}", .{value}) catch "?";
     const value_rect: palette.Rect = .{ .x = dec_rect.x + m.step_w, .y = row_y, .w = m.value_w, .h = m.row_h };
-    queueRoundedRect(state, .{ .x = dec_rect.x + m.step_w - 0.5, .y = row_y + theme.scaledUi(5.0), .w = 1.0, .h = m.row_h - theme.scaledUi(10.0) }, paletteColor(theme.withAlpha(theme.borderMuted(), 100)), 0.0);
-    queueRoundedRect(state, .{ .x = inc_rect.x - 0.5, .y = row_y + theme.scaledUi(5.0), .w = 1.0, .h = m.row_h - theme.scaledUi(10.0) }, paletteColor(theme.withAlpha(theme.borderMuted(), 100)), 0.0);
-    queueCenteredText(state, value_rect, value_text, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+    queueRoundedRect(state, .{ .x = dec_rect.x + m.step_w - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0);
+    queueRoundedRect(state, .{ .x = inc_rect.x - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0);
+    queueCenteredText(state, value_rect, value_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.5), clip);
 
     const at_min = value <= min_value;
     const at_max = value >= max_value;
@@ -544,7 +556,7 @@ fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u
     if (hovered and enabled) {
         queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(5.0));
     }
-    const text_color = if (enabled) theme.COLOR_WHITE else theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 120);
+    const text_color = if (enabled) theme.COLOR_WHITE else textHint();
     queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(14.0), rect);
 }
 
@@ -552,30 +564,25 @@ fn drawFooterButton(state: *runtime.AppState, rect: palette.Rect, label: []const
     const bg: [4]f32 = switch (style) {
         .primary => theme.COLOR_GREEN,
         .secondary => theme.COLOR_PANEL_MUTED,
-        .muted => theme.darken(theme.COLOR_PANEL_MUTED, 0.06),
     };
     const text_color: [4]f32 = switch (style) {
-        .primary => theme.darken(theme.COLOR_PANEL, 0.25),
+        .primary => theme.COLOR_WHITE,
         .secondary => theme.COLOR_WHITE,
-        .muted => theme.COLOR_TEXT_SUBTLE,
     };
-    queueRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(7.0));
-    if (style != .primary) {
-        queueBorder(state, rect, paletteColor(theme.withAlpha(theme.borderMuted(), 140)), theme.scaledUi(7.0), theme.scaledUi(1.0));
-    }
-    queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(12.5), rect);
+    queueRoundedRect(state, rect, paletteColor(bg), radiusMd());
+    queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(13.0), rect);
 }
 
 fn drawIconButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, hovered: bool) void {
     if (hovered) {
-        queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 160)), theme.scaledUi(6.0));
+        queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), radiusSm());
     }
-    queueCenteredText(state, rect, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(17.0), rect);
+    queueCenteredText(state, rect, label, paletteColor(if (hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(17.0), rect);
 }
 
 fn drawHairline(state: *runtime.AppState, x: f32, y: f32, w: f32) void {
     if (w <= 0.0) return;
-    queueRoundedRect(state, .{ .x = x, .y = y, .w = w, .h = 1.0 }, paletteColor(theme.withAlpha(theme.borderMuted(), 160)), 0.0);
+    queueRoundedRect(state, .{ .x = x, .y = y, .w = w, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 18)), 0.0);
 }
 
 fn queueCenteredText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
