@@ -287,6 +287,13 @@ const PtySession = struct {
     cols: u16,
     rows: u16,
     output_ring: std.ArrayList(u8) = .empty,
+    /// Cumulative count of bytes ever appended to output_ring. Forms the public
+    /// "offset" the desktop client sends in `session.tail` requests. The ring
+    /// itself is capped at MAX_OUTPUT_RING and drops oldest bytes on overflow,
+    /// so a raw array index isn't a stable cursor — once 1 MB has streamed
+    /// through, the array length saturates and every later request collapses
+    /// to an empty slice (the bug that froze TUI panes mid-output).
+    output_total: u64 = 0,
     running: bool = true,
     exit_status: ?u32 = null,
     created_at_ms: i64,
@@ -515,10 +522,29 @@ const PtySession = struct {
         }
     }
 
+    /// Number of bytes dropped from the head of `output_ring` over its lifetime
+    /// (i.e. `output_total - output_ring.items.len`). Subtracting this from a
+    /// cumulative client offset yields the corresponding index into the ring.
+    fn ringStart(self: *const PtySession) u64 {
+        return self.output_total - @as(u64, @intCast(self.output_ring.items.len));
+    }
+
+    /// Translate a cumulative client offset into a valid index inside
+    /// `output_ring.items`. Clamps below-window offsets to 0 (caller will
+    /// receive the oldest still-buffered bytes instead of an empty slice) and
+    /// past-the-end offsets to the ring length.
+    fn ringIndexForOffset(self: *const PtySession, offset: u64) usize {
+        const start = self.ringStart();
+        if (offset <= start) return 0;
+        const idx = offset - start;
+        return @intCast(@min(idx, @as(u64, @intCast(self.output_ring.items.len))));
+    }
+
     fn appendOutput(self: *PtySession, allocator: std.mem.Allocator, bytes: []const u8) !void {
         if (bytes.len >= MAX_OUTPUT_RING) {
             self.output_ring.clearRetainingCapacity();
             try self.output_ring.appendSlice(allocator, bytes[bytes.len - MAX_OUTPUT_RING ..]);
+            self.output_total +%= bytes.len;
             return;
         }
         const overflow = self.output_ring.items.len + bytes.len -| MAX_OUTPUT_RING;
@@ -527,6 +553,7 @@ const PtySession = struct {
             self.output_ring.shrinkRetainingCapacity(self.output_ring.items.len - overflow);
         }
         try self.output_ring.appendSlice(allocator, bytes);
+        self.output_total +%= bytes.len;
     }
 
     fn captureExitStatus(self: *PtySession) bool {
@@ -779,10 +806,13 @@ pub const Daemon = struct {
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
-        const start_offset = session.output_ring.items.len;
+        const start_total = session.output_total;
         const wrote = try session.writeInput(text);
         const output_bytes = if (wrote) try session.pollSettle(self.allocator) else 0;
-        const output_text = try self.allocator.dupe(u8, session.output_ring.items[start_offset..]);
+        const new_count = session.output_total - start_total;
+        const ring = session.output_ring.items;
+        const slice_start = if (new_count >= ring.len) 0 else ring.len - @as(usize, @intCast(new_count));
+        const output_text = try self.allocator.dupe(u8, ring[slice_start..]);
         defer self.allocator.free(output_text);
         log.info(
             "write id={s} pid={d} pgrp={?d} input_bytes={d} output_bytes={d}",
@@ -795,8 +825,8 @@ pub const Daemon = struct {
             .pid = session.child_pid,
             .foreground_process_group = session.foregroundProcessGroup(),
             .text = output_text,
-            .offset = start_offset,
-            .next_offset = session.output_ring.items.len,
+            .offset = start_total,
+            .next_offset = session.output_total,
         });
     }
 
@@ -804,13 +834,16 @@ pub const Daemon = struct {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
-        const start_offset = session.output_ring.items.len;
+        const start_total = session.output_total;
         session.resize(
             jsonU16(params.object.get("cols") orelse .null) orelse session.cols,
             jsonU16(params.object.get("rows") orelse .null) orelse session.rows,
         );
         const output_bytes = try session.pollSettle(self.allocator);
-        const output_text = try self.allocator.dupe(u8, session.output_ring.items[start_offset..]);
+        const new_count = session.output_total - start_total;
+        const ring = session.output_ring.items;
+        const slice_start = if (new_count >= ring.len) 0 else ring.len - @as(usize, @intCast(new_count));
+        const output_text = try self.allocator.dupe(u8, ring[slice_start..]);
         defer self.allocator.free(output_text);
         log.info(
             "resize-poll id={s} pid={d} pgrp={?d} output_bytes={d}",
@@ -823,8 +856,8 @@ pub const Daemon = struct {
             .foreground_process_group = session.foregroundProcessGroup(),
             .child_process_count = childProcessCount(session.child_pid),
             .text = output_text,
-            .offset = start_offset,
-            .next_offset = session.output_ring.items.len,
+            .offset = start_total,
+            .next_offset = session.output_total,
         });
     }
 
@@ -837,19 +870,20 @@ pub const Daemon = struct {
         const start_offset = jsonUsize(params.object.get("offset") orelse .null);
         const max_bytes = jsonUsize(params.object.get("max_bytes") orelse .null);
         const text_range = if (start_offset) |offset|
-            bytesRangeFromOffset(session.output_ring.items, offset, max_bytes)
+            bytesRangeFromOffset(session.output_ring.items, session.ringIndexForOffset(@intCast(offset)), max_bytes)
         else
             bytesRangeForTailLines(session.output_ring.items, lines, max_bytes);
         const text = try self.allocator.dupe(u8, session.output_ring.items[text_range.start..text_range.end]);
         defer self.allocator.free(text);
+        const ring_start = session.ringStart();
         return try okValueResponse(self.allocator, id_value, .{
             .id = session.session_id,
             .running = session.running,
             .pid = session.child_pid,
             .foreground_process_group = session.foregroundProcessGroup(),
             .text = text,
-            .offset = text_range.start,
-            .next_offset = session.output_ring.items.len,
+            .offset = ring_start + @as(u64, @intCast(text_range.start)),
+            .next_offset = session.output_total,
             .child_process_count = childProcessCount(session.child_pid),
         });
     }
