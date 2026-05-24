@@ -106,6 +106,10 @@ const PALETTE_GPU_EMOJI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/NotoEmoji-Regular.ttf",
     "packages/desktop/src/assets/fonts/NotoEmoji-Regular.ttf",
 };
+const PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSansSymbols-Regular.ttf",
+    "packages/desktop/src/assets/fonts/NotoSansSymbols-Regular.ttf",
+};
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
 const NOTO_SANS_REGULAR_BYTES = @embedFile("assets/fonts/NotoSans-Regular.ttf");
@@ -301,6 +305,17 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_SYMBOLS_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_symbols_font_path);
+    // Secondary symbols face (original Noto Sans Symbols, distinct from
+    // Symbols 2 above). Adds numbered dingbats (❶❷..❿ / ➀➁..➓ at
+    // U+2776..2793) and other blocks Symbols 2 omits.
+    const palette_gpu_symbols_alt_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSansSymbols-Regular.ttf",
+        @embedFile("assets/fonts/NotoSansSymbols-Regular.ttf")[0..],
+        &PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_symbols_alt_font_path);
     // Monochrome emoji face (Noto Emoji) for the emoji-styled Dingbats that
     // Noto Sans Symbols 2 deliberately excludes — Vite's ✨, ✅/❌, ➕/➖,
     // ❤, ℹ, ⚡, ⚠ — plus 4-byte emoji (🔥/📦) that modern CLIs use as
@@ -326,6 +341,7 @@ fn mainInner(init: std.process.Init) !void {
         .icon_font_path = palette_gpu_icon_font_path,
         .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
         .symbols_font_path = palette_gpu_symbols_font_path,
+        .symbols_alt_font_path = palette_gpu_symbols_alt_font_path,
         .emoji_font_path = palette_gpu_emoji_font_path,
     });
     palette_renderer.configureTextMeasureRenderer();
