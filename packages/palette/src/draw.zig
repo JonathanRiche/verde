@@ -98,11 +98,16 @@ pub const FontRole = enum {
     // proportional rather than mono, but cell advance is forced by the
     // caller so layout is unaffected.
     symbols,
+    // Complement to `symbols` (Noto Sans Symbols 2) — the original Noto Sans
+    // Symbols covers blocks Symbols 2 omits: numbered dingbats (❶❷..❿ and
+    // ➀➁..➓ at U+2776..2793), several Letterlike Symbols, parts of
+    // Mathematical Operators, etc. Consulted between `symbols` and `emoji`.
+    symbols_alt,
     // Monochrome emoji face (Noto Emoji) for the *emoji-styled* Dingbats and
     // Misc Symbols that Noto Sans Symbols 2 deliberately excludes — Vite's
     // ✨ (U+2728), check/cross emoji (✅❌), ➕➖, ℹ, ⚡, etc., plus 4-byte
-    // emoji like 🔥/📦. Consulted after `symbols` so the simpler vector
-    // glyphs win when both faces cover a codepoint.
+    // emoji like 🔥/📦. Consulted after `symbols`/`symbols_alt` so the
+    // simpler vector glyphs win when faces overlap.
     emoji,
     // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
     // (display sans) can differ from the body face (humanist sans regular).
