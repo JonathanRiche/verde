@@ -110,10 +110,6 @@ const PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/NotoSansSymbols-Regular.ttf",
     "packages/desktop/src/assets/fonts/NotoSansSymbols-Regular.ttf",
 };
-const PALETTE_GPU_COLOR_EMOJI_FONT_PATHS = [_][:0]const u8{
-    "src/assets/fonts/NotoColorEmoji.ttf",
-    "packages/desktop/src/assets/fonts/NotoColorEmoji.ttf",
-};
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
 const NOTO_SANS_REGULAR_BYTES = @embedFile("assets/fonts/NotoSans-Regular.ttf");
@@ -320,17 +316,6 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_SYMBOLS_ALT_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_symbols_alt_font_path);
-    // Color emoji face (Noto Color Emoji, CBDT/CBLC bitmap tables) so 4-byte
-    // emoji and emoji-styled Dingbats render colored like Ghostty. Consulted
-    // before the monochrome face so color wins when available.
-    const palette_gpu_color_emoji_font_path = try paletteGpuFontPath(
-        allocator,
-        storage.pref_path,
-        "NotoColorEmoji.ttf",
-        @embedFile("assets/fonts/NotoColorEmoji.ttf")[0..],
-        &PALETTE_GPU_COLOR_EMOJI_FONT_PATHS,
-    );
-    defer allocator.free(palette_gpu_color_emoji_font_path);
     // Monochrome emoji face (Noto Emoji) for the emoji-styled Dingbats that
     // Noto Sans Symbols 2 deliberately excludes — Vite's ✨, ✅/❌, ➕/➖,
     // ❤, ℹ, ⚡, ⚠ — plus 4-byte emoji (🔥/📦) that modern CLIs use as
@@ -357,7 +342,6 @@ fn mainInner(init: std.process.Init) !void {
         .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
         .symbols_font_path = palette_gpu_symbols_font_path,
         .symbols_alt_font_path = palette_gpu_symbols_alt_font_path,
-        .color_emoji_font_path = palette_gpu_color_emoji_font_path,
         .emoji_font_path = palette_gpu_emoji_font_path,
     });
     palette_renderer.configureTextMeasureRenderer();
