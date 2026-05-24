@@ -448,7 +448,12 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const dock_id = hit_cache.dock_id;
     const cache = draw_cache.entryFor(dock_id, pane_id);
     const selection_dynamic = selectionAffectsPane(dock_id, pane_id);
-    if (!selection_dynamic and cache.validFor(render_state, rect, font_scale)) {
+    // Diagnostic: VERDE_TERMINAL_DISABLE_DRAW_CACHE=1 forces every frame to
+    // rebuild. Used to isolate cache-invalidation bugs (e.g. zoom-then-scroll
+    // showing narrow-cell ghost rows from a pre-resize cached frame) from
+    // upstream Ghostty reflow issues. If the artifact vanishes with this set,
+    // the cache key is missing something it should depend on.
+    if (!selection_dynamic and !drawCacheBypassEnabled() and cache.validFor(render_state, rect, font_scale)) {
         replayCachedViewport(state, cache);
         return;
     }
@@ -1023,6 +1028,15 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
 
 fn foregroundAlpha(style: ghostty_vt.Style) f32 {
     return if (style.flags.faint) 0.55 else 1.0;
+}
+
+/// When `VERDE_TERMINAL_DISABLE_DRAW_CACHE=1` is set in the host environment,
+/// `renderViewport` skips the per-pane draw-command cache and rebuilds every
+/// frame. Pure diagnostic — used to bisect rendering bugs between cache
+/// invalidation gaps (resize, reflow, font scale) and upstream terminal-model
+/// problems.
+fn drawCacheBypassEnabled() bool {
+    return std.c.getenv("VERDE_TERMINAL_DISABLE_DRAW_CACHE") != null;
 }
 
 fn rgbEql(a: ghostty_vt.color.RGB, b: ghostty_vt.color.RGB) bool {

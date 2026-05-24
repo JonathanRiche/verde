@@ -1624,6 +1624,8 @@ const UnixSession = struct {
             }
             return;
         }
+        const prev_cols = self.cols;
+        const prev_rows = self.rows;
         self.cols = next_cols;
         self.rows = next_rows;
         self.cell_width = next_cell_width;
@@ -1646,6 +1648,25 @@ const UnixSession = struct {
             self.terminal.modes.set(.synchronized_output, false);
             if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
                 self.resetAlternateViewport();
+            }
+            if (terminalLayoutDiagnosticsEnabled()) {
+                // Capture the inputs that decide reflow behavior so we can
+                // diagnose "zoom-then-scroll shows narrow ghost rows" without
+                // re-instrumenting per repro. See Terminal.resize (Ghostty):
+                // primary reflows iff `wraparound` is set; alternate never
+                // reflows.
+                log.info(
+                    "resize-mode session={s} active_screen={s} wraparound={} old_cols={d} new_cols={d} old_rows={d} new_rows={d}",
+                    .{
+                        self.session_id orelse "<local>",
+                        @tagName(self.terminal.screens.active_key),
+                        self.terminal.modes.get(.wraparound),
+                        prev_cols,
+                        next_cols,
+                        prev_rows,
+                        next_rows,
+                    },
+                );
             }
         }
         switch (self.backend) {
@@ -1949,6 +1970,13 @@ const UnixSession = struct {
             .bottom => .bottom,
         });
         try self.refreshRenderState(allocator);
+        // Forcing .full mirrors what `resize` / `retheme` do. Without it, the
+        // per-pane draw cache in terminal_panel.zig keeps replaying the
+        // pre-scroll frame (rows/cols/rect/font_scale all match), which is
+        // what caused narrow-cell "ghost rows" to show through a wider pane
+        // after a zoom-then-scroll. Render-state dimensions don't change here,
+        // but the visible row contents do.
+        self.render_state.dirty = .full;
     }
 
     pub fn pasteClipboard(self: *UnixSession, allocator: std.mem.Allocator) !bool {
