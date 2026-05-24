@@ -236,15 +236,8 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     if (state.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
-    const inset = terminalPaneHorizontalInset();
-    const inner_rect = palette.Rect{
-        .x = rect.x + inset,
-        .y = rect.y,
-        .w = @max(rect.w - inset * 2.0, 1.0),
-        .h = rect.h,
-    };
     if (dock.activePaneConst()) |active| {
-        dock.resizePaneToFit(state.allocator, active.id, inner_rect.w, inner_rect.h) catch |err| {
+        dock.resizePaneToFit(state.allocator, active.id, rect.w, rect.h) catch |err| {
             runtime_log.diagnostic("terminal workspace pre-resize failed dock={d} pane={d}: {s}", .{ dock_id, active.id, @errorName(err) });
         };
     }
@@ -253,7 +246,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
 
     if (dock.activeTab()) |tab| {
-        renderPaneNode(state, dock, tab.root, inner_rect);
+        renderPaneNode(state, dock, tab.root, rect);
     } else {
         renderStatus(state, rect, "Starting shell...");
     }
@@ -436,8 +429,19 @@ fn renderPaneNode(state: *app_state.AppState, dock: anytype, node: anytype, rect
 }
 
 fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: palette.Rect) void {
-    appendPaneHit(pane_id, rect);
-    dock.resizePaneToFit(state.allocator, pane_id, rect.w, rect.h) catch {};
+    // `rect` is the full pane bounds; `grid_rect` is inset horizontally so
+    // cell output gets breathing room without pulling the focus border or
+    // mouse hit envelope inward (the focus border should hug the dock edge
+    // for outermost panes, not float at the inset).
+    const inset = terminalPaneHorizontalInset();
+    const grid_rect = palette.Rect{
+        .x = rect.x + inset,
+        .y = rect.y,
+        .w = @max(rect.w - inset * 2.0, 1.0),
+        .h = rect.h,
+    };
+    appendPaneHit(pane_id, grid_rect);
+    dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch {};
     const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;
@@ -445,7 +449,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, pane_id, render_state, rect, dock.font_scale);
+    renderViewport(state, pane_id, render_state, grid_rect, dock.font_scale);
     dock.markPaneRendered(pane_id);
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
