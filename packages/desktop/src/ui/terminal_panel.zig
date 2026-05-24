@@ -1063,11 +1063,9 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
 /// come from Symbols 2 or Emoji.
 fn glyphBaselineLiftFraction(cp: u21) f32 {
     return switch (cp) {
-        // Numbered dingbats render from Noto Sans Symbols (the original),
-        // whose baseline is closer to mono but still sits a touch low.
-        // Full 14% put them too high; zero left them too low — split the
-        // difference.
-        0x2776...0x2793 => 0.07,
+        // Numbered dingbats render from Noto Sans Symbols (the original).
+        // 14% was too high, 0% too low, 7% still sat a touch below x-height.
+        0x2776...0x2793 => 0.10,
         0x2100...0x214F,
         0x2300...0x23FF,
         0x2600...0x26FF,
