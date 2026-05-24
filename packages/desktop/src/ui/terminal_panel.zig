@@ -1017,6 +1017,12 @@ fn cellText(raw_cell: ghostty_vt.Cell, graphemes: []const u21, buffer: []u8) ?[]
 
 fn glyphNeedsRelaxedClip(cp: u21) bool {
     return switch (cp) {
+        // Numbered Dingbats — U+2776..2793 (❶❷..❿ filled, ➀..➓ outlined,
+        // ➊..➓ negative filled). The Noto Sans Symbols glyphs are sized for
+        // proportional rendering and get visibly cropped at the top/bottom
+        // when clipped to a mono cell. The relaxed (full-pane) clip lets
+        // them render at their natural extent.
+        0x2776...0x2793,
         0xe0a0...0xe0af,
         0xe5fa...0xe7ff,
         0xf000...0xf8ff,
