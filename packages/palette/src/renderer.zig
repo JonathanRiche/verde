@@ -116,6 +116,7 @@ pub const Renderer = struct {
     prose_bold_italic_font: ?*c.TTF_Font = null,
     mono_font: ?*c.TTF_Font = null,
     icon_font: ?*c.TTF_Font = null,
+    mono_symbols_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
     text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -415,6 +416,7 @@ pub const Renderer = struct {
         prose_bold_italic: *sdl.Font,
         mono: ?*sdl.Font,
         icon: ?*sdl.Font,
+        mono_symbols: ?*sdl.Font = null,
     };
 
     pub fn configureGpuTextWithAllRoleFonts(self: *Renderer, role_fonts: RoleFonts) !void {
@@ -426,6 +428,7 @@ pub const Renderer = struct {
         self.prose_bold_italic_font = @ptrCast(role_fonts.prose_bold_italic);
         self.mono_font = if (role_fonts.mono) |fallback| @ptrCast(fallback) else null;
         self.icon_font = if (role_fonts.icon) |fallback| @ptrCast(fallback) else null;
+        self.mono_symbols_font = if (role_fonts.mono_symbols) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
@@ -1047,11 +1050,19 @@ pub const Renderer = struct {
         if (c.TTF_FontHasGlyph(mono, codepoint)) return font_role;
         const icon = self.fontForRoleAndSize(font_size, .icon) catch return font_role;
         if (c.TTF_FontHasGlyph(icon, codepoint)) return .icon;
-        // Last resort: the prose face (Noto Sans) has broad Unicode coverage —
-        // notably the Dingbats block (U+2700..U+27BF) that the mono/icon Nerd
-        // faces only partially carry. This is what rescues e.g. Claude Code's
-        // ✻/✽/✶ spinner frames, which otherwise render inconsistently (some
-        // present in JetBrains Mono, others falling through to tofu).
+        // Coverage fallback: the user's chosen terminal mono face often has
+        // sparse Dingbats / Arrows coverage (e.g. CaskaydiaMono covers ~4% of
+        // U+2700..U+27BF, ~9% of U+2190..U+21FF). Verde bundles a second mono
+        // face (JetBrains Mono Nerd) specifically so common TUI glyphs —
+        // Vite's ➜, Claude Code's spinner frames, ●, □, ✓ — still render
+        // instead of tofu when the primary mono lacks them.
+        if (self.mono_symbols_font != null) {
+            const symbols = self.fontForRoleAndSize(font_size, .mono_symbols) catch return font_role;
+            if (c.TTF_FontHasGlyph(symbols, codepoint)) return .mono_symbols;
+        }
+        // Last resort: the prose face (Noto Sans) covers a smaller set of
+        // codepoints than expected in the bundled subset, but is kept in the
+        // chain in case it ever ships with broader coverage.
         if (self.prose_font != null) {
             const prose = self.fontForRoleAndSize(font_size, .prose) catch return font_role;
             if (c.TTF_FontHasGlyph(prose, codepoint)) return .prose;
@@ -1128,6 +1139,7 @@ pub const Renderer = struct {
             .prose_bold_italic => if (self.prose_bold_italic_font) |font_value| return font_value,
             .mono => if (self.mono_font) |font_value| return font_value,
             .icon => if (self.icon_font) |font_value| return font_value,
+            .mono_symbols => if (self.mono_symbols_font) |font_value| return font_value,
         };
         return self.font.?;
     }
@@ -2101,6 +2113,7 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .prose_bold => 6,
         .prose_italic => 7,
         .prose_bold_italic => 8,
+        .mono_symbols => 9,
     } else 0;
 }
 
