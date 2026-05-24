@@ -1497,12 +1497,17 @@ fn rgbPaletteColor(rgb: ghostty_vt.color.RGB, alpha: f32) palette.Color {
 }
 
 fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
+    // Only the powerline codepoints whose geometry `queuePowerlineGlyph`
+    // actually draws (filled right- and left-pointing triangles, plus their
+    // half-circle / hexagonal / flame stylistic variants — same triangle
+    // approximation for all). Everything else in the broader powerline range
+    // (E0B1 thin right, E0B3 thin left, E0B5/E0B7 lower / upper triangles,
+    // etc.) falls through to .text so it renders via the user's Nerd Font
+    // which has the correct glyph shapes — instead of hitting the `else =>
+    // "?"` placeholder in queuePowerlineGlyph that rendered as tofu.
     return switch (cp) {
-        0xe0b0...0xe0c8,
-        0xe0ca,
-        0xe0cc...0xe0d2,
-        0xe0d4,
-        0xe0d6...0xe0d7,
+        0xe0b0, 0xe0b2, 0xe0b4, 0xe0b6, 0xe0b8, 0xe0ba,
+        0xe0bc, 0xe0be, 0xe0c0, 0xe0c2, 0xe0c4, 0xe0c6,
         => .powerline,
         else => .text,
     };
