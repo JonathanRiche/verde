@@ -550,10 +550,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             // metrics expressed for proportional layout — the visible glyph
             // sits noticeably lower in the em-box than mono glyphs at the
             // same y. Lift them so they line up with adjacent mono text.
-            const glyph_y_offset = if (glyphNeedsBaselineLift(raw_cell.codepoint()))
-                text_y_offset - cell_h * 0.14
-            else
-                text_y_offset;
+            const glyph_y_offset = text_y_offset - cell_h * glyphBaselineLiftFraction(raw_cell.codepoint());
             const text_rect = terminalTextRect(cell_rect, glyph_y_offset, glyph_kind);
             const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
             queueTerminalText(state, .{
@@ -1057,9 +1054,13 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
 /// whose metrics are closer to mono — applying the lift made them sit too
 /// high. Other dingbats in U+2700..U+27BF still need the lift since they
 /// come from Symbols 2 or Emoji.
-fn glyphNeedsBaselineLift(cp: u21) bool {
+fn glyphBaselineLiftFraction(cp: u21) f32 {
     return switch (cp) {
-        0x2776...0x2793 => false, // numbered dingbats: Noto Sans Symbols, no lift
+        // Numbered dingbats render from Noto Sans Symbols (the original),
+        // whose baseline is closer to mono but still sits a touch low.
+        // Full 14% put them too high; zero left them too low — split the
+        // difference.
+        0x2776...0x2793 => 0.07,
         0x2100...0x214F,
         0x2300...0x23FF,
         0x2600...0x26FF,
@@ -1067,8 +1068,8 @@ fn glyphNeedsBaselineLift(cp: u21) bool {
         0x2794...0x27BF,
         0x2B00...0x2BFF,
         0x1F300...0x1FAFF, // 4-byte emoji blocks
-        => true,
-        else => false,
+        => 0.14,
+        else => 0.0,
     };
 }
 
