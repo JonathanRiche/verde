@@ -118,6 +118,7 @@ pub const Renderer = struct {
     icon_font: ?*c.TTF_Font = null,
     mono_symbols_font: ?*c.TTF_Font = null,
     symbols_font: ?*c.TTF_Font = null,
+    emoji_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
     text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -419,6 +420,7 @@ pub const Renderer = struct {
         icon: ?*sdl.Font,
         mono_symbols: ?*sdl.Font = null,
         symbols: ?*sdl.Font = null,
+        emoji: ?*sdl.Font = null,
     };
 
     pub fn configureGpuTextWithAllRoleFonts(self: *Renderer, role_fonts: RoleFonts) !void {
@@ -432,6 +434,7 @@ pub const Renderer = struct {
         self.icon_font = if (role_fonts.icon) |fallback| @ptrCast(fallback) else null;
         self.mono_symbols_font = if (role_fonts.mono_symbols) |fallback| @ptrCast(fallback) else null;
         self.symbols_font = if (role_fonts.symbols) |fallback| @ptrCast(fallback) else null;
+        self.emoji_font = if (role_fonts.emoji) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
@@ -1072,6 +1075,15 @@ pub const Renderer = struct {
             const sym = self.fontForRoleAndSize(font_size, .symbols) catch return font_role;
             if (c.TTF_FontHasGlyph(sym, codepoint)) return .symbols;
         }
+        // Monochrome emoji face (Noto Emoji) — Symbols 2 deliberately excludes
+        // emoji-styled Dingbats (✨ U+2728, ✅ U+2705, ❌ U+274C, ➕ U+2795,
+        // ❤ U+2764, etc.), so emoji-as-status-markers (Vite's ✨, ⚠/⚡, ℹ,
+        // and 4-byte 🔥/📦) need their own face. Consulted after `symbols`
+        // so plain symbol glyphs win when both faces cover a codepoint.
+        if (self.emoji_font != null) {
+            const em = self.fontForRoleAndSize(font_size, .emoji) catch return font_role;
+            if (c.TTF_FontHasGlyph(em, codepoint)) return .emoji;
+        }
         // Last resort: the prose face (Noto Sans) covers a smaller set of
         // codepoints than expected in the bundled subset, but is kept in the
         // chain in case it ever ships with broader coverage.
@@ -1153,6 +1165,7 @@ pub const Renderer = struct {
             .icon => if (self.icon_font) |font_value| return font_value,
             .mono_symbols => if (self.mono_symbols_font) |font_value| return font_value,
             .symbols => if (self.symbols_font) |font_value| return font_value,
+            .emoji => if (self.emoji_font) |font_value| return font_value,
         };
         return self.font.?;
     }
@@ -2128,6 +2141,7 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .prose_bold_italic => 8,
         .mono_symbols => 9,
         .symbols => 10,
+        .emoji => 11,
     } else 0;
 }
 
