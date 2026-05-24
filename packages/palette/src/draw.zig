@@ -91,6 +91,13 @@ pub const FontRole = enum {
     // Claude Code's ✻/✽ spinner frames, ●, □, etc.) still render instead
     // of tofu. Verde wires this to its embedded JetBrainsMonoNerdFont.
     mono_symbols,
+    // Dedicated symbols face (Noto Sans Symbols 2) covering most of the
+    // Dingbats block (U+2700-U+27BF) and broader Misc Symbols. Consulted
+    // after mono_symbols/icon so things JetBrains Mono also lacks — Claude
+    // Code's ✻/✽/✶ spinner frames, ➤, ✷, etc. — still render. Glyphs are
+    // proportional rather than mono, but cell advance is forced by the
+    // caller so layout is unaffected.
+    symbols,
     // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
     // (display sans) can differ from the body face (humanist sans regular).
     prose,

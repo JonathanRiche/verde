@@ -98,6 +98,10 @@ const PALETTE_GPU_MONO_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
     "packages/desktop/src/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf",
 };
+const PALETTE_GPU_SYMBOLS_FONT_PATHS = [_][:0]const u8{
+    "src/assets/fonts/NotoSansSymbols2-Regular.ttf",
+    "packages/desktop/src/assets/fonts/NotoSansSymbols2-Regular.ttf",
+};
 
 const CAL_SANS_BYTES = @embedFile("assets/fonts/CalSans-Regular.ttf");
 const NOTO_SANS_REGULAR_BYTES = @embedFile("assets/fonts/NotoSans-Regular.ttf");
@@ -281,6 +285,18 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_MONO_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_mono_symbols_font_path);
+    // Dedicated symbols face (Noto Sans Symbols 2) covering ~145/192 Dingbats
+    // plus broader Misc Symbols ranges that even JetBrains Mono Nerd lacks —
+    // notably Claude Code's ✻/✽/✶ spinner frames, ➤, ✷, and various other
+    // status/bullet glyphs that ship in modern TUIs.
+    const palette_gpu_symbols_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "NotoSansSymbols2-Regular.ttf",
+        @embedFile("assets/fonts/NotoSansSymbols2-Regular.ttf")[0..],
+        &PALETTE_GPU_SYMBOLS_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_symbols_font_path);
     var palette_renderer = try palette_frame_renderer.Renderer.init(.{
         .requested_backend = requested_renderer_backend,
         .window = window,
@@ -293,6 +309,7 @@ fn mainInner(init: std.process.Init) !void {
         .mono_font_path = palette_gpu_mono_font_path,
         .icon_font_path = palette_gpu_icon_font_path,
         .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
+        .symbols_font_path = palette_gpu_symbols_font_path,
     });
     palette_renderer.configureTextMeasureRenderer();
     defer palette_renderer.deinit(allocator);
