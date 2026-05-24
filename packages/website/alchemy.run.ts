@@ -8,9 +8,9 @@ const app = await alchemy('verde-website', {
   phase: process.argv.includes('--destroy') ? 'destroy' : 'up',
   stateStore: useCloudflareState
     ? (scope) =>
-        new CloudflareStateStore(scope, {
-          scriptName: 'verde-website-state',
-        })
+      new CloudflareStateStore(scope, {
+        scriptName: 'verde-website-state',
+      })
     : undefined,
 })
 
@@ -23,6 +23,8 @@ export const worker = await TanStackStart('website', {
   domains: [
     { domainName: 'openverde.ai', adopt: true },
     { domainName: 'open-verde.com', adopt: true },
+    { domainName: 'verdeai.dev', adopt: true },
+    { domainName: 'verdeapp.dev', adopt: true },
   ],
   wrangler: {
     main: 'dist/server/server.js',
