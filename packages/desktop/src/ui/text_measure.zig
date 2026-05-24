@@ -99,11 +99,11 @@ fn fontForRole(role_fonts: RoleFonts, role: palette.FontRole) *palette.sdl.Font 
         .prose_bold_italic => role_fonts.prose_bold_italic,
         .mono => role_fonts.mono,
         .icon => role_fonts.icon,
-        // mono_symbols / symbols / symbols_alt / emoji are coverage fallbacks
-        // the renderer picks per-glyph; measurement always reports the primary
-        // mono cell width because terminal layout advances by mono cells
-        // regardless of which face ends up drawing each glyph.
-        .mono_symbols, .symbols, .symbols_alt, .emoji => role_fonts.mono,
+        // mono_symbols / symbols / symbols_alt / color_emoji / emoji are
+        // coverage fallbacks the renderer picks per-glyph; measurement always
+        // reports the primary mono cell width because terminal layout advances
+        // by mono cells regardless of which face ends up drawing each glyph.
+        .mono_symbols, .symbols, .symbols_alt, .color_emoji, .emoji => role_fonts.mono,
     };
 }
 

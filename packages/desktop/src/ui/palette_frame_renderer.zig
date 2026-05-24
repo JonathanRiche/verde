@@ -28,6 +28,7 @@ pub const Renderer = struct {
     gpu_mono_symbols_font: ?*palette.sdl.Font = null,
     gpu_symbols_font: ?*palette.sdl.Font = null,
     gpu_symbols_alt_font: ?*palette.sdl.Font = null,
+    gpu_color_emoji_font: ?*palette.sdl.Font = null,
     gpu_emoji_font: ?*palette.sdl.Font = null,
     gpu_ttf_initialized: bool = false,
     next_texture_id: u32 = 1,
@@ -56,6 +57,10 @@ pub const Renderer = struct {
         /// complements `symbols` with numbered dingbats (❶❷..❿ / ➀➁..➓) and
         /// other blocks Symbols 2 omits. Null disables.
         symbols_alt_font_path: ?[:0]const u8 = null,
+        /// Optional color emoji face (Noto Color Emoji, CBDT/CBLC bitmap
+        /// tables) for 4-byte emoji and emoji-styled Dingbats. Consulted
+        /// before the monochrome emoji face. Null disables.
+        color_emoji_font_path: ?[:0]const u8 = null,
         /// Optional monochrome emoji face (Noto Emoji) for emoji-styled
         /// Dingbats (✨/✅/❌/➕/❤) and 4-byte emoji (🔥/📦) that the
         /// symbols face excludes. Null disables.
@@ -93,6 +98,9 @@ pub const Renderer = struct {
         if (options.symbols_alt_font_path) |path| {
             result.gpu_symbols_alt_font = palette.sdl.ttfOpenFont(path, 16.0) catch null;
         }
+        if (options.color_emoji_font_path) |path| {
+            result.gpu_color_emoji_font = palette.sdl.ttfOpenFont(path, 16.0) catch null;
+        }
         if (options.emoji_font_path) |path| {
             result.gpu_emoji_font = palette.sdl.ttfOpenFont(path, 16.0) catch null;
         }
@@ -113,6 +121,7 @@ pub const Renderer = struct {
             .mono_symbols = result.gpu_mono_symbols_font,
             .symbols = result.gpu_symbols_font,
             .symbols_alt = result.gpu_symbols_alt_font,
+            .color_emoji = result.gpu_color_emoji_font,
             .emoji = result.gpu_emoji_font,
         });
         text_measure.configure(.{
@@ -150,6 +159,7 @@ pub const Renderer = struct {
             gpu.deinit();
         }
         if (self.gpu_emoji_font) |font| palette.sdl.ttfCloseFont(font);
+        if (self.gpu_color_emoji_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_symbols_alt_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_symbols_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_mono_symbols_font) |font| palette.sdl.ttfCloseFont(font);

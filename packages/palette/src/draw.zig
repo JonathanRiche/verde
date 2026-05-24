@@ -103,11 +103,17 @@ pub const FontRole = enum {
     // ➀➁..➓ at U+2776..2793), several Letterlike Symbols, parts of
     // Mathematical Operators, etc. Consulted between `symbols` and `emoji`.
     symbols_alt,
+    // Color emoji face (Noto Color Emoji, CBDT/CBLC bitmap tables) used so
+    // 4-byte emoji (🌀/📦/🔥/🚀/🎉/💡) and emoji-styled Dingbats (✨/✅/❌)
+    // render colored like Ghostty does. Consulted before `emoji` so the
+    // color glyph wins when available; falls through to monochrome `emoji`
+    // for codepoints color emoji lacks.
+    color_emoji,
     // Monochrome emoji face (Noto Emoji) for the *emoji-styled* Dingbats and
     // Misc Symbols that Noto Sans Symbols 2 deliberately excludes — Vite's
     // ✨ (U+2728), check/cross emoji (✅❌), ➕➖, ℹ, ⚡, etc., plus 4-byte
-    // emoji like 🔥/📦. Consulted after `symbols`/`symbols_alt` so the
-    // simpler vector glyphs win when faces overlap.
+    // emoji like 🔥/📦. Consulted after `symbols`/`symbols_alt`/`color_emoji`
+    // so the simpler vector glyphs win when faces overlap.
     emoji,
     // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
     // (display sans) can differ from the body face (humanist sans regular).

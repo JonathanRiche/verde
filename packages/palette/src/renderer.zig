@@ -119,6 +119,7 @@ pub const Renderer = struct {
     mono_symbols_font: ?*c.TTF_Font = null,
     symbols_font: ?*c.TTF_Font = null,
     symbols_alt_font: ?*c.TTF_Font = null,
+    color_emoji_font: ?*c.TTF_Font = null,
     emoji_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
@@ -422,6 +423,7 @@ pub const Renderer = struct {
         mono_symbols: ?*sdl.Font = null,
         symbols: ?*sdl.Font = null,
         symbols_alt: ?*sdl.Font = null,
+        color_emoji: ?*sdl.Font = null,
         emoji: ?*sdl.Font = null,
     };
 
@@ -437,6 +439,7 @@ pub const Renderer = struct {
         self.mono_symbols_font = if (role_fonts.mono_symbols) |fallback| @ptrCast(fallback) else null;
         self.symbols_font = if (role_fonts.symbols) |fallback| @ptrCast(fallback) else null;
         self.symbols_alt_font = if (role_fonts.symbols_alt) |fallback| @ptrCast(fallback) else null;
+        self.color_emoji_font = if (role_fonts.color_emoji) |fallback| @ptrCast(fallback) else null;
         self.emoji_font = if (role_fonts.emoji) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
@@ -1081,16 +1084,24 @@ pub const Renderer = struct {
         // Original Noto Sans Symbols — complements Symbols 2 with blocks the
         // newer face omits: numbered dingbats (❶❷..❿ at U+2776..277F, and
         // ➀➁..➓ at U+2780..2793), several Letterlike Symbols, parts of
-        // Mathematical Operators. Consulted between `symbols` and `emoji`.
+        // Mathematical Operators. Consulted between `symbols` and the emoji
+        // faces.
         if (self.symbols_alt_font != null) {
             const sym_alt = self.fontForRoleAndSize(font_size, .symbols_alt) catch return font_role;
             if (c.TTF_FontHasGlyph(sym_alt, codepoint)) return .symbols_alt;
         }
+        // Color emoji face (Noto Color Emoji, CBDT/CBLC bitmap tables).
+        // Consulted before the monochrome face so 4-byte emoji and emoji-
+        // styled Dingbats render colored like Ghostty does.
+        if (self.color_emoji_font != null) {
+            const cem = self.fontForRoleAndSize(font_size, .color_emoji) catch return font_role;
+            if (c.TTF_FontHasGlyph(cem, codepoint)) return .color_emoji;
+        }
         // Monochrome emoji face (Noto Emoji) — Symbols 2 deliberately excludes
         // emoji-styled Dingbats (✨ U+2728, ✅ U+2705, ❌ U+274C, ➕ U+2795,
         // ❤ U+2764, etc.), so emoji-as-status-markers (Vite's ✨, ⚠/⚡, ℹ,
-        // and 4-byte 🔥/📦) need their own face. Consulted after `symbols`
-        // and `symbols_alt` so plain symbol glyphs win when faces overlap.
+        // and 4-byte 🔥/📦) need their own face. Consulted last among the
+        // symbol faces so it covers anything color emoji lacks.
         if (self.emoji_font != null) {
             const em = self.fontForRoleAndSize(font_size, .emoji) catch return font_role;
             if (c.TTF_FontHasGlyph(em, codepoint)) return .emoji;
@@ -1177,6 +1188,7 @@ pub const Renderer = struct {
             .mono_symbols => if (self.mono_symbols_font) |font_value| return font_value,
             .symbols => if (self.symbols_font) |font_value| return font_value,
             .symbols_alt => if (self.symbols_alt_font) |font_value| return font_value,
+            .color_emoji => if (self.color_emoji_font) |font_value| return font_value,
             .emoji => if (self.emoji_font) |font_value| return font_value,
         };
         return self.font.?;
@@ -2154,7 +2166,8 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .mono_symbols => 9,
         .symbols => 10,
         .symbols_alt => 11,
-        .emoji => 12,
+        .color_emoji => 12,
+        .emoji => 13,
     } else 0;
 }
 
