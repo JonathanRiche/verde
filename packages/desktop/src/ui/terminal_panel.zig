@@ -236,8 +236,15 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     if (state.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
+    const inset = terminalPaneHorizontalInset();
+    const inner_rect = palette.Rect{
+        .x = rect.x + inset,
+        .y = rect.y,
+        .w = @max(rect.w - inset * 2.0, 1.0),
+        .h = rect.h,
+    };
     if (dock.activePaneConst()) |active| {
-        dock.resizePaneToFit(state.allocator, active.id, rect.w, rect.h) catch |err| {
+        dock.resizePaneToFit(state.allocator, active.id, inner_rect.w, inner_rect.h) catch |err| {
             runtime_log.diagnostic("terminal workspace pre-resize failed dock={d} pane={d}: {s}", .{ dock_id, active.id, @errorName(err) });
         };
     }
@@ -246,7 +253,7 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
 
     if (dock.activeTab()) |tab| {
-        renderPaneNode(state, dock, tab.root, rect);
+        renderPaneNode(state, dock, tab.root, inner_rect);
     } else {
         renderStatus(state, rect, "Starting shell...");
     }
@@ -1142,6 +1149,14 @@ fn terminalTextRect(rect: palette.Rect, y_offset: f32, glyph_kind: TerminalGlyph
 
 fn terminalRenderCellSize(base: u32, font_scale: f32) f32 {
     return @max(@round(@as(f32, @floatFromInt(base)) * font_scale), 1.0);
+}
+
+/// Breathing room on the left/right edges of the dock so terminal output
+/// doesn't sit flush against the pane border. Applied once at the dock
+/// level — splits divide the inset region without adding more padding
+/// between sibling panes.
+fn terminalPaneHorizontalInset() f32 {
+    return theme.scaledUi(6.0);
 }
 
 fn intersectRect(a: palette.Rect, b: palette.Rect) ?palette.Rect {
