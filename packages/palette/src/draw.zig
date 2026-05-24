@@ -83,6 +83,14 @@ pub const FontRole = enum {
     ui_bold,
     icon,
     mono,
+    // Coverage-fallback face for `mono`. The user's configured terminal font
+    // (read from Ghostty config) may have sparse Dingbats/Arrows coverage
+    // (e.g. CaskaydiaMono covers 4% of the Dingbats block). When the primary
+    // mono face lacks a glyph, the renderer's per-glyph fallback consults
+    // `mono_symbols` before icon/prose so common TUI glyphs (Vite's ➜,
+    // Claude Code's ✻/✽ spinner frames, ●, □, etc.) still render instead
+    // of tofu. Verde wires this to its embedded JetBrainsMonoNerdFont.
+    mono_symbols,
     // Chat-transcript prose faces. Kept distinct from `ui` so the chrome face
     // (display sans) can differ from the body face (humanist sans regular).
     prose,

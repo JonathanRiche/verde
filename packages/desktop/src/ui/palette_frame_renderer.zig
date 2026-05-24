@@ -25,6 +25,7 @@ pub const Renderer = struct {
     gpu_prose_bold_italic_font: ?*palette.sdl.Font = null,
     gpu_mono_font: ?*palette.sdl.Font = null,
     gpu_icon_font: ?*palette.sdl.Font = null,
+    gpu_mono_symbols_font: ?*palette.sdl.Font = null,
     gpu_ttf_initialized: bool = false,
     next_texture_id: u32 = 1,
 
@@ -39,6 +40,11 @@ pub const Renderer = struct {
         prose_bold_italic_font_path: [:0]const u8,
         mono_font_path: [:0]const u8,
         icon_font_path: [:0]const u8,
+        /// Optional coverage fallback for `mono`. Typically Verde's embedded
+        /// JetBrains Mono Nerd, used when the user's chosen terminal mono has
+        /// sparse Dingbats/Arrows coverage (CaskaydiaMono etc.). Null disables
+        /// the fallback.
+        mono_symbols_font_path: ?[:0]const u8 = null,
     };
 
     pub fn init(options: InitOptions) !Renderer {
@@ -63,6 +69,9 @@ pub const Renderer = struct {
         result.gpu_prose_bold_italic_font = try palette.sdl.ttfOpenFont(options.prose_bold_italic_font_path, 16.0);
         result.gpu_mono_font = try palette.sdl.ttfOpenFont(options.mono_font_path, 16.0);
         result.gpu_icon_font = try palette.sdl.ttfOpenFont(options.icon_font_path, 16.0);
+        if (options.mono_symbols_font_path) |path| {
+            result.gpu_mono_symbols_font = palette.sdl.ttfOpenFont(path, 16.0) catch null;
+        }
         result.gpu = try palette.renderer.Renderer.init(.{
             .debug_mode = builtin.mode == .Debug,
             .shader_formats = palette.renderer.ShaderFormat.defaultForTarget(builtin.os.tag),
@@ -77,6 +86,7 @@ pub const Renderer = struct {
             .prose_bold_italic = result.gpu_prose_bold_italic_font.?,
             .mono = result.gpu_mono_font,
             .icon = result.gpu_icon_font,
+            .mono_symbols = result.gpu_mono_symbols_font,
         });
         text_measure.configure(.{
             .ui = result.gpu_ui_font.?,
@@ -112,6 +122,7 @@ pub const Renderer = struct {
             if (self.window) |window| gpu.releaseWindow(@ptrCast(window));
             gpu.deinit();
         }
+        if (self.gpu_mono_symbols_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_icon_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_mono_font) |font| palette.sdl.ttfCloseFont(font);
         if (self.gpu_prose_bold_italic_font) |font| palette.sdl.ttfCloseFont(font);

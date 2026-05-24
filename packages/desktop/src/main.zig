@@ -267,6 +267,20 @@ fn mainInner(init: std.process.Init) !void {
         &PALETTE_GPU_ICON_FONT_PATHS,
     );
     defer allocator.free(palette_gpu_icon_font_path);
+    // Always materialize JetBrains Mono Nerd as a coverage fallback for mono,
+    // even when ghosttyMonoFontPath returned a primary (e.g. CaskaydiaMono).
+    // The renderer's per-glyph fallback consults this when the primary mono
+    // lacks a glyph — fixes tofu for common TUI symbols (Vite ➜, Claude
+    // Code's ✻/✽ spinner frames, ●, □, etc.) that user-chosen fonts often
+    // don't carry.
+    const palette_gpu_mono_symbols_font_path = try paletteGpuFontPath(
+        allocator,
+        storage.pref_path,
+        "JetBrainsMonoNerdFont-Regular.ttf",
+        @embedFile("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf")[0..],
+        &PALETTE_GPU_MONO_FONT_PATHS,
+    );
+    defer allocator.free(palette_gpu_mono_symbols_font_path);
     var palette_renderer = try palette_frame_renderer.Renderer.init(.{
         .requested_backend = requested_renderer_backend,
         .window = window,
@@ -278,6 +292,7 @@ fn mainInner(init: std.process.Init) !void {
         .prose_bold_italic_font_path = palette_gpu_prose_bold_italic_font_path,
         .mono_font_path = palette_gpu_mono_font_path,
         .icon_font_path = palette_gpu_icon_font_path,
+        .mono_symbols_font_path = palette_gpu_mono_symbols_font_path,
     });
     palette_renderer.configureTextMeasureRenderer();
     defer palette_renderer.deinit(allocator);
