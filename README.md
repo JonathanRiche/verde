@@ -20,7 +20,7 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 Install the latest release from the website:
 
 ```bash
-curl -fsSL https://openverde.ai/install.sh | sh
+curl -fsSL https://verdeai.dev/install.sh | sh
 ```
 
 Or download a release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).

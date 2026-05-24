@@ -2,4 +2,4 @@
 User-agent: *
 Disallow:
 
-Sitemap: https://openverde.ai/sitemap.xml
+Sitemap: https://verdeai.dev/sitemap.xml
