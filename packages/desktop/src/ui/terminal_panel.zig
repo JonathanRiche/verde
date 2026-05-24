@@ -1049,16 +1049,22 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
 }
 
 /// Codepoints whose glyph likely lives in a *proportional* fallback face
-/// (Noto Sans Symbols, Noto Sans Symbols 2, Noto Emoji). Their baseline sits
-/// lower in the em-box than mono glyphs at the same font_size, so without a
-/// y-lift they appear to drop below adjacent mono text. Excluded: Nerd Font
-/// private-use blocks which use mono-style faces and align natively.
+/// (Noto Sans Symbols 2, Noto Emoji). Their baseline sits lower in the em-box
+/// than mono glyphs at the same font_size, so without a y-lift they appear to
+/// drop below adjacent mono text. Excluded: Nerd Font private-use blocks
+/// (mono-style, align natively) AND the numbered-dingbat sub-range
+/// U+2776..U+2793 served by *Noto Sans Symbols* (the original, not "2"),
+/// whose metrics are closer to mono — applying the lift made them sit too
+/// high. Other dingbats in U+2700..U+27BF still need the lift since they
+/// come from Symbols 2 or Emoji.
 fn glyphNeedsBaselineLift(cp: u21) bool {
     return switch (cp) {
+        0x2776...0x2793 => false, // numbered dingbats: Noto Sans Symbols, no lift
         0x2100...0x214F,
         0x2300...0x23FF,
         0x2600...0x26FF,
-        0x2700...0x27BF,
+        0x2700...0x2775,
+        0x2794...0x27BF,
         0x2B00...0x2BFF,
         0x1F300...0x1FAFF, // 4-byte emoji blocks
         => true,
