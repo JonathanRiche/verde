@@ -545,7 +545,16 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             if (queueTerminalCellGeometry(state, cell_rect, raw_cell.codepoint(), rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect)) {
                 continue;
             }
-            const text_rect = terminalTextRect(cell_rect, text_y_offset, glyph_kind);
+            // Codepoints that fall through to the proportional fallback faces
+            // (Noto Sans Symbols / Symbols 2 / Emoji) have their baseline
+            // metrics expressed for proportional layout — the visible glyph
+            // sits noticeably lower in the em-box than mono glyphs at the
+            // same y. Lift them so they line up with adjacent mono text.
+            const glyph_y_offset = if (glyphNeedsBaselineLift(raw_cell.codepoint()))
+                text_y_offset - cell_h * 0.14
+            else
+                text_y_offset;
+            const text_rect = terminalTextRect(cell_rect, glyph_y_offset, glyph_kind);
             const draw_font_size = terminalTextFontSize(font_size, glyph_kind);
             queueTerminalText(state, .{
                 .x = text_rect.x,
@@ -1026,6 +1035,7 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
         // own design width; in practice TUIs follow these symbols with a
         // space, so any overflow lands harmlessly.
         0x2100...0x214F, // Letterlike Symbols (ℹ etc.)
+        0x2300...0x23FF, // Misc Technical (⌘⌥⌫⏵⎿ etc.)
         0x2600...0x26FF, // Misc Symbols (☀☁⚠⚡⚙⚓☃⛅⚑)
         0x2700...0x27BF, // Dingbats (✓✗✨➜➤➔ + numbered ❶➀)
         0x2B00...0x2BFF, // Misc Symbols and Arrows (⮕⭐⬆)
@@ -1033,6 +1043,24 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
         0xe5fa...0xe7ff,
         0xf000...0xf8ff,
         0xf0000...0xf20ff,
+        => true,
+        else => false,
+    };
+}
+
+/// Codepoints whose glyph likely lives in a *proportional* fallback face
+/// (Noto Sans Symbols, Noto Sans Symbols 2, Noto Emoji). Their baseline sits
+/// lower in the em-box than mono glyphs at the same font_size, so without a
+/// y-lift they appear to drop below adjacent mono text. Excluded: Nerd Font
+/// private-use blocks which use mono-style faces and align natively.
+fn glyphNeedsBaselineLift(cp: u21) bool {
+    return switch (cp) {
+        0x2100...0x214F,
+        0x2300...0x23FF,
+        0x2600...0x26FF,
+        0x2700...0x27BF,
+        0x2B00...0x2BFF,
+        0x1F300...0x1FAFF, // 4-byte emoji blocks
         => true,
         else => false,
     };
