@@ -1064,8 +1064,9 @@ fn glyphNeedsRelaxedClip(cp: u21) bool {
 fn glyphBaselineLiftFraction(cp: u21) f32 {
     return switch (cp) {
         // Numbered dingbats render from Noto Sans Symbols (the original).
-        // 14% was too high, 0% too low, 7% still sat a touch below x-height.
-        0x2776...0x2793 => 0.10,
+        // 14% too high, 0% too low, 7% / 10% still slightly low — split
+        // toward the upper bound.
+        0x2776...0x2793 => 0.12,
         0x2100...0x214F,
         0x2300...0x23FF,
         0x2600...0x26FF,
