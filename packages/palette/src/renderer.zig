@@ -117,6 +117,7 @@ pub const Renderer = struct {
     mono_font: ?*c.TTF_Font = null,
     icon_font: ?*c.TTF_Font = null,
     mono_symbols_font: ?*c.TTF_Font = null,
+    symbols_font: ?*c.TTF_Font = null,
     vertex_buffer: ?*c.SDL_GPUBuffer = null,
     index_buffer: ?*c.SDL_GPUBuffer = null,
     text_vertex_buffer: ?*c.SDL_GPUBuffer = null,
@@ -417,6 +418,7 @@ pub const Renderer = struct {
         mono: ?*sdl.Font,
         icon: ?*sdl.Font,
         mono_symbols: ?*sdl.Font = null,
+        symbols: ?*sdl.Font = null,
     };
 
     pub fn configureGpuTextWithAllRoleFonts(self: *Renderer, role_fonts: RoleFonts) !void {
@@ -429,6 +431,7 @@ pub const Renderer = struct {
         self.mono_font = if (role_fonts.mono) |fallback| @ptrCast(fallback) else null;
         self.icon_font = if (role_fonts.icon) |fallback| @ptrCast(fallback) else null;
         self.mono_symbols_font = if (role_fonts.mono_symbols) |fallback| @ptrCast(fallback) else null;
+        self.symbols_font = if (role_fonts.symbols) |fallback| @ptrCast(fallback) else null;
         self.text_engine = c.TTF_CreateGPUTextEngine(device) orelse return error.SdlTtfGpuTextEngineFailed;
         c.TTF_SetGPUTextEngineWinding(self.text_engine.?, c.TTF_GPU_TEXTENGINE_WINDING_COUNTER_CLOCKWISE);
         self.sampler = c.SDL_CreateGPUSampler(device, &.{
@@ -1057,8 +1060,17 @@ pub const Renderer = struct {
         // Vite's ➜, Claude Code's spinner frames, ●, □, ✓ — still render
         // instead of tofu when the primary mono lacks them.
         if (self.mono_symbols_font != null) {
-            const symbols = self.fontForRoleAndSize(font_size, .mono_symbols) catch return font_role;
-            if (c.TTF_FontHasGlyph(symbols, codepoint)) return .mono_symbols;
+            const mono_sym = self.fontForRoleAndSize(font_size, .mono_symbols) catch return font_role;
+            if (c.TTF_FontHasGlyph(mono_sym, codepoint)) return .mono_symbols;
+        }
+        // Dedicated symbols face (Noto Sans Symbols 2) covers ~145 / 192
+        // Dingbats and broader Misc Symbols ranges that even JetBrains Mono
+        // Nerd lacks — notably Claude Code's ✻/✽/✶ spinner frames, ➤, ✷,
+        // and assorted bullet/check variants. Glyph is proportional but the
+        // caller forces cell advance so layout is unchanged.
+        if (self.symbols_font != null) {
+            const sym = self.fontForRoleAndSize(font_size, .symbols) catch return font_role;
+            if (c.TTF_FontHasGlyph(sym, codepoint)) return .symbols;
         }
         // Last resort: the prose face (Noto Sans) covers a smaller set of
         // codepoints than expected in the bundled subset, but is kept in the
@@ -1140,6 +1152,7 @@ pub const Renderer = struct {
             .mono => if (self.mono_font) |font_value| return font_value,
             .icon => if (self.icon_font) |font_value| return font_value,
             .mono_symbols => if (self.mono_symbols_font) |font_value| return font_value,
+            .symbols => if (self.symbols_font) |font_value| return font_value,
         };
         return self.font.?;
     }
@@ -2114,6 +2127,7 @@ fn fontRoleCacheValue(font_role: ?draw.FontRole) u8 {
         .prose_italic => 7,
         .prose_bold_italic => 8,
         .mono_symbols => 9,
+        .symbols => 10,
     } else 0;
 }
 
