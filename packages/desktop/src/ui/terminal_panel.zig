@@ -317,6 +317,10 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             hit_cache.menu_open = false;
             return true;
         }
+        // Try to begin a selection candidate first — it requires both a pane
+        // hit AND a valid cell at the click, so clicks in the inset/padding
+        // zone fall through to the focus-only branch below.
+        if (beginSelectionCandidate(state, x, y)) return true;
         if (paneAtPoint(x, y)) |target| {
             hit_cache.dock_id = target.dock_id;
             var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
