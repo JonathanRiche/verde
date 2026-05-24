@@ -166,7 +166,13 @@ fn mainInner(init: std.process.Init) !void {
     }
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
-    defer sdl.quit();
+    defer {
+        if (skipSdlQuitOnProcessExit()) {
+            runtime_log.diagnostic("skipping SDL_Quit on process exit to avoid Linux GPU driver shutdown hang", .{});
+        } else {
+            sdl.quit();
+        }
+    }
 
     var storage = try Storage.init(allocator);
     defer storage.deinit();
@@ -560,6 +566,10 @@ fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
     return switch (build_options.palette_renderer) {
         .sdl_gpu => .sdl_gpu,
     };
+}
+
+fn skipSdlQuitOnProcessExit() bool {
+    return builtin.os.tag == .linux and build_options.palette_renderer == .sdl_gpu;
 }
 
 fn paletteGpuFontPath(
@@ -1560,12 +1570,20 @@ fn shouldPasteClipboardImage(state: *const AppState, event: *const sdl.KeyboardE
 
 fn terminalOwnedShortcut(event: *const sdl.KeyboardEvent) bool {
     if (!event.down) return false;
+    if (isKeymodPressed(event.mod, sdl.Keymod.alt)) return false;
     const ctrl = isKeymodPressed(event.mod, sdl.Keymod.ctrl);
     const shift = isKeymodPressed(event.mod, sdl.Keymod.shift);
-    if (!shift or isKeymodPressed(event.mod, sdl.Keymod.alt) or isKeymodPressed(event.mod, sdl.Keymod.gui)) return false;
+    const gui = isKeymodPressed(event.mod, sdl.Keymod.gui);
     return switch (event.scancode) {
-        .c, .v, .pageup, .pagedown => ctrl or event.scancode == .pageup or event.scancode == .pagedown,
-        .up, .down, .home, .end => ctrl,
+        // Copy/paste: Ctrl+C / Super+C / Ctrl+V / Super+V (with or without
+        // shift). For copy, the panel's selection-aware handler intercepts
+        // first; bare Ctrl+C with no selection falls through to the shell
+        // as SIGINT.
+        .c, .v => ctrl != gui,
+        // Scroll combos require shift (chosen so they don't conflict with
+        // shell history or terminal-internal shortcuts).
+        .pageup, .pagedown => shift and !ctrl and !gui,
+        .up, .down, .home, .end => shift and ctrl and !gui,
         else => false,
     };
 }

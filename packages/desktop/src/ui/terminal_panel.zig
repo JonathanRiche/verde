@@ -972,10 +972,13 @@ fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
 fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
     if (!event.down or event.repeat) return false;
     if (event.scancode != .c and event.key != .c) return false;
-    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
-        modifierPressed(event.mod, sdl.Keymod.shift) and
-        !modifierPressed(event.mod, sdl.Keymod.alt) and
-        !modifierPressed(event.mod, sdl.Keymod.gui);
+    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
+    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+    // Ctrl+C, Ctrl+Shift+C, Super+C, Super+Shift+C. Shift is optional so the
+    // copy-if-selection behavior reaches handlePaletteKeyDown before the bare
+    // Ctrl+C falls through to the terminal as SIGINT.
+    return ctrl != gui; // exactly one of ctrl/gui; reject ctrl+gui chord
 }
 
 fn modifierPressed(state: sdl.Keymod, mask: u16) bool {

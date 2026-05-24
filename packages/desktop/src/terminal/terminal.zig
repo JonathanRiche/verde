@@ -3211,18 +3211,26 @@ fn terminalPageScrollLines(rows: u16) isize {
 
 fn terminalPasteShortcut(event: *const sdl.KeyboardEvent) bool {
     if (event.scancode != .v) return false;
-    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
-        modifierPressed(event.mod, sdl.Keymod.shift) and
-        !modifierPressed(event.mod, sdl.Keymod.alt) and
-        !modifierPressed(event.mod, sdl.Keymod.gui);
+    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
+    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+    // Ctrl+V, Ctrl+Shift+V, Super+V, Super+Shift+V. Note: this steals Ctrl+V
+    // from TUIs that bind it (vim insert-mode literal char, etc.) — explicit
+    // user request.
+    return ctrl != gui;
 }
 
 fn terminalCopyShortcut(event: *const sdl.KeyboardEvent) bool {
     if (event.scancode != .c) return false;
-    return modifierPressed(event.mod, sdl.Keymod.ctrl) and
-        modifierPressed(event.mod, sdl.Keymod.shift) and
-        !modifierPressed(event.mod, sdl.Keymod.alt) and
-        !modifierPressed(event.mod, sdl.Keymod.gui);
+    // Stricter than the panel-level copy: this path runs when no selection
+    // is active and copies the whole screen, so we require shift to make it
+    // an explicit gesture (Ctrl+Shift+C / Super+Shift+C). Bare Ctrl+C falls
+    // through to the shell as SIGINT.
+    if (modifierPressed(event.mod, sdl.Keymod.alt)) return false;
+    if (!modifierPressed(event.mod, sdl.Keymod.shift)) return false;
+    const ctrl = modifierPressed(event.mod, sdl.Keymod.ctrl);
+    const gui = modifierPressed(event.mod, sdl.Keymod.gui);
+    return ctrl != gui;
 }
 
 fn mapScancodeToGhostty(scancode: sdl.Scancode) ?ghostty_vt.input.Key {
