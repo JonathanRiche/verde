@@ -12,11 +12,14 @@ export default function Header() {
         </Link>
 
         <div class="nav-links">
-          <a href="/#product" class="nav-link">
-            Product
+          <a href="/#providers" class="nav-link">
+            Providers
           </a>
-          <a href="/#flow" class="nav-link">
-            Workflow
+          <a href="/#tiling" class="nav-link">
+            Tiling
+          </a>
+          <a href="/#scripting" class="nav-link">
+            CLI
           </a>
           <a href="/#install" class="nav-link">
             Install

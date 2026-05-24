@@ -16,7 +16,7 @@ import Header from '../components/Header'
 // names that 404 under `vite dev`.
 import '../styles.css'
 
-const siteUrl = 'https://openverde.ai'
+const siteUrl = 'https://verdeai.dev'
 const title = 'Verde | Desktop workspace for coding agents'
 const description =
   'Verde is a native desktop workspace for coding agents with local provider CLIs, an embedded browser pane, and a project-scoped terminal dock.'
