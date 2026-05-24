@@ -1501,6 +1501,10 @@ const UnixSession = struct {
         var terminal = try ghostty_vt.Terminal.init(allocator, .{
             .cols = options.cols,
             .rows = options.rows,
+            // Ghostty's libterminal default is 10_000 *bytes* (~10 KB), which
+            // caps scrollback at a few screenfuls. Match Ghostty's main-app
+            // default of 10 MB so long sessions retain meaningful history.
+            .max_scrollback = 10_000_000,
         });
         errdefer terminal.deinit(allocator);
         configureTerminalTheme(allocator, &terminal);
