@@ -372,8 +372,29 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 
 - App state is saved through SDL's pref path in `state.sqlite`.
 - User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json`.
+- Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace root. `processes:` and `agents:` entries both run in terminal docks; agent entries may also declare `provider`, `revive`, `notify`, `mcp`, and `hooks` metadata. New agent metadata defaults to disabled unless explicitly set.
 - On Omarchy systems, UI colors are loaded from an Omarchy-compatible `colors.toml`. Verde first honors `VERDE_OMARCHY_COLORS=/path/to/colors.toml`, then `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, then named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` or `~/.config/omarchy/themes/verde/colors.toml`. Missing values fall back to Verde defaults. See [`examples/omarchy/verde/colors.toml`](examples/omarchy/verde/colors.toml).
 - `theme.colors` in `verde.json` can override Verde theme tokens. Omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
+
+Example project stack config:
+
+```yaml
+processes:
+  web:
+    command: "npm run dev"
+    cwd: "."
+    restart: on_crash
+
+agents:
+  codex:
+    provider: codex
+    command: "codex"
+    cwd: "."
+    revive: attach_or_create
+    notify: true
+    mcp: true
+    hooks: false
+```
 
 Example config:
 

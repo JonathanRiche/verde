@@ -326,10 +326,9 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
         .commands = &.{
             "status",                              "capabilities",                        "workspaces",                           "panes",
             "active",                              "inspect",                             "threads",                              "terminals",
-            "surfaces",                            "surface.list",                         "surface.inspect",                      "surface.focus",
-            "surface.clearAttention",
-            "notification.create",                 "notification.update",                  "notification.clear",                   "processes",
-            "pane.focus",                          "pane.split",                           "pane.resize",
+            "surfaces",                            "surface.list",                        "surface.inspect",                      "surface.focus",
+            "surface.clearAttention",              "notification.create",                 "notification.update",                  "notification.clear",
+            "processes",                           "pane.focus",                          "pane.split",                           "pane.resize",
             "pane.minimize",                       "pane.maximize",                       "pane.restore",                         "pane.close",
             "chat.status",                         "chat.transcript",                     "chat.draft.set",                       "chat.draft.append",
             "chat.send",                           "chat.followup",                       "chat.stop",                            "chat.approve",
@@ -1250,6 +1249,16 @@ fn writeManagedProcess(s: *std.json.Stringify, state: *app_state.AppState, proje
     try s.write(process.cwd);
     try s.objectField("restart");
     try s.write(@tagName(process.restart));
+    try s.objectField("provider");
+    if (process.provider) |provider| try s.write(@tagName(provider)) else try s.write(null);
+    try s.objectField("revive");
+    try s.write(@tagName(process.revive));
+    try s.objectField("notify");
+    try s.write(process.notify);
+    try s.objectField("mcp");
+    try s.write(process.mcp);
+    try s.objectField("hooks");
+    try s.write(process.hooks);
     try s.objectField("status");
     try s.write(@tagName(process.status));
     try s.objectField("exit_code");
