@@ -1439,6 +1439,11 @@ pub const ManagedProcess = struct {
     command: []u8,
     cwd: []u8,
     restart: stack_config.RestartPolicy,
+    provider: ?stack_config.AgentProvider = null,
+    revive: stack_config.RevivePolicy = .attach_or_create,
+    notify: bool = false,
+    mcp: bool = false,
+    hooks: bool = false,
     watch: std.ArrayList([]u8) = .empty,
     status: ManagedProcessStatus = .stopped,
     exit_code: ?u32 = null,
@@ -1465,6 +1470,11 @@ pub const ManagedProcess = struct {
             .command = try allocator.dupe(u8, definition.command),
             .cwd = try allocator.dupe(u8, definition.cwd),
             .restart = definition.restart,
+            .provider = definition.provider,
+            .revive = definition.revive,
+            .notify = definition.notify,
+            .mcp = definition.mcp,
+            .hooks = definition.hooks,
             .watch = .empty,
         };
         errdefer process.deinit(allocator);
@@ -1477,6 +1487,11 @@ pub const ManagedProcess = struct {
     fn updateFromDefinition(self: *ManagedProcess, allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !void {
         self.kind = definition.kind;
         self.restart = definition.restart;
+        self.provider = definition.provider;
+        self.revive = definition.revive;
+        self.notify = definition.notify;
+        self.mcp = definition.mcp;
+        self.hooks = definition.hooks;
         var reset_watch_state = false;
         if (!std.mem.eql(u8, self.command, definition.command)) {
             allocator.free(self.command);
@@ -8351,10 +8366,37 @@ pub const AppState = struct {
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+        if (process.kind == .agent and process.notify) {
+            if (dock.activeSessionId()) |session_id| {
+                _ = try self.updateSurface(.{
+                    .session_id = session_id,
+                    .workspace_id = project.id,
+                    .workspace_path = project.path,
+                    .dock_id = dock_id,
+                    .pane_id = process.pane_id,
+                    .provider = providerFromStack(process.provider),
+                    .title = process.name,
+                    .status = .working,
+                    .attention = false,
+                    .last_event_title = process.name,
+                    .last_event_body = "Agent started.",
+                });
+            }
+        }
         project.workspace_layout.maximized_pane_id = null;
         self.terminal_focused = true;
         self.markDirty();
         return true;
+    }
+
+    fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
+        return switch (provider orelse return null) {
+            .codex => .codex,
+            .claude => .claude,
+            .opencode => .opencode,
+            .cursor => .cursor,
+            .other => null,
+        };
     }
 
     pub fn stopManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
