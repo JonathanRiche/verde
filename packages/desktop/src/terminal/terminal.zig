@@ -600,6 +600,14 @@ pub const Dock = struct {
         return session.takeNotification(pane.id);
     }
 
+    pub fn clearNotificationForSession(self: *Dock, session_id: []const u8) bool {
+        var cleared = false;
+        for (self.tabs.items) |*tab| {
+            if (clearNotificationInNode(tab.root, session_id)) cleared = true;
+        }
+        return cleared;
+    }
+
     pub fn focusPane(self: *Dock, pane_id: u32) void {
         const tab = self.activeTab() orelse return;
         if (findPaneLeaf(tab.root, pane_id) == null) return;
@@ -1102,6 +1110,19 @@ fn findFirstPaneLeafConst(node: *const PaneNode) ?*const PaneLeaf {
     };
 }
 
+fn clearNotificationInNode(node: *PaneNode, session_id: []const u8) bool {
+    return switch (node.*) {
+        .leaf => |*leaf| blk: {
+            const session = leaf.session orelse break :blk false;
+            const id = session.sessionId() orelse break :blk false;
+            if (!std.mem.eql(u8, id, session_id)) break :blk false;
+            session.clearNotification();
+            break :blk true;
+        },
+        .split => |*split| clearNotificationInNode(split.first, session_id) or clearNotificationInNode(split.second, session_id),
+    };
+}
+
 fn paneNodeContains(node: *PaneNode, pane_id: u32) bool {
     return findPaneLeaf(node, pane_id) != null;
 }
@@ -1415,6 +1436,8 @@ const UnsupportedSession = struct {
         return null;
     }
 
+    pub fn clearNotification(_: *UnsupportedSession) void {}
+
     pub fn snapshot(_: *const UnsupportedSession) SessionSnapshot {
         return .{ .running = false };
     }
@@ -1646,6 +1669,12 @@ const UnixSession = struct {
             .body = self.pending_notification_body[0..self.pending_notification_body_len],
             .attention = true,
         };
+    }
+
+    pub fn clearNotification(self: *UnixSession) void {
+        self.pending_notification_attention = false;
+        self.pending_notification_title_len = 0;
+        self.pending_notification_body_len = 0;
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
