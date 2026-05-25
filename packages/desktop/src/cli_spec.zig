@@ -10,6 +10,7 @@ pub const top_level_commands = [_][]const u8{
     "capabilities",
     "state",
     "notify",
+    "integrations",
     "session",
     "live",
     "mcp",
@@ -22,6 +23,21 @@ pub const state_commands = [_][]const u8{
     "panes",
     "threads",
     "transcript",
+};
+
+pub const integration_commands = [_][]const u8{
+    "list",
+    "doctor",
+    "install",
+    "remove",
+    "disable",
+};
+
+pub const integration_providers = [_][]const u8{
+    "claude",
+    "codex",
+    "opencode",
+    "cursor",
 };
 
 pub const session_commands = [_][]const u8{

@@ -64,6 +64,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try handleNotify(allocator, out, io, parsed.rest);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "integrations")) {
+        try handleIntegrations(allocator, out, parsed.rest);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "__session-daemon")) {
         const pref_path = try prefPath(allocator);
         defer allocator.free(pref_path);
@@ -99,6 +103,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
         \\  verde notify [options]        Update the current terminal surface
+        \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
@@ -109,6 +114,13 @@ fn printHelp(out: output.Output) !void {
         \\  panes --workspace <id|index|current> [--json]
         \\  threads --workspace <id|index|current> [--json]
         \\  transcript --workspace <id|index|current> --thread <index|provider-id> [--json]
+        \\
+        \\Integration commands:
+        \\  list [--json]
+        \\  doctor [--json]
+        \\  install <claude|codex|opencode|cursor>
+        \\  remove <claude|codex|opencode|cursor>
+        \\  disable <claude|codex|opencode|cursor>
         \\
         \\Session commands:
         \\  list [--json]
@@ -165,6 +177,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         .protocol_version = 2,
         .cli = .{
             .state = spec.state_commands[0..],
+            .integrations = spec.integration_commands[0..],
             .session = spec.session_commands[0..],
             .live = spec.live_capabilities[0..],
             .completion = spec.shells[0..],
@@ -185,6 +198,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\verde CLI capabilities
         \\  protocol: 1
         \\  state: path, workspaces, panes, threads, transcript
+        \\  integrations: list, doctor, install, remove, disable
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
         \\  live: status, workspaces, panes, pane control, chat control, terminal/process control
         \\  completion: bash, zsh, fish
@@ -581,6 +595,151 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
     } else if (!args.hasFlag(argv, "--quiet")) {
         try printLiveResponse(out, response);
     }
+}
+
+const IntegrationProvider = struct {
+    name: []const u8,
+    hook_state: []const u8,
+    installable: bool,
+    installed: bool,
+    reason: []const u8,
+};
+
+const integration_providers = [_]IntegrationProvider{
+    .{ .name = "claude", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "codex", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+};
+
+fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde integrations list [--json]
+            \\  verde integrations doctor [--json]
+            \\  verde integrations install <claude|codex|opencode|cursor>
+            \\  verde integrations remove <claude|codex|opencode|cursor>
+            \\  verde integrations disable <claude|codex|opencode|cursor>
+            \\
+            \\Provider hooks are optional. Verde does not overwrite provider config
+            \\or change provider login/auth behavior.
+            \\
+        , .{});
+        return;
+    }
+
+    const command = args.positional(argv, 0) orelse "list";
+    const json = args.hasFlag(argv, "--json");
+    if (std.mem.eql(u8, command, "list")) {
+        try printIntegrationsList(allocator, out, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "doctor")) {
+        try printIntegrationsDoctor(allocator, out, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "install") or
+        std.mem.eql(u8, command, "remove") or
+        std.mem.eql(u8, command, "disable"))
+    {
+        const provider_name = args.positional(argv, 1) orelse {
+            try out.stderr("verde integrations {s} requires a provider name\n", .{command});
+            std.process.exit(2);
+        };
+        const provider = findIntegrationProvider(provider_name) orelse {
+            try out.stderr("unknown integration provider: {s}\n", .{provider_name});
+            std.process.exit(2);
+        };
+        if (std.mem.eql(u8, command, "install")) {
+            try printIntegrationInstallUnsupported(allocator, out, json, provider);
+            std.process.exit(1);
+        }
+        try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
+        return;
+    }
+
+    try out.stderr("unknown integrations command: {s}\n", .{command});
+    std.process.exit(2);
+}
+
+fn findIntegrationProvider(name: []const u8) ?IntegrationProvider {
+    for (integration_providers) |provider| {
+        if (std.mem.eql(u8, provider.name, name)) return provider;
+    }
+    return null;
+}
+
+fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .providers = integration_providers[0..],
+            .policy = .{
+                .writes_config = false,
+                .requires_verde_env = true,
+                .changes_auth = false,
+            },
+        });
+        return;
+    }
+    try out.stdout("Provider integrations:\n", .{});
+    for (integration_providers) |provider| {
+        try out.stdout("  {s}: {s} ({s})\n", .{ provider.name, provider.hook_state, provider.reason });
+    }
+}
+
+fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    const verde_env = getenvSlice("VERDE") orelse "";
+    const has_identity = getenvSlice("VERDE_SESSION_ID") != null and
+        (getenvSlice("VERDE_SOCKET") != null or getenvSlice("VERDE_LIVE_SOCKET") != null or getenvSlice("VERDE_SESSIONIZER_SOCKET") != null);
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .verde_env = std.mem.eql(u8, verde_env, "1"),
+            .has_terminal_identity = has_identity,
+            .providers = integration_providers[0..],
+            .summary = "No provider hook installer is currently enabled; generic verde notify, OSC, and MCP paths remain available.",
+        });
+        return;
+    }
+    try out.stdout(
+        \\Integration doctor:
+        \\  VERDE=1: {s}
+        \\  terminal identity: {s}
+        \\  hook installers: none enabled
+        \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
+        \\
+    , .{
+        if (std.mem.eql(u8, verde_env, "1")) "yes" else "no",
+        if (has_identity) "yes" else "no",
+    });
+}
+
+fn printIntegrationInstallUnsupported(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = "install",
+            .installed = false,
+            .status = "unsupported",
+            .reason = provider.reason,
+        });
+        return;
+    }
+    try out.stderr("verde integrations install {s}: {s}\n", .{ provider.name, provider.reason });
+}
+
+fn printIntegrationNoInstalledHook(allocator: std.mem.Allocator, out: output.Output, json: bool, action: []const u8, provider: IntegrationProvider) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = action,
+            .installed = false,
+            .changed = false,
+            .status = "not_installed",
+        });
+        return;
+    }
+    try out.stdout("verde integrations {s} {s}: no installed hook to change\n", .{ action, provider.name });
 }
 
 fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
