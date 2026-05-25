@@ -236,11 +236,11 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     if (state.projects.items.len == 0) return;
     hit_cache.dock_id = dock_id;
     var dock = state.currentProjectTerminalDockMutable(dock_id) orelse return;
-    if (dock.activePaneConst()) |active| {
-        dock.resizePaneToFit(state.allocator, active.id, rect.w, rect.h) catch |err| {
-            runtime_log.diagnostic("terminal workspace pre-resize failed dock={d} pane={d}: {s}", .{ dock_id, active.id, @errorName(err) });
-        };
-    }
+    // No dock-level pre-resize: renderPane below resizes each pane against
+    // its real (inset) grid rect. Pre-resizing here with the full dock rect
+    // computes a different column count than the per-pane call, so on every
+    // frame the active pane oscillated between two col counts and ghostty
+    // reflowed back and forth — visible as terminal-pane jitter while typing.
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
