@@ -84,6 +84,13 @@ const TerminalPaneDrawCache = struct {
     rows: u16 = 0,
     cols: u16 = 0,
     font_scale: f32 = 0.0,
+    // Cache the cursor position so a pure cursor move forces a rebuild even
+    // if the dirty flag doesn't propagate (e.g. a same-cell SGR that doesn't
+    // touch the rendered grid). Otherwise the previous frame's cursor
+    // highlight can linger over the old cell.
+    cursor_x: u16 = 0,
+    cursor_y: u16 = 0,
+    cursor_visible: bool = false,
     arena: ?std.heap.ArenaAllocator = null,
     commands: std.ArrayList(CachedDrawCommand) = .empty,
 
@@ -92,11 +99,16 @@ const TerminalPaneDrawCache = struct {
     }
 
     fn validFor(self: *const TerminalPaneDrawCache, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) bool {
+        const cursor_x: u16 = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
+        const cursor_y: u16 = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         return self.active and
             rectEql(self.rect, rect) and
             self.rows == render_state.rows and
             self.cols == render_state.cols and
             self.font_scale == font_scale and
+            self.cursor_x == cursor_x and
+            self.cursor_y == cursor_y and
+            self.cursor_visible == render_state.cursor.visible and
             render_state.dirty == .false;
     }
 
@@ -108,6 +120,9 @@ const TerminalPaneDrawCache = struct {
         self.rows = render_state.rows;
         self.cols = render_state.cols;
         self.font_scale = font_scale;
+        self.cursor_x = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
+        self.cursor_y = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
+        self.cursor_visible = render_state.cursor.visible;
         if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(allocator);
         _ = self.arena.?.reset(.retain_capacity);
         self.commands.clearRetainingCapacity();
