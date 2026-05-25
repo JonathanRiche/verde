@@ -2528,7 +2528,7 @@ const UnixSession = struct {
     }
 
     fn scanNotifications(self: *UnixSession, bytes: []const u8) void {
-        if (std.mem.indexOfScalar(u8, bytes, 0x07) != null) {
+        if (hasStandaloneBel(bytes)) {
             self.pending_notification_attention = true;
             self.pending_notification_title_len = 0;
             self.pending_notification_body_len = 0;
@@ -2547,6 +2547,25 @@ const UnixSession = struct {
             self.storeNotificationText(title, body);
             search_start = payload_end + 1;
         }
+    }
+
+    fn hasStandaloneBel(bytes: []const u8) bool {
+        var index: usize = 0;
+        while (index < bytes.len) : (index += 1) {
+            if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == ']') {
+                index += 2;
+                while (index < bytes.len) : (index += 1) {
+                    if (bytes[index] == 0x07) break;
+                    if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') {
+                        index += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (bytes[index] == 0x07) return true;
+        }
+        return false;
     }
 
     fn storeNotificationText(self: *UnixSession, title: []const u8, body: []const u8) void {
