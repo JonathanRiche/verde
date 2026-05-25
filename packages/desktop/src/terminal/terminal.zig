@@ -578,6 +578,14 @@ pub const Dock = struct {
         return findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root);
     }
 
+    pub fn activeSessionId(self: *const Dock) ?[]const u8 {
+        const pane = self.activePaneConst() orelse return null;
+        if (pane.session) |session| {
+            return session.sessionId();
+        }
+        return pane.session_id;
+    }
+
     pub fn focusPane(self: *Dock, pane_id: u32) void {
         const tab = self.activeTab() orelse return;
         if (findPaneLeaf(tab.root, pane_id) == null) return;
@@ -1385,6 +1393,10 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn sessionId(_: *const UnsupportedSession) ?[]const u8 {
+        return null;
+    }
+
     pub fn snapshot(_: *const UnsupportedSession) SessionSnapshot {
         return .{ .running = false };
     }
@@ -1547,7 +1559,7 @@ const UnixSession = struct {
             return self;
         }
 
-        const child = try spawnCommand(allocator, options.cwd, options.cols, options.rows, options.profile);
+        const child = try spawnCommand(allocator, options);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -1595,6 +1607,10 @@ const UnixSession = struct {
         if (self.attach_id) |attach_id| allocator.free(attach_id);
         if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
+    }
+
+    pub fn sessionId(self: *const UnixSession) ?[]const u8 {
+        return self.session_id;
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
@@ -2150,6 +2166,7 @@ const UnixSession = struct {
                 .rows = options.rows,
                 .dock_id = options.dock_id,
                 .pane_id = options.pane_id,
+                .pref_path = pref_path,
             }, 1);
             defer allocator.free(create_response);
             try ensureSessionResponseOk(allocator, create_response);
@@ -2707,16 +2724,18 @@ const UnixSession = struct {
         );
     }
 
-    fn spawnCommand(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16, profile: TerminalLaunchProfile) !SpawnResult {
-        const cwd_z = try allocator.dupeZ(u8, cwd);
+    fn spawnCommand(allocator: std.mem.Allocator, options: SessionCreateOptions) !SpawnResult {
+        const cwd_z = try allocator.dupeZ(u8, options.cwd);
         defer allocator.free(cwd_z);
-        const command = try commandForProfile(allocator, profile);
+        const command = try commandForProfile(allocator, options.profile);
         defer freeCommand(allocator, command);
+        const identity = try LocalIdentityEnv.init(allocator, options);
+        defer identity.deinit(allocator);
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
-            .row = rows,
-            .col = cols,
+            .row = options.rows,
+            .col = options.cols,
             .xpixel = 0,
             .ypixel = 0,
         };
@@ -2724,7 +2743,7 @@ const UnixSession = struct {
         if (fork_result < 0) return error.ForkPtyFailed;
 
         if (fork_result == 0) {
-            childExec(cwd_z, command);
+            childExec(cwd_z, command, identity);
         }
 
         try setNonBlocking(@intCast(master_fd));
@@ -2734,7 +2753,67 @@ const UnixSession = struct {
         };
     }
 
-    fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
+    const LocalIdentityEnv = struct {
+        session_id: ?[:0]const u8 = null,
+        project_id: [:0]const u8,
+        project_path: [:0]const u8,
+        dock_id: [:0]const u8,
+        pane_id: [:0]const u8,
+        live_socket: ?[:0]const u8 = null,
+        sessionizer_socket: ?[:0]const u8 = null,
+
+        fn init(allocator: std.mem.Allocator, options: SessionCreateOptions) !LocalIdentityEnv {
+            const project_id = try allocator.dupeZ(u8, options.project_id);
+            errdefer allocator.free(project_id);
+            const project_path = try allocator.dupeZ(u8, options.project_path);
+            errdefer allocator.free(project_path);
+            const dock_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.dock_id});
+            defer allocator.free(dock_id_text);
+            const dock_id = try allocator.dupeZ(u8, dock_id_text);
+            errdefer allocator.free(dock_id);
+            const pane_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.pane_id});
+            defer allocator.free(pane_id_text);
+            const pane_id = try allocator.dupeZ(u8, pane_id_text);
+            errdefer allocator.free(pane_id);
+            var session_id: ?[:0]u8 = null;
+            if (options.session_id) |id| {
+                session_id = try allocator.dupeZ(u8, id);
+            }
+            errdefer if (session_id) |value| allocator.free(value);
+            var live_socket: ?[:0]u8 = null;
+            var sessionizer_socket: ?[:0]u8 = null;
+            if (options.pref_path) |pref_path| {
+                const live_path = try std.fs.path.join(allocator, &.{ pref_path, sessionizer.LIVE_SOCKET_NAME });
+                defer allocator.free(live_path);
+                live_socket = try allocator.dupeZ(u8, live_path);
+                errdefer if (live_socket) |value| allocator.free(value);
+                const sessionizer_path = try sessionizer.socketPath(allocator, pref_path);
+                defer allocator.free(sessionizer_path);
+                sessionizer_socket = try allocator.dupeZ(u8, sessionizer_path);
+            }
+            return .{
+                .session_id = session_id,
+                .project_id = project_id,
+                .project_path = project_path,
+                .dock_id = dock_id,
+                .pane_id = pane_id,
+                .live_socket = live_socket,
+                .sessionizer_socket = sessionizer_socket,
+            };
+        }
+
+        fn deinit(self: LocalIdentityEnv, allocator: std.mem.Allocator) void {
+            if (self.session_id) |value| allocator.free(value);
+            allocator.free(self.project_id);
+            allocator.free(self.project_path);
+            allocator.free(self.dock_id);
+            allocator.free(self.pane_id);
+            if (self.live_socket) |value| allocator.free(value);
+            if (self.sessionizer_socket) |value| allocator.free(value);
+        }
+    };
+
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: LocalIdentityEnv) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) {
             std.c._exit(127);
         }
@@ -2747,6 +2826,18 @@ const UnixSession = struct {
         _ = setenv("CLICOLOR_FORCE", "1", 0);
         _ = setenv("FORCE_COLOR", "3", 0);
         _ = unsetenv("NO_COLOR");
+        _ = setenv("VERDE", "1", 1);
+        if (identity.session_id) |value| _ = setenv("VERDE_SESSION_ID", value.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_ID", identity.project_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_PATH", identity.project_path.ptr, 1);
+        _ = setenv("VERDE_DOCK_ID", identity.dock_id.ptr, 1);
+        _ = setenv("VERDE_PANE_ID", identity.pane_id.ptr, 1);
+        if (identity.live_socket) |value| {
+            _ = setenv("VERDE_SOCKET", value.ptr, 1);
+            _ = setenv("VERDE_LIVE_SOCKET", value.ptr, 1);
+        }
+        if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
+        _ = setenv("VERDE_CLI", "verde", 1);
         if (std.c.getenv("LANG") == null) {
             _ = setenv("LANG", "C.UTF-8", 1);
         }

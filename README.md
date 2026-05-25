@@ -110,6 +110,7 @@ verde version [--json]        # Print version metadata
 verde capabilities [--json]   # Print supported CLI/live features
 verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
+verde notify [options]        # Update the current terminal surface
 verde live <command>          # Control or inspect the running app
 ```
 
@@ -193,6 +194,7 @@ verde live active [--json]
 verde live panes [--project <id|index|path|current>] [--json]
 verde live threads [--project <id|index|path|current>] [--json]
 verde live terminals [--project <id|index|path|current>] [--json]
+verde live surfaces [--json]
 verde live processes [--json]
 verde live inspect --pane <pane-id> [--project <id|index|path|current>] [--json]
 verde live inspect --focused [--json]
@@ -208,6 +210,27 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
   last browser error, last bridge message, and last eval result.
 - `projects` lists live projects.
 - `active` returns the current project and focused pane.
+- `surfaces` lists in-memory terminal surface status and attention metadata.
+
+### Terminal Surface Notifications
+
+Verde terminal children receive identity variables such as `VERDE=1`,
+`VERDE_SESSION_ID`, `VERDE_WORKSPACE_ID`, `VERDE_WORKSPACE_PATH`,
+`VERDE_DOCK_ID`, `VERDE_PANE_ID`, `VERDE_SOCKET`,
+`VERDE_LIVE_SOCKET`, `VERDE_SESSIONIZER_SOCKET`, and `VERDE_CLI`.
+Terminal tools can use those variables to update their pane surface:
+
+```bash
+verde notify --title "Codex needs input" --body "Approve command?" --status waiting
+verde notify --status working --progress 0.4 --label "Running tests"
+verde notify --status done --title "Agent finished"
+verde notify --clear
+```
+
+`verde notify` infers `--session` from `VERDE_SESSION_ID`; scripts can pass
+`--session`, `--workspace`, `--dock`, or `--pane` explicitly. If the desktop app
+is not running, `verde notify --quiet` exits without launching Verde or showing
+an OS notification.
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
   Verde.

@@ -11,6 +11,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 const log = std.log.scoped(.sessionizer);
 
 pub const SOCKET_NAME = "verde-sessionizer.sock";
+pub const LIVE_SOCKET_NAME = "verde.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_COLS: u16 = 120;
@@ -266,6 +267,9 @@ pub const CreateOptions = struct {
     command: []const []const u8 = &.{},
     cols: u16 = DEFAULT_COLS,
     rows: u16 = DEFAULT_ROWS,
+    dock_id: u32 = 0,
+    pane_id: u32 = 0,
+    pref_path: []const u8 = "",
 };
 
 const PtySession = struct {
@@ -282,6 +286,8 @@ const PtySession = struct {
     cwd: []u8,
     label: []u8,
     command_label: []u8,
+    dock_id: u32,
+    pane_id: u32,
     master_fd: std.posix.fd_t,
     child_pid: std.posix.pid_t,
     cols: u16,
@@ -325,7 +331,7 @@ const PtySession = struct {
         const command_label = try commandLabel(allocator, command);
         errdefer allocator.free(command_label);
 
-        const child = try spawnCommand(allocator, cwd, options.cols, options.rows, command);
+        const child = try spawnCommand(allocator, cwd, options, command);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -338,6 +344,8 @@ const PtySession = struct {
             .cwd = try allocator.dupe(u8, cwd),
             .label = try allocator.dupe(u8, if (options.label.len > 0) options.label else command_label),
             .command_label = command_label,
+            .dock_id = options.dock_id,
+            .pane_id = options.pane_id,
             .master_fd = child.master_fd,
             .child_pid = child.child_pid,
             .cols = options.cols,
@@ -569,23 +577,52 @@ const PtySession = struct {
     fn spawnCommand(
         allocator: std.mem.Allocator,
         cwd: []const u8,
-        cols: u16,
-        rows: u16,
+        options: CreateOptions,
         command: []const [:0]u8,
     ) !SpawnResult {
         const cwd_z = try allocator.dupeZ(u8, cwd);
         defer allocator.free(cwd_z);
+        const session_id_z = try allocator.dupeZ(u8, options.session_id);
+        defer allocator.free(session_id_z);
+        const project_id_z = try allocator.dupeZ(u8, options.project_id);
+        defer allocator.free(project_id_z);
+        const project_path_z = try allocator.dupeZ(u8, options.project_path);
+        defer allocator.free(project_path_z);
+        const dock_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.dock_id});
+        defer allocator.free(dock_id_text);
+        const dock_id_z = try allocator.dupeZ(u8, dock_id_text);
+        defer allocator.free(dock_id_z);
+        const pane_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.pane_id});
+        defer allocator.free(pane_id_text);
+        const pane_id_z = try allocator.dupeZ(u8, pane_id_text);
+        defer allocator.free(pane_id_z);
+        const sessionizer_socket_path = try socketPath(allocator, options.pref_path);
+        defer allocator.free(sessionizer_socket_path);
+        const sessionizer_socket_z = try allocator.dupeZ(u8, sessionizer_socket_path);
+        defer allocator.free(sessionizer_socket_z);
+        const live_socket_path = try std.fs.path.join(allocator, &.{ options.pref_path, LIVE_SOCKET_NAME });
+        defer allocator.free(live_socket_path);
+        const live_socket_z = try allocator.dupeZ(u8, live_socket_path);
+        defer allocator.free(live_socket_z);
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
-            .row = rows,
-            .col = cols,
+            .row = options.rows,
+            .col = options.cols,
             .xpixel = 0,
             .ypixel = 0,
         };
         const fork_result = forkpty(&master_fd, null, null, &winsize);
         if (fork_result < 0) return error.ForkPtyFailed;
-        if (fork_result == 0) childExec(cwd_z, command);
+        if (fork_result == 0) childExec(cwd_z, command, .{
+            .session_id = session_id_z,
+            .project_id = project_id_z,
+            .project_path = project_path_z,
+            .dock_id = dock_id_z,
+            .pane_id = pane_id_z,
+            .live_socket = live_socket_z,
+            .sessionizer_socket = sessionizer_socket_z,
+        });
 
         try setNonBlocking(@intCast(master_fd));
         return .{
@@ -594,11 +631,31 @@ const PtySession = struct {
         };
     }
 
-    fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
+    const ChildIdentityEnv = struct {
+        session_id: [:0]const u8,
+        project_id: [:0]const u8,
+        project_path: [:0]const u8,
+        dock_id: [:0]const u8,
+        pane_id: [:0]const u8,
+        live_socket: [:0]const u8,
+        sessionizer_socket: [:0]const u8,
+    };
+
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: ChildIdentityEnv) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) std.c._exit(127);
         _ = setenv("TERM", "xterm-ghostty", 1);
         _ = setenv("COLORTERM", "truecolor", 1);
         _ = setenv("TERM_PROGRAM", "verde", 1);
+        _ = setenv("VERDE", "1", 1);
+        _ = setenv("VERDE_SESSION_ID", identity.session_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_ID", identity.project_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_PATH", identity.project_path.ptr, 1);
+        _ = setenv("VERDE_DOCK_ID", identity.dock_id.ptr, 1);
+        _ = setenv("VERDE_PANE_ID", identity.pane_id.ptr, 1);
+        _ = setenv("VERDE_SOCKET", identity.live_socket.ptr, 1);
+        _ = setenv("VERDE_LIVE_SOCKET", identity.live_socket.ptr, 1);
+        _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_socket.ptr, 1);
+        _ = setenv("VERDE_CLI", "verde", 1);
         if (std.c.getenv("LANG") == null) _ = setenv("LANG", "C.UTF-8", 1);
 
         var argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
@@ -769,6 +826,9 @@ pub const Daemon = struct {
             .command = command,
             .cols = jsonU16(params.object.get("cols") orelse .null) orelse DEFAULT_COLS,
             .rows = jsonU16(params.object.get("rows") orelse .null) orelse DEFAULT_ROWS,
+            .dock_id = jsonU32(params.object.get("dock_id") orelse .null) orelse 0,
+            .pane_id = jsonU32(params.object.get("pane_id") orelse .null) orelse 0,
+            .pref_path = jsonString(params.object.get("pref_path") orelse .null) orelse "",
         });
         errdefer session.deinit(self.allocator);
         try self.sessions.append(self.allocator, session);
@@ -1093,6 +1153,10 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.label);
     try s.objectField("command");
     try s.write(session.command_label);
+    try s.objectField("dock_id");
+    try s.write(session.dock_id);
+    try s.objectField("pane_id");
+    try s.write(session.pane_id);
     try s.objectField("pid");
     try s.write(session.child_pid);
     try s.objectField("foreground_process_group");

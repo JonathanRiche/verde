@@ -60,6 +60,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try handleState(allocator, out, parsed.rest);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "notify")) {
+        try handleNotify(allocator, out, io, parsed.rest);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "__session-daemon")) {
         const pref_path = try prefPath(allocator);
         defer allocator.free(pref_path);
@@ -94,6 +98,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde capabilities [--json]   Print CLI capability metadata
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
+        \\  verde notify [options]        Update the current terminal surface
         \\  verde session <command>       Manage persistent terminal sessions
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
@@ -125,6 +130,7 @@ fn printHelp(out: output.Output) !void {
         \\  active [--json]
         \\  threads [--workspace <id|index|current>] [--json]
         \\  terminals [--workspace <id|index|current>] [--json]
+        \\  surfaces [--json]
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
         \\  pane focus|split|resize|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
@@ -489,6 +495,7 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         std.mem.eql(u8, command, "workspaces") or
         std.mem.eql(u8, command, "projects") or
         std.mem.eql(u8, command, "active") or
+        std.mem.eql(u8, command, "surfaces") or
         std.mem.eql(u8, command, "processes"))
     {
         try sendLiveRequest(allocator, out, io, command, .{}, json);
@@ -531,6 +538,49 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     }
     try out.stderr("unknown live command: {s}\n", .{command});
     std.process.exit(2);
+}
+
+fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde notify --title <text> [--body <text>] [--status idle|working|waiting|done|error]
+            \\  verde notify --status working --progress <0..1> [--label <text>]
+            \\  verde notify --clear
+            \\
+        , .{});
+        return;
+    }
+    const explicit_session = args.optionValue(argv, "--session") orelse args.optionValue(argv, "--session-id");
+    const env_session = getenvSlice("VERDE_SESSION_ID");
+    const session_id = explicit_session orelse env_session orelse {
+        try out.stderr("verde notify requires --session or VERDE_SESSION_ID\n", .{});
+        std.process.exit(2);
+    };
+    const clear = args.hasFlag(argv, "--clear");
+    const method = if (clear) "notification.clear" else "notification.create";
+    const response = sendLiveRequestAlloc(allocator, io, method, .{
+        .session_id = session_id,
+        .workspace_id = args.optionValue(argv, "--workspace") orelse getenvSlice("VERDE_WORKSPACE_ID"),
+        .workspace_path = getenvSlice("VERDE_WORKSPACE_PATH"),
+        .dock_id = parseOptionalU32(args.optionValue(argv, "--dock") orelse getenvSlice("VERDE_DOCK_ID")),
+        .pane_id = parseOptionalU32(args.optionValue(argv, "--pane") orelse getenvSlice("VERDE_PANE_ID")),
+        .title = args.optionValue(argv, "--title"),
+        .body = args.optionValue(argv, "--body"),
+        .status = args.optionValue(argv, "--status"),
+        .progress = parseOptionalF32(args.optionValue(argv, "--progress")),
+        .label = args.optionValue(argv, "--label"),
+        .attention = if (args.hasFlag(argv, "--attention")) true else null,
+    }, 1) catch |err| {
+        if (!args.hasFlag(argv, "--quiet")) try out.stderr("verde notify: running app unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(response);
+    if (args.hasFlag(argv, "--json")) {
+        try out.stdout("{s}\n", .{response});
+    } else if (!args.hasFlag(argv, "--quiet")) {
+        try printLiveResponse(out, response);
+    }
 }
 
 fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -1532,6 +1582,16 @@ fn requiredFloatOption(out: output.Output, argv: []const []const u8, name: []con
 fn parseOptionalU32(value: ?[]const u8) ?u32 {
     const raw = value orelse return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
+}
+
+fn parseOptionalF32(value: ?[]const u8) ?f32 {
+    const raw = value orelse return null;
+    return std.fmt.parseFloat(f32, raw) catch null;
+}
+
+fn getenvSlice(name: [:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(name) orelse return null;
+    return std.mem.span(ptr);
 }
 
 fn trailingFreeArg(argv: []const []const u8, positional_commands: usize) ?[]const u8 {
