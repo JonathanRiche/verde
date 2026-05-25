@@ -5455,6 +5455,7 @@ pub const AppState = struct {
         const project = &self.projects.items[project_index];
         for (self.surfaces.items) |*surface| {
             if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+                if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
                 if (surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
             }
         }
@@ -6648,7 +6649,6 @@ pub const AppState = struct {
             .workspace_path = project.path,
             .dock_id = dock_id,
             .pane_id = event.pane_id,
-            .status = .waiting,
             .attention = event.attention,
             .unread_increment = 1,
             .last_event_title = if (event.title.len > 0) event.title else "Terminal",
