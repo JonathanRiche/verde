@@ -1879,6 +1879,10 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         _ = SDL_HideWindow(window);
     }
     if (builtin.os.tag == .linux) {
+        if (state.isPickerPending()) {
+            runtime_log.diagnostic("ignoring linux window close request while folder picker is pending", .{});
+            return true;
+        }
         const window_flags = SDL_GetWindowFlags(window);
         const suspicious_close = !window_flags.input_focus or
             !window_flags.mouse_focus or
