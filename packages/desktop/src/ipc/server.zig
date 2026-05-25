@@ -186,6 +186,11 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "active")) return try activeResponse(allocator, id_value, state);
     if (std.mem.eql(u8, method, "threads")) return try threadsResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "terminals")) return try terminalsResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "surfaces") or std.mem.eql(u8, method, "surface.list")) return try surfacesResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "surface.inspect")) return try surfaceInspectResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "surface.clearAttention")) return try surfaceClearAttentionResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "notification.create") or std.mem.eql(u8, method, "notification.update")) return try notificationUpdateResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "notification.clear")) return try notificationClearResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "processes")) return try managedProcessesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
@@ -320,7 +325,9 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
         .commands = &.{
             "status",                              "capabilities",                        "workspaces",                           "panes",
             "active",                              "inspect",                             "threads",                              "terminals",
-            "processes",                           "pane.focus",                          "pane.split",                           "pane.resize",
+            "surfaces",                            "surface.list",                         "surface.inspect",                      "surface.clearAttention",
+            "notification.create",                 "notification.update",                  "notification.clear",                   "processes",
+            "pane.focus",                          "pane.split",                           "pane.resize",
             "pane.minimize",                       "pane.maximize",                       "pane.restore",                         "pane.close",
             "chat.status",                         "chat.transcript",                     "chat.draft.set",                       "chat.draft.append",
             "chat.send",                           "chat.followup",                       "chat.stop",                            "chat.approve",
@@ -447,6 +454,81 @@ fn terminalsResponse(allocator: std.mem.Allocator, id_value: std.json.Value, sta
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+fn surfacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    _ = params;
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("surfaces");
+    try s.beginArray();
+    for (state.surfaces.items) |*surface| try writeSurface(&s, surface);
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn surfaceInspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "surface.inspect requires session_id");
+    const surface = state.surfaceBySessionId(session_id) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "surface not found");
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("surface");
+    try writeSurface(&s, surface);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn surfaceClearAttentionResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "surface.clearAttention requires session_id");
+    const changed = state.clearSurfaceAttentionBySession(session_id);
+    return try okValueResponse(allocator, id_value, .{ .session_id = session_id, .changed = changed });
+}
+
+fn notificationUpdateResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "notification requires session_id");
+    const status = if (stringParam(params, "status")) |value| parseSurfaceStatus(value) orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid surface status") else null;
+    const status_requests_attention = if (status) |value| value == .waiting or value == .@"error" else false;
+    const requested_attention = boolParam(params, "attention") orelse if (status_requests_attention) true else null;
+    const surface = try state.updateSurface(.{
+        .session_id = session_id,
+        .workspace_id = stringParam(params, "workspace_id") orelse stringParam(params, "workspace"),
+        .workspace_path = stringParam(params, "workspace_path"),
+        .dock_id = u32Param(params, "dock_id") orelse u32Param(params, "dock"),
+        .pane_id = u32Param(params, "pane_id") orelse u32Param(params, "pane"),
+        .provider = if (stringParam(params, "provider")) |value| parseProvider(value) else null,
+        .provider_thread_id = stringParam(params, "provider_thread_id"),
+        .title = stringParam(params, "label") orelse stringParam(params, "title"),
+        .status = status,
+        .progress = floatParam(params, "progress"),
+        .attention = requested_attention,
+        .unread_increment = if (requested_attention orelse false) 1 else 0,
+        .last_event_title = stringParam(params, "title") orelse stringParam(params, "label"),
+        .last_event_body = stringParam(params, "body"),
+    });
+    return try surfaceResultResponse(allocator, id_value, surface);
+}
+
+fn notificationClearResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "notification.clear requires session_id");
+    const surface = try state.updateSurface(.{ .session_id = session_id, .clear = true });
+    return try surfaceResultResponse(allocator, id_value, surface);
 }
 
 fn inspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
@@ -968,11 +1050,11 @@ fn writePane(s: *std.json.Stringify, state: *app_state.AppState, project_index: 
                 try s.objectField("cwd");
                 if (dock.cwd) |cwd| try s.write(cwd) else try s.write(null);
             }
-            const attention = terminalDockHasAttention(project, ref.dock_id);
+            const attention = terminalDockHasAttention(state, project_index, project, ref.dock_id);
             try s.objectField("attention");
             try s.write(attention);
             try s.objectField("attention_reasons");
-            try writeTerminalAttentionReasons(s, project, ref.dock_id);
+            try writeTerminalAttentionReasons(s, state, project_index, project, ref.dock_id);
         },
         .browser => {
             try s.objectField("kind");
@@ -1044,11 +1126,11 @@ fn writeTerminalsArray(s: *std.json.Stringify, state: *app_state.AppState, maybe
                 try s.endObject();
                 break;
             }
-            const attention = terminalDockHasAttention(&project, ref.dock_id);
+            const attention = terminalDockHasAttention(state, project_index, &project, ref.dock_id);
             try s.objectField("attention");
             try s.write(attention);
             try s.objectField("attention_reasons");
-            try writeTerminalAttentionReasons(s, &project, ref.dock_id);
+            try writeTerminalAttentionReasons(s, state, project_index, &project, ref.dock_id);
             try s.endObject();
         }
     }
@@ -1232,7 +1314,8 @@ fn threadHasPendingApproval(thread: *const app_state.ChatThread) bool {
     return send_state.status == .pending and send_state.pending_approval != null;
 }
 
-fn terminalDockHasAttention(project: *const app_state.Project, dock_id: u32) bool {
+fn terminalDockHasAttention(state: *const app_state.AppState, project_index: usize, project: *const app_state.Project, dock_id: u32) bool {
+    if (state.terminalDockSurfaceAttention(project_index, dock_id)) return true;
     for (project.managed_processes.items) |process| {
         if (process.dock_id == null or process.dock_id.? != dock_id) continue;
         if (process.status == .crashed or process.pending_watch_restart_ms != 0) return true;
@@ -1240,14 +1323,64 @@ fn terminalDockHasAttention(project: *const app_state.Project, dock_id: u32) boo
     return false;
 }
 
-fn writeTerminalAttentionReasons(s: *std.json.Stringify, project: *const app_state.Project, dock_id: u32) !void {
+fn writeTerminalAttentionReasons(s: *std.json.Stringify, state: *const app_state.AppState, project_index: usize, project: *const app_state.Project, dock_id: u32) !void {
     try s.beginArray();
+    if (state.terminalDockSurfaceAttention(project_index, dock_id)) try s.write("surface_attention");
     for (project.managed_processes.items) |process| {
         if (process.dock_id == null or process.dock_id.? != dock_id) continue;
         if (process.status == .crashed) try s.write("process_crashed");
         if (process.pending_watch_restart_ms != 0) try s.write("watch_restart_pending");
     }
     try s.endArray();
+}
+
+fn writeSurface(s: *std.json.Stringify, surface: *const app_state.SurfaceState) !void {
+    try s.beginObject();
+    try s.objectField("session_id");
+    try s.write(surface.session_id);
+    try s.objectField("workspace_id");
+    try s.write(surface.workspace_id);
+    try s.objectField("workspace_path");
+    try s.write(surface.workspace_path);
+    try s.objectField("dock_id");
+    try s.write(surface.dock_id);
+    try s.objectField("pane_id");
+    if (surface.pane_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("provider");
+    if (surface.provider) |value| try s.write(@tagName(value)) else try s.write(null);
+    try s.objectField("provider_thread_id");
+    if (surface.provider_thread_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("title");
+    try s.write(surface.title);
+    try s.objectField("status");
+    try s.write(@tagName(surface.status));
+    try s.objectField("progress");
+    if (surface.progress) |value| try s.write(value) else try s.write(null);
+    try s.objectField("attention");
+    try s.write(surface.attention);
+    try s.objectField("unread_count");
+    try s.write(surface.unread_count);
+    try s.objectField("last_event_title");
+    if (surface.last_event_title) |value| try s.write(value) else try s.write(null);
+    try s.objectField("last_event_body");
+    if (surface.last_event_body) |value| try s.write(value) else try s.write(null);
+    try s.objectField("last_event_at_ms");
+    try s.write(surface.last_event_at_ms);
+    try s.endObject();
+}
+
+fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value, surface: *const app_state.SurfaceState) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("surface");
+    try writeSurface(&s, surface);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
 }
 
 fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
@@ -1414,6 +1547,12 @@ fn intParam(params: std.json.Value, name: []const u8) ?i64 {
     return jsonInt(params.object.get(name) orelse .null);
 }
 
+fn u32Param(params: std.json.Value, name: []const u8) ?u32 {
+    const value = intParam(params, name) orelse return null;
+    if (value < 0 or value > std.math.maxInt(u32)) return null;
+    return @intCast(value);
+}
+
 fn floatParam(params: std.json.Value, name: []const u8) ?f32 {
     if (params != .object) return null;
     const value = params.object.get(name) orelse .null;
@@ -1433,6 +1572,20 @@ fn boolParam(params: std.json.Value, name: []const u8) ?bool {
         .bool => |value| value,
         else => null,
     };
+}
+
+fn parseSurfaceStatus(value: []const u8) ?app_state.SurfaceStatus {
+    inline for (std.meta.fields(app_state.SurfaceStatus)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parseProvider(value: []const u8) ?app_state.Provider {
+    inline for (std.meta.fields(app_state.Provider)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
 }
 
 fn parseInspectorMode(value: []const u8) ?browser_runtime.InspectorMode {

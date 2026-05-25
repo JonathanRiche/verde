@@ -780,6 +780,15 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
         if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        if (project_visible and state.projectSurfaceAttention(project_index)) {
+            const dot = theme.scaledUi(7.0);
+            queuePaletteRoundedRect(state, .{
+                .x = row_rect.x + row_rect.w - theme.scaledUi(14.0),
+                .y = cy - dot * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.COLOR_YELLOW), dot * 0.5);
+        }
 
         const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
         const new_hovered = state.sidebar_new_thread_hover == project_index;

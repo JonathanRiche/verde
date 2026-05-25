@@ -39,6 +39,61 @@ pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
 
+pub const SurfaceStatus = enum {
+    idle,
+    working,
+    waiting,
+    done,
+    @"error",
+};
+
+pub const SurfaceUpdate = struct {
+    session_id: []const u8,
+    workspace_id: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
+    dock_id: ?u32 = null,
+    pane_id: ?u32 = null,
+    provider: ?Provider = null,
+    provider_thread_id: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    status: ?SurfaceStatus = null,
+    progress: ?f32 = null,
+    attention: ?bool = null,
+    unread_increment: u32 = 0,
+    last_event_title: ?[]const u8 = null,
+    last_event_body: ?[]const u8 = null,
+    clear: bool = false,
+};
+
+pub const SurfaceState = struct {
+    session_id: []u8,
+    workspace_id: []u8 = "",
+    workspace_path: []u8 = "",
+    dock_id: u32 = 0,
+    pane_id: ?u32 = null,
+    provider: ?Provider = null,
+    provider_thread_id: ?[]u8 = null,
+    title: []u8 = "",
+    status: SurfaceStatus = .idle,
+    progress: ?f32 = null,
+    attention: bool = false,
+    unread_count: u32 = 0,
+    last_event_title: ?[]u8 = null,
+    last_event_body: ?[]u8 = null,
+    last_event_at_ms: i64 = 0,
+
+    pub fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.workspace_id);
+        allocator.free(self.workspace_path);
+        allocator.free(self.title);
+        if (self.provider_thread_id) |value| allocator.free(value);
+        if (self.last_event_title) |value| allocator.free(value);
+        if (self.last_event_body) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const PaletteModalAction = enum {
     image_close,
     project_rename_cancel,
@@ -2644,6 +2699,7 @@ pub const AppState = struct {
     storage: *const Storage,
     projects: std.ArrayList(Project),
     archived_projects: std.ArrayList(Project),
+    surfaces: std.ArrayList(SurfaceState),
     selected_project_index: usize,
     next_project_number: usize,
     import_path_storage: [DRAFT_CAPACITY:0]u8,
@@ -2852,6 +2908,7 @@ pub const AppState = struct {
             .storage = storage,
             .projects = .empty,
             .archived_projects = .empty,
+            .surfaces = .empty,
             .selected_project_index = 0,
             .next_project_number = 4,
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
@@ -5281,6 +5338,111 @@ pub const AppState = struct {
                 try entry.dock.rethemeSessions(self.allocator);
             }
         }
+    }
+
+    pub fn clearSurfaces(self: *AppState) void {
+        for (self.surfaces.items) |*surface| surface.deinit(self.allocator);
+        self.surfaces.clearRetainingCapacity();
+    }
+
+    pub fn surfaceBySessionId(self: *AppState, session_id: []const u8) ?*SurfaceState {
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+        }
+        return null;
+    }
+
+    pub fn surfaceBySessionIdConst(self: *const AppState, session_id: []const u8) ?*const SurfaceState {
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+        }
+        return null;
+    }
+
+    pub fn updateSurface(self: *AppState, update: SurfaceUpdate) !*SurfaceState {
+        var surface = self.surfaceBySessionId(update.session_id);
+        if (surface == null) {
+            try self.surfaces.append(self.allocator, .{
+                .session_id = try self.allocator.dupe(u8, update.session_id),
+                .workspace_id = try self.allocator.dupe(u8, update.workspace_id orelse ""),
+                .workspace_path = try self.allocator.dupe(u8, update.workspace_path orelse ""),
+                .dock_id = update.dock_id orelse 0,
+                .pane_id = update.pane_id,
+                .title = try self.allocator.dupe(u8, update.title orelse ""),
+            });
+            surface = &self.surfaces.items[self.surfaces.items.len - 1];
+        }
+        var s = surface.?;
+        if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
+        if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
+        if (update.dock_id) |value| s.dock_id = value;
+        if (update.pane_id) |value| s.pane_id = value;
+        if (update.provider) |value| s.provider = value;
+        if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
+        if (update.title) |value| try replaceOwnedSlice(self.allocator, &s.title, value);
+        if (update.clear) {
+            s.status = .idle;
+            s.progress = null;
+            s.attention = false;
+            s.unread_count = 0;
+            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, null);
+            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, null);
+        } else {
+            if (update.status) |value| s.status = value;
+            if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
+            if (update.attention) |value| s.attention = value;
+            if (update.unread_increment > 0) s.unread_count +|= update.unread_increment;
+            if (update.last_event_title) |value| {
+                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, value);
+                s.last_event_at_ms = unixTimestampMs();
+            }
+            if (update.last_event_body) |value| {
+                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, value);
+                s.last_event_at_ms = unixTimestampMs();
+            }
+        }
+        self.markDirty();
+        return s;
+    }
+
+    pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
+        const surface = self.surfaceBySessionId(session_id) orelse return false;
+        if (!surface.attention and surface.unread_count == 0) return false;
+        surface.attention = false;
+        surface.unread_count = 0;
+        self.markDirty();
+        return true;
+    }
+
+    pub fn terminalDockSurfaceAttention(self: *const AppState, project_index: usize, dock_id: u32) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return false;
+        const session_id = dock.activeSessionId() orelse return false;
+        const surface = self.surfaceBySessionIdConst(session_id) orelse return false;
+        return surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error";
+    }
+
+    pub fn projectSurfaceAttention(self: *const AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+                if (surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
+            }
+        }
+        return false;
+    }
+
+    fn replaceOwnedSlice(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !void {
+        const next = try allocator.dupe(u8, value);
+        allocator.free(dest.*);
+        dest.* = next;
+    }
+
+    fn replaceOwnedOptionalSlice(allocator: std.mem.Allocator, dest: *?[]u8, value: ?[]const u8) !void {
+        const next = if (value) |v| try allocator.dupe(u8, v) else null;
+        if (dest.*) |old| allocator.free(old);
+        dest.* = next;
     }
 
     pub fn hasCustomTerminalLaunchProfile(self: *const AppState) bool {
@@ -9157,6 +9319,13 @@ pub const AppState = struct {
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.palette_modal_text_focus = .none;
+        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+            if (self.currentProjectTerminalDock(dock_id)) |dock| {
+                if (dock.activeSessionId()) |session_id| {
+                    _ = self.clearSurfaceAttentionBySession(session_id);
+                }
+            }
+        }
     }
 
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
@@ -10367,6 +10536,7 @@ pub const AppState = struct {
         self.expanded_cards.deinit();
         self.closeTranscriptSelectionModal();
         self.clearProjects();
+        self.clearSurfaces();
         self.transcript_markdown_entries.deinit(self.allocator);
         self.clearBrowserContextMenuLocal();
         self.browser_context_menu_items.deinit(self.allocator);
@@ -10383,6 +10553,7 @@ pub const AppState = struct {
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
+        self.surfaces.deinit(self.allocator);
         runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
