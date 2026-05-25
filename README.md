@@ -231,6 +231,22 @@ verde notify --clear
 `--session`, `--workspace`, `--dock`, or `--pane` explicitly. If the desktop app
 is not running, `verde notify --quiet` exits without launching Verde or showing
 an OS notification.
+
+Provider hook integrations are intentionally opt-in and conservative:
+
+```bash
+verde integrations list
+verde integrations doctor
+verde integrations install claude
+verde integrations remove claude
+```
+
+`verde integrations` reports hook support without touching provider auth or
+overwriting provider config. Until a provider has a stable documented hook
+lifecycle implemented in Verde, `install` returns an unsupported status and the
+generic `verde notify`, OSC notification, and MCP surface paths remain the
+supported integration mechanisms.
+
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
   Verde.

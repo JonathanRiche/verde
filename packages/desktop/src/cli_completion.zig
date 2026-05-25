@@ -48,6 +48,10 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local integrations=\"");
+    try writeWords(w, &spec.integration_commands);
+    try w.writeAll("\"\n  local integration_providers=\"");
+    try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
@@ -134,6 +138,12 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
+        \\      integrations)
+        \\        case "$sub" in
+        \\          list|doctor) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\          *) COMPREPLY=( $(compgen -W "--help -h" -- "$cur") ) ;;
+        \\        esac
+        \\        ;;
         \\      session)
         \\        case "$sub" in
         \\          inspect|screen) COMPREPLY=( $(compgen -W "--id --json" -- "$cur") ) ;;
@@ -195,8 +205,10 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    1:*) COMPREPLY=( $(compgen -W "$top --help -h" -- "$cur") ) ;;
         \\    2:completion:*) COMPREPLY=( $(compgen -W "$shells" -- "$cur") ) ;;
         \\    2:state:*) COMPREPLY=( $(compgen -W "$state" -- "$cur") ) ;;
+        \\    2:integrations:*) COMPREPLY=( $(compgen -W "$integrations" -- "$cur") ) ;;
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
+        \\    3:integrations:install:|3:integrations:remove:|3:integrations:disable:) COMPREPLY=( $(compgen -W "$integration_providers" -- "$cur") ) ;;
         \\    3:live:pane:*) COMPREPLY=( $(compgen -W "$pane" -- "$cur") ) ;;
         \\    3:live:chat:*) COMPREPLY=( $(compgen -W "$chat" -- "$cur") ) ;;
         \\    3:live:browser:*) COMPREPLY=( $(compgen -W "$browser" -- "$cur") ) ;;
@@ -231,6 +243,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local integrations=\"");
+    try writeWords(w, &spec.integration_commands);
+    try w.writeAll("\"\n  local integration_providers=\"");
+    try writeWords(w, &spec.integration_providers);
     try w.writeAll("\"\n  local session=\"");
     try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
@@ -315,6 +331,12 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
+        \\      integrations)
+        \\        case "$sub" in
+        \\          list|doctor) compadd -- ${(s: :)json_flags} ;;
+        \\          *) compadd -- --help -h ;;
+        \\        esac
+        \\        ;;
         \\      session)
         \\        case "$sub" in
         \\          inspect|screen) compadd -- --id --json ;;
@@ -376,8 +398,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    2:*) compadd -- ${(s: :)top} --help -h ;;
         \\    3:completion:*) compadd -- ${(s: :)shells} ;;
         \\    3:state:*) compadd -- ${(s: :)state} ;;
+        \\    3:integrations:*) compadd -- ${(s: :)integrations} ;;
         \\    3:session:*) compadd -- ${(s: :)session} ;;
         \\    3:live:*) compadd -- ${(s: :)live} ;;
+        \\    4:integrations:install:|4:integrations:remove:|4:integrations:disable:) compadd -- ${(s: :)integration_providers} ;;
         \\    4:live:pane:*) compadd -- ${(s: :)pane} ;;
         \\    4:live:chat:*) compadd -- ${(s: :)chat} ;;
         \\    4:live:browser:*) compadd -- ${(s: :)browser} ;;
@@ -420,6 +444,14 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after state' -a '");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations' -a '");
+    try writeWords(w, &spec.integration_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations install' -a '");
+    try writeWords(w, &spec.integration_providers);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations remove' -a '");
+    try writeWords(w, &spec.integration_providers);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after integrations disable' -a '");
+    try writeWords(w, &spec.integration_providers);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after session' -a '");
     try writeWords(w, &spec.session_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live' -a '");
