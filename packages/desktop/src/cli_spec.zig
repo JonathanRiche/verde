@@ -67,6 +67,7 @@ pub const live_capabilities = [_][]const u8{
     "surfaces",
     "surface.list",
     "surface.inspect",
+    "surface.focus",
     "surface.clearAttention",
     "notification.create",
     "notification.update",

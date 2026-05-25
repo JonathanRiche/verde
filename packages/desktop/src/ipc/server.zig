@@ -188,6 +188,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "terminals")) return try terminalsResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surfaces") or std.mem.eql(u8, method, "surface.list")) return try surfacesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.inspect")) return try surfaceInspectResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "surface.focus")) return try surfaceFocusResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.clearAttention")) return try surfaceClearAttentionResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "notification.create") or std.mem.eql(u8, method, "notification.update")) return try notificationUpdateResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "notification.clear")) return try notificationClearResponse(allocator, id_value, state, params);
@@ -325,7 +326,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
         .commands = &.{
             "status",                              "capabilities",                        "workspaces",                           "panes",
             "active",                              "inspect",                             "threads",                              "terminals",
-            "surfaces",                            "surface.list",                         "surface.inspect",                      "surface.clearAttention",
+            "surfaces",                            "surface.list",                         "surface.inspect",                      "surface.focus",
+            "surface.clearAttention",
             "notification.create",                 "notification.update",                  "notification.clear",                   "processes",
             "pane.focus",                          "pane.split",                           "pane.resize",
             "pane.minimize",                       "pane.maximize",                       "pane.restore",                         "pane.close",
@@ -489,6 +491,20 @@ fn surfaceInspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+fn surfaceFocusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    const session_id = stringParam(params, "session_id") orelse stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "surface.focus requires session_id");
+    const surface = state.surfaceBySessionId(session_id) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "surface not found");
+    const pane_id = surface.pane_id orelse return try errorResponseAlloc(allocator, id_value, "not_found", "surface has no pane");
+    const project_index = resolveSurfaceProjectIndex(state, surface) orelse
+        return try errorResponseAlloc(allocator, id_value, "not_found", "surface workspace not found");
+    state.selected_project_index = project_index;
+    const changed = state.focusCurrentProjectWorkspacePane(pane_id);
+    _ = state.clearSurfaceAttentionBySession(session_id);
+    return try okValueResponse(allocator, id_value, .{ .session_id = session_id, .workspace_index = project_index, .pane_id = pane_id, .focused = changed });
 }
 
 fn surfaceClearAttentionResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
@@ -1381,6 +1397,14 @@ fn surfaceResultResponse(allocator: std.mem.Allocator, id_value: std.json.Value,
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+fn resolveSurfaceProjectIndex(state: *const app_state.AppState, surface: *const app_state.SurfaceState) ?usize {
+    for (state.projects.items, 0..) |project, index| {
+        if (surface.workspace_id.len > 0 and std.mem.eql(u8, surface.workspace_id, project.id)) return index;
+        if (surface.workspace_path.len > 0 and std.mem.eql(u8, surface.workspace_path, project.path)) return index;
+    }
+    return null;
 }
 
 fn chatStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
