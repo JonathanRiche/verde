@@ -97,6 +97,14 @@ pub const SessionSnapshot = struct {
     signal: ?u32 = null,
 };
 
+pub const NotificationEvent = struct {
+    session_id: []const u8,
+    pane_id: u32,
+    title: []const u8 = "",
+    body: []const u8 = "",
+    attention: bool = true,
+};
+
 const SessionCreateOptions = struct {
     cwd: []const u8,
     cols: u16,
@@ -584,6 +592,12 @@ pub const Dock = struct {
             return session.sessionId();
         }
         return pane.session_id;
+    }
+
+    pub fn takeActiveNotification(self: *Dock) ?NotificationEvent {
+        const pane = self.activePane() orelse return null;
+        const session = pane.session orelse return null;
+        return session.takeNotification(pane.id);
     }
 
     pub fn focusPane(self: *Dock, pane_id: u32) void {
@@ -1397,6 +1411,10 @@ const UnsupportedSession = struct {
         return null;
     }
 
+    pub fn takeNotification(_: *UnsupportedSession, _: u32) ?NotificationEvent {
+        return null;
+    }
+
     pub fn snapshot(_: *const UnsupportedSession) SessionSnapshot {
         return .{ .running = false };
     }
@@ -1482,6 +1500,11 @@ const UnixSession = struct {
     /// where a desync (visible SGR params like `5;174m`, stray `\e`) manifests.
     parser_log_enabled: bool = false,
     parser_log_prev_tail_had_esc: bool = false,
+    pending_notification_attention: bool = false,
+    pending_notification_title: [128]u8 = undefined,
+    pending_notification_title_len: usize = 0,
+    pending_notification_body: [512]u8 = undefined,
+    pending_notification_body_len: usize = 0,
 
     const Backend = enum {
         local,
@@ -1611,6 +1634,18 @@ const UnixSession = struct {
 
     pub fn sessionId(self: *const UnixSession) ?[]const u8 {
         return self.session_id;
+    }
+
+    pub fn takeNotification(self: *UnixSession, pane_id: u32) ?NotificationEvent {
+        if (!self.pending_notification_attention) return null;
+        self.pending_notification_attention = false;
+        return .{
+            .session_id = self.session_id orelse return null,
+            .pane_id = pane_id,
+            .title = self.pending_notification_title[0..self.pending_notification_title_len],
+            .body = self.pending_notification_body[0..self.pending_notification_body_len],
+            .attention = true,
+        };
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
@@ -2446,6 +2481,7 @@ const UnixSession = struct {
     }
 
     fn appendOutput(self: *UnixSession, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        self.scanNotifications(bytes);
         if (bytes.len >= OUTPUT_RING_CAPACITY) {
             self.output_ring.clearRetainingCapacity();
             try self.output_ring.appendSlice(allocator, bytes[bytes.len - OUTPUT_RING_CAPACITY ..]);
@@ -2460,6 +2496,36 @@ const UnixSession = struct {
             self.output_ring.shrinkRetainingCapacity(self.output_ring.items.len - overflow);
         }
         try self.output_ring.appendSlice(allocator, bytes);
+    }
+
+    fn scanNotifications(self: *UnixSession, bytes: []const u8) void {
+        if (std.mem.indexOfScalar(u8, bytes, 0x07) != null) {
+            self.pending_notification_attention = true;
+            self.pending_notification_title_len = 0;
+            self.pending_notification_body_len = 0;
+        }
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, bytes, search_start, "\x1b]777;notify;")) |start| {
+            const payload_start = start + "\x1b]777;notify;".len;
+            const payload_end = std.mem.indexOfScalarPos(u8, bytes, payload_start, 0x07) orelse {
+                search_start = payload_start;
+                continue;
+            };
+            const payload = bytes[payload_start..payload_end];
+            const split = std.mem.indexOfScalar(u8, payload, ';');
+            const title = if (split) |index| payload[0..index] else payload;
+            const body = if (split) |index| payload[index + 1 ..] else "";
+            self.storeNotificationText(title, body);
+            search_start = payload_end + 1;
+        }
+    }
+
+    fn storeNotificationText(self: *UnixSession, title: []const u8, body: []const u8) void {
+        self.pending_notification_attention = true;
+        self.pending_notification_title_len = @min(title.len, self.pending_notification_title.len);
+        @memcpy(self.pending_notification_title[0..self.pending_notification_title_len], title[0..self.pending_notification_title_len]);
+        self.pending_notification_body_len = @min(body.len, self.pending_notification_body.len);
+        @memcpy(self.pending_notification_body[0..self.pending_notification_body_len], body[0..self.pending_notification_body_len]);
     }
 
     fn repairTerminalState(self: *UnixSession, allocator: std.mem.Allocator) !void {

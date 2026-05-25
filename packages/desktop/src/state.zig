@@ -6576,6 +6576,9 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
+                    log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
+                };
                 if (changed and project_index == self.selected_project_index and base_visible) visible_changed = true;
             }
             for (project.terminal_docks.items) |*entry| {
@@ -6597,11 +6600,32 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
+                    log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
+                };
                 if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
             }
             self.pollManagedProcesses(project_index);
         }
         return visible_changed;
+    }
+
+    fn drainTerminalDockNotifications(self: *AppState, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
+        if (project_index >= self.projects.items.len) return;
+        const event = dock.takeActiveNotification() orelse return;
+        const project = &self.projects.items[project_index];
+        _ = try self.updateSurface(.{
+            .session_id = event.session_id,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .dock_id = dock_id,
+            .pane_id = event.pane_id,
+            .status = .waiting,
+            .attention = event.attention,
+            .unread_increment = 1,
+            .last_event_title = if (event.title.len > 0) event.title else "Terminal",
+            .last_event_body = event.body,
+        });
     }
 
     /// Returns mutable browser UI/runtime state for desktop control surfaces.
