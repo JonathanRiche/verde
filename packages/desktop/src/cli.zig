@@ -1335,6 +1335,14 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try s.beginObject();
     try s.objectField("tools");
     try s.beginArray();
+    try writeMcpTool(&s, "list_surfaces", "List live Verde terminal surfaces.");
+    try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
+    try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
+    try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
+    try writeMcpTool(&s, "tail_surface_output", "Read recent terminal output for a surface pane.");
+    try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
+    try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
+    try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
     try writeMcpTool(&s, "list_processes", "List configured Verde processes.");
     try writeMcpTool(&s, "inspect_process", "Inspect a configured Verde process.");
     try writeMcpTool(&s, "tail_process_logs", "Read recent output for a configured Verde process.");
@@ -1370,9 +1378,53 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     const arguments = params.object.get("arguments") orelse .null;
     const workspace = mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project");
     const process_name = mcpArgString(arguments, "name");
+    const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
+    const pane_id = mcpArgU32(arguments, "pane_id") orelse mcpArgU32(arguments, "pane");
     const lines = mcpArgU32(arguments, "lines");
 
     const response = blk: {
+        if (std.mem.eql(u8, tool_name, "list_surfaces")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "surfaces", .{}, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "inspect_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "inspect_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.inspect", .{ .session_id = session }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "focus_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "focus_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.focus", .{ .session_id = session }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "read_surface_screen")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "read_surface_screen requires pane_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.screen", .{ .workspace = workspace, .pane = pane }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "tail_surface_output")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "tail_surface_output requires pane_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.tail", .{ .workspace = workspace, .pane = pane, .lines = lines }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "write_surface_text")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id");
+            const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.write", .{ .workspace = workspace, .pane = pane, .text = text }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "notify_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "notify_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "notification.update", .{
+                .session_id = session,
+                .workspace = workspace,
+                .pane = pane_id,
+                .title = mcpArgString(arguments, "title"),
+                .body = mcpArgString(arguments, "body"),
+                .label = mcpArgString(arguments, "label"),
+                .status = mcpArgString(arguments, "status"),
+                .progress = mcpArgF32(arguments, "progress"),
+                .attention = mcpArgBool(arguments, "attention"),
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "clear_surface_attention")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "clear_surface_attention requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.clearAttention", .{ .session_id = session }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "list_processes")) {
             break :blk sendLiveRequestAlloc(allocator, io, "processes", .{ .workspace = workspace }, 1);
         }
@@ -1464,6 +1516,25 @@ fn mcpArgU32(arguments: std.json.Value, name: []const u8) ?u32 {
     return switch (value) {
         .integer => |int| if (int >= 0) @intCast(int) else null,
         .number_string => |text| std.fmt.parseInt(u32, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn mcpArgF32(arguments: std.json.Value, name: []const u8) ?f32 {
+    if (arguments != .object) return null;
+    const value = arguments.object.get(name) orelse .null;
+    return switch (value) {
+        .integer => |int| @floatFromInt(int),
+        .float => |float| @floatCast(float),
+        .number_string => |text| std.fmt.parseFloat(f32, text) catch null,
+        else => null,
+    };
+}
+
+fn mcpArgBool(arguments: std.json.Value, name: []const u8) ?bool {
+    if (arguments != .object) return null;
+    return switch (arguments.object.get(name) orelse .null) {
+        .bool => |value| value,
         else => null,
     };
 }
