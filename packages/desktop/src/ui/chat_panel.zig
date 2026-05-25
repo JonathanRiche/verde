@@ -2776,7 +2776,7 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
-    if (state.currentThread().provider == .codex) {
+    if (state.palette_composer.showFastToggle()) {
         const fast_icon_rect = snapIconRectOrigin(palette.Rect{
             .x = fast_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
             .y = fast_rect.y + (fast_rect.h - icon_size) * 0.5,

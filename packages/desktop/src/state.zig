@@ -9454,7 +9454,7 @@ pub const AppState = struct {
             self.palette_composer.modelRect()
         else if (self.composer_toolbar_reasoning_rect.contains(point))
             self.palette_composer.reasoningRect()
-        else if (self.currentThread().provider == .codex and self.composer_toolbar_fast_rect.contains(point))
+        else if (self.palette_composer.showFastToggle() and self.composer_toolbar_fast_rect.contains(point))
             self.palette_composer.fastRect()
         else if (self.composer_toolbar_access_rect.contains(point))
             self.palette_composer.accessRect()
