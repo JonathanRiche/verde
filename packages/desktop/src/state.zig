@@ -5402,6 +5402,7 @@ pub const AppState = struct {
             s.unread_count = 0;
             try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, null);
             try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, null);
+            _ = self.clearTerminalNotificationBySession(update.session_id);
         } else {
             if (update.status) |value| s.status = value;
             if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
@@ -5421,12 +5422,24 @@ pub const AppState = struct {
     }
 
     pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
-        const surface = self.surfaceBySessionId(session_id) orelse return false;
-        if (!surface.attention and surface.unread_count == 0) return false;
+        const terminal_changed = self.clearTerminalNotificationBySession(session_id);
+        const surface = self.surfaceBySessionId(session_id) orelse return terminal_changed;
+        if (!surface.attention and surface.unread_count == 0) return terminal_changed;
         surface.attention = false;
         surface.unread_count = 0;
         self.markDirty();
         return true;
+    }
+
+    fn clearTerminalNotificationBySession(self: *AppState, session_id: []const u8) bool {
+        var changed = false;
+        for (self.projects.items) |*project| {
+            if (project.terminal_dock.clearNotificationForSession(session_id)) changed = true;
+            for (project.terminal_docks.items) |*entry| {
+                if (entry.dock.clearNotificationForSession(session_id)) changed = true;
+            }
+        }
+        return changed;
     }
 
     pub fn terminalDockSurfaceAttention(self: *const AppState, project_index: usize, dock_id: u32) bool {
