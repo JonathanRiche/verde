@@ -185,6 +185,19 @@ macos_installed_version() {
   fi
 }
 
+linux_install_is_complete() {
+  [ -x "$PREFIX/bin/verde" ] || return 1
+  [ -r "$PREFIX/share/verde/provider_bridge.mjs" ] || return 1
+  return 0
+}
+
+macos_install_is_complete() {
+  app_dir="$MACOS_APP_DIR/Verde.app"
+  [ -x "$app_dir/Contents/MacOS/verde" ] || return 1
+  [ -r "$app_dir/Contents/Resources/provider_bridge.mjs" ] || return 1
+  return 0
+}
+
 make_temp_dir() {
   if command -v mktemp >/dev/null 2>&1; then
     mktemp -d 2>/dev/null || mktemp -d -t verde-install
@@ -241,9 +254,22 @@ if [ "$platform" = "linux" ]; then
   linux_install_wpe_runtime_if_requested
 fi
 
-if [ -n "$installed_version" ] && [ "$(normalize_version "$installed_version")" = "$latest_version" ]; then
-  say "Verde $latest_version is already installed. Nothing to do."
-  exit 0
+if [ "${'${'}VERDE_FORCE_INSTALL:-0}" != "1" ] &&
+  [ -n "$installed_version" ] &&
+  [ "$(normalize_version "$installed_version")" = "$latest_version" ]; then
+  if [ "$platform" = "linux" ]; then
+    if linux_install_is_complete; then
+      say "Verde $latest_version is already installed. Nothing to do."
+      exit 0
+    fi
+  else
+    if macos_install_is_complete; then
+      say "Verde $latest_version is already installed. Nothing to do."
+      exit 0
+    fi
+  fi
+
+  say "Verde $latest_version is installed but incomplete. Reinstalling..."
 fi
 
 work_dir="$(make_temp_dir)"

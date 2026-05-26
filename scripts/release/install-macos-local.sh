@@ -115,6 +115,7 @@ install -m 755 "$PREFIX_DIR/bin/verde" "$APP_DIR/Contents/MacOS/verde"
 install -m 755 "$PREFIX_DIR/bin/libfff_c.dylib" "$APP_DIR/Contents/MacOS/libfff_c.dylib"
 ditto "$PREFIX_DIR/bin/SDL3.framework" "$APP_DIR/Contents/MacOS/SDL3.framework"
 assert_no_cef_payload "$APP_DIR"
+install -m 644 "$PREFIX_DIR/share/verde/provider_bridge.mjs" "$APP_DIR/Contents/Resources/provider_bridge.mjs"
 set_macos_build_version "$APP_DIR/Contents/MacOS/verde"
 
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
