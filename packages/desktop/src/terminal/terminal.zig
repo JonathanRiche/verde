@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
+const process_env = @import("../process_env.zig");
 pub const sessionizer = @import("sessionizer.zig");
 const theme = @import("../ui/theme.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -2739,6 +2740,7 @@ const UnixSession = struct {
             std.c._exit(127);
         }
 
+        process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
         _ = setenv("TERM", "xterm-ghostty", 1);
         _ = setenv("COLORTERM", "truecolor", 1);
         _ = setenv("TERM_PROGRAM", "ghostty", 1);

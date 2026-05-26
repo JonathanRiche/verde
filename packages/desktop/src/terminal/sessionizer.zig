@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const process_env = @import("../process_env.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const log = std.log.scoped(.sessionizer);
@@ -596,6 +597,7 @@ const PtySession = struct {
 
     fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) std.c._exit(127);
+        process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
         _ = setenv("TERM", "xterm-ghostty", 1);
         _ = setenv("COLORTERM", "truecolor", 1);
         _ = setenv("TERM_PROGRAM", "verde", 1);
@@ -926,6 +928,8 @@ pub const Daemon = struct {
 };
 
 pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    try process_env.applyAugmentedPathToCurrentProcess(allocator);
+
     var setup_threaded = std.Io.Threaded.init_single_threaded;
     try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
     const socket_path = try socketPath(allocator, pref_path);
