@@ -36,7 +36,15 @@ column_exists() {
   sqlite3 "$db_path" "select count(*) from pragma_table_info('$1') where name = '$2';"
 }
 
+row_count() {
+  sqlite3 "$db_path" "select count(*) from $1;"
+}
+
 sqlite3 "$db_path" "pragma foreign_keys = off;"
+
+if [[ "$(table_exists projects)" == "1" && "$(table_exists workspaces)" == "1" && "$(row_count workspaces)" == "0" ]]; then
+  sqlite3 "$db_path" "drop index if exists workspaces_sort_index_idx; drop table workspaces;"
+fi
 
 if [[ "$(table_exists projects)" == "1" && "$(table_exists workspaces)" == "0" ]]; then
   sqlite3 "$db_path" "drop index if exists projects_sort_index_idx; alter table projects rename to workspaces;"
