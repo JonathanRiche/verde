@@ -20,7 +20,7 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
 
     if (std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_json_path, allocator, .limited(256 * 1024))) |existing| {
         defer allocator.free(existing);
-        if (std.mem.indexOf(u8, existing, CODEX_HOOK_MARKER) != null) return;
+        if (codexHooksJsonIsManaged(existing)) return;
         return error.CodexHooksJsonExists;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -31,6 +31,11 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
     const hooks_json = try codexHooksJsonAlloc(allocator, hook_path);
     defer allocator.free(hooks_json);
     try writeFileAtomic(allocator, io, hooks_json_path, hooks_json, .default_file);
+}
+
+fn codexHooksJsonIsManaged(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, CODEX_HOOK_MARKER) != null or
+        std.mem.indexOf(u8, content, CODEX_HOOK_REL_PATH) != null;
 }
 
 fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
@@ -159,6 +164,16 @@ test "ensureCodexProjectHooks writes hook script and hooks json" {
     defer std.testing.allocator.free(hooks_json);
     try std.testing.expect(std.mem.indexOf(u8, hooks_json, "PermissionRequest") != null);
     try std.testing.expect(std.mem.indexOf(u8, hooks_json, hook_path) != null);
+}
+
+test "ensureCodexProjectHooks accepts existing managed hooks json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(project_path);
+
+    try ensureCodexProjectHooks(std.testing.allocator, project_path);
+    try ensureCodexProjectHooks(std.testing.allocator, project_path);
 }
 
 test "ensureCodexProjectHooks refuses unmanaged hooks json" {
