@@ -61,6 +61,7 @@ var sidebar_max_scroll_y: f32 = 0.0;
 
 const SidebarContextMenuAction = enum {
     workspace_new_chat,
+    workspace_open_codex_tui,
     workspace_open_terminal,
     workspace_rename,
     workspace_import_codex,
@@ -298,6 +299,19 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
         switch (hit.kind) {
+            .new_thread => {
+                state.workspace_header_open_menu_open = false;
+                state.sidebar_context_menu_anchor_x = x;
+                state.sidebar_context_menu_anchor_y = y;
+                state.sidebar_context_menu_project_index = hit.project_index;
+                state.sidebar_context_menu_thread_index = 0;
+                state.sidebar_context_menu_kind = .project_new_thread;
+                state.sidebar_context_menu_open = true;
+                state.blurPaletteComposer();
+                state.noteInteraction();
+                state.markDirty();
+                return true;
+            },
             .workspace_row => {
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
@@ -565,6 +579,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_new_chat => {
                     if (pi < state.projects.items.len) state.createThreadForProject(pi);
                 },
+                .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
                 .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
                 .workspace_rename => state.beginProjectRename(pi),
                 .workspace_import_codex => state.beginThreadImport(pi, .codex),
@@ -620,6 +635,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .project => {
             const pi = state.sidebar_context_menu_project_index;
             appendSidebarContextMenuRow(.workspace_new_chat, true, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
             appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.projects.items.len, "Open terminal");
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
@@ -635,6 +651,11 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                 }
             }
             appendSidebarContextMenuRow(.workspace_archive, !busy, "Archive workspace");
+        },
+        .project_new_thread => {
+            const pi = state.sidebar_context_menu_project_index;
+            appendSidebarContextMenuRow(.workspace_new_chat, pi < state.projects.items.len, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
         },
         .thread => {
             const pi = state.sidebar_context_menu_project_index;

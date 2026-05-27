@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const args = @import("cli_args.zig");
 const completion = @import("cli_completion.zig");
 const output = @import("cli_output.zig");
+const provider_hooks = @import("provider_hooks.zig");
 const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
@@ -200,7 +201,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  state: path, workspaces, panes, threads, transcript
         \\  integrations: list, doctor, install, remove, disable
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
-        \\  live: status, workspaces, panes, pane control, chat control, terminal/process control
+        \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
         \\  completion: bash, zsh, fish
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
@@ -546,6 +547,10 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         try handleLiveProcess(allocator, out, io, argv, json);
         return;
     }
+    if (std.mem.eql(u8, command, "agent")) {
+        try handleLiveAgent(allocator, out, io, argv, json);
+        return;
+    }
     if (std.mem.eql(u8, command, "stack")) {
         try handleLiveStack(allocator, out, io, argv, json);
         return;
@@ -607,7 +612,7 @@ const IntegrationProvider = struct {
 
 const integration_providers = [_]IntegrationProvider{
     .{ .name = "claude", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
-    .{ .name = "codex", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
     .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
     .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
 };
@@ -651,10 +656,7 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stderr("unknown integration provider: {s}\n", .{provider_name});
             std.process.exit(2);
         };
-        if (std.mem.eql(u8, command, "install")) {
-            try printIntegrationInstallUnsupported(allocator, out, json, provider);
-            std.process.exit(1);
-        }
+        if (std.mem.eql(u8, command, "install")) return try installIntegration(allocator, out, json, provider);
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
         return;
     }
@@ -675,7 +677,8 @@ fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json:
         try out.jsonValue(allocator, .{
             .providers = integration_providers[0..],
             .policy = .{
-                .writes_config = false,
+                .writes_config = true,
+                .writes_project_config_only = true,
                 .requires_verde_env = true,
                 .changes_auth = false,
             },
@@ -697,7 +700,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = integration_providers[0..],
-            .summary = "No provider hook installer is currently enabled; generic verde notify, OSC, and MCP paths remain available.",
+            .summary = "Codex project-local hooks are available; other providers currently use generic verde notify, OSC, and MCP paths.",
         });
         return;
     }
@@ -705,13 +708,51 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: none enabled
+        \\  hook installers: codex project-local
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
         if (std.mem.eql(u8, verde_env, "1")) "yes" else "no",
         if (has_identity) "yes" else "no",
     });
+}
+
+fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
+    if (!std.mem.eql(u8, provider.name, "codex")) {
+        try printIntegrationInstallUnsupported(allocator, out, json, provider);
+        std.process.exit(1);
+    }
+
+    const project_path = ".";
+    provider_hooks.ensureCodexProjectHooks(allocator, project_path) catch |err| switch (err) {
+        error.CodexHooksJsonExists => {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "blocked",
+                    .reason = ".codex/hooks.json already exists and is not managed by Verde; refusing to overwrite user hooks.",
+                });
+                return;
+            }
+            try out.stderr("verde integrations install codex: .codex/hooks.json already exists and is not managed by Verde; refusing to overwrite user hooks\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = "install",
+            .installed = true,
+            .status = "installed",
+            .path = ".codex/hooks.json",
+        });
+        return;
+    }
+    try out.stdout("verde integrations install codex: installed project-local Codex hooks in .codex/hooks.json\n", .{});
 }
 
 fn printIntegrationInstallUnsupported(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
@@ -1039,6 +1080,22 @@ fn handleLiveProcess(allocator: std.mem.Allocator, out: output.Output, io: std.I
     const method = try std.fmt.allocPrint(allocator, "process.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+fn handleLiveAgent(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live agent command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "open")) {
+        try sendLiveRequest(allocator, out, io, "agent.open", .{
+            .workspace = workspaceOption(argv),
+            .provider = args.optionValue(argv, "--provider") orelse "codex",
+        }, json);
+        return;
+    }
+    try out.stderr("unknown live agent command: {s}\n", .{subcommand});
+    std.process.exit(2);
 }
 
 fn handleLiveStack(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {

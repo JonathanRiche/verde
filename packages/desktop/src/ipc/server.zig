@@ -199,6 +199,7 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.startsWith(u8, method, "browser.")) return try browserCommandResponse(allocator, id_value, state, params, method["browser.".len..]);
     if (std.mem.startsWith(u8, method, "terminal.")) return try terminalCommandResponse(allocator, id_value, state, params, method["terminal.".len..]);
     if (std.mem.startsWith(u8, method, "process.")) return try processCommandResponse(allocator, id_value, state, params, method["process.".len..]);
+    if (std.mem.startsWith(u8, method, "agent.")) return try agentCommandResponse(allocator, id_value, state, params, method["agent.".len..]);
     if (std.mem.startsWith(u8, method, "stack.")) return try stackCommandResponse(allocator, id_value, state, params, method["stack.".len..]);
 
     return try errorResponseAlloc(allocator, id_value, "method_not_found", method);
@@ -343,7 +344,8 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "terminal.write",
             "terminal.tail",                       "terminal.screen",                     "process.list",                         "process.inspect",
             "process.start",                       "process.stop",                        "process.restart",                      "process.logs",
-            "stack.status",                        "stack.start",                         "stack.stop",                           "stack.restart",
+            "agent.open",                          "stack.status",                        "stack.start",                          "stack.stop",
+            "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -908,6 +910,20 @@ fn processCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
             .truncated = output.len >= max_bytes,
             .text = output,
         });
+    }
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
+fn agentCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    const project_index = resolveProjectIndex(state, params) orelse return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+    if (std.mem.eql(u8, command, "open")) {
+        const provider_name = stringParam(params, "provider") orelse "codex";
+        if (!std.mem.eql(u8, provider_name, "codex")) {
+            return try errorResponseAlloc(allocator, id_value, "unsupported_provider", "agent.open currently supports --provider codex");
+        }
+        const changed = try state.openAgentTui(project_index, .codex);
+        if (!changed) return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        return try managedProcessResponse(allocator, id_value, state, project_index, "codex");
     }
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
 }

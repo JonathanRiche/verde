@@ -237,15 +237,17 @@ Provider hook integrations are intentionally opt-in and conservative:
 ```bash
 verde integrations list
 verde integrations doctor
+verde integrations install codex
 verde integrations install claude
-verde integrations remove claude
 ```
 
-`verde integrations` reports hook support without touching provider auth or
-overwriting provider config. Until a provider has a stable documented hook
-lifecycle implemented in Verde, `install` returns an unsupported status and the
-generic `verde notify`, OSC notification, and MCP surface paths remain the
-supported integration mechanisms.
+`verde integrations` reports hook support without touching provider auth.
+Codex uses project-local hooks: `verde integrations install codex` writes
+`.codex/hooks.json` and `.verde/hooks/codex-notify-hook.sh` in the current
+workspace, and refuses to overwrite an existing unmanaged `.codex/hooks.json`.
+Other providers currently return an unsupported status; the generic
+`verde notify`, OSC notification, and MCP surface paths remain available for
+all terminal tools.
 
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
@@ -333,15 +335,26 @@ write through the same active PTY input path as the UI.
 ```bash
 verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
 verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
-verde live process inspect --pane <pane-id> [--json]
-verde live process inspect --focused [--json]
+verde live process list [--project <id|index|path|current>] [--json]
+verde live process start --name <name> [--project <id|index|path|current>] [--json]
+verde live process stop --name <name> [--project <id|index|path|current>] [--json]
+verde live process restart --name <name> [--project <id|index|path|current>] [--json]
+verde live process inspect --name <name> [--project <id|index|path|current>] [--json]
+verde live process logs --name <name> [--project <id|index|path|current>] [--json]
+verde live agent open --provider codex [--project <id|index|path|current>] [--json]
+verde live stack start [--project <id|index|path|current>] [--json]
+verde live stack stop [--project <id|index|path|current>] [--json]
+verde live stack restart [--project <id|index|path|current>] [--json]
 ```
 
 - `terminal write` sends text to the active terminal tab/pane. Include `\r` when
   you want to submit a shell command.
-- `process inspect` currently returns the same pane/terminal details as
-  `inspect` for a terminal pane. Process spawn, restart, and rename are reserved
-  for a later slice.
+- `process start`, `stop`, and `restart` control entries loaded from
+  `verde.yml`.
+- `agent open --provider codex` opens a first-class Codex TUI in the selected
+  workspace without requiring a `verde.yml` entry.
+- `stack start`, `stop`, and `restart` apply the same action to every configured
+  process and agent in the selected workspace.
 
 ### Selectors And Exit Codes
 
@@ -409,8 +422,36 @@ agents:
     revive: attach_or_create
     notify: true
     mcp: true
-    hooks: false
+    hooks: true
 ```
+
+Use `processes:` for normal long-running commands such as dev servers. Use
+`agents:` for terminal/TUI AI tools that should behave like first-class Verde
+surfaces. With the Codex example above, Verde creates or reuses a terminal dock
+for the agent and wires Codex hook events into pane/workspace attention. Plain
+`codex` managed commands are launched with `features.codex_hooks=true` when
+`hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
+`Stop` can mark it `done`.
+
+Start or restart a configured Codex agent with:
+
+```bash
+verde live agent open --provider codex
+verde live process restart --name codex
+```
+
+Use `verde live agent open --provider codex` for the default Codex TUI flow; it
+creates a managed terminal surface, applies Codex hook setup, and does not need
+a `verde.yml` entry. Use `verde live process restart --name codex` when you
+want to launch or restart the named agent declared in `verde.yml`. The same
+default Codex TUI action is available from the workspace sidebar by
+right-clicking the workspace new-thread/pencil button and choosing `Open Codex
+TUI`.
+
+A Codex TUI opened manually in any Verde terminal still gets Verde identity
+environment variables and can update the surface through `verde notify`, BEL,
+OSC 777, or MCP, but it is not automatically a managed `verde.yml` agent unless
+it is launched through the configured process entry.
 
 Example config:
 
