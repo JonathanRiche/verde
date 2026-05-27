@@ -52,9 +52,10 @@ Manual smoke:
    ```sh
    ./zig-out/bin/verde integrations list
    ./zig-out/bin/verde integrations doctor --json
+   ./zig-out/bin/verde integrations install codex --json
    ./zig-out/bin/verde integrations install claude --json
    ```
-   Expect install to return `unsupported` and not modify provider config.
+   Expect Codex install to create project-local `.codex/hooks.json` plus `.verde/hooks/codex-notify-hook.sh`. Expect Claude install to return `unsupported`.
 
 8. Test `verde.yml` agents with a workspace config:
    ```yaml
@@ -66,15 +67,22 @@ Manual smoke:
        revive: attach_or_create
        notify: true
        mcp: true
-       hooks: false
+       hooks: true
    ```
    Then run:
    ```sh
    ./zig-out/bin/verde live process list --json
    ```
    Expect the agent metadata fields in process output.
+   Verde automatically enables `features.codex_hooks=true` for plain `codex` managed commands when `hooks: true` is set. When Codex runs in that pane, `PermissionRequest` hooks should mark the Verde surface `waiting`, and `Stop` hooks should mark it `done`.
 
-9. Close Verde and confirm quiet notify no-ops:
+9. Test first-class Codex TUI open:
+   ```sh
+   ./zig-out/bin/verde live agent open --provider codex --json
+   ```
+   Expect a Codex terminal pane to open for the selected workspace. Also right-click the workspace new-thread/pencil button and choose `Open Codex TUI`; expect the same result.
+
+10. Close Verde and confirm quiet notify no-ops:
    ```sh
    VERDE_SESSION_ID=test ./zig-out/bin/verde notify --quiet --status waiting
    echo $?

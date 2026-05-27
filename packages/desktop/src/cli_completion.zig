@@ -68,6 +68,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
     try writeWords(w, &spec.process_commands);
+    try w.writeAll("\"\n  local agent=\"");
+    try writeWords(w, &spec.agent_commands);
     try w.writeAll("\"\n  local stack=\"");
     try writeWords(w, &spec.stack_commands);
     try w.writeAll("\"\n  local all_flags=\"");
@@ -104,12 +106,16 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.terminal_tail_flags);
     try w.writeAll("\"\n  local process_flags=\"");
     try writeWords(w, &spec.process_flags);
+    try w.writeAll("\"\n  local agent_flags=\"");
+    try writeWords(w, &spec.agent_flags);
     try w.writeAll("\"\n  local kind_values=\"");
     try writeWords(w, &spec.kind_values);
     try w.writeAll("\"\n  local axis_values=\"");
     try writeWords(w, &spec.axis_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("\"\n  local provider_values=\"");
+    try writeWords(w, &spec.provider_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
@@ -119,6 +125,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    --kind) COMPREPLY=( $(compgen -W "$kind_values" -- "$cur") ); return 0 ;;
         \\    --axis) COMPREPLY=( $(compgen -W "$axis_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
+        \\    --provider) COMPREPLY=( $(compgen -W "$provider_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
         \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
         \\  esac
@@ -192,6 +199,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\            esac
         \\            ;;
         \\          process) COMPREPLY=( $(compgen -W "$process_flags" -- "$cur") ) ;;
+        \\          agent) COMPREPLY=( $(compgen -W "$agent_flags" -- "$cur") ) ;;
         \\          stack) COMPREPLY=( $(compgen -W "$project_json_flags" -- "$cur") ) ;;
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
@@ -214,6 +222,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    3:live:browser:*) COMPREPLY=( $(compgen -W "$browser" -- "$cur") ) ;;
         \\    3:live:terminal:*) COMPREPLY=( $(compgen -W "$terminal" -- "$cur") ) ;;
         \\    3:live:process:*) COMPREPLY=( $(compgen -W "$process" -- "$cur") ) ;;
+        \\    3:live:agent:*) COMPREPLY=( $(compgen -W "$agent" -- "$cur") ) ;;
         \\    3:live:stack:*) COMPREPLY=( $(compgen -W "$stack" -- "$cur") ) ;;
         \\    4:live:chat:draft) COMPREPLY=( $(compgen -W "$draft" -- "$cur") ) ;;
         \\  esac
@@ -263,6 +272,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
     try writeWords(w, &spec.process_commands);
+    try w.writeAll("\"\n  local agent=\"");
+    try writeWords(w, &spec.agent_commands);
     try w.writeAll("\"\n  local stack=\"");
     try writeWords(w, &spec.stack_commands);
     try w.writeAll("\"\n  local all_flags=\"");
@@ -297,12 +308,16 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.terminal_tail_flags);
     try w.writeAll("\"\n  local process_flags=\"");
     try writeWords(w, &spec.process_flags);
+    try w.writeAll("\"\n  local agent_flags=\"");
+    try writeWords(w, &spec.agent_flags);
     try w.writeAll("\"\n  local kind_values=\"");
     try writeWords(w, &spec.kind_values);
     try w.writeAll("\"\n  local axis_values=\"");
     try writeWords(w, &spec.axis_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("\"\n  local provider_values=\"");
+    try writeWords(w, &spec.provider_values);
     try w.writeAll("\"\n  local inspector_mode_values=\"");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll(
@@ -312,6 +327,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    --kind) compadd -- ${(s: :)kind_values}; return ;;
         \\    --axis) compadd -- ${(s: :)axis_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
+        \\    --provider) compadd -- ${(s: :)provider_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
         \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
         \\  esac
@@ -385,6 +401,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\            esac
         \\            ;;
         \\          process) compadd -- ${(s: :)process_flags} ;;
+        \\          agent) compadd -- ${(s: :)agent_flags} ;;
         \\          stack) compadd -- ${(s: :)project_json_flags} ;;
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
@@ -407,6 +424,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    4:live:browser:*) compadd -- ${(s: :)browser} ;;
         \\    4:live:terminal:*) compadd -- ${(s: :)terminal} ;;
         \\    4:live:process:*) compadd -- ${(s: :)process} ;;
+        \\    4:live:agent:*) compadd -- ${(s: :)agent} ;;
         \\    4:live:stack:*) compadd -- ${(s: :)stack} ;;
         \\    5:live:chat:draft) compadd -- ${(s: :)draft} ;;
         \\  esac
@@ -468,6 +486,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live process' -a '");
     try writeWords(w, &spec.process_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live agent' -a '");
+    try writeWords(w, &spec.agent_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live stack' -a '");
     try writeWords(w, &spec.stack_commands);
     try w.writeAll("'\n\ncomplete -c verde -l json -d 'Print JSON output'\n");
@@ -484,6 +504,7 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l prompt -r -d 'Prompt text'
         \\complete -c verde -l call -r -d 'Approval call id'
         \\complete -c verde -l name -r -d 'Configured process name'
+        \\complete -c verde -l provider -r -d 'Provider name'
         \\complete -c verde -l lines -r -d 'Number of output lines'
         \\complete -c verde -l mode -r -d 'Browser inspector mode'
         \\complete -c verde -s h -l help -d 'Show help'
@@ -495,6 +516,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.axis_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --decision' -a '");
     try writeWords(w, &spec.decision_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --provider' -a '");
+    try writeWords(w, &spec.provider_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --mode' -a '");
     try writeWords(w, &spec.inspector_mode_values);
     try w.writeAll("'\n");

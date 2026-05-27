@@ -12,6 +12,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const provider_hooks = @import("provider_hooks.zig");
 const runtime_log = @import("runtime_log.zig");
 const stack_config = @import("stack.zig");
 const stb_image = @import("stb_image.zig");
@@ -2659,6 +2660,12 @@ pub const SendState = struct {
     pending_approval: ?PendingApproval = null,
     ui_revision: u64 = 0,
     polled_ui_revision: u64 = 0,
+    /// Whole-second elapsed value last reported to the UI poll loop for the
+    /// pending "Working - mm:ss" label. Tracked so `pollSend` can request a
+    /// repaint exactly when the visible seconds counter would change, even
+    /// while the provider has not streamed any tokens. -1 means "no value
+    /// reported yet" (so the very first pending poll always renders).
+    polled_working_seconds: i64 = -1,
     pending_followup: ?PendingFollowup = null,
     pending_followup_signal_sent: bool = false,
     approval_decision: ?ai_harness.ApprovalDecision = null,
@@ -2703,6 +2710,7 @@ pub const SidebarThreadHover = struct {
 pub const SidebarContextMenuKind = enum {
     none,
     project,
+    project_new_thread,
     thread,
 };
 
@@ -4788,6 +4796,9 @@ pub const AppState = struct {
         freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
         send_state.ui_revision = 1;
         send_state.polled_ui_revision = 0;
+        // Reset the working-seconds tracker so the first pending poll forces
+        // a render and seeds the visible "Working - 0:00" label.
+        send_state.polled_working_seconds = -1;
         send_state.approval_decision = null;
         send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
@@ -8357,14 +8368,23 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
-        var process = project.managedProcessByName(name) orelse return false;
+        const process = project.managedProcessByName(name) orelse return false;
+        return try self.startManagedProcessDirect(project, process);
+    }
+
+    fn startManagedProcessDirect(self: *AppState, project: *Project, process: *ManagedProcess) !bool {
         const dock_id = process.dock_id orelse try self.createCurrentProjectTerminalDock();
         process.dock_id = dock_id;
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
+        if (process.kind == .agent and process.provider == .codex and process.hooks) {
+            try provider_hooks.ensureCodexProjectHooks(self.allocator, project.path);
+        }
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        const command_args = [_][]const u8{ "/bin/sh", "-lc", process.command };
+        const command = try self.managedProcessLaunchCommand(process);
+        defer self.allocator.free(command);
+        const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
         try dock.restartWithProfilePersistent(self.allocator, cwd, .{
             .kind = .custom,
             .label = process.name,
@@ -8402,6 +8422,33 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn openAgentTui(self: *AppState, project_index: usize, provider: Provider) !bool {
+        if (provider != .codex) return false;
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        var project = &self.projects.items[project_index];
+        const name = "codex";
+        if (project.managedProcessByName(name) == null) {
+            var process: ManagedProcess = .{
+                .name = try self.allocator.dupe(u8, name),
+                .kind = .agent,
+                .command = try self.allocator.dupe(u8, "codex"),
+                .cwd = try self.allocator.dupe(u8, "."),
+                .restart = .manual,
+                .provider = .codex,
+                .revive = .attach_or_create,
+                .notify = true,
+                .mcp = true,
+                .hooks = true,
+                .watch = .empty,
+            };
+            errdefer process.deinit(self.allocator);
+            try project.managed_processes.append(self.allocator, process);
+        }
+        const process = project.managedProcessByName(name) orelse return false;
+        return try self.startManagedProcessDirect(project, process);
+    }
+
     fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
         return switch (provider orelse return null) {
             .codex => .codex,
@@ -8410,6 +8457,24 @@ pub const AppState = struct {
             .cursor => .cursor,
             .other => null,
         };
+    }
+
+    fn managedProcessLaunchCommand(self: *AppState, process: *const ManagedProcess) ![]u8 {
+        if (!(process.kind == .agent and process.provider == .codex and process.hooks)) {
+            return self.allocator.dupe(u8, process.command);
+        }
+        if (std.mem.indexOf(u8, process.command, "features.codex_hooks") != null) {
+            return self.allocator.dupe(u8, process.command);
+        }
+
+        const trimmed = std.mem.trim(u8, process.command, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "codex")) {
+            return self.allocator.dupe(u8, "codex -c features.codex_hooks=true");
+        }
+        if (std.mem.startsWith(u8, trimmed, "codex ")) {
+            return try std.fmt.allocPrint(self.allocator, "codex -c features.codex_hooks=true {s}", .{trimmed["codex ".len..]});
+        }
+        return self.allocator.dupe(u8, process.command);
     }
 
     pub fn stopManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
@@ -10879,6 +10944,18 @@ pub const AppState = struct {
             .pending => {
                 if (send_state.ui_revision != send_state.polled_ui_revision) {
                     send_state.polled_ui_revision = send_state.ui_revision;
+                    stream_changed = true;
+                }
+                // Force a repaint exactly when the visible seconds in the
+                // "Working - mm:ss" label would change. Without this, the
+                // main loop sleeps in SDL_WaitEventTimeout(IDLE) while a
+                // turn is in flight and no tokens are streaming, so the
+                // wall-clock label freezes until the user moves the mouse.
+                const safe_started_at_ms = @max(send_state.started_at_ms, 0);
+                const elapsed_ms = @max(unixTimestampMs() - safe_started_at_ms, 0);
+                const elapsed_seconds = @divTrunc(elapsed_ms, std.time.ms_per_s);
+                if (elapsed_seconds != send_state.polled_working_seconds) {
+                    send_state.polled_working_seconds = elapsed_seconds;
                     stream_changed = true;
                 }
             },
