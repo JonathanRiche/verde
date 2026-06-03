@@ -1234,8 +1234,9 @@ fn renderOpenPaneRow(
                 }
             }
             if (agent_provider) |prov| {
-                // Green prompt mark reads as a terminal and stands out against the logo.
-                const mark_color = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_SECONDARY_GREEN;
+                // Neutral/white prompt mark so it contrasts with the provider logo
+                // instead of blending into it (the accent shares the logo's hue).
+                const mark_color = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_WHITE;
                 queuePaletteAgentTerminalGlyph(state, prov, icon_x, cy, mark_color, clip);
             } else {
                 queuePaletteTerminalMark(state, icon_x, cy, theme.scaledUi(14.0), muted, clip);
@@ -1250,6 +1251,10 @@ fn renderOpenPaneRow(
                 }
                 break :blk "Terminal";
             };
+            // Agents (e.g. Claude Code) prefix their title with a symbol marker
+            // like "✳" the sidebar font can't render; drop it so it doesn't show
+            // as a tofu box before the title.
+            title = stripLeadingTitleSymbols(title);
         },
         .browser => {
             queuePaletteGlobeIcon(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
@@ -1577,6 +1582,23 @@ fn snapRect(rect: palette.Rect) palette.Rect {
     };
 }
 
+/// Strips a leading run of non-ASCII bytes (a symbol/emoji marker such as the
+/// "✳" agents prepend to their terminal title) when it is separated from the
+/// real title by a space. Falls back to the original string otherwise, so plain
+/// or fully non-ASCII titles are left untouched.
+fn stripLeadingTitleSymbols(title: []const u8) []const u8 {
+    if (title.len == 0 or title[0] < 0x80) return title;
+    var i: usize = 0;
+    while (i < title.len and title[i] >= 0x80) {
+        i += if (title[i] >= 0xF0) 4 else if (title[i] >= 0xE0) 3 else if (title[i] >= 0xC0) 2 else 1;
+    }
+    if (i < title.len and (title[i] == ' ' or title[i] == '\t')) {
+        const rest = std.mem.trimStart(u8, title[i..], " \t");
+        if (rest.len > 0 and rest[0] < 0x80) return rest;
+    }
+    return title;
+}
+
 /// Truncates a thread title for narrow sidebar rows.
 fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:0]const u8 {
     const bounded_max = @min(buffer.len - 1, max_len);
@@ -1671,25 +1693,12 @@ fn providerFromComm(comm: []const u8) ?Provider {
 /// sits in the upper-left, a font-safe `>_` prompt mark in the lower-right, and
 /// a diagonal slash divides them.
 fn queuePaletteAgentTerminalGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, term_color: [4]f32, clip: palette.Rect) void {
-    // Use a touch more than the bitmap slot (into the title gap) so the two
-    // marks each get enough room to read at sidebar size.
-    const total = theme.scaledUi(27.0);
-    const top = center_y - total * 0.5;
-    // Provider logo, upper-left.
-    queuePaletteProviderGlyphInRect(state, provider, .{ .x = x, .y = top, .w = theme.scaledUi(15.0), .h = theme.scaledUi(15.0) }, clip);
-    // Diagonal slash from lower-left to upper-right.
-    queuePaletteDiagLine(
-        state,
-        x + theme.scaledUi(2.0),
-        center_y + total * 0.5 - theme.scaledUi(2.0),
-        x + total - theme.scaledUi(2.0),
-        top + theme.scaledUi(2.0),
-        theme.scaledUi(1.6),
-        theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 200),
-        clip,
-    );
-    // Terminal prompt mark, lower-right.
-    queuePaletteTerminalMark(state, x + theme.scaledUi(13.0), center_y + theme.scaledUi(6.5), theme.scaledUi(13.0), term_color, clip);
+    // Provider logo, then a `>_` prompt — laid out horizontally and vertically
+    // centered. Kept deliberately simple (no diagonal/divider primitives) so it
+    // renders cleanly at sidebar size.
+    const logo = theme.scaledUi(15.0);
+    queuePaletteProviderGlyphInRect(state, provider, .{ .x = x, .y = center_y - logo * 0.5, .w = logo, .h = logo }, clip);
+    queuePaletteTerminalMark(state, x + logo + theme.scaledUi(1.0), center_y, theme.scaledUi(11.0), term_color, clip);
 }
 
 /// Draws a font-safe `>_` shell-prompt mark for terminal panes.
