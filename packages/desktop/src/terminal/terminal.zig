@@ -127,6 +127,7 @@ pub const PersistedWorkspace = struct {
 
 pub const PersistedTab = struct {
     title: ?[]const u8 = null,
+    observed_title: ?[]const u8 = null,
     active_pane_id: u32 = 0,
     root_node_id: u32 = 0,
     nodes: []const PersistedNode = &.{},
@@ -190,11 +191,16 @@ const PaneFocusCandidate = struct {
 pub const Tab = struct {
     id: u32,
     title: ?[]u8 = null,
+    /// Last non-empty OSC title observed for the active pane's program (e.g. an
+    /// agent's session summary). Persisted so the label survives a Verde restart
+    /// even before the program re-emits its title.
+    observed_title: ?[]u8 = null,
     root: *PaneNode,
     active_pane_id: u32,
 
     fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
+        if (self.observed_title) |observed| allocator.free(observed);
         deinitPaneNode(self.root, allocator);
     }
 };
@@ -368,8 +374,26 @@ pub const Dock = struct {
         var changed = false;
         for (self.tabs.items) |*tab| {
             changed = (try pollPaneNode(tab.root, allocator)) or changed;
+            if (self.captureTabObservedTitle(allocator, tab)) changed = true;
         }
         return changed;
+    }
+
+    /// Remembers the active pane's live OSC title on its tab so it can be shown
+    /// (and persisted) even after a restart, before the program re-emits it.
+    fn captureTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, tab: *Tab) bool {
+        const pane = findPaneLeaf(tab.root, tab.active_pane_id) orelse findFirstPaneLeaf(tab.root) orelse return false;
+        const session = pane.session orelse return false;
+        var buf: [96]u8 = undefined;
+        const live = session.liveOscTitle(&buf) orelse return false;
+        if (tab.observed_title) |old| {
+            if (std.mem.eql(u8, old, live)) return false;
+        }
+        const dup = allocator.dupe(u8, live) catch return false;
+        if (tab.observed_title) |old| allocator.free(old);
+        tab.observed_title = dup;
+        self.workspace_changed = true;
+        return true;
     }
 
     pub fn rethemeSessions(self: *Dock, allocator: std.mem.Allocator) !void {
@@ -710,6 +734,45 @@ pub const Dock = struct {
         return "Shell";
     }
 
+    /// Like `tabTitle`, but prefers a live label for whatever program is running
+    /// in the active pane — its OSC title (e.g. an agent's session summary) or
+    /// process name — over the cwd fallback. Used for compact labels such as the
+    /// sidebar's open-pane list.
+    pub fn activeProcessLabel(self: *const Dock, buffer: *[96]u8) []const u8 {
+        if (self.activeTabConst()) |tab| {
+            const session: ?*Session = blk: {
+                const pane = findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root) orelse break :blk null;
+                break :blk pane.session;
+            };
+            // 1. live OSC title (the running program's session summary)
+            if (session) |s| {
+                if (s.liveOscTitle(buffer)) |osc| return osc;
+            }
+            // 2. last observed title, persisted across restarts (shown before the
+            //    program re-emits its OSC title)
+            if (tab.observed_title) |observed| {
+                if (observed.len > 0) return observed;
+            }
+            // 3. foreground process name (e.g. `claude` before it sets a title)
+            if (session) |s| {
+                if (s.foregroundProcessName(buffer)) |name| return name;
+            }
+        }
+        return self.tabTitle(self.active_tab_index, buffer);
+    }
+
+    /// The active pane's foreground process name (e.g. `claude`, `codex`) when a
+    /// program other than the shell is running, else null. Used to pick a
+    /// provider-aware icon in the sidebar.
+    pub fn activeForegroundProcessName(self: *const Dock, buffer: *[96]u8) ?[]const u8 {
+        if (self.activeTabConst()) |tab| {
+            if (findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root)) |pane| {
+                if (pane.session) |session| return session.foregroundProcessName(buffer);
+            }
+        }
+        return null;
+    }
+
     pub fn beginRenameTab(self: *Dock, tab_id: u32) void {
         self.rename_tab_id = tab_id;
         @memset(&self.rename_storage, 0);
@@ -774,6 +837,7 @@ pub const Dock = struct {
             const root_node_id = try serializePaneNode(arena_allocator, tab.root, &nodes, &next_node_id, context);
             try persisted_tabs.append(arena_allocator, .{
                 .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
+                .observed_title = if (tab.observed_title) |observed| try arena_allocator.dupe(u8, observed) else null,
                 .active_pane_id = tab.active_pane_id,
                 .root_node_id = root_node_id,
                 .nodes = try nodes.toOwnedSlice(arena_allocator),
@@ -803,6 +867,7 @@ pub const Dock = struct {
             var tab = Tab{
                 .id = self.allocateTabId(),
                 .title = if (persisted_tab.title) |tab_title| try allocator.dupe(u8, tab_title) else null,
+                .observed_title = if (persisted_tab.observed_title) |observed| try allocator.dupe(u8, observed) else null,
                 .root = root,
                 .active_pane_id = persisted_tab.active_pane_id,
             };
@@ -1424,6 +1489,14 @@ const UnsupportedSession = struct {
         return "Shell";
     }
 
+    pub fn liveOscTitle(_: *const UnsupportedSession, _: *[96]u8) ?[]const u8 {
+        return null;
+    }
+
+    pub fn foregroundProcessName(_: *const UnsupportedSession, _: *[96]u8) ?[]const u8 {
+        return null;
+    }
+
     pub fn isRunning(_: *const UnsupportedSession) bool {
         return false;
     }
@@ -1986,19 +2059,63 @@ const UnixSession = struct {
     }
 
     fn hasForegroundProcessAwayFromShell(self: *const UnixSession) bool {
+        return self.foregroundProcessGroup() != null;
+    }
+
+    /// Returns the foreground process group id when a program other than the
+    /// session's own shell is in the foreground (e.g. `nvim`, `htop`), else null.
+    fn foregroundProcessGroup(self: *const UnixSession) ?usize {
         switch (self.backend) {
             .local => {
-                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return false;
+                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
                 var foreground_process_group: c_int = 0;
-                if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return false;
-                return foreground_process_group > 0 and foreground_process_group != self.child_pid;
+                if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return null;
+                if (foreground_process_group <= 0 or foreground_process_group == self.child_pid) return null;
+                return @intCast(foreground_process_group);
             },
             .daemon => {
-                const shell_pid = self.daemon_shell_pid orelse return false;
-                const foreground_process_group = self.daemon_foreground_process_group orelse return false;
-                return foreground_process_group > 0 and foreground_process_group != shell_pid;
+                const shell_pid = self.daemon_shell_pid orelse return null;
+                const foreground_process_group = self.daemon_foreground_process_group orelse return null;
+                if (foreground_process_group == 0 or foreground_process_group == shell_pid) return null;
+                return foreground_process_group;
             },
         }
+    }
+
+    /// The live OSC window title the running program set (OSC 0/1/2), trimmed.
+    /// Agents like Claude Code / Codex use this to publish a session summary.
+    fn oscTitle(self: *const UnixSession) ?[]const u8 {
+        const title = self.terminal.getTitle() orelse return null;
+        const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
+        return if (trimmed.len > 0) trimmed else null;
+    }
+
+    /// The live OSC title of the program running in this session (e.g. an
+    /// agent's session summary), copied into `buffer`. Null at a bare shell
+    /// prompt, so the caller can fall back to cwd / process name.
+    pub fn liveOscTitle(self: *const UnixSession, buffer: *[96]u8) ?[]const u8 {
+        const away = self.hasForegroundProcessAwayFromShell();
+        if (!away and self.launch_kind == .shell) return null;
+        const osc = self.oscTitle() orelse return null;
+        const clipped = osc[0..@min(osc.len, buffer.len)];
+        return std.fmt.bufPrint(buffer, "{s}", .{clipped}) catch clipped;
+    }
+
+    /// Linux-only: the foreground process group leader's command name from
+    /// `/proc/<pgid>/comm`, so terminal labels can reflect the running program
+    /// instead of just the working directory. Null at the shell prompt.
+    pub fn foregroundProcessName(self: *const UnixSession, buffer: *[96]u8) ?[]const u8 {
+        if (builtin.os.tag != .linux) return null;
+        if (self.launch_kind != .shell) return null;
+        const pgid = self.foregroundProcessGroup() orelse return null;
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pgid}) catch return null;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+        defer _ = std.c.close(fd);
+        const n = std.posix.read(fd, buffer[0..]) catch return null;
+        const trimmed = std.mem.trim(u8, buffer[0..n], &std.ascii.whitespace);
+        if (trimmed.len == 0) return null;
+        return trimmed;
     }
 
     fn writeWheelMouseInput(self: *UnixSession, local_x: f32, local_y: f32, width: f32, height: f32, wheel_y: f32, line_count: isize) !void {

@@ -1580,8 +1580,18 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
     // which has the correct glyph shapes — instead of hitting the `else =>
     // "?"` placeholder in queuePowerlineGlyph that rendered as tofu.
     return switch (cp) {
-        0xe0b0, 0xe0b2, 0xe0b4, 0xe0b6, 0xe0b8, 0xe0ba,
-        0xe0bc, 0xe0be, 0xe0c0, 0xe0c2, 0xe0c4, 0xe0c6,
+        0xe0b0,
+        0xe0b2,
+        0xe0b4,
+        0xe0b6,
+        0xe0b8,
+        0xe0ba,
+        0xe0bc,
+        0xe0be,
+        0xe0c0,
+        0xe0c2,
+        0xe0c4,
+        0xe0c6,
         => .powerline,
         else => .text,
     };

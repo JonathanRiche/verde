@@ -63,6 +63,11 @@ const MAX_WINDOW_WIDTH: c_int = 1520;
 const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
+// Wake the event loop at least 4 times per second while any chat turn is in
+// flight so the "Working - mm:ss" label (computed from wall clock) ticks
+// even when no streamed tokens or input events arrive. pollSend gates the
+// actual render on a whole-second change, so cost is ~1 render/sec.
+const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
@@ -138,8 +143,28 @@ pub fn main(init: std.process.Init) void {
     mainInner(init) catch |err| {
         runtime_log.diagnostic("fatal startup error: {s}", .{@errorName(err)});
         std.debug.print("fatal startup error: {s}\n", .{@errorName(err)});
+        logFatalStartupHint(err);
         std.process.exit(1);
     };
+}
+
+fn logFatalStartupHint(err: anyerror) void {
+    switch (err) {
+        error.SdlGpuCreateDeviceFailed => if (builtin.os.tag == .linux) {
+            runtime_log.diagnostic("startup hint: SDL GPU device creation failed. This usually means Vulkan is unavailable for the active GPU. Install the Vulkan driver for your GPU: Arch Intel `vulkan-intel`, AMD `vulkan-radeon`, software fallback `vulkan-swrast`; Debian/Ubuntu Intel/AMD `mesa-vulkan-drivers`.", .{});
+            std.debug.print(
+                \\startup hint: SDL GPU could not create a Vulkan device.
+                \\Install the Vulkan driver for the active GPU:
+                \\  Arch Intel: sudo pacman -S --needed vulkan-intel
+                \\  Arch AMD:   sudo pacman -S --needed vulkan-radeon
+                \\  Fallback:   sudo pacman -S --needed vulkan-swrast
+                \\  Debian/Ubuntu Intel/AMD: sudo apt install mesa-vulkan-drivers
+                \\Then verify with: vulkaninfo --summary
+                \\
+            , .{});
+        },
+        else => {},
+    }
 }
 
 fn mainInner(init: std.process.Init) !void {
@@ -380,6 +405,7 @@ fn mainInner(init: std.process.Init) !void {
     state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
     state.restorePersistedBrowserPaneOnLaunch();
+    state.applyInitialWorkspaceFocusOnLaunch();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
@@ -1014,10 +1040,14 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
-        ACTIVE_WAIT_TIMEOUT_MS
-    else
-        IDLE_WAIT_TIMEOUT_MS;
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating()) {
+        return ACTIVE_WAIT_TIMEOUT_MS;
+    }
+    // While a chat turn is pending we still want the wall-clock "Working"
+    // label to tick. pollSend bumps once per whole second; this just caps
+    // the SDL wait so we actually reach pollSend before that second elapses.
+    if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    return IDLE_WAIT_TIMEOUT_MS;
 }
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {

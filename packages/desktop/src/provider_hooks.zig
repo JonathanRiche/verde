@@ -124,6 +124,123 @@ fn writeCodexHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []c
     try s.endArray();
 }
 
+const CLAUDE_HOOK_MARKER = "verde-claude-notify-hook";
+const CLAUDE_HOOK_REL_PATH = ".verde/hooks/claude-notify-hook.sh";
+// Claude Code merges hooks across settings files, so we target the personal,
+// usually-gitignored settings.local.json to avoid touching shared settings.json.
+const CLAUDE_SETTINGS_REL_PATH = ".claude/settings.local.json";
+
+pub fn ensureClaudeProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ project_path, CLAUDE_HOOK_REL_PATH });
+    defer allocator.free(hook_path);
+    const settings_path = try std.fs.path.join(allocator, &.{ project_path, CLAUDE_SETTINGS_REL_PATH });
+    defer allocator.free(settings_path);
+
+    const io = threaded.io();
+
+    try ensureParentDir(io, hook_path);
+    try writeClaudeHookScript(allocator, io, hook_path);
+
+    if (std.Io.Dir.cwd().readFileAlloc(threaded.io(), settings_path, allocator, .limited(1024 * 1024))) |existing| {
+        defer allocator.free(existing);
+        if (claudeSettingsIsManaged(existing)) return;
+        return error.ClaudeSettingsExist;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    try ensureParentDir(io, settings_path);
+    const settings_json = try claudeSettingsJsonAlloc(allocator, hook_path);
+    defer allocator.free(settings_json);
+    try writeFileAtomic(allocator, io, settings_path, settings_json, .default_file);
+}
+
+fn claudeSettingsIsManaged(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, CLAUDE_HOOK_MARKER) != null or
+        std.mem.indexOf(u8, content, CLAUDE_HOOK_REL_PATH) != null;
+}
+
+fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    // Drives Verde surface status (working/waiting/done) for the pips. It does
+    // not set a title, so the live OSC session summary remains the pane label.
+    const script =
+        \\#!/bin/sh
+        \\# verde-claude-notify-hook
+        \\[ "${VERDE:-}" = "1" ] || exit 0
+        \\[ -n "${VERDE_SESSION_ID:-}" ] || exit 0
+        \\
+        \\payload="${TMPDIR:-/tmp}/verde-claude-hook.$$"
+        \\cat > "$payload" 2>/dev/null || true
+        \\
+        \\event="$(sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\[ -n "$event" ] || event="${1:-}"
+        \\
+        \\status=""
+        \\case "$event" in
+        \\  SessionStart) status="working" ;;
+        \\  UserPromptSubmit) status="working" ;;
+        \\  Notification) status="waiting" ;;
+        \\  Stop) status="done" ;;
+        \\  *)
+        \\    rm -f "$payload"; exit 0 ;;
+        \\esac
+        \\
+        \\cli="${VERDE_CLI:-verde}"
+        \\if ! command -v "$cli" >/dev/null 2>&1; then
+        \\  if [ -x "./zig-out/bin/verde" ]; then
+        \\    cli="./zig-out/bin/verde"
+        \\  else
+        \\    cli="verde"
+        \\  fi
+        \\fi
+        \\
+        \\"$cli" notify --quiet --status "$status" >/dev/null 2>&1 || true
+        \\rm -f "$payload"
+        \\exit 0
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, script, .executable_file);
+}
+
+fn claudeSettingsJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{ .whitespace = .indent_2 } };
+    try s.beginObject();
+    try s.objectField("hooks");
+    try s.beginObject();
+    try writeClaudeHookEvent(&s, "SessionStart", hook_path);
+    try writeClaudeHookEvent(&s, "UserPromptSubmit", hook_path);
+    try writeClaudeHookEvent(&s, "Notification", hook_path);
+    try writeClaudeHookEvent(&s, "Stop", hook_path);
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeClaudeHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []const u8) !void {
+    try s.objectField(event);
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("hooks");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("command");
+    try s.objectField("command");
+    try s.write(hook_path);
+    try s.objectField("timeout");
+    try s.write(5);
+    try s.endObject();
+    try s.endArray();
+    try s.endObject();
+    try s.endArray();
+}
+
 fn ensureParentDir(io: std.Io, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
 }
