@@ -5473,6 +5473,62 @@ pub const AppState = struct {
         return false;
     }
 
+    /// Returns the terminal surface (if any) bound to a given dock within a
+    /// workspace, so the sidebar can render per-pane agent status.
+    pub fn projectTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) ?*const SurfaceState {
+        if (project_index >= self.projects.items.len) return null;
+        const project = &self.projects.items[project_index];
+        for (self.surfaces.items) |*surface| {
+            if (surface.dock_id != dock_id) continue;
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+                return surface;
+            }
+        }
+        return null;
+    }
+
+    /// Selects a workspace and focuses one of its open layout panes directly
+    /// from the sidebar's live "OPEN" list, restoring it first if minimized.
+    pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
+        if (project_index >= self.projects.items.len) return;
+        self.selected_project_index = project_index;
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        var target: ?*WorkspacePane = null;
+        for (layout.panes.items) |*pane| {
+            if (pane.id == pane_id) {
+                target = pane;
+                break;
+            }
+        }
+        const pane = target orelse return;
+        if (pane.minimized) {
+            pane.minimized = false;
+            layout.ensurePaneInRootSplit(self.allocator, pane_id, .horizontal, 0.64) catch |err| {
+                log.err("failed to restore workspace pane from sidebar: {s}", .{@errorName(err)});
+            };
+        }
+        layout.focused_pane_id = pane_id;
+        layout.maximized_pane_id = null;
+        switch (pane.ref) {
+            .chat => |ref| {
+                self.terminal_focused = false;
+                project.selected_thread_index = ref.thread_index;
+                self.requestComposerFocus();
+            },
+            .terminal => self.requestTerminalFocus(),
+            .browser => {
+                self.terminal_focused = false;
+                self.composer_focused = false;
+                self.browser_state.setControlsVisible(true);
+                self.browser_state.controller.show() catch |err| {
+                    log.warn("failed to show browser pane from sidebar: {s}", .{@errorName(err)});
+                };
+            },
+        }
+        self.markDirty();
+    }
+
     fn replaceOwnedSlice(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !void {
         const next = try allocator.dupe(u8, value);
         allocator.free(dest.*);
@@ -6724,6 +6780,21 @@ pub const AppState = struct {
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         if (!layout.hasVisiblePaneKind(.browser)) return;
         self.browser_launch_open_delay_frames = 2;
+    }
+
+    /// Applies keyboard focus on launch based on the restored focused pane, so a
+    /// reopened terminal (or browser/chat) pane is immediately typeable instead
+    /// of requiring a manual mouse click to start receiving input.
+    pub fn applyInitialWorkspaceFocusOnLaunch(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
+        const pane = layout.paneById(pane_id) orelse return;
+        switch (pane.ref) {
+            .terminal => self.requestTerminalFocus(),
+            .browser => self.focusBrowserPane(),
+            .chat => self.requestComposerFocus(),
+        }
     }
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.

@@ -611,7 +611,7 @@ const IntegrationProvider = struct {
 };
 
 const integration_providers = [_]IntegrationProvider{
-    .{ .name = "claude", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "claude", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Claude Code hooks are supported through project-local .claude/settings.local.json when enabled for a Verde session." },
     .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
     .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
     .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
@@ -700,7 +700,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = integration_providers[0..],
-            .summary = "Codex project-local hooks are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+            .summary = "Claude and Codex project-local hooks are available; other providers currently use generic verde notify, OSC, and MCP paths.",
         });
         return;
     }
@@ -708,7 +708,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: codex project-local
+        \\  hook installers: claude, codex project-local
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -718,12 +718,44 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
 }
 
 fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
+    const project_path = ".";
+    if (std.mem.eql(u8, provider.name, "claude")) {
+        provider_hooks.ensureClaudeProjectHooks(allocator, project_path) catch |err| switch (err) {
+            error.ClaudeSettingsExist => {
+                if (json) {
+                    try out.jsonValue(allocator, .{
+                        .provider = provider.name,
+                        .action = "install",
+                        .installed = false,
+                        .status = "blocked",
+                        .reason = ".claude/settings.local.json already exists and is not managed by Verde; refusing to overwrite user settings.",
+                    });
+                    return;
+                }
+                try out.stderr("verde integrations install claude: .claude/settings.local.json already exists and is not managed by Verde; refusing to overwrite user settings\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .path = ".claude/settings.local.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install claude: installed project-local Claude hooks in .claude/settings.local.json\n", .{});
+        return;
+    }
+
     if (!std.mem.eql(u8, provider.name, "codex")) {
         try printIntegrationInstallUnsupported(allocator, out, json, provider);
         std.process.exit(1);
     }
 
-    const project_path = ".";
     provider_hooks.ensureCodexProjectHooks(allocator, project_path) catch |err| switch (err) {
         error.CodexHooksJsonExists => {
             if (json) {
