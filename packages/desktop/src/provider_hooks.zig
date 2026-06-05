@@ -68,9 +68,22 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\[ -n "$event" ] || event="${1:-}"
         \\
         \\status=""
+        \\title=""
         \\case "$event" in
         \\  SessionStart) status="working" ;;
-        \\  UserPromptSubmit) status="working" ;;
+        \\  UserPromptSubmit)
+        \\    status="working"
+        \\    # Codex has no session-title field, but UserPromptSubmit carries the
+        \\    # prompt text. Derive a pane label from it (like a chat thread title):
+        \\    # prefer jq for correct JSON decoding, else a best-effort sed fallback;
+        \\    # collapse whitespace and truncate to a sidebar-friendly length.
+        \\    if command -v jq >/dev/null 2>&1; then
+        \\      title="$(jq -r '.prompt // empty' "$payload" 2>/dev/null)"
+        \\    else
+        \\      title="$(sed -n 's/.*"prompt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    fi
+        \\    title="$(printf '%s' "$title" | tr '\n\t' '  ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]][[:space:]]*/ /g' | cut -c1-72)"
+        \\    ;;
         \\  PermissionRequest) status="waiting" ;;
         \\  Stop) status="done" ;;
         \\  *)
@@ -86,7 +99,11 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\  fi
         \\fi
         \\
-        \\"$cli" notify --quiet --status "$status" --provider codex >/dev/null 2>&1 || true
+        \\if [ -n "$title" ]; then
+        \\  "$cli" notify --quiet --status "$status" --title "$title" --provider codex >/dev/null 2>&1 || true
+        \\else
+        \\  "$cli" notify --quiet --status "$status" --provider codex >/dev/null 2>&1 || true
+        \\fi
         \\rm -f "$payload"
         \\exit 0
         \\
