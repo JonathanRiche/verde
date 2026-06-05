@@ -132,6 +132,55 @@ pub fn isCompletionPulseAnimating() bool {
     return false;
 }
 
+// Placement for a hotkey-opened pane while auto-building the 2x2 grid.
+pub const GridPlacement = struct {
+    pane_id: runtime.WorkspacePaneId,
+    axis: runtime.WorkspaceSplitAxis,
+    new_after: bool,
+};
+
+// Chooses where a new hotkey-opened pane should land so the first four panes
+// form a 2x2 grid (TL -> TR -> BL -> BR) and a closed quadrant gets refilled.
+// Returns null when the grid is full (>= 4 panes), when maximized, or when no
+// geometry is available — callers then fall back to splitting the focused pane.
+//
+// Strategy: split the largest visible pane. The first split is side-by-side
+// (a `.vertical` divider, i.e. left|right), and afterwards we split the largest
+// pane along its longer dimension, which trends toward a square 2x2 and also
+// naturally refills a collapsed column. `.vertical` = left|right divider,
+// `.horizontal` = top/bottom divider (see split_left/right vs up/down).
+pub fn gridNewPanePlacement(state: *runtime.AppState) ?GridPlacement {
+    if (state.currentProjectWorkspaceMaximizedPaneId() != null) return null;
+    const visible = state.currentProjectWorkspaceVisiblePaneCount();
+    if (visible == 0 or visible >= 4) return null;
+    if (pane_rect_count == 0) return null;
+
+    // Largest-area pane wins; ties break to the left-most then top-most pane so
+    // the build order fills TL before TR/BL.
+    var best: usize = 0;
+    var i: usize = 1;
+    while (i < pane_rect_count) : (i += 1) {
+        const a = pane_rects[i].rect;
+        const b = pane_rects[best].rect;
+        const area_a = a.w * a.h;
+        const area_b = b.w * b.h;
+        if (area_a > area_b + 0.5) {
+            best = i;
+        } else if (area_a > area_b - 0.5) {
+            if (a.x < b.x - 0.5 or (a.x < b.x + 0.5 and a.y < b.y - 0.5)) best = i;
+        }
+    }
+
+    const r = pane_rects[best].rect;
+    const axis: runtime.WorkspaceSplitAxis = if (visible == 1)
+        .vertical
+    else if (r.w >= r.h)
+        .vertical
+    else
+        .horizontal;
+    return .{ .pane_id = pane_rects[best].pane_id, .axis = axis, .new_after = true };
+}
+
 pub const FocusDirection = enum { left, right, up, down };
 
 pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
