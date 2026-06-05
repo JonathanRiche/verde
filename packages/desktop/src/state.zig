@@ -2795,6 +2795,10 @@ pub const AppState = struct {
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
+    // Whether the OS window currently holds input focus. Updated from SDL
+    // window focus events; used to gate chat-completion notifications so we
+    // don't notify about a turn the user is actively watching.
+    window_input_focus: bool,
     debug_terminal_window_focused: bool,
     debug_terminal_hitbox_focused: bool,
     debug_terminal_hitbox_active: bool,
@@ -2997,6 +3001,7 @@ pub const AppState = struct {
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
+            .window_input_focus = true,
             .debug_terminal_window_focused = false,
             .debug_terminal_hitbox_focused = false,
             .debug_terminal_hitbox_active = false,
@@ -11154,6 +11159,7 @@ pub const AppState = struct {
                 }
             },
             .completed => {
+                had_pending_followup = send_state.pending_followup != null;
                 completed_result = send_state.result;
                 send_state.result = null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
@@ -11309,7 +11315,68 @@ pub const AppState = struct {
         if (next_status == .completed or next_status == .aborted) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
+        // Notify on a real chat turn completion. Skip when a follow-up is queued
+        // (the turn continues immediately) so we only fire once the agent truly
+        // rests, mirroring the terminal-agent `.done` notification.
+        if (next_status == .completed and !had_pending_followup) {
+            self.maybeNotifyChatCompletion(project_index, thread_index, thread);
+        }
         return next_status != .idle or stream_changed;
+    }
+
+    // Fires a desktop notification for a finished in-app chat turn, unless the
+    // user is actively watching that thread in the focused window. Provider is
+    // known here (no hook/CLI dependency), so the logo is always correct.
+    fn maybeNotifyChatCompletion(self: *AppState, project_index: usize, thread_index: usize, thread: *const ChatThread) void {
+        if (!self.app_config.notifications_enabled) return;
+        if (self.isChatThreadVisibleAndFocused(project_index, thread_index)) return;
+        if (project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+
+        const title = if (thread.title.len > 0)
+            thread.title
+        else
+            utils.providerLabel(thread.provider);
+
+        const dir = if (project.path.len > 0) std.fs.path.basename(project.path) else "";
+        var body_buf: [256]u8 = undefined;
+        const body = if (dir.len > 0)
+            (std.fmt.bufPrint(&body_buf, "Reply ready in {s}", .{dir}) catch "Reply ready")
+        else
+            "Reply ready";
+
+        const icon: notifier.Icon = switch (thread.provider) {
+            .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
+            .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
+            .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
+            .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        };
+        notifier.notifyAgentDone(self.allocator, title, body, icon);
+    }
+
+    // True when the given chat thread is currently on screen in the focused
+    // window: the window holds input focus, its project is selected, and a
+    // non-minimized chat pane (respecting maximize) shows that thread.
+    fn isChatThreadVisibleAndFocused(self: *const AppState, project_index: usize, thread_index: usize) bool {
+        if (!self.window_input_focus) return false;
+        if (project_index != self.selected_project_index) return false;
+        if (project_index >= self.projects.items.len) return false;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        if (layout.maximized_pane_id) |max_id| {
+            const pane = layout.paneById(max_id) orelse return false;
+            return switch (pane.ref) {
+                .chat => |ref| ref.thread_index == thread_index,
+                else => false,
+            };
+        }
+        for (layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => |ref| if (ref.thread_index == thread_index) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {
