@@ -1,10 +1,14 @@
 //! Shared subprocess environment helpers for packaged desktop launches.
 
 const std = @import("std");
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const PATH_SEPARATOR: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
 const SYSTEM_PATH_DIRS = [_][]const u8{
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
     "/usr/local/bin",
+    "/usr/local/sbin",
     "/usr/bin",
     "/bin",
     "/usr/sbin",
@@ -107,6 +111,20 @@ pub fn commandExists(executable: []const u8) bool {
     const resolved = resolveExecutableInEnvMapAlloc(std.heap.page_allocator, &env_map, executable) catch return false;
     defer std.heap.page_allocator.free(resolved);
     return true;
+}
+
+/// Applies Verde's packaged-launch PATH repair to the current process.
+/// Useful before PTY exec from a Finder-launched macOS app, where PATH is often
+/// too small for Homebrew-backed shell startup files.
+pub fn applyAugmentedPathToCurrentProcess(allocator: std.mem.Allocator) !void {
+    var env_map = try buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+
+    const path = env_map.get("PATH") orelse return;
+    const path_z = try allocator.dupeZ(u8, path);
+    // Do not free path_z after setenv: POSIX permits implementations to retain
+    // the supplied pointer, and PTY child processes exec immediately after this.
+    _ = setenv("PATH", path_z.ptr, 1);
 }
 
 fn appendUniquePathDir(
