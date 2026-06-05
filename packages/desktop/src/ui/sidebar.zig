@@ -1231,7 +1231,13 @@ fn renderOpenPaneRow(
             var agent_provider: ?Provider = if (surface) |s| s.provider else null;
             if (agent_provider == null) {
                 if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                    // Live foreground process when running, else the provider
+                    // pinned by the notify hook (persisted across restarts,
+                    // available before the agent process is revived).
                     if (dock.activeForegroundProcessName(&comm_buf)) |comm| agent_provider = providerFromComm(comm);
+                    if (agent_provider == null) {
+                        if (dock.activeTabPinnedProvider()) |name| agent_provider = std.meta.stringToEnum(Provider, name);
+                    }
                 }
             }
             if (agent_provider) |prov| {
