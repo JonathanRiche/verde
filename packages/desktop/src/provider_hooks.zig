@@ -77,7 +77,7 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\  fi
         \\fi
         \\
-        \\"$cli" notify --quiet --status "$status" --title "$title" --body "$body" >/dev/null 2>&1 || true
+        \\"$cli" notify --quiet --status "$status" --title "$title" --body "$body" --provider codex >/dev/null 2>&1 || true
         \\rm -f "$payload"
         \\exit 0
         \\
@@ -205,7 +205,7 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\  fi
         \\fi
         \\
-        \\"$cli" notify --quiet --status "$status" >/dev/null 2>&1 || true
+        \\"$cli" notify --quiet --status "$status" --provider claude >/dev/null 2>&1 || true
         \\rm -f "$payload"
         \\exit 0
         \\

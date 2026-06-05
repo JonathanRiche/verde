@@ -584,6 +584,7 @@ fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, ar
         .workspace_path = getenvSlice("VERDE_WORKSPACE_PATH"),
         .dock_id = parseOptionalU32(args.optionValue(argv, "--dock") orelse getenvSlice("VERDE_DOCK_ID")),
         .pane_id = parseOptionalU32(args.optionValue(argv, "--pane") orelse getenvSlice("VERDE_PANE_ID")),
+        .provider = args.optionValue(argv, "--provider") orelse getenvSlice("VERDE_PROVIDER"),
         .title = args.optionValue(argv, "--title"),
         .body = args.optionValue(argv, "--body"),
         .status = args.optionValue(argv, "--status"),
