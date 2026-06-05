@@ -5475,7 +5475,13 @@ pub const AppState = struct {
         if (update.pane_id) |value| s.pane_id = value;
         if (update.provider) |value| s.provider = value;
         if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
-        if (update.title) |value| try replaceOwnedSlice(self.allocator, &s.title, value);
+        if (update.title) |value| {
+            try replaceOwnedSlice(self.allocator, &s.title, value);
+            // Mirror the title onto the terminal tab's observed title so it
+            // persists across app restarts (surfaces are in-memory only). This
+            // is the same channel that carries Claude's OSC title.
+            if (value.len > 0) self.mirrorSurfaceTitleToTerminal(s, value);
+        }
         if (update.clear) {
             s.status = .idle;
             s.progress = null;
@@ -5507,6 +5513,22 @@ pub const AppState = struct {
         }
         self.markDirty();
         return s;
+    }
+
+    // Mirrors a notify-provided surface title onto the owning terminal tab's
+    // observed title. Surfaces are in-memory only, so without this a Codex pane
+    // title (derived from the prompt) would reset to the folder name after an
+    // app restart; observed titles are saved with the workspace layout.
+    fn mirrorSurfaceTitleToTerminal(self: *AppState, surface: *const SurfaceState, title: []const u8) void {
+        for (self.projects.items, 0..) |*project, idx| {
+            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
+                std.mem.eql(u8, surface.workspace_path, project.path);
+            if (!owns) continue;
+            if (self.projectTerminalDockMutable(idx, surface.dock_id)) |dock| {
+                _ = dock.setActiveTabObservedTitle(self.allocator, title);
+            }
+            return;
+        }
     }
 
     // Resolves which agent provider a surface belongs to, for the notification

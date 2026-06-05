@@ -379,6 +379,23 @@ pub const Dock = struct {
         return changed;
     }
 
+    /// Records an externally-provided title (e.g. from a Codex notify hook,
+    /// which has no OSC title) as the active tab's observed title, so it shows
+    /// in the sidebar and persists across restarts via the same channel as the
+    /// live OSC title. No-op when the title is empty or unchanged.
+    pub fn setActiveTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, title: []const u8) bool {
+        if (title.len == 0) return false;
+        const tab = self.activeTab() orelse return false;
+        if (tab.observed_title) |old| {
+            if (std.mem.eql(u8, old, title)) return false;
+        }
+        const dup = allocator.dupe(u8, title) catch return false;
+        if (tab.observed_title) |old| allocator.free(old);
+        tab.observed_title = dup;
+        self.workspace_changed = true;
+        return true;
+    }
+
     /// Remembers the active pane's live OSC title on its tab so it can be shown
     /// (and persisted) even after a restart, before the program re-emits it.
     fn captureTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, tab: *Tab) bool {
