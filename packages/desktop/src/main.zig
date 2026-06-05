@@ -1032,6 +1032,25 @@ fn processOneEvent(
     return keep_running;
 }
 
+const HotkeyPaneKind = enum { chat, terminal };
+
+// Opens a new pane via hotkey. For the first four panes it routes through the
+// 2x2 grid placement (gridNewPanePlacement); once the grid is full (or the
+// workspace is maximized) it falls back to splitting the focused pane along the
+// requested axis.
+fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis: native_state.WorkspaceSplitAxis) bool {
+    if (workspace_panes_ui.gridNewPanePlacement(state)) |p| {
+        return switch (kind) {
+            .chat => state.splitCurrentProjectWorkspacePaneWithChatPlacement(p.pane_id, p.axis, p.new_after),
+            .terminal => state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(p.pane_id, p.axis, p.new_after),
+        };
+    }
+    return switch (kind) {
+        .chat => state.splitFocusedWorkspacePaneWithChatAxis(fallback_axis),
+        .terminal => state.splitFocusedWorkspacePaneWithTerminalAxis(fallback_axis),
+    };
+}
+
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
@@ -1825,10 +1844,10 @@ fn handleKeyboardAction(
         .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
             state.requestTranscriptPageScroll(1);
         },
-        .workspace_split_chat_vertical => _ = state.splitFocusedWorkspacePaneWithChatAxis(.vertical),
-        .workspace_split_chat_horizontal => _ = state.splitFocusedWorkspacePaneWithChatAxis(.horizontal),
-        .workspace_split_terminal_vertical => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.vertical),
-        .workspace_split_terminal_horizontal => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.horizontal),
+        .workspace_split_chat_vertical => _ = openHotkeyWorkspacePane(state, .chat, .vertical),
+        .workspace_split_chat_horizontal => _ = openHotkeyWorkspacePane(state, .chat, .horizontal),
+        .workspace_split_terminal_vertical => _ = openHotkeyWorkspacePane(state, .terminal, .vertical),
+        .workspace_split_terminal_horizontal => _ = openHotkeyWorkspacePane(state, .terminal, .horizontal),
         .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
         .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
         .workspace_close => _ = state.closeFocusedWorkspacePane(),
