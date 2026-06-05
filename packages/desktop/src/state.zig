@@ -2839,6 +2839,7 @@ pub const AppState = struct {
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
     settings_hook_claude_installed: bool,
+    settings_hook_codex_installed: bool,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
     app_config_file_mtime: i128,
@@ -3041,6 +3042,7 @@ pub const AppState = struct {
             .show_settings_modal = false,
             .settings_draft = .{},
             .settings_hook_claude_installed = false,
+            .settings_hook_codex_installed = false,
             .settings_hover_control = null,
             .settings_close_hovered = false,
             .app_config_file_mtime = -1,
@@ -5289,6 +5291,7 @@ pub const AppState = struct {
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
         self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
+        self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
         self.show_settings_modal = true;
@@ -5319,6 +5322,32 @@ pub const AppState = struct {
             };
             self.settings_hook_claude_installed = true;
             self.setSidebarNotice("Enabled global Claude status hooks.");
+        }
+        self.markDirty();
+    }
+
+    /// Installs or removes the global Codex notify hooks and refreshes the
+    /// settings toggle state. Merges into ~/.codex/hooks.json, preserving any
+    /// user-owned hooks. Acts immediately (filesystem side effect).
+    pub fn toggleCodexGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_codex_installed) {
+            provider_hooks.removeCodexGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Codex hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Codex hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_codex_installed = false;
+            self.setSidebarNotice("Disabled global Codex status hooks.");
+        } else {
+            provider_hooks.ensureCodexGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Codex hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Codex hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_codex_installed = true;
+            self.setSidebarNotice("Enabled global Codex status hooks.");
         }
         self.markDirty();
     }

@@ -628,8 +628,9 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\  verde integrations remove <claude|codex|opencode|cursor> [--global]
             \\  verde integrations disable <claude|codex|opencode|cursor>
             \\
-            \\  --global installs Claude hooks in ~/.claude/settings.json for all
-            \\  projects (no-op outside Verde panes); otherwise hooks are project-local.
+            \\  --global installs Claude/Codex hooks in ~/.claude/settings.json or
+            \\  ~/.codex/hooks.json for all projects (merged, preserving existing
+            \\  hooks; no-op outside Verde panes); otherwise hooks are project-local.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -679,6 +680,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
                 return;
             }
             try out.stdout("verde integrations {s} claude --global: removed global Claude hooks from ~/.claude/settings.json\n", .{command});
+            return;
+        }
+        if (global and std.mem.eql(u8, provider.name, "codex")) {
+            provider_hooks.removeCodexGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} codex --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} codex --global: removed global Codex hooks from ~/.codex/hooks.json\n", .{command});
             return;
         }
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
@@ -802,6 +822,37 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install claude: installed project-local Claude hooks in .claude/settings.local.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "codex") and global) {
+        provider_hooks.ensureCodexGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install codex --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.codex/hooks.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install codex --global: merged global Codex hooks into ~/.codex/hooks.json\n", .{});
         return;
     }
 

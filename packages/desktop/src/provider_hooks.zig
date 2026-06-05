@@ -4,6 +4,21 @@ const CODEX_HOOK_MARKER = "verde-codex-notify-hook";
 const CODEX_HOOK_REL_PATH = ".verde/hooks/codex-notify-hook.sh";
 const CODEX_HOOKS_JSON_REL_PATH = ".codex/hooks.json";
 
+// Global (all-projects) Codex hooks live in ~/.codex/hooks.json with the hook
+// script at an absolute path, mirroring the global Claude integration. Codex
+// merges global and project hooks, so we merge our entries in while preserving
+// any hooks the user already runs (e.g. their own notify-stop.sh).
+const CODEX_GLOBAL_HOOK_REL = ".codex/verde-codex-notify-hook.sh";
+const CODEX_GLOBAL_HOOKS_JSON_REL = ".codex/hooks.json";
+const CODEX_GLOBAL_HOOK_NEEDLE = "verde-codex-notify-hook";
+const CodexHookEvent = struct { name: []const u8, status_message: []const u8 };
+const CODEX_HOOK_EVENTS = [_]CodexHookEvent{
+    .{ .name = "SessionStart", .status_message = "Syncing Verde session" },
+    .{ .name = "UserPromptSubmit", .status_message = "Marking Verde agent busy" },
+    .{ .name = "PermissionRequest", .status_message = "Marking Verde agent waiting" },
+    .{ .name = "Stop", .status_message = "Marking Verde agent done" },
+};
+
 pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []const u8) !void {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -328,6 +343,160 @@ pub fn removeClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
     defer if (updated) |u| allocator.free(u);
     if (updated) |u| try writeFileAtomic(allocator, io, settings_path, u, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+/// True when our managed hook is present in the global Codex hooks file.
+pub fn codexGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDir() orelse return false;
+    const hooks_path = std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL }) catch return false;
+    defer allocator.free(hooks_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), hooks_path, allocator, .limited(8 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, CODEX_GLOBAL_HOOK_NEEDLE) != null;
+}
+
+/// Installs the Codex notify hook globally by merging our events into the
+/// existing ~/.codex/hooks.json (preserving any hooks the user already runs).
+pub fn ensureCodexGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOK_REL });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    try ensureParentDir(io, hook_path);
+    try writeCodexHookScript(allocator, io, hook_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{}"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const merged = try mergeCodexHooks(allocator, existing, hook_path);
+    defer if (merged) |m| allocator.free(m);
+    if (merged) |m| {
+        try ensureParentDir(io, hooks_path);
+        try writeFileAtomic(allocator, io, hooks_path, m, .default_file);
+    }
+}
+
+/// Removes our managed hook entries from the global Codex hooks file and deletes
+/// the hook script, leaving any user-owned hooks intact. Idempotent.
+pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOK_REL });
+    defer allocator.free(hook_path);
+    const hooks_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL });
+    defer allocator.free(hooks_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, hooks_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const updated = try removeCodexHooksFromJson(allocator, existing, hook_path);
+    defer if (updated) |u| allocator.free(u);
+    if (updated) |u| try writeFileAtomic(allocator, io, hooks_path, u, .default_file);
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+fn codexMatcherEntry(arena: std.mem.Allocator, hook_path: []const u8, status_message: []const u8) !std.json.Value {
+    var cmd: std.json.ObjectMap = .empty;
+    try cmd.put(arena, "type", .{ .string = "command" });
+    try cmd.put(arena, "command", .{ .string = try arena.dupe(u8, hook_path) });
+    try cmd.put(arena, "timeout", .{ .integer = 5 });
+    try cmd.put(arena, "statusMessage", .{ .string = try arena.dupe(u8, status_message) });
+    var inner = std.json.Array.init(arena);
+    try inner.append(.{ .object = cmd });
+    var entry: std.json.ObjectMap = .empty;
+    try entry.put(arena, "matcher", .{ .string = "*" });
+    try entry.put(arena, "hooks", .{ .array = inner });
+    return .{ .object = entry };
+}
+
+fn ensureCodexEvent(arena: std.mem.Allocator, hooks: *std.json.ObjectMap, event: CodexHookEvent, hook_path: []const u8) !bool {
+    if (hooks.getPtr(event.name)) |ev| {
+        if (ev.* != .array) return false;
+        for (ev.array.items) |entry| {
+            // Reuse the Claude detector: both shapes nest commands under "hooks".
+            if (claudeEntryReferencesHook(entry, hook_path)) return false;
+        }
+        try ev.array.append(try codexMatcherEntry(arena, hook_path, event.status_message));
+        return true;
+    }
+    var arr = std.json.Array.init(arena);
+    try arr.append(try codexMatcherEntry(arena, hook_path, event.status_message));
+    try hooks.put(arena, event.name, .{ .array = arr });
+    return true;
+}
+
+fn mergeCodexHooks(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.CodexHooksParse;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.CodexHooksNotObject;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+
+    if (root.getPtr("hooks")) |hv| {
+        if (hv.* != .object) return error.CodexHooksHooksNotObject;
+    } else {
+        try root.put(arena, "hooks", .{ .object = .empty });
+    }
+    const hooks = &root.getPtr("hooks").?.object;
+
+    var changed = false;
+    for (CODEX_HOOK_EVENTS) |event| {
+        if (try ensureCodexEvent(arena, hooks, event, hook_path)) changed = true;
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+fn removeCodexHooksFromJson(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+    const hooks_val = root.getPtr("hooks") orelse return null;
+    if (hooks_val.* != .object) return null;
+    const hooks = &hooks_val.object;
+
+    var changed = false;
+    for (CODEX_HOOK_EVENTS) |event| {
+        const ev = hooks.getPtr(event.name) orelse continue;
+        if (ev.* != .array) continue;
+        var kept = std.json.Array.init(arena);
+        for (ev.array.items) |entry| {
+            if (claudeEntryReferencesHook(entry, hook_path)) {
+                changed = true;
+                continue;
+            }
+            try kept.append(entry);
+        }
+        if (kept.items.len == 0) {
+            _ = hooks.orderedRemove(event.name);
+        } else {
+            ev.* = .{ .array = kept };
+        }
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
 }
 
 fn claudeEntryReferencesHook(entry: std.json.Value, hook_path: []const u8) bool {
