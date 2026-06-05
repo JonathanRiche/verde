@@ -19,6 +19,7 @@ pub const Control = enum(u8) {
     open_vscode,
     open_zed,
     hooks_claude,
+    hooks_codex,
     notifications_toggle,
 };
 
@@ -98,6 +99,7 @@ const SettingsLayout = struct {
     custom_open: ?palette.Rect = null,
     integrations_card: palette.Rect,
     hooks_claude: palette.Rect,
+    hooks_codex: palette.Rect,
     integrations_hint_y: f32,
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
@@ -168,7 +170,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const appearance_h = m.labeledBlockH(2);
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // Title, field label, two toggle rows (Claude + Codex), hint.
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
 
@@ -257,7 +260,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const integrations_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = integrations_h };
     const hooks_claude_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const integrations_hint_y = hooks_claude_y + m.row_h + m.inner_gap;
+    const hooks_codex_y = hooks_claude_y + m.row_h + m.inner_gap;
+    const hooks_codex: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_codex_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const integrations_hint_y = hooks_codex_y + m.row_h + m.inner_gap;
 
     y += integrations_h + m.card_gap;
 
@@ -287,6 +292,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .custom_open = custom_open,
         .integrations_card = integrations_card,
         .hooks_claude = hooks_claude,
+        .hooks_codex = hooks_codex,
         .integrations_hint_y = integrations_hint_y,
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
@@ -329,6 +335,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queue_hit(state, layout.open_cells[index], .settings_control, @intFromEnum(choice.control));
     }
     queue_hit(state, layout.hooks_claude, .settings_control, @intFromEnum(Control.hooks_claude));
+    queue_hit(state, layout.hooks_codex, .settings_control, @intFromEnum(Control.hooks_codex));
     queue_hit(state, layout.notifications_toggle, .settings_control, @intFromEnum(Control.notifications_toggle));
 }
 
@@ -389,12 +396,14 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawFieldLabel(state, layout.integrations_card, m, "Status pip hooks (global)");
     const claude_on = state.settings_hook_claude_installed;
     drawToggleCell(state, layout.hooks_claude, if (claude_on) "Claude  ·  Enabled" else "Claude  ·  Disabled", claude_on, isControlHovered(state, .hooks_claude), layout.modal);
+    const codex_on = state.settings_hook_codex_installed;
+    drawToggleCell(state, layout.hooks_codex, if (codex_on) "Codex  ·  Enabled" else "Codex  ·  Disabled", codex_on, isControlHovered(state, .hooks_codex), layout.modal);
     queueText(state, .{
         .x = layout.integrations_card.x + m.card_pad,
         .y = layout.integrations_hint_y,
         .w = layout.integrations_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Writes hooks to ~/.claude/settings.json · no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
+    }, "Writes hooks to ~/.claude & ~/.codex · merges, no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
 
     // Notifications
     drawCardTitle(state, layout.notifications_card, "Notifications", layout.modal);
@@ -462,6 +471,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
         .hooks_claude => {
             state.toggleClaudeGlobalHooks();
+            return;
+        },
+        .hooks_codex => {
+            state.toggleCodexGlobalHooks();
             return;
         },
         // Draft toggle: persisted to verde.json on Save, like the other fields.
