@@ -129,6 +129,7 @@ pub const PersistedTab = struct {
     title: ?[]const u8 = null,
     observed_title: ?[]const u8 = null,
     pinned_title: ?[]const u8 = null,
+    pinned_provider: ?[]const u8 = null,
     active_pane_id: u32 = 0,
     root_node_id: u32 = 0,
     nodes: []const PersistedNode = &.{},
@@ -201,6 +202,11 @@ pub const Tab = struct {
     /// separate from `observed_title` so the live OSC stream can't overwrite it,
     /// and preferred over the OSC title when labeling the pane. Persisted.
     pinned_title: ?[]u8 = null,
+    /// Provider tag name (e.g. "codex", "claude") of the agent last seen running
+    /// in this tab, from a notify hook. Persisted so the sidebar can draw the
+    /// provider logo after a restart, before the agent process is revived (its
+    /// foreground process name isn't available until then).
+    pinned_provider: ?[]u8 = null,
     root: *PaneNode,
     active_pane_id: u32,
 
@@ -208,6 +214,7 @@ pub const Tab = struct {
         if (self.title) |title| allocator.free(title);
         if (self.observed_title) |observed| allocator.free(observed);
         if (self.pinned_title) |pinned| allocator.free(pinned);
+        if (self.pinned_provider) |pinned| allocator.free(pinned);
         deinitPaneNode(self.root, allocator);
     }
 };
@@ -402,6 +409,28 @@ pub const Dock = struct {
         tab.pinned_title = dup;
         self.workspace_changed = true;
         return true;
+    }
+
+    /// Records the provider (tag name) of the agent running in the active tab so
+    /// the sidebar can draw its logo after a restart, before the process revives.
+    pub fn setActiveTabPinnedProvider(self: *Dock, allocator: std.mem.Allocator, provider: []const u8) bool {
+        if (provider.len == 0) return false;
+        const tab = self.activeTab() orelse return false;
+        if (tab.pinned_provider) |old| {
+            if (std.mem.eql(u8, old, provider)) return false;
+        }
+        const dup = allocator.dupe(u8, provider) catch return false;
+        if (tab.pinned_provider) |old| allocator.free(old);
+        tab.pinned_provider = dup;
+        self.workspace_changed = true;
+        return true;
+    }
+
+    /// The provider tag name pinned on the active tab, if any (for the sidebar
+    /// logo fallback when no live surface/foreground process is available).
+    pub fn activeTabPinnedProvider(self: *const Dock) ?[]const u8 {
+        const tab = self.activeTabConst() orelse return null;
+        return tab.pinned_provider;
     }
 
     /// Remembers the active pane's live OSC title on its tab so it can be shown
@@ -869,6 +898,7 @@ pub const Dock = struct {
                 .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
                 .observed_title = if (tab.observed_title) |observed| try arena_allocator.dupe(u8, observed) else null,
                 .pinned_title = if (tab.pinned_title) |pinned| try arena_allocator.dupe(u8, pinned) else null,
+                .pinned_provider = if (tab.pinned_provider) |pinned| try arena_allocator.dupe(u8, pinned) else null,
                 .active_pane_id = tab.active_pane_id,
                 .root_node_id = root_node_id,
                 .nodes = try nodes.toOwnedSlice(arena_allocator),
@@ -900,6 +930,7 @@ pub const Dock = struct {
                 .title = if (persisted_tab.title) |tab_title| try allocator.dupe(u8, tab_title) else null,
                 .observed_title = if (persisted_tab.observed_title) |observed| try allocator.dupe(u8, observed) else null,
                 .pinned_title = if (persisted_tab.pinned_title) |pinned| try allocator.dupe(u8, pinned) else null,
+                .pinned_provider = if (persisted_tab.pinned_provider) |pinned| try allocator.dupe(u8, pinned) else null,
                 .root = root,
                 .active_pane_id = persisted_tab.active_pane_id,
             };

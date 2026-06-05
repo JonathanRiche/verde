@@ -5473,14 +5473,24 @@ pub const AppState = struct {
         if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
         if (update.dock_id) |value| s.dock_id = value;
         if (update.pane_id) |value| s.pane_id = value;
-        if (update.provider) |value| s.provider = value;
+        if (update.provider) |value| {
+            s.provider = value;
+            // Pin the provider on the terminal tab so the sidebar can draw the
+            // logo after a restart, before the agent process revives.
+            if (self.terminalDockForSurface(s)) |dock| {
+                _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
+            }
+        }
         if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
         if (update.title) |value| {
             try replaceOwnedSlice(self.allocator, &s.title, value);
-            // Mirror the title onto the terminal tab's observed title so it
-            // persists across app restarts (surfaces are in-memory only). This
-            // is the same channel that carries Claude's OSC title.
-            if (value.len > 0) self.mirrorSurfaceTitleToTerminal(s, value);
+            // Pin the title on the terminal tab so it persists across restarts
+            // (surfaces are in-memory only) and survives Codex's folder-name OSC.
+            if (value.len > 0) {
+                if (self.terminalDockForSurface(s)) |dock| {
+                    _ = dock.setActiveTabPinnedTitle(self.allocator, value);
+                }
+            }
         }
         if (update.clear) {
             s.status = .idle;
@@ -5515,20 +5525,18 @@ pub const AppState = struct {
         return s;
     }
 
-    // Mirrors a notify-provided surface title onto the owning terminal tab's
-    // observed title. Surfaces are in-memory only, so without this a Codex pane
-    // title (derived from the prompt) would reset to the folder name after an
-    // app restart; observed titles are saved with the workspace layout.
-    fn mirrorSurfaceTitleToTerminal(self: *AppState, surface: *const SurfaceState, title: []const u8) void {
+    // Resolves the terminal dock that owns a surface (by workspace + dock id),
+    // so notify-provided metadata can be pinned onto its tab. Surfaces are
+    // in-memory only; pinning onto the tab persists across restarts via the
+    // workspace layout.
+    fn terminalDockForSurface(self: *AppState, surface: *const SurfaceState) ?*terminal.Dock {
         for (self.projects.items, 0..) |*project, idx| {
             const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
                 std.mem.eql(u8, surface.workspace_path, project.path);
             if (!owns) continue;
-            if (self.projectTerminalDockMutable(idx, surface.dock_id)) |dock| {
-                _ = dock.setActiveTabPinnedTitle(self.allocator, title);
-            }
-            return;
+            return self.projectTerminalDockMutable(idx, surface.dock_id);
         }
+        return null;
     }
 
     // Resolves which agent provider a surface belongs to, for the notification
