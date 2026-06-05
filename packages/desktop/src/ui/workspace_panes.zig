@@ -100,6 +100,84 @@ pub fn isFocusAnimating() bool {
     return (nowMs() - focus_anim_start_ms) < FOCUS_ANIM_DURATION_MS;
 }
 
+// "Completion pulse": when a pane's agent work transitions to `.done` we flash
+// its tiled border in a distinct themed color for ~2s, then ease back to the
+// resting focus-border color. This is the workspace-pane analog of the sidebar
+// "done" pip. We track per-pane status here (on the main thread, in renderAt)
+// because the IPC worker thread owns surface updates and must not read layout.
+const COMPLETION_PULSE_DURATION_MS: i64 = 2000;
+// Number of brighten/dim cycles the border performs across the pulse window.
+const COMPLETION_PULSE_CYCLES: f32 = 2.0;
+// One slot per layout pane we can realistically have on screen at once.
+const MAX_COMPLETION_PULSE_SLOTS = MAX_WORKSPACE_PANE_RECTS;
+
+const CompletionPulseSlot = struct {
+    pane_id: runtime.WorkspacePaneId = 0,
+    // Last observed surface status for this pane, used to detect the
+    // `!= .done` -> `.done` edge that triggers a fresh pulse.
+    last_status: runtime.SurfaceStatus = .idle,
+    start_ms: i64 = std.math.minInt(i64) >> 2,
+    used: bool = false,
+};
+
+var completion_pulse_slots: [MAX_COMPLETION_PULSE_SLOTS]CompletionPulseSlot =
+    [_]CompletionPulseSlot{.{}} ** MAX_COMPLETION_PULSE_SLOTS;
+
+pub fn isCompletionPulseAnimating() bool {
+    const now = nowMs();
+    for (completion_pulse_slots) |slot| {
+        if (!slot.used) continue;
+        if ((now - slot.start_ms) < COMPLETION_PULSE_DURATION_MS) return true;
+    }
+    return false;
+}
+
+// Placement for a hotkey-opened pane while auto-building the 2x2 grid.
+pub const GridPlacement = struct {
+    pane_id: runtime.WorkspacePaneId,
+    axis: runtime.WorkspaceSplitAxis,
+    new_after: bool,
+};
+
+// Chooses where a new hotkey-opened pane should land so the first four panes
+// form a 2x2 grid (TL -> TR -> BL -> BR) and a closed quadrant gets refilled.
+// Returns null when the grid is full (>= 4 panes), when maximized, or when no
+// geometry is available — callers then fall back to splitting the focused pane.
+//
+// The axis is driven by the build step, not aspect ratio: the first new pane
+// splits side-by-side (a `.vertical` divider, i.e. left|right). The 2nd and 3rd
+// then split the remaining full-height column into rows (`.horizontal`,
+// top/bottom), which yields a square 2x2 on any display and naturally refills a
+// collapsed column. (Aspect ratio fails on wide displays, where a half-width
+// pane is still landscape and keeps spawning columns.)
+pub fn gridNewPanePlacement(state: *runtime.AppState) ?GridPlacement {
+    if (state.currentProjectWorkspaceMaximizedPaneId() != null) return null;
+    const visible = state.currentProjectWorkspaceVisiblePaneCount();
+    if (visible == 0 or visible >= 4) return null;
+    if (pane_rect_count == 0) return null;
+
+    if (visible == 1) {
+        // First split: side-by-side, regardless of window aspect.
+        return .{ .pane_id = pane_rects[0].pane_id, .axis = .vertical, .new_after = true };
+    }
+
+    // Panes 3 and 4: split the full-height column into top/bottom. The target is
+    // the tallest pane (the not-yet-rowed column), tie-broken to the left-most so
+    // the left column rows before the right (BL before BR).
+    var best: usize = 0;
+    var i: usize = 1;
+    while (i < pane_rect_count) : (i += 1) {
+        const a = pane_rects[i].rect;
+        const b = pane_rects[best].rect;
+        if (a.h > b.h + 0.5) {
+            best = i;
+        } else if (a.h > b.h - 0.5 and a.x < b.x - 0.5) {
+            best = i;
+        }
+    }
+    return .{ .pane_id = pane_rects[best].pane_id, .axis = .horizontal, .new_after = true };
+}
+
 pub const FocusDirection = enum { left, right, up, down };
 
 pub fn focusPaneInDirection(state: *runtime.AppState, dir: FocusDirection) bool {
@@ -376,6 +454,85 @@ fn tickFocusAnimation(state: *runtime.AppState) void {
     focus_anim_start_ms = nowMs();
 }
 
+// Scans the current project's panes for terminal surfaces that just finished
+// (`status` flipped to `.done`) and stamps a completion pulse for that pane.
+// Runs on the main thread from renderAt so it can safely read layout/surfaces.
+fn tickCompletionPulse(state: *runtime.AppState) void {
+    if (state.projects.items.len == 0) return;
+    if (state.selected_project_index >= state.projects.items.len) return;
+    const layout = &state.projects.items[state.selected_project_index].workspace_layout;
+    const now = nowMs();
+    for (layout.panes.items) |pane| {
+        const dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => continue,
+        };
+        const surface = state.projectTerminalSurface(state.selected_project_index, dock_id);
+        const status: runtime.SurfaceStatus = if (surface) |s| s.status else .idle;
+        const slot = completionPulseSlot(pane.id);
+        // Trigger on the transition into `.done`; holding at `.done` must not
+        // re-fire, and a never-seen pane adopts its current status silently.
+        if (slot.used and slot.last_status != .done and status == .done) {
+            slot.start_ms = now;
+        }
+        slot.last_status = status;
+        slot.used = true;
+    }
+}
+
+// Returns the tracking slot for a pane, reusing an existing one or claiming a
+// free/oldest slot. Pane ids are reused sparingly so a small table is fine.
+fn completionPulseSlot(pane_id: runtime.WorkspacePaneId) *CompletionPulseSlot {
+    var free: ?*CompletionPulseSlot = null;
+    var oldest: *CompletionPulseSlot = &completion_pulse_slots[0];
+    for (&completion_pulse_slots) |*slot| {
+        if (slot.used and slot.pane_id == pane_id) return slot;
+        if (!slot.used and free == null) free = slot;
+        if (slot.start_ms < oldest.start_ms) oldest = slot;
+    }
+    const target = free orelse oldest;
+    target.* = .{ .pane_id = pane_id };
+    return target;
+}
+
+// Fraction of the pulse window over which the color is held near full strength
+// before easing back to the resting border. Keeping the pulse sustained for
+// most of the ~2s (rather than decaying immediately) is what makes it readable.
+const COMPLETION_PULSE_RELEASE_START: f32 = 0.65;
+
+// Pulse intensity in [0,1] for a pane: held near 1 for most of the window with a
+// gentle throb so the border visibly "pulses", then eased to 0 at the tail so it
+// settles back to the resting border color. 0 means no active pulse.
+fn completionPulseFactor(pane_id: runtime.WorkspacePaneId) f32 {
+    for (completion_pulse_slots) |slot| {
+        if (!slot.used or slot.pane_id != pane_id) continue;
+        const elapsed = nowMs() - slot.start_ms;
+        if (elapsed < 0 or elapsed >= COMPLETION_PULSE_DURATION_MS) return 0.0;
+        const t = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(COMPLETION_PULSE_DURATION_MS));
+        // Sustain at full strength, then smoothly ease to 0 over the tail.
+        const sustain = if (t < COMPLETION_PULSE_RELEASE_START)
+            @as(f32, 1.0)
+        else blk: {
+            const r = (t - COMPLETION_PULSE_RELEASE_START) / (1.0 - COMPLETION_PULSE_RELEASE_START);
+            break :blk 0.5 + 0.5 * @cos(std.math.pi * r);
+        };
+        // Throb with a floor (0.55..1.0) so the pulse stays on its distinct
+        // color during the window instead of dipping back to resting mid-pulse.
+        const throb = 0.775 + 0.225 * @cos(2.0 * std.math.pi * COMPLETION_PULSE_CYCLES * t);
+        return sustain * throb;
+    }
+    return 0.0;
+}
+
+fn lerpColor(a: [4]f32, b: [4]f32, t: f32) [4]f32 {
+    return .{
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    };
+}
+
 fn easeOutCubic(t: f32) f32 {
     const inv = 1.0 - t;
     return 1.0 - inv * inv * inv;
@@ -399,6 +556,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     state.ensureCurrentProjectWorkspace();
     state.debug_workspace_visible_pane_count = state.currentProjectWorkspaceVisiblePaneCount();
     tickFocusAnimation(state);
+    tickCompletionPulse(state);
     hit_cache.count = 0;
     pane_rect_count = 0;
     browser_pane_rendered = false;
@@ -767,9 +925,15 @@ fn renderLeaf(state: *runtime.AppState, pane_id: runtime.WorkspacePaneId, rect: 
         const header_rect = palette.Rect{ .x = rect.x, .y = rect.y, .w = rect.w, .h = header_h };
         renderPaneOverlay(state, pane_id, header_rect, reserve);
     }
-    const alpha = focusBorderAlpha(pane_id);
+    // Resting/focus border fade plus a transient completion pulse. The pulse can
+    // light up an unfocused pane (alpha 0 at rest), so the visible alpha is the
+    // max of the two and the color eases from the pulse color back to resting.
+    const focus_alpha = focusBorderAlpha(pane_id);
+    const pulse = completionPulseFactor(pane_id);
+    const alpha = @max(focus_alpha, pulse);
     if (alpha > 0.01) {
-        var border_color = theme.COLOR_SECONDARY_GREEN;
+        // p=1 -> full pulse color; p=0 -> resting focus-border color.
+        var border_color = lerpColor(theme.COLOR_SECONDARY_GREEN, theme.COLOR_DIFF_ADD, pulse);
         border_color[3] *= alpha;
         queueBorder(state, rect, paletteColor(border_color), 0.0, theme.scaledUi(2.0));
     }

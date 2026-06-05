@@ -63,6 +63,11 @@ const MAX_WINDOW_WIDTH: c_int = 1520;
 const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
+// Wake the event loop at least 4 times per second while any chat turn is in
+// flight so the "Working - mm:ss" label (computed from wall clock) ticks
+// even when no streamed tokens or input events arrive. pollSend gates the
+// actual render on a whole-second change, so cost is ~1 render/sec.
+const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
@@ -138,8 +143,28 @@ pub fn main(init: std.process.Init) void {
     mainInner(init) catch |err| {
         runtime_log.diagnostic("fatal startup error: {s}", .{@errorName(err)});
         std.debug.print("fatal startup error: {s}\n", .{@errorName(err)});
+        logFatalStartupHint(err);
         std.process.exit(1);
     };
+}
+
+fn logFatalStartupHint(err: anyerror) void {
+    switch (err) {
+        error.SdlGpuCreateDeviceFailed => if (builtin.os.tag == .linux) {
+            runtime_log.diagnostic("startup hint: SDL GPU device creation failed. This usually means Vulkan is unavailable for the active GPU. Install the Vulkan driver for your GPU: Arch Intel `vulkan-intel`, AMD `vulkan-radeon`, software fallback `vulkan-swrast`; Debian/Ubuntu Intel/AMD `mesa-vulkan-drivers`.", .{});
+            std.debug.print(
+                \\startup hint: SDL GPU could not create a Vulkan device.
+                \\Install the Vulkan driver for the active GPU:
+                \\  Arch Intel: sudo pacman -S --needed vulkan-intel
+                \\  Arch AMD:   sudo pacman -S --needed vulkan-radeon
+                \\  Fallback:   sudo pacman -S --needed vulkan-swrast
+                \\  Debian/Ubuntu Intel/AMD: sudo apt install mesa-vulkan-drivers
+                \\Then verify with: vulkaninfo --summary
+                \\
+            , .{});
+        },
+        else => {},
+    }
 }
 
 fn mainInner(init: std.process.Init) !void {
@@ -380,6 +405,7 @@ fn mainInner(init: std.process.Init) !void {
     state.attachBrowserHostWindow(nativeBrowserHostWindow(window));
     state.openBrowserOnLaunchIfRequested();
     state.restorePersistedBrowserPaneOnLaunch();
+    state.applyInitialWorkspaceFocusOnLaunch();
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
@@ -1006,18 +1032,54 @@ fn processOneEvent(
     return keep_running;
 }
 
+const HotkeyPaneKind = enum { chat, terminal };
+
+// Opens a new pane via hotkey. For the first four panes it routes through the
+// 2x2 grid placement (gridNewPanePlacement); once the grid is full (or the
+// workspace is maximized) it falls back to splitting the focused pane along the
+// requested axis.
+fn openHotkeyWorkspacePane(state: *AppState, kind: HotkeyPaneKind, fallback_axis: native_state.WorkspaceSplitAxis) bool {
+    if (workspace_panes_ui.gridNewPanePlacement(state)) |p| {
+        return switch (kind) {
+            .chat => state.splitCurrentProjectWorkspacePaneWithChatPlacement(p.pane_id, p.axis, p.new_after),
+            .terminal => state.splitCurrentProjectWorkspacePaneWithTerminalPlacement(p.pane_id, p.axis, p.new_after),
+        };
+    }
+    return switch (kind) {
+        .chat => state.splitFocusedWorkspacePaneWithChatAxis(fallback_axis),
+        .terminal => state.splitFocusedWorkspacePaneWithTerminalAxis(fallback_axis),
+    };
+}
+
+// The "new thread" hotkey: while building the 2x2 grid (first four panes) it
+// tiles a fresh chat thread into the next grid slot like the split hotkeys;
+// once the grid is full it falls back to the default behavior (reuse a visible
+// chat pane, otherwise split the focused pane).
+fn openHotkeyWorkspaceChatThread(state: *AppState) bool {
+    if (workspace_panes_ui.gridNewPanePlacement(state)) |p| {
+        return state.splitCurrentProjectWorkspacePaneWithChatPlacement(p.pane_id, p.axis, p.new_after);
+    }
+    state.createThreadForProject(state.selected_project_index);
+    return true;
+}
+
 fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
+        workspace_panes_ui.isCompletionPulseAnimating() or
         ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    return if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating())
-        ACTIVE_WAIT_TIMEOUT_MS
-    else
-        IDLE_WAIT_TIMEOUT_MS;
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating()) {
+        return ACTIVE_WAIT_TIMEOUT_MS;
+    }
+    // While a chat turn is pending we still want the wall-clock "Working"
+    // label to tick. pollSend bumps once per whole second; this just caps
+    // the SDL wait so we actually reach pollSend before that second elapses.
+    if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    return IDLE_WAIT_TIMEOUT_MS;
 }
 
 fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.NativeKeyboardConfig, ui_scale: f32, event: *sdl.Event) bool {
@@ -1036,6 +1098,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         },
         .window_shown, .window_restored => {
             state.resumeBrowserAfterHostWindowShown();
+        },
+        .window_focus_gained => {
+            state.window_input_focus = true;
+        },
+        .window_focus_lost => {
+            state.window_input_focus = false;
         },
         .key_down => {
             if (browserInputDebugEnabled()) {
@@ -1771,7 +1839,7 @@ fn handleKeyboardAction(
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
         .open_default => state.runDefaultOpenAction(),
-        .new_thread => state.createThreadForProject(state.selected_project_index),
+        .new_thread => _ = openHotkeyWorkspaceChatThread(state),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_browser => state.toggleBrowser(),
@@ -1788,10 +1856,10 @@ fn handleKeyboardAction(
         .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
             state.requestTranscriptPageScroll(1);
         },
-        .workspace_split_chat_vertical => _ = state.splitFocusedWorkspacePaneWithChatAxis(.vertical),
-        .workspace_split_chat_horizontal => _ = state.splitFocusedWorkspacePaneWithChatAxis(.horizontal),
-        .workspace_split_terminal_vertical => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.vertical),
-        .workspace_split_terminal_horizontal => _ = state.splitFocusedWorkspacePaneWithTerminalAxis(.horizontal),
+        .workspace_split_chat_vertical => _ = openHotkeyWorkspacePane(state, .chat, .vertical),
+        .workspace_split_chat_horizontal => _ = openHotkeyWorkspacePane(state, .chat, .horizontal),
+        .workspace_split_terminal_vertical => _ = openHotkeyWorkspacePane(state, .terminal, .vertical),
+        .workspace_split_terminal_horizontal => _ = openHotkeyWorkspacePane(state, .terminal, .horizontal),
         .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
         .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
         .workspace_close => _ = state.closeFocusedWorkspacePane(),
@@ -1879,6 +1947,10 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         _ = SDL_HideWindow(window);
     }
     if (builtin.os.tag == .linux) {
+        if (state.isPickerPending()) {
+            runtime_log.diagnostic("ignoring linux window close request while folder picker is pending", .{});
+            return true;
+        }
         const window_flags = SDL_GetWindowFlags(window);
         const suspicious_close = !window_flags.input_focus or
             !window_flags.mouse_focus or

@@ -98,6 +98,14 @@ pub const SessionSnapshot = struct {
     signal: ?u32 = null,
 };
 
+pub const NotificationEvent = struct {
+    session_id: []const u8,
+    pane_id: u32,
+    title: []const u8 = "",
+    body: []const u8 = "",
+    attention: bool = true,
+};
+
 const SessionCreateOptions = struct {
     cwd: []const u8,
     cols: u16,
@@ -120,6 +128,9 @@ pub const PersistedWorkspace = struct {
 
 pub const PersistedTab = struct {
     title: ?[]const u8 = null,
+    observed_title: ?[]const u8 = null,
+    pinned_title: ?[]const u8 = null,
+    pinned_provider: ?[]const u8 = null,
     active_pane_id: u32 = 0,
     root_node_id: u32 = 0,
     nodes: []const PersistedNode = &.{},
@@ -183,11 +194,28 @@ const PaneFocusCandidate = struct {
 pub const Tab = struct {
     id: u32,
     title: ?[]u8 = null,
+    /// Last non-empty OSC title observed for the active pane's program (e.g. an
+    /// agent's session summary). Persisted so the label survives a Verde restart
+    /// even before the program re-emits its title.
+    observed_title: ?[]u8 = null,
+    /// Externally-pinned title from a notify hook (e.g. Codex, which sets its
+    /// OSC title to the folder name and has no session-summary field). Kept
+    /// separate from `observed_title` so the live OSC stream can't overwrite it,
+    /// and preferred over the OSC title when labeling the pane. Persisted.
+    pinned_title: ?[]u8 = null,
+    /// Provider tag name (e.g. "codex", "claude") of the agent last seen running
+    /// in this tab, from a notify hook. Persisted so the sidebar can draw the
+    /// provider logo after a restart, before the agent process is revived (its
+    /// foreground process name isn't available until then).
+    pinned_provider: ?[]u8 = null,
     root: *PaneNode,
     active_pane_id: u32,
 
     fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
+        if (self.observed_title) |observed| allocator.free(observed);
+        if (self.pinned_title) |pinned| allocator.free(pinned);
+        if (self.pinned_provider) |pinned| allocator.free(pinned);
         deinitPaneNode(self.root, allocator);
     }
 };
@@ -361,8 +389,66 @@ pub const Dock = struct {
         var changed = false;
         for (self.tabs.items) |*tab| {
             changed = (try pollPaneNode(tab.root, allocator)) or changed;
+            if (self.captureTabObservedTitle(allocator, tab)) changed = true;
         }
         return changed;
+    }
+
+    /// Records an externally-provided title (e.g. from a Codex notify hook,
+    /// which sets its OSC title to the folder and has no session-summary field)
+    /// as the active tab's pinned title. Kept separate from observed_title so
+    /// the live OSC stream can't overwrite it; persisted so it survives a
+    /// restart. No-op when the title is empty or unchanged.
+    pub fn setActiveTabPinnedTitle(self: *Dock, allocator: std.mem.Allocator, title: []const u8) bool {
+        if (title.len == 0) return false;
+        const tab = self.activeTab() orelse return false;
+        if (tab.pinned_title) |old| {
+            if (std.mem.eql(u8, old, title)) return false;
+        }
+        const dup = allocator.dupe(u8, title) catch return false;
+        if (tab.pinned_title) |old| allocator.free(old);
+        tab.pinned_title = dup;
+        self.workspace_changed = true;
+        return true;
+    }
+
+    /// Records the provider (tag name) of the agent running in the active tab so
+    /// the sidebar can draw its logo after a restart, before the process revives.
+    pub fn setActiveTabPinnedProvider(self: *Dock, allocator: std.mem.Allocator, provider: []const u8) bool {
+        if (provider.len == 0) return false;
+        const tab = self.activeTab() orelse return false;
+        if (tab.pinned_provider) |old| {
+            if (std.mem.eql(u8, old, provider)) return false;
+        }
+        const dup = allocator.dupe(u8, provider) catch return false;
+        if (tab.pinned_provider) |old| allocator.free(old);
+        tab.pinned_provider = dup;
+        self.workspace_changed = true;
+        return true;
+    }
+
+    /// The provider tag name pinned on the active tab, if any (for the sidebar
+    /// logo fallback when no live surface/foreground process is available).
+    pub fn activeTabPinnedProvider(self: *const Dock) ?[]const u8 {
+        const tab = self.activeTabConst() orelse return null;
+        return tab.pinned_provider;
+    }
+
+    /// Remembers the active pane's live OSC title on its tab so it can be shown
+    /// (and persisted) even after a restart, before the program re-emits it.
+    fn captureTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, tab: *Tab) bool {
+        const pane = findPaneLeaf(tab.root, tab.active_pane_id) orelse findFirstPaneLeaf(tab.root) orelse return false;
+        const session = pane.session orelse return false;
+        var buf: [96]u8 = undefined;
+        const live = session.liveOscTitle(&buf) orelse return false;
+        if (tab.observed_title) |old| {
+            if (std.mem.eql(u8, old, live)) return false;
+        }
+        const dup = allocator.dupe(u8, live) catch return false;
+        if (tab.observed_title) |old| allocator.free(old);
+        tab.observed_title = dup;
+        self.workspace_changed = true;
+        return true;
     }
 
     pub fn rethemeSessions(self: *Dock, allocator: std.mem.Allocator) !void {
@@ -579,6 +665,28 @@ pub const Dock = struct {
         return findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root);
     }
 
+    pub fn activeSessionId(self: *const Dock) ?[]const u8 {
+        const pane = self.activePaneConst() orelse return null;
+        if (pane.session) |session| {
+            return session.sessionId();
+        }
+        return pane.session_id;
+    }
+
+    pub fn takeActiveNotification(self: *Dock) ?NotificationEvent {
+        const pane = self.activePane() orelse return null;
+        const session = pane.session orelse return null;
+        return session.takeNotification(pane.id);
+    }
+
+    pub fn clearNotificationForSession(self: *Dock, session_id: []const u8) bool {
+        var cleared = false;
+        for (self.tabs.items) |*tab| {
+            if (clearNotificationInNode(tab.root, session_id)) cleared = true;
+        }
+        return cleared;
+    }
+
     pub fn focusPane(self: *Dock, pane_id: u32) void {
         const tab = self.activeTab() orelse return;
         if (findPaneLeaf(tab.root, pane_id) == null) return;
@@ -681,6 +789,50 @@ pub const Dock = struct {
         return "Shell";
     }
 
+    /// Like `tabTitle`, but prefers a live label for whatever program is running
+    /// in the active pane — its OSC title (e.g. an agent's session summary) or
+    /// process name — over the cwd fallback. Used for compact labels such as the
+    /// sidebar's open-pane list.
+    pub fn activeProcessLabel(self: *const Dock, buffer: *[96]u8) []const u8 {
+        if (self.activeTabConst()) |tab| {
+            const session: ?*Session = blk: {
+                const pane = findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root) orelse break :blk null;
+                break :blk pane.session;
+            };
+            // 0. externally-pinned title (e.g. Codex notify hook). Wins over the
+            //    OSC title because Codex sets its OSC title to the folder name.
+            if (tab.pinned_title) |pinned| {
+                if (pinned.len > 0) return pinned;
+            }
+            // 1. live OSC title (the running program's session summary)
+            if (session) |s| {
+                if (s.liveOscTitle(buffer)) |osc| return osc;
+            }
+            // 2. last observed title, persisted across restarts (shown before the
+            //    program re-emits its OSC title)
+            if (tab.observed_title) |observed| {
+                if (observed.len > 0) return observed;
+            }
+            // 3. foreground process name (e.g. `claude` before it sets a title)
+            if (session) |s| {
+                if (s.foregroundProcessName(buffer)) |name| return name;
+            }
+        }
+        return self.tabTitle(self.active_tab_index, buffer);
+    }
+
+    /// The active pane's foreground process name (e.g. `claude`, `codex`) when a
+    /// program other than the shell is running, else null. Used to pick a
+    /// provider-aware icon in the sidebar.
+    pub fn activeForegroundProcessName(self: *const Dock, buffer: *[96]u8) ?[]const u8 {
+        if (self.activeTabConst()) |tab| {
+            if (findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root)) |pane| {
+                if (pane.session) |session| return session.foregroundProcessName(buffer);
+            }
+        }
+        return null;
+    }
+
     pub fn beginRenameTab(self: *Dock, tab_id: u32) void {
         self.rename_tab_id = tab_id;
         @memset(&self.rename_storage, 0);
@@ -745,6 +897,9 @@ pub const Dock = struct {
             const root_node_id = try serializePaneNode(arena_allocator, tab.root, &nodes, &next_node_id, context);
             try persisted_tabs.append(arena_allocator, .{
                 .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
+                .observed_title = if (tab.observed_title) |observed| try arena_allocator.dupe(u8, observed) else null,
+                .pinned_title = if (tab.pinned_title) |pinned| try arena_allocator.dupe(u8, pinned) else null,
+                .pinned_provider = if (tab.pinned_provider) |pinned| try arena_allocator.dupe(u8, pinned) else null,
                 .active_pane_id = tab.active_pane_id,
                 .root_node_id = root_node_id,
                 .nodes = try nodes.toOwnedSlice(arena_allocator),
@@ -774,6 +929,9 @@ pub const Dock = struct {
             var tab = Tab{
                 .id = self.allocateTabId(),
                 .title = if (persisted_tab.title) |tab_title| try allocator.dupe(u8, tab_title) else null,
+                .observed_title = if (persisted_tab.observed_title) |observed| try allocator.dupe(u8, observed) else null,
+                .pinned_title = if (persisted_tab.pinned_title) |pinned| try allocator.dupe(u8, pinned) else null,
+                .pinned_provider = if (persisted_tab.pinned_provider) |pinned| try allocator.dupe(u8, pinned) else null,
                 .root = root,
                 .active_pane_id = persisted_tab.active_pane_id,
             };
@@ -1081,6 +1239,19 @@ fn findFirstPaneLeafConst(node: *const PaneNode) ?*const PaneLeaf {
     };
 }
 
+fn clearNotificationInNode(node: *PaneNode, session_id: []const u8) bool {
+    return switch (node.*) {
+        .leaf => |*leaf| blk: {
+            const session = leaf.session orelse break :blk false;
+            const id = session.sessionId() orelse break :blk false;
+            if (!std.mem.eql(u8, id, session_id)) break :blk false;
+            session.clearNotification();
+            break :blk true;
+        },
+        .split => |*split| clearNotificationInNode(split.first, session_id) or clearNotificationInNode(split.second, session_id),
+    };
+}
+
 fn paneNodeContains(node: *PaneNode, pane_id: u32) bool {
     return findPaneLeaf(node, pane_id) != null;
 }
@@ -1382,9 +1553,27 @@ const UnsupportedSession = struct {
         return "Shell";
     }
 
+    pub fn liveOscTitle(_: *const UnsupportedSession, _: *[96]u8) ?[]const u8 {
+        return null;
+    }
+
+    pub fn foregroundProcessName(_: *const UnsupportedSession, _: *[96]u8) ?[]const u8 {
+        return null;
+    }
+
     pub fn isRunning(_: *const UnsupportedSession) bool {
         return false;
     }
+
+    pub fn sessionId(_: *const UnsupportedSession) ?[]const u8 {
+        return null;
+    }
+
+    pub fn takeNotification(_: *UnsupportedSession, _: u32) ?NotificationEvent {
+        return null;
+    }
+
+    pub fn clearNotification(_: *UnsupportedSession) void {}
 
     pub fn snapshot(_: *const UnsupportedSession) SessionSnapshot {
         return .{ .running = false };
@@ -1471,6 +1660,11 @@ const UnixSession = struct {
     /// where a desync (visible SGR params like `5;174m`, stray `\e`) manifests.
     parser_log_enabled: bool = false,
     parser_log_prev_tail_had_esc: bool = false,
+    pending_notification_attention: bool = false,
+    pending_notification_title: [128]u8 = undefined,
+    pending_notification_title_len: usize = 0,
+    pending_notification_body: [512]u8 = undefined,
+    pending_notification_body_len: usize = 0,
 
     const Backend = enum {
         local,
@@ -1548,7 +1742,7 @@ const UnixSession = struct {
             return self;
         }
 
-        const child = try spawnCommand(allocator, options.cwd, options.cols, options.rows, options.profile);
+        const child = try spawnCommand(allocator, options);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
             _ = std.c.close(child.master_fd);
@@ -1596,6 +1790,28 @@ const UnixSession = struct {
         if (self.attach_id) |attach_id| allocator.free(attach_id);
         if (self.pref_path) |pref_path| allocator.free(pref_path);
         self.output_ring.deinit(allocator);
+    }
+
+    pub fn sessionId(self: *const UnixSession) ?[]const u8 {
+        return self.session_id;
+    }
+
+    pub fn takeNotification(self: *UnixSession, pane_id: u32) ?NotificationEvent {
+        if (!self.pending_notification_attention) return null;
+        self.pending_notification_attention = false;
+        return .{
+            .session_id = self.session_id orelse return null,
+            .pane_id = pane_id,
+            .title = self.pending_notification_title[0..self.pending_notification_title_len],
+            .body = self.pending_notification_body[0..self.pending_notification_body_len],
+            .attention = true,
+        };
+    }
+
+    pub fn clearNotification(self: *UnixSession) void {
+        self.pending_notification_attention = false;
+        self.pending_notification_title_len = 0;
+        self.pending_notification_body_len = 0;
     }
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
@@ -1907,19 +2123,63 @@ const UnixSession = struct {
     }
 
     fn hasForegroundProcessAwayFromShell(self: *const UnixSession) bool {
+        return self.foregroundProcessGroup() != null;
+    }
+
+    /// Returns the foreground process group id when a program other than the
+    /// session's own shell is in the foreground (e.g. `nvim`, `htop`), else null.
+    fn foregroundProcessGroup(self: *const UnixSession) ?usize {
         switch (self.backend) {
             .local => {
-                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return false;
+                const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
                 var foreground_process_group: c_int = 0;
-                if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return false;
-                return foreground_process_group > 0 and foreground_process_group != self.child_pid;
+                if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return null;
+                if (foreground_process_group <= 0 or foreground_process_group == self.child_pid) return null;
+                return @intCast(foreground_process_group);
             },
             .daemon => {
-                const shell_pid = self.daemon_shell_pid orelse return false;
-                const foreground_process_group = self.daemon_foreground_process_group orelse return false;
-                return foreground_process_group > 0 and foreground_process_group != shell_pid;
+                const shell_pid = self.daemon_shell_pid orelse return null;
+                const foreground_process_group = self.daemon_foreground_process_group orelse return null;
+                if (foreground_process_group == 0 or foreground_process_group == shell_pid) return null;
+                return foreground_process_group;
             },
         }
+    }
+
+    /// The live OSC window title the running program set (OSC 0/1/2), trimmed.
+    /// Agents like Claude Code / Codex use this to publish a session summary.
+    fn oscTitle(self: *const UnixSession) ?[]const u8 {
+        const title = self.terminal.getTitle() orelse return null;
+        const trimmed = std.mem.trim(u8, title, &std.ascii.whitespace);
+        return if (trimmed.len > 0) trimmed else null;
+    }
+
+    /// The live OSC title of the program running in this session (e.g. an
+    /// agent's session summary), copied into `buffer`. Null at a bare shell
+    /// prompt, so the caller can fall back to cwd / process name.
+    pub fn liveOscTitle(self: *const UnixSession, buffer: *[96]u8) ?[]const u8 {
+        const away = self.hasForegroundProcessAwayFromShell();
+        if (!away and self.launch_kind == .shell) return null;
+        const osc = self.oscTitle() orelse return null;
+        const clipped = osc[0..@min(osc.len, buffer.len)];
+        return std.fmt.bufPrint(buffer, "{s}", .{clipped}) catch clipped;
+    }
+
+    /// Linux-only: the foreground process group leader's command name from
+    /// `/proc/<pgid>/comm`, so terminal labels can reflect the running program
+    /// instead of just the working directory. Null at the shell prompt.
+    pub fn foregroundProcessName(self: *const UnixSession, buffer: *[96]u8) ?[]const u8 {
+        if (builtin.os.tag != .linux) return null;
+        if (self.launch_kind != .shell) return null;
+        const pgid = self.foregroundProcessGroup() orelse return null;
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pgid}) catch return null;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+        defer _ = std.c.close(fd);
+        const n = std.posix.read(fd, buffer[0..]) catch return null;
+        const trimmed = std.mem.trim(u8, buffer[0..n], &std.ascii.whitespace);
+        if (trimmed.len == 0) return null;
+        return trimmed;
     }
 
     fn writeWheelMouseInput(self: *UnixSession, local_x: f32, local_y: f32, width: f32, height: f32, wheel_y: f32, line_count: isize) !void {
@@ -2151,6 +2411,7 @@ const UnixSession = struct {
                 .rows = options.rows,
                 .dock_id = options.dock_id,
                 .pane_id = options.pane_id,
+                .pref_path = pref_path,
             }, 1);
             defer allocator.free(create_response);
             try ensureSessionResponseOk(allocator, create_response);
@@ -2430,6 +2691,7 @@ const UnixSession = struct {
     }
 
     fn appendOutput(self: *UnixSession, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        self.scanNotifications(bytes);
         if (bytes.len >= OUTPUT_RING_CAPACITY) {
             self.output_ring.clearRetainingCapacity();
             try self.output_ring.appendSlice(allocator, bytes[bytes.len - OUTPUT_RING_CAPACITY ..]);
@@ -2444,6 +2706,55 @@ const UnixSession = struct {
             self.output_ring.shrinkRetainingCapacity(self.output_ring.items.len - overflow);
         }
         try self.output_ring.appendSlice(allocator, bytes);
+    }
+
+    fn scanNotifications(self: *UnixSession, bytes: []const u8) void {
+        if (hasStandaloneBel(bytes)) {
+            self.pending_notification_attention = true;
+            self.pending_notification_title_len = 0;
+            self.pending_notification_body_len = 0;
+        }
+        var search_start: usize = 0;
+        while (std.mem.indexOfPos(u8, bytes, search_start, "\x1b]777;notify;")) |start| {
+            const payload_start = start + "\x1b]777;notify;".len;
+            const payload_end = std.mem.indexOfScalarPos(u8, bytes, payload_start, 0x07) orelse {
+                search_start = payload_start;
+                continue;
+            };
+            const payload = bytes[payload_start..payload_end];
+            const split = std.mem.indexOfScalar(u8, payload, ';');
+            const title = if (split) |index| payload[0..index] else payload;
+            const body = if (split) |index| payload[index + 1 ..] else "";
+            self.storeNotificationText(title, body);
+            search_start = payload_end + 1;
+        }
+    }
+
+    fn hasStandaloneBel(bytes: []const u8) bool {
+        var index: usize = 0;
+        while (index < bytes.len) : (index += 1) {
+            if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == ']') {
+                index += 2;
+                while (index < bytes.len) : (index += 1) {
+                    if (bytes[index] == 0x07) break;
+                    if (bytes[index] == 0x1b and index + 1 < bytes.len and bytes[index + 1] == '\\') {
+                        index += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (bytes[index] == 0x07) return true;
+        }
+        return false;
+    }
+
+    fn storeNotificationText(self: *UnixSession, title: []const u8, body: []const u8) void {
+        self.pending_notification_attention = true;
+        self.pending_notification_title_len = @min(title.len, self.pending_notification_title.len);
+        @memcpy(self.pending_notification_title[0..self.pending_notification_title_len], title[0..self.pending_notification_title_len]);
+        self.pending_notification_body_len = @min(body.len, self.pending_notification_body.len);
+        @memcpy(self.pending_notification_body[0..self.pending_notification_body_len], body[0..self.pending_notification_body_len]);
     }
 
     fn repairTerminalState(self: *UnixSession, allocator: std.mem.Allocator) !void {
@@ -2708,16 +3019,18 @@ const UnixSession = struct {
         );
     }
 
-    fn spawnCommand(allocator: std.mem.Allocator, cwd: []const u8, cols: u16, rows: u16, profile: TerminalLaunchProfile) !SpawnResult {
-        const cwd_z = try allocator.dupeZ(u8, cwd);
+    fn spawnCommand(allocator: std.mem.Allocator, options: SessionCreateOptions) !SpawnResult {
+        const cwd_z = try allocator.dupeZ(u8, options.cwd);
         defer allocator.free(cwd_z);
-        const command = try commandForProfile(allocator, profile);
+        const command = try commandForProfile(allocator, options.profile);
         defer freeCommand(allocator, command);
+        const identity = try LocalIdentityEnv.init(allocator, options);
+        defer identity.deinit(allocator);
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
-            .row = rows,
-            .col = cols,
+            .row = options.rows,
+            .col = options.cols,
             .xpixel = 0,
             .ypixel = 0,
         };
@@ -2725,7 +3038,7 @@ const UnixSession = struct {
         if (fork_result < 0) return error.ForkPtyFailed;
 
         if (fork_result == 0) {
-            childExec(cwd_z, command);
+            childExec(cwd_z, command, identity);
         }
 
         try setNonBlocking(@intCast(master_fd));
@@ -2735,7 +3048,77 @@ const UnixSession = struct {
         };
     }
 
-    fn childExec(cwd: [:0]const u8, command: []const [:0]u8) noreturn {
+    const LocalIdentityEnv = struct {
+        session_id: ?[:0]const u8 = null,
+        project_id: [:0]const u8,
+        project_path: [:0]const u8,
+        dock_id: [:0]const u8,
+        pane_id: [:0]const u8,
+        live_socket: ?[:0]const u8 = null,
+        sessionizer_socket: ?[:0]const u8 = null,
+        cli_path: [:0]const u8,
+
+        fn init(allocator: std.mem.Allocator, options: SessionCreateOptions) !LocalIdentityEnv {
+            const project_id = try allocator.dupeZ(u8, options.project_id);
+            errdefer allocator.free(project_id);
+            const project_path = try allocator.dupeZ(u8, options.project_path);
+            errdefer allocator.free(project_path);
+            const dock_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.dock_id});
+            defer allocator.free(dock_id_text);
+            const dock_id = try allocator.dupeZ(u8, dock_id_text);
+            errdefer allocator.free(dock_id);
+            const pane_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.pane_id});
+            defer allocator.free(pane_id_text);
+            const pane_id = try allocator.dupeZ(u8, pane_id_text);
+            errdefer allocator.free(pane_id);
+            // Running executable path so provider hooks call this exact binary.
+            const cli_path = blk: {
+                const p = selfExePathAlloc(allocator) catch break :blk try allocator.dupeZ(u8, "verde");
+                defer allocator.free(p);
+                break :blk try allocator.dupeZ(u8, p);
+            };
+            errdefer allocator.free(cli_path);
+            var session_id: ?[:0]u8 = null;
+            if (options.session_id) |id| {
+                session_id = try allocator.dupeZ(u8, id);
+            }
+            errdefer if (session_id) |value| allocator.free(value);
+            var live_socket: ?[:0]u8 = null;
+            var sessionizer_socket: ?[:0]u8 = null;
+            if (options.pref_path) |pref_path| {
+                const live_path = try std.fs.path.join(allocator, &.{ pref_path, sessionizer.LIVE_SOCKET_NAME });
+                defer allocator.free(live_path);
+                live_socket = try allocator.dupeZ(u8, live_path);
+                errdefer if (live_socket) |value| allocator.free(value);
+                const sessionizer_path = try sessionizer.socketPath(allocator, pref_path);
+                defer allocator.free(sessionizer_path);
+                sessionizer_socket = try allocator.dupeZ(u8, sessionizer_path);
+            }
+            return .{
+                .session_id = session_id,
+                .project_id = project_id,
+                .project_path = project_path,
+                .dock_id = dock_id,
+                .pane_id = pane_id,
+                .live_socket = live_socket,
+                .sessionizer_socket = sessionizer_socket,
+                .cli_path = cli_path,
+            };
+        }
+
+        fn deinit(self: LocalIdentityEnv, allocator: std.mem.Allocator) void {
+            if (self.session_id) |value| allocator.free(value);
+            allocator.free(self.project_id);
+            allocator.free(self.project_path);
+            allocator.free(self.dock_id);
+            allocator.free(self.pane_id);
+            if (self.live_socket) |value| allocator.free(value);
+            if (self.sessionizer_socket) |value| allocator.free(value);
+            allocator.free(self.cli_path);
+        }
+    };
+
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: LocalIdentityEnv) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) {
             std.c._exit(127);
         }
@@ -2749,6 +3132,18 @@ const UnixSession = struct {
         _ = setenv("CLICOLOR_FORCE", "1", 0);
         _ = setenv("FORCE_COLOR", "3", 0);
         _ = unsetenv("NO_COLOR");
+        _ = setenv("VERDE", "1", 1);
+        if (identity.session_id) |value| _ = setenv("VERDE_SESSION_ID", value.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_ID", identity.project_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_PATH", identity.project_path.ptr, 1);
+        _ = setenv("VERDE_DOCK_ID", identity.dock_id.ptr, 1);
+        _ = setenv("VERDE_PANE_ID", identity.pane_id.ptr, 1);
+        if (identity.live_socket) |value| {
+            _ = setenv("VERDE_SOCKET", value.ptr, 1);
+            _ = setenv("VERDE_LIVE_SOCKET", value.ptr, 1);
+        }
+        if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
+        _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
         if (std.c.getenv("LANG") == null) {
             _ = setenv("LANG", "C.UTF-8", 1);
         }

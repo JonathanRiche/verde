@@ -72,6 +72,10 @@ pub const AppConfig = struct {
     theme_config: theme.ThemeConfig = .{},
     default_open_action: DefaultOpenAction = .folder,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
+    // Fire a desktop notification when an agent surface finishes (transitions
+    // to `.done`). Defaults on so the feature works without first opening
+    // Settings; users can disable it from the Settings cog / verde.json.
+    notifications_enabled: bool = true,
 
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
         self.default_open_action.deinit(allocator);
@@ -153,6 +157,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeThemeSection(allocator, &root.object, config);
     try writeOpenSection(allocator, &root.object, config);
     try writeTerminalSection(allocator, &root.object, config);
+    try writeNotificationsSection(allocator, &root.object, config);
 
     const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
@@ -262,6 +267,13 @@ fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMa
     try object.put(allocator, "terminal", terminal_object);
 }
 
+fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var notifications_object: std.json.Value = object.get("notifications") orelse .{ .object = .empty };
+    if (notifications_object != .object) notifications_object = .{ .object = .empty };
+    try notifications_object.object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
+    try object.put(allocator, "notifications", notifications_object);
+}
+
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
     const r: u8 = @intFromFloat(@round(theme.clampf(color[0], 0.0, 1.0) * 255.0));
     const g: u8 = @intFromFloat(@round(theme.clampf(color[1], 0.0, 1.0) * 255.0));
@@ -308,6 +320,23 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     }
     if (root.object.get("terminal")) |terminal_value| {
         applyTerminalOverrides(allocator, config, terminal_value);
+    }
+    if (root.object.get("notifications")) |notifications_value| {
+        applyNotificationsOverrides(config, notifications_value);
+    }
+}
+
+fn applyNotificationsOverrides(config: *AppConfig, notifications_value: std.json.Value) void {
+    if (notifications_value != .object) {
+        log.warn("notifications must be an object when provided", .{});
+        return;
+    }
+    if (notifications_value.object.get("enabled")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.notifications_enabled = enabled_value.bool;
+        } else {
+            log.warn("notifications.enabled must be a boolean when provided", .{});
+        }
     }
 }
 

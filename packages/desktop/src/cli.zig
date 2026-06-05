@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const args = @import("cli_args.zig");
 const completion = @import("cli_completion.zig");
 const output = @import("cli_output.zig");
+const provider_hooks = @import("provider_hooks.zig");
 const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
@@ -60,6 +61,14 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try handleState(allocator, out, parsed.rest);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "notify")) {
+        try handleNotify(allocator, out, io, parsed.rest);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "integrations")) {
+        try handleIntegrations(allocator, out, parsed.rest);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "__session-daemon")) {
         const pref_path = try prefPath(allocator);
         defer allocator.free(pref_path);
@@ -94,6 +103,8 @@ fn printHelp(out: output.Output) !void {
         \\  verde capabilities [--json]   Print CLI capability metadata
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
+        \\  verde notify [options]        Update the current terminal surface
+        \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
@@ -104,6 +115,13 @@ fn printHelp(out: output.Output) !void {
         \\  panes --workspace <id|index|current> [--json]
         \\  threads --workspace <id|index|current> [--json]
         \\  transcript --workspace <id|index|current> --thread <index|provider-id> [--json]
+        \\
+        \\Integration commands:
+        \\  list [--json]
+        \\  doctor [--json]
+        \\  install <claude|codex|opencode|cursor>
+        \\  remove <claude|codex|opencode|cursor>
+        \\  disable <claude|codex|opencode|cursor>
         \\
         \\Session commands:
         \\  list [--json]
@@ -125,6 +143,7 @@ fn printHelp(out: output.Output) !void {
         \\  active [--json]
         \\  threads [--workspace <id|index|current>] [--json]
         \\  terminals [--workspace <id|index|current>] [--json]
+        \\  surfaces [--json]
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
         \\  pane focus|split|resize|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
@@ -159,6 +178,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         .protocol_version = 2,
         .cli = .{
             .state = spec.state_commands[0..],
+            .integrations = spec.integration_commands[0..],
             .session = spec.session_commands[0..],
             .live = spec.live_capabilities[0..],
             .completion = spec.shells[0..],
@@ -179,8 +199,9 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\verde CLI capabilities
         \\  protocol: 1
         \\  state: path, workspaces, panes, threads, transcript
+        \\  integrations: list, doctor, install, remove, disable
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
-        \\  live: status, workspaces, panes, pane control, chat control, terminal/process control
+        \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
         \\  completion: bash, zsh, fish
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
@@ -489,6 +510,7 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         std.mem.eql(u8, command, "workspaces") or
         std.mem.eql(u8, command, "projects") or
         std.mem.eql(u8, command, "active") or
+        std.mem.eql(u8, command, "surfaces") or
         std.mem.eql(u8, command, "processes"))
     {
         try sendLiveRequest(allocator, out, io, command, .{}, json);
@@ -525,12 +547,377 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         try handleLiveProcess(allocator, out, io, argv, json);
         return;
     }
+    if (std.mem.eql(u8, command, "agent")) {
+        try handleLiveAgent(allocator, out, io, argv, json);
+        return;
+    }
     if (std.mem.eql(u8, command, "stack")) {
         try handleLiveStack(allocator, out, io, argv, json);
         return;
     }
     try out.stderr("unknown live command: {s}\n", .{command});
     std.process.exit(2);
+}
+
+fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde notify --title <text> [--body <text>] [--status idle|working|waiting|done|error]
+            \\  verde notify --status working --progress <0..1> [--label <text>]
+            \\  verde notify --clear
+            \\
+        , .{});
+        return;
+    }
+    const explicit_session = args.optionValue(argv, "--session") orelse args.optionValue(argv, "--session-id");
+    const env_session = getenvSlice("VERDE_SESSION_ID");
+    const session_id = explicit_session orelse env_session orelse {
+        try out.stderr("verde notify requires --session or VERDE_SESSION_ID\n", .{});
+        std.process.exit(2);
+    };
+    const clear = args.hasFlag(argv, "--clear");
+    const method = if (clear) "notification.clear" else "notification.create";
+    const response = sendLiveRequestAlloc(allocator, io, method, .{
+        .session_id = session_id,
+        .workspace_id = args.optionValue(argv, "--workspace") orelse getenvSlice("VERDE_WORKSPACE_ID"),
+        .workspace_path = getenvSlice("VERDE_WORKSPACE_PATH"),
+        .dock_id = parseOptionalU32(args.optionValue(argv, "--dock") orelse getenvSlice("VERDE_DOCK_ID")),
+        .pane_id = parseOptionalU32(args.optionValue(argv, "--pane") orelse getenvSlice("VERDE_PANE_ID")),
+        .provider = args.optionValue(argv, "--provider") orelse getenvSlice("VERDE_PROVIDER"),
+        .title = args.optionValue(argv, "--title"),
+        .body = args.optionValue(argv, "--body"),
+        .status = args.optionValue(argv, "--status"),
+        .progress = parseOptionalF32(args.optionValue(argv, "--progress")),
+        .label = args.optionValue(argv, "--label"),
+        .attention = if (args.hasFlag(argv, "--attention")) true else null,
+    }, 1) catch |err| {
+        if (!args.hasFlag(argv, "--quiet")) try out.stderr("verde notify: running app unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(response);
+    if (args.hasFlag(argv, "--json")) {
+        try out.stdout("{s}\n", .{response});
+    } else if (!args.hasFlag(argv, "--quiet")) {
+        try printLiveResponse(out, response);
+    }
+}
+
+const IntegrationProvider = struct {
+    name: []const u8,
+    hook_state: []const u8,
+    installable: bool,
+    installed: bool,
+    reason: []const u8,
+};
+
+const integration_providers = [_]IntegrationProvider{
+    .{ .name = "claude", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Claude Code hooks are supported through project-local .claude/settings.local.json when enabled for a Verde session." },
+    .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
+    .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+    .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
+};
+
+fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde integrations list [--json]
+            \\  verde integrations doctor [--json]
+            \\  verde integrations install <claude|codex|opencode|cursor> [--global]
+            \\  verde integrations remove <claude|codex|opencode|cursor> [--global]
+            \\  verde integrations disable <claude|codex|opencode|cursor>
+            \\
+            \\  --global installs Claude/Codex hooks in ~/.claude/settings.json or
+            \\  ~/.codex/hooks.json for all projects (merged, preserving existing
+            \\  hooks; no-op outside Verde panes); otherwise hooks are project-local.
+            \\
+            \\Provider hooks are optional. Verde does not overwrite provider config
+            \\or change provider login/auth behavior.
+            \\
+        , .{});
+        return;
+    }
+
+    const command = args.positional(argv, 0) orelse "list";
+    const json = args.hasFlag(argv, "--json");
+    if (std.mem.eql(u8, command, "list")) {
+        try printIntegrationsList(allocator, out, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "doctor")) {
+        try printIntegrationsDoctor(allocator, out, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "install") or
+        std.mem.eql(u8, command, "remove") or
+        std.mem.eql(u8, command, "disable"))
+    {
+        const provider_name = args.positional(argv, 1) orelse {
+            try out.stderr("verde integrations {s} requires a provider name\n", .{command});
+            std.process.exit(2);
+        };
+        const provider = findIntegrationProvider(provider_name) orelse {
+            try out.stderr("unknown integration provider: {s}\n", .{provider_name});
+            std.process.exit(2);
+        };
+        const global = args.hasFlag(argv, "--global");
+        if (std.mem.eql(u8, command, "install")) return try installIntegration(allocator, out, json, provider, global);
+        if (global and std.mem.eql(u8, provider.name, "claude")) {
+            provider_hooks.removeClaudeGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} claude --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} claude --global: removed global Claude hooks from ~/.claude/settings.json\n", .{command});
+            return;
+        }
+        if (global and std.mem.eql(u8, provider.name, "codex")) {
+            provider_hooks.removeCodexGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} codex --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} codex --global: removed global Codex hooks from ~/.codex/hooks.json\n", .{command});
+            return;
+        }
+        try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
+        return;
+    }
+
+    try out.stderr("unknown integrations command: {s}\n", .{command});
+    std.process.exit(2);
+}
+
+fn findIntegrationProvider(name: []const u8) ?IntegrationProvider {
+    for (integration_providers) |provider| {
+        if (std.mem.eql(u8, provider.name, name)) return provider;
+    }
+    return null;
+}
+
+fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .providers = integration_providers[0..],
+            .policy = .{
+                .writes_config = true,
+                .writes_project_config_only = true,
+                .requires_verde_env = true,
+                .changes_auth = false,
+            },
+        });
+        return;
+    }
+    try out.stdout("Provider integrations:\n", .{});
+    for (integration_providers) |provider| {
+        try out.stdout("  {s}: {s} ({s})\n", .{ provider.name, provider.hook_state, provider.reason });
+    }
+}
+
+fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    const verde_env = getenvSlice("VERDE") orelse "";
+    const has_identity = getenvSlice("VERDE_SESSION_ID") != null and
+        (getenvSlice("VERDE_SOCKET") != null or getenvSlice("VERDE_LIVE_SOCKET") != null or getenvSlice("VERDE_SESSIONIZER_SOCKET") != null);
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .verde_env = std.mem.eql(u8, verde_env, "1"),
+            .has_terminal_identity = has_identity,
+            .providers = integration_providers[0..],
+            .summary = "Claude and Codex project-local hooks are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+        });
+        return;
+    }
+    try out.stdout(
+        \\Integration doctor:
+        \\  VERDE=1: {s}
+        \\  terminal identity: {s}
+        \\  hook installers: claude, codex project-local
+        \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
+        \\
+    , .{
+        if (std.mem.eql(u8, verde_env, "1")) "yes" else "no",
+        if (has_identity) "yes" else "no",
+    });
+}
+
+fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider, global: bool) !void {
+    const project_path = ".";
+    if (std.mem.eql(u8, provider.name, "claude") and global) {
+        provider_hooks.ensureClaudeGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install claude --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.claude/settings.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install claude --global: installed global Claude hooks in ~/.claude/settings.json\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, provider.name, "claude")) {
+        provider_hooks.ensureClaudeProjectHooks(allocator, project_path) catch |err| switch (err) {
+            error.ClaudeSettingsExist => {
+                if (json) {
+                    try out.jsonValue(allocator, .{
+                        .provider = provider.name,
+                        .action = "install",
+                        .installed = false,
+                        .status = "blocked",
+                        .reason = ".claude/settings.local.json already exists and is not managed by Verde; refusing to overwrite user settings.",
+                    });
+                    return;
+                }
+                try out.stderr("verde integrations install claude: .claude/settings.local.json already exists and is not managed by Verde; refusing to overwrite user settings\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .path = ".claude/settings.local.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install claude: installed project-local Claude hooks in .claude/settings.local.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "codex") and global) {
+        provider_hooks.ensureCodexGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install codex --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.codex/hooks.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install codex --global: merged global Codex hooks into ~/.codex/hooks.json\n", .{});
+        return;
+    }
+
+    if (!std.mem.eql(u8, provider.name, "codex")) {
+        try printIntegrationInstallUnsupported(allocator, out, json, provider);
+        std.process.exit(1);
+    }
+
+    provider_hooks.ensureCodexProjectHooks(allocator, project_path) catch |err| switch (err) {
+        error.CodexHooksJsonExists => {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "blocked",
+                    .reason = ".codex/hooks.json already exists and is not managed by Verde; refusing to overwrite user hooks.",
+                });
+                return;
+            }
+            try out.stderr("verde integrations install codex: .codex/hooks.json already exists and is not managed by Verde; refusing to overwrite user hooks\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = "install",
+            .installed = true,
+            .status = "installed",
+            .path = ".codex/hooks.json",
+        });
+        return;
+    }
+    try out.stdout("verde integrations install codex: installed project-local Codex hooks in .codex/hooks.json\n", .{});
+}
+
+fn printIntegrationInstallUnsupported(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = "install",
+            .installed = false,
+            .status = "unsupported",
+            .reason = provider.reason,
+        });
+        return;
+    }
+    try out.stderr("verde integrations install {s}: {s}\n", .{ provider.name, provider.reason });
+}
+
+fn printIntegrationNoInstalledHook(allocator: std.mem.Allocator, out: output.Output, json: bool, action: []const u8, provider: IntegrationProvider) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .provider = provider.name,
+            .action = action,
+            .installed = false,
+            .changed = false,
+            .status = "not_installed",
+        });
+        return;
+    }
+    try out.stdout("verde integrations {s} {s}: no installed hook to change\n", .{ action, provider.name });
 }
 
 fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -830,6 +1217,22 @@ fn handleLiveProcess(allocator: std.mem.Allocator, out: output.Output, io: std.I
     const method = try std.fmt.allocPrint(allocator, "process.{s}", .{subcommand});
     defer allocator.free(method);
     try sendLiveRequest(allocator, out, io, method, commonPaneParams(argv), json);
+}
+
+fn handleLiveAgent(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live agent command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "open")) {
+        try sendLiveRequest(allocator, out, io, "agent.open", .{
+            .workspace = workspaceOption(argv),
+            .provider = args.optionValue(argv, "--provider") orelse "codex",
+        }, json);
+        return;
+    }
+    try out.stderr("unknown live agent command: {s}\n", .{subcommand});
+    std.process.exit(2);
 }
 
 fn handleLiveStack(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
@@ -1285,6 +1688,14 @@ fn mcpToolsList(allocator: std.mem.Allocator, out: output.Output, id_value: std.
     try s.beginObject();
     try s.objectField("tools");
     try s.beginArray();
+    try writeMcpTool(&s, "list_surfaces", "List live Verde terminal surfaces.");
+    try writeMcpTool(&s, "inspect_surface", "Inspect one Verde terminal surface.");
+    try writeMcpTool(&s, "focus_surface", "Focus a Verde terminal surface.");
+    try writeMcpTool(&s, "read_surface_screen", "Read the current screen text for a terminal surface pane.");
+    try writeMcpTool(&s, "tail_surface_output", "Read recent terminal output for a surface pane.");
+    try writeMcpTool(&s, "write_surface_text", "Write text to a terminal surface pane.");
+    try writeMcpTool(&s, "notify_surface", "Update terminal surface status or notification text.");
+    try writeMcpTool(&s, "clear_surface_attention", "Clear terminal surface attention.");
     try writeMcpTool(&s, "list_processes", "List configured Verde processes.");
     try writeMcpTool(&s, "inspect_process", "Inspect a configured Verde process.");
     try writeMcpTool(&s, "tail_process_logs", "Read recent output for a configured Verde process.");
@@ -1320,9 +1731,53 @@ fn mcpToolsCall(allocator: std.mem.Allocator, out: output.Output, io: std.Io, id
     const arguments = params.object.get("arguments") orelse .null;
     const workspace = mcpArgString(arguments, "workspace") orelse mcpArgString(arguments, "project");
     const process_name = mcpArgString(arguments, "name");
+    const session_id = mcpArgString(arguments, "session_id") orelse mcpArgString(arguments, "session");
+    const pane_id = mcpArgU32(arguments, "pane_id") orelse mcpArgU32(arguments, "pane");
     const lines = mcpArgU32(arguments, "lines");
 
     const response = blk: {
+        if (std.mem.eql(u8, tool_name, "list_surfaces")) {
+            break :blk sendLiveRequestAlloc(allocator, io, "surfaces", .{}, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "inspect_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "inspect_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.inspect", .{ .session_id = session }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "focus_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "focus_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.focus", .{ .session_id = session }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "read_surface_screen")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "read_surface_screen requires pane_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.screen", .{ .workspace = workspace, .pane = pane }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "tail_surface_output")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "tail_surface_output requires pane_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.tail", .{ .workspace = workspace, .pane = pane, .lines = lines }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "write_surface_text")) {
+            const pane = pane_id orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires pane_id");
+            const text = mcpArgString(arguments, "text") orelse return try mcpError(allocator, out, id_value, -32602, "write_surface_text requires text");
+            break :blk sendLiveRequestAlloc(allocator, io, "terminal.write", .{ .workspace = workspace, .pane = pane, .text = text }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "notify_surface")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "notify_surface requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "notification.update", .{
+                .session_id = session,
+                .workspace = workspace,
+                .pane = pane_id,
+                .title = mcpArgString(arguments, "title"),
+                .body = mcpArgString(arguments, "body"),
+                .label = mcpArgString(arguments, "label"),
+                .status = mcpArgString(arguments, "status"),
+                .progress = mcpArgF32(arguments, "progress"),
+                .attention = mcpArgBool(arguments, "attention"),
+            }, 1);
+        }
+        if (std.mem.eql(u8, tool_name, "clear_surface_attention")) {
+            const session = session_id orelse return try mcpError(allocator, out, id_value, -32602, "clear_surface_attention requires session_id");
+            break :blk sendLiveRequestAlloc(allocator, io, "surface.clearAttention", .{ .session_id = session }, 1);
+        }
         if (std.mem.eql(u8, tool_name, "list_processes")) {
             break :blk sendLiveRequestAlloc(allocator, io, "processes", .{ .workspace = workspace }, 1);
         }
@@ -1414,6 +1869,25 @@ fn mcpArgU32(arguments: std.json.Value, name: []const u8) ?u32 {
     return switch (value) {
         .integer => |int| if (int >= 0) @intCast(int) else null,
         .number_string => |text| std.fmt.parseInt(u32, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn mcpArgF32(arguments: std.json.Value, name: []const u8) ?f32 {
+    if (arguments != .object) return null;
+    const value = arguments.object.get(name) orelse .null;
+    return switch (value) {
+        .integer => |int| @floatFromInt(int),
+        .float => |float| @floatCast(float),
+        .number_string => |text| std.fmt.parseFloat(f32, text) catch null,
+        else => null,
+    };
+}
+
+fn mcpArgBool(arguments: std.json.Value, name: []const u8) ?bool {
+    if (arguments != .object) return null;
+    return switch (arguments.object.get(name) orelse .null) {
+        .bool => |value| value,
         else => null,
     };
 }
@@ -1532,6 +2006,16 @@ fn requiredFloatOption(out: output.Output, argv: []const []const u8, name: []con
 fn parseOptionalU32(value: ?[]const u8) ?u32 {
     const raw = value orelse return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
+}
+
+fn parseOptionalF32(value: ?[]const u8) ?f32 {
+    const raw = value orelse return null;
+    return std.fmt.parseFloat(f32, raw) catch null;
+}
+
+fn getenvSlice(name: [:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(name) orelse return null;
+    return std.mem.span(ptr);
 }
 
 fn trailingFreeArg(argv: []const []const u8, positional_commands: usize) ?[]const u8 {

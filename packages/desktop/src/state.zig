@@ -12,6 +12,8 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const notifier = @import("notifier.zig");
+const provider_hooks = @import("provider_hooks.zig");
 const runtime_log = @import("runtime_log.zig");
 const stack_config = @import("stack.zig");
 const stb_image = @import("stb_image.zig");
@@ -38,6 +40,61 @@ pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
 pub const Harness = db_types.Harness;
+
+pub const SurfaceStatus = enum {
+    idle,
+    working,
+    waiting,
+    done,
+    @"error",
+};
+
+pub const SurfaceUpdate = struct {
+    session_id: []const u8,
+    workspace_id: ?[]const u8 = null,
+    workspace_path: ?[]const u8 = null,
+    dock_id: ?u32 = null,
+    pane_id: ?u32 = null,
+    provider: ?Provider = null,
+    provider_thread_id: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    status: ?SurfaceStatus = null,
+    progress: ?f32 = null,
+    attention: ?bool = null,
+    unread_increment: u32 = 0,
+    last_event_title: ?[]const u8 = null,
+    last_event_body: ?[]const u8 = null,
+    clear: bool = false,
+};
+
+pub const SurfaceState = struct {
+    session_id: []u8,
+    workspace_id: []u8 = "",
+    workspace_path: []u8 = "",
+    dock_id: u32 = 0,
+    pane_id: ?u32 = null,
+    provider: ?Provider = null,
+    provider_thread_id: ?[]u8 = null,
+    title: []u8 = "",
+    status: SurfaceStatus = .idle,
+    progress: ?f32 = null,
+    attention: bool = false,
+    unread_count: u32 = 0,
+    last_event_title: ?[]u8 = null,
+    last_event_body: ?[]u8 = null,
+    last_event_at_ms: i64 = 0,
+
+    pub fn deinit(self: *SurfaceState, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.workspace_id);
+        allocator.free(self.workspace_path);
+        allocator.free(self.title);
+        if (self.provider_thread_id) |value| allocator.free(value);
+        if (self.last_event_title) |value| allocator.free(value);
+        if (self.last_event_body) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
 
 pub const PaletteModalAction = enum {
     image_close,
@@ -76,6 +133,7 @@ pub const SettingsDraft = struct {
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
     theme_source: theme.ThemeSource = .omarchy,
     open_action: SettingsOpenAction = .folder,
+    notifications_enabled: bool = true,
 };
 
 pub const PaletteModalHit = struct {
@@ -1384,6 +1442,11 @@ pub const ManagedProcess = struct {
     command: []u8,
     cwd: []u8,
     restart: stack_config.RestartPolicy,
+    provider: ?stack_config.AgentProvider = null,
+    revive: stack_config.RevivePolicy = .attach_or_create,
+    notify: bool = false,
+    mcp: bool = false,
+    hooks: bool = false,
     watch: std.ArrayList([]u8) = .empty,
     status: ManagedProcessStatus = .stopped,
     exit_code: ?u32 = null,
@@ -1410,6 +1473,11 @@ pub const ManagedProcess = struct {
             .command = try allocator.dupe(u8, definition.command),
             .cwd = try allocator.dupe(u8, definition.cwd),
             .restart = definition.restart,
+            .provider = definition.provider,
+            .revive = definition.revive,
+            .notify = definition.notify,
+            .mcp = definition.mcp,
+            .hooks = definition.hooks,
             .watch = .empty,
         };
         errdefer process.deinit(allocator);
@@ -1422,6 +1490,11 @@ pub const ManagedProcess = struct {
     fn updateFromDefinition(self: *ManagedProcess, allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !void {
         self.kind = definition.kind;
         self.restart = definition.restart;
+        self.provider = definition.provider;
+        self.revive = definition.revive;
+        self.notify = definition.notify;
+        self.mcp = definition.mcp;
+        self.hooks = definition.hooks;
         var reset_watch_state = false;
         if (!std.mem.eql(u8, self.command, definition.command)) {
             allocator.free(self.command);
@@ -2589,6 +2662,12 @@ pub const SendState = struct {
     pending_approval: ?PendingApproval = null,
     ui_revision: u64 = 0,
     polled_ui_revision: u64 = 0,
+    /// Whole-second elapsed value last reported to the UI poll loop for the
+    /// pending "Working - mm:ss" label. Tracked so `pollSend` can request a
+    /// repaint exactly when the visible seconds counter would change, even
+    /// while the provider has not streamed any tokens. -1 means "no value
+    /// reported yet" (so the very first pending poll always renders).
+    polled_working_seconds: i64 = -1,
     pending_followup: ?PendingFollowup = null,
     pending_followup_signal_sent: bool = false,
     approval_decision: ?ai_harness.ApprovalDecision = null,
@@ -2633,6 +2712,7 @@ pub const SidebarThreadHover = struct {
 pub const SidebarContextMenuKind = enum {
     none,
     project,
+    project_new_thread,
     thread,
 };
 
@@ -2644,6 +2724,7 @@ pub const AppState = struct {
     storage: *const Storage,
     projects: std.ArrayList(Project),
     archived_projects: std.ArrayList(Project),
+    surfaces: std.ArrayList(SurfaceState),
     selected_project_index: usize,
     next_project_number: usize,
     import_path_storage: [DRAFT_CAPACITY:0]u8,
@@ -2714,6 +2795,10 @@ pub const AppState = struct {
     terminal_focused: bool,
     terminal_resize_drag_active: bool,
     terminal_resize_drag_origin_height: f32,
+    // Whether the OS window currently holds input focus. Updated from SDL
+    // window focus events; used to gate chat-completion notifications so we
+    // don't notify about a turn the user is actively watching.
+    window_input_focus: bool,
     debug_terminal_window_focused: bool,
     debug_terminal_hitbox_focused: bool,
     debug_terminal_hitbox_active: bool,
@@ -2753,6 +2838,8 @@ pub const AppState = struct {
     show_project_creator: bool,
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
+    settings_hook_claude_installed: bool,
+    settings_hook_codex_installed: bool,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
     app_config_file_mtime: i128,
@@ -2852,6 +2939,7 @@ pub const AppState = struct {
             .storage = storage,
             .projects = .empty,
             .archived_projects = .empty,
+            .surfaces = .empty,
             .selected_project_index = 0,
             .next_project_number = 4,
             .import_path_storage = std.mem.zeroes([DRAFT_CAPACITY:0]u8),
@@ -2914,6 +3002,7 @@ pub const AppState = struct {
             .terminal_focused = false,
             .terminal_resize_drag_active = false,
             .terminal_resize_drag_origin_height = 0.0,
+            .window_input_focus = true,
             .debug_terminal_window_focused = false,
             .debug_terminal_hitbox_focused = false,
             .debug_terminal_hitbox_active = false,
@@ -2952,6 +3041,8 @@ pub const AppState = struct {
             .show_project_creator = false,
             .show_settings_modal = false,
             .settings_draft = .{},
+            .settings_hook_claude_installed = false,
+            .settings_hook_codex_installed = false,
             .settings_hover_control = null,
             .settings_close_hovered = false,
             .app_config_file_mtime = -1,
@@ -4716,6 +4807,9 @@ pub const AppState = struct {
         freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
         send_state.ui_revision = 1;
         send_state.polled_ui_revision = 0;
+        // Reset the working-seconds tracker so the first pending poll forces
+        // a render and seeds the visible "Working - 0:00" label.
+        send_state.polled_working_seconds = -1;
         send_state.approval_decision = null;
         send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
@@ -5178,6 +5272,7 @@ pub const AppState = struct {
             .terminal_font_size = self.app_config.terminal_font_size,
             .theme_source = self.app_config.theme_config.source,
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
+            .notifications_enabled = self.app_config.notifications_enabled,
         };
     }
 
@@ -5186,6 +5281,7 @@ pub const AppState = struct {
         if (draft.font_size != self.app_config.font_size) return true;
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
         if (draft.theme_source != self.app_config.theme_config.source) return true;
+        if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
         return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
     }
 
@@ -5194,12 +5290,65 @@ pub const AppState = struct {
         self.workspace_header_open_menu_open = false;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
+        self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
+        self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
         self.show_settings_modal = true;
         self.palette_modal_text_focus = .none;
         self.blurPaletteComposer();
         self.noteInteraction();
+        self.markDirty();
+    }
+
+    /// Installs or removes the global Claude notify hooks and refreshes the
+    /// settings toggle state. Acts immediately (filesystem side effect).
+    pub fn toggleClaudeGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_claude_installed) {
+            provider_hooks.removeClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Claude hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Claude hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_claude_installed = false;
+            self.setSidebarNotice("Disabled global Claude status hooks.");
+        } else {
+            provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Claude hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Claude hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_claude_installed = true;
+            self.setSidebarNotice("Enabled global Claude status hooks.");
+        }
+        self.markDirty();
+    }
+
+    /// Installs or removes the global Codex notify hooks and refreshes the
+    /// settings toggle state. Merges into ~/.codex/hooks.json, preserving any
+    /// user-owned hooks. Acts immediately (filesystem side effect).
+    pub fn toggleCodexGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_codex_installed) {
+            provider_hooks.removeCodexGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Codex hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Codex hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_codex_installed = false;
+            self.setSidebarNotice("Disabled global Codex status hooks.");
+        } else {
+            provider_hooks.ensureCodexGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Codex hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Codex hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_codex_installed = true;
+            self.setSidebarNotice("Enabled global Codex status hooks.");
+        }
         self.markDirty();
     }
 
@@ -5216,6 +5365,7 @@ pub const AppState = struct {
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.theme_config.source = self.settings_draft.theme_source;
+        self.app_config.notifications_enabled = self.settings_draft.notifications_enabled;
         try self.applySettingsDraftOpenAction();
 
         try app_config.saveAppConfig(self.allocator, &self.app_config);
@@ -5281,6 +5431,301 @@ pub const AppState = struct {
                 try entry.dock.rethemeSessions(self.allocator);
             }
         }
+    }
+
+    pub fn clearSurfaces(self: *AppState) void {
+        for (self.surfaces.items) |*surface| surface.deinit(self.allocator);
+        self.surfaces.clearRetainingCapacity();
+    }
+
+    pub fn surfaceBySessionId(self: *AppState, session_id: []const u8) ?*SurfaceState {
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+        }
+        return null;
+    }
+
+    pub fn surfaceBySessionIdConst(self: *const AppState, session_id: []const u8) ?*const SurfaceState {
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.session_id, session_id)) return surface;
+        }
+        return null;
+    }
+
+    pub fn updateSurface(self: *AppState, update: SurfaceUpdate) !*SurfaceState {
+        var surface = self.surfaceBySessionId(update.session_id);
+        if (surface == null) {
+            try self.surfaces.append(self.allocator, .{
+                .session_id = try self.allocator.dupe(u8, update.session_id),
+                .workspace_id = try self.allocator.dupe(u8, update.workspace_id orelse ""),
+                .workspace_path = try self.allocator.dupe(u8, update.workspace_path orelse ""),
+                .dock_id = update.dock_id orelse 0,
+                .pane_id = update.pane_id,
+                .title = try self.allocator.dupe(u8, update.title orelse ""),
+            });
+            surface = &self.surfaces.items[self.surfaces.items.len - 1];
+        }
+        var s = surface.?;
+        // Remember the status before this update so we can fire a one-shot
+        // desktop notification only on the `!= .done` -> `.done` transition.
+        const prev_status = s.status;
+        if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
+        if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
+        if (update.dock_id) |value| s.dock_id = value;
+        if (update.pane_id) |value| s.pane_id = value;
+        if (update.provider) |value| {
+            s.provider = value;
+            // Pin the provider on the terminal tab so the sidebar can draw the
+            // logo after a restart, before the agent process revives.
+            if (self.terminalDockForSurface(s)) |dock| {
+                _ = dock.setActiveTabPinnedProvider(self.allocator, @tagName(value));
+            }
+        }
+        if (update.provider_thread_id) |value| try replaceOwnedOptionalSlice(self.allocator, &s.provider_thread_id, value);
+        if (update.title) |value| {
+            try replaceOwnedSlice(self.allocator, &s.title, value);
+            // Pin the title on the terminal tab so it persists across restarts
+            // (surfaces are in-memory only) and survives Codex's folder-name OSC.
+            if (value.len > 0) {
+                if (self.terminalDockForSurface(s)) |dock| {
+                    _ = dock.setActiveTabPinnedTitle(self.allocator, value);
+                }
+            }
+        }
+        if (update.clear) {
+            s.status = .idle;
+            s.progress = null;
+            s.attention = false;
+            s.unread_count = 0;
+            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, null);
+            try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, null);
+            _ = self.clearTerminalNotificationBySession(update.session_id);
+        } else {
+            if (update.status) |value| s.status = value;
+            if (update.progress) |value| s.progress = theme.clampf(value, 0.0, 1.0);
+            if (update.attention) |value| s.attention = value;
+            if (update.unread_increment > 0) s.unread_count +|= update.unread_increment;
+            if (update.last_event_title) |value| {
+                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_title, value);
+                s.last_event_at_ms = unixTimestampMs();
+            }
+            if (update.last_event_body) |value| {
+                try replaceOwnedOptionalSlice(self.allocator, &s.last_event_body, value);
+                s.last_event_at_ms = unixTimestampMs();
+            }
+        }
+        // Notify on the completion edge. Runs on the main thread (live commands
+        // are drained from the main loop), so spawning the notifier here is safe.
+        if (!update.clear and self.app_config.notifications_enabled and
+            prev_status != .done and s.status == .done)
+        {
+            self.fireCompletionNotification(s);
+        }
+        self.markDirty();
+        return s;
+    }
+
+    // Resolves the terminal dock that owns a surface (by workspace + dock id),
+    // so notify-provided metadata can be pinned onto its tab. Surfaces are
+    // in-memory only; pinning onto the tab persists across restarts via the
+    // workspace layout.
+    fn terminalDockForSurface(self: *AppState, surface: *const SurfaceState) ?*terminal.Dock {
+        for (self.projects.items, 0..) |*project, idx| {
+            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
+                std.mem.eql(u8, surface.workspace_path, project.path);
+            if (!owns) continue;
+            return self.projectTerminalDockMutable(idx, surface.dock_id);
+        }
+        return null;
+    }
+
+    // Resolves which agent provider a surface belongs to, for the notification
+    // logo/title. The surface itself usually has no provider (the Codex Stop
+    // hook calls `verde notify` without one), so fall back to the owning
+    // project's managed agent process, then its first chat thread.
+    fn resolveSurfaceProvider(self: *const AppState, surface: *const SurfaceState) ?Provider {
+        if (surface.provider) |p| return p;
+        for (self.projects.items) |*project| {
+            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
+                std.mem.eql(u8, surface.workspace_path, project.path);
+            if (!owns) continue;
+            for (project.managed_processes.items) |process| {
+                if (process.kind == .agent) {
+                    if (providerFromStack(process.provider)) |p| return p;
+                }
+            }
+            if (project.threads.items.len > 0) return project.threads.items[0].provider;
+            return null;
+        }
+        return null;
+    }
+
+    // Builds a human-readable title/body from the surface and hands off to the
+    // cross-platform notifier. Title prefers the surface's own label, then the
+    // provider name; the body names the workspace directory so multiple agents
+    // stay distinguishable. The provider also selects the notification logo.
+    fn fireCompletionNotification(self: *AppState, surface: *const SurfaceState) void {
+        const provider = self.resolveSurfaceProvider(surface);
+        const dir = if (surface.workspace_path.len > 0)
+            std.fs.path.basename(surface.workspace_path)
+        else
+            "";
+
+        var title_buf: [128]u8 = undefined;
+        const title = if (surface.title.len > 0)
+            surface.title
+        else if (provider) |p|
+            (std.fmt.bufPrint(&title_buf, "{s} finished", .{utils.providerLabel(p)}) catch "Agent finished")
+        else
+            "Agent finished";
+
+        var body_buf: [256]u8 = undefined;
+        const body = if (dir.len > 0)
+            (std.fmt.bufPrint(&body_buf, "Completed in {s}", .{dir}) catch "Task completed")
+        else
+            "Task completed";
+
+        const icon: ?notifier.Icon = if (provider) |p| switch (p) {
+            .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
+            .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
+            .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
+            .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        } else null;
+
+        notifier.notifyAgentDone(self.allocator, title, body, icon);
+    }
+
+    pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
+        const terminal_changed = self.clearTerminalNotificationBySession(session_id);
+        const surface = self.surfaceBySessionId(session_id) orelse return terminal_changed;
+        // Focusing the pane acknowledges a finished turn, so clear the "done"
+        // indicator — it shouldn't re-appear in the sidebar once you've come
+        // back and looked. Genuine waiting/error states persist (you still need
+        // to act on them).
+        const done_ack = surface.status == .done;
+        if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
+        surface.attention = false;
+        surface.unread_count = 0;
+        if (done_ack) surface.status = .idle;
+        self.markDirty();
+        return true;
+    }
+
+    fn clearTerminalNotificationBySession(self: *AppState, session_id: []const u8) bool {
+        var changed = false;
+        for (self.projects.items) |*project| {
+            if (project.terminal_dock.clearNotificationForSession(session_id)) changed = true;
+            for (project.terminal_docks.items) |*entry| {
+                if (entry.dock.clearNotificationForSession(session_id)) changed = true;
+            }
+        }
+        return changed;
+    }
+
+    pub fn terminalDockSurfaceAttention(self: *const AppState, project_index: usize, dock_id: u32) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return false;
+        const session_id = dock.activeSessionId() orelse return false;
+        const surface = self.surfaceBySessionIdConst(session_id) orelse return false;
+        return surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error";
+    }
+
+    pub fn projectSurfaceAttention(self: *const AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        for (self.surfaces.items) |*surface| {
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+                if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
+                // The pane you're actively in shouldn't raise a background alert.
+                if (self.isFocusedTerminalSurface(project_index, surface.dock_id)) continue;
+                if (surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when (project_index, dock_id) is the terminal pane the user is
+    /// currently focused in — used to suppress its own sidebar status/attention
+    /// indicators (you're already looking at it).
+    pub fn isFocusedTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) bool {
+        if (!self.terminal_focused) return false;
+        if (project_index != self.selected_project_index) return false;
+        if (project_index >= self.projects.items.len) return false;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse return false;
+        const pane = layout.paneById(pane_id) orelse return false;
+        return switch (pane.ref) {
+            .terminal => |ref| ref.dock_id == dock_id,
+            else => false,
+        };
+    }
+
+    /// Returns the terminal surface (if any) bound to a given dock within a
+    /// workspace, so the sidebar can render per-pane agent status.
+    pub fn projectTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) ?*const SurfaceState {
+        if (project_index >= self.projects.items.len) return null;
+        const project = &self.projects.items[project_index];
+        for (self.surfaces.items) |*surface| {
+            if (surface.dock_id != dock_id) continue;
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+                return surface;
+            }
+        }
+        return null;
+    }
+
+    /// Selects a workspace and focuses one of its open layout panes directly
+    /// from the sidebar's live "OPEN" list, restoring it first if minimized.
+    pub fn focusWorkspaceOpenPane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
+        if (project_index >= self.projects.items.len) return;
+        self.selected_project_index = project_index;
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        var target: ?*WorkspacePane = null;
+        for (layout.panes.items) |*pane| {
+            if (pane.id == pane_id) {
+                target = pane;
+                break;
+            }
+        }
+        const pane = target orelse return;
+        if (pane.minimized) {
+            pane.minimized = false;
+            layout.ensurePaneInRootSplit(self.allocator, pane_id, .horizontal, 0.64) catch |err| {
+                log.err("failed to restore workspace pane from sidebar: {s}", .{@errorName(err)});
+            };
+        }
+        layout.focused_pane_id = pane_id;
+        layout.maximized_pane_id = null;
+        switch (pane.ref) {
+            .chat => |ref| {
+                self.terminal_focused = false;
+                project.selected_thread_index = ref.thread_index;
+                self.requestComposerFocus();
+            },
+            .terminal => self.requestTerminalFocus(),
+            .browser => {
+                self.terminal_focused = false;
+                self.composer_focused = false;
+                self.browser_state.setControlsVisible(true);
+                self.browser_state.controller.show() catch |err| {
+                    log.warn("failed to show browser pane from sidebar: {s}", .{@errorName(err)});
+                };
+            },
+        }
+        self.markDirty();
+    }
+
+    fn replaceOwnedSlice(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !void {
+        const next = try allocator.dupe(u8, value);
+        allocator.free(dest.*);
+        dest.* = next;
+    }
+
+    fn replaceOwnedOptionalSlice(allocator: std.mem.Allocator, dest: *?[]u8, value: ?[]const u8) !void {
+        const next = if (value) |v| try allocator.dupe(u8, v) else null;
+        if (dest.*) |old| allocator.free(old);
+        dest.* = next;
     }
 
     pub fn hasCustomTerminalLaunchProfile(self: *const AppState) bool {
@@ -6414,6 +6859,9 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
+                    log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
+                };
                 if (changed and project_index == self.selected_project_index and base_visible) visible_changed = true;
             }
             for (project.terminal_docks.items) |*entry| {
@@ -6435,11 +6883,31 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
+                    log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
+                };
                 if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
             }
             self.pollManagedProcesses(project_index);
         }
         return visible_changed;
+    }
+
+    fn drainTerminalDockNotifications(self: *AppState, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
+        if (project_index >= self.projects.items.len) return;
+        const event = dock.takeActiveNotification() orelse return;
+        const project = &self.projects.items[project_index];
+        _ = try self.updateSurface(.{
+            .session_id = event.session_id,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .dock_id = dock_id,
+            .pane_id = event.pane_id,
+            .attention = event.attention,
+            .unread_increment = 1,
+            .last_event_title = if (event.title.len > 0) event.title else "Terminal",
+            .last_event_body = event.body,
+        });
     }
 
     /// Returns mutable browser UI/runtime state for desktop control surfaces.
@@ -6499,6 +6967,21 @@ pub const AppState = struct {
         const layout = &self.projects.items[self.selected_project_index].workspace_layout;
         if (!layout.hasVisiblePaneKind(.browser)) return;
         self.browser_launch_open_delay_frames = 2;
+    }
+
+    /// Applies keyboard focus on launch based on the restored focused pane, so a
+    /// reopened terminal (or browser/chat) pane is immediately typeable instead
+    /// of requiring a manual mouse click to start receiving input.
+    pub fn applyInitialWorkspaceFocusOnLaunch(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
+        const pane = layout.paneById(pane_id) orelse return;
+        switch (pane.ref) {
+            .terminal => self.requestTerminalFocus(),
+            .browser => self.focusBrowserPane(),
+            .chat => self.requestComposerFocus(),
+        }
     }
 
     /// Toggles the desktop browser control surface and the underlying browser runtime.
@@ -8143,14 +8626,23 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
-        var process = project.managedProcessByName(name) orelse return false;
+        const process = project.managedProcessByName(name) orelse return false;
+        return try self.startManagedProcessDirect(project, process);
+    }
+
+    fn startManagedProcessDirect(self: *AppState, project: *Project, process: *ManagedProcess) !bool {
         const dock_id = process.dock_id orelse try self.createCurrentProjectTerminalDock();
         process.dock_id = dock_id;
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
+        if (process.kind == .agent and process.provider == .codex and process.hooks) {
+            try provider_hooks.ensureCodexProjectHooks(self.allocator, project.path);
+        }
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        const command_args = [_][]const u8{ "/bin/sh", "-lc", process.command };
+        const command = try self.managedProcessLaunchCommand(process);
+        defer self.allocator.free(command);
+        const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
         try dock.restartWithProfilePersistent(self.allocator, cwd, .{
             .kind = .custom,
             .label = process.name,
@@ -8165,10 +8657,82 @@ pub const AppState = struct {
         process.pending_watch_restart_ms = 0;
         process.explicit_stop = false;
         process.pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+        if (process.kind == .agent and process.notify) {
+            if (dock.activeSessionId()) |session_id| {
+                _ = try self.updateSurface(.{
+                    .session_id = session_id,
+                    .workspace_id = project.id,
+                    .workspace_path = project.path,
+                    .dock_id = dock_id,
+                    .pane_id = process.pane_id,
+                    .provider = providerFromStack(process.provider),
+                    .title = process.name,
+                    .status = .working,
+                    .attention = false,
+                    .last_event_title = process.name,
+                    .last_event_body = "Agent started.",
+                });
+            }
+        }
         project.workspace_layout.maximized_pane_id = null;
         self.terminal_focused = true;
         self.markDirty();
         return true;
+    }
+
+    pub fn openAgentTui(self: *AppState, project_index: usize, provider: Provider) !bool {
+        if (provider != .codex) return false;
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        var project = &self.projects.items[project_index];
+        const name = "codex";
+        if (project.managedProcessByName(name) == null) {
+            var process: ManagedProcess = .{
+                .name = try self.allocator.dupe(u8, name),
+                .kind = .agent,
+                .command = try self.allocator.dupe(u8, "codex"),
+                .cwd = try self.allocator.dupe(u8, "."),
+                .restart = .manual,
+                .provider = .codex,
+                .revive = .attach_or_create,
+                .notify = true,
+                .mcp = true,
+                .hooks = true,
+                .watch = .empty,
+            };
+            errdefer process.deinit(self.allocator);
+            try project.managed_processes.append(self.allocator, process);
+        }
+        const process = project.managedProcessByName(name) orelse return false;
+        return try self.startManagedProcessDirect(project, process);
+    }
+
+    fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
+        return switch (provider orelse return null) {
+            .codex => .codex,
+            .claude => .claude,
+            .opencode => .opencode,
+            .cursor => .cursor,
+            .other => null,
+        };
+    }
+
+    fn managedProcessLaunchCommand(self: *AppState, process: *const ManagedProcess) ![]u8 {
+        if (!(process.kind == .agent and process.provider == .codex and process.hooks)) {
+            return self.allocator.dupe(u8, process.command);
+        }
+        if (std.mem.indexOf(u8, process.command, "features.codex_hooks") != null) {
+            return self.allocator.dupe(u8, process.command);
+        }
+
+        const trimmed = std.mem.trim(u8, process.command, " \t\r\n");
+        if (std.mem.eql(u8, trimmed, "codex")) {
+            return self.allocator.dupe(u8, "codex -c features.codex_hooks=true");
+        }
+        if (std.mem.startsWith(u8, trimmed, "codex ")) {
+            return try std.fmt.allocPrint(self.allocator, "codex -c features.codex_hooks=true {s}", .{trimmed["codex ".len..]});
+        }
+        return self.allocator.dupe(u8, process.command);
     }
 
     pub fn stopManagedProcess(self: *AppState, project_index: usize, name: []const u8) !bool {
@@ -9157,6 +9721,13 @@ pub const AppState = struct {
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.palette_modal_text_focus = .none;
+        if (self.focusedWorkspaceTerminalDockId()) |dock_id| {
+            if (self.currentProjectTerminalDock(dock_id)) |dock| {
+                if (dock.activeSessionId()) |session_id| {
+                    _ = self.clearSurfaceAttentionBySession(session_id);
+                }
+            }
+        }
     }
 
     pub fn consumeComposerFocusRequest(self: *AppState) bool {
@@ -10367,6 +10938,7 @@ pub const AppState = struct {
         self.expanded_cards.deinit();
         self.closeTranscriptSelectionModal();
         self.clearProjects();
+        self.clearSurfaces();
         self.transcript_markdown_entries.deinit(self.allocator);
         self.clearBrowserContextMenuLocal();
         self.browser_context_menu_items.deinit(self.allocator);
@@ -10383,6 +10955,7 @@ pub const AppState = struct {
         self.app_config.deinit(self.allocator);
         self.projects.deinit(self.allocator);
         self.archived_projects.deinit(self.allocator);
+        self.surfaces.deinit(self.allocator);
         runtime_log.diagnostic("AppState.deinit complete", .{});
     }
 
@@ -10631,8 +11204,21 @@ pub const AppState = struct {
                     send_state.polled_ui_revision = send_state.ui_revision;
                     stream_changed = true;
                 }
+                // Force a repaint exactly when the visible seconds in the
+                // "Working - mm:ss" label would change. Without this, the
+                // main loop sleeps in SDL_WaitEventTimeout(IDLE) while a
+                // turn is in flight and no tokens are streaming, so the
+                // wall-clock label freezes until the user moves the mouse.
+                const safe_started_at_ms = @max(send_state.started_at_ms, 0);
+                const elapsed_ms = @max(unixTimestampMs() - safe_started_at_ms, 0);
+                const elapsed_seconds = @divTrunc(elapsed_ms, std.time.ms_per_s);
+                if (elapsed_seconds != send_state.polled_working_seconds) {
+                    send_state.polled_working_seconds = elapsed_seconds;
+                    stream_changed = true;
+                }
             },
             .completed => {
+                had_pending_followup = send_state.pending_followup != null;
                 completed_result = send_state.result;
                 send_state.result = null;
                 if (send_state.provisional_provider_thread_id) |thread_id| {
@@ -10788,7 +11374,68 @@ pub const AppState = struct {
         if (next_status == .completed or next_status == .aborted) {
             self.dispatchPendingFollowup(project_index, thread_index, thread);
         }
+        // Notify on a real chat turn completion. Skip when a follow-up is queued
+        // (the turn continues immediately) so we only fire once the agent truly
+        // rests, mirroring the terminal-agent `.done` notification.
+        if (next_status == .completed and !had_pending_followup) {
+            self.maybeNotifyChatCompletion(project_index, thread_index, thread);
+        }
         return next_status != .idle or stream_changed;
+    }
+
+    // Fires a desktop notification for a finished in-app chat turn, unless the
+    // user is actively watching that thread in the focused window. Provider is
+    // known here (no hook/CLI dependency), so the logo is always correct.
+    fn maybeNotifyChatCompletion(self: *AppState, project_index: usize, thread_index: usize, thread: *const ChatThread) void {
+        if (!self.app_config.notifications_enabled) return;
+        if (self.isChatThreadVisibleAndFocused(project_index, thread_index)) return;
+        if (project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+
+        const title = if (thread.title.len > 0)
+            thread.title
+        else
+            utils.providerLabel(thread.provider);
+
+        const dir = if (project.path.len > 0) std.fs.path.basename(project.path) else "";
+        var body_buf: [256]u8 = undefined;
+        const body = if (dir.len > 0)
+            (std.fmt.bufPrint(&body_buf, "Reply ready in {s}", .{dir}) catch "Reply ready")
+        else
+            "Reply ready";
+
+        const icon: notifier.Icon = switch (thread.provider) {
+            .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
+            .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
+            .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
+            .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        };
+        notifier.notifyAgentDone(self.allocator, title, body, icon);
+    }
+
+    // True when the given chat thread is currently on screen in the focused
+    // window: the window holds input focus, its project is selected, and a
+    // non-minimized chat pane (respecting maximize) shows that thread.
+    fn isChatThreadVisibleAndFocused(self: *const AppState, project_index: usize, thread_index: usize) bool {
+        if (!self.window_input_focus) return false;
+        if (project_index != self.selected_project_index) return false;
+        if (project_index >= self.projects.items.len) return false;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        if (layout.maximized_pane_id) |max_id| {
+            const pane = layout.paneById(max_id) orelse return false;
+            return switch (pane.ref) {
+                .chat => |ref| ref.thread_index == thread_index,
+                else => false,
+            };
+        }
+        for (layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            switch (pane.ref) {
+                .chat => |ref| if (ref.thread_index == thread_index) return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn capturePendingProviderThreadId(self: *AppState, thread: *ChatThread) void {

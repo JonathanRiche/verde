@@ -15,12 +15,32 @@ pub const RestartPolicy = enum {
     always,
 };
 
+pub const AgentProvider = enum {
+    codex,
+    claude,
+    opencode,
+    cursor,
+    other,
+};
+
+pub const RevivePolicy = enum {
+    attach_or_create,
+    attach_only,
+    restart,
+    manual,
+};
+
 pub const ProcessDefinition = struct {
     name: []u8,
     kind: ProcessKind,
     command: []u8,
     cwd: []u8,
     restart: RestartPolicy,
+    provider: ?AgentProvider = null,
+    revive: RevivePolicy = .attach_or_create,
+    notify: bool = false,
+    mcp: bool = false,
+    hooks: bool = false,
     watch: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *ProcessDefinition, allocator: std.mem.Allocator) void {
@@ -110,6 +130,11 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
                 .command = try allocator.dupe(u8, ""),
                 .cwd = try allocator.dupe(u8, "."),
                 .restart = if (section == .agents) .manual else .manual,
+                .provider = null,
+                .revive = .attach_or_create,
+                .notify = false,
+                .mcp = false,
+                .hooks = false,
                 .watch = .empty,
             });
             current_index = config.processes.items.len - 1;
@@ -142,6 +167,16 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
             process.cwd = value;
         } else if (std.mem.eql(u8, key, "restart")) {
             process.restart = parseRestart(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "provider")) {
+            process.provider = parseProvider(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "revive")) {
+            process.revive = parseRevive(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "notify")) {
+            process.notify = parseBool(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "mcp")) {
+            process.mcp = parseBool(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "hooks")) {
+            process.hooks = parseBool(raw_value) orelse return error.InvalidStackConfig;
         }
     }
 
@@ -191,6 +226,32 @@ fn parseRestart(raw_value: []const u8) ?RestartPolicy {
     return null;
 }
 
+fn parseProvider(raw_value: []const u8) ?AgentProvider {
+    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
+    if (std.mem.eql(u8, value, "codex")) return .codex;
+    if (std.mem.eql(u8, value, "claude")) return .claude;
+    if (std.mem.eql(u8, value, "opencode")) return .opencode;
+    if (std.mem.eql(u8, value, "cursor")) return .cursor;
+    if (std.mem.eql(u8, value, "other")) return .other;
+    return null;
+}
+
+fn parseRevive(raw_value: []const u8) ?RevivePolicy {
+    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
+    if (std.mem.eql(u8, value, "attach_or_create")) return .attach_or_create;
+    if (std.mem.eql(u8, value, "attach_only")) return .attach_only;
+    if (std.mem.eql(u8, value, "restart")) return .restart;
+    if (std.mem.eql(u8, value, "manual")) return .manual;
+    return null;
+}
+
+fn parseBool(raw_value: []const u8) ?bool {
+    const value = std.mem.trim(u8, raw_value, " \t\r\"'");
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "no") or std.mem.eql(u8, value, "0")) return false;
+    return null;
+}
+
 test "parse verde stack config" {
     const content =
         \\version: 1
@@ -203,7 +264,12 @@ test "parse verde stack config" {
         \\      - "src/**"
         \\agents:
         \\  codex:
+        \\    provider: codex
         \\    command: "codex"
+        \\    revive: attach_or_create
+        \\    notify: true
+        \\    mcp: true
+        \\    hooks: false
         \\
     ;
     var config = try parse(std.testing.allocator, content, "verde.yml");
@@ -216,4 +282,9 @@ test "parse verde stack config" {
     try std.testing.expectEqualStrings("src/**", config.processes.items[0].watch.items[0]);
     try std.testing.expectEqualStrings("codex", config.processes.items[1].name);
     try std.testing.expectEqual(ProcessKind.agent, config.processes.items[1].kind);
+    try std.testing.expectEqual(AgentProvider.codex, config.processes.items[1].provider.?);
+    try std.testing.expectEqual(RevivePolicy.attach_or_create, config.processes.items[1].revive);
+    try std.testing.expect(config.processes.items[1].notify);
+    try std.testing.expect(config.processes.items[1].mcp);
+    try std.testing.expect(!config.processes.items[1].hooks);
 }
