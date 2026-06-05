@@ -110,6 +110,7 @@ verde version [--json]        # Print version metadata
 verde capabilities [--json]   # Print supported CLI/live features
 verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
+verde notify [options]        # Update the current terminal surface
 verde live <command>          # Control or inspect the running app
 ```
 
@@ -193,6 +194,7 @@ verde live active [--json]
 verde live panes [--project <id|index|path|current>] [--json]
 verde live threads [--project <id|index|path|current>] [--json]
 verde live terminals [--project <id|index|path|current>] [--json]
+verde live surfaces [--json]
 verde live processes [--json]
 verde live inspect --pane <pane-id> [--project <id|index|path|current>] [--json]
 verde live inspect --focused [--json]
@@ -208,6 +210,45 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
   last browser error, last bridge message, and last eval result.
 - `projects` lists live projects.
 - `active` returns the current project and focused pane.
+- `surfaces` lists in-memory terminal surface status and attention metadata.
+
+### Terminal Surface Notifications
+
+Verde terminal children receive identity variables such as `VERDE=1`,
+`VERDE_SESSION_ID`, `VERDE_WORKSPACE_ID`, `VERDE_WORKSPACE_PATH`,
+`VERDE_DOCK_ID`, `VERDE_PANE_ID`, `VERDE_SOCKET`,
+`VERDE_LIVE_SOCKET`, `VERDE_SESSIONIZER_SOCKET`, and `VERDE_CLI`.
+Terminal tools can use those variables to update their pane surface:
+
+```bash
+verde notify --title "Codex needs input" --body "Approve command?" --status waiting
+verde notify --status working --progress 0.4 --label "Running tests"
+verde notify --status done --title "Agent finished"
+verde notify --clear
+```
+
+`verde notify` infers `--session` from `VERDE_SESSION_ID`; scripts can pass
+`--session`, `--workspace`, `--dock`, or `--pane` explicitly. If the desktop app
+is not running, `verde notify --quiet` exits without launching Verde or showing
+an OS notification.
+
+Provider hook integrations are intentionally opt-in and conservative:
+
+```bash
+verde integrations list
+verde integrations doctor
+verde integrations install codex
+verde integrations install claude
+```
+
+`verde integrations` reports hook support without touching provider auth.
+Codex uses project-local hooks: `verde integrations install codex` writes
+`.codex/hooks.json` and `.verde/hooks/codex-notify-hook.sh` in the current
+workspace, and refuses to overwrite an existing unmanaged `.codex/hooks.json`.
+Other providers currently return an unsupported status; the generic
+`verde notify`, OSC notification, and MCP surface paths remain available for
+all terminal tools.
+
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
   Verde.
@@ -294,15 +335,26 @@ write through the same active PTY input path as the UI.
 ```bash
 verde live terminal write --pane <pane-id> --text $'cargo test\r' [--json]
 verde live terminal write --focused --text $'printf "ok\\n"\r' [--json]
-verde live process inspect --pane <pane-id> [--json]
-verde live process inspect --focused [--json]
+verde live process list [--project <id|index|path|current>] [--json]
+verde live process start --name <name> [--project <id|index|path|current>] [--json]
+verde live process stop --name <name> [--project <id|index|path|current>] [--json]
+verde live process restart --name <name> [--project <id|index|path|current>] [--json]
+verde live process inspect --name <name> [--project <id|index|path|current>] [--json]
+verde live process logs --name <name> [--project <id|index|path|current>] [--json]
+verde live agent open --provider codex [--project <id|index|path|current>] [--json]
+verde live stack start [--project <id|index|path|current>] [--json]
+verde live stack stop [--project <id|index|path|current>] [--json]
+verde live stack restart [--project <id|index|path|current>] [--json]
 ```
 
 - `terminal write` sends text to the active terminal tab/pane. Include `\r` when
   you want to submit a shell command.
-- `process inspect` currently returns the same pane/terminal details as
-  `inspect` for a terminal pane. Process spawn, restart, and rename are reserved
-  for a later slice.
+- `process start`, `stop`, and `restart` control entries loaded from
+  `verde.yml`.
+- `agent open --provider codex` opens a first-class Codex TUI in the selected
+  workspace without requiring a `verde.yml` entry.
+- `stack start`, `stop`, and `restart` apply the same action to every configured
+  process and agent in the selected workspace.
 
 ### Selectors And Exit Codes
 
@@ -349,8 +401,57 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 
 - App state is saved through SDL's pref path in `state.sqlite`.
 - User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json`.
+- Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace root. `processes:` and `agents:` entries both run in terminal docks; agent entries may also declare `provider`, `revive`, `notify`, `mcp`, and `hooks` metadata. New agent metadata defaults to disabled unless explicitly set.
 - On Omarchy systems, UI colors are loaded from an Omarchy-compatible `colors.toml`. Verde first honors `VERDE_OMARCHY_COLORS=/path/to/colors.toml`, then `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, then named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` or `~/.config/omarchy/themes/verde/colors.toml`. Missing values fall back to Verde defaults. See [`examples/omarchy/verde/colors.toml`](examples/omarchy/verde/colors.toml).
 - `theme.colors` in `verde.json` can override Verde theme tokens. Omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
+
+Example project stack config:
+
+```yaml
+processes:
+  web:
+    command: "npm run dev"
+    cwd: "."
+    restart: on_crash
+
+agents:
+  codex:
+    provider: codex
+    command: "codex"
+    cwd: "."
+    revive: attach_or_create
+    notify: true
+    mcp: true
+    hooks: true
+```
+
+Use `processes:` for normal long-running commands such as dev servers. Use
+`agents:` for terminal/TUI AI tools that should behave like first-class Verde
+surfaces. With the Codex example above, Verde creates or reuses a terminal dock
+for the agent and wires Codex hook events into pane/workspace attention. Plain
+`codex` managed commands are launched with `features.codex_hooks=true` when
+`hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
+`Stop` can mark it `done`.
+
+Start or restart a configured Codex agent with:
+
+```bash
+verde live agent open --provider codex
+verde live process restart --name codex
+```
+
+Use `verde live agent open --provider codex` for the default Codex TUI flow; it
+creates a managed terminal surface, applies Codex hook setup, and does not need
+a `verde.yml` entry. Use `verde live process restart --name codex` when you
+want to launch or restart the named agent declared in `verde.yml`. The same
+default Codex TUI action is available from the workspace sidebar by
+right-clicking the workspace new-thread/pencil button and choosing `Open Codex
+TUI`.
+
+A Codex TUI opened manually in any Verde terminal still gets Verde identity
+environment variables and can update the surface through `verde notify`, BEL,
+OSC 777, or MCP, but it is not automatically a managed `verde.yml` agent unless
+it is launched through the configured process entry.
 
 Example config:
 

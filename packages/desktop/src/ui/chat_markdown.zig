@@ -3553,11 +3553,12 @@ fn queueCodeCopyButton(
     const btn_x = block_rect.x + block_rect.w - btn_size - margin;
     const btn_y = block_rect.y + margin;
     const btn_rect: palette.Rect = .{ .x = btn_x, .y = btn_y, .w = btn_size, .h = btn_size };
+    const visible_btn_rect = visibleClipRect(context.clip, btn_rect) orelse return;
 
     const mx = context.mouse_pos[0];
     const my = context.mouse_pos[1];
-    const hovered = mx >= btn_rect.x and mx <= btn_rect.x + btn_rect.w and
-        my >= btn_rect.y and my <= btn_rect.y + btn_rect.h;
+    const hovered = mx >= visible_btn_rect.x and mx <= visible_btn_rect.x + visible_btn_rect.w and
+        my >= visible_btn_rect.y and my <= visible_btn_rect.y + visible_btn_rect.h;
 
     const bg_color = if (is_recent)
         paletteColor(theme.md.copy_bg_recent)
@@ -3588,7 +3589,7 @@ fn queueCodeCopyButton(
     const payload_len = context.frame_text.items.len - payload_start;
 
     recorder.push_fn(recorder.context, .{
-        .rect = btn_rect,
+        .rect = visible_btn_rect,
         .payload_offset = payload_start,
         .payload_len = payload_len,
         .identity = identity,
@@ -3636,11 +3637,27 @@ fn advancePaletteCursor(context: *PaletteRenderContext, height: f32) void {
 }
 
 fn queuePaletteRect(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color) void {
-    context.batch.rect(context.allocator, rect, color) catch {};
+    if (context.clip) |clip| {
+        if (visibleClipRect(clip, rect) == null) return;
+        context.batch.rectClipped(context.allocator, rect, color, clip) catch {};
+    } else {
+        context.batch.rect(context.allocator, rect, color) catch {};
+    }
 }
 
 fn queuePaletteRoundedRect(context: *PaletteRenderContext, rect: palette.Rect, color: palette.Color, radius: f32) void {
-    context.batch.roundedRect(context.allocator, rect, color, radius) catch {};
+    if (context.clip) |clip| {
+        if (visibleClipRect(clip, rect) == null) return;
+        context.batch.roundedRectClipped(context.allocator, rect, color, radius, clip) catch {};
+    } else {
+        context.batch.roundedRect(context.allocator, rect, color, radius) catch {};
+    }
+}
+
+fn visibleClipRect(parent: ?palette.Rect, child: palette.Rect) ?palette.Rect {
+    const clipped = intersectClipRect(parent, child) orelse return child;
+    if (clipped.w <= 0.0 or clipped.h <= 0.0) return null;
+    return clipped;
 }
 
 /// Rounded frame without `rectBorder` (axis-aligned quads with sharp corners on top of rounded fills).

@@ -259,6 +259,9 @@ pub fn renderDockAtForDockWithReserve(state: *app_state.AppState, rect: palette.
     const dock_bg = if (dock.activeRenderState()) |render_state| rgbPaletteColor(render_state.colors.background, 1.0) else paletteColor(theme.background());
     queueRounded(state, rect, dock_bg, 0.0);
     queueBorder(state, rect, paletteColor(theme.COLOR_PANEL_MUTED), 0.0, 1.0);
+    if (state.terminalDockSurfaceAttention(state.selected_project_index, dock_id)) {
+        queueBorder(state, rect, paletteColor(theme.COLOR_YELLOW), 0.0, theme.scaledUi(2.0));
+    }
 
     if (dock.activeTab()) |tab| {
         renderPaneNode(state, dock, tab.root, rect);
@@ -1592,8 +1595,18 @@ fn terminalGlyphKind(cp: u21) TerminalGlyphKind {
     // which has the correct glyph shapes — instead of hitting the `else =>
     // "?"` placeholder in queuePowerlineGlyph that rendered as tofu.
     return switch (cp) {
-        0xe0b0, 0xe0b2, 0xe0b4, 0xe0b6, 0xe0b8, 0xe0ba,
-        0xe0bc, 0xe0be, 0xe0c0, 0xe0c2, 0xe0c4, 0xe0c6,
+        0xe0b0,
+        0xe0b2,
+        0xe0b4,
+        0xe0b6,
+        0xe0b8,
+        0xe0ba,
+        0xe0bc,
+        0xe0be,
+        0xe0c0,
+        0xe0c2,
+        0xe0c4,
+        0xe0c6,
         => .powerline,
         else => .text,
     };

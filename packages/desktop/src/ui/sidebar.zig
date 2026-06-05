@@ -41,7 +41,9 @@ const SidebarHitKind = enum {
     add_workspace,
     new_thread,
     workspace_row,
+    workspace_avatar,
     thread_row,
+    open_pane,
     toggle_threads,
     settings,
 };
@@ -61,6 +63,7 @@ var sidebar_max_scroll_y: f32 = 0.0;
 
 const SidebarContextMenuAction = enum {
     workspace_new_chat,
+    workspace_open_codex_tui,
     workspace_open_terminal,
     workspace_rename,
     workspace_import_codex,
@@ -262,6 +265,15 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     _ = sdl.captureMouse(true);
                 }
             },
+            .open_pane => {
+                state.focusWorkspaceOpenPane(hit.project_index, @intCast(hit.thread_index));
+            },
+            .workspace_avatar => {
+                if (hit.project_index < state.projects.items.len) {
+                    state.selected_project_index = hit.project_index;
+                    state.markDirty();
+                }
+            },
             .toggle_threads => {
                 if (hit.project_index < state.projects.items.len) {
                     state.projects.items[hit.project_index].thread_list_expanded = !state.projects.items[hit.project_index].thread_list_expanded;
@@ -298,6 +310,19 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
         if (!rectContainsPoint(hit.rect, x, y)) continue;
 
         switch (hit.kind) {
+            .new_thread => {
+                state.workspace_header_open_menu_open = false;
+                state.sidebar_context_menu_anchor_x = x;
+                state.sidebar_context_menu_anchor_y = y;
+                state.sidebar_context_menu_project_index = hit.project_index;
+                state.sidebar_context_menu_thread_index = 0;
+                state.sidebar_context_menu_kind = .project_new_thread;
+                state.sidebar_context_menu_open = true;
+                state.blurPaletteComposer();
+                state.noteInteraction();
+                state.markDirty();
+                return true;
+            },
             .workspace_row => {
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
@@ -565,6 +590,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_new_chat => {
                     if (pi < state.projects.items.len) state.createThreadForProject(pi);
                 },
+                .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
                 .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
                 .workspace_rename => state.beginProjectRename(pi),
                 .workspace_import_codex => state.beginThreadImport(pi, .codex),
@@ -620,6 +646,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .project => {
             const pi = state.sidebar_context_menu_project_index;
             appendSidebarContextMenuRow(.workspace_new_chat, true, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
             appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.projects.items.len, "Open terminal");
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
@@ -635,6 +662,11 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                 }
             }
             appendSidebarContextMenuRow(.workspace_archive, !busy, "Archive workspace");
+        },
+        .project_new_thread => {
+            const pi = state.sidebar_context_menu_project_index;
+            appendSidebarContextMenuRow(.workspace_new_chat, pi < state.projects.items.len, "Start a new chat");
+            appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
         },
         .thread => {
             const pi = state.sidebar_context_menu_project_index;
@@ -780,6 +812,18 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
         if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        // Per-pane status pips in the "OPEN" list below supersede the old
+        // aggregate attention dot, but keep a single dot on collapsed rows where
+        // the pane list is hidden so attention is still visible at a glance.
+        if (project_visible and collapsed and state.projectSurfaceAttention(project_index)) {
+            const dot = theme.scaledUi(7.0);
+            queuePaletteRoundedRect(state, .{
+                .x = row_rect.x + row_rect.w - theme.scaledUi(14.0),
+                .y = cy - dot * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.COLOR_YELLOW), dot * 0.5);
+        }
 
         const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
         const new_hovered = state.sidebar_new_thread_hover == project_index;
@@ -793,6 +837,8 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         y += row_h + theme.scaledUi(4.0);
 
         if (!collapsed) {
+            y = renderOpenPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
+
             var saved_buf: [32]u8 = undefined;
             const saved = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCountCached(state.allocator)}) catch "saved chats";
             const saved_rect: palette.Rect = .{ .x = x + theme.scaledUi(24.0), .y = y, .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(22.0) };
@@ -913,18 +959,168 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     const x = rect.x + (rect.w - button) * 0.5;
     var y = rect.y + theme.scaledUi(30.0);
     queuePaletteLogoMark(state, .{ .x = x + theme.scaledUi(2.0), .y = y, .w = theme.scaledUi(32.0), .h = theme.scaledUi(32.0) });
-    y += theme.scaledUi(62.0);
+    y += theme.scaledUi(58.0);
     const expand_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteButton(state, expand_rect, ">", false);
     addPaletteHit(expand_rect, .expand, 0, 0);
-    y += theme.scaledUi(40.0);
+    y += theme.scaledUi(38.0);
     const new_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, theme.COLOR_TEXT_MUTED);
     addPaletteHit(new_rect, .new_thread, state.selected_project_index, 0);
-    y += theme.scaledUi(40.0);
-    const add_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
+    y += theme.scaledUi(34.0);
+
+    // Hairline divider, then a vertical "activity dock" of workspace avatars so
+    // the narrow rail shows every workspace, which one is active, and whether
+    // any of its panes need attention — instead of being a dead button strip.
+    queuePaletteRect(state, .{ .x = x + theme.scaledUi(6.0), .y = y, .w = button - theme.scaledUi(12.0), .h = theme.scaledUi(1.0) }, paletteColor(theme.borderMuted()));
+    y += theme.scaledUi(12.0);
+
+    const avatar = theme.scaledUi(36.0);
+    const dock_bottom = rect.y + rect.h - theme.scaledUi(48.0);
+    var project_index: usize = 0;
+    while (project_index < state.projects.items.len) : (project_index += 1) {
+        if (y + avatar > dock_bottom) break; // keep the rail tidy; expand to see the rest
+        const project = &state.projects.items[project_index];
+        const selected = state.selected_project_index == project_index;
+        const avatar_rect: palette.Rect = .{ .x = x, .y = y, .w = avatar, .h = avatar };
+        const hovered = state.palette_mouse_in_workspace and rectContainsPoint(avatar_rect, state.palette_mouse_x, state.palette_mouse_y);
+
+        // The active workspace reads as a bold filled chip in the theme accent —
+        // mirroring (and amplifying) the green filled folder of the expanded
+        // view's selected row — with a left accent bar for an unmistakable cue.
+        const bg = if (selected)
+            paletteColor(theme.COLOR_SECONDARY_GREEN)
+        else if (hovered)
+            paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 110))
+        else
+            paletteColor(theme.COLOR_PANEL_ALT);
+        queuePaletteRoundedRect(state, avatar_rect, bg, theme.scaledUi(9.0));
+        if (selected) {
+            const bar_h = avatar * 0.55;
+            queuePaletteRoundedRect(state, .{
+                .x = rect.x + theme.scaledUi(2.0),
+                .y = avatar_rect.y + (avatar - bar_h) * 0.5,
+                .w = theme.scaledUi(3.0),
+                .h = bar_h,
+            }, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(1.5));
+        }
+
+        // Workspace initial as the avatar mark. queuePaletteText is left-aligned,
+        // so center it manually (single glyph ~= font * 0.6 wide). On the filled
+        // active chip the initial reverses out to the dark panel color.
+        var letter_buf: [1]u8 = undefined;
+        const letter = workspaceInitial(&letter_buf, project.label);
+        const letter_font = theme.scaledUi(15.0);
+        const letter_w = letter_font * 0.6;
+        const letter_color = if (selected)
+            theme.background()
+        else if (hovered)
+            theme.COLOR_WHITE
+        else
+            theme.COLOR_TEXT_MUTED;
+        queuePaletteText(state, .{
+            .x = @round(avatar_rect.x + (avatar - letter_w) * 0.5),
+            .y = @round(avatar_rect.y + (avatar - letter_font * 1.25) * 0.5),
+            .w = letter_w + theme.scaledUi(3.0),
+            .h = letter_font * 1.25,
+        }, letter, paletteColor(letter_color), letter_font, null);
+
+        // Attention badge tucked into the top-right corner, kept fully inside the
+        // narrow rail so it doesn't clip against the panel edge.
+        if (workspaceStatusColor(state, project_index)) |badge| {
+            const pulse: f32 = 0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0);
+            const badge_d = theme.scaledUi(8.0);
+            queuePaletteRoundedRect(state, .{
+                .x = avatar_rect.x + avatar - badge_d - theme.scaledUi(2.0),
+                .y = avatar_rect.y + theme.scaledUi(2.0),
+                .w = badge_d,
+                .h = badge_d,
+            }, paletteColor(theme.withAlpha(badge, @intFromFloat(pulse * 255.0))), badge_d * 0.5);
+        }
+
+        addPaletteHit(avatar_rect, .workspace_avatar, project_index, 0);
+        y += avatar + theme.scaledUi(5.0);
+
+        // Composition dots: one per open (non-minimized) pane, colored by kind.
+        renderCollapsedCompositionDots(state, project, avatar_rect.x + avatar * 0.5, y);
+        y += theme.scaledUi(11.0);
+    }
+
+    const add_rect: palette.Rect = .{ .x = x, .y = rect.y + rect.h - theme.scaledUi(42.0), .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteButton(state, add_rect, "+", true);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
+}
+
+/// Writes the uppercase first letter of a workspace label into `buf` for use as
+/// a collapsed-rail avatar mark, returning the rendered slice.
+fn workspaceInitial(buf: *[1]u8, label: []const u8) []const u8 {
+    if (label.len == 0) return "?";
+    buf[0] = switch (label[0]) {
+        'a'...'z' => label[0] - 32,
+        else => label[0],
+    };
+    return buf[0..1];
+}
+
+/// Aggregate attention color for a workspace's panes (error > waiting > working),
+/// or null when nothing needs attention. Used by the collapsed activity dock.
+fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 {
+    if (project_index >= state.projects.items.len) return null;
+    const project = &state.projects.items[project_index];
+    var has_waiting = false;
+    var has_working = false;
+    for (project.workspace_layout.panes.items) |pane| {
+        switch (pane.ref) {
+            .terminal => |ref| {
+                if (state.isFocusedTerminalSurface(project_index, ref.dock_id)) continue;
+                if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
+                    switch (surface.status) {
+                        .@"error" => return theme.COLOR_DIFF_REMOVE,
+                        .waiting => has_waiting = true,
+                        .working => has_working = true,
+                        else => {},
+                    }
+                }
+            },
+            .chat => |ref| {
+                if (ref.thread_index < project.threads.items.len and project.threads.items[ref.thread_index].isSendPendingForUi()) has_working = true;
+            },
+            .browser => {},
+        }
+    }
+    if (has_waiting) return theme.COLOR_YELLOW;
+    if (has_working) return theme.COLOR_SECONDARY_GREEN;
+    return null;
+}
+
+/// Draws a centered row of small dots — one per open pane, colored by kind —
+/// beneath a collapsed workspace avatar.
+fn renderCollapsedCompositionDots(state: *runtime.AppState, project: *const native_state.Project, center_x: f32, y: f32) void {
+    const max_dots = 4;
+    var count: usize = 0;
+    for (project.workspace_layout.panes.items) |pane| {
+        if (pane.minimized) continue;
+        count += 1;
+    }
+    if (count == 0) return;
+    const shown = @min(count, max_dots);
+    const dot = theme.scaledUi(4.0);
+    const gap = theme.scaledUi(3.0);
+    const total_w = @as(f32, @floatFromInt(shown)) * dot + @as(f32, @floatFromInt(shown - 1)) * gap;
+    var dx = center_x - total_w * 0.5;
+    var drawn: usize = 0;
+    for (project.workspace_layout.panes.items) |pane| {
+        if (pane.minimized) continue;
+        if (drawn >= max_dots) break;
+        const color = switch (pane.ref) {
+            .chat => theme.COLOR_SECONDARY_GREEN,
+            .terminal => theme.COLOR_TEXT_MUTED,
+            .browser => theme.COLOR_GREEN,
+        };
+        queuePaletteRoundedRect(state, .{ .x = dx, .y = y, .w = dot, .h = dot }, paletteColor(color), dot * 0.5);
+        dx += dot + gap;
+        drawn += 1;
+    }
 }
 
 fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {
@@ -943,6 +1139,209 @@ fn queuePaletteButton(state: *runtime.AppState, rect: palette.Rect, label: []con
         .w = @max(text_width, theme.scaledUi(4.0)),
         .h = font_size * 1.25,
     }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
+}
+
+/// Renders the live "OPEN" list of a workspace's layout panes (chat / terminal
+/// / browser) above the saved-chats history, so every pane kind is visible and
+/// directly focusable from the sidebar. Returns the advanced y cursor.
+fn renderOpenPanesSection(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    x: f32,
+    rail_w: f32,
+    list_clip: palette.Rect,
+    clip: palette.Rect,
+    y_in: f32,
+) f32 {
+    var y = y_in;
+    const layout = &project.workspace_layout;
+    if (layout.panes.items.len == 0) return y;
+
+    const label_rect: palette.Rect = .{ .x = x + theme.scaledUi(24.0), .y = y, .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) };
+    if (rowVisible(label_rect, list_clip)) queuePaletteText(state, label_rect, "OPEN", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
+    y += theme.scaledUi(22.0);
+
+    for (layout.panes.items) |*pane| {
+        const row_rect: palette.Rect = .{
+            .x = x + theme.scaledUi(24.0),
+            .y = y,
+            .w = rail_w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
+        };
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip);
+        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+    }
+    y += theme.scaledUi(6.0);
+    return y;
+}
+
+fn renderOpenPaneRow(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+    rect: palette.Rect,
+    clip: palette.Rect,
+) void {
+    const layout = &project.workspace_layout;
+    const focused = state.selected_project_index == project_index and layout.focused_pane_id == pane.id;
+    const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (focused) {
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.borderMuted()), theme.scaledUi(7.0));
+    } else if (hovered) {
+        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)), theme.scaledUi(7.0));
+    }
+    addPaletteHit(rect, .open_pane, project_index, pane.id);
+
+    const dim = pane.minimized;
+    const cy = rect.y + rect.h * 0.5;
+    const icon_x = rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS);
+    const muted = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_TEXT_MUTED;
+
+    // Backing storage for the terminal pane's live tab title and the foreground
+    // process name used for provider detection; must outlive the render below,
+    // so they live at function scope.
+    var term_title_buf: [96]u8 = undefined;
+    var comm_buf: [96]u8 = undefined;
+    var title: []const u8 = "";
+    var running = false;
+    var status: ?native_state.SurfaceStatus = null;
+    switch (pane.ref) {
+        .chat => |ref| {
+            if (ref.thread_index < project.threads.items.len) {
+                const thread = &project.threads.items[ref.thread_index];
+                queuePaletteProviderGlyph(state, thread.provider, icon_x, cy, clip);
+                title = thread.title;
+                running = thread.isSendPendingForUi();
+            } else {
+                queuePaletteChatBubbleIcon(state, icon_x, cy, muted);
+                title = "Chat";
+            }
+        },
+        .terminal => |ref| {
+            const surface = state.projectTerminalSurface(project_index, ref.dock_id);
+            if (surface) |s| {
+                status = s.status;
+                if (s.status == .working) running = true;
+            }
+            // Detect a running agent (Claude/Codex/etc.) from the surface
+            // provider or the foreground process name, and draw a split
+            // provider+terminal glyph for it; otherwise a plain terminal glyph.
+            var agent_provider: ?Provider = if (surface) |s| s.provider else null;
+            if (agent_provider == null) {
+                if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                    // Live foreground process when running, else the provider
+                    // pinned by the notify hook (persisted across restarts,
+                    // available before the agent process is revived).
+                    if (dock.activeForegroundProcessName(&comm_buf)) |comm| agent_provider = providerFromComm(comm);
+                    if (agent_provider == null) {
+                        if (dock.activeTabPinnedProvider()) |name| agent_provider = std.meta.stringToEnum(Provider, name);
+                    }
+                }
+            }
+            if (agent_provider) |prov| {
+                // Neutral/white prompt mark so it contrasts with the provider logo
+                // instead of blending into it (the accent shares the logo's hue).
+                const mark_color = if (dim) theme.COLOR_TEXT_SUBTLE else theme.COLOR_WHITE;
+                queuePaletteAgentTerminalGlyph(state, prov, icon_x, cy, mark_color, clip);
+            } else {
+                queuePaletteTerminalMark(state, icon_x, cy, theme.scaledUi(14.0), muted, clip);
+            }
+            // Prefer an agent/notify-provided surface title, then the terminal's
+            // live OSC title (or cwd via tabTitle), then a generic fallback.
+            title = blk: {
+                if (surface) |s| if (s.title.len > 0) break :blk s.title;
+                if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
+                    const live = dock.activeProcessLabel(&term_title_buf);
+                    if (live.len > 0) break :blk live;
+                }
+                break :blk "Terminal";
+            };
+            // Agents (e.g. Claude Code) prefix their title with a symbol marker
+            // like "✳" the sidebar font can't render; drop it so it doesn't show
+            // as a tofu box before the title.
+            title = stripLeadingTitleSymbols(title);
+        },
+        .browser => {
+            queuePaletteGlobeIcon(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
+            title = browserPaneTitle(state);
+        },
+    }
+
+    const title_left_css = SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
+    var title_buf = std.mem.zeroes([64:0]u8);
+    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
+    const shown = truncatedThreadTitle(&title_buf, title, title_chars);
+
+    const emphasis = focused or hovered;
+    const title_color = if (dim)
+        theme.COLOR_TEXT_SUBTLE
+    else if (running)
+        theme.COLOR_SECONDARY_GREEN
+    else if (emphasis)
+        theme.COLOR_WHITE
+    else
+        theme.COLOR_TEXT_MUTED;
+
+    const title_font = theme.scaledUi(13.5);
+    const title_line = title_font * 1.30;
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(title_left_css),
+        .y = @round(rect.y + (rect.h - title_line) * 0.5),
+        .w = rect.w - theme.scaledUi(title_left_css + 12.0),
+        .h = title_line,
+    }, shown, paletteColor(title_color), title_font, clip);
+
+    // No status pip on the pane you're focused in — you're already there.
+    if (!focused) {
+        if (paneStatusColor(status, running)) |pip_color| {
+            const animated = running or (if (status) |s| s == .waiting else false);
+            const pulse: f32 = if (animated)
+                0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
+            else
+                1.0;
+            const dot = theme.scaledUi(7.0);
+            queuePaletteRoundedRect(state, .{
+                .x = rect.x + rect.w - theme.scaledUi(10.0),
+                .y = cy - dot * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
+        }
+    }
+}
+
+/// Maps a terminal surface status (and chat running state) to a sidebar status
+/// pip color, or null when the pane needs no attention indicator.
+fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
+    if (status) |s| {
+        return switch (s) {
+            .working => theme.COLOR_SECONDARY_GREEN,
+            .waiting => theme.COLOR_YELLOW,
+            .@"error" => theme.COLOR_DIFF_REMOVE,
+            .done => theme.COLOR_TEXT_SUBTLE,
+            .idle => if (running) theme.COLOR_SECONDARY_GREEN else null,
+        };
+    }
+    if (running) return theme.COLOR_SECONDARY_GREEN;
+    return null;
+}
+
+/// Best-effort human label for the workspace browser pane.
+fn browserPaneTitle(state: *runtime.AppState) []const u8 {
+    const url = state.browserState().current_url orelse return "Browser";
+    if (url.len == 0) return "Browser";
+    return url;
+}
+
+/// Draws a minimal globe glyph (circle + equator + meridian) for browser panes.
+fn queuePaletteGlobeIcon(state: *runtime.AppState, cx: f32, cy: f32, size: f32, color: palette.Color) void {
+    const r = size * 0.5;
+    const stroke = @max(theme.scaledUi(1.0), size * 0.09);
+    queuePaletteBorder(state, .{ .x = cx - r, .y = cy - r, .w = size, .h = size }, color, r, stroke);
+    queuePaletteRect(state, .{ .x = cx - r, .y = cy - stroke * 0.5, .w = size, .h = stroke }, color);
+    queuePaletteRect(state, .{ .x = cx - stroke * 0.5, .y = cy - r, .w = stroke, .h = size }, color);
 }
 
 fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread_index: usize, thread: anytype, rect: palette.Rect, clip: palette.Rect) void {
@@ -1065,6 +1464,7 @@ const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_GEAR = "\u{EB51}";
+const NF_COD_TERMINAL = "\u{EA85}";
 
 /// Renders a centered codicon glyph through the icon font. Replaces the
 /// hand-drawn shapes / PNGs we used before.
@@ -1192,6 +1592,23 @@ fn snapRect(rect: palette.Rect) palette.Rect {
     };
 }
 
+/// Strips a leading run of non-ASCII bytes (a symbol/emoji marker such as the
+/// "✳" agents prepend to their terminal title) when it is separated from the
+/// real title by a space. Falls back to the original string otherwise, so plain
+/// or fully non-ASCII titles are left untouched.
+fn stripLeadingTitleSymbols(title: []const u8) []const u8 {
+    if (title.len == 0 or title[0] < 0x80) return title;
+    var i: usize = 0;
+    while (i < title.len and title[i] >= 0x80) {
+        i += if (title[i] >= 0xF0) 4 else if (title[i] >= 0xE0) 3 else if (title[i] >= 0xC0) 2 else 1;
+    }
+    if (i < title.len and (title[i] == ' ' or title[i] == '\t')) {
+        const rest = std.mem.trimStart(u8, title[i..], " \t");
+        if (rest.len > 0 and rest[0] < 0x80) return rest;
+    }
+    return title;
+}
+
 /// Truncates a thread title for narrow sidebar rows.
 fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:0]const u8 {
     const bounded_max = @min(buffer.len - 1, max_len);
@@ -1235,12 +1652,16 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
 
 fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
     const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-    const image_rect: palette.Rect = .{
+    queuePaletteProviderGlyphInRect(state, provider, .{
         .x = x,
         .y = center_y - image_size * 0.5,
         .w = image_size,
         .h = image_size,
-    };
+    }, clip);
+}
+
+/// Draws a provider logo (or letter fallback) fitted within `box`.
+fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: Provider, box: palette.Rect, clip: ?palette.Rect) void {
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
@@ -1248,7 +1669,7 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .cursor => state.cursor_logo_texture,
     };
     if (texture) |cached| {
-        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, image_rect.x, image_rect.y, image_rect.w, image_rect.h));
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
         const draw = snapRect(.{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
         if (queuePaletteImage(state, draw, cached, paletteColor(theme.COLOR_WHITE), clip)) return;
     }
@@ -1259,13 +1680,62 @@ fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f3
         .claude => "Cl",
         .cursor => "Cu",
     };
-    const font_size = theme.scaledUi(11.0);
+    const font_size = @min(theme.scaledUi(11.0), box.h);
+    queuePaletteText(state, .{
+        .x = box.x,
+        .y = box.y + (box.h - font_size * 1.25) * 0.5,
+        .w = box.w,
+        .h = font_size * 1.25,
+    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, clip);
+}
+
+/// Maps a foreground process `comm` name to a known agent provider, so a
+/// terminal pane running e.g. `claude` shows that provider's split icon.
+fn providerFromComm(comm: []const u8) ?Provider {
+    if (std.mem.eql(u8, comm, "claude")) return .claude;
+    if (std.mem.eql(u8, comm, "codex")) return .codex;
+    if (std.mem.eql(u8, comm, "opencode")) return .opencode;
+    if (std.mem.startsWith(u8, comm, "cursor")) return .cursor;
+    return null;
+}
+
+/// Composite glyph for an agent running in a terminal pane: the provider logo
+/// sits in the upper-left, a font-safe `>_` prompt mark in the lower-right, and
+/// a diagonal slash divides them.
+fn queuePaletteAgentTerminalGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, term_color: [4]f32, clip: palette.Rect) void {
+    // Provider logo, then a `>_` prompt — laid out horizontally and vertically
+    // centered. Kept deliberately simple (no diagonal/divider primitives) so it
+    // renders cleanly at sidebar size.
+    const logo = theme.scaledUi(15.0);
+    queuePaletteProviderGlyphInRect(state, provider, .{ .x = x, .y = center_y - logo * 0.5, .w = logo, .h = logo }, clip);
+    queuePaletteTerminalMark(state, x + logo + theme.scaledUi(1.0), center_y, theme.scaledUi(11.0), term_color, clip);
+}
+
+/// Draws a font-safe `>_` shell-prompt mark for terminal panes.
+fn queuePaletteTerminalMark(state: *runtime.AppState, x: f32, center_y: f32, size: f32, color: [4]f32, clip: ?palette.Rect) void {
     queuePaletteText(state, .{
         .x = x,
-        .y = center_y - font_size * 0.55,
-        .w = theme.scaledUi(14.0),
-        .h = font_size * 1.25,
-    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, null);
+        .y = center_y - size * 0.62,
+        .w = size * 1.9,
+        .h = size * 1.25,
+    }, ">_", paletteColor(color), size, clip);
+}
+
+/// Draws a thick line segment between two points using two triangles.
+fn queuePaletteDiagLine(state: *runtime.AppState, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: [4]f32, clip: palette.Rect) void {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len <= 0.0) return;
+    const nx = -dy / len * (thickness * 0.5);
+    const ny = dx / len * (thickness * 0.5);
+    const c = paletteColor(color);
+    const a: palette.draw.Vec2 = .{ .x = x0 + nx, .y = y0 + ny };
+    const b: palette.draw.Vec2 = .{ .x = x0 - nx, .y = y0 - ny };
+    const cc: palette.draw.Vec2 = .{ .x = x1 - nx, .y = y1 - ny };
+    const d: palette.draw.Vec2 = .{ .x = x1 + nx, .y = y1 + ny };
+    state.palette_overlay_batch.triangleClipped(state.allocator, a, b, cc, c, clip) catch {};
+    state.palette_overlay_batch.triangleClipped(state.allocator, a, cc, d, c, clip) catch {};
 }
 
 /// Queues a small speech bubble icon for thread rows.

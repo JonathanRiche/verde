@@ -9,6 +9,8 @@ pub const top_level_commands = [_][]const u8{
     "version",
     "capabilities",
     "state",
+    "notify",
+    "integrations",
     "session",
     "live",
     "mcp",
@@ -21,6 +23,21 @@ pub const state_commands = [_][]const u8{
     "panes",
     "threads",
     "transcript",
+};
+
+pub const integration_commands = [_][]const u8{
+    "list",
+    "doctor",
+    "install",
+    "remove",
+    "disable",
+};
+
+pub const integration_providers = [_][]const u8{
+    "claude",
+    "codex",
+    "opencode",
+    "cursor",
 };
 
 pub const session_commands = [_][]const u8{
@@ -43,6 +60,7 @@ pub const live_commands = [_][]const u8{
     "active",
     "threads",
     "terminals",
+    "surfaces",
     "processes",
     "inspect",
     "pane",
@@ -50,6 +68,7 @@ pub const live_commands = [_][]const u8{
     "browser",
     "terminal",
     "process",
+    "agent",
     "stack",
 };
 
@@ -62,6 +81,14 @@ pub const live_capabilities = [_][]const u8{
     "inspect",
     "threads",
     "terminals",
+    "surfaces",
+    "surface.list",
+    "surface.inspect",
+    "surface.focus",
+    "surface.clearAttention",
+    "notification.create",
+    "notification.update",
+    "notification.clear",
     "processes",
     "pane.focus",
     "pane.split",
@@ -122,6 +149,7 @@ pub const live_capabilities = [_][]const u8{
     "process.stop",
     "process.restart",
     "process.logs",
+    "agent.open",
     "stack.status",
     "stack.start",
     "stack.stop",
@@ -190,6 +218,7 @@ pub const browser_commands = [_][]const u8{
 
 pub const terminal_commands = [_][]const u8{ "write", "tail", "screen" };
 pub const process_commands = [_][]const u8{ "list", "inspect", "start", "stop", "restart", "logs" };
+pub const agent_commands = [_][]const u8{"open"};
 pub const stack_commands = [_][]const u8{ "status", "start", "stop", "restart" };
 
 pub const all_flags = [_][]const u8{
@@ -208,10 +237,20 @@ pub const all_flags = [_][]const u8{
     "--second",
     "--ratio",
     "--text",
+    "--title",
+    "--body",
+    "--status",
+    "--progress",
+    "--label",
+    "--session",
+    "--dock",
+    "--clear",
+    "--quiet",
     "--prompt",
     "--call",
     "--decision",
     "--name",
+    "--provider",
     "--lines",
     "--script",
     "--json-payload",
@@ -239,10 +278,12 @@ pub const browser_paste_text_flags = [_][]const u8{ "--text", "--json" };
 pub const browser_inspector_mode_flags = [_][]const u8{ "--mode", "--json" };
 pub const terminal_tail_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--lines", "--json" };
 pub const process_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--name", "--lines", "--json" };
+pub const agent_flags = [_][]const u8{ "--workspace", "--provider", "--json" };
 
 pub const kind_values = [_][]const u8{ "chat", "terminal" };
 pub const axis_values = [_][]const u8{ "horizontal", "vertical" };
 pub const decision_values = [_][]const u8{ "approve", "deny" };
+pub const provider_values = [_][]const u8{"codex"};
 pub const inspector_mode_values = [_][]const u8{ "point", "draw-box", "draw-freeform" };
 
 pub fn shellSupported(name: []const u8) bool {
