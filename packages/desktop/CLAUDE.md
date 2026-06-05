@@ -1,1 +1,1 @@
-packages/desktop/AGENTS.md
+../../AGENTS.md
