@@ -5475,26 +5475,59 @@ pub const AppState = struct {
         return s;
     }
 
+    // Resolves which agent provider a surface belongs to, for the notification
+    // logo/title. The surface itself usually has no provider (the Codex Stop
+    // hook calls `verde notify` without one), so fall back to the owning
+    // project's managed agent process, then its first chat thread.
+    fn resolveSurfaceProvider(self: *const AppState, surface: *const SurfaceState) ?Provider {
+        if (surface.provider) |p| return p;
+        for (self.projects.items) |*project| {
+            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
+                std.mem.eql(u8, surface.workspace_path, project.path);
+            if (!owns) continue;
+            for (project.managed_processes.items) |process| {
+                if (process.kind == .agent) {
+                    if (providerFromStack(process.provider)) |p| return p;
+                }
+            }
+            if (project.threads.items.len > 0) return project.threads.items[0].provider;
+            return null;
+        }
+        return null;
+    }
+
     // Builds a human-readable title/body from the surface and hands off to the
-    // cross-platform notifier. Title prefers the surface's own label; the body
-    // names the workspace directory so multiple agents stay distinguishable.
+    // cross-platform notifier. Title prefers the surface's own label, then the
+    // provider name; the body names the workspace directory so multiple agents
+    // stay distinguishable. The provider also selects the notification logo.
     fn fireCompletionNotification(self: *AppState, surface: *const SurfaceState) void {
-        const title = if (surface.title.len > 0) surface.title else "Agent finished";
+        const provider = self.resolveSurfaceProvider(surface);
         const dir = if (surface.workspace_path.len > 0)
             std.fs.path.basename(surface.workspace_path)
         else
             "";
+
+        var title_buf: [128]u8 = undefined;
+        const title = if (surface.title.len > 0)
+            surface.title
+        else if (provider) |p|
+            (std.fmt.bufPrint(&title_buf, "{s} finished", .{utils.providerLabel(p)}) catch "Agent finished")
+        else
+            "Agent finished";
+
         var body_buf: [256]u8 = undefined;
         const body = if (dir.len > 0)
             (std.fmt.bufPrint(&body_buf, "Completed in {s}", .{dir}) catch "Task completed")
         else
             "Task completed";
-        const icon: ?notifier.Icon = if (surface.provider) |provider| switch (provider) {
+
+        const icon: ?notifier.Icon = if (provider) |p| switch (p) {
             .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
             .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
             .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
             .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
         } else null;
+
         notifier.notifyAgentDone(self.allocator, title, body, icon);
     }
 
