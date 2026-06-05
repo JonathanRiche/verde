@@ -2832,6 +2832,7 @@ pub const AppState = struct {
     show_project_creator: bool,
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
+    settings_hook_claude_installed: bool,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
     app_config_file_mtime: i128,
@@ -3032,6 +3033,7 @@ pub const AppState = struct {
             .show_project_creator = false,
             .show_settings_modal = false,
             .settings_draft = .{},
+            .settings_hook_claude_installed = false,
             .settings_hover_control = null,
             .settings_close_hovered = false,
             .app_config_file_mtime = -1,
@@ -5277,12 +5279,38 @@ pub const AppState = struct {
         self.workspace_header_open_menu_open = false;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
+        self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
         self.show_settings_modal = true;
         self.palette_modal_text_focus = .none;
         self.blurPaletteComposer();
         self.noteInteraction();
+        self.markDirty();
+    }
+
+    /// Installs or removes the global Claude notify hooks and refreshes the
+    /// settings toggle state. Acts immediately (filesystem side effect).
+    pub fn toggleClaudeGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_claude_installed) {
+            provider_hooks.removeClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Claude hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Claude hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_claude_installed = false;
+            self.setSidebarNotice("Disabled global Claude status hooks.");
+        } else {
+            provider_hooks.ensureClaudeGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Claude hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Claude hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_claude_installed = true;
+            self.setSidebarNotice("Enabled global Claude status hooks.");
+        }
         self.markDirty();
     }
 
@@ -5435,9 +5463,15 @@ pub const AppState = struct {
     pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {
         const terminal_changed = self.clearTerminalNotificationBySession(session_id);
         const surface = self.surfaceBySessionId(session_id) orelse return terminal_changed;
-        if (!surface.attention and surface.unread_count == 0) return terminal_changed;
+        // Focusing the pane acknowledges a finished turn, so clear the "done"
+        // indicator — it shouldn't re-appear in the sidebar once you've come
+        // back and looked. Genuine waiting/error states persist (you still need
+        // to act on them).
+        const done_ack = surface.status == .done;
+        if (!surface.attention and surface.unread_count == 0 and !done_ack) return terminal_changed;
         surface.attention = false;
         surface.unread_count = 0;
+        if (done_ack) surface.status = .idle;
         self.markDirty();
         return true;
     }
@@ -5467,10 +5501,28 @@ pub const AppState = struct {
         for (self.surfaces.items) |*surface| {
             if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
                 if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
+                // The pane you're actively in shouldn't raise a background alert.
+                if (self.isFocusedTerminalSurface(project_index, surface.dock_id)) continue;
                 if (surface.attention or surface.unread_count > 0 or surface.status == .waiting or surface.status == .@"error") return true;
             }
         }
         return false;
+    }
+
+    /// True when (project_index, dock_id) is the terminal pane the user is
+    /// currently focused in — used to suppress its own sidebar status/attention
+    /// indicators (you're already looking at it).
+    pub fn isFocusedTerminalSurface(self: *const AppState, project_index: usize, dock_id: u32) bool {
+        if (!self.terminal_focused) return false;
+        if (project_index != self.selected_project_index) return false;
+        if (project_index >= self.projects.items.len) return false;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        const pane_id = layout.focused_pane_id orelse return false;
+        const pane = layout.paneById(pane_id) orelse return false;
+        return switch (pane.ref) {
+            .terminal => |ref| ref.dock_id == dock_id,
+            else => false,
+        };
     }
 
     /// Returns the terminal surface (if any) bound to a given dock within a

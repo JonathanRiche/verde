@@ -623,9 +623,12 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|opencode|cursor>
-            \\  verde integrations remove <claude|codex|opencode|cursor>
+            \\  verde integrations install <claude|codex|opencode|cursor> [--global]
+            \\  verde integrations remove <claude|codex|opencode|cursor> [--global]
             \\  verde integrations disable <claude|codex|opencode|cursor>
+            \\
+            \\  --global installs Claude hooks in ~/.claude/settings.json for all
+            \\  projects (no-op outside Verde panes); otherwise hooks are project-local.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -656,7 +659,27 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stderr("unknown integration provider: {s}\n", .{provider_name});
             std.process.exit(2);
         };
-        if (std.mem.eql(u8, command, "install")) return try installIntegration(allocator, out, json, provider);
+        const global = args.hasFlag(argv, "--global");
+        if (std.mem.eql(u8, command, "install")) return try installIntegration(allocator, out, json, provider, global);
+        if (global and std.mem.eql(u8, provider.name, "claude")) {
+            provider_hooks.removeClaudeGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} claude --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} claude --global: removed global Claude hooks from ~/.claude/settings.json\n", .{command});
+            return;
+        }
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
         return;
     }
@@ -717,8 +740,38 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
     });
 }
 
-fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider) !void {
+fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bool, provider: IntegrationProvider, global: bool) !void {
     const project_path = ".";
+    if (std.mem.eql(u8, provider.name, "claude") and global) {
+        provider_hooks.ensureClaudeGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install claude --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.claude/settings.json",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install claude --global: installed global Claude hooks in ~/.claude/settings.json\n", .{});
+        return;
+    }
     if (std.mem.eql(u8, provider.name, "claude")) {
         provider_hooks.ensureClaudeProjectHooks(allocator, project_path) catch |err| switch (err) {
             error.ClaudeSettingsExist => {

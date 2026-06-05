@@ -183,7 +183,14 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\case "$event" in
         \\  SessionStart) status="working" ;;
         \\  UserPromptSubmit) status="working" ;;
-        \\  Notification) status="waiting" ;;
+        \\  Notification)
+        \\    # Claude fires Notification for both permission requests and the
+        \\    # idle "waiting for your input" nudge. Only the former needs you.
+        \\    msg="$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$payload" | head -n 1)"
+        \\    case "$msg" in
+        \\      *"waiting for your input"*|*"is idle"*) rm -f "$payload"; exit 0 ;;
+        \\      *) status="waiting" ;;
+        \\    esac ;;
         \\  Stop) status="done" ;;
         \\  *)
         \\    rm -f "$payload"; exit 0 ;;
@@ -239,6 +246,181 @@ fn writeClaudeHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []
     try s.endArray();
     try s.endObject();
     try s.endArray();
+}
+
+// Global (all-projects) Claude hooks live in ~/.claude/settings.json with the
+// hook script at an absolute path so it resolves from any working directory.
+const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
+const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
+const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
+const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "Stop" };
+
+fn homeDir() ?[]const u8 {
+    const ptr = std.c.getenv("HOME") orelse return null;
+    return std.mem.span(ptr);
+}
+
+/// True when our managed hook is present in the global Claude settings.
+pub fn claudeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDir() orelse return false;
+    const settings_path = std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL }) catch return false;
+    defer allocator.free(settings_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), settings_path, allocator, .limited(8 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, CLAUDE_GLOBAL_HOOK_NEEDLE) != null;
+}
+
+/// Installs the Claude notify hook globally by merging our events into the
+/// existing ~/.claude/settings.json (preserving all other settings and hooks).
+pub fn ensureClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_HOOK_REL });
+    defer allocator.free(hook_path);
+    const settings_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL });
+    defer allocator.free(settings_path);
+
+    try ensureParentDir(io, hook_path);
+    try writeClaudeHookScript(allocator, io, hook_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, "{}"),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const merged = try mergeClaudeHooks(allocator, existing, hook_path);
+    defer if (merged) |m| allocator.free(m);
+    if (merged) |m| {
+        try ensureParentDir(io, settings_path);
+        try writeFileAtomic(allocator, io, settings_path, m, .default_file);
+    }
+}
+
+/// Removes our managed hook entries from the global Claude settings and deletes
+/// the hook script. Idempotent.
+pub fn removeClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const hook_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_HOOK_REL });
+    defer allocator.free(hook_path);
+    const settings_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL });
+    defer allocator.free(settings_path);
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const updated = try removeClaudeHooksFromJson(allocator, existing, hook_path);
+    defer if (updated) |u| allocator.free(u);
+    if (updated) |u| try writeFileAtomic(allocator, io, settings_path, u, .default_file);
+    std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+fn claudeEntryReferencesHook(entry: std.json.Value, hook_path: []const u8) bool {
+    if (entry != .object) return false;
+    const inner = entry.object.get("hooks") orelse return false;
+    if (inner != .array) return false;
+    for (inner.array.items) |cmd| {
+        if (cmd != .object) continue;
+        const command = cmd.object.get("command") orelse continue;
+        if (command == .string and std.mem.eql(u8, command.string, hook_path)) return true;
+    }
+    return false;
+}
+
+fn claudeMatcherEntry(arena: std.mem.Allocator, hook_path: []const u8) !std.json.Value {
+    var cmd: std.json.ObjectMap = .empty;
+    try cmd.put(arena, "type", .{ .string = "command" });
+    try cmd.put(arena, "command", .{ .string = try arena.dupe(u8, hook_path) });
+    try cmd.put(arena, "timeout", .{ .integer = 5 });
+    var inner = std.json.Array.init(arena);
+    try inner.append(.{ .object = cmd });
+    var entry: std.json.ObjectMap = .empty;
+    try entry.put(arena, "hooks", .{ .array = inner });
+    return .{ .object = entry };
+}
+
+fn ensureClaudeEvent(arena: std.mem.Allocator, hooks: *std.json.ObjectMap, event: []const u8, hook_path: []const u8) !bool {
+    if (hooks.getPtr(event)) |ev| {
+        if (ev.* != .array) return false;
+        for (ev.array.items) |entry| {
+            if (claudeEntryReferencesHook(entry, hook_path)) return false;
+        }
+        try ev.array.append(try claudeMatcherEntry(arena, hook_path));
+        return true;
+    }
+    var arr = std.json.Array.init(arena);
+    try arr.append(try claudeMatcherEntry(arena, hook_path));
+    try hooks.put(arena, event, .{ .array = arr });
+    return true;
+}
+
+fn mergeClaudeHooks(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return error.ClaudeSettingsParse;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.ClaudeSettingsNotObject;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+
+    if (root.getPtr("hooks")) |hv| {
+        if (hv.* != .object) return error.ClaudeSettingsHooksNotObject;
+    } else {
+        try root.put(arena, "hooks", .{ .object = .empty });
+    }
+    const hooks = &root.getPtr("hooks").?.object;
+
+    var changed = false;
+    for (CLAUDE_HOOK_EVENTS) |event| {
+        if (try ensureClaudeEvent(arena, hooks, event, hook_path)) changed = true;
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
+fn removeClaudeHooksFromJson(allocator: std.mem.Allocator, content: []const u8, hook_path: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+    const root = &parsed.value.object;
+    const hooks_val = root.getPtr("hooks") orelse return null;
+    if (hooks_val.* != .object) return null;
+    const hooks = &hooks_val.object;
+
+    var changed = false;
+    for (CLAUDE_HOOK_EVENTS) |event| {
+        const ev = hooks.getPtr(event) orelse continue;
+        if (ev.* != .array) continue;
+        var kept = std.json.Array.init(arena);
+        for (ev.array.items) |entry| {
+            if (claudeEntryReferencesHook(entry, hook_path)) {
+                changed = true;
+                continue;
+            }
+            try kept.append(entry);
+        }
+        if (kept.items.len == 0) {
+            _ = hooks.orderedRemove(event);
+        } else {
+            ev.* = .{ .array = kept };
+        }
+    }
+    if (!changed) return null;
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
 }
 
 fn ensureParentDir(io: std.Io, path: []const u8) !void {

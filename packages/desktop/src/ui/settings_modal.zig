@@ -18,6 +18,7 @@ pub const Control = enum(u8) {
     open_cursor,
     open_vscode,
     open_zed,
+    hooks_claude,
 };
 
 const OpenChoice = struct {
@@ -94,6 +95,9 @@ const SettingsLayout = struct {
     workspace_card: palette.Rect,
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
+    integrations_card: palette.Rect,
+    hooks_claude: palette.Rect,
+    integrations_hint_y: f32,
 };
 
 const log = std.log.scoped(.native_ui_settings);
@@ -160,8 +164,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const appearance_h = m.labeledBlockH(2);
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h;
+    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -241,6 +246,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         };
     }
 
+    y += workspace_h + m.card_gap;
+
+    const integrations_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = integrations_h };
+    const hooks_claude_y = integrations_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const integrations_hint_y = hooks_claude_y + m.row_h + m.inner_gap;
+
     return .{
         .modal = modal,
         .header = header,
@@ -260,6 +272,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .workspace_card = workspace_card,
         .open_cells = open_cells,
         .custom_open = custom_open,
+        .integrations_card = integrations_card,
+        .hooks_claude = hooks_claude,
+        .integrations_hint_y = integrations_hint_y,
     };
 }
 
@@ -297,6 +312,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     for (OPEN_CHOICES, 0..) |choice, index| {
         queue_hit(state, layout.open_cells[index], .settings_control, @intFromEnum(choice.control));
     }
+    queue_hit(state, layout.hooks_claude, .settings_control, @intFromEnum(Control.hooks_claude));
 }
 
 /// Renders the settings modal over the workspace.
@@ -312,6 +328,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.appearance_card);
     drawCard(state, layout.terminal_card);
     drawCard(state, layout.workspace_card);
+    drawCard(state, layout.integrations_card);
 
     // Appearance
     drawCardTitle(state, layout.appearance_card, "Appearance", layout.modal);
@@ -348,6 +365,18 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
             drawToggleCell(state, custom_row, custom_label, true, false, layout.modal);
         }
     }
+
+    // Agent integrations
+    drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.modal);
+    drawFieldLabel(state, layout.integrations_card, m, "Status pip hooks (global)");
+    const claude_on = state.settings_hook_claude_installed;
+    drawToggleCell(state, layout.hooks_claude, if (claude_on) "Claude  ·  Enabled" else "Claude  ·  Disabled", claude_on, isControlHovered(state, .hooks_claude), layout.modal);
+    queueText(state, .{
+        .x = layout.integrations_card.x + m.card_pad,
+        .y = layout.integrations_hint_y,
+        .w = layout.integrations_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Writes hooks to ~/.claude/settings.json · no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
 
     drawFooterBar(state, layout, dirty);
 }
@@ -400,6 +429,11 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .open_cursor => state.settings_draft.open_action = .cursor,
         .open_vscode => state.settings_draft.open_action = .vscode,
         .open_zed => state.settings_draft.open_action = .zed,
+        // Acts immediately (filesystem side effect), independent of Save/Cancel.
+        .hooks_claude => {
+            state.toggleClaudeGlobalHooks();
+            return;
+        },
     }
     state.markDirty();
 }
