@@ -12,6 +12,7 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const notifier = @import("notifier.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const runtime_log = @import("runtime_log.zig");
 const stack_config = @import("stack.zig");
@@ -132,6 +133,7 @@ pub const SettingsDraft = struct {
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
     theme_source: theme.ThemeSource = .omarchy,
     open_action: SettingsOpenAction = .folder,
+    notifications_enabled: bool = true,
 };
 
 pub const PaletteModalHit = struct {
@@ -5263,6 +5265,7 @@ pub const AppState = struct {
             .terminal_font_size = self.app_config.terminal_font_size,
             .theme_source = self.app_config.theme_config.source,
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
+            .notifications_enabled = self.app_config.notifications_enabled,
         };
     }
 
@@ -5271,6 +5274,7 @@ pub const AppState = struct {
         if (draft.font_size != self.app_config.font_size) return true;
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
         if (draft.theme_source != self.app_config.theme_config.source) return true;
+        if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
         return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
     }
 
@@ -5327,6 +5331,7 @@ pub const AppState = struct {
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.theme_config.source = self.settings_draft.theme_source;
+        self.app_config.notifications_enabled = self.settings_draft.notifications_enabled;
         try self.applySettingsDraftOpenAction();
 
         try app_config.saveAppConfig(self.allocator, &self.app_config);
@@ -5427,6 +5432,9 @@ pub const AppState = struct {
             surface = &self.surfaces.items[self.surfaces.items.len - 1];
         }
         var s = surface.?;
+        // Remember the status before this update so we can fire a one-shot
+        // desktop notification only on the `!= .done` -> `.done` transition.
+        const prev_status = s.status;
         if (update.workspace_id) |value| try replaceOwnedSlice(self.allocator, &s.workspace_id, value);
         if (update.workspace_path) |value| try replaceOwnedSlice(self.allocator, &s.workspace_path, value);
         if (update.dock_id) |value| s.dock_id = value;
@@ -5456,8 +5464,38 @@ pub const AppState = struct {
                 s.last_event_at_ms = unixTimestampMs();
             }
         }
+        // Notify on the completion edge. Runs on the main thread (live commands
+        // are drained from the main loop), so spawning the notifier here is safe.
+        if (!update.clear and self.app_config.notifications_enabled and
+            prev_status != .done and s.status == .done)
+        {
+            self.fireCompletionNotification(s);
+        }
         self.markDirty();
         return s;
+    }
+
+    // Builds a human-readable title/body from the surface and hands off to the
+    // cross-platform notifier. Title prefers the surface's own label; the body
+    // names the workspace directory so multiple agents stay distinguishable.
+    fn fireCompletionNotification(self: *AppState, surface: *const SurfaceState) void {
+        const title = if (surface.title.len > 0) surface.title else "Agent finished";
+        const dir = if (surface.workspace_path.len > 0)
+            std.fs.path.basename(surface.workspace_path)
+        else
+            "";
+        var body_buf: [256]u8 = undefined;
+        const body = if (dir.len > 0)
+            (std.fmt.bufPrint(&body_buf, "Completed in {s}", .{dir}) catch "Task completed")
+        else
+            "Task completed";
+        const icon: ?notifier.Icon = if (surface.provider) |provider| switch (provider) {
+            .codex => .{ .key = "codex", .png_bytes = CODEX_LOGO_BYTES },
+            .opencode => .{ .key = "opencode", .png_bytes = OPENCODE_LOGO_BYTES },
+            .claude => .{ .key = "claude", .png_bytes = CLAUDE_LOGO_BYTES },
+            .cursor => .{ .key = "cursor", .png_bytes = CURSOR_LOGO_BYTES },
+        } else null;
+        notifier.notifyAgentDone(self.allocator, title, body, icon);
     }
 
     pub fn clearSurfaceAttentionBySession(self: *AppState, session_id: []const u8) bool {

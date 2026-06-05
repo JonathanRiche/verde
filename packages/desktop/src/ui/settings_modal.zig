@@ -19,6 +19,7 @@ pub const Control = enum(u8) {
     open_vscode,
     open_zed,
     hooks_claude,
+    notifications_toggle,
 };
 
 const OpenChoice = struct {
@@ -98,6 +99,9 @@ const SettingsLayout = struct {
     integrations_card: palette.Rect,
     hooks_claude: palette.Rect,
     integrations_hint_y: f32,
+    notifications_card: palette.Rect,
+    notifications_toggle: palette.Rect,
+    notifications_hint_y: f32,
 };
 
 const log = std.log.scoped(.native_ui_settings);
@@ -165,8 +169,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // Same shape as the integrations card: title, field label, one toggle row, hint.
+    const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
 
-    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h;
+    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -253,6 +259,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const integrations_hint_y = hooks_claude_y + m.row_h + m.inner_gap;
 
+    y += integrations_h + m.card_gap;
+
+    const notifications_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = notifications_h };
+    const notifications_toggle_y = notifications_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
+    const notifications_toggle: palette.Rect = .{ .x = notifications_card.x + m.card_pad, .y = notifications_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const notifications_hint_y = notifications_toggle_y + m.row_h + m.inner_gap;
+
     return .{
         .modal = modal,
         .header = header,
@@ -275,6 +288,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .integrations_card = integrations_card,
         .hooks_claude = hooks_claude,
         .integrations_hint_y = integrations_hint_y,
+        .notifications_card = notifications_card,
+        .notifications_toggle = notifications_toggle,
+        .notifications_hint_y = notifications_hint_y,
     };
 }
 
@@ -313,6 +329,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queue_hit(state, layout.open_cells[index], .settings_control, @intFromEnum(choice.control));
     }
     queue_hit(state, layout.hooks_claude, .settings_control, @intFromEnum(Control.hooks_claude));
+    queue_hit(state, layout.notifications_toggle, .settings_control, @intFromEnum(Control.notifications_toggle));
 }
 
 /// Renders the settings modal over the workspace.
@@ -329,6 +346,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.terminal_card);
     drawCard(state, layout.workspace_card);
     drawCard(state, layout.integrations_card);
+    drawCard(state, layout.notifications_card);
 
     // Appearance
     drawCardTitle(state, layout.appearance_card, "Appearance", layout.modal);
@@ -377,6 +395,18 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.integrations_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, "Writes hooks to ~/.claude/settings.json · no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
+
+    // Notifications
+    drawCardTitle(state, layout.notifications_card, "Notifications", layout.modal);
+    drawFieldLabel(state, layout.notifications_card, m, "Desktop alerts");
+    const notifications_on = state.settings_draft.notifications_enabled;
+    drawToggleCell(state, layout.notifications_toggle, if (notifications_on) "On agent completion  ·  Enabled" else "On agent completion  ·  Disabled", notifications_on, isControlHovered(state, .notifications_toggle), layout.modal);
+    queueText(state, .{
+        .x = layout.notifications_card.x + m.card_pad,
+        .y = layout.notifications_hint_y,
+        .w = layout.notifications_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "System notification when an agent finishes · macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
 
     drawFooterBar(state, layout, dirty);
 }
@@ -434,6 +464,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             state.toggleClaudeGlobalHooks();
             return;
         },
+        // Draft toggle: persisted to verde.json on Save, like the other fields.
+        .notifications_toggle => state.settings_draft.notifications_enabled = !state.settings_draft.notifications_enabled,
     }
     state.markDirty();
 }

@@ -1036,11 +1036,12 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
     return state.isPickerPending() or
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
+        workspace_panes_ui.isCompletionPulseAnimating() or
         ui_layout.isSidebarAnimating();
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or ui_layout.isSidebarAnimating()) {
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // While a chat turn is pending we still want the wall-clock "Working"
