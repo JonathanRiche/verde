@@ -1072,6 +1072,7 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
     for (project.workspace_layout.panes.items) |pane| {
         switch (pane.ref) {
             .terminal => |ref| {
+                if (state.isFocusedTerminalSurface(project_index, ref.dock_id)) continue;
                 if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
                     switch (surface.status) {
                         .@"error" => return theme.COLOR_DIFF_REMOVE,
@@ -1286,19 +1287,22 @@ fn renderOpenPaneRow(
         .h = title_line,
     }, shown, paletteColor(title_color), title_font, clip);
 
-    if (paneStatusColor(status, running)) |pip_color| {
-        const animated = running or (if (status) |s| s == .waiting else false);
-        const pulse: f32 = if (animated)
-            0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
-        else
-            1.0;
-        const dot = theme.scaledUi(7.0);
-        queuePaletteRoundedRect(state, .{
-            .x = rect.x + rect.w - theme.scaledUi(10.0),
-            .y = cy - dot * 0.5,
-            .w = dot,
-            .h = dot,
-        }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
+    // No status pip on the pane you're focused in — you're already there.
+    if (!focused) {
+        if (paneStatusColor(status, running)) |pip_color| {
+            const animated = running or (if (status) |s| s == .waiting else false);
+            const pulse: f32 = if (animated)
+                0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
+            else
+                1.0;
+            const dot = theme.scaledUi(7.0);
+            queuePaletteRoundedRect(state, .{
+                .x = rect.x + rect.w - theme.scaledUi(10.0),
+                .y = cy - dot * 0.5,
+                .w = dot,
+                .h = dot,
+            }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
+        }
     }
 }
 

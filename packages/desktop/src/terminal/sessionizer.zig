@@ -223,6 +223,16 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     return error.SessionDaemonUnavailable;
 }
 
+/// Path to the currently running executable (the daemon binary), used to set
+/// VERDE_CLI so provider hooks invoke this exact binary. Linux-only; callers
+/// fall back to "verde" on failure (e.g. other platforms).
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
+    if (len < 0) return error.FileNotFound;
+    return allocator.dupe(u8, buffer[0..@intCast(len)]);
+}
+
 pub fn spawnDaemon(allocator: std.mem.Allocator, exe_path: []const u8) !void {
     const daemon_exe = try daemonExecutablePath(allocator, exe_path);
     defer allocator.free(daemon_exe);
@@ -604,6 +614,18 @@ const PtySession = struct {
         defer allocator.free(live_socket_path);
         const live_socket_z = try allocator.dupeZ(u8, live_socket_path);
         defer allocator.free(live_socket_z);
+        // Inject the daemon's own executable path as VERDE_CLI so provider hooks
+        // call this exact binary (which supports `notify`) rather than whatever
+        // stale `verde` happens to be on PATH.
+        var cli_path_owned: ?[:0]u8 = null;
+        defer if (cli_path_owned) |p| allocator.free(p);
+        const cli_path_z: [:0]const u8 = brk: {
+            const p = selfExePathAlloc(allocator) catch break :brk "verde";
+            defer allocator.free(p);
+            const z = allocator.dupeZ(u8, p) catch break :brk "verde";
+            cli_path_owned = z;
+            break :brk z;
+        };
 
         var master_fd: c_int = -1;
         const winsize = std.posix.winsize{
@@ -622,6 +644,7 @@ const PtySession = struct {
             .pane_id = pane_id_z,
             .live_socket = live_socket_z,
             .sessionizer_socket = sessionizer_socket_z,
+            .cli_path = cli_path_z,
         });
 
         try setNonBlocking(@intCast(master_fd));
@@ -639,6 +662,7 @@ const PtySession = struct {
         pane_id: [:0]const u8,
         live_socket: [:0]const u8,
         sessionizer_socket: [:0]const u8,
+        cli_path: [:0]const u8,
     };
 
     fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: ChildIdentityEnv) noreturn {
@@ -655,7 +679,7 @@ const PtySession = struct {
         _ = setenv("VERDE_SOCKET", identity.live_socket.ptr, 1);
         _ = setenv("VERDE_LIVE_SOCKET", identity.live_socket.ptr, 1);
         _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_socket.ptr, 1);
-        _ = setenv("VERDE_CLI", "verde", 1);
+        _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
         if (std.c.getenv("LANG") == null) _ = setenv("LANG", "C.UTF-8", 1);
 
         var argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;

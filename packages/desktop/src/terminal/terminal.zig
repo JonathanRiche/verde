@@ -2992,6 +2992,7 @@ const UnixSession = struct {
         pane_id: [:0]const u8,
         live_socket: ?[:0]const u8 = null,
         sessionizer_socket: ?[:0]const u8 = null,
+        cli_path: [:0]const u8,
 
         fn init(allocator: std.mem.Allocator, options: SessionCreateOptions) !LocalIdentityEnv {
             const project_id = try allocator.dupeZ(u8, options.project_id);
@@ -3006,6 +3007,13 @@ const UnixSession = struct {
             defer allocator.free(pane_id_text);
             const pane_id = try allocator.dupeZ(u8, pane_id_text);
             errdefer allocator.free(pane_id);
+            // Running executable path so provider hooks call this exact binary.
+            const cli_path = blk: {
+                const p = selfExePathAlloc(allocator) catch break :blk try allocator.dupeZ(u8, "verde");
+                defer allocator.free(p);
+                break :blk try allocator.dupeZ(u8, p);
+            };
+            errdefer allocator.free(cli_path);
             var session_id: ?[:0]u8 = null;
             if (options.session_id) |id| {
                 session_id = try allocator.dupeZ(u8, id);
@@ -3030,6 +3038,7 @@ const UnixSession = struct {
                 .pane_id = pane_id,
                 .live_socket = live_socket,
                 .sessionizer_socket = sessionizer_socket,
+                .cli_path = cli_path,
             };
         }
 
@@ -3041,6 +3050,7 @@ const UnixSession = struct {
             allocator.free(self.pane_id);
             if (self.live_socket) |value| allocator.free(value);
             if (self.sessionizer_socket) |value| allocator.free(value);
+            allocator.free(self.cli_path);
         }
     };
 
@@ -3068,7 +3078,7 @@ const UnixSession = struct {
             _ = setenv("VERDE_LIVE_SOCKET", value.ptr, 1);
         }
         if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
-        _ = setenv("VERDE_CLI", "verde", 1);
+        _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
         if (std.c.getenv("LANG") == null) {
             _ = setenv("LANG", "C.UTF-8", 1);
         }
