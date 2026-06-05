@@ -5525,7 +5525,7 @@ pub const AppState = struct {
                 std.mem.eql(u8, surface.workspace_path, project.path);
             if (!owns) continue;
             if (self.projectTerminalDockMutable(idx, surface.dock_id)) |dock| {
-                _ = dock.setActiveTabObservedTitle(self.allocator, title);
+                _ = dock.setActiveTabPinnedTitle(self.allocator, title);
             }
             return;
         }

@@ -128,6 +128,7 @@ pub const PersistedWorkspace = struct {
 pub const PersistedTab = struct {
     title: ?[]const u8 = null,
     observed_title: ?[]const u8 = null,
+    pinned_title: ?[]const u8 = null,
     active_pane_id: u32 = 0,
     root_node_id: u32 = 0,
     nodes: []const PersistedNode = &.{},
@@ -195,12 +196,18 @@ pub const Tab = struct {
     /// agent's session summary). Persisted so the label survives a Verde restart
     /// even before the program re-emits its title.
     observed_title: ?[]u8 = null,
+    /// Externally-pinned title from a notify hook (e.g. Codex, which sets its
+    /// OSC title to the folder name and has no session-summary field). Kept
+    /// separate from `observed_title` so the live OSC stream can't overwrite it,
+    /// and preferred over the OSC title when labeling the pane. Persisted.
+    pinned_title: ?[]u8 = null,
     root: *PaneNode,
     active_pane_id: u32,
 
     fn deinit(self: *Tab, allocator: std.mem.Allocator) void {
         if (self.title) |title| allocator.free(title);
         if (self.observed_title) |observed| allocator.free(observed);
+        if (self.pinned_title) |pinned| allocator.free(pinned);
         deinitPaneNode(self.root, allocator);
     }
 };
@@ -380,18 +387,19 @@ pub const Dock = struct {
     }
 
     /// Records an externally-provided title (e.g. from a Codex notify hook,
-    /// which has no OSC title) as the active tab's observed title, so it shows
-    /// in the sidebar and persists across restarts via the same channel as the
-    /// live OSC title. No-op when the title is empty or unchanged.
-    pub fn setActiveTabObservedTitle(self: *Dock, allocator: std.mem.Allocator, title: []const u8) bool {
+    /// which sets its OSC title to the folder and has no session-summary field)
+    /// as the active tab's pinned title. Kept separate from observed_title so
+    /// the live OSC stream can't overwrite it; persisted so it survives a
+    /// restart. No-op when the title is empty or unchanged.
+    pub fn setActiveTabPinnedTitle(self: *Dock, allocator: std.mem.Allocator, title: []const u8) bool {
         if (title.len == 0) return false;
         const tab = self.activeTab() orelse return false;
-        if (tab.observed_title) |old| {
+        if (tab.pinned_title) |old| {
             if (std.mem.eql(u8, old, title)) return false;
         }
         const dup = allocator.dupe(u8, title) catch return false;
-        if (tab.observed_title) |old| allocator.free(old);
-        tab.observed_title = dup;
+        if (tab.pinned_title) |old| allocator.free(old);
+        tab.pinned_title = dup;
         self.workspace_changed = true;
         return true;
     }
@@ -761,6 +769,11 @@ pub const Dock = struct {
                 const pane = findPaneLeafConst(tab.root, tab.active_pane_id) orelse findFirstPaneLeafConst(tab.root) orelse break :blk null;
                 break :blk pane.session;
             };
+            // 0. externally-pinned title (e.g. Codex notify hook). Wins over the
+            //    OSC title because Codex sets its OSC title to the folder name.
+            if (tab.pinned_title) |pinned| {
+                if (pinned.len > 0) return pinned;
+            }
             // 1. live OSC title (the running program's session summary)
             if (session) |s| {
                 if (s.liveOscTitle(buffer)) |osc| return osc;
@@ -855,6 +868,7 @@ pub const Dock = struct {
             try persisted_tabs.append(arena_allocator, .{
                 .title = if (tab.title) |tab_title| try arena_allocator.dupe(u8, tab_title) else null,
                 .observed_title = if (tab.observed_title) |observed| try arena_allocator.dupe(u8, observed) else null,
+                .pinned_title = if (tab.pinned_title) |pinned| try arena_allocator.dupe(u8, pinned) else null,
                 .active_pane_id = tab.active_pane_id,
                 .root_node_id = root_node_id,
                 .nodes = try nodes.toOwnedSlice(arena_allocator),
@@ -885,6 +899,7 @@ pub const Dock = struct {
                 .id = self.allocateTabId(),
                 .title = if (persisted_tab.title) |tab_title| try allocator.dupe(u8, tab_title) else null,
                 .observed_title = if (persisted_tab.observed_title) |observed| try allocator.dupe(u8, observed) else null,
+                .pinned_title = if (persisted_tab.pinned_title) |pinned| try allocator.dupe(u8, pinned) else null,
                 .root = root,
                 .active_pane_id = persisted_tab.active_pane_id,
             };
