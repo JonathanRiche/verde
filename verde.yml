@@ -1,0 +1,9 @@
+agents:
+  codex:
+    provider: codex
+    command: "codex"
+    cwd: "."
+    revive: attach_or_create
+    notify: true
+    mcp: true
+    hooks: true
