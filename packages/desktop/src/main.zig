@@ -1068,6 +1068,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
         .window_shown, .window_restored => {
             state.resumeBrowserAfterHostWindowShown();
         },
+        .window_focus_gained => {
+            state.window_input_focus = true;
+        },
+        .window_focus_lost => {
+            state.window_input_focus = false;
+        },
         .key_down => {
             if (browserInputDebugEnabled()) {
                 log.info(
