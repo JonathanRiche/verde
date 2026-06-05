@@ -68,17 +68,11 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\[ -n "$event" ] || event="${1:-}"
         \\
         \\status=""
-        \\title="Codex"
-        \\body=""
         \\case "$event" in
-        \\  SessionStart)
-        \\    status="working"; title="Codex started"; body="Session started." ;;
-        \\  UserPromptSubmit)
-        \\    status="working"; title="Codex working"; body="Prompt submitted." ;;
-        \\  PermissionRequest)
-        \\    status="waiting"; title="Codex needs approval"; body="Review the pending approval in the terminal." ;;
-        \\  Stop)
-        \\    status="done"; title="Codex done"; body="Turn complete." ;;
+        \\  SessionStart) status="working" ;;
+        \\  UserPromptSubmit) status="working" ;;
+        \\  PermissionRequest) status="waiting" ;;
+        \\  Stop) status="done" ;;
         \\  *)
         \\    rm -f "$payload"; exit 0 ;;
         \\esac
@@ -92,7 +86,7 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\  fi
         \\fi
         \\
-        \\"$cli" notify --quiet --status "$status" --title "$title" --body "$body" --provider codex >/dev/null 2>&1 || true
+        \\"$cli" notify --quiet --status "$status" --provider codex >/dev/null 2>&1 || true
         \\rm -f "$payload"
         \\exit 0
         \\
