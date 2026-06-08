@@ -669,7 +669,8 @@ const PtySession = struct {
     fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: ChildIdentityEnv) noreturn {
         if (std.c.chdir(cwd.ptr) != 0) std.c._exit(127);
         process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
-        _ = setenv("TERM", "xterm-ghostty", 1);
+        const term = childTermEnvValue();
+        _ = setenv("TERM", term.ptr, 1);
         _ = setenv("COLORTERM", "truecolor", 1);
         _ = setenv("TERM_PROGRAM", "verde", 1);
         _ = setenv("VERDE", "1", 1);
@@ -682,7 +683,10 @@ const PtySession = struct {
         _ = setenv("VERDE_LIVE_SOCKET", identity.live_socket.ptr, 1);
         _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_socket.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
-        if (std.c.getenv("LANG") == null) _ = setenv("LANG", "C.UTF-8", 1);
+        if (std.c.getenv("LANG") == null) {
+            const lang = childLocaleEnvValue();
+            _ = setenv("LANG", lang.ptr, 1);
+        }
 
         var argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
         const count = @min(command.len, argv.len - 1);
@@ -1275,8 +1279,35 @@ fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) voi
 
 fn commandForOptions(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
     if (args.len > 0) return dupeCommand(allocator, args);
-    const shell = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
-    return dupeCommand(allocator, &.{ shell, "-i" });
+    return dupeCommand(allocator, &.{ defaultInteractiveShell(), "-i" });
+}
+
+fn defaultInteractiveShell() []const u8 {
+    if (std.c.getenv("SHELL")) |shell_ptr| {
+        const shell = std.mem.span(shell_ptr);
+        if (shell.len > 0) return shell;
+    }
+    return switch (builtin.os.tag) {
+        .macos => "/bin/zsh",
+        else => "/bin/bash",
+    };
+}
+
+fn childTermEnvValue() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        // macOS ships xterm-256color, but not Ghostty's terminfo entry. zsh's
+        // line editor relies on terminfo for clear-to-end-line while drawing
+        // syntax highlighting and autosuggestions.
+        .macos => "xterm-256color",
+        else => "xterm-ghostty",
+    };
+}
+
+fn childLocaleEnvValue() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "en_US.UTF-8",
+        else => "C.UTF-8",
+    };
 }
 
 fn dupeCommand(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
