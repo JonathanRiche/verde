@@ -3126,9 +3126,11 @@ const UnixSession = struct {
         }
 
         process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
-        _ = setenv("TERM", "xterm-ghostty", 1);
+        const term = childTermEnvValue();
+        _ = setenv("TERM", term.ptr, 1);
         _ = setenv("COLORTERM", "truecolor", 1);
-        _ = setenv("TERM_PROGRAM", "ghostty", 1);
+        const term_program = childTermProgramEnvValue();
+        _ = setenv("TERM_PROGRAM", term_program.ptr, 1);
         _ = setenv("TERM_PROGRAM_VERSION", "1.1.0", 1);
         _ = setenv("CLICOLOR", "1", 1);
         _ = setenv("CLICOLOR_FORCE", "1", 0);
@@ -3147,7 +3149,8 @@ const UnixSession = struct {
         if (identity.sessionizer_socket) |value| _ = setenv("VERDE_SESSIONIZER_SOCKET", value.ptr, 1);
         _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
         if (std.c.getenv("LANG") == null) {
-            _ = setenv("LANG", "C.UTF-8", 1);
+            const lang = childLocaleEnvValue();
+            _ = setenv("LANG", lang.ptr, 1);
         }
 
         var argv: [32:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 32;
@@ -3301,7 +3304,7 @@ fn daemonCommandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunch
     }
     if (profile.kind == .shell) {
         const command = try allocator.alloc([]const u8, 2);
-        command[0] = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
+        command[0] = defaultInteractiveShell();
         command[1] = "-i";
         return command;
     }
@@ -3900,8 +3903,7 @@ fn launchLabel(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![]
 fn commandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfile) ![][:0]u8 {
     return switch (profile.kind) {
         .shell => blk: {
-            const shell = if (std.c.getenv("SHELL")) |shell_ptr| std.mem.span(shell_ptr) else "/bin/bash";
-            break :blk dupeCommand(allocator, &.{ shell, "-i" });
+            break :blk dupeCommand(allocator, &.{ defaultInteractiveShell(), "-i" });
         },
         .claude => dupeCommand(allocator, &.{"claude"}),
         .opencode => dupeCommand(allocator, &.{"opencode"}),
@@ -3911,6 +3913,41 @@ fn commandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunchProfil
             if (profile.command.len == 0) return error.EmptyTerminalLaunchCommand;
             return dupeCommand(allocator, profile.command);
         },
+    };
+}
+
+fn defaultInteractiveShell() []const u8 {
+    if (std.c.getenv("SHELL")) |shell_ptr| {
+        const shell = std.mem.span(shell_ptr);
+        if (shell.len > 0) return shell;
+    }
+    return switch (builtin.os.tag) {
+        .macos => "/bin/zsh",
+        else => "/bin/bash",
+    };
+}
+
+fn childTermEnvValue() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        // macOS does not reliably have Ghostty's terminfo database available
+        // to GUI-launched child shells. Use the system-provided entry so zle
+        // and curses tools can clear/redraw autosuggestions correctly.
+        .macos => "xterm-256color",
+        else => "xterm-ghostty",
+    };
+}
+
+fn childTermProgramEnvValue() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "verde",
+        else => "ghostty",
+    };
+}
+
+fn childLocaleEnvValue() [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .macos => "en_US.UTF-8",
+        else => "C.UTF-8",
     };
 }
 
