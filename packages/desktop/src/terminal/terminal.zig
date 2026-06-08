@@ -520,7 +520,8 @@ pub const Dock = struct {
     }
 
     pub fn handleTextInput(self: *Dock, input_text: []const u8) bool {
-        if (input_text.len == 0 or isAsciiTerminalText(input_text)) return false;
+        if (input_text.len == 0) return false;
+        if (builtin.os.tag != .macos and isAsciiTerminalText(input_text)) return false;
         if (self.activePane()) |pane| {
             if (pane.session) |session| {
                 return session.writeInput(input_text) catch |err| {
@@ -2027,6 +2028,7 @@ const UnixSession = struct {
 
     pub fn handleKeyDown(self: *UnixSession, event: *const sdl.KeyboardEvent) !bool {
         if (!self.running or !event.down) return false;
+        if (shouldUseTextInputForTerminalPrintableText(event)) return false;
 
         var utf8_buf: [8]u8 = undefined;
         const synthesized_utf8 = synthesizeTerminalUtf8(event, &utf8_buf);
@@ -3493,6 +3495,15 @@ fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
         => true,
         else => false,
     };
+}
+
+fn shouldUseTextInputForTerminalPrintableText(event: *const sdl.KeyboardEvent) bool {
+    if (builtin.os.tag != .macos) return false;
+    // macOS can deliver duplicate-looking printable input when we synthesize
+    // ASCII from key_down while SDL text input is active. Let SDL's composed
+    // text event own printable characters on macOS; key_down still handles
+    // control/navigation keys and modified terminal shortcuts.
+    return shouldDeferToTextInput(event);
 }
 
 fn isAsciiTerminalText(input_text: []const u8) bool {
