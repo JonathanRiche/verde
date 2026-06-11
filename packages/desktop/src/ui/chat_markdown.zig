@@ -138,6 +138,10 @@ pub const SelectionRange = struct {
     focus: SelectionPoint,
 };
 
+pub const LinkHit = struct {
+    href: []const u8,
+};
+
 pub const SelectionRenderOutput = struct {
     hovered: bool = false,
     hovered_point: ?SelectionPoint = null,
@@ -176,6 +180,7 @@ pub const TextRunView = struct {
     start: usize,
     end: usize,
     style: InlineStyle,
+    href: ?[]const u8 = null,
 };
 
 pub const InlineRunView = union(enum) {
@@ -968,7 +973,7 @@ fn buildPlainTextContent(
     var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
     errdefer runs.deinit(allocator);
 
-    try appendStyledText(allocator, &builder, &runs, text, style);
+    try appendStyledText(allocator, &builder, &runs, text, style, null);
     return .{
         .text = try builder.toOwnedSlice(allocator),
         .runs = try runs.toOwnedSlice(allocator),
@@ -986,7 +991,7 @@ fn prefixTextContent(
     var runs: std.ArrayListUnmanaged(InlineRunView) = .empty;
     errdefer runs.deinit(allocator);
 
-    try appendStyledText(allocator, &text_builder, &runs, prefix, .{});
+    try appendStyledText(allocator, &text_builder, &runs, prefix, .{}, null);
     const prefix_len = text_builder.items.len;
     try text_builder.appendSlice(allocator, content.text);
 
@@ -997,6 +1002,7 @@ fn prefixTextContent(
                     .start = prefix_len + text_run.start,
                     .end = prefix_len + text_run.end,
                     .style = text_run.style,
+                    .href = text_run.href,
                 },
             }),
             .line_break => |kind| try runs.append(allocator, .{ .line_break = kind }),
@@ -1016,29 +1022,43 @@ fn appendInlineRuns(
     inlines: []const zig_markdown.Inline,
     style: InlineStyle,
 ) Allocator.Error!void {
+    try appendInlineRunsWithHref(allocator, text_builder, runs, inlines, style, null);
+}
+
+fn appendInlineRunsWithHref(
+    allocator: Allocator,
+    text_builder: *std.ArrayListUnmanaged(u8),
+    runs: *std.ArrayListUnmanaged(InlineRunView),
+    inlines: []const zig_markdown.Inline,
+    style: InlineStyle,
+    href: ?[]const u8,
+) Allocator.Error!void {
     for (inlines) |item| {
         switch (item) {
-            .text => |text| try appendStyledText(allocator, text_builder, runs, text.text, style),
-            .emphasis => |container| try appendInlineRuns(
+            .text => |text| try appendStyledText(allocator, text_builder, runs, text.text, style, href),
+            .emphasis => |container| try appendInlineRunsWithHref(
                 allocator,
                 text_builder,
                 runs,
                 container.children,
                 mergeInlineStyle(style, .{ .emphasis = true }),
+                href,
             ),
-            .strong => |container| try appendInlineRuns(
+            .strong => |container| try appendInlineRunsWithHref(
                 allocator,
                 text_builder,
                 runs,
                 container.children,
                 mergeInlineStyle(style, .{ .strong = true }),
+                href,
             ),
-            .strikethrough => |container| try appendInlineRuns(
+            .strikethrough => |container| try appendInlineRunsWithHref(
                 allocator,
                 text_builder,
                 runs,
                 container.children,
                 mergeInlineStyle(style, .{ .strike = true }),
+                href,
             ),
             .code => |code| try appendStyledText(
                 allocator,
@@ -1046,13 +1066,14 @@ fn appendInlineRuns(
                 runs,
                 code.text,
                 mergeInlineStyle(style, .{ .code = true }),
+                href,
             ),
             .link => |link| {
                 const link_style = mergeInlineStyle(style, .{ .link = true });
                 if (link.children.len > 0) {
-                    try appendInlineRuns(allocator, text_builder, runs, link.children, link_style);
+                    try appendInlineRunsWithHref(allocator, text_builder, runs, link.children, link_style, link.destination);
                 } else {
-                    try appendStyledText(allocator, text_builder, runs, link.label, link_style);
+                    try appendStyledText(allocator, text_builder, runs, link.label, link_style, link.destination);
                 }
             },
             .line_break => |kind| try runs.append(allocator, .{ .line_break = kind }),
@@ -1066,6 +1087,7 @@ fn appendStyledText(
     runs: *std.ArrayListUnmanaged(InlineRunView),
     text: []const u8,
     style: InlineStyle,
+    href: ?[]const u8,
 ) Allocator.Error!void {
     if (text.len == 0) return;
 
@@ -1076,7 +1098,7 @@ fn appendStyledText(
     if (runs.items.len > 0) {
         switch (runs.items[runs.items.len - 1]) {
             .text => |*last| {
-                if (std.meta.eql(last.style, style) and last.end == start) {
+                if (std.meta.eql(last.style, style) and optionalBytesEqual(last.href, href) and last.end == start) {
                     last.end = end;
                     return;
                 }
@@ -1090,8 +1112,17 @@ fn appendStyledText(
             .start = start,
             .end = end,
             .style = style,
+            .href = href,
         },
     });
+}
+
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |av| {
+        const bv = b orelse return false;
+        return std.mem.eql(u8, av, bv);
+    }
+    return b == null;
 }
 
 fn mergeInlineStyle(base: InlineStyle, extra: InlineStyle) InlineStyle {
@@ -1753,6 +1784,7 @@ const TextBlockLayoutStep = struct {
     text: []const u8,
     block_style: TextStyle,
     inline_style: InlineStyle,
+    href: ?[]const u8 = null,
     font_spec: FontSpec,
     x: f32,
     y: f32,
@@ -1854,6 +1886,7 @@ fn walkTextBlockLayout(
                                 .text = ws,
                                 .block_style = block.style,
                                 .inline_style = text_run.style,
+                                .href = text_run.href,
                                 .font_spec = spec,
                                 .x = state.x,
                                 .y = state.y,
@@ -1900,6 +1933,7 @@ fn walkTextBlockLayout(
                         .text = flush,
                         .block_style = block.style,
                         .inline_style = text_run.style,
+                        .href = text_run.href,
                         .font_spec = spec,
                         .x = seg_x,
                         .y = state.y,
@@ -1920,6 +1954,7 @@ fn walkTextBlockLayout(
                         .text = seg,
                         .block_style = block.style,
                         .inline_style = text_run.style,
+                        .href = text_run.href,
                         .font_spec = spec,
                         .x = seg_x,
                         .y = state.y,
@@ -2407,6 +2442,97 @@ pub fn hitTestSelectablePaletteBody(
                 context_cursor.y += height;
                 context_cursor.h = @max(context_cursor.h, height);
                 global_line_index += 1 + table_block.rows.len;
+            },
+        }
+
+        previous = block;
+    }
+
+    return null;
+}
+
+/// Hit-tests rendered markdown links in the same coordinate space as
+/// [`PaletteRenderContext.cursor`]. The returned href slice is owned by `view`.
+pub fn hitTestLinkPaletteBody(
+    view: BodyView,
+    options: RenderOptions,
+    body_rect: palette.Rect,
+    available_width: f32,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?LinkHit {
+    const width = @max(available_width, 1.0);
+    var context_cursor = body_rect;
+    var previous: ?BlockView = null;
+
+    for (view.blocks) |block| {
+        if (previous) |prior| {
+            if (prior.kind() != .blank and block.kind() != .blank) {
+                const gap_height = if (prior.isCompact() or block.isCompact()) compactBlockGap(options) else blockGap(options);
+                context_cursor.y += gap_height;
+                context_cursor.h = @max(context_cursor.h, gap_height);
+            }
+        }
+
+        switch (block) {
+            .blank => {
+                const height = blankBlockHeight(options);
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+            },
+            .text => |text_block| {
+                const indent = indentWidth(text_block.indent);
+                const start = .{ context_cursor.x + indent, context_cursor.y };
+                const line_width = @max(width - indent, 1.0);
+                const HitContext = struct {
+                    start: [2]f32,
+                    mouse_x: f32,
+                    mouse_y: f32,
+                    found: ?LinkHit = null,
+
+                    fn onStep(self: *@This(), step: TextBlockLayoutStep) void {
+                        if (self.found != null or !step.inline_style.link) return;
+                        const href = step.href orelse return;
+                        const rect: palette.Rect = .{
+                            .x = self.start[0] + step.x,
+                            .y = self.start[1] + step.y,
+                            .w = step.width,
+                            .h = step.line_height,
+                        };
+                        if (self.mouse_x >= rect.x and self.mouse_x <= rect.x + rect.w and
+                            self.mouse_y >= rect.y and self.mouse_y <= rect.y + rect.h)
+                        {
+                            self.found = .{ .href = href };
+                        }
+                    }
+                };
+
+                var hit_context: HitContext = .{ .start = start, .mouse_x = mouse_x, .mouse_y = mouse_y };
+                const height = walkTextBlockLayout(text_block, line_width, options, &hit_context, HitContext.onStep);
+                if (hit_context.found) |hit| return hit;
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+            },
+            .fenced_code => |code_block| {
+                const indent = indentWidth(code_block.indent);
+                const line_height = codeLineHeight(options);
+                const pad_x = codeBlockPaddingX(options);
+                const pad_y = codeBlockPaddingY(options);
+                const block_w = @max(width - indent, minimumCodeBlockWidth(options));
+                const tw = @max(block_w - pad_x * 2.0, 1.0);
+                const height = codeBlockHeight(code_block, line_height, pad_y, tw, codeCharWidth(options));
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+            },
+            .thematic_break => {
+                const height = thematicBreakHeight(options);
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
+            },
+            .table => |table_block| {
+                const height = measureTableHeight(table_block, width, options);
+                context_cursor.y += height;
+                context_cursor.h = @max(context_cursor.h, height);
             },
         }
 
@@ -3901,6 +4027,7 @@ test "preserves links and inline code runs" {
                     if (std.mem.eql(u8, slice, "docs")) {
                         found_link = true;
                         try std.testing.expect(span.style.link);
+                        try std.testing.expectEqualStrings("https://example.com", span.href.?);
                     }
                 },
                 else => {},

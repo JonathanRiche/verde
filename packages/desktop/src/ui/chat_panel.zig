@@ -450,6 +450,10 @@ const TranscriptMarkdownHit = struct {
     point: chat_markdown.SelectionPoint,
 };
 
+const TranscriptMarkdownLinkHit = struct {
+    href: []const u8,
+};
+
 fn assistantTranscriptMarkdownHit(
     state: *app_state.AppState,
     column: palette.Rect,
@@ -490,6 +494,50 @@ fn assistantTranscriptMarkdownHit(
     ) catch return null;
     const p = pt orelse return null;
     return .{ .message_index = message_index, .point = p };
+}
+
+fn assistantTranscriptMarkdownLinkHit(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    role: app_state.ChatRole,
+    body_raw: []const u8,
+    muted_body: bool,
+    assistant_plain_layout: bool,
+    streaming: bool,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?TranscriptMarkdownLinkHit {
+    if (!(role == .assistant and !muted_body and !assistant_plain_layout)) return null;
+    const bubble_width = if (role == .user) column.w * 0.62 else column.w;
+    const bubble_x = if (role == .user) column.x + column.w - bubble_width else column.x;
+    const bubble = palette.Rect{ .x = bubble_x, .y = y, .w = bubble_width, .h = height };
+
+    const body_rect = palette.Rect{
+        .x = bubble.x + theme.scaledUi(14.0),
+        .y = bubble.y + theme.scaledUi(34.0),
+        .w = bubble.w - theme.scaledUi(28.0),
+        .h = bubble.h - theme.scaledUi(42.0),
+    };
+    if (!rectContains(body_rect, mouse_x, mouse_y)) return null;
+
+    const body_text = std.mem.trim(u8, body_raw, "\n\r\t ");
+    var view = (if (streaming)
+        chat_markdown.buildBodyViewStreaming(state.allocator, body_text)
+    else
+        chat_markdown.buildBodyView(state.allocator, body_text)) catch return null;
+    defer view.deinit(state.allocator);
+
+    const hit = chat_markdown.hitTestLinkPaletteBody(
+        view,
+        transcriptMarkdownOptions(),
+        body_rect,
+        body_rect.w,
+        mouse_x,
+        mouse_y,
+    ) orelse return null;
+    return .{ .href = hit.href };
 }
 
 fn transcriptMarkdownBubbleHit(
@@ -544,6 +592,71 @@ fn transcriptMarkdownBubbleHit(
     const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
     const stream_idx = base_idx + send_state.pending_events.items.len;
     return assistantTranscriptMarkdownHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, stream_idx, mouse_x, mouse_y);
+}
+
+fn transcriptMarkdownBubbleLinkHit(
+    state: *app_state.AppState,
+    mouse_x: f32,
+    mouse_y: f32,
+) ?TranscriptMarkdownLinkHit {
+    const column = state.transcript_palette_column;
+    const clip = state.transcript_palette_clip;
+    if (column.w <= 0 or !rectContains(clip, mouse_x, mouse_y)) return null;
+
+    const thread = state.currentThread();
+    const scroll_y = state.transcript_palette_scroll_y;
+    var content_y = column.y - scroll_y;
+
+    for (thread.messages.items, 0..) |message, msg_idx| {
+        if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
+        const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
+        if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
+            content_y += item_h + theme.scaledUi(12.0);
+            continue;
+        }
+        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, message.role, message.body, false, false, false, mouse_x, mouse_y)) |hit| {
+            return hit;
+        }
+        content_y += item_h + theme.scaledUi(12.0);
+    }
+
+    const send_state = thread.send_state;
+    send_state.mutex.lock();
+    defer send_state.mutex.unlock();
+    if (send_state.status != .pending) return null;
+
+    for (send_state.pending_events.items) |event| {
+        if (event.role == .system and shouldHideCursorLifecycleSystemEvent(event.author, event.body)) continue;
+        const item_h = transcriptMessageHeight(null, null, event.body, event.role, column.w, event.author, false);
+        if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
+            content_y += item_h + theme.scaledUi(12.0);
+            continue;
+        }
+        if (assistantTranscriptMarkdownLinkHit(state, column, content_y, item_h, event.role, event.body, false, false, false, mouse_x, mouse_y)) |hit| {
+            return hit;
+        }
+        content_y += item_h + theme.scaledUi(12.0);
+    }
+
+    const stream_text: []const u8 = send_state.partial_text.items;
+    const body: []const u8 = if (stream_text.len > 0) stream_text else "Waiting for streamed output...";
+    const stream_plain = stream_text.len > 0;
+    const assistant_h = transcriptMessageHeightStream(null, null, body, .assistant, column.w, "", stream_plain, stream_text.len > 0);
+    return assistantTranscriptMarkdownLinkHit(state, column, content_y, assistant_h, .assistant, body, stream_text.len == 0, stream_plain, true, mouse_x, mouse_y);
+}
+
+fn localFileHref(href: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+    if (trimmed.len == 0 or trimmed[0] == '#') return null;
+    if (std.mem.startsWith(u8, trimmed, "file://localhost/") or
+        std.mem.startsWith(u8, trimmed, "file:///"))
+    {
+        return trimmed;
+    }
+    if (std.mem.startsWith(u8, trimmed, "file://")) return null;
+    if (std.mem.indexOf(u8, trimmed, "://") != null) return null;
+    if (std.mem.startsWith(u8, trimmed, "mailto:")) return null;
+    return trimmed;
 }
 
 pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
@@ -644,6 +757,16 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     }
     if (clicks <= 1 and state.consumeCardToggleClick(x, y)) {
         return true;
+    }
+    if (clicks <= 1) {
+        if (transcriptMarkdownBubbleLinkHit(state, x, y)) |link_hit| {
+            if (localFileHref(link_hit.href)) |file_href| {
+                state.blurPaletteComposer();
+                state.clearTranscriptMarkdownSelection();
+                state.openTranscriptFileReference(file_href);
+                return true;
+            }
+        }
     }
     if (transcriptMarkdownBubbleHit(state, x, y)) |markdown_hit| {
         state.blurPaletteComposer();
