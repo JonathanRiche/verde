@@ -5801,7 +5801,33 @@ pub const AppState = struct {
     }
 
     pub fn openTranscriptFileReference(self: *AppState, file_path: []const u8) void {
-        const result = utils.openFilePreferEditor(self.allocator, file_path) catch |err| {
+        const normalized = std.mem.trim(u8, if (std.mem.startsWith(u8, file_path, "file://localhost/"))
+            file_path["file://localhost".len..]
+        else if (std.mem.startsWith(u8, file_path, "file://"))
+            file_path["file://".len..]
+        else
+            file_path, &std.ascii.whitespace);
+        if (normalized.len == 0) {
+            self.setSidebarNotice("No file reference selected.");
+            return;
+        }
+
+        const resolved_path = if (std.fs.path.isAbsolute(normalized)) resolved: {
+            break :resolved self.allocator.dupe(u8, normalized) catch |err| {
+                log.warn("failed to copy transcript file reference: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open file reference.");
+                return;
+            };
+        } else resolved: {
+            break :resolved std.fs.path.join(self.allocator, &.{ self.currentProject().path, normalized }) catch |err| {
+                log.warn("failed to resolve transcript file reference: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open file reference.");
+                return;
+            };
+        };
+        defer self.allocator.free(resolved_path);
+
+        const result = utils.openFilePreferEditor(self.allocator, resolved_path) catch |err| {
             log.warn("failed to open transcript file reference: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to open file reference.");
             return;
