@@ -483,7 +483,7 @@ Example config:
     "refresh": ["CommandOrControl+R", "CommandOrControl+Shift+R", "Ctrl+Shift+R", "F5"],
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
-    "sidebar_hidden": "Alt+B",
+    "sidebar_hidden": "Ctrl+Shift+S",
     "browser": "Ctrl+B",
     "workspace": {
       "split_chat_vertical": "CommandOrControl+Alt+C",
