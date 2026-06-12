@@ -13,6 +13,7 @@ const browser_texture = @import("browser/texture.zig");
 const chat_threads = @import("chat/threads.zig");
 const cli = @import("cli.zig");
 const live_ipc = @import("ipc/server.zig");
+const loop_wakeup = @import("loop_wakeup.zig");
 const keybinds = @import("keybinds.zig");
 const profiler = @import("profiler.zig");
 const runtime_log = @import("runtime_log.zig");
@@ -63,10 +64,15 @@ const MAX_WINDOW_WIDTH: c_int = 1520;
 const MAX_WINDOW_HEIGHT: c_int = 980;
 const ACTIVE_WAIT_TIMEOUT_MS: c_int = 16;
 const IDLE_WAIT_TIMEOUT_MS: c_int = 50;
+// ~30fps tick while a sidebar status pip is pulsing. The pulse is a ~1.1s
+// sine (sidebar.zig), so 30fps already looks perfectly smooth at half the
+// render cost of the 16ms ACTIVE tier; pips can stay lit for minutes while
+// agents work, so the cheaper cadence matters.
+const PIP_PULSE_WAIT_TIMEOUT_MS: c_int = 33;
 // Wake the event loop at least 4 times per second while any chat turn is in
 // flight so the "Working - mm:ss" label (computed from wall clock) ticks
-// even when no streamed tokens or input events arrive. pollSend gates the
-// actual render on a whole-second change, so cost is ~1 render/sec.
+// even when no streamed tokens or input events arrive. Streamed tokens wake
+// the loop immediately via loop_wakeup; this is only the fallback heartbeat.
 const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
@@ -191,6 +197,7 @@ fn mainInner(init: std.process.Init) !void {
     }
     try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
+    loop_wakeup.init();
     defer {
         if (skipSdlQuitOnProcessExit()) {
             runtime_log.diagnostic("skipping SDL_Quit on process exit to avoid Linux GPU driver shutdown hang", .{});
@@ -1013,6 +1020,9 @@ fn processOneEvent(
     event: *sdl.Event,
     frame_sample: *profiler.FrameSample,
 ) bool {
+    // Cross-thread wake events carry no payload; noteEventForRender already
+    // flagged them as render-worthy, so just clear the coalescing flag.
+    if (loop_wakeup.consume(event)) return true;
     const start = profiler.nowNs();
     normalizeMouseEventCoordinates(window, event);
     switch (event.type) {
@@ -1068,13 +1078,22 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         state.transcriptMarkdownSelectionDragging() or
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isCompletionPulseAnimating() or
-        ui_layout.isSidebarAnimating();
+        ui_layout.isSidebarAnimating() or
+        // Pulsing sidebar status pips need a steady tick or the sine wave
+        // gets sampled at the 1Hz "Working" label cadence and looks steppy.
+        state.sidebar_pulse_animating;
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
     if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
+    // Terminal output only reaches the screen when the loop wakes and polls
+    // (daemon sessions tail over an RPC; there is no fd to push a wake from).
+    // While output was seen recently, poll at display rate so TUI redraws
+    // aren't capped at the idle cadence; decays back to idle on quiet panes.
+    if (state.terminalOutputBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
+    if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
     // While a chat turn is pending we still want the wall-clock "Working"
     // label to tick. pollSend bumps once per whole second; this just caps
     // the SDL wait so we actually reach pollSend before that second elapses.

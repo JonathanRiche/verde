@@ -1051,6 +1051,40 @@ pub const Renderer = struct {
         return @floatFromInt(substring.rect.x);
     }
 
+    /// Per-glyph advances for a single line (no newlines) in one shaping pass.
+    /// `advances.len` must equal `value.len`; advances[i] is the width of the
+    /// glyph starting at byte i (0 for continuation bytes). measureTextOffset
+    /// costs a full TTF_CreateText shape per call, so callers that need every
+    /// glyph (text-input layout) must use this instead of per-prefix queries —
+    /// that path is O(line²) and visibly stalls multi-line composer buffers.
+    pub fn measureTextGlyphAdvances(self: *Renderer, value: []const u8, font_size: f32, font_role: ?draw.FontRole, advances: []f32) !void {
+        std.debug.assert(advances.len == value.len);
+        @memset(advances, 0.0);
+        if (value.len == 0) return;
+
+        const font = try self.fontForRoleAndSize(font_size, font_role);
+        const text = c.TTF_CreateText(self.text_engine.?, font, value.ptr, value.len) orelse return error.SdlTtfCreateTextFailed;
+        defer c.TTF_DestroyText(text);
+        if (!c.TTF_UpdateText(text)) return error.SdlTtfTextFailed;
+
+        var prev_start: usize = 0;
+        var prev_x: f32 = 0.0;
+        var index: usize = utf8ByteLen(value[0], value.len);
+        while (index < value.len) {
+            var substring: c.TTF_SubString = undefined;
+            if (!c.TTF_GetTextSubString(text, @intCast(index), &substring)) return error.SdlTtfTextFailed;
+            const x: f32 = @floatFromInt(substring.rect.x);
+            advances[prev_start] = @max(x - prev_x, 0.0);
+            prev_start = index;
+            prev_x = x;
+            index += utf8ByteLen(value[index], value.len - index);
+        }
+        // Last glyph: total width minus its pen position. measureTextOffset
+        // handles the trailing-whitespace advance TTF draw data omits.
+        const total = try self.measureTextOffset(value, font_size, value.len, font_role);
+        advances[prev_start] = @max(total - prev_x, 0.0);
+    }
+
     fn fallbackFontRoleForGlyph(self: *Renderer, value: []const u8, font_size: f32, font_role: ?draw.FontRole) ?draw.FontRole {
         if (font_role != .mono or self.icon_font == null) return font_role;
         if (value.len == 0 or value[0] < 0x80) return font_role;

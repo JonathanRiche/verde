@@ -14,6 +14,18 @@ const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
 
+/// Shared ~1.1s sine pulse (0.10..1.0) for working/waiting pips and badges.
+/// Marks the frame as hosting an active pip animation so the main loop keeps
+/// a ~30fps tick going; without it the loop sleeps between sends' 1Hz label
+/// updates and the pulse visibly steps.
+fn attentionPulse(state: *runtime.AppState) f32 {
+    state.sidebar_pulse_animating = true;
+    // Phase math in f64: ms-since-boot exceeds f32's 24-bit mantissa after
+    // ~4.6h of uptime, which would quantize the sine into visible steps.
+    const now_ms: f64 = @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+    return @floatCast(0.55 + 0.45 * @sin(now_ms / 180.0));
+}
+
 /// Saved-thread row: provider bitmap slot (CSS px). Match `COMPOSER_PROVIDER_LOGO_SLOT_CSS` in `chat_panel.zig`.
 const SIDEBAR_THREAD_PROVIDER_GLYPH_CSS: f32 = 22.0;
 /// Thread row height must fit `SIDEBAR_THREAD_PROVIDER_GLYPH_CSS` with a little vertical air.
@@ -1028,7 +1040,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         // Attention badge tucked into the top-right corner, kept fully inside the
         // narrow rail so it doesn't clip against the panel edge.
         if (workspaceStatusColor(state, project_index)) |badge| {
-            const pulse: f32 = 0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0);
+            const pulse = attentionPulse(state);
             const badge_d = theme.scaledUi(8.0);
             queuePaletteRoundedRect(state, .{
                 .x = avatar_rect.x + avatar - badge_d - theme.scaledUi(2.0),
@@ -1297,10 +1309,7 @@ fn renderOpenPaneRow(
     if (!focused) {
         if (paneStatusColor(status, running)) |pip_color| {
             const animated = running or (if (status) |s| s == .waiting else false);
-            const pulse: f32 = if (animated)
-                0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
-            else
-                1.0;
+            const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
             const dot = theme.scaledUi(7.0);
             queuePaletteRoundedRect(state, .{
                 .x = rect.x + rect.w - theme.scaledUi(10.0),
@@ -1380,10 +1389,7 @@ fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread
     const title_font = theme.scaledUi(13.5);
     const title_line = title_font * 1.30;
     const title_y = @round(rect.y + (rect.h - title_line) * 0.5);
-    const pulse = if (running)
-        0.55 + 0.45 * @sin(@as(f32, @floatFromInt(@divTrunc(profiler.nowNs(), std.time.ns_per_ms))) / 180.0)
-    else
-        0.0;
+    const pulse: f32 = if (running) attentionPulse(state) else 0.0;
     const mix_t = pulse * 0.35;
     const running_color = [4]f32{
         theme.COLOR_SECONDARY_GREEN[0] + (theme.COLOR_WHITE[0] - theme.COLOR_SECONDARY_GREEN[0]) * mix_t,

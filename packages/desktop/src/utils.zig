@@ -1,5 +1,6 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
+const loop_wakeup = @import("loop_wakeup.zig");
 const process_env = @import("process_env.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
@@ -439,6 +440,9 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
 
     state.mutex.lock();
     defer state.mutex.unlock();
+    // Whatever terminal status we settle on below, wake the render loop so
+    // pollSend commits it immediately instead of on the next timeout tick.
+    defer loop_wakeup.notify();
 
     if (result) |payload| {
         if (state.stop_requested) {
@@ -1260,6 +1264,7 @@ fn handleSendThreadId(context: ?*anyopaque, thread_id: []const u8) void {
         return;
     };
     send_state.ui_revision +%= 1;
+    loop_wakeup.notify();
 }
 fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1281,6 +1286,7 @@ fn handleSendTurnId(context: ?*anyopaque, turn_id: []const u8) void {
         return;
     };
     send_state.ui_revision +%= 1;
+    loop_wakeup.notify();
 }
 fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1301,6 +1307,9 @@ fn handleSendStreamDelta(context: ?*anyopaque, delta: []const u8) void {
         return;
     };
     send_state.ui_revision +%= 1;
+    // Wake the render loop now; otherwise streamed tokens only appear on the
+    // next PENDING_SEND timeout tick (~4fps). loop_wakeup coalesces bursts.
+    loop_wakeup.notify();
 }
 fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) void {
     const send_state: *app_state.SendState = @ptrCast(@alignCast(context orelse return));
@@ -1335,11 +1344,13 @@ fn handleSendStreamEvent(context: ?*anyopaque, event: ai_harness.StreamEvent) vo
                 return;
             };
             send_state.ui_revision +%= 1;
+            loop_wakeup.notify();
         },
         .diff => |diff| {
             flushPendingAssistantTextLocked(send_state, page_alloc);
             mergePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files, diff.files);
             send_state.ui_revision +%= 1;
+            loop_wakeup.notify();
         },
     }
 }
@@ -1447,6 +1458,9 @@ fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalR
     };
     send_state.approval_decision = null;
     send_state.ui_revision +%= 1;
+    // Surface the approval prompt immediately; this thread is about to block
+    // on the user's decision, so a stale 250ms tick would delay the modal.
+    loop_wakeup.notify();
 
     while (send_state.status == .pending and send_state.approval_decision == null) {
         send_state.condition.wait(&send_state.mutex);
@@ -1456,6 +1470,7 @@ fn handleSendApprovalRequest(context: ?*anyopaque, request: ai_harness.ApprovalR
     send_state.approval_decision = null;
     freePendingApprovalLocked(page_alloc, &send_state.pending_approval);
     send_state.ui_revision +%= 1;
+    loop_wakeup.notify();
     return decision;
 }
 pub fn freePendingApproval(allocator: std.mem.Allocator, approval: *?app_state.PendingApproval) void {
