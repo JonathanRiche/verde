@@ -31,6 +31,11 @@ pub fn updateSettingsModalHover(state: *runtime.AppState, x: f32, y: f32) void {
     settings_modal.updateHover(state, x, y);
 }
 
+/// Routes wheel input to the settings modal body when it is open.
+pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    return settings_modal.handleWheel(state, width, height, x, y, wheel_y);
+}
+
 /// Rebuilds palette modal hit targets from the current window size **before** SDL input is
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {

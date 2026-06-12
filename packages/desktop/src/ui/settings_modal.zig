@@ -82,6 +82,8 @@ const SettingsLayout = struct {
     modal: palette.Rect,
     header: palette.Rect,
     footer: palette.Rect,
+    body_clip: palette.Rect,
+    max_scroll_y: f32,
     close: palette.Rect,
     cancel: palette.Rect,
     save: palette.Rect,
@@ -181,6 +183,16 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const header: palette.Rect = .{ .x = modal.x, .y = modal.y, .w = modal.w, .h = m.header_h };
     const footer: palette.Rect = .{ .x = modal.x, .y = modal.y + modal.h - m.footer_h, .w = modal.w, .h = m.footer_h };
+    const content_y = header.y + header.h + m.modal_pad;
+    const body_view_h = @max(footer.y - m.modal_pad - content_y, 0.0);
+    const max_scroll_y = @max(body_h - body_view_h, 0.0);
+    const scroll_y = theme.clampf(state.settings_scroll_y, 0.0, max_scroll_y);
+    const body_clip: palette.Rect = .{
+        .x = modal.x,
+        .y = header.y + header.h,
+        .w = modal.w,
+        .h = @max(footer.y - (header.y + header.h), 0.0),
+    };
 
     const close_size = theme.scaledUi(26.0);
     const close: palette.Rect = .{
@@ -208,7 +220,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const content_x = modal.x + m.modal_pad;
     const content_w = modal.w - m.modal_pad * 2.0;
-    var y = header.y + header.h + m.modal_pad;
+    var y = content_y - scroll_y;
 
     const appearance_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = appearance_h };
     const theme_row_y = appearance_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
@@ -275,6 +287,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .modal = modal,
         .header = header,
         .footer = footer,
+        .body_clip = body_clip,
+        .max_scroll_y = max_scroll_y,
         .close = close,
         .cancel = cancel,
         .save = save,
@@ -315,28 +329,40 @@ fn openActionSelected(state: *const runtime.AppState, control: Control) bool {
     };
 }
 
+fn queueControlHit(
+    state: *runtime.AppState,
+    rect: palette.Rect,
+    clip: palette.Rect,
+    control: Control,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    const visible = intersectRect(rect, clip) orelse return;
+    queue_hit(state, visible, .settings_control, @intFromEnum(control));
+}
+
 /// Registers palette hit targets for the settings modal.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
     if (!state.show_settings_modal) return;
 
     const layout = computeLayout(state, width, height);
+    state.settings_scroll_y = theme.clampf(state.settings_scroll_y, 0.0, layout.max_scroll_y);
     queue_hit(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .modal_dismiss, 0);
     queue_hit(state, layout.modal, .modal_block, 0);
     queue_hit(state, layout.close, .settings_close, 0);
     queue_hit(state, layout.cancel, .settings_cancel, 0);
     queue_hit(state, layout.save, .settings_save, 0);
-    queue_hit(state, layout.theme_omarchy, .settings_control, @intFromEnum(Control.theme_omarchy));
-    queue_hit(state, layout.theme_default, .settings_control, @intFromEnum(Control.theme_default));
-    queue_hit(state, layout.ui_font_dec, .settings_control, @intFromEnum(Control.ui_font_dec));
-    queue_hit(state, layout.ui_font_inc, .settings_control, @intFromEnum(Control.ui_font_inc));
-    queue_hit(state, layout.terminal_font_dec, .settings_control, @intFromEnum(Control.terminal_font_dec));
-    queue_hit(state, layout.terminal_font_inc, .settings_control, @intFromEnum(Control.terminal_font_inc));
+    queueControlHit(state, layout.theme_omarchy, layout.body_clip, .theme_omarchy, queue_hit);
+    queueControlHit(state, layout.theme_default, layout.body_clip, .theme_default, queue_hit);
+    queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
+    queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
+    queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
+    queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
-        queue_hit(state, layout.open_cells[index], .settings_control, @intFromEnum(choice.control));
+        queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
-    queue_hit(state, layout.hooks_claude, .settings_control, @intFromEnum(Control.hooks_claude));
-    queue_hit(state, layout.hooks_codex, .settings_control, @intFromEnum(Control.hooks_codex));
-    queue_hit(state, layout.notifications_toggle, .settings_control, @intFromEnum(Control.notifications_toggle));
+    queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
+    queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
+    queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
 }
 
 /// Renders the settings modal over the workspace.
@@ -345,26 +371,27 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
 
     const m = metrics();
     const layout = computeLayout(state, width, height);
+    state.settings_scroll_y = theme.clampf(state.settings_scroll_y, 0.0, layout.max_scroll_y);
     const dirty = state.isSettingsDraftDirty();
     drawModalChrome(state, width, height, layout.modal);
 
     drawHeaderBar(state, layout, dirty);
-    drawCard(state, layout.appearance_card);
-    drawCard(state, layout.terminal_card);
-    drawCard(state, layout.workspace_card);
-    drawCard(state, layout.integrations_card);
-    drawCard(state, layout.notifications_card);
+    drawCard(state, layout.appearance_card, layout.body_clip);
+    drawCard(state, layout.terminal_card, layout.body_clip);
+    drawCard(state, layout.workspace_card, layout.body_clip);
+    drawCard(state, layout.integrations_card, layout.body_clip);
+    drawCard(state, layout.notifications_card, layout.body_clip);
 
     // Appearance
-    drawCardTitle(state, layout.appearance_card, "Appearance", layout.modal);
-    drawFieldLabel(state, layout.appearance_card, m, "Theme");
-    drawToggleCell(state, layout.theme_omarchy, "Omarchy", state.settings_draft.theme_source == .omarchy, isControlHovered(state, .theme_omarchy), layout.modal);
-    drawToggleCell(state, layout.theme_default, "Verde", state.settings_draft.theme_source == .default, isControlHovered(state, .theme_default), layout.modal);
-    drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.modal);
+    drawCardTitle(state, layout.appearance_card, "Appearance", layout.body_clip);
+    drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
+    drawToggleCell(state, layout.theme_omarchy, "Omarchy", state.settings_draft.theme_source == .omarchy, isControlHovered(state, .theme_omarchy), layout.body_clip);
+    drawToggleCell(state, layout.theme_default, "Verde", state.settings_draft.theme_source == .default, isControlHovered(state, .theme_default), layout.body_clip);
+    drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
 
     // Terminal
-    drawCardTitle(state, layout.terminal_card, "Terminal", layout.modal);
-    drawStepperRow(state, layout.terminal_card, m, layout.terminal_font_dec.y, "Font size", state.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE, .terminal_font_dec, .terminal_font_inc, layout.terminal_font_dec, layout.terminal_font_inc, layout.modal);
+    drawCardTitle(state, layout.terminal_card, "Terminal", layout.body_clip);
+    drawStepperRow(state, layout.terminal_card, m, layout.terminal_font_dec.y, "Font size", state.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE, .terminal_font_dec, .terminal_font_inc, layout.terminal_font_dec, layout.terminal_font_inc, layout.body_clip);
     var profile_buf: [56]u8 = undefined;
     const profile_line = std.fmt.bufPrint(&profile_buf, "{d} launch profile(s) · edit in verde.json", .{state.app_config.terminal_launch_profiles.len}) catch "Edit terminal.profiles in verde.json";
     queueText(state, .{
@@ -372,13 +399,13 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .y = layout.terminal_hint_y,
         .w = layout.terminal_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, profile_line, paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
+    }, profile_line, paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     // Workspace
-    drawCardTitle(state, layout.workspace_card, "Workspace", layout.modal);
-    drawFieldLabel(state, layout.workspace_card, m, "Default open action");
+    drawCardTitle(state, layout.workspace_card, "Workspace", layout.body_clip);
+    drawFieldLabel(state, layout.workspace_card, m, "Default open action", layout.body_clip);
     for (OPEN_CHOICES, 0..) |choice, index| {
-        drawToggleCell(state, layout.open_cells[index], choice.label, openActionSelected(state, choice.control), isControlHovered(state, choice.control), layout.modal);
+        drawToggleCell(state, layout.open_cells[index], choice.label, openActionSelected(state, choice.control), isControlHovered(state, choice.control), layout.body_clip);
     }
     if (state.settings_draft.open_action == .custom) {
         if (layout.custom_open) |custom_row| {
@@ -387,37 +414,55 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
                 std.fmt.bufPrint(&custom_buf, "{s} (custom)", .{state.app_config.default_open_action.custom.label}) catch "Custom"
             else
                 "Custom action";
-            drawToggleCell(state, custom_row, custom_label, true, false, layout.modal);
+            drawToggleCell(state, custom_row, custom_label, true, false, layout.body_clip);
         }
     }
 
     // Agent integrations
-    drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.modal);
-    drawFieldLabel(state, layout.integrations_card, m, "Status pip hooks (global)");
+    drawCardTitle(state, layout.integrations_card, "Agent integrations", layout.body_clip);
+    drawFieldLabel(state, layout.integrations_card, m, "Status pip hooks (global)", layout.body_clip);
     const claude_on = state.settings_hook_claude_installed;
-    drawToggleCell(state, layout.hooks_claude, if (claude_on) "Claude  ·  Enabled" else "Claude  ·  Disabled", claude_on, isControlHovered(state, .hooks_claude), layout.modal);
+    drawToggleCell(state, layout.hooks_claude, if (claude_on) "Claude  ·  Enabled" else "Claude  ·  Disabled", claude_on, isControlHovered(state, .hooks_claude), layout.body_clip);
     const codex_on = state.settings_hook_codex_installed;
-    drawToggleCell(state, layout.hooks_codex, if (codex_on) "Codex  ·  Enabled" else "Codex  ·  Disabled", codex_on, isControlHovered(state, .hooks_codex), layout.modal);
+    drawToggleCell(state, layout.hooks_codex, if (codex_on) "Codex  ·  Enabled" else "Codex  ·  Disabled", codex_on, isControlHovered(state, .hooks_codex), layout.body_clip);
     queueText(state, .{
         .x = layout.integrations_card.x + m.card_pad,
         .y = layout.integrations_hint_y,
         .w = layout.integrations_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Writes hooks to ~/.claude & ~/.codex · merges, no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
+    }, "Writes hooks to ~/.claude & ~/.codex · merges, no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     // Notifications
-    drawCardTitle(state, layout.notifications_card, "Notifications", layout.modal);
-    drawFieldLabel(state, layout.notifications_card, m, "Desktop alerts");
+    drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
+    drawFieldLabel(state, layout.notifications_card, m, "Desktop alerts", layout.body_clip);
     const notifications_on = state.settings_draft.notifications_enabled;
-    drawToggleCell(state, layout.notifications_toggle, if (notifications_on) "On agent completion  ·  Enabled" else "On agent completion  ·  Disabled", notifications_on, isControlHovered(state, .notifications_toggle), layout.modal);
+    drawToggleCell(state, layout.notifications_toggle, if (notifications_on) "On agent completion  ·  Enabled" else "On agent completion  ·  Disabled", notifications_on, isControlHovered(state, .notifications_toggle), layout.body_clip);
     queueText(state, .{
         .x = layout.notifications_card.x + m.card_pad,
         .y = layout.notifications_hint_y,
         .w = layout.notifications_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "System notification when an agent finishes · macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.modal);
+    }, "System notification when an agent finishes · macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     drawFooterBar(state, layout, dirty);
+}
+
+/// Scrolls settings modal content within the fixed header/footer chrome.
+pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    if (!state.show_settings_modal) return false;
+
+    const layout = computeLayout(state, width, height);
+    if (!rectContains(layout.modal, x, y)) return true;
+    if (layout.max_scroll_y <= 0.0) return true;
+    if (!rectContains(layout.body_clip, x, y)) return true;
+
+    const delta = -wheel_y * theme.scaledUi(72.0);
+    const next = theme.clampf(state.settings_scroll_y + delta, 0.0, layout.max_scroll_y);
+    if (next != state.settings_scroll_y) {
+        state.settings_scroll_y = next;
+        state.markDirty();
+    }
+    return true;
 }
 
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
@@ -545,8 +590,8 @@ fn drawFooterBar(state: *runtime.AppState, layout: SettingsLayout, dirty: bool) 
 
 const FooterStyle = enum { primary, secondary };
 
-fn drawCard(state: *runtime.AppState, rect: palette.Rect) void {
-    queueRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), radiusMd());
+fn drawCard(state: *runtime.AppState, rect: palette.Rect, clip: palette.Rect) void {
+    queueRoundedRectClipped(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), radiusMd(), clip);
 }
 
 fn drawCardTitle(state: *runtime.AppState, card: palette.Rect, title: []const u8, clip: palette.Rect) void {
@@ -559,13 +604,13 @@ fn drawCardTitle(state: *runtime.AppState, card: palette.Rect, title: []const u8
     }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
 }
 
-fn drawFieldLabel(state: *runtime.AppState, card: palette.Rect, m: Metrics, label: []const u8) void {
+fn drawFieldLabel(state: *runtime.AppState, card: palette.Rect, m: Metrics, label: []const u8, clip: palette.Rect) void {
     queueText(state, .{
         .x = card.x + m.card_pad,
         .y = card.y + m.card_pad + m.title_h + m.row_gap,
         .w = card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, label, paletteColor(textLabel()), theme.scaledUi(12.0), card);
+    }, label, paletteColor(textLabel()), theme.scaledUi(12.0), clip);
 }
 
 fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
@@ -575,13 +620,13 @@ fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u
         theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)
     else
         theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
-    queueRoundedRect(state, rect, paletteColor(bg), radiusSm());
+    queueRoundedRectClipped(state, rect, paletteColor(bg), radiusSm(), clip);
 
     const dot_size = theme.scaledUi(7.0);
     const dot_x = rect.x + theme.scaledUi(9.0);
     const dot_y = rect.y + (rect.h - dot_size) * 0.5;
     const dot_color = if (selected) theme.COLOR_GREEN else theme.withAlpha(theme.COLOR_TEXT_MUTED, 180);
-    queueRoundedRect(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(dot_color), theme.scaledUi(3.5));
+    queueRoundedRectClipped(state, .{ .x = dot_x, .y = dot_y, .w = dot_size, .h = dot_size }, paletteColor(dot_color), theme.scaledUi(3.5), clip);
 
     const text_color = if (selected or hovered) theme.COLOR_WHITE else textLabel();
     queueText(state, .{
@@ -616,27 +661,27 @@ fn drawStepperRow(
 
     const pill_x = dec_rect.x;
     const pill: palette.Rect = .{ .x = pill_x, .y = row_y, .w = m.stepperW(), .h = m.row_h };
-    queueRoundedRect(state, pill, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), radiusSm());
+    queueRoundedRectClipped(state, pill, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 120)), radiusSm(), clip);
 
     var value_buf: [8]u8 = undefined;
     const value_text = std.fmt.bufPrint(&value_buf, "{d:.0}", .{value}) catch "?";
     const value_rect: palette.Rect = .{ .x = dec_rect.x + m.step_w, .y = row_y, .w = m.value_w, .h = m.row_h };
-    queueRoundedRect(state, .{ .x = dec_rect.x + m.step_w - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0);
-    queueRoundedRect(state, .{ .x = inc_rect.x - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0);
+    queueRoundedRectClipped(state, .{ .x = dec_rect.x + m.step_w - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
+    queueRoundedRectClipped(state, .{ .x = inc_rect.x - 0.5, .y = row_y + theme.scaledUi(6.0), .w = 1.0, .h = m.row_h - theme.scaledUi(12.0) }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 24)), 0.0, clip);
     queueCenteredText(state, value_rect, value_text, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.5), clip);
 
     const at_min = value <= min_value;
     const at_max = value >= max_value;
-    drawStepButton(state, dec_rect, "−", !at_min, isControlHovered(state, dec_control));
-    drawStepButton(state, inc_rect, "+", !at_max, isControlHovered(state, inc_control));
+    drawStepButton(state, dec_rect, "−", !at_min, isControlHovered(state, dec_control), clip);
+    drawStepButton(state, inc_rect, "+", !at_max, isControlHovered(state, inc_control), clip);
 }
 
-fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, enabled: bool, hovered: bool) void {
+fn drawStepButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, enabled: bool, hovered: bool, clip: palette.Rect) void {
     if (hovered and enabled) {
-        queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(5.0));
+        queueRoundedRectClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(5.0), clip);
     }
     const text_color = if (enabled) theme.COLOR_WHITE else textHint();
-    queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(14.0), rect);
+    queueCenteredText(state, rect, label, paletteColor(text_color), theme.scaledUi(14.0), clip);
 }
 
 fn drawFooterButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, style: FooterStyle) void {
@@ -680,6 +725,13 @@ fn queueRoundedRect(state: *runtime.AppState, rect: palette.Rect, color: palette
     };
 }
 
+fn queueRoundedRectClipped(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, clip: palette.Rect) void {
+    if (intersectRect(rect, clip) == null) return;
+    state.palette_overlay_batch.roundedRectClipped(state.allocator, rect, color, radius, clip) catch |err| {
+        log.warn("failed to queue clipped settings rounded rect: {s}", .{@errorName(err)});
+    };
+}
+
 fn queueBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32) void {
     state.palette_overlay_batch.rectBorder(state.allocator, rect, color, radius, width) catch |err| {
         log.warn("failed to queue settings border: {s}", .{@errorName(err)});
@@ -709,6 +761,15 @@ fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, co
 
 fn rectContains(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
+}
+
+fn intersectRect(a: palette.Rect, b: palette.Rect) ?palette.Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
 fn paletteColor(value: [4]f32) palette.Color {
