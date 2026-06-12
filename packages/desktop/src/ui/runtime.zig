@@ -28,7 +28,6 @@ pub const IMAGE_MODAL_ID: [:0]const u8 = native_state.IMAGE_MODAL_ID;
 pub const WORKSPACE_RENAME_MODAL_ID: [:0]const u8 = "WorkspaceRenameModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = native_state.THREAD_IMPORT_MODAL_ID;
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = native_state.TRANSCRIPT_SELECTION_MODAL_ID;
-pub const SIDEBAR_VISIBLE_THREAD_LIMIT: usize = 6;
 pub const PERSISTED_DIFF_MARKER = utils.PERSISTED_DIFF_MARKER;
 pub const paletteUiTextPrefixWidth = native_state.paletteUiTextPrefixWidth;
 

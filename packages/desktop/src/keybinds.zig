@@ -11,6 +11,7 @@ pub const NativeKeyboardAction = enum {
     refresh,
     open_default,
     new_thread,
+    command_palette,
     toggle_sidebar,
     toggle_sidebar_hidden,
     toggle_browser,
@@ -109,6 +110,7 @@ pub const NativeKeyboardConfig = struct {
     refresh: []Keybind,
     open_default: []Keybind,
     new_thread: []Keybind,
+    command_palette: []Keybind,
     toggle_sidebar: []Keybind,
     toggle_sidebar_hidden: []Keybind,
     toggle_browser: []Keybind,
@@ -158,6 +160,7 @@ pub const NativeKeyboardConfig = struct {
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
             .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
+            .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
             .toggle_sidebar_hidden = try cloneDefaultSidebarHiddenKeybinds(allocator),
             .toggle_browser = try cloneDefaultBrowserKeybinds(allocator),
@@ -218,6 +221,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.refresh);
         self.allocator.free(self.open_default);
         self.allocator.free(self.new_thread);
+        self.allocator.free(self.command_palette);
         self.allocator.free(self.toggle_sidebar);
         self.allocator.free(self.toggle_sidebar_hidden);
         self.allocator.free(self.toggle_browser);
@@ -271,6 +275,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.new_thread, event)) {
             return .new_thread;
+        }
+        if (matchesAny(self.command_palette, event)) {
+            return .command_palette;
         }
         if (matchesAny(self.toggle_sidebar, event)) {
             return .toggle_sidebar;
@@ -459,6 +466,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(new_thread_value, "new_thread")) |bindings| {
                 self.allocator.free(self.new_thread);
                 self.new_thread = bindings;
+            }
+        }
+        if (keybinds_value.object.get("command_palette")) |palette_value| {
+            if (self.parseOverrideValue(palette_value, "command_palette")) |bindings| {
+                self.allocator.free(self.command_palette);
+                self.command_palette = bindings;
             }
         }
         if (keybinds_value.object.get("sidebar")) |sidebar_value| {
@@ -840,6 +853,12 @@ fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     });
 }
 
+fn cloneDefaultCommandPaletteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("CommandOrControl+P"),
+    });
+}
+
 fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+S"),
@@ -848,7 +867,7 @@ fn cloneDefaultSidebarKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultSidebarHiddenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Alt+B"),
+        try parseDefaultAccelerator("Ctrl+Shift+S"),
     });
 }
 
@@ -1277,27 +1296,12 @@ test "array parsing deduplicates repeated bindings" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"refresh": ["F5", "f5"]}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            var bindings = std.json.Array.init(std.testing.allocator);
-            errdefer bindings.deinit();
-            try bindings.append(.{ .string = "F5" });
-            try bindings.append(.{ .string = "f5" });
-
-            try keybinds.put("refresh", .{ .array = bindings });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.refresh.len);
     try std.testing.expectEqual(sdl.Keycode.f5, config.refresh[0].key);
@@ -1307,22 +1311,12 @@ test "open keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"open": "Ctrl+Shift+O"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("open", .{ .string = "Ctrl+Shift+O" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.open_default.len);
     try std.testing.expect(config.open_default[0].ctrl);
@@ -1334,22 +1328,12 @@ test "browser keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"browser": "Alt+Shift+B"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("browser", .{ .string = "Alt+Shift+B" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_browser.len);
     try std.testing.expect(config.toggle_browser[0].alt);
@@ -1372,31 +1356,12 @@ test "workspace select override accepts ordered accelerator array" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"workspace": {"select": ["Ctrl+1", "Ctrl+2"]}}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            var workspace = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer workspace.deinit();
-
-            var bindings = std.json.Array.init(std.testing.allocator);
-            errdefer bindings.deinit();
-            try bindings.append(.{ .string = "Ctrl+1" });
-            try bindings.append(.{ .string = "Ctrl+2" });
-
-            try workspace.put("select", .{ .array = bindings });
-            try keybinds.put("workspace", .{ .object = workspace });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 2), config.workspace_select.len);
     try std.testing.expect(config.workspace_select[0].ctrl);
@@ -1409,22 +1374,12 @@ test "new thread keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"new_thread": "Alt+Shift+T"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("new_thread", .{ .string = "Alt+Shift+T" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.new_thread.len);
     try std.testing.expect(config.new_thread[0].alt);
@@ -1436,22 +1391,12 @@ test "sidebar keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"sidebar": "Ctrl+Shift+M"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("sidebar", .{ .string = "Ctrl+Shift+M" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar.len);
     try std.testing.expect(config.toggle_sidebar[0].ctrl);
@@ -1618,16 +1563,17 @@ test "default sidebar keybind uses primary plus s" {
     try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar[0].key);
 }
 
-test "default hidden sidebar keybind uses alt plus b" {
+test "default hidden sidebar keybind uses ctrl shift plus s" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_sidebar_hidden.len);
-    try std.testing.expect(config.toggle_sidebar_hidden[0].alt);
-    try std.testing.expect(!config.toggle_sidebar_hidden[0].ctrl);
+    try std.testing.expect(!config.toggle_sidebar_hidden[0].alt);
+    try std.testing.expect(config.toggle_sidebar_hidden[0].ctrl);
     try std.testing.expect(!config.toggle_sidebar_hidden[0].meta);
     try std.testing.expect(!config.toggle_sidebar_hidden[0].primary);
-    try std.testing.expectEqual(sdl.Keycode.b, config.toggle_sidebar_hidden[0].key);
+    try std.testing.expect(config.toggle_sidebar_hidden[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.s, config.toggle_sidebar_hidden[0].key);
 }
 
 test "default chat scroll keybinds use arrows and paging keys" {
@@ -1648,22 +1594,12 @@ test "chat page down keybind override accepts a single accelerator" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"chat_page_down": "Shift+J"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("chat_page_down", .{ .string = "Shift+J" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.chat_page_down.len);
     try std.testing.expect(config.chat_page_down[0].shift);
@@ -1674,29 +1610,17 @@ test "terminal nested keybind overrides accept workspace actions" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"terminal": {
+        \\  "toggle": "Alt+J",
+        \\  "new_tab": "Ctrl+Alt+T",
+        \\  "split_right": "Ctrl+Alt+L",
+        \\  "focus_right": "Alt+Shift+L"
+        \\}}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            var terminal = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer terminal.deinit();
-
-            try terminal.put("toggle", .{ .string = "Alt+J" });
-            try terminal.put("new_tab", .{ .string = "Ctrl+Alt+T" });
-            try terminal.put("split_right", .{ .string = "Ctrl+Alt+L" });
-            try terminal.put("focus_right", .{ .string = "Alt+Shift+L" });
-            try keybinds.put("terminal", .{ .object = terminal });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
     try std.testing.expect(config.toggle_terminal[0].alt);
@@ -1722,22 +1646,12 @@ test "legacy terminal keybind override still maps to terminal toggle" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    const root: std.json.Value = .{
-        .object = blk: {
-            var object = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer object.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"keybinds": {"terminal": "Ctrl+Alt+J"}}
+    , .{});
+    defer parsed.deinit();
 
-            var keybinds = std.json.ObjectMap.init(std.testing.allocator);
-            errdefer keybinds.deinit();
-
-            try keybinds.put("terminal", .{ .string = "Ctrl+Alt+J" });
-            try object.put("keybinds", .{ .object = keybinds });
-            break :blk object;
-        },
-    };
-    defer root.object.deinit();
-
-    config.applyOverrides(root);
+    config.applyOverrides(parsed.value);
 
     try std.testing.expectEqual(@as(usize, 1), config.toggle_terminal.len);
     try std.testing.expect(config.toggle_terminal[0].ctrl);
