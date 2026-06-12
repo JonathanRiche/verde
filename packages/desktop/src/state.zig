@@ -317,14 +317,88 @@ fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: us
     _ = std.unicode.utf8Decode(text[byte_offset..end]) catch {
         return .{ .byte_len = 1, .width = @max(font_size * 0.55, 1.0) };
     };
+    return .{ .byte_len = end - byte_offset, .width = paletteCachedGlyphAdvance(text, byte_offset, font_size) };
+}
 
-    var line_start: usize = byte_offset;
-    while (line_start > 0 and text[line_start - 1] != '\n') : (line_start -= 1) {}
-    const line = text[line_start..];
-    const before = text_measure.textPrefixWidth(.ui, line, font_size, byte_offset - line_start);
-    const through = text_measure.textPrefixWidth(.ui, line, font_size, end - line_start);
-    const w = through - before;
-    return .{ .byte_len = end - byte_offset, .width = @max(w, 0.0) };
+// Palette's text layout asks for one glyph advance at a time and walks whole
+// buffers several times per frame (runs, content height, caret, selection).
+// Measuring each glyph as a line-prefix difference re-shapes the prefix via
+// SDL_ttf on every call — O(line²) per walk, which visibly stalled the
+// composer beyond a few lines and froze the app on large pastes. Instead,
+// shape each distinct text once (one pass per line) into a per-glyph advance
+// table and serve lookups O(1). A few slots cover the concurrent shapes the
+// layout uses per frame: the full buffer plus caret/selection line prefixes.
+const PALETTE_ADVANCE_CACHE_SLOTS = 6;
+
+const PaletteAdvanceCacheEntry = struct {
+    // Identity of the live slice this entry was built from; mid-walk lookups
+    // trust it without re-comparing content (single-threaded, edits happen
+    // between walks). Content equality is re-checked whenever a walk restarts.
+    ptr: usize = 0,
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    advances: std.ArrayListUnmanaged(f32) = .empty,
+    font_size: f32 = 0.0,
+    last_offset: usize = std.math.maxInt(usize),
+    stamp: u64 = 0,
+};
+
+var palette_advance_cache: [PALETTE_ADVANCE_CACHE_SLOTS]PaletteAdvanceCacheEntry =
+    .{PaletteAdvanceCacheEntry{}} ** PALETTE_ADVANCE_CACHE_SLOTS;
+var palette_advance_cache_stamp: u64 = 0;
+
+fn paletteCachedGlyphAdvance(text: []const u8, byte_offset: usize, font_size: f32) f32 {
+    palette_advance_cache_stamp += 1;
+    var oldest: *PaletteAdvanceCacheEntry = &palette_advance_cache[0];
+    for (&palette_advance_cache) |*entry| {
+        if (entry.stamp < oldest.stamp) oldest = entry;
+        if (entry.font_size != font_size) continue;
+        if (entry.ptr != @intFromPtr(text.ptr) or entry.text.items.len != text.len) continue;
+        // A walk restarted (offset went backward): the buffer may have been
+        // edited in place since this entry was built, so re-verify content.
+        const restarted = byte_offset <= entry.last_offset;
+        if (restarted and !std.mem.eql(u8, entry.text.items, text)) continue;
+        entry.last_offset = byte_offset;
+        entry.stamp = palette_advance_cache_stamp;
+        return entry.advances.items[byte_offset];
+    }
+
+    rebuildPaletteAdvanceEntry(oldest, text, font_size) catch {
+        // Allocation failure: fall back to a single uncached prefix pair.
+        var line_start: usize = byte_offset;
+        while (line_start > 0 and text[line_start - 1] != '\n') : (line_start -= 1) {}
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[byte_offset]) catch 1;
+        const end = @min(byte_offset + seq_len, text.len);
+        const line = text[line_start..];
+        const before = text_measure.textPrefixWidth(.ui, line, font_size, byte_offset - line_start);
+        const through = text_measure.textPrefixWidth(.ui, line, font_size, end - line_start);
+        return @max(through - before, 0.0);
+    };
+    oldest.last_offset = byte_offset;
+    oldest.stamp = palette_advance_cache_stamp;
+    return oldest.advances.items[byte_offset];
+}
+
+fn rebuildPaletteAdvanceEntry(entry: *PaletteAdvanceCacheEntry, text: []const u8, font_size: f32) !void {
+    const cache_alloc = std.heap.page_allocator;
+    try entry.text.resize(cache_alloc, text.len);
+    @memcpy(entry.text.items, text);
+    try entry.advances.resize(cache_alloc, text.len);
+    @memset(entry.advances.items, 0.0);
+    entry.ptr = @intFromPtr(text.ptr);
+    entry.font_size = font_size;
+
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i == text.len or text[i] == '\n') {
+            const line = text[line_start..i];
+            if (line.len > 0) {
+                text_measure.textGlyphAdvances(.ui, line, font_size, entry.advances.items[line_start..i]);
+            }
+            // Newline bytes keep a 0 advance, matching the layout contract.
+            line_start = i + 1;
+        }
+    }
 }
 
 fn paletteEstimatedFontMetrics(font_size: f32) palette.FontMetrics {
@@ -2920,6 +2994,15 @@ pub const AppState = struct {
     last_dirty_at_ms: i64,
     last_interaction_at_ms: i64,
     pending_send_count: usize,
+    /// Set by the sidebar render pass whenever it draws a pulsing status pip
+    /// this frame; cleared at the top of renderRoot. The main loop reads the
+    /// previous frame's value to keep a ~30fps animation tick going (the loop
+    /// otherwise sleeps and the pulse would step at the 1Hz label cadence).
+    sidebar_pulse_animating: bool,
+    /// Monotonic ms timestamp of the last visible terminal output, driving a
+    /// short fast-poll burst so TUI redraws aren't capped at the idle wake
+    /// cadence (terminal output is pull-only; there is no fd to wake on).
+    last_terminal_output_ms: i64,
 
     pub const InitOptions = struct {
         gl_texture_uploads_enabled: bool = true,
@@ -3115,6 +3198,8 @@ pub const AppState = struct {
             .last_dirty_at_ms = 0,
             .last_interaction_at_ms = 0,
             .pending_send_count = 0,
+            .sidebar_pulse_animating = false,
+            .last_terminal_output_ms = 0,
         };
         state.palette_composer.setCallbacks(.{});
 
@@ -6859,6 +6944,23 @@ pub const AppState = struct {
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
+    // Visible terminal output within this window keeps the main loop polling
+    // at display rate. Long enough to bridge frame-to-frame gaps of a TUI
+    // redrawing continuously; short enough that one stray prompt repaint
+    // doesn't keep the loop hot.
+    const TERMINAL_OUTPUT_BURST_WINDOW_MS: i64 = 250;
+
+    fn monotonicMs() i64 {
+        return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
+    }
+
+    /// True while a visible terminal recently produced output; the main loop
+    /// uses this to shorten its event wait so the next chunk renders promptly.
+    pub fn terminalOutputBurstActive(self: *const AppState) bool {
+        if (self.last_terminal_output_ms == 0) return false;
+        return monotonicMs() - self.last_terminal_output_ms < TERMINAL_OUTPUT_BURST_WINDOW_MS;
+    }
+
     pub fn pollTerminals(self: *AppState) bool {
         var visible_changed = false;
         for (self.projects.items, 0..) |*project, project_index| {
@@ -6916,6 +7018,7 @@ pub const AppState = struct {
             }
             self.pollManagedProcesses(project_index);
         }
+        if (visible_changed) self.last_terminal_output_ms = monotonicMs();
         return visible_changed;
     }
 

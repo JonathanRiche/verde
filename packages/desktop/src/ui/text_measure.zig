@@ -83,6 +83,33 @@ fn fallbackTextPrefixWidth(role: palette.FontRole, font_size: f32, text: []const
     return textWidth(role, font_size, text[0..@min(end, text.len)]);
 }
 
+/// Fills `advances` (len == text.len) with the advance width of each glyph,
+/// indexed by the glyph's starting byte, in a single shaping pass. `text`
+/// must be a single line (no newlines). Use this for text-input layout where
+/// every glyph is needed; per-glyph textPrefixWidth calls re-shape the whole
+/// prefix each time and are O(line²).
+pub fn textGlyphAdvances(role: palette.FontRole, text: []const u8, font_size: f32, advances: []f32) void {
+    std.debug.assert(advances.len == text.len);
+    if (text.len == 0) return;
+    if (gpu_renderer) |renderer| {
+        if (renderer.measureTextGlyphAdvances(text, font_size, role, advances)) |_| {
+            return;
+        } else |_| {}
+    }
+    estimatedGlyphAdvances(font_size * GPU_TEXT_FONT_SCALE, text, advances);
+}
+
+fn estimatedGlyphAdvances(font_size: f32, text: []const u8, advances: []f32) void {
+    @memset(advances, 0.0);
+    var index: usize = 0;
+    while (index < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        const end = @min(index + seq_len, text.len);
+        advances[index] = estimatedTextWidth(font_size, text[index..end]);
+        index = end;
+    }
+}
+
 pub fn codepointWidth(role: palette.FontRole, cp: u21, font_size: f32) f32 {
     var buf: [4]u8 = undefined;
     const len = std.unicode.utf8Encode(cp, &buf) catch return @max(font_size * 0.55, 1.0);

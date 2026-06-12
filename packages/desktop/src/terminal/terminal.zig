@@ -2477,7 +2477,9 @@ const UnixSession = struct {
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
-        log.info(
+        // Empty tails dominate (the main loop polls at up to display rate
+        // during output bursts); only log polls that actually moved data.
+        if (text.len > 0) log.info(
             "daemon-tail session={s} offset={d}->{d} text_len={d} shell_pid={?d} pgrp={?d} suppress={} active_screen={s}",
             .{
                 session_id,
