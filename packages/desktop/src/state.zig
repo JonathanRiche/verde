@@ -117,6 +117,9 @@ pub const PaletteModalAction = enum {
     settings_close,
     settings_save,
     settings_control,
+    command_palette_input,
+    command_palette_row,
+    command_palette_action_row,
 };
 
 pub const SettingsOpenAction = enum {
@@ -189,6 +192,7 @@ pub const PaletteModalTextFocus = enum {
     project_rename,
     thread_import,
     project_import,
+    command_palette,
 };
 
 const PALETTE_COMPOSER_FONT_SIZE: f32 = 22.0;
@@ -2909,6 +2913,23 @@ pub const AppState = struct {
     /// Row index in `thread_import_threads` under the cursor (import modal list).
     thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
+    /// Command palette (Ctrl+P overlay). `ui/command_palette.zig` owns result
+    /// building and rendering; these are the cross-cutting bits the input
+    /// router and keybind dispatch need.
+    command_palette_open: bool,
+    /// Restrict results to one workspace's threads (sidebar "History" entry
+    /// point). `null` = global scope: commands + threads across workspaces.
+    command_palette_scope_project: ?usize,
+    command_palette_query_storage: [256:0]u8,
+    command_palette_cursor: usize,
+    /// Selected row in the palette's flattened selectable result list.
+    command_palette_selected: usize,
+    /// Tab-opened secondary action submenu for the selected result row.
+    command_palette_action_menu_open: bool,
+    command_palette_action_selected: usize,
+    /// Read-only view of the loaded keybind config so the palette can show
+    /// live accelerator hints; set by main after keybinds load/reload.
+    keyboard_config: ?*const keybinds.NativeKeyboardConfig,
     show_project_creator: bool,
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
@@ -3122,6 +3143,14 @@ pub const AppState = struct {
             .thread_import_selected_index = null,
             .thread_import_hover_index = null,
             .thread_import_threads = .empty,
+            .command_palette_open = false,
+            .command_palette_scope_project = null,
+            .command_palette_query_storage = std.mem.zeroes([256:0]u8),
+            .command_palette_cursor = 0,
+            .command_palette_selected = 0,
+            .command_palette_action_menu_open = false,
+            .command_palette_action_selected = 0,
+            .keyboard_config = null,
             .show_project_creator = false,
             .show_settings_modal = false,
             .settings_draft = .{},
@@ -4179,6 +4208,79 @@ pub const AppState = struct {
 
     pub fn threadImportThreadId(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.import_thread_id_storage[0..], 0);
+    }
+
+    /// Opens the command palette overlay. `scope_project` restricts results to
+    /// one workspace's thread history (the sidebar "History" entry point);
+    /// `null` is the global Ctrl+P scope (commands + threads everywhere).
+    pub fn openCommandPalette(self: *AppState, scope_project: ?usize) void {
+        self.command_palette_open = true;
+        self.command_palette_scope_project = scope_project;
+        self.command_palette_query_storage[0] = 0;
+        self.command_palette_cursor = 0;
+        self.command_palette_selected = 0;
+        self.command_palette_action_menu_open = false;
+        self.command_palette_action_selected = 0;
+        self.modal_text_selection_anchor = null;
+        self.palette_modal_text_focus = .command_palette;
+        self.closeSidebarContextMenu();
+        self.workspace_header_open_menu_open = false;
+        self.blurPaletteComposer();
+        self.noteInteraction();
+        self.markDirty();
+    }
+
+    pub fn closeCommandPalette(self: *AppState) void {
+        if (!self.command_palette_open) return;
+        self.command_palette_open = false;
+        self.command_palette_action_menu_open = false;
+        if (self.palette_modal_text_focus == .command_palette) self.palette_modal_text_focus = .none;
+        self.modal_text_selection_anchor = null;
+        self.markDirty();
+    }
+
+    pub fn commandPaletteQuery(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.command_palette_query_storage[0..], 0);
+    }
+
+    pub fn commandPaletteQueryBuffer(self: *AppState) [:0]u8 {
+        return self.command_palette_query_storage[0 .. self.command_palette_query_storage.len - 1 :0];
+    }
+
+    /// Opens a thread in a brand-new chat pane split off the focused pane,
+    /// preserving the existing layout. This is the command palette's
+    /// Ctrl+Enter / "Open in New Pane" path; plain Enter goes through
+    /// `selectThreadForProject` (reuse a visible chat pane) instead.
+    pub fn openThreadInWorkspaceSplit(self: *AppState, project_index: usize, thread_index: usize) void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (thread_index >= project.threads.items.len) return;
+        self.selected_project_index = project_index;
+        var layout = &project.workspace_layout;
+        const new_pane_id = layout.createChatPane(self.allocator, thread_index) catch |err| {
+            log.err("failed to create chat pane for palette split: {s}", .{@errorName(err)});
+            return;
+        };
+        const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId();
+        if (target_pane_id) |target_id| {
+            layout.splitPaneWithLeaf(self.allocator, target_id, new_pane_id, .vertical, true) catch |err| {
+                log.err("failed to split workspace pane for palette: {s}", .{@errorName(err)});
+                return;
+            };
+        } else {
+            layout.replaceRootWithLeaf(self.allocator, new_pane_id) catch |err| {
+                log.err("failed to seed workspace pane for palette: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+        layout.focused_pane_id = new_pane_id;
+        layout.maximized_pane_id = null;
+        project.selected_thread_index = thread_index;
+        self.terminal_focused = false;
+        self.requestComposerFocus();
+        self.syncRenameBuffer();
+        self.requestTranscriptScrollToBottom();
+        self.markDirty();
     }
 
     pub fn threadImportNotice(self: *const AppState) []const u8 {

@@ -9,7 +9,6 @@ const runtime = @import("runtime.zig");
 const utils = @import("../utils.zig");
 const profiler = @import("../profiler.zig");
 const native_state = @import("../state.zig");
-const workspace_panes = @import("workspace_panes.zig");
 const Provider = native_state.Provider;
 
 const log = std.log.scoped(.native_ui_sidebar);
@@ -54,9 +53,10 @@ const SidebarHitKind = enum {
     new_thread,
     workspace_row,
     workspace_avatar,
-    thread_row,
     open_pane,
-    toggle_threads,
+    /// Per-workspace "History · N" row; opens the command palette scoped to
+    /// that workspace's saved threads.
+    history,
     settings,
 };
 
@@ -95,18 +95,6 @@ var sidebar_menu_row_enabled: [16]bool = undefined;
 var sidebar_menu_row_labels: [16][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
 
-const ThreadDragState = struct {
-    pending: bool = false,
-    active: bool = false,
-    project_index: usize = 0,
-    thread_index: usize = 0,
-    start_x: f32 = 0.0,
-    start_y: f32 = 0.0,
-    x: f32 = 0.0,
-    y: f32 = 0.0,
-};
-
-var thread_drag: ThreadDragState = .{};
 var settings_hovered: bool = false;
 
 const WorkspaceDragState = struct {
@@ -159,10 +147,8 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
         state.setSidebarHoverRevealed(reveal);
     }
 
-    updateThreadDrag(state, x, y);
     updateWorkspaceDrag(state, x, y);
 
-    var new_thread_hover: ?native_state.SidebarThreadHover = null;
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
     var new_settings_hover = false;
@@ -175,11 +161,6 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
             const hit = palette_hits[index];
             if (!rectContainsPoint(hit.rect, x, y)) continue;
             switch (hit.kind) {
-                .thread_row => {
-                    if (new_thread_hover == null) {
-                        new_thread_hover = .{ .project_index = hit.project_index, .thread_index = hit.thread_index };
-                    }
-                },
                 .workspace_row => {
                     if (new_project_hover == null) new_project_hover = hit.project_index;
                 },
@@ -192,29 +173,20 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
         }
     }
 
-    const thread_changed = !threadHoverEq(state.sidebar_thread_hover, new_thread_hover);
     const project_changed = state.sidebar_project_hover != new_project_hover;
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
     const settings_changed = settings_hovered != new_settings_hover;
     settings_hovered = new_settings_hover;
-    if (!thread_changed and !project_changed and !new_thread_changed and !settings_changed) return;
+    if (!project_changed and !new_thread_changed and !settings_changed) return;
 
-    state.sidebar_thread_hover = new_thread_hover;
     state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
     state.markDirty();
 }
 
-fn threadHoverEq(a: ?native_state.SidebarThreadHover, b: ?native_state.SidebarThreadHover) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.?.project_index == b.?.project_index and a.?.thread_index == b.?.thread_index;
-}
-
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) {
         if (workspace_drag.pending or workspace_drag.active) return finishWorkspaceDrag(state, x, y);
-        if (thread_drag.pending or thread_drag.active) return finishThreadDrag(state, x, y);
         return rectContainsPoint(palette_sidebar_rect, x, y);
     }
     if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
@@ -262,21 +234,6 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     _ = sdl.captureMouse(true);
                 }
             },
-            .thread_row => {
-                if (hit.project_index < state.projects.items.len and hit.thread_index < state.projects.items[hit.project_index].threads.items.len) {
-                    workspace_panes.clearThreadDropTarget();
-                    thread_drag = .{
-                        .pending = true,
-                        .project_index = hit.project_index,
-                        .thread_index = hit.thread_index,
-                        .start_x = x,
-                        .start_y = y,
-                        .x = x,
-                        .y = y,
-                    };
-                    _ = sdl.captureMouse(true);
-                }
-            },
             .open_pane => {
                 state.focusWorkspaceOpenPane(hit.project_index, @intCast(hit.thread_index));
             },
@@ -286,10 +243,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.markDirty();
                 }
             },
-            .toggle_threads => {
+            .history => {
                 if (hit.project_index < state.projects.items.len) {
-                    state.projects.items[hit.project_index].thread_list_expanded = !state.projects.items[hit.project_index].thread_list_expanded;
-                    state.markDirty();
+                    state.openCommandPalette(hit.project_index);
                 }
             },
             .settings => {
@@ -348,38 +304,18 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.markDirty();
                 return true;
             },
-            .thread_row => {
-                state.workspace_header_open_menu_open = false;
-                state.sidebar_context_menu_anchor_x = x;
-                state.sidebar_context_menu_anchor_y = y;
-                state.sidebar_context_menu_project_index = hit.project_index;
-                state.sidebar_context_menu_thread_index = hit.thread_index;
-                state.sidebar_context_menu_kind = .thread;
-                state.sidebar_context_menu_open = true;
-                state.blurPaletteComposer();
-                state.noteInteraction();
-                state.markDirty();
-                return true;
-            },
             else => {},
         }
     }
     return false;
 }
 
-pub fn renderWorkspaceDragPreview(state: *runtime.AppState) void {
-    if (!thread_drag.active) return;
-    workspace_panes.renderThreadDropPreview(state, thread_drag.x, thread_drag.y);
-}
-
 pub fn renderFloatingDragPreview(state: *runtime.AppState) void {
-    renderThreadDragPreview(state);
     renderWorkspaceDragOverlay(state);
 }
 
 pub fn hasActiveThreadDrag() bool {
-    return thread_drag.pending or thread_drag.active or
-        workspace_drag.pending or workspace_drag.active;
+    return workspace_drag.pending or workspace_drag.active;
 }
 
 pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
@@ -387,9 +323,7 @@ pub fn finishThreadDragIfMouseReleased(state: *runtime.AppState, x: f32, y: f32,
         if (buttons.left != 0) return false;
         return finishWorkspaceDrag(state, x, y);
     }
-    if (!thread_drag.pending and !thread_drag.active) return false;
-    if (buttons.left != 0) return false;
-    return finishThreadDrag(state, x, y);
+    return false;
 }
 
 fn updateWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) void {
@@ -506,79 +440,6 @@ fn renderWorkspaceDragOverlay(state: *runtime.AppState) void {
         .w = rect.w - theme.scaledUi(20.0),
         .h = font * 1.25,
     }, project.label, paletteColor(theme.COLOR_WHITE), font, rect);
-}
-
-fn updateThreadDrag(state: *runtime.AppState, x: f32, y: f32) void {
-    if (!thread_drag.pending and !thread_drag.active) return;
-    thread_drag.x = x;
-    thread_drag.y = y;
-    if (thread_drag.pending) {
-        const dx = x - thread_drag.start_x;
-        const dy = y - thread_drag.start_y;
-        const threshold = theme.scaledUi(THREAD_DRAG_THRESHOLD_CSS);
-        if (dx * dx + dy * dy >= threshold * threshold) {
-            thread_drag.pending = false;
-            thread_drag.active = true;
-        }
-    }
-    state.markDirty();
-}
-
-fn finishThreadDrag(state: *runtime.AppState, x: f32, y: f32) bool {
-    const drag = thread_drag;
-    thread_drag = .{};
-    _ = sdl.captureMouse(false);
-    if (!drag.active) {
-        workspace_panes.clearThreadDropTarget();
-        if (drag.project_index < state.projects.items.len and drag.thread_index < state.projects.items[drag.project_index].threads.items.len) {
-            state.noteInteraction();
-            state.selectThreadForProject(drag.project_index, drag.thread_index);
-        }
-        return true;
-    }
-
-    if (drag.project_index != state.selected_project_index) {
-        state.selected_project_index = drag.project_index;
-        state.ensureCurrentProjectWorkspace();
-        state.syncRenameBuffer();
-    }
-    if (workspace_panes.dropThreadAt(state, drag.thread_index, x, y)) {
-        state.setSidebarNotice("");
-    } else {
-        workspace_panes.clearThreadDropTarget();
-        state.setSidebarNotice("Drop on a pane edge to open that thread.");
-    }
-    return true;
-}
-
-fn renderThreadDragPreview(state: *runtime.AppState) void {
-    if (!thread_drag.active) return;
-    if (thread_drag.project_index >= state.projects.items.len) return;
-    const project = &state.projects.items[thread_drag.project_index];
-    if (thread_drag.thread_index >= project.threads.items.len) return;
-    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DRAG_FLOATING_Z);
-    defer state.palette_overlay_batch.restoreZIndex(previous_z);
-    const thread = &project.threads.items[thread_drag.thread_index];
-    const w = theme.scaledUi(220.0);
-    const h = theme.scaledUi(38.0);
-    const rect: palette.Rect = .{
-        .x = thread_drag.x + theme.scaledUi(12.0),
-        .y = thread_drag.y + theme.scaledUi(10.0),
-        .w = w,
-        .h = h,
-    };
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 232)), theme.scaledUi(8.0));
-    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 180)), theme.scaledUi(8.0), theme.scaledUi(1.0));
-    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(10.0), rect.y + rect.h * 0.5, rect);
-    var title_buf = std.mem.zeroes([64:0]u8);
-    const row_label = truncatedThreadTitle(&title_buf, thread.title, 24);
-    const font = theme.scaledUi(13.5);
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(42.0),
-        .y = rect.y + (rect.h - font * 1.25) * 0.5,
-        .w = rect.w - theme.scaledUi(52.0),
-        .h = font * 1.25,
-    }, row_label, paletteColor(theme.COLOR_WHITE), font, rect);
 }
 
 fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) bool {
@@ -824,19 +685,6 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
         if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
-        // Per-pane status pips in the "OPEN" list below supersede the old
-        // aggregate attention dot, but keep a single dot on collapsed rows where
-        // the pane list is hidden so attention is still visible at a glance.
-        if (project_visible and collapsed and state.projectSurfaceAttention(project_index)) {
-            const dot = theme.scaledUi(7.0);
-            queuePaletteRoundedRect(state, .{
-                .x = row_rect.x + row_rect.w - theme.scaledUi(14.0),
-                .y = cy - dot * 0.5,
-                .w = dot,
-                .h = dot,
-            }, paletteColor(theme.COLOR_YELLOW), dot * 0.5);
-        }
-
         const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
         const new_hovered = state.sidebar_new_thread_hover == project_index;
         if (project_visible) {
@@ -850,45 +698,9 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
 
         if (!collapsed) {
             y = renderOpenPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
-
-            var saved_buf: [32]u8 = undefined;
-            const saved = std.fmt.bufPrint(&saved_buf, "{d} saved chats", .{project.committedThreadCountCached(state.allocator)}) catch "saved chats";
-            const saved_rect: palette.Rect = .{ .x = x + theme.scaledUi(24.0), .y = y, .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(22.0) };
-            if (rowVisible(saved_rect, list_clip)) queuePaletteText(state, saved_rect, saved, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(14.0), clip);
-            y += theme.scaledUi(24.0);
-
-            const sorted_indices = project.sortedCommittedThreadIndices(state.allocator);
-            const show_all = project.thread_list_expanded or sorted_indices.len <= runtime.SIDEBAR_VISIBLE_THREAD_LIMIT;
-            const visible_count = if (show_all) sorted_indices.len else @min(sorted_indices.len, runtime.SIDEBAR_VISIBLE_THREAD_LIMIT);
-            for (sorted_indices[0..visible_count]) |thread_index| {
-                if (thread_index >= project.threads.items.len) break;
-                const thread = &project.threads.items[thread_index];
-                const thread_rect: palette.Rect = .{
-                    .x = x + theme.scaledUi(24.0),
-                    .y = y,
-                    .w = rail_w - theme.scaledUi(42.0),
-                    .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
-                };
-                if (rowVisible(thread_rect, list_clip)) renderPaletteThreadRow(state, project_index, thread_index, thread, thread_rect, clip);
-                y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
-            }
-            if (sorted_indices.len > runtime.SIDEBAR_VISIBLE_THREAD_LIMIT) {
-                const show_rect: palette.Rect = .{ .x = x + theme.scaledUi(12.0), .y = y + theme.scaledUi(2.0), .w = rail_w - theme.scaledUi(24.0), .h = theme.scaledUi(32.0) };
-                if (rowVisible(show_rect, list_clip)) {
-                    queuePaletteRoundedRect(state, show_rect, paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(8.0));
-                    const label = if (project.thread_list_expanded) "Show less" else "Show more";
-                    const show_pad_x = theme.scaledUi(14.0);
-                    const font_size = theme.scaledUi(14.0);
-                    queuePaletteText(state, .{
-                        .x = show_rect.x + show_pad_x,
-                        .y = show_rect.y + (show_rect.h - font_size * 1.25) * 0.5,
-                        .w = show_rect.w - show_pad_x * 2.0,
-                        .h = font_size * 1.25,
-                    }, label, paletteColor(theme.COLOR_WHITE), font_size, show_rect);
-                    addPaletteHit(show_rect, .toggle_threads, project_index, 0);
-                }
-                y += theme.scaledUi(40.0);
-            }
+            y = renderHistoryRow(state, project_index, project, x, rail_w, list_clip, clip, y);
+        } else {
+            y = renderAttentionPanesSection(state, project_index, project, x, rail_w, list_clip, clip, y);
         }
         y += theme.scaledUi(8.0);
     }
@@ -1321,6 +1133,105 @@ fn renderOpenPaneRow(
     }
 }
 
+/// Quiet per-workspace "History · N" trailing row. The saved-thread list
+/// itself lives in the command palette (this row opens it scoped to the
+/// workspace); the rail only tracks live panes.
+fn renderHistoryRow(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *native_state.Project,
+    x: f32,
+    rail_w: f32,
+    list_clip: palette.Rect,
+    clip: palette.Rect,
+    y_in: f32,
+) f32 {
+    var y = y_in;
+    const row_rect: palette.Rect = .{
+        .x = x + theme.scaledUi(24.0),
+        .y = y,
+        .w = rail_w - theme.scaledUi(42.0),
+        .h = theme.scaledUi(28.0),
+    };
+    if (rowVisible(row_rect, list_clip)) {
+        const hovered = state.palette_mouse_in_workspace and rectContainsPoint(row_rect, state.palette_mouse_x, state.palette_mouse_y);
+        if (hovered) {
+            queuePaletteRoundedRect(state, snapRect(row_rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(7.0));
+        }
+        addPaletteHit(row_rect, .history, project_index, 0);
+        var label_buf: [40]u8 = undefined;
+        const count = project.committedThreadCountCached(state.allocator);
+        const label = std.fmt.bufPrint(&label_buf, "History · {d}", .{count}) catch "History";
+        const font_size = theme.scaledUi(12.5);
+        queuePaletteText(state, .{
+            .x = row_rect.x + theme.scaledUi(10.0),
+            .y = row_rect.y + (row_rect.h - font_size * 1.3) * 0.5,
+            .w = row_rect.w - theme.scaledUi(20.0),
+            .h = font_size * 1.3,
+        }, label, paletteColor(if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE), font_size, clip);
+    }
+    y += theme.scaledUi(30.0);
+    return y;
+}
+
+/// Collapsed workspaces hide quiet panes but punch attention panes through
+/// as compact rows, so the rail reads as a live status board: its height
+/// tracks activity, never history or pane count. Idle collapsed workspaces
+/// stay one header line tall.
+fn renderAttentionPanesSection(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    x: f32,
+    rail_w: f32,
+    list_clip: palette.Rect,
+    clip: palette.Rect,
+    y_in: f32,
+) f32 {
+    var y = y_in;
+    const layout = &project.workspace_layout;
+    for (layout.panes.items) |*pane| {
+        if (!paneNeedsAttention(state, project_index, project, pane)) continue;
+        const row_rect: palette.Rect = .{
+            .x = x + theme.scaledUi(24.0),
+            .y = y,
+            .w = rail_w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(SIDEBAR_THREAD_ROW_HEIGHT_CSS),
+        };
+        if (rowVisible(row_rect, list_clip)) renderOpenPaneRow(state, project_index, project, pane, row_rect, clip);
+        y += theme.scaledUi(SIDEBAR_THREAD_ROW_STEP_CSS);
+    }
+    return y;
+}
+
+/// True when a pane should punch through a collapsed workspace row: chat
+/// sends in flight, or terminal surfaces working/waiting/errored (or flagged
+/// for attention/unread by hooks). `done`/idle panes stay hidden so finished
+/// work stops occupying the rail once it has nothing new to report.
+fn paneNeedsAttention(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+) bool {
+    switch (pane.ref) {
+        .chat => |ref| {
+            if (ref.thread_index >= project.threads.items.len) return false;
+            return project.threads.items[ref.thread_index].isSendPendingForUi();
+        },
+        .terminal => |ref| {
+            const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
+            if (state.isFocusedTerminalSurface(project_index, ref.dock_id)) return false;
+            if (surface.attention or surface.unread_count > 0) return true;
+            return switch (surface.status) {
+                .working, .waiting, .@"error" => true,
+                .done, .idle => false,
+            };
+        },
+        .browser => return false,
+    }
+}
+
 /// Maps a terminal surface status (and chat running state) to a sidebar status
 /// pip color, or null when the pane needs no attention indicator.
 fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
@@ -1351,64 +1262,6 @@ fn queuePaletteGlobeIcon(state: *runtime.AppState, cx: f32, cy: f32, size: f32, 
     queuePaletteBorder(state, .{ .x = cx - r, .y = cy - r, .w = size, .h = size }, color, r, stroke);
     queuePaletteRect(state, .{ .x = cx - r, .y = cy - stroke * 0.5, .w = size, .h = stroke }, color);
     queuePaletteRect(state, .{ .x = cx - stroke * 0.5, .y = cy - r, .w = stroke, .h = size }, color);
-}
-
-fn renderPaletteThreadRow(state: *runtime.AppState, project_index: usize, thread_index: usize, thread: anytype, rect: palette.Rect, clip: palette.Rect) void {
-    const project = &state.projects.items[project_index];
-    const selected = state.selected_project_index == project_index and project.selected_thread_index == thread_index;
-    const hovered = if (state.sidebar_thread_hover) |h| h.project_index == project_index and h.thread_index == thread_index else false;
-    if (selected) {
-        const bg = if (hovered)
-            paletteColor(theme.lighten(theme.borderMuted(), 0.09))
-        else
-            paletteColor(theme.borderMuted());
-        queuePaletteRoundedRect(state, snapRect(rect), bg, theme.scaledUi(7.0));
-    } else if (hovered) {
-        queuePaletteRoundedRect(state, snapRect(rect), paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)), theme.scaledUi(7.0));
-    }
-    addPaletteHit(rect, .thread_row, project_index, thread_index);
-
-    const title_left_css = SIDEBAR_THREAD_ICON_LEADING_PAD_CSS + SIDEBAR_THREAD_PROVIDER_GLYPH_CSS + SIDEBAR_THREAD_ICON_TITLE_GAP_CSS;
-    const title_area_right_css = title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS + SIDEBAR_THREAD_TITLE_TIME_GAP_CSS;
-    queuePaletteProviderGlyph(state, thread.provider, rect.x + theme.scaledUi(SIDEBAR_THREAD_ICON_LEADING_PAD_CSS), rect.y + rect.h * 0.5, clip);
-    var time_buf: [24]u8 = undefined;
-    const relative_time = formatRelativeTime(&time_buf, thread.last_activity_at);
-    var title_buf = std.mem.zeroes([64:0]u8);
-    const title_chars: usize = @intFromFloat(@max((rect.w - theme.scaledUi(title_left_css + SIDEBAR_THREAD_TIME_COLUMN_CSS)) / theme.scaledUi(7.0), 8.0));
-    const running = thread.isSendPendingForUi();
-    const title = truncatedThreadTitle(&title_buf, thread.title, title_chars);
-    var tui_title_buf: [72]u8 = undefined;
-    const row_label = if (running)
-        "Working..."
-    else if (state.threadIsOpenInTui(project_index, thread_index))
-        std.fmt.bufPrint(&tui_title_buf, "TUI: {s}", .{title}) catch title
-    else
-        title;
-
-    const title_emphasis = selected or hovered;
-    const title_font = theme.scaledUi(13.5);
-    const title_line = title_font * 1.30;
-    const title_y = @round(rect.y + (rect.h - title_line) * 0.5);
-    const pulse: f32 = if (running) attentionPulse(state) else 0.0;
-    const mix_t = pulse * 0.35;
-    const running_color = [4]f32{
-        theme.COLOR_SECONDARY_GREEN[0] + (theme.COLOR_WHITE[0] - theme.COLOR_SECONDARY_GREEN[0]) * mix_t,
-        theme.COLOR_SECONDARY_GREEN[1] + (theme.COLOR_WHITE[1] - theme.COLOR_SECONDARY_GREEN[1]) * mix_t,
-        theme.COLOR_SECONDARY_GREEN[2] + (theme.COLOR_WHITE[2] - theme.COLOR_SECONDARY_GREEN[2]) * mix_t,
-        1.0,
-    };
-    queuePaletteText(state, .{
-        .x = rect.x + theme.scaledUi(title_left_css),
-        .y = title_y,
-        .w = rect.w - theme.scaledUi(title_area_right_css),
-        .h = title_line,
-    }, row_label, paletteColor(if (running) running_color else if (title_emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), title_font, clip);
-    queuePaletteText(state, .{
-        .x = rect.x + rect.w - theme.scaledUi(60.0),
-        .y = title_y,
-        .w = theme.scaledUi(58.0),
-        .h = title_line,
-    }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), title_font, clip);
 }
 
 fn rowVisible(row: palette.Rect, viewport: palette.Rect) bool {
@@ -1639,7 +1492,7 @@ fn unixTimestampSeconds() i64 {
 }
 
 /// Formats a relative timestamp for sidebar metadata.
-fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
+pub fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     if (timestamp <= 0) return "—";
     const now = unixTimestampSeconds();
     const elapsed = @max(0, now - timestamp);
@@ -1656,7 +1509,7 @@ fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}d", .{days}) catch "…";
 }
 
-fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
+pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
     const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
     queuePaletteProviderGlyphInRect(state, provider, .{
         .x = x,

@@ -10,6 +10,7 @@ const workspace_panes = @import("workspace_panes.zig");
 const runtime = @import("runtime.zig");
 const debug_window = @import("debug.zig");
 const settings_modal = @import("settings_modal.zig");
+const command_palette = @import("command_palette.zig");
 const profiler = @import("../profiler.zig");
 
 const RootLayout = struct {
@@ -46,6 +47,17 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
     settings_modal.registerHits(state, width, height, queueModalHit);
+    command_palette.registerHits(state, width, height, queueModalHit);
+}
+
+/// Updates command-palette row hover using hits from `refreshPaletteModalHits`.
+pub fn updateCommandPaletteHover(state: *runtime.AppState, x: f32, y: f32) void {
+    command_palette.updateHover(state, x, y);
+}
+
+/// Routes wheel input to the command palette result list when it is open.
+pub fn handleCommandPaletteWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y: f32, wheel_y: f32) bool {
+    return command_palette.handleWheel(state, width, height, x, y, wheel_y);
 }
 
 /// Updates import-modal thread list hover using hits from `refreshPaletteModalHits`.
@@ -96,7 +108,6 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
         sidebar.renderPalette(state, root_layout.sidebar);
         workspace_panes.renderAt(state, root_layout.workspace);
     }
-    sidebar.renderWorkspaceDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
@@ -106,6 +117,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     settings_modal.render(state, width, height);
+    command_palette.render(state, width, height);
     debug_window.render(state, width, height);
 }
 
@@ -299,6 +311,7 @@ fn focusedCursorReadOnly(state: *runtime.AppState) usize {
         .project_rename => state.project_rename_cursor,
         .thread_import => state.thread_import_cursor,
         .project_import => state.project_import_cursor,
+        .command_palette => state.command_palette_cursor,
         .none => 0,
     };
 }
@@ -344,6 +357,7 @@ fn focusedValue(state: *runtime.AppState) []const u8 {
         .project_rename => state.renameInputPublic(),
         .thread_import => state.threadImportThreadId(),
         .project_import => state.importDirectoryDraft(),
+        .command_palette => state.commandPaletteQuery(),
         .none => &[_]u8{},
     };
 }
@@ -464,6 +478,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
             .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
+            .command_palette_input => focusModalInput(state, .command_palette, hit.rect, x, clicks),
+            .command_palette_row => command_palette.activateRow(state, hit.index, false),
+            .command_palette_action_row => command_palette.runActionRow(state, hit.index),
         }
         return true;
     }
@@ -522,12 +539,20 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
         .project_rename => insertIntoZBuffer(state.renameBuffer(), &state.project_rename_cursor, text),
         .thread_import => insertIntoZBuffer(state.threadImportThreadIdBuffer(), &state.thread_import_cursor, text),
         .project_import => insertIntoZBuffer(state.importPathBuffer(), &state.project_import_cursor, text),
+        .command_palette => blk: {
+            const inserted = insertIntoZBuffer(state.commandPaletteQueryBuffer(), &state.command_palette_cursor, text);
+            state.markDirty();
+            break :blk inserted;
+        },
         .none => false,
     };
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator and !state.show_settings_modal) return false;
+    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator and !state.show_settings_modal and !state.command_palette_open) return false;
+    // Palette-owned navigation/activation keys; editing keys fall through to
+    // the shared modal text path below.
+    if (state.command_palette_open and command_palette.handleKeyDown(state, event)) return true;
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {
@@ -625,6 +650,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
 }
 
 fn dismissTopModal(state: *runtime.AppState) void {
+    if (state.command_palette_open) {
+        state.closeCommandPalette();
+        return;
+    }
     if (state.modal_image_path != null) {
         state.closeImageModal();
     } else if (state.transcriptSelectionBuffer() != null) {
@@ -696,6 +725,7 @@ fn focusedCursor(state: *runtime.AppState) ?*usize {
         .project_rename => &state.project_rename_cursor,
         .thread_import => &state.thread_import_cursor,
         .project_import => &state.project_import_cursor,
+        .command_palette => &state.command_palette_cursor,
         .none => null,
     };
 }
@@ -705,6 +735,7 @@ fn focusedBuffer(state: *runtime.AppState) ?[:0]u8 {
         .project_rename => state.renameBuffer(),
         .thread_import => state.threadImportThreadIdBuffer(),
         .project_import => state.importPathBuffer(),
+        .command_palette => state.commandPaletteQueryBuffer(),
         .none => null,
     };
 }
@@ -714,6 +745,7 @@ fn focusedTextLen(state: *runtime.AppState) usize {
         .project_rename => state.renameInputPublic().len,
         .thread_import => state.threadImportThreadId().len,
         .project_import => state.importDirectoryDraft().len,
+        .command_palette => state.commandPaletteQuery().len,
         .none => 0,
     };
 }

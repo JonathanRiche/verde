@@ -429,6 +429,9 @@ fn mainInner(init: std.process.Init) !void {
     defer if (live_server) |*server| server.deinit();
     var keyboard = try keybinds.NativeKeyboardConfig.load(allocator);
     defer keyboard.deinit();
+    // Reloads swap the config in place through this same pointer, so the
+    // palette's accelerator hints stay live across keybind refreshes.
+    state.keyboard_config = &keyboard;
 
     log.info("verde main loop starting", .{});
     defer log.info("verde main loop exiting", .{});
@@ -1158,6 +1161,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            // The command palette must open from anywhere — including while
+            // the composer or a terminal owns focus — so it dispatches before
+            // the focus-dependent routing below.
+            if (action) |resolved_action| {
+                if (resolved_action == .command_palette) {
+                    handleKeyboardAction(state, keyboard, resolved_action);
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
                 if (selectWorkspaceBySidebarOrdinal(state, workspace_ordinal)) {
                     syncWindowTextInput(window, state);
@@ -1344,6 +1357,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
+            ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
@@ -1466,6 +1480,16 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             var input_fb_w: c_int = 0;
             var input_fb_h: c_int = 0;
             getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
+            if (ui_layout.handleCommandPaletteWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.y,
+            )) {
+                return true;
+            }
             if (ui_layout.handleSettingsModalWheel(
                 state,
                 @floatFromInt(input_fb_w),
@@ -1872,6 +1896,7 @@ fn handleKeyboardAction(
         .refresh => reloadApplication(state, keyboard),
         .open_default => state.runDefaultOpenAction(),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
+        .command_palette => state.openCommandPalette(null),
         .toggle_sidebar => state.toggleSidebarCollapsed(),
         .toggle_sidebar_hidden => state.toggleSidebarHidden(),
         .toggle_browser => state.toggleBrowser(),
@@ -2166,4 +2191,5 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
 
 test {
     _ = @import("providers/claude.zig");
+    _ = @import("ui/command_palette.zig");
 }
