@@ -134,7 +134,7 @@ Config supports UI and terminal font size, keybind overrides, and the default ac
     "open": "Alt+O",
     "new_thread": "CommandOrControl+T",
     "sidebar": "CommandOrControl+S",
-    "sidebar_hidden": "Alt+B",
+    "sidebar_hidden": "Ctrl+Shift+S",
     "browser": "Ctrl+B",
     "workspace": {
       "split_terminal_horizontal": "CommandOrControl+Shift+T",
