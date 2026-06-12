@@ -1463,6 +1463,19 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             syncWindowTextInput(window, state);
         },
         .mouse_wheel => {
+            var input_fb_w: c_int = 0;
+            var input_fb_h: c_int = 0;
+            getWindowSizeInPixels(window, &input_fb_w, &input_fb_h);
+            if (ui_layout.handleSettingsModalWheel(
+                state,
+                @floatFromInt(input_fb_w),
+                @floatFromInt(input_fb_h),
+                event.wheel.mouse_x,
+                event.wheel.mouse_y,
+                event.wheel.y,
+            )) {
+                return true;
+            }
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
