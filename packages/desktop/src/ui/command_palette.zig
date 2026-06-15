@@ -33,6 +33,15 @@ const PAD_CSS: f32 = 14.0;
 
 const Section = enum { threads, panes, workspaces, app };
 
+fn sectionName(section: Section) []const u8 {
+    return switch (section) {
+        .threads => "threads",
+        .panes => "panes",
+        .workspaces => "workspaces",
+        .app => "app",
+    };
+}
+
 /// One static palette entry. `keywords` are extra fuzzy-match terms beyond
 /// the title; `keybind` selects which loaded accelerator to show as a hint.
 const Command = struct {
@@ -141,6 +150,49 @@ var action_menu_rect: palette.Rect = .{};
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+pub const StaticCommandInfo = struct {
+    id: []const u8,
+    title: []const u8,
+    section: []const u8,
+    enabled: bool,
+};
+
+pub const RunStaticCommandResult = enum {
+    ran,
+    not_found,
+    disabled,
+};
+
+/// Returns the number of stable command-palette entries exposed to live IPC.
+pub fn staticCommandCount() usize {
+    return STATIC_COMMANDS.len;
+}
+
+/// Returns public metadata for one static command-palette entry.
+pub fn staticCommandInfo(state: *runtime.AppState, index: usize) ?StaticCommandInfo {
+    if (index >= STATIC_COMMANDS.len) return null;
+    const command = STATIC_COMMANDS[index];
+    return .{
+        .id = command.id,
+        .title = command.title,
+        .section = sectionName(command.section),
+        .enabled = command.enabled(state),
+    };
+}
+
+/// Runs one static command-palette entry by stable id, mirroring UI activation.
+pub fn runStaticCommandById(state: *runtime.AppState, id: []const u8) RunStaticCommandResult {
+    for (STATIC_COMMANDS) |command| {
+        if (!std.mem.eql(u8, command.id, id)) continue;
+        if (!command.enabled(state)) return .disabled;
+        if (!command.keeps_open) state.closeCommandPalette();
+        command.run(state);
+        state.markDirty();
+        return .ran;
+    }
+    return .not_found;
+}
 
 /// Registers modal hit targets (scrim, input, rows, action submenu) for the
 /// current frame. Mirrors the settings-modal pattern in `layout.zig`.

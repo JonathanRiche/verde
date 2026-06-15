@@ -3,6 +3,7 @@ const std = @import("std");
 const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
+const command_palette = @import("../ui/command_palette.zig");
 const provider_types = @import("../provider_types.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -194,9 +195,11 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "notification.clear")) return try notificationClearResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "processes")) return try managedProcessesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "inspect")) return try inspectResponse(allocator, id_value, state, params);
+    if (std.mem.startsWith(u8, method, "workspace.")) return try workspaceCommandResponse(allocator, id_value, state, params, method["workspace.".len..]);
     if (std.mem.startsWith(u8, method, "pane.")) return try paneCommandResponse(allocator, id_value, state, params, method["pane.".len..]);
     if (std.mem.startsWith(u8, method, "chat.")) return try chatCommandResponse(allocator, id_value, state, params, method["chat.".len..]);
     if (std.mem.startsWith(u8, method, "browser.")) return try browserCommandResponse(allocator, id_value, state, params, method["browser.".len..]);
+    if (std.mem.startsWith(u8, method, "palette.")) return try paletteCommandResponse(allocator, id_value, state, params, method["palette.".len..]);
     if (std.mem.startsWith(u8, method, "terminal.")) return try terminalCommandResponse(allocator, id_value, state, params, method["terminal.".len..]);
     if (std.mem.startsWith(u8, method, "process.")) return try processCommandResponse(allocator, id_value, state, params, method["process.".len..]);
     if (std.mem.startsWith(u8, method, "agent.")) return try agentCommandResponse(allocator, id_value, state, params, method["agent.".len..]);
@@ -262,6 +265,7 @@ fn writeFocusStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
 
 fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void {
     const browser = state.browserStateConst();
+    const location = state.browserWorkspaceLocation();
     try s.beginObject();
     try s.objectField("runtime_kind");
     try s.write(@tagName(browser.controller.runtimeKind()));
@@ -273,6 +277,14 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.write(browser.statusLabel());
     try s.objectField("visible");
     try s.write(state.isBrowserVisible());
+    try s.objectField("suspended");
+    try s.write(state.isBrowserSurfaceSuspendedForLayout() or state.isBrowserSurfaceSuspendedForPaletteOverlay());
+    try s.objectField("workspace_index");
+    if (location) |loc| try s.write(loc.index) else try s.write(null);
+    try s.objectField("workspace_id");
+    if (location) |loc| try s.write(state.projects.items[loc.index].id) else try s.write(null);
+    try s.objectField("pane_id");
+    if (location) |loc| try s.write(loc.pane_id) else try s.write(null);
     try s.objectField("pane_focused");
     try s.write(state.isBrowserPaneFocused());
     try s.objectField("address_focused");
@@ -321,31 +333,44 @@ fn writeBrowserStatus(s: *std.json.Stringify, state: *app_state.AppState) !void 
     try s.endObject();
 }
 
+fn browserStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try writeBrowserStatus(&s, state);
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
 fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) ![]u8 {
     return try okValueResponse(allocator, id_value, .{
         .protocol_version = PROTOCOL_VERSION,
         .commands = &.{
-            "status",                              "capabilities",                        "workspaces",                           "panes",
-            "active",                              "inspect",                             "threads",                              "terminals",
-            "surfaces",                            "surface.list",                        "surface.inspect",                      "surface.focus",
-            "surface.clearAttention",              "notification.create",                 "notification.update",                  "notification.clear",
-            "processes",                           "pane.focus",                          "pane.split",                           "pane.resize",
-            "pane.minimize",                       "pane.maximize",                       "pane.restore",                         "pane.close",
-            "chat.status",                         "chat.transcript",                     "chat.draft.set",                       "chat.draft.append",
-            "chat.send",                           "chat.followup",                       "chat.stop",                            "chat.approve",
-            "browser.open",                        "browser.close",                       "browser.toggle",                       "browser.back",
-            "browser.forward",                     "browser.reload",                      "browser.focus",                        "browser.blur",
-            "browser.toolbarHit",                  "browser.selectAllFocused",            "browser.copyFocused",                  "browser.cutFocused",
-            "browser.pasteTextFocused",            "browser.eval",                        "browser.postJson",                     "browser.inspector.enable",
-            "browser.inspector.disable",           "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",
-            "browser.inspector.menuClose",         "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",
-            "browser.overlay.sidebarMenuClose",    "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen",
-            "browser.overlay.workspaceModalClose", "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",
-            "browser.overlay.imageModalClose",     "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "terminal.write",
-            "terminal.tail",                       "terminal.screen",                     "process.list",                         "process.inspect",
-            "process.start",                       "process.stop",                        "process.restart",                      "process.logs",
-            "agent.open",                          "stack.status",                        "stack.start",                          "stack.stop",
-            "stack.restart",
+            "status",                              "capabilities",                         "workspaces",                         "panes",
+            "active",                              "inspect",                              "threads",                            "terminals",
+            "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
+            "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
+            "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
+            "workspace.archive",                   "pane.focus",                           "pane.split",                         "pane.resize",
+            "pane.move",                           "pane.minimize",                        "pane.maximize",                      "pane.restore",
+            "pane.close",                          "chat.status",                          "chat.transcript",                    "chat.draft.set",
+            "chat.draft.append",                   "chat.send",                            "chat.followup",                      "chat.stop",
+            "chat.approve",                        "browser.open",                         "browser.navigate",                   "browser.status",
+            "browser.close",                       "browser.toggle",                       "browser.back",                       "browser.forward",
+            "browser.reload",                      "browser.focus",                        "browser.blur",                       "browser.toolbarHit",
+            "browser.selectAllFocused",            "browser.copyFocused",                  "browser.cutFocused",                 "browser.pasteTextFocused",
+            "browser.eval",                        "browser.postJson",                     "browser.inspector.enable",           "browser.inspector.disable",
+            "browser.inspector.toggle",            "browser.inspector.mode",               "browser.inspector.menuOpen",         "browser.inspector.menuClose",
+            "browser.overlay.workspaceMenuOpen",   "browser.overlay.workspaceMenuClose",   "browser.overlay.sidebarMenuOpen",    "browser.overlay.sidebarMenuClose",
+            "browser.overlay.composerMenuOpen",    "browser.overlay.composerMenuClose",    "browser.overlay.workspaceModalOpen", "browser.overlay.workspaceModalClose",
+            "browser.overlay.threadModalOpen",     "browser.overlay.threadModalClose",     "browser.overlay.imageModalOpen",     "browser.overlay.imageModalClose",
+            "browser.overlay.transcriptModalOpen", "browser.overlay.transcriptModalClose", "palette.list",                       "palette.run",
+            "terminal.write",                      "terminal.tail",                        "terminal.screen",                    "process.list",
+            "process.inspect",                     "process.start",                        "process.stop",                       "process.restart",
+            "process.logs",                        "agent.open",                           "stack.status",                       "stack.start",
+            "stack.stop",                          "stack.restart",
         },
         .events = &.{},
         .encodings = &.{"json"},
@@ -554,22 +579,66 @@ fn inspectResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state
     return try inspectPaneResponse(allocator, id_value, state, target.project_index, target.pane_id);
 }
 
+fn workspaceCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "select")) {
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (!state.selectProjectAtIndex(project_index)) return try errorResponseAlloc(allocator, id_value, "rejected", "workspace select did not apply");
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "create")) {
+        const path = stringParam(params, "path") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.create requires path");
+        _ = state.createProjectFromPath(path) catch |err| switch (err) {
+            error.EmptyProjectPath => return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace path cannot be empty"),
+            error.ProjectAlreadyExists => return try errorResponseAlloc(allocator, id_value, "rejected", "workspace already exists"),
+            error.FileNotFound, error.NotDir, error.AccessDenied => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace path not found"),
+            else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+        };
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "rename")) {
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        const label = stringParam(params, "label") orelse stringParam(params, "name") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace.rename requires label");
+        state.renameProjectAtIndex(project_index, label) catch |err| switch (err) {
+            error.ProjectNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+            error.EmptyProjectName => return try errorResponseAlloc(allocator, id_value, "invalid_request", "workspace name cannot be empty"),
+            else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+        };
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "archive")) {
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        if (!state.archiveProjectAtIndexResult(project_index)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "workspace archive did not apply");
+        }
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
 fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "pane not found");
-    state.selected_project_index = target.project_index;
 
     var changed = false;
     if (std.mem.eql(u8, command, "focus")) {
-        changed = state.focusCurrentProjectWorkspacePane(target.pane_id);
+        changed = state.focusWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "split")) {
         const kind = stringParam(params, "kind") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "pane.split requires kind");
         const axis = parseAxis(stringParam(params, "axis") orelse "horizontal") orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid split axis");
         changed = if (std.mem.eql(u8, kind, "chat"))
-            state.splitCurrentProjectWorkspacePaneWithChatAxis(target.pane_id, axis)
+            state.splitWorkspacePaneWithChatAxis(target.project_index, target.pane_id, axis)
         else if (std.mem.eql(u8, kind, "terminal"))
-            state.splitCurrentProjectWorkspacePaneWithTerminalAxis(target.pane_id, axis)
+            state.splitWorkspacePaneWithTerminalAxis(target.project_index, target.pane_id, axis)
         else
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid split kind");
     } else if (std.mem.eql(u8, command, "resize")) {
@@ -578,17 +647,19 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
         const axis = parseAxis(stringParam(params, "axis") orelse "horizontal") orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid resize axis");
         const ratio = floatParam(params, "ratio") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "pane.resize requires ratio");
-        state.resizeCurrentProjectWorkspaceSplit(first, second, axis, ratio);
-        changed = true;
+        changed = state.resizeWorkspaceSplit(target.project_index, first, second, axis, ratio);
+    } else if (std.mem.eql(u8, command, "move")) {
+        const direction = parsePaneDirection(stringParam(params, "direction") orelse "right") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid pane direction");
+        changed = state.moveWorkspacePaneInDirection(target.project_index, target.pane_id, direction);
     } else if (std.mem.eql(u8, command, "minimize")) {
-        changed = state.minimizeCurrentProjectWorkspacePane(target.pane_id);
+        changed = state.minimizeWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "maximize")) {
-        const project = &state.projects.items[target.project_index];
-        changed = project.workspace_layout.maximized_pane_id == target.pane_id or state.toggleCurrentProjectWorkspacePaneMaximized(target.pane_id);
+        changed = state.maximizeWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "restore")) {
-        changed = state.restoreCurrentProjectWorkspacePane(target.pane_id);
+        changed = state.restoreWorkspacePane(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "close")) {
-        changed = state.closeCurrentProjectWorkspacePane(target.pane_id);
+        changed = state.closeWorkspacePane(target.project_index, target.pane_id);
     } else {
         return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
     }
@@ -600,7 +671,6 @@ fn paneCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "chat pane not found");
-    state.selected_project_index = target.project_index;
     if (!targetIsChat(state, target)) return try errorResponseAlloc(allocator, id_value, "invalid_target", "target pane is not a chat pane");
 
     if (std.mem.eql(u8, command, "status")) return try chatStatusResponse(allocator, id_value, state, target.project_index, target.pane_id);
@@ -609,21 +679,21 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
     var accepted = false;
     if (std.mem.eql(u8, command, "draft.set")) {
         const text = stringParam(params, "text") orelse "";
-        accepted = try state.setWorkspaceChatPaneDraft(target.pane_id, text, false);
+        accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, false);
     } else if (std.mem.eql(u8, command, "draft.append")) {
         const text = stringParam(params, "text") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.draft.append requires text");
-        accepted = try state.setWorkspaceChatPaneDraft(target.pane_id, text, true);
+        accepted = try state.setWorkspaceChatPaneDraftForProject(target.project_index, target.pane_id, text, true);
     } else if (std.mem.eql(u8, command, "send")) {
-        accepted = try state.sendWorkspaceChatPanePrompt(target.pane_id, stringParam(params, "prompt"));
+        accepted = try state.sendWorkspaceChatPanePromptForProject(target.project_index, target.pane_id, stringParam(params, "prompt"));
     } else if (std.mem.eql(u8, command, "followup")) {
         const prompt = stringParam(params, "prompt") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.followup requires prompt");
-        accepted = try state.followupWorkspaceChatPanePrompt(target.pane_id, prompt);
+        accepted = try state.followupWorkspaceChatPanePromptForProject(target.project_index, target.pane_id, prompt);
     } else if (std.mem.eql(u8, command, "stop")) {
-        accepted = state.stopWorkspaceChatPane(target.pane_id);
+        accepted = state.stopWorkspaceChatPaneForProject(target.project_index, target.pane_id);
     } else if (std.mem.eql(u8, command, "approve")) {
         const decision = parseApprovalDecision(stringParam(params, "decision") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "chat.approve requires decision")) orelse
             return try errorResponseAlloc(allocator, id_value, "invalid_request", "invalid approval decision");
-        accepted = state.approveWorkspaceChatPane(target.pane_id, decision);
+        accepted = state.approveWorkspaceChatPaneForProject(target.project_index, target.pane_id, decision);
     } else {
         return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
     }
@@ -633,9 +703,29 @@ fn chatCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, s
 }
 
 fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "status")) {
+        return try browserStatusResponse(allocator, id_value, state);
+    }
+
     if (std.mem.eql(u8, command, "open")) {
-        if (!state.isBrowserVisible()) state.toggleBrowser();
-        return try okValueResponse(allocator, id_value, .{ .accepted = true });
+        const project_index = resolveProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
+        const result = state.openBrowserInWorkspace(project_index, stringParam(params, "url")) catch |err| switch (err) {
+            error.WorkspaceNotFound => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+            error.BrowserDisabled => return try errorResponseAlloc(allocator, id_value, "unsupported", "browser runtime is disabled"),
+            error.EmptyBrowserUrl => return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.open requires a non-empty url"),
+            error.BrowserNavigationFailed => return try errorResponseAlloc(allocator, id_value, "rejected", "browser navigation failed"),
+            error.BrowserOpenFailed => return try errorResponseAlloc(allocator, id_value, "rejected", "browser open failed"),
+            else => return err,
+        };
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .workspace_index = result.workspace_index,
+            .workspace_id = state.projects.items[result.workspace_index].id,
+            .pane_id = result.pane_id,
+            .moved_from_workspace = result.moved_from_workspace,
+            .url = state.browserStateConst().current_url,
+        });
     }
 
     if (std.mem.eql(u8, command, "close")) {
@@ -650,6 +740,19 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
 
     if (!state.isBrowserVisible()) {
         return try errorResponseAlloc(allocator, id_value, "rejected", "browser pane is not visible");
+    }
+
+    if (std.mem.eql(u8, command, "navigate")) {
+        const url = stringParam(params, "url") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.navigate requires url");
+        state.navigateBrowserToUrl(url) catch |err| switch (err) {
+            error.EmptyBrowserUrl => return try errorResponseAlloc(allocator, id_value, "invalid_request", "browser.navigate requires a non-empty url"),
+            error.BrowserNavigationFailed => return try errorResponseAlloc(allocator, id_value, "rejected", "browser navigation failed"),
+            else => return err,
+        };
+        return try okValueResponse(allocator, id_value, .{
+            .accepted = true,
+            .url = state.browserStateConst().current_url,
+        });
     }
 
     if (std.mem.eql(u8, command, "back")) {
@@ -827,20 +930,53 @@ fn browserCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
 }
 
+fn paletteCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
+    if (std.mem.eql(u8, command, "list")) {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("commands");
+        try s.beginArray();
+        var index: usize = 0;
+        while (index < command_palette.staticCommandCount()) : (index += 1) {
+            const info = command_palette.staticCommandInfo(state, index) orelse continue;
+            try s.write(info);
+        }
+        try s.endArray();
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    if (std.mem.eql(u8, command, "run")) {
+        const command_id = stringParam(params, "command") orelse stringParam(params, "id") orelse
+            return try errorResponseAlloc(allocator, id_value, "invalid_request", "palette.run requires command");
+        return switch (command_palette.runStaticCommandById(state, command_id)) {
+            .ran => try okValueResponse(allocator, id_value, .{ .accepted = true, .command = command_id }),
+            .not_found => try errorResponseAlloc(allocator, id_value, "not_found", "palette command not found"),
+            .disabled => try errorResponseAlloc(allocator, id_value, "rejected", "palette command is disabled"),
+        };
+    }
+
+    return try errorResponseAlloc(allocator, id_value, "method_not_found", command);
+}
+
 fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value, command: []const u8) ![]u8 {
     const target = resolvePaneTarget(state, params) orelse
         return try errorResponseAlloc(allocator, id_value, "not_found", "terminal pane not found");
-    state.selected_project_index = target.project_index;
     if (!targetIsTerminal(state, target)) return try errorResponseAlloc(allocator, id_value, "invalid_target", "target pane is not a terminal pane");
 
     if (std.mem.eql(u8, command, "write")) {
         const text = stringParam(params, "text") orelse return try errorResponseAlloc(allocator, id_value, "invalid_request", "terminal.write requires text");
-        if (!try state.writeWorkspaceTerminalPane(target.pane_id, text)) return try errorResponseAlloc(allocator, id_value, "rejected", "terminal write did not apply");
+        if (!try state.writeWorkspaceTerminalPaneForProject(target.project_index, target.pane_id, text)) return try errorResponseAlloc(allocator, id_value, "rejected", "terminal write did not apply");
         return try inspectPaneResponse(allocator, id_value, state, target.project_index, target.pane_id);
     }
     if (std.mem.eql(u8, command, "tail")) {
         const max_bytes = @as(usize, @intCast((intParam(params, "lines") orelse 200) * 240));
-        const output = (try state.terminalPaneOutputTail(target.pane_id, max_bytes)) orelse
+        const output = (try state.terminalPaneOutputTailForProject(target.project_index, target.pane_id, max_bytes)) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "terminal output not found");
         defer state.allocator.free(output);
         return try okValueResponse(allocator, id_value, .{
@@ -851,7 +987,7 @@ fn terminalCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Valu
         });
     }
     if (std.mem.eql(u8, command, "screen")) {
-        const screen = (try state.terminalPaneScreenText(target.pane_id)) orelse
+        const screen = (try state.terminalPaneScreenTextForProject(target.project_index, target.pane_id)) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "terminal screen not found");
         defer state.allocator.free(screen);
         return try okValueResponse(allocator, id_value, .{
@@ -1662,6 +1798,14 @@ fn jsonInt(value: std.json.Value) ?i64 {
 fn parseAxis(value: []const u8) ?app_state.WorkspaceSplitAxis {
     if (std.mem.eql(u8, value, "horizontal")) return .horizontal;
     if (std.mem.eql(u8, value, "vertical")) return .vertical;
+    return null;
+}
+
+fn parsePaneDirection(value: []const u8) ?app_state.WorkspacePaneDirection {
+    if (std.mem.eql(u8, value, "left")) return .left;
+    if (std.mem.eql(u8, value, "right")) return .right;
+    if (std.mem.eql(u8, value, "up")) return .up;
+    if (std.mem.eql(u8, value, "down")) return .down;
     return null;
 }
 

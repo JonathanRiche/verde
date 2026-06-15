@@ -1172,7 +1172,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 }
             }
             if (keyboard.workspaceSelectIndexForEvent(&event.key)) |workspace_ordinal| {
-                if (selectWorkspaceBySidebarOrdinal(state, workspace_ordinal)) {
+                if (state.selectProjectAtIndex(workspace_ordinal)) {
                     syncWindowTextInput(window, state);
                     return true;
                 }
@@ -1933,17 +1933,6 @@ fn handleKeyboardAction(
         .workspace_grow_up => _ = workspace_panes_ui.growPaneInDirection(state, .up),
         .workspace_grow_down => _ = workspace_panes_ui.growPaneInDirection(state, .down),
     }
-}
-
-fn selectWorkspaceBySidebarOrdinal(state: *AppState, ordinal: usize) bool {
-    if (ordinal >= state.projects.items.len) return false;
-    if (state.selected_project_index == ordinal) return true;
-    state.selected_project_index = ordinal;
-    state.ensureCurrentProjectWorkspace();
-    state.workspace_header_open_menu_open = false;
-    state.sidebar_context_menu_open = false;
-    state.markDirty();
-    return true;
 }
 
 fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {

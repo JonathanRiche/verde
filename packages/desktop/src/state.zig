@@ -1486,6 +1486,25 @@ pub const TerminalPaneRef = struct {
 
 pub const BrowserPaneRef = struct {};
 
+pub const BrowserOpenResult = struct {
+    pane_id: WorkspacePaneId,
+    workspace_index: usize,
+    moved_from_workspace: ?usize,
+};
+
+pub const BrowserWorkspaceLocation = struct {
+    index: usize,
+    pane_id: WorkspacePaneId,
+};
+
+const ViewFocusSnapshot = struct {
+    selected_project_index: usize,
+    terminal_focused: bool,
+    composer_focused: bool,
+    palette_composer_focused: bool,
+    browser_address_focused: bool,
+};
+
 pub const WorkspacePane = struct {
     id: WorkspacePaneId,
     ref: WorkspacePaneRef,
@@ -1623,6 +1642,13 @@ pub const WorkspaceSplitAxis = enum {
     vertical,
 };
 
+pub const WorkspacePaneDirection = enum {
+    left,
+    right,
+    up,
+    down,
+};
+
 pub const WorkspaceNode = union(enum) {
     leaf: WorkspacePaneId,
     split: struct {
@@ -1744,6 +1770,16 @@ pub const WorkspaceLayout = struct {
             if (pane.id == pane_id) return index;
         }
         return null;
+    }
+
+    fn swapPaneRefs(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
+        const first_index = self.paneIndexById(first_pane_id) orelse return false;
+        const second_index = self.paneIndexById(second_pane_id) orelse return false;
+        if (self.panes.items[first_index].minimized or self.panes.items[second_index].minimized) return false;
+        const first_ref = self.panes.items[first_index].ref;
+        self.panes.items[first_index].ref = self.panes.items[second_index].ref;
+        self.panes.items[second_index].ref = first_ref;
+        return true;
     }
 
     fn hasVisiblePaneKind(self: *const WorkspaceLayout, kind: WorkspacePaneKind) bool {
@@ -1926,6 +1962,59 @@ pub const WorkspaceLayout = struct {
     fn nudgeSplitRatio(self: *WorkspaceLayout, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, delta: f32) bool {
         const root_node = self.root orelse return false;
         return nudgeNodeSplitRatio(root_node, first_pane_id, second_pane_id, axis, delta);
+    }
+
+    fn neighborPaneId(self: *const WorkspaceLayout, pane_id: WorkspacePaneId, direction: WorkspacePaneDirection) ?WorkspacePaneId {
+        const root_node = self.root orelse return null;
+        if (!nodeContainsPane(root_node, pane_id)) return null;
+        return self.neighborPaneIdInNode(root_node, pane_id, direction);
+    }
+
+    fn neighborPaneIdInNode(
+        self: *const WorkspaceLayout,
+        node: *const WorkspaceNode,
+        pane_id: WorkspacePaneId,
+        direction: WorkspacePaneDirection,
+    ) ?WorkspacePaneId {
+        switch (node.*) {
+            .leaf => return null,
+            .split => |split| {
+                if (nodeContainsPane(split.first, pane_id)) {
+                    if (self.neighborPaneIdInNode(split.first, pane_id, direction)) |neighbor| return neighbor;
+                    if ((direction == .right and split.axis == .vertical) or
+                        (direction == .down and split.axis == .horizontal))
+                    {
+                        return self.edgeVisiblePaneId(split.second, false);
+                    }
+                    return null;
+                }
+                if (nodeContainsPane(split.second, pane_id)) {
+                    if (self.neighborPaneIdInNode(split.second, pane_id, direction)) |neighbor| return neighbor;
+                    if ((direction == .left and split.axis == .vertical) or
+                        (direction == .up and split.axis == .horizontal))
+                    {
+                        return self.edgeVisiblePaneId(split.first, true);
+                    }
+                    return null;
+                }
+                return null;
+            },
+        }
+    }
+
+    fn edgeVisiblePaneId(self: *const WorkspaceLayout, node: *const WorkspaceNode, prefer_second: bool) ?WorkspacePaneId {
+        switch (node.*) {
+            .leaf => |pane_id| {
+                const pane = self.paneById(pane_id) orelse return null;
+                return if (pane.minimized) null else pane_id;
+            },
+            .split => |split| {
+                if (prefer_second) {
+                    return self.edgeVisiblePaneId(split.second, true) orelse self.edgeVisiblePaneId(split.first, true);
+                }
+                return self.edgeVisiblePaneId(split.first, false) orelse self.edgeVisiblePaneId(split.second, false);
+            },
+        }
     }
 
     fn persistedWorkspaceJson(self: *const WorkspaceLayout, allocator: std.mem.Allocator) ![]u8 {
@@ -3911,6 +4000,11 @@ pub const AppState = struct {
         restored,
     };
 
+    pub const CreateProjectResult = struct {
+        index: usize,
+        restored: bool,
+    };
+
     fn addProject(self: *AppState, label: []const u8, path: []const u8, unread_count: u8) !AddProjectResult {
         const id = try self.deriveProjectId(path);
         defer self.allocator.free(id);
@@ -3931,6 +4025,30 @@ pub const AppState = struct {
         try self.projects.append(self.allocator, project);
         self.markDirty();
         return .created;
+    }
+
+    pub fn createProjectFromPath(self: *AppState, raw_path: []const u8) !CreateProjectResult {
+        const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
+        if (trimmed.len == 0) return error.EmptyProjectPath;
+
+        const resolved = try self.resolveProjectPath(trimmed);
+        defer self.allocator.free(resolved);
+
+        if (self.findProjectIndexByPath(resolved) != null) return error.ProjectAlreadyExists;
+
+        const label = utils.projectLabelFromPath(resolved);
+        const add_result = try self.addProject(label, resolved, 0);
+        const index = self.projects.items.len - 1;
+        self.selected_project_index = index;
+        self.syncRenameBuffer();
+        self.show_project_creator = false;
+        self.palette_modal_text_focus = .none;
+        self.setSidebarNotice(if (add_result == .restored) "Workspace restored from archive." else "Workspace imported.");
+        self.markDirty();
+        return .{
+            .index = index,
+            .restored = add_result == .restored,
+        };
     }
 
     fn appendMessageToThread(
@@ -3969,30 +4087,19 @@ pub const AppState = struct {
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
-        const trimmed = std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace);
-        if (trimmed.len == 0) {
-            self.setSidebarNotice("Enter a workspace directory path first.");
-            return;
-        }
-
-        const resolved = try self.resolveProjectPath(trimmed);
-        defer self.allocator.free(resolved);
-
-        if (self.findProjectIndexByPath(resolved) != null) {
-            self.setSidebarNotice("That directory is already in the workspace rail.");
-            return;
-        }
-
-        const label = utils.projectLabelFromPath(resolved);
-        const add_result = try self.addProject(label, resolved, 0);
-        self.selected_project_index = self.projects.items.len - 1;
+        _ = self.createProjectFromPath(self.importDirectoryDraft()) catch |err| switch (err) {
+            error.EmptyProjectPath => {
+                self.setSidebarNotice("Enter a workspace directory path first.");
+                return;
+            },
+            error.ProjectAlreadyExists => {
+                self.setSidebarNotice("That directory is already in the workspace rail.");
+                return;
+            },
+            else => return err,
+        };
         self.clearImportPath();
         self.project_import_cursor = 0;
-        self.syncRenameBuffer();
-        self.setSidebarNotice(if (add_result == .restored) "Workspace restored from archive." else "Workspace imported.");
-        self.show_project_creator = false;
-        self.palette_modal_text_focus = .none;
-        self.markDirty();
     }
 
     pub fn cancelProjectImport(self: *AppState) void {
@@ -4068,18 +4175,22 @@ pub const AppState = struct {
 
     fn renameSelectedProject(self: *AppState) void {
         if (self.projects.items.len == 0) return;
-        const trimmed = std.mem.trim(u8, self.renameInput(), &std.ascii.whitespace);
-        if (trimmed.len == 0) {
-            self.setSidebarNotice("Workspace name cannot be empty.");
-            return;
-        }
-
-        const project = self.currentProjectMutable();
-        self.allocator.free(project.label);
-        project.label = self.allocator.dupeZ(u8, trimmed) catch {
-            self.setSidebarNotice("Rename failed.");
-            return;
+        self.renameProjectAtIndex(self.selected_project_index, self.renameInput()) catch |err| switch (err) {
+            error.EmptyProjectName => self.setSidebarNotice("Workspace name cannot be empty."),
+            else => self.setSidebarNotice("Rename failed."),
         };
+    }
+
+    pub fn renameProjectAtIndex(self: *AppState, index: usize, label: []const u8) !void {
+        if (index >= self.projects.items.len) return error.ProjectNotFound;
+        const trimmed = std.mem.trim(u8, label, &std.ascii.whitespace);
+        if (trimmed.len == 0) return error.EmptyProjectName;
+
+        const project = &self.projects.items[index];
+        const copied = try self.allocator.dupeZ(u8, trimmed);
+        self.allocator.free(project.label);
+        project.label = copied;
+        if (self.selected_project_index == index) self.syncRenameBuffer();
         self.setSidebarNotice("Workspace renamed.");
         self.markDirty();
     }
@@ -4093,6 +4204,17 @@ pub const AppState = struct {
         self.palette_modal_text_focus = .project_rename;
         self.project_rename_cursor = self.renameInput().len;
         self.setSidebarNotice("");
+    }
+
+    pub fn selectProjectAtIndex(self: *AppState, index: usize) bool {
+        if (index >= self.projects.items.len) return false;
+        self.selected_project_index = index;
+        self.ensureCurrentProjectWorkspace();
+        self.workspace_header_open_menu_open = false;
+        self.sidebar_context_menu_open = false;
+        self.syncRenameBuffer();
+        self.markDirty();
+        return true;
     }
 
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
@@ -4519,45 +4641,60 @@ pub const AppState = struct {
     }
 
     pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
-        if (index >= self.projects.items.len) return;
-        self.selected_project_index = index;
-        self.archiveSelectedProject();
-        self.rename_project_index = null;
+        _ = self.archiveProjectAtIndexResult(index);
     }
 
-    fn archiveSelectedProject(self: *AppState) void {
-        if (self.projects.items.len == 0) return;
-        for (self.projects.items[self.selected_project_index].threads.items) |*thread| {
-            if (thread.isSendPending()) {
-                self.setSidebarNotice("Finish this workspace's running provider requests before archiving it.");
-                return;
-            }
+    pub fn archiveProjectAtIndexResult(self: *AppState, index: usize) bool {
+        if (index >= self.projects.items.len) return false;
+        if (self.projectHasPendingSend(index)) {
+            self.setSidebarNotice("Finish this workspace's running provider requests before archiving it.");
+            return false;
         }
+
         self.cancelThreadImport();
-        var removed = self.projects.orderedRemove(self.selected_project_index);
+        var removed = self.projects.orderedRemove(index);
         removed.archived = true;
         removed.terminal_dock.visible = false;
         removed.archiveAllThreads(self.allocator) catch {
             removed.deinit(self.allocator);
             self.setSidebarNotice("Failed to archive the workspace.");
-            return;
+            return false;
         };
         self.archived_projects.append(self.allocator, removed) catch |err| {
             var failed = removed;
             failed.deinit(self.allocator);
             self.setSidebarNotice(@errorName(err));
-            return;
+            return false;
         };
 
         if (self.projects.items.len == 0) {
             self.selected_project_index = 0;
-        } else if (self.selected_project_index >= self.projects.items.len) {
-            self.selected_project_index = self.projects.items.len - 1;
+        } else if (self.selected_project_index == index) {
+            self.selected_project_index = @min(index, self.projects.items.len - 1);
+        } else if (self.selected_project_index > index) {
+            self.selected_project_index -= 1;
         }
 
+        self.rename_project_index = null;
         self.syncRenameBuffer();
         self.setSidebarNotice("Workspace archived.");
         self.markDirty();
+        return true;
+    }
+
+    fn archiveSelectedProject(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        _ = self.archiveProjectAtIndexResult(self.selected_project_index);
+    }
+
+    fn projectHasPendingSend(self: *const AppState, index: usize) bool {
+        if (index >= self.projects.items.len) return false;
+        for (self.projects.items[index].threads.items) |*thread| {
+            if (thread.isSendPending()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn archiveThreadAtIndex(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -6029,6 +6166,30 @@ pub const AppState = struct {
         }
     }
 
+    pub fn openTranscriptWebLink(self: *AppState, href: []const u8) void {
+        const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.setSidebarNotice("No web link selected.");
+            return;
+        }
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("No workspace selected.");
+            return;
+        }
+
+        _ = self.openBrowserInWorkspace(self.selected_project_index, trimmed) catch |err| switch (err) {
+            error.WorkspaceNotFound => self.setSidebarNotice("No workspace selected."),
+            error.BrowserDisabled => self.setSidebarNotice("Browser is disabled."),
+            error.EmptyBrowserUrl => self.setSidebarNotice("No web link selected."),
+            error.BrowserNavigationFailed => self.setSidebarNotice("Failed to open web link."),
+            error.BrowserOpenFailed => self.setSidebarNotice("Failed to open browser."),
+            else => {
+                log.warn("failed to open transcript web link: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open web link.");
+            },
+        };
+    }
+
     fn runCustomOpenAction(self: *AppState, custom: app_config.CustomOpenAction) void {
         utils.runCustomProjectCommand(self.allocator, self.currentProject().path, custom.action) catch |err| {
             log.warn("failed to run custom open action: {s}", .{@errorName(err)});
@@ -6885,9 +7046,9 @@ pub const AppState = struct {
         };
     }
 
-    fn createCurrentProjectTerminalDock(self: *AppState) !u32 {
-        if (self.projects.items.len == 0) return error.NoProjectSelected;
-        var project = self.currentProjectMutable();
+    fn createProjectTerminalDock(self: *AppState, project_index: usize) !u32 {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        var project = &self.projects.items[project_index];
         const dock_id = project.next_terminal_dock_id;
         project.next_terminal_dock_id += 1;
         var dock = try terminal.Dock.init(self.allocator);
@@ -6895,6 +7056,11 @@ pub const AppState = struct {
         errdefer dock.deinit(self.allocator);
         try project.terminal_docks.append(self.allocator, .{ .id = dock_id, .dock = dock });
         return dock_id;
+    }
+
+    fn createCurrentProjectTerminalDock(self: *AppState) !u32 {
+        if (self.projects.items.len == 0) return error.NoProjectSelected;
+        return self.createProjectTerminalDock(self.selected_project_index);
     }
 
     pub fn isTerminalVisible(self: *const AppState) bool {
@@ -7275,6 +7441,147 @@ pub const AppState = struct {
         };
         self.blurNativeBrowserForAddressField();
         self.setSidebarNotice("Browser opened.");
+    }
+
+    /// Ensures the singleton browser pane exists in a workspace without selecting that workspace or stealing keyboard focus.
+    pub fn openBrowserInWorkspace(self: *AppState, project_index: usize, url: ?[]const u8) !BrowserOpenResult {
+        if (!self.browser_textures_enabled) {
+            self.setSidebarNotice("Browser is disabled for the SDL_GPU non-image renderer experiment.");
+            return error.BrowserDisabled;
+        }
+        if (project_index >= self.projects.items.len) return error.WorkspaceNotFound;
+
+        const selected_index = self.selected_project_index;
+        const selected_focus = if (selected_index < self.projects.items.len)
+            self.projects.items[selected_index].workspace_layout.focused_pane_id
+        else
+            null;
+        const selected_focus_was_browser = if (selected_focus) |pane_id| focused: {
+            const kind = self.workspacePaneKind(selected_index, pane_id) orelse break :focused false;
+            break :focused kind == .browser;
+        } else false;
+
+        const previous_workspace = self.browserWorkspaceIndex();
+        const moved_from_workspace = if (previous_workspace) |index|
+            if (index != project_index) index else null
+        else
+            null;
+
+        for (self.projects.items, 0..) |*project, index| {
+            if (index == project_index) continue;
+            _ = project.workspace_layout.minimizePaneKind(self.allocator, .browser);
+        }
+
+        var layout = &self.projects.items[project_index].workspace_layout;
+        const browser_pane_id = try layout.ensureBrowserPane(self.allocator);
+        layout.maximized_pane_id = null;
+
+        if (project_index == selected_index) {
+            self.restoreWorkspaceFocusIfVisible(project_index, selected_focus, browser_pane_id);
+        } else {
+            self.restoreWorkspaceFocusIfVisible(selected_index, selected_focus, null);
+            if (selected_focus_was_browser) self.unfocusBrowserPane();
+        }
+
+        self.browser_state.setControlsVisible(true);
+        self.browser_address_focused = false;
+        self.browser_inspector_menu_open = false;
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+
+        if (url) |target_url| {
+            try self.navigateBrowserToUrl(target_url);
+        } else if (!self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null) {
+            try self.navigateBrowserToUrl(self.browser_state.current_url.?);
+        } else {
+            try self.showBrowserRuntimeForLiveOpen();
+        }
+
+        if (project_index == selected_index) {
+            self.restoreBrowserSurfaceForRenderedLayout();
+            self.syncBrowserPaneBoundsToBackend();
+        } else {
+            self.noteBrowserPaneNotRendered();
+        }
+
+        self.setSidebarNotice("Browser opened.");
+        self.markDirty();
+        return .{
+            .pane_id = browser_pane_id,
+            .workspace_index = project_index,
+            .moved_from_workspace = moved_from_workspace,
+        };
+    }
+
+    /// Navigates the browser runtime through the same normalization path used by the address field.
+    pub fn navigateBrowserToUrl(self: *AppState, value: []const u8) !void {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len == 0) return error.EmptyBrowserUrl;
+
+        const normalized = try self.normalizeBrowserUrl(trimmed);
+        defer self.allocator.free(normalized);
+
+        self.browser_state.status = .opening;
+        self.browser_state.controller.navigate(normalized) catch |err| {
+            log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
+            self.setSidebarNotice("Browser navigation failed.");
+            return error.BrowserNavigationFailed;
+        };
+        self.browser_state.setAddress(normalized);
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.setSidebarNotice("Browser navigation requested.");
+    }
+
+    /// Returns the workspace currently hosting the singleton browser pane, if any.
+    pub fn browserWorkspaceLocation(self: *const AppState) ?BrowserWorkspaceLocation {
+        for (self.projects.items, 0..) |project, index| {
+            const pane_id = project.workspace_layout.visibleBrowserPaneId() orelse continue;
+            return .{
+                .index = index,
+                .pane_id = pane_id,
+            };
+        }
+        return null;
+    }
+
+    /// Returns the workspace currently hosting the singleton browser pane, if any.
+    pub fn browserWorkspaceIndex(self: *const AppState) ?usize {
+        const location = self.browserWorkspaceLocation() orelse return null;
+        return location.index;
+    }
+
+    /// Returns the visible singleton browser pane id, if any.
+    pub fn browserWorkspacePaneId(self: *const AppState) ?WorkspacePaneId {
+        const location = self.browserWorkspaceLocation() orelse return null;
+        return location.pane_id;
+    }
+
+    fn showBrowserRuntimeForLiveOpen(self: *AppState) !void {
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.err("failed to show browser runtime: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to show browser runtime.") catch {};
+            self.setSidebarNotice("Failed to show browser.");
+            return error.BrowserOpenFailed;
+        };
+    }
+
+    fn restoreWorkspaceFocusIfVisible(self: *AppState, project_index: usize, pane_id: ?WorkspacePaneId, except_pane_id: ?WorkspacePaneId) void {
+        if (project_index >= self.projects.items.len) return;
+        const wanted = pane_id orelse return;
+        if (except_pane_id != null and except_pane_id.? == wanted) return;
+        var layout = &self.projects.items[project_index].workspace_layout;
+        const pane = layout.paneById(wanted) orelse return;
+        if (pane.minimized) return;
+        layout.focused_pane_id = wanted;
+    }
+
+    fn workspacePaneKind(self: *const AppState, project_index: usize, pane_id: WorkspacePaneId) ?WorkspacePaneKind {
+        if (project_index >= self.projects.items.len) return null;
+        const pane = self.projects.items[project_index].workspace_layout.paneById(pane_id) orelse return null;
+        return std.meta.activeTag(pane.ref);
     }
 
     fn blurNativeBrowserForAddressField(self: *AppState) void {
@@ -7966,27 +8273,17 @@ pub const AppState = struct {
 
     /// Navigates the browser runtime using the current browser address input buffer.
     pub fn navigateBrowserFromAddress(self: *AppState) void {
-        const trimmed = std.mem.trim(u8, self.browser_state.addressInput(), &std.ascii.whitespace);
-        if (trimmed.len == 0) {
-            self.setSidebarNotice("Enter a browser URL first.");
-            return;
-        }
-        const normalized = self.normalizeBrowserUrl(trimmed) catch {
-            self.setSidebarNotice("Failed to normalize browser URL.");
-            return;
+        self.navigateBrowserToUrl(self.browser_state.addressInput()) catch |err| switch (err) {
+            error.EmptyBrowserUrl => {
+                self.setSidebarNotice("Enter a browser URL first.");
+                return;
+            },
+            error.BrowserNavigationFailed => return,
+            else => {
+                self.setSidebarNotice("Failed to normalize browser URL.");
+                return;
+            },
         };
-        defer self.allocator.free(normalized);
-
-        self.browser_state.status = .opening;
-        self.browser_state.controller.navigate(normalized) catch |err| {
-            log.err("failed to navigate browser runtime: {s}", .{@errorName(err)});
-            self.browser_state.status = .failed;
-            self.browser_state.setLastError("Failed to navigate browser runtime.") catch {};
-            self.setSidebarNotice("Browser navigation failed.");
-            return;
-        };
-        self.browser_state.setAddress(normalized);
-        self.setSidebarNotice("Browser navigation requested.");
     }
 
     /// Navigates typed addresses or reloads when the URL bar already matches the current page.
@@ -8644,9 +8941,35 @@ pub const AppState = struct {
         };
     }
 
-    pub fn setWorkspaceChatPaneDraft(self: *AppState, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
-        if (self.projects.items.len == 0) return false;
-        var project = &self.projects.items[self.selected_project_index];
+    fn captureViewFocusSnapshot(self: *const AppState) ViewFocusSnapshot {
+        return .{
+            .selected_project_index = self.selected_project_index,
+            .terminal_focused = self.terminal_focused,
+            .composer_focused = self.composer_focused,
+            .palette_composer_focused = self.palette_composer.focused,
+            .browser_address_focused = self.browser_address_focused,
+        };
+    }
+
+    fn restoreViewFocusSnapshot(self: *AppState, snapshot: ViewFocusSnapshot) void {
+        if (snapshot.selected_project_index < self.projects.items.len) {
+            self.selected_project_index = snapshot.selected_project_index;
+        } else if (self.projects.items.len > 0) {
+            self.selected_project_index = self.projects.items.len - 1;
+        } else {
+            self.selected_project_index = 0;
+        }
+        self.terminal_focused = snapshot.terminal_focused;
+        self.composer_focused = snapshot.composer_focused;
+        self.palette_composer.focused = snapshot.palette_composer_focused;
+        self.browser_address_focused = snapshot.browser_address_focused;
+        self.syncRenameBuffer();
+        self.syncPaletteComposerFromDraft();
+    }
+
+    pub fn setWorkspaceChatPaneDraftForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
         const pane = project.workspace_layout.paneById(pane_id) orelse return false;
         const thread_index = switch (pane.ref) {
             .chat => |ref| ref.thread_index,
@@ -8666,75 +8989,140 @@ pub const AppState = struct {
             thread.setDraft(value);
         }
         project.selected_thread_index = thread_index;
-        self.terminal_focused = false;
-        self.syncPaletteComposerFromDraft();
+        if (self.selected_project_index == project_index) {
+            self.terminal_focused = false;
+            self.syncPaletteComposerFromDraft();
+        }
         self.markDirty();
         return true;
     }
 
-    pub fn sendWorkspaceChatPanePrompt(self: *AppState, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
+    pub fn setWorkspaceChatPaneDraft(self: *AppState, pane_id: WorkspacePaneId, value: []const u8, append: bool) !bool {
+        if (self.projects.items.len == 0) return false;
+        return self.setWorkspaceChatPaneDraftForProject(self.selected_project_index, pane_id, value, append);
+    }
+
+    pub fn sendWorkspaceChatPanePromptForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        const snapshot = self.captureViewFocusSnapshot();
+        const restore_view = project_index != snapshot.selected_project_index;
+        if (restore_view) self.selected_project_index = project_index;
+        defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
+
         if (prompt) |text| {
             if (!try self.setWorkspaceChatPaneDraft(pane_id, text, false)) return false;
-        } else {
-            if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
-        }
+        } else if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
+
         try self.sendDraft();
         return true;
     }
 
-    pub fn followupWorkspaceChatPanePrompt(self: *AppState, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
+    pub fn sendWorkspaceChatPanePrompt(self: *AppState, pane_id: WorkspacePaneId, prompt: ?[]const u8) !bool {
+        if (self.projects.items.len == 0) return false;
+        return self.sendWorkspaceChatPanePromptForProject(self.selected_project_index, pane_id, prompt);
+    }
+
+    pub fn followupWorkspaceChatPanePromptForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        const snapshot = self.captureViewFocusSnapshot();
+        const restore_view = project_index != snapshot.selected_project_index;
+        if (restore_view) self.selected_project_index = project_index;
+        defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
+
         if (!try self.setWorkspaceChatPaneDraft(pane_id, prompt, false)) return false;
         self.queueOrSteerDraftDuringSend();
         return true;
     }
 
-    pub fn stopWorkspaceChatPane(self: *AppState, pane_id: WorkspacePaneId) bool {
+    pub fn followupWorkspaceChatPanePrompt(self: *AppState, pane_id: WorkspacePaneId, prompt: []const u8) !bool {
+        if (self.projects.items.len == 0) return false;
+        return self.followupWorkspaceChatPanePromptForProject(self.selected_project_index, pane_id, prompt);
+    }
+
+    pub fn stopWorkspaceChatPaneForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const snapshot = self.captureViewFocusSnapshot();
+        const restore_view = project_index != snapshot.selected_project_index;
+        if (restore_view) self.selected_project_index = project_index;
+        defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
+
         if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
         self.abortCurrentThreadSend();
         return true;
     }
 
-    pub fn approveWorkspaceChatPane(self: *AppState, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
+    pub fn stopWorkspaceChatPane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        return self.stopWorkspaceChatPaneForProject(self.selected_project_index, pane_id);
+    }
+
+    pub fn approveWorkspaceChatPaneForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const snapshot = self.captureViewFocusSnapshot();
+        const restore_view = project_index != snapshot.selected_project_index;
+        if (restore_view) self.selected_project_index = project_index;
+        defer if (restore_view) self.restoreViewFocusSnapshot(snapshot);
+
         if (!self.selectWorkspaceChatPaneThread(pane_id)) return false;
         self.resolvePendingApproval(decision);
         return true;
     }
 
-    pub fn writeWorkspaceTerminalPane(self: *AppState, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
+    pub fn approveWorkspaceChatPane(self: *AppState, pane_id: WorkspacePaneId, decision: ai_harness.ApprovalDecision) bool {
         if (self.projects.items.len == 0) return false;
-        var project = &self.projects.items[self.selected_project_index];
+        return self.approveWorkspaceChatPaneForProject(self.selected_project_index, pane_id, decision);
+    }
+
+    pub fn writeWorkspaceTerminalPaneForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
         const pane = project.workspace_layout.paneById(pane_id) orelse return false;
         const dock_id = switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => return false,
         };
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
         try dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id);
         return try dock.writeInputToActivePane(bytes);
     }
 
-    pub fn terminalPaneOutputTail(self: *AppState, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
-        if (self.projects.items.len == 0) return null;
-        var project = &self.projects.items[self.selected_project_index];
+    pub fn writeWorkspaceTerminalPane(self: *AppState, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
+        if (self.projects.items.len == 0) return false;
+        return self.writeWorkspaceTerminalPaneForProject(self.selected_project_index, pane_id, bytes);
+    }
+
+    pub fn terminalPaneOutputTailForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
+        if (project_index >= self.projects.items.len) return null;
+        var project = &self.projects.items[project_index];
         const pane = project.workspace_layout.paneById(pane_id) orelse return null;
         const dock_id = switch (pane.ref) {
             .terminal => |ref| ref.dock_id,
             else => return null,
         };
-        const dock = self.currentProjectTerminalDock(dock_id) orelse return null;
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
         return try dock.activeOutputTailAlloc(self.allocator, max_bytes);
+    }
+
+    pub fn terminalPaneOutputTail(self: *AppState, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
+        if (self.projects.items.len == 0) return null;
+        return self.terminalPaneOutputTailForProject(self.selected_project_index, pane_id, max_bytes);
+    }
+
+    pub fn terminalPaneScreenTextForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) !?[]u8 {
+        if (project_index >= self.projects.items.len) return null;
+        var project = &self.projects.items[project_index];
+        const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+        const dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => return null,
+        };
+        const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+        return try dock.activeScreenTextAlloc(self.allocator);
     }
 
     pub fn terminalPaneScreenText(self: *AppState, pane_id: WorkspacePaneId) !?[]u8 {
         if (self.projects.items.len == 0) return null;
-        var project = &self.projects.items[self.selected_project_index];
-        const pane = project.workspace_layout.paneById(pane_id) orelse return null;
-        const dock_id = switch (pane.ref) {
-            .terminal => |ref| ref.dock_id,
-            else => return null,
-        };
-        const dock = self.currentProjectTerminalDock(dock_id) orelse return null;
-        return try dock.activeScreenTextAlloc(self.allocator);
+        return self.terminalPaneScreenTextForProject(self.selected_project_index, pane_id);
     }
 
     pub fn refreshProjectStackConfig(self: *AppState, project_index: usize) !void {
@@ -9306,31 +9694,40 @@ pub const AppState = struct {
         return self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id == pane_id;
     }
 
-    pub fn focusCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
-        if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+    pub fn focusWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
         if (pane.minimized) return false;
         layout.focused_pane_id = pane_id;
         switch (pane.ref) {
             .chat => |ref| {
-                var project = &self.projects.items[self.selected_project_index];
+                var project = &self.projects.items[project_index];
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
                 }
-                self.terminal_focused = false;
-                self.unfocusBrowserPane();
-                self.browser_address_focused = false;
+                if (self.selected_project_index == project_index) {
+                    self.terminal_focused = false;
+                    self.unfocusBrowserPane();
+                    self.browser_address_focused = false;
+                }
             },
-            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
+            .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
             .browser => {
-                self.terminal_focused = false;
-                self.composer_focused = false;
-                self.palette_composer.focused = false;
+                if (self.selected_project_index == project_index) {
+                    self.terminal_focused = false;
+                    self.composer_focused = false;
+                    self.palette_composer.focused = false;
+                }
             },
         }
         self.markDirty();
         return true;
+    }
+
+    pub fn focusCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
+        if (self.projects.items.len == 0) return false;
+        return self.focusWorkspacePane(self.selected_project_index, pane_id);
     }
 
     pub fn focusPromptForFocusedChatWorkspacePane(self: *AppState) bool {
@@ -9358,44 +9755,77 @@ pub const AppState = struct {
     pub fn swapCurrentProjectWorkspacePanes(self: *AppState, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
         var layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        const first_index = layout.paneIndexById(first_pane_id) orelse return false;
-        const second_index = layout.paneIndexById(second_pane_id) orelse return false;
-        if (layout.panes.items[first_index].minimized or layout.panes.items[second_index].minimized) return false;
-        const first_ref = layout.panes.items[first_index].ref;
-        layout.panes.items[first_index].ref = layout.panes.items[second_index].ref;
-        layout.panes.items[second_index].ref = first_ref;
+        if (!layout.swapPaneRefs(first_pane_id, second_pane_id)) return false;
         self.markDirty();
+        return true;
+    }
+
+    pub fn moveWorkspacePaneInDirection(
+        self: *AppState,
+        project_index: usize,
+        pane_id: WorkspacePaneId,
+        direction: WorkspacePaneDirection,
+    ) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
+        const neighbor_id = layout.neighborPaneId(pane_id, direction) orelse return false;
+        if (!layout.swapPaneRefs(pane_id, neighbor_id)) return false;
+        layout.focused_pane_id = neighbor_id;
+        if (self.selected_project_index == project_index) {
+            _ = self.focusCurrentProjectWorkspacePane(neighbor_id);
+        } else {
+            self.markDirty();
+        }
         return true;
     }
 
     pub fn toggleCurrentProjectWorkspacePaneMaximized(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.toggleWorkspacePaneMaximized(self.selected_project_index, pane_id);
+    }
+
+    pub fn toggleWorkspacePaneMaximized(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
         if (pane.minimized) return false;
         layout.maximized_pane_id = if (layout.maximized_pane_id == pane_id) null else pane_id;
         layout.focused_pane_id = pane_id;
         switch (pane.ref) {
             .chat => |ref| {
-                var project = &self.projects.items[self.selected_project_index];
+                var project = &self.projects.items[project_index];
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
                 }
-                self.terminal_focused = false;
+                if (self.selected_project_index == project_index) self.terminal_focused = false;
             },
-            .terminal => |ref| self.requestTerminalDockFocus(ref.dock_id),
+            .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
             .browser => {
-                self.terminal_focused = false;
-                self.composer_focused = false;
+                if (self.selected_project_index == project_index) {
+                    self.terminal_focused = false;
+                    self.composer_focused = false;
+                }
             },
         }
         self.markDirty();
         return true;
     }
 
+    pub fn maximizeWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const layout = &self.projects.items[project_index].workspace_layout;
+        if (layout.maximized_pane_id == pane_id) return true;
+        return self.toggleWorkspacePaneMaximized(project_index, pane_id);
+    }
+
     pub fn clearCurrentProjectWorkspacePaneMaximized(self: *AppState) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.clearWorkspacePaneMaximized(self.selected_project_index);
+    }
+
+    pub fn clearWorkspacePaneMaximized(self: *AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
         if (layout.maximized_pane_id == null) return false;
         layout.maximized_pane_id = null;
         self.markDirty();
@@ -9404,7 +9834,12 @@ pub const AppState = struct {
 
     pub fn closeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
-        var project = &self.projects.items[self.selected_project_index];
+        return self.closeWorkspacePane(self.selected_project_index, pane_id);
+    }
+
+    pub fn closeWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
         var layout = &project.workspace_layout;
         if (layout.visiblePaneCount() <= 1) {
             self.setSidebarNotice("Cannot close the last workspace pane.");
@@ -9423,7 +9858,7 @@ pub const AppState = struct {
                         _ = project.removeTerminalDockById(self.allocator, ref.dock_id);
                     }
                 }
-                if (!layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
+                if (self.selected_project_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
                 self.setSidebarNotice("Terminal pane closed.");
             },
             .browser => {
@@ -9475,10 +9910,20 @@ pub const AppState = struct {
 
     pub fn splitCurrentProjectWorkspacePaneWithChatPlacement(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.splitWorkspacePaneWithChatPlacement(self.selected_project_index, pane_id, axis, new_after);
+    }
+
+    pub fn splitWorkspacePaneWithChatAxis(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        return self.splitWorkspacePaneWithChatPlacement(project_index, pane_id, axis, true);
+    }
+
+    pub fn splitWorkspacePaneWithChatPlacement(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
         const target = layout.paneById(pane_id) orelse return false;
         if (target.minimized) return false;
-        const thread_index = self.projects.items[self.selected_project_index].addThread(self.allocator) catch |err| {
+        const thread_index = project.addThread(self.allocator) catch |err| {
             log.err("failed to create chat thread for workspace pane: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create a new thread.");
             return false;
@@ -9494,9 +9939,12 @@ pub const AppState = struct {
             return false;
         };
         layout.maximized_pane_id = null;
-        self.terminal_focused = false;
-        self.requestComposerFocus();
-        self.syncRenameBuffer();
+        project.selected_thread_index = thread_index;
+        if (self.selected_project_index == project_index) {
+            self.terminal_focused = false;
+            self.requestComposerFocus();
+            self.syncRenameBuffer();
+        }
         self.setSidebarNotice("New chat pane ready.");
         self.markDirty();
         return true;
@@ -9657,18 +10105,27 @@ pub const AppState = struct {
 
     pub fn splitCurrentProjectWorkspacePaneWithTerminalPlacement(self: *AppState, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.splitWorkspacePaneWithTerminalPlacement(self.selected_project_index, pane_id, axis, new_after);
+    }
+
+    pub fn splitWorkspacePaneWithTerminalAxis(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis) bool {
+        return self.splitWorkspacePaneWithTerminalPlacement(project_index, pane_id, axis, true);
+    }
+
+    pub fn splitWorkspacePaneWithTerminalPlacement(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, new_after: bool) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
         const target = layout.paneById(pane_id) orelse return false;
         if (target.minimized) return false;
 
-        const dock_id = self.createCurrentProjectTerminalDock() catch |err| {
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
             log.err("failed to allocate terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create terminal dock.");
             return false;
         };
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        const project_path = self.currentProject().path;
-        dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, dock_id) catch |err| {
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
             log.err("failed to start terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start terminal.");
             return false;
@@ -9686,7 +10143,7 @@ pub const AppState = struct {
         };
         layout.maximized_pane_id = null;
         dock.visible = false;
-        self.requestTerminalFocus();
+        if (self.selected_project_index == project_index) self.requestTerminalFocus();
         self.setSidebarNotice("Terminal pane created.");
         self.markDirty();
         return true;
@@ -9694,7 +10151,12 @@ pub const AppState = struct {
 
     pub fn minimizeCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.minimizeWorkspacePane(self.selected_project_index, pane_id);
+    }
+
+    pub fn minimizeWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
         if (layout.visiblePaneCount() <= 1) {
             self.setSidebarNotice("Cannot minimize the last workspace pane.");
             return false;
@@ -9709,7 +10171,7 @@ pub const AppState = struct {
                     layout.focused_pane_id = next_id;
                 };
             }
-            if (self.focusedWorkspacePaneKind() != .terminal) self.terminal_focused = false;
+            if (self.selected_project_index == project_index and self.focusedWorkspacePaneKind() != .terminal) self.terminal_focused = false;
             self.setSidebarNotice("Workspace pane minimized.");
             self.markDirty();
             return true;
@@ -9731,7 +10193,12 @@ pub const AppState = struct {
 
     pub fn restoreCurrentProjectWorkspacePane(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        return self.restoreWorkspacePane(self.selected_project_index, pane_id);
+    }
+
+    pub fn restoreWorkspacePane(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
         for (layout.panes.items) |*pane| {
             if (pane.id != pane_id or !pane.minimized) continue;
             pane.minimized = false;
@@ -9741,15 +10208,22 @@ pub const AppState = struct {
                 return false;
             };
             switch (pane.ref) {
-                .chat => self.terminal_focused = false,
-                .terminal => self.requestTerminalFocus(),
+                .chat => {
+                    if (self.selected_project_index == project_index) self.terminal_focused = false;
+                },
+                .terminal => {
+                    if (self.selected_project_index == project_index) self.requestTerminalFocus();
+                },
                 .browser => {
-                    self.terminal_focused = false;
-                    self.composer_focused = false;
+                    if (self.selected_project_index == project_index) {
+                        self.terminal_focused = false;
+                        self.composer_focused = false;
+                    }
                     self.browser_state.setControlsVisible(true);
                     self.browser_state.controller.show() catch |err| {
                         log.warn("failed to restore browser runtime with pane: {s}", .{@errorName(err)});
                     };
+                    if (self.selected_project_index != project_index) self.noteBrowserPaneNotRendered();
                 },
             }
             self.setSidebarNotice("Workspace pane restored.");
@@ -9767,10 +10241,22 @@ pub const AppState = struct {
         ratio: f32,
     ) void {
         if (self.projects.items.len == 0) return;
-        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
-        if (layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) {
-            self.markDirty();
-        }
+        _ = self.resizeWorkspaceSplit(self.selected_project_index, first_pane_id, second_pane_id, axis, ratio);
+    }
+
+    pub fn resizeWorkspaceSplit(
+        self: *AppState,
+        project_index: usize,
+        first_pane_id: WorkspacePaneId,
+        second_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        ratio: f32,
+    ) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var layout = &self.projects.items[project_index].workspace_layout;
+        if (!layout.resizeSplit(first_pane_id, second_pane_id, axis, ratio)) return false;
+        self.markDirty();
+        return true;
     }
 
     pub fn nudgeCurrentProjectWorkspaceSplit(

@@ -56,6 +56,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
+    try w.writeAll("\"\n  local workspace=\"");
+    try writeWords(w, &spec.workspace_commands);
     try w.writeAll("\"\n  local pane=\"");
     try writeWords(w, &spec.pane_commands);
     try w.writeAll("\"\n  local chat=\"");
@@ -64,6 +66,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_draft_commands);
     try w.writeAll("\"\n  local browser=\"");
     try writeWords(w, &spec.browser_commands);
+    try w.writeAll("\"\n  local palette=\"");
+    try writeWords(w, &spec.palette_commands);
     try w.writeAll("\"\n  local terminal=\"");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
@@ -84,12 +88,26 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_split_flags);
     try w.writeAll("\"\n  local pane_resize_flags=\"");
     try writeWords(w, &spec.pane_resize_flags);
+    try w.writeAll("\"\n  local pane_move_flags=\"");
+    try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local workspace_select_flags=\"");
+    try writeWords(w, &spec.workspace_select_flags);
+    try w.writeAll("\"\n  local workspace_create_flags=\"");
+    try writeWords(w, &spec.workspace_create_flags);
+    try w.writeAll("\"\n  local workspace_rename_flags=\"");
+    try writeWords(w, &spec.workspace_rename_flags);
+    try w.writeAll("\"\n  local workspace_archive_flags=\"");
+    try writeWords(w, &spec.workspace_archive_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
     try writeWords(w, &spec.chat_draft_flags);
     try w.writeAll("\"\n  local chat_send_flags=\"");
     try writeWords(w, &spec.chat_send_flags);
     try w.writeAll("\"\n  local chat_approve_flags=\"");
     try writeWords(w, &spec.chat_approve_flags);
+    try w.writeAll("\"\n  local browser_open_flags=\"");
+    try writeWords(w, &spec.browser_open_flags);
+    try w.writeAll("\"\n  local browser_navigate_flags=\"");
+    try writeWords(w, &spec.browser_navigate_flags);
     try w.writeAll("\"\n  local browser_eval_flags=\"");
     try writeWords(w, &spec.browser_eval_flags);
     try w.writeAll("\"\n  local browser_post_json_flags=\"");
@@ -100,6 +118,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.browser_paste_text_flags);
     try w.writeAll("\"\n  local browser_inspector_mode_flags=\"");
     try writeWords(w, &spec.browser_inspector_mode_flags);
+    try w.writeAll("\"\n  local palette_run_flags=\"");
+    try writeWords(w, &spec.palette_run_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -112,6 +132,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.kind_values);
     try w.writeAll("\"\n  local axis_values=\"");
     try writeWords(w, &spec.axis_values);
+    try w.writeAll("\"\n  local direction_values=\"");
+    try writeWords(w, &spec.direction_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
     try w.writeAll("\"\n  local provider_values=\"");
@@ -124,10 +146,11 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\  case "$prev" in
         \\    --kind) COMPREPLY=( $(compgen -W "$kind_values" -- "$cur") ); return 0 ;;
         \\    --axis) COMPREPLY=( $(compgen -W "$axis_values" -- "$cur") ); return 0 ;;
+        \\    --direction) COMPREPLY=( $(compgen -W "$direction_values" -- "$cur") ); return 0 ;;
         \\    --decision) COMPREPLY=( $(compgen -W "$decision_values" -- "$cur") ); return 0 ;;
         \\    --provider) COMPREPLY=( $(compgen -W "$provider_values" -- "$cur") ); return 0 ;;
         \\    --mode) COMPREPLY=( $(compgen -W "$inspector_mode_values" -- "$cur") ); return 0 ;;
-        \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return 0 ;;
+        \\    --workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--lines|--command|--label) return 0 ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -166,10 +189,20 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\        case "$sub" in
         \\          panes|threads|terminals) COMPREPLY=( $(compgen -W "$project_json_flags" -- "$cur") ) ;;
         \\          inspect) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
+        \\          workspace)
+        \\            case "$third" in
+        \\              select) COMPREPLY=( $(compgen -W "$workspace_select_flags" -- "$cur") ) ;;
+        \\              create) COMPREPLY=( $(compgen -W "$workspace_create_flags" -- "$cur") ) ;;
+        \\              rename) COMPREPLY=( $(compgen -W "$workspace_rename_flags" -- "$cur") ) ;;
+        \\              archive) COMPREPLY=( $(compgen -W "$workspace_archive_flags" -- "$cur") ) ;;
+        \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\            esac
+        \\            ;;
         \\          pane)
         \\            case "$third" in
         \\              split) COMPREPLY=( $(compgen -W "$pane_split_flags" -- "$cur") ) ;;
         \\              resize) COMPREPLY=( $(compgen -W "$pane_resize_flags" -- "$cur") ) ;;
+        \\              move) COMPREPLY=( $(compgen -W "$pane_move_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$pane_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
@@ -183,11 +216,19 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\            ;;
         \\          browser)
         \\            case "$third" in
+        \\              open) COMPREPLY=( $(compgen -W "$browser_open_flags" -- "$cur") ) ;;
+        \\              navigate) COMPREPLY=( $(compgen -W "$browser_navigate_flags" -- "$cur") ) ;;
         \\              eval) COMPREPLY=( $(compgen -W "$browser_eval_flags" -- "$cur") ) ;;
         \\              post-json) COMPREPLY=( $(compgen -W "$browser_post_json_flags" -- "$cur") ) ;;
         \\              toolbar-hit) COMPREPLY=( $(compgen -W "$browser_toolbar_hit_flags" -- "$cur") ) ;;
         \\              paste-text) COMPREPLY=( $(compgen -W "$browser_paste_text_flags" -- "$cur") ) ;;
         \\              inspector-mode) COMPREPLY=( $(compgen -W "$browser_inspector_mode_flags" -- "$cur") ) ;;
+        \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\            esac
+        \\            ;;
+        \\          palette)
+        \\            case "$third" in
+        \\              run) COMPREPLY=( $(compgen -W "$palette_run_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\            esac
         \\            ;;
@@ -217,6 +258,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
         \\    2:live:*) COMPREPLY=( $(compgen -W "$live" -- "$cur") ) ;;
         \\    3:integrations:install:|3:integrations:remove:|3:integrations:disable:) COMPREPLY=( $(compgen -W "$integration_providers" -- "$cur") ) ;;
+        \\    3:live:workspace:*) COMPREPLY=( $(compgen -W "$workspace" -- "$cur") ) ;;
         \\    3:live:pane:*) COMPREPLY=( $(compgen -W "$pane" -- "$cur") ) ;;
         \\    3:live:chat:*) COMPREPLY=( $(compgen -W "$chat" -- "$cur") ) ;;
         \\    3:live:browser:*) COMPREPLY=( $(compgen -W "$browser" -- "$cur") ) ;;
@@ -260,6 +302,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.session_commands);
     try w.writeAll("\"\n  local live=\"");
     try writeWords(w, &spec.live_commands);
+    try w.writeAll("\"\n  local workspace=\"");
+    try writeWords(w, &spec.workspace_commands);
     try w.writeAll("\"\n  local pane=\"");
     try writeWords(w, &spec.pane_commands);
     try w.writeAll("\"\n  local chat=\"");
@@ -268,6 +312,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_draft_commands);
     try w.writeAll("\"\n  local browser=\"");
     try writeWords(w, &spec.browser_commands);
+    try w.writeAll("\"\n  local palette=\"");
+    try writeWords(w, &spec.palette_commands);
     try w.writeAll("\"\n  local terminal=\"");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("\"\n  local process=\"");
@@ -288,12 +334,26 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.pane_split_flags);
     try w.writeAll("\"\n  local pane_resize_flags=\"");
     try writeWords(w, &spec.pane_resize_flags);
+    try w.writeAll("\"\n  local pane_move_flags=\"");
+    try writeWords(w, &spec.pane_move_flags);
+    try w.writeAll("\"\n  local workspace_select_flags=\"");
+    try writeWords(w, &spec.workspace_select_flags);
+    try w.writeAll("\"\n  local workspace_create_flags=\"");
+    try writeWords(w, &spec.workspace_create_flags);
+    try w.writeAll("\"\n  local workspace_rename_flags=\"");
+    try writeWords(w, &spec.workspace_rename_flags);
+    try w.writeAll("\"\n  local workspace_archive_flags=\"");
+    try writeWords(w, &spec.workspace_archive_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
     try writeWords(w, &spec.chat_draft_flags);
     try w.writeAll("\"\n  local chat_send_flags=\"");
     try writeWords(w, &spec.chat_send_flags);
     try w.writeAll("\"\n  local chat_approve_flags=\"");
     try writeWords(w, &spec.chat_approve_flags);
+    try w.writeAll("\"\n  local browser_open_flags=\"");
+    try writeWords(w, &spec.browser_open_flags);
+    try w.writeAll("\"\n  local browser_navigate_flags=\"");
+    try writeWords(w, &spec.browser_navigate_flags);
     try w.writeAll("\"\n  local browser_eval_flags=\"");
     try writeWords(w, &spec.browser_eval_flags);
     try w.writeAll("\"\n  local browser_post_json_flags=\"");
@@ -302,6 +362,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.browser_toolbar_hit_flags);
     try w.writeAll("\"\n  local browser_paste_text_flags=\"");
     try writeWords(w, &spec.browser_paste_text_flags);
+    try w.writeAll("\"\n  local browser_inspector_mode_flags=\"");
+    try writeWords(w, &spec.browser_inspector_mode_flags);
+    try w.writeAll("\"\n  local palette_run_flags=\"");
+    try writeWords(w, &spec.palette_run_flags);
     try w.writeAll("\"\n  local terminal_write_flags=\"");
     try writeWords(w, &spec.terminal_write_flags);
     try w.writeAll("\"\n  local terminal_tail_flags=\"");
@@ -314,6 +378,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.kind_values);
     try w.writeAll("\"\n  local axis_values=\"");
     try writeWords(w, &spec.axis_values);
+    try w.writeAll("\"\n  local direction_values=\"");
+    try writeWords(w, &spec.direction_values);
     try w.writeAll("\"\n  local decision_values=\"");
     try writeWords(w, &spec.decision_values);
     try w.writeAll("\"\n  local provider_values=\"");
@@ -326,10 +392,11 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\  case "$prev" in
         \\    --kind) compadd -- ${(s: :)kind_values}; return ;;
         \\    --axis) compadd -- ${(s: :)axis_values}; return ;;
+        \\    --direction) compadd -- ${(s: :)direction_values}; return ;;
         \\    --decision) compadd -- ${(s: :)decision_values}; return ;;
         \\    --provider) compadd -- ${(s: :)provider_values}; return ;;
         \\    --mode) compadd -- ${(s: :)inspector_mode_values}; return ;;
-        \\    --workspace|--thread|--id|--pane|--first|--second|--ratio|--text|--prompt|--call|--name|--lines) return ;;
+        \\    --workspace|--project|--thread|--id|--pane|--first|--second|--ratio|--path|--url|--text|--target|--script|--json-payload|--prompt|--call|--name|--lines|--command|--label) return ;;
         \\  esac
         \\
         \\  if [[ "$cur" == -* ]]; then
@@ -368,10 +435,20 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\        case "$sub" in
         \\          panes|threads|terminals) compadd -- ${(s: :)project_json_flags} ;;
         \\          inspect) compadd -- ${(s: :)pane_flags} ;;
+        \\          workspace)
+        \\            case "$third" in
+        \\              select) compadd -- ${(s: :)workspace_select_flags} ;;
+        \\              create) compadd -- ${(s: :)workspace_create_flags} ;;
+        \\              rename) compadd -- ${(s: :)workspace_rename_flags} ;;
+        \\              archive) compadd -- ${(s: :)workspace_archive_flags} ;;
+        \\              *) compadd -- ${(s: :)json_flags} ;;
+        \\            esac
+        \\            ;;
         \\          pane)
         \\            case "$third" in
         \\              split) compadd -- ${(s: :)pane_split_flags} ;;
         \\              resize) compadd -- ${(s: :)pane_resize_flags} ;;
+        \\              move) compadd -- ${(s: :)pane_move_flags} ;;
         \\              *) compadd -- ${(s: :)pane_flags} ;;
         \\            esac
         \\            ;;
@@ -385,11 +462,19 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\            ;;
         \\          browser)
         \\            case "$third" in
+        \\              open) compadd -- ${(s: :)browser_open_flags} ;;
+        \\              navigate) compadd -- ${(s: :)browser_navigate_flags} ;;
         \\              eval) compadd -- ${(s: :)browser_eval_flags} ;;
         \\              post-json) compadd -- ${(s: :)browser_post_json_flags} ;;
         \\              toolbar-hit) compadd -- ${(s: :)browser_toolbar_hit_flags} ;;
         \\              paste-text) compadd -- ${(s: :)browser_paste_text_flags} ;;
         \\              inspector-mode) compadd -- ${(s: :)browser_inspector_mode_flags} ;;
+        \\              *) compadd -- ${(s: :)json_flags} ;;
+        \\            esac
+        \\            ;;
+        \\          palette)
+        \\            case "$third" in
+        \\              run) compadd -- ${(s: :)palette_run_flags} ;;
         \\              *) compadd -- ${(s: :)json_flags} ;;
         \\            esac
         \\            ;;
@@ -419,6 +504,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    3:session:*) compadd -- ${(s: :)session} ;;
         \\    3:live:*) compadd -- ${(s: :)live} ;;
         \\    4:integrations:install:|4:integrations:remove:|4:integrations:disable:) compadd -- ${(s: :)integration_providers} ;;
+        \\    4:live:workspace:*) compadd -- ${(s: :)workspace} ;;
         \\    4:live:pane:*) compadd -- ${(s: :)pane} ;;
         \\    4:live:chat:*) compadd -- ${(s: :)chat} ;;
         \\    4:live:browser:*) compadd -- ${(s: :)browser} ;;
@@ -474,6 +560,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.session_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live' -a '");
     try writeWords(w, &spec.live_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live workspace' -a '");
+    try writeWords(w, &spec.workspace_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live pane' -a '");
     try writeWords(w, &spec.pane_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live chat' -a '");
@@ -482,6 +570,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.chat_draft_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live browser' -a '");
     try writeWords(w, &spec.browser_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live palette' -a '");
+    try writeWords(w, &spec.palette_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live terminal' -a '");
     try writeWords(w, &spec.terminal_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after live process' -a '");
@@ -500,13 +590,19 @@ fn writeFish(w: *std.Io.Writer) !void {
         \\complete -c verde -l first -r -d 'First sibling pane id'
         \\complete -c verde -l second -r -d 'Second sibling pane id'
         \\complete -c verde -l ratio -r -d 'Split ratio'
+        \\complete -c verde -l direction -r -d 'Pane move direction'
+        \\complete -c verde -l path -r -d 'Workspace path'
+        \\complete -c verde -l url -r -d 'Browser URL'
         \\complete -c verde -l text -r -d 'Text argument'
+        \\complete -c verde -l target -r -d 'Browser toolbar target'
         \\complete -c verde -l prompt -r -d 'Prompt text'
         \\complete -c verde -l call -r -d 'Approval call id'
         \\complete -c verde -l name -r -d 'Configured process name'
         \\complete -c verde -l provider -r -d 'Provider name'
         \\complete -c verde -l lines -r -d 'Number of output lines'
         \\complete -c verde -l mode -r -d 'Browser inspector mode'
+        \\complete -c verde -l command -r -d 'Command palette id'
+        \\complete -c verde -l label -r -d 'Workspace label'
         \\complete -c verde -s h -l help -d 'Show help'
         \\
         \\complete -c verde -n '__verde_prev_is --kind' -a '
@@ -514,6 +610,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.kind_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --axis' -a '");
     try writeWords(w, &spec.axis_values);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --direction' -a '");
+    try writeWords(w, &spec.direction_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --decision' -a '");
     try writeWords(w, &spec.decision_values);
     try w.writeAll("'\ncomplete -c verde -n '__verde_prev_is --provider' -a '");

@@ -659,6 +659,16 @@ fn localFileHref(href: []const u8) ?[]const u8 {
     return trimmed;
 }
 
+fn webHref(href: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
+    if (std.ascii.startsWithIgnoreCase(trimmed, "https://") or
+        std.ascii.startsWithIgnoreCase(trimmed, "http://"))
+    {
+        return trimmed;
+    }
+    return null;
+}
+
 pub fn handleTranscriptPaletteMouseMotion(state: *app_state.AppState) void {
     if (transcript_scrollbar_drag_active and transcript_scrollbar_max_scroll > 1.0 and transcript_scrollbar_track.h > 0.0) {
         const pane_id = transcript_scrollbar_drag_pane_id;
@@ -764,6 +774,12 @@ pub fn handleTranscriptPaletteMouseButton(state: *app_state.AppState, x: f32, y:
                 state.blurPaletteComposer();
                 state.clearTranscriptMarkdownSelection();
                 state.openTranscriptFileReference(file_href);
+                return true;
+            }
+            if (webHref(link_hit.href)) |web_href| {
+                state.blurPaletteComposer();
+                state.clearTranscriptMarkdownSelection();
+                state.openTranscriptWebLink(web_href);
                 return true;
             }
         }

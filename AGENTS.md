@@ -94,6 +94,8 @@ verde live active --json
 verde live panes --project current --json
 verde live threads --project current --json
 verde live terminals --project current --json
+verde live browser status --json
+verde live palette list --json
 verde live processes --json
 ```
 
@@ -109,6 +111,7 @@ Pane and terminal smoke test:
 
 ```bash
 verde live pane split --pane <chat-pane-id> --kind terminal --axis vertical --json
+verde live pane move --pane <terminal-pane-id> --direction left --json
 verde live terminal write --pane <terminal-pane-id> --text $'printf "verde-cli-smoke\\n"\r' --json
 verde live process inspect --pane <terminal-pane-id> --json
 verde live pane close --pane <terminal-pane-id> --json
