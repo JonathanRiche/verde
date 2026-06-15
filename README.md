@@ -108,6 +108,7 @@ verde app                     # Launch the desktop app explicitly
 verde --help                  # Show CLI help
 verde version [--json]        # Print version metadata
 verde capabilities [--json]   # Print supported CLI/live features
+verde open <url> [--json]     # Open a URL in this Verde workspace's browser pane
 verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
 verde notify [options]        # Update the current terminal surface
@@ -198,8 +199,17 @@ verde live surfaces [--json]
 verde live processes [--json]
 verde live inspect --pane <pane-id> [--project <id|index|path|current>] [--json]
 verde live inspect --focused [--json]
+verde live browser status [--json]
+verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
+verde live browser navigate --url https://example.com [--json]
 verde live browser eval --script "document.title" [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
+verde live palette list [--json]
+verde live palette run --command pane.split_terminal_down [--json]
+verde live workspace select --project <id|index|path|current> [--json]
+verde live workspace create --path /path/to/project [--json]
+verde live workspace rename --project <id|index|path|current> --label "New name" [--json]
+verde live workspace archive --project <id|index|path|current> [--json]
 ```
 
 - `capabilities` prints the live method list without requiring the app to be
@@ -254,16 +264,47 @@ all terminal tools.
   Verde.
 - `inspect` returns details for a specific pane or the focused pane.
 
-### Browser Control
+### Palette Control
 
-Browser commands require the browser pane to be visible. They route through the
-same backend-neutral browser contract used by the Palette toolbar and inspector.
+Palette commands act on the currently selected desktop workspace, matching what
+the user could run from the command palette UI.
 
 ```bash
+verde live palette list [--json]
+verde live palette run --command pane.split_terminal_down [--json]
+```
+
+- `list` returns every stable static command-palette id with title, section, and
+  current enabled state.
+- `run` invokes one enabled command by stable id. Disabled commands return a
+  `rejected` live error; unknown ids return `not_found`.
+
+### Browser Control
+
+`verde open <url>` is shorthand for `verde live browser open --url <url>`.
+When run inside a Verde terminal pane, browser open defaults to that terminal's
+workspace by resolving `VERDE_WORKSPACE_ID`; outside Verde it defaults to the
+currently selected desktop workspace. The browser is a singleton runtime: opening
+it in another workspace moves the browser pane there.
+
+Browser commands route through the same backend-neutral browser contract used by
+the Palette toolbar and inspector. Commands other than `open` and `status`
+require the browser runtime to be visible somewhere.
+
+```bash
+verde open https://example.com [--json]
+verde live browser status [--json]
+verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
+verde live browser navigate --url https://ziglang.org [--json]
 verde live browser eval --script "JSON.stringify({title:document.title,url:location.href})" [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 ```
 
+- `status` returns browser visibility, suspension, URL, lifecycle status, and
+  the workspace/pane currently hosting the singleton browser.
+- `open` ensures a browser pane exists in the target workspace and optionally
+  navigates it without switching the selected workspace or focusing the URL bar.
+- `navigate` normalizes and loads a URL in the active singleton browser runtime.
 - `eval` queues JavaScript evaluation in the active browser runtime; inspect
   `verde live status --json` for `browser.last_eval_result`.
 - `post-json` sends a JSON payload through the host-to-page bridge.
@@ -271,6 +312,23 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
   default: `app://`, `localhost`, `127.0.0.1`, and `[::1]`. Set
   `VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE=1` only for local diagnostics that need
   arbitrary pages or `data:` URLs to call back into Verde.
+
+### Workspace Control
+
+Workspace commands mutate the project rail and return the updated workspace
+list.
+
+```bash
+verde live workspace select --project <id|index|path|current> [--json]
+verde live workspace create --path /path/to/project [--json]
+verde live workspace rename --project <id|index|path|current> --label "New name" [--json]
+verde live workspace archive --project <id|index|path|current> [--json]
+```
+
+- `create` resolves `~` and relative paths the same way as the workspace import
+  modal, and restores an archived workspace if the path was archived.
+- `select`, `rename`, and `archive` accept `--project` or `--workspace` using
+  id, index, path, or `current`.
 
 ### Pane Control
 
@@ -283,6 +341,7 @@ verde live pane focus --focused [--json]
 verde live pane split --pane <pane-id> --kind chat --axis horizontal [--json]
 verde live pane split --pane <pane-id> --kind terminal --axis vertical [--json]
 verde live pane resize --pane <pane-id> --first <pane-id> --second <pane-id> --axis horizontal --ratio 0.6 [--json]
+verde live pane move --pane <pane-id> --direction left|right|up|down [--json]
 verde live pane minimize --pane <pane-id> [--json]
 verde live pane maximize --pane <pane-id> [--json]
 verde live pane restore --pane <pane-id> [--json]
@@ -294,6 +353,8 @@ verde live pane close --pane <pane-id> [--json]
   `vertical`.
 - `resize` updates the split ratio between two sibling panes. `--ratio` is a
   floating-point value such as `0.6`.
+- `move` swaps the target pane with the adjacent structural pane in the given
+  direction, matching the keyboard move action.
 - `minimize`, `maximize`, `restore`, and `close` match the pane header actions
   in the UI.
 

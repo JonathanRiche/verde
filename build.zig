@@ -37,7 +37,10 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the desktop app from the repo root");
     run_step.dependOn(&run_cmd.step);
 
-    const test_cmd = addDesktopCommand(b, optimize, .{
+    // Desktop Debug builds are not currently a valid smoke-test target on Linux
+    // with Zig 0.16; use the same safe mode as the supported installable build.
+    const test_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseSafe else optimize;
+    const test_cmd = addDesktopCommand(b, test_optimize, .{
         .subcommand = "test",
         .forward_runtime_args = false,
         .target = target,

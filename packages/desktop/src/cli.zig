@@ -53,6 +53,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try printCapabilities(allocator, out, parsed.json);
         return .handled;
     }
+    if (std.mem.eql(u8, parsed.command, "open")) {
+        try handleOpen(allocator, out, io, parsed.rest, parsed.json);
+        return .handled;
+    }
     if (std.mem.eql(u8, parsed.command, "completion")) {
         try handleCompletion(allocator, out, parsed.rest);
         return .handled;
@@ -101,6 +105,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde --help                  Show this help
         \\  verde version [--json]        Print version metadata
         \\  verde capabilities [--json]   Print CLI capability metadata
+        \\  verde open <url>              Open a URL in this Verde workspace's browser pane
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
         \\  verde notify [options]        Update the current terminal surface
@@ -145,9 +150,11 @@ fn printHelp(out: output.Output) !void {
         \\  terminals [--workspace <id|index|current>] [--json]
         \\  surfaces [--json]
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
-        \\  pane focus|split|resize|minimize|maximize|restore|close ...
+        \\  workspace select|create|rename|archive ...
+        \\  pane focus|split|resize|move|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
-        \\  browser open|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
+        \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
+        \\  palette list|run ...
         \\  terminal write|tail|screen --pane <id> ...
         \\  process list|inspect|start|stop|restart|logs ...
         \\  stack status|start|stop|restart ...
@@ -527,6 +534,10 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
         try sendLiveRequest(allocator, out, io, "inspect", commonPaneParams(argv), json);
         return;
     }
+    if (std.mem.eql(u8, command, "workspace")) {
+        try handleLiveWorkspace(allocator, out, io, argv, json);
+        return;
+    }
     if (std.mem.eql(u8, command, "pane")) {
         try handleLivePane(allocator, out, io, argv, json);
         return;
@@ -537,6 +548,10 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     }
     if (std.mem.eql(u8, command, "browser")) {
         try handleLiveBrowser(allocator, out, io, argv, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "palette")) {
+        try handleLivePalette(allocator, out, io, argv, json);
         return;
     }
     if (std.mem.eql(u8, command, "terminal")) {
@@ -557,6 +572,30 @@ fn handleLive(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv
     }
     try out.stderr("unknown live command: {s}\n", .{command});
     std.process.exit(2);
+}
+
+fn handleOpen(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde open <url> [--project <id|index|path|current|self>] [--json]
+            \\
+            \\Opens or moves the singleton browser pane into the target workspace.
+            \\Defaults to the calling Verde terminal workspace when available;
+            \\otherwise defaults to the current desktop workspace.
+            \\
+        , .{});
+        return;
+    }
+
+    const url = args.optionValue(argv, "--url") orelse trailingFreeArg(argv, 0) orelse {
+        try out.stderr("verde open requires a URL\n", .{});
+        std.process.exit(2);
+    };
+    try sendLiveRequest(allocator, out, io, "browser.open", .{
+        .url = url,
+        .project = try liveBrowserOpenProject(out, argv),
+    }, json);
 }
 
 fn handleNotify(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8) !void {
@@ -920,6 +959,46 @@ fn printIntegrationNoInstalledHook(allocator: std.mem.Allocator, out: output.Out
     try out.stdout("verde integrations {s} {s}: no installed hook to change\n", .{ action, provider.name });
 }
 
+fn handleLiveWorkspace(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live workspace command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "select")) {
+        try sendLiveRequest(allocator, out, io, "workspace.select", .{
+            .workspace = workspaceOption(argv) orelse trailingFreeArg(argv, 2) orelse "current",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "create")) {
+        const path = args.optionValue(argv, "--path") orelse trailingFreeArg(argv, 2) orelse {
+            try out.stderr("verde live workspace create requires --path\n", .{});
+            std.process.exit(2);
+        };
+        try sendLiveRequest(allocator, out, io, "workspace.create", .{ .path = path }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "rename")) {
+        const label = args.optionValue(argv, "--label") orelse args.optionValue(argv, "--name") orelse trailingFreeArg(argv, 2) orelse {
+            try out.stderr("verde live workspace rename requires --label\n", .{});
+            std.process.exit(2);
+        };
+        try sendLiveRequest(allocator, out, io, "workspace.rename", .{
+            .workspace = workspaceOption(argv),
+            .label = label,
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "archive")) {
+        try sendLiveRequest(allocator, out, io, "workspace.archive", .{
+            .workspace = workspaceOption(argv) orelse trailingFreeArg(argv, 2) orelse "current",
+        }, json);
+        return;
+    }
+    try out.stderr("unknown live workspace command: {s}\n", .{subcommand});
+    std.process.exit(2);
+}
+
 fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
     const subcommand = args.positional(argv, 1) orelse {
         try out.stderr("missing live pane command\n", .{});
@@ -944,6 +1023,15 @@ fn handleLivePane(allocator: std.mem.Allocator, out: output.Output, io: std.Io, 
             .second = try requiredIntOption(out, argv, "--second"),
             .axis = args.optionValue(argv, "--axis") orelse "horizontal",
             .ratio = try requiredFloatOption(out, argv, "--ratio"),
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "move")) {
+        try sendLiveRequest(allocator, out, io, "pane.move", .{
+            .workspace = workspaceOption(argv),
+            .pane = try paneOption(out, argv),
+            .focused = args.hasFlag(argv, "--focused"),
+            .direction = args.optionValue(argv, "--direction") orelse trailingFreeArg(argv, 2) orelse "right",
         }, json);
         return;
     }
@@ -1010,7 +1098,23 @@ fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.I
         std.process.exit(2);
     };
     if (std.mem.eql(u8, subcommand, "open")) {
-        try sendLiveRequest(allocator, out, io, "browser.open", .{}, json);
+        const url = args.optionValue(argv, "--url") orelse trailingFreeArg(argv, 2);
+        try sendLiveRequest(allocator, out, io, "browser.open", .{
+            .url = url,
+            .project = try liveBrowserOpenProject(out, argv),
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "navigate")) {
+        const url = args.optionValue(argv, "--url") orelse trailingFreeArg(argv, 2) orelse {
+            try out.stderr("verde live browser navigate requires --url\n", .{});
+            std.process.exit(2);
+        };
+        try sendLiveRequest(allocator, out, io, "browser.navigate", .{ .url = url }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "status")) {
+        try sendLiveRequest(allocator, out, io, "browser.status", .{}, json);
         return;
     }
     if (std.mem.eql(u8, subcommand, "close")) {
@@ -1160,6 +1264,27 @@ fn handleLiveBrowser(allocator: std.mem.Allocator, out: output.Output, io: std.I
         return;
     }
     try out.stderr("unknown live browser command: {s}\n", .{subcommand});
+    std.process.exit(2);
+}
+
+fn handleLivePalette(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const subcommand = args.positional(argv, 1) orelse {
+        try out.stderr("missing live palette command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, subcommand, "list")) {
+        try sendLiveRequest(allocator, out, io, "palette.list", .{}, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "run")) {
+        const command = args.optionValue(argv, "--command") orelse trailingFreeArg(argv, 2) orelse {
+            try out.stderr("verde live palette run requires --command\n", .{});
+            std.process.exit(2);
+        };
+        try sendLiveRequest(allocator, out, io, "palette.run", .{ .command = command }, json);
+        return;
+    }
+    try out.stderr("unknown live palette command: {s}\n", .{subcommand});
     std.process.exit(2);
 }
 
@@ -1959,6 +2084,20 @@ fn commonPaneParams(argv: []const []const u8) struct { workspace: ?[]const u8, p
     };
 }
 
+fn liveBrowserOpenProject(out: output.Output, argv: []const []const u8) ![]const u8 {
+    if (workspaceOption(argv)) |value| return try resolveLiveProjectSelector(out, value);
+    if (getenvSlice("VERDE_WORKSPACE_ID")) |workspace_id| return workspace_id;
+    return "current";
+}
+
+fn resolveLiveProjectSelector(out: output.Output, value: []const u8) ![]const u8 {
+    if (!std.mem.eql(u8, value, "self")) return value;
+    if (getenvSlice("VERDE_WORKSPACE_ID")) |workspace_id| return workspace_id;
+    if (getenvSlice("VERDE_WORKSPACE_PATH")) |workspace_path| return workspace_path;
+    try out.stderr("project selector 'self' requires VERDE_WORKSPACE_ID or VERDE_WORKSPACE_PATH\n", .{});
+    std.process.exit(2);
+}
+
 fn processParams(argv: []const []const u8) struct { workspace: ?[]const u8, pane: ?u32, focused: bool, name: ?[]const u8, lines: ?u32 } {
     return .{
         .workspace = workspaceOption(argv),
@@ -2050,11 +2189,28 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--first") or
         std.mem.eql(u8, name, "--second") or
         std.mem.eql(u8, name, "--ratio") or
+        std.mem.eql(u8, name, "--direction") or
+        std.mem.eql(u8, name, "--path") or
+        std.mem.eql(u8, name, "--url") or
         std.mem.eql(u8, name, "--text") or
+        std.mem.eql(u8, name, "--target") or
+        std.mem.eql(u8, name, "--title") or
+        std.mem.eql(u8, name, "--body") or
+        std.mem.eql(u8, name, "--status") or
+        std.mem.eql(u8, name, "--progress") or
+        std.mem.eql(u8, name, "--label") or
+        std.mem.eql(u8, name, "--session") or
+        std.mem.eql(u8, name, "--session-id") or
+        std.mem.eql(u8, name, "--dock") or
+        std.mem.eql(u8, name, "--script") or
+        std.mem.eql(u8, name, "--json-payload") or
+        std.mem.eql(u8, name, "--mode") or
+        std.mem.eql(u8, name, "--command") or
         std.mem.eql(u8, name, "--prompt") or
         std.mem.eql(u8, name, "--call") or
         std.mem.eql(u8, name, "--decision") or
         std.mem.eql(u8, name, "--name") or
+        std.mem.eql(u8, name, "--provider") or
         std.mem.eql(u8, name, "--lines") or
         std.mem.eql(u8, name, "--thread");
 }
@@ -2277,4 +2433,32 @@ test "cli args parse command and json flag" {
     const parsed = args.parse(&argv);
     try std.testing.expectEqualStrings("state", parsed.command);
     try std.testing.expect(parsed.json);
+}
+
+test "open free arg skips project option value" {
+    const argv = [_][]const u8{ "--project", "self", "https://example.com" };
+    const url = trailingFreeArg(&argv, 0) orelse return error.MissingUrl;
+    try std.testing.expectEqualStrings("https://example.com", url);
+}
+
+test "label consumes its value for trailing free arg parsing" {
+    const argv = [_][]const u8{ "workspace", "rename", "--label", "new label" };
+    try std.testing.expect(trailingFreeArg(&argv, 2) == null);
+    try std.testing.expect(optionConsumesValue("--label"));
+}
+
+fn flagIsBare(name: []const u8) bool {
+    return std.mem.eql(u8, name, "--help") or
+        std.mem.eql(u8, name, "-h") or
+        std.mem.eql(u8, name, "--json") or
+        std.mem.eql(u8, name, "--focused") or
+        std.mem.eql(u8, name, "--clear") or
+        std.mem.eql(u8, name, "--quiet");
+}
+
+test "value-taking cli spec flags are covered by free arg parser" {
+    for (spec.all_flags) |flag| {
+        if (flagIsBare(flag)) continue;
+        try std.testing.expect(optionConsumesValue(flag));
+    }
 }

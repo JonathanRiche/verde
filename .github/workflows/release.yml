@@ -87,6 +87,7 @@ jobs:
       - name: Install Zig
         shell: bash
         run: |
+          ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
           ZIG_DOWNLOAD="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           ZIG_DIR="zig-x86_64-linux-${ZIG_VERSION}"
           curl -fL --retry 5 --retry-delay 2 "${ZIG_DOWNLOAD}" -o zig.tar.xz
@@ -228,6 +229,7 @@ jobs:
       - name: Install Zig
         shell: bash
         run: |
+          ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
           case "${{ matrix.target }}" in
             macos-x86_64)
               ZIG_DOWNLOAD="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-macos-${ZIG_VERSION}.tar.xz"

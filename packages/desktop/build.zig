@@ -364,6 +364,7 @@ pub fn build(b: *std.Build) void {
             chat_markdown_tests.root_module.addLibraryPath(sdl3_prebuilt.path("lib"));
         }
         chat_markdown_tests.root_module.linkSystemLibrary("SDL3", .{});
+        chat_markdown_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         chat_markdown_tests.root_module.linkSystemLibrary("util", .{});
     }
     test_step.dependOn(&b.addRunArtifact(chat_markdown_tests).step);
@@ -426,6 +427,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{},
         });
         exe_tests.root_module.linkSystemLibrary("SDL3", .{});
+        exe_tests.root_module.linkSystemLibrary("SDL3_ttf", .{});
         exe_tests.root_module.linkSystemLibrary("util", .{});
         exe_tests.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
     } else if (target.result.os.tag == .macos) {
