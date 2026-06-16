@@ -1482,9 +1482,85 @@ pub const ChatPaneRef = struct {
 
 pub const TerminalPaneRef = struct {
     dock_id: u32 = 0,
+    purpose: TerminalPanePurpose = .normal,
 };
 
-pub const BrowserPaneRef = struct {};
+pub const TerminalPanePurpose = enum {
+    normal,
+    editor,
+};
+
+pub const BrowserPaneRef = struct {
+    url: ?[]u8 = null,
+    title: ?[]u8 = null,
+    history: std.ArrayList([]u8) = .empty,
+    history_index: ?usize = null,
+
+    fn deinit(self: *BrowserPaneRef, allocator: std.mem.Allocator) void {
+        if (self.url) |url| allocator.free(url);
+        if (self.title) |title| allocator.free(title);
+        for (self.history.items) |entry| allocator.free(entry);
+        self.history.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn setUrl(self: *BrowserPaneRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
+        if (self.url) |url| allocator.free(url);
+        self.url = if (value) |slice| try allocator.dupe(u8, slice) else null;
+    }
+
+    fn setTitle(self: *BrowserPaneRef, allocator: std.mem.Allocator, value: ?[]const u8) !void {
+        if (self.title) |title| allocator.free(title);
+        self.title = if (value) |slice| try allocator.dupe(u8, slice) else null;
+    }
+
+    fn recordNavigation(self: *BrowserPaneRef, allocator: std.mem.Allocator, url: []const u8) !void {
+        if (self.url) |current| {
+            if (std.mem.eql(u8, current, url)) return;
+        }
+
+        if (self.history_index) |index| {
+            if (index < self.history.items.len and std.mem.eql(u8, self.history.items[index], url)) {
+                try self.setUrl(allocator, url);
+                return;
+            }
+            const remove_index = index + 1;
+            while (self.history.items.len > remove_index) {
+                allocator.free(self.history.items[self.history.items.len - 1]);
+                self.history.items.len -= 1;
+            }
+        } else if (self.history.items.len > 0) {
+            for (self.history.items) |entry| allocator.free(entry);
+            self.history.clearRetainingCapacity();
+        }
+
+        try self.appendHistoryEntry(allocator, url);
+        self.history_index = self.history.items.len - 1;
+        try self.setUrl(allocator, url);
+    }
+
+    fn appendHistoryEntry(self: *BrowserPaneRef, allocator: std.mem.Allocator, url: []const u8) !void {
+        const owned = try allocator.dupe(u8, url);
+        errdefer allocator.free(owned);
+        try self.history.append(allocator, owned);
+    }
+
+    fn historyTarget(self: *const BrowserPaneRef, delta: i32) ?struct { index: usize, url: []const u8 } {
+        const index = self.history_index orelse return null;
+        const target: isize = @as(isize, @intCast(index)) + @as(isize, @intCast(delta));
+        if (target < 0) return null;
+        const target_index: usize = @intCast(target);
+        if (target_index >= self.history.items.len) return null;
+        return .{ .index = target_index, .url = self.history.items[target_index] };
+    }
+};
+
+fn deinitWorkspacePaneRef(ref: *WorkspacePaneRef, allocator: std.mem.Allocator) void {
+    switch (ref.*) {
+        .browser => |*browser| browser.deinit(allocator),
+        .chat, .terminal => {},
+    }
+}
 
 pub const BrowserOpenResult = struct {
     pane_id: WorkspacePaneId,
@@ -1682,12 +1758,13 @@ pub const WorkspaceLayout = struct {
 
     fn deinit(self: *WorkspaceLayout, allocator: std.mem.Allocator) void {
         if (self.root) |root| destroyNode(allocator, root);
+        for (self.panes.items) |*pane| deinitWorkspacePaneRef(&pane.ref, allocator);
         self.panes.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureDefaultChat(self: *WorkspaceLayout, allocator: std.mem.Allocator) !void {
-        if (self.root != null and self.panes.items.len > 0) {
+        if (self.root != null and self.panes.items.len > 0 and self.firstVisiblePaneId() != null) {
             if (self.focused_pane_id == null) {
                 self.focused_pane_id = self.firstVisiblePaneId();
             }
@@ -1815,6 +1892,16 @@ pub const WorkspaceLayout = struct {
         return false;
     }
 
+    fn hasEditorTerminalDockPane(self: *const WorkspaceLayout, dock_id: u32) bool {
+        for (self.panes.items) |pane| {
+            switch (pane.ref) {
+                .terminal => |ref| if (ref.dock_id == dock_id and ref.purpose == .editor) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn maxTerminalDockId(self: *const WorkspaceLayout) u32 {
         var max_id: u32 = 0;
         for (self.panes.items) |pane| {
@@ -1875,11 +1962,15 @@ pub const WorkspaceLayout = struct {
     }
 
     fn createTerminalPane(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32) !WorkspacePaneId {
+        return self.createTerminalPaneWithPurpose(allocator, dock_id, .normal);
+    }
+
+    fn createTerminalPaneWithPurpose(self: *WorkspaceLayout, allocator: std.mem.Allocator, dock_id: u32, purpose: TerminalPanePurpose) !WorkspacePaneId {
         const pane_id = self.next_pane_id;
         self.next_pane_id += 1;
         try self.panes.append(allocator, .{
             .id = pane_id,
-            .ref = .{ .terminal = .{ .dock_id = dock_id } },
+            .ref = .{ .terminal = .{ .dock_id = dock_id, .purpose = purpose } },
         });
         return pane_id;
     }
@@ -1940,6 +2031,43 @@ pub const WorkspaceLayout = struct {
             }
         }
         return changed;
+    }
+
+    fn closePaneKind(self: *WorkspaceLayout, allocator: std.mem.Allocator, kind: WorkspacePaneKind) bool {
+        var changed = false;
+        var index: usize = 0;
+        while (index < self.panes.items.len) {
+            const pane = self.panes.items[index];
+            if (std.meta.activeTag(pane.ref) != kind) {
+                index += 1;
+                continue;
+            }
+            if (self.root) |root_node| {
+                self.root = removePaneFromTree(allocator, root_node, pane.id);
+            }
+            var removed_ref = self.panes.items[index].ref;
+            deinitWorkspacePaneRef(&removed_ref, allocator);
+            _ = self.panes.orderedRemove(index);
+            changed = true;
+        }
+        if (!changed) return false;
+
+        if (self.focused_pane_id) |pane_id| {
+            const focused = self.paneById(pane_id);
+            if (focused == null or focused.?.minimized) self.focused_pane_id = self.firstVisiblePaneId();
+        }
+        if (self.maximized_pane_id) |pane_id| {
+            const maximized = self.paneById(pane_id);
+            if (maximized == null or maximized.?.minimized) self.maximized_pane_id = null;
+        }
+        if (self.root == null) {
+            if (self.firstVisiblePaneId()) |pane_id| {
+                self.replaceRootWithLeaf(allocator, pane_id) catch {
+                    self.focused_pane_id = pane_id;
+                };
+            }
+        }
+        return true;
     }
 
     fn closePane(self: *WorkspaceLayout, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) ?WorkspacePaneRef {
@@ -2060,10 +2188,34 @@ pub const WorkspaceLayout = struct {
                     try stringify.write("terminal");
                     try stringify.objectField("dock");
                     try stringify.write(ref.dock_id);
+                    if (ref.purpose != .normal) {
+                        try stringify.objectField("purpose");
+                        try stringify.write(@tagName(ref.purpose));
+                    }
                 },
-                .browser => {
+                .browser => |ref| {
                     try stringify.objectField("kind");
                     try stringify.write("browser");
+                    if (ref.url) |url| {
+                        try stringify.objectField("url");
+                        try stringify.write(url);
+                    }
+                    if (ref.title) |title| {
+                        try stringify.objectField("title");
+                        try stringify.write(title);
+                    }
+                    try stringify.objectField("history_index");
+                    if (ref.history_index) |history_index| {
+                        try stringify.write(history_index);
+                    } else {
+                        try stringify.write(null);
+                    }
+                    try stringify.objectField("history");
+                    try stringify.beginArray();
+                    for (ref.history.items) |entry| {
+                        try stringify.write(entry);
+                    }
+                    try stringify.endArray();
                 },
             }
             try stringify.endObject();
@@ -2114,17 +2266,50 @@ pub const WorkspaceLayout = struct {
                 });
             } else if (std.mem.eql(u8, kind, "terminal")) {
                 const dock_id: u32 = @intCast(jsonInt(pane_value.object.get("dock") orelse .null) orelse 0);
+                const purpose_label = jsonString(pane_value.object.get("purpose") orelse .null) orelse "normal";
+                const purpose: TerminalPanePurpose = if (std.mem.eql(u8, purpose_label, "editor")) .editor else .normal;
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
-                    .ref = .{ .terminal = .{ .dock_id = dock_id } },
+                    .ref = .{ .terminal = .{ .dock_id = dock_id, .purpose = purpose } },
                     .minimized = minimized,
                 });
             } else if (std.mem.eql(u8, kind, "browser")) {
+                var browser_ref: BrowserPaneRef = .{};
+                var browser_ref_owned = true;
+                errdefer if (browser_ref_owned) browser_ref.deinit(allocator);
+                if (jsonString(pane_value.object.get("url") orelse .null)) |url| {
+                    try browser_ref.setUrl(allocator, url);
+                }
+                if (jsonString(pane_value.object.get("title") orelse .null)) |title| {
+                    try browser_ref.setTitle(allocator, title);
+                }
+                if (pane_value.object.get("history")) |history_value| {
+                    if (history_value == .array) {
+                        for (history_value.array.items) |entry_value| {
+                            const entry = jsonString(entry_value) orelse continue;
+                            try browser_ref.appendHistoryEntry(allocator, entry);
+                        }
+                    }
+                }
+                if (jsonInt(pane_value.object.get("history_index") orelse .null)) |history_index| {
+                    if (history_index >= 0 and @as(usize, @intCast(history_index)) < browser_ref.history.items.len) {
+                        browser_ref.history_index = @intCast(history_index);
+                    }
+                } else if (browser_ref.url != null and browser_ref.history.items.len == 0) {
+                    try browser_ref.appendHistoryEntry(allocator, browser_ref.url.?);
+                    browser_ref.history_index = 0;
+                }
+                if (browser_ref.url == null and browser_ref.history.items.len > 0) {
+                    const restore_index = browser_ref.history_index orelse browser_ref.history.items.len - 1;
+                    try browser_ref.setUrl(allocator, browser_ref.history.items[restore_index]);
+                    browser_ref.history_index = restore_index;
+                }
                 try next_layout.panes.append(allocator, .{
                     .id = pane_id,
-                    .ref = .{ .browser = .{} },
+                    .ref = .{ .browser = browser_ref },
                     .minimized = minimized,
                 });
+                browser_ref_owned = false;
             }
             if (pane_id >= next_layout.next_pane_id) next_layout.next_pane_id = pane_id + 1;
         }
@@ -5516,7 +5701,9 @@ pub const AppState = struct {
     }
 
     pub fn canOpenCurrentProjectEditor(self: *const AppState, target: ProjectEditorTarget) bool {
-        return self.projects.items.len > 0 and utils.canOpenProjectEditor(target);
+        if (self.projects.items.len == 0) return false;
+        if (target == .configured and utils.configuredEditorIsNeovim()) return true;
+        return utils.canOpenProjectEditor(target);
     }
 
     pub fn configuredEditorDisplayName(self: *const AppState) ?[]const u8 {
@@ -6118,6 +6305,11 @@ pub const AppState = struct {
             return;
         }
 
+        if (target == .configured and utils.configuredEditorIsNeovim()) {
+            self.openCurrentProjectNeovimEditorPane();
+            return;
+        }
+
         utils.openProjectEditor(self.allocator, self.currentProject().path, target) catch |err| {
             log.warn("failed to open workspace editor: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to open workspace editor.");
@@ -6125,6 +6317,30 @@ pub const AppState = struct {
         };
         log.info("openCurrentProjectEditor target={s} completed", .{@tagName(target)});
         self.setSidebarNotice(projectEditorOpenedNotice(target));
+    }
+
+    fn openCurrentProjectNeovimEditorPane(self: *AppState) void {
+        const command = utils.configuredEditorTerminalCommandAlloc(self.allocator) catch |err| {
+            log.warn("failed to build Neovim editor command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open workspace editor.");
+            return;
+        } orelse {
+            utils.openProjectEditor(self.allocator, self.currentProject().path, .configured) catch |err| {
+                log.warn("failed to open workspace editor: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open workspace editor.");
+            };
+            return;
+        };
+        defer self.allocator.free(command);
+
+        const pane_id = self.openCurrentProjectTerminalPaneForCommand() orelse return;
+        _ = self.writeWorkspaceTerminalPane(pane_id, command) catch |err| {
+            log.warn("failed to write Neovim editor command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to open workspace editor.");
+            return;
+        };
+        self.setSidebarNotice("Opened workspace in Neovim.");
+        self.markDirty();
     }
 
     pub fn openTranscriptFileReference(self: *AppState, file_path: []const u8) void {
@@ -7263,8 +7479,13 @@ pub const AppState = struct {
                 };
                 if (changed and project_index == self.selected_project_index and base_visible) visible_changed = true;
             }
+            var exited_editor_dock_id: ?u32 = null;
             for (project.terminal_docks.items) |*entry| {
                 const dock_visible = entry.dock.visible or project.workspace_layout.hasTerminalDockPane(entry.id);
+                if (dock_visible and !entry.dock.hasRunningSession() and project.workspace_layout.hasEditorTerminalDockPane(entry.id)) {
+                    exited_editor_dock_id = entry.id;
+                    break;
+                }
                 if (project_selected and dock_visible and !entry.dock.hasRunningSession()) {
                     entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id) catch |err| {
                         log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
@@ -7287,10 +7508,40 @@ pub const AppState = struct {
                 };
                 if (changed and project_index == self.selected_project_index and dock_visible) visible_changed = true;
             }
+            if (exited_editor_dock_id) |dock_id| {
+                if (self.closeExitedEditorTerminalPane(project_index, dock_id) and project_index == self.selected_project_index) {
+                    visible_changed = true;
+                }
+            }
             self.pollManagedProcesses(project_index);
         }
         if (visible_changed) self.last_terminal_output_ms = monotonicMs();
         return visible_changed;
+    }
+
+    fn closeExitedEditorTerminalPane(self: *AppState, project_index: usize, dock_id: u32) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        const pane_id = layout.visibleTerminalPaneIdForDock(dock_id) orelse return false;
+        const pane = layout.paneById(pane_id) orelse return false;
+        const terminal_ref = switch (pane.ref) {
+            .terminal => |ref| ref,
+            else => return false,
+        };
+        if (terminal_ref.purpose != .editor) return false;
+        if (layout.visiblePaneCount() <= 1) return false;
+
+        if (project.terminalDockEntryById(dock_id)) |entry| {
+            entry.dock.terminateAllSessions();
+            _ = project.removeTerminalDockById(self.allocator, dock_id);
+        }
+        var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+        defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
+        if (self.selected_project_index == project_index and !layout.hasVisiblePaneKind(.terminal)) self.terminal_focused = false;
+        self.setSidebarNotice("Editor pane closed.");
+        self.markDirty();
+        return true;
     }
 
     fn drainTerminalDockNotifications(self: *AppState, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
@@ -7364,8 +7615,11 @@ pub const AppState = struct {
         if (!self.browser_textures_enabled) return;
         if (self.browser_launch_open_delay_frames > 0 or self.browser_state.controls_visible) return;
         if (self.projects.items.len == 0) return;
-        const layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
         if (!layout.hasVisiblePaneKind(.browser)) return;
+        if (layout.visibleBrowserPaneId()) |pane_id| {
+            self.applyBrowserPaneSnapshotToRuntime(self.selected_project_index, pane_id);
+        }
         self.browser_launch_open_delay_frames = 2;
     }
 
@@ -7408,8 +7662,14 @@ pub const AppState = struct {
         if (self.projects.items.len > 0) {
             self.projects.items[self.selected_project_index].workspace_layout.maximized_pane_id = null;
         }
+        if (browser_pane_id) |pane_id| {
+            self.applyBrowserPaneSnapshotToRuntime(self.selected_project_index, pane_id);
+        }
+        const restore_url = if (browser_pane_id) |pane_id|
+            self.browserPaneSnapshotUrl(self.selected_project_index, pane_id)
+        else
+            null;
 
-        const restore_last_url = !self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null;
         self.browser_state.setControlsVisible(true);
         self.browser_address_focused = true;
         self.browser_address_cursor = self.browser_state.addressInput().len;
@@ -7418,9 +7678,22 @@ pub const AppState = struct {
         self.composer_focused = false;
         if (browser_pane_id) |pane_id| _ = self.focusCurrentProjectWorkspacePane(pane_id);
         self.browser_state.status = .opening;
-        if (restore_last_url) {
+        if (restore_url) |url| {
+            if (!isBlankBrowserUrl(url)) {
+                self.navigateBrowserToUrl(url) catch |err| {
+                    log.err("failed to restore browser runtime: {s}", .{@errorName(err)});
+                    self.browser_state.status = .failed;
+                    self.browser_state.setLastError("Failed to restore browser runtime.") catch {};
+                    self.setSidebarNotice("Failed to reopen browser.");
+                    return;
+                };
+                self.blurNativeBrowserForAddressField();
+                self.setSidebarNotice("Browser reopened.");
+                return;
+            }
+        } else if (!self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null) {
             const url = self.browser_state.current_url.?;
-            self.browser_state.controller.navigate(url) catch |err| {
+            self.navigateBrowserToUrl(url) catch |err| {
                 log.err("failed to restore browser runtime: {s}", .{@errorName(err)});
                 self.browser_state.status = .failed;
                 self.browser_state.setLastError("Failed to restore browser runtime.") catch {};
@@ -7469,12 +7742,14 @@ pub const AppState = struct {
 
         for (self.projects.items, 0..) |*project, index| {
             if (index == project_index) continue;
-            _ = project.workspace_layout.minimizePaneKind(self.allocator, .browser);
+            _ = project.workspace_layout.closePaneKind(self.allocator, .browser);
         }
 
         var layout = &self.projects.items[project_index].workspace_layout;
         const browser_pane_id = try layout.ensureBrowserPane(self.allocator);
         layout.maximized_pane_id = null;
+        self.applyBrowserPaneSnapshotToRuntime(project_index, browser_pane_id);
+        const restore_url = self.browserPaneSnapshotUrl(project_index, browser_pane_id);
 
         if (project_index == selected_index) {
             self.restoreWorkspaceFocusIfVisible(project_index, selected_focus, browser_pane_id);
@@ -7490,6 +7765,12 @@ pub const AppState = struct {
 
         if (url) |target_url| {
             try self.navigateBrowserToUrl(target_url);
+        } else if (restore_url) |target_url| {
+            if (isBlankBrowserUrl(target_url)) {
+                try self.showBrowserRuntimeForLiveOpen();
+            } else {
+                try self.navigateBrowserToUrl(target_url);
+            }
         } else if (!self.browser_state.controller.runtimeInitialized() and self.browser_state.current_url != null) {
             try self.navigateBrowserToUrl(self.browser_state.current_url.?);
         } else {
@@ -7530,6 +7811,7 @@ pub const AppState = struct {
         };
         self.browser_state.setAddress(normalized);
         self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.recordVisibleBrowserPaneNavigation(normalized);
         self.setSidebarNotice("Browser navigation requested.");
     }
 
@@ -7555,6 +7837,85 @@ pub const AppState = struct {
     pub fn browserWorkspacePaneId(self: *const AppState) ?WorkspacePaneId {
         const location = self.browserWorkspaceLocation() orelse return null;
         return location.pane_id;
+    }
+
+    fn browserPaneRefMutable(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) ?*BrowserPaneRef {
+        if (project_index >= self.projects.items.len) return null;
+        const pane = self.projects.items[project_index].workspace_layout.paneByIdMutable(pane_id) orelse return null;
+        return switch (pane.ref) {
+            .browser => |*ref| ref,
+            else => null,
+        };
+    }
+
+    fn visibleBrowserPaneRefMutable(self: *AppState) ?*BrowserPaneRef {
+        const location = self.browserWorkspaceLocation() orelse return null;
+        return self.browserPaneRefMutable(location.index, location.pane_id);
+    }
+
+    fn browserPaneSnapshotUrl(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) ?[]const u8 {
+        const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return null;
+        return ref.url;
+    }
+
+    fn applyBrowserPaneSnapshotToRuntime(self: *AppState, project_index: usize, pane_id: WorkspacePaneId) void {
+        const ref = self.browserPaneRefMutable(project_index, pane_id) orelse return;
+        if (ref.url) |url| {
+            self.browser_state.setCurrentUrl(url) catch |err| {
+                log.warn("failed to restore browser pane URL: {s}", .{@errorName(err)});
+            };
+            self.browser_state.setAddress(url);
+            self.browser_address_cursor = self.browser_state.addressInput().len;
+        }
+        if (ref.title) |title| {
+            self.browser_state.setCurrentTitle(title) catch |err| {
+                log.warn("failed to restore browser pane title: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn recordVisibleBrowserPaneNavigation(self: *AppState, url: []const u8) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        if (isBlankBrowserUrl(url)) {
+            if (ref.url) |existing_url| {
+                if (!isBlankBrowserUrl(existing_url)) return;
+            }
+        }
+        ref.recordNavigation(self.allocator, url) catch |err| {
+            log.warn("failed to persist browser pane URL history: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    fn recordVisibleBrowserPaneTitle(self: *AppState, title: []const u8) void {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return;
+        ref.setTitle(self.allocator, title) catch |err| {
+            log.warn("failed to persist browser pane title: {s}", .{@errorName(err)});
+            return;
+        };
+        self.markDirty();
+    }
+
+    fn navigatePersistedBrowserHistory(self: *AppState, delta: i32) bool {
+        const ref = self.visibleBrowserPaneRefMutable() orelse return false;
+        const target = ref.historyTarget(delta) orelse return false;
+        ref.history_index = target.index;
+        ref.setUrl(self.allocator, target.url) catch |err| {
+            log.warn("failed to update persisted browser history index: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.browser_state.status = .opening;
+        self.browser_state.controller.navigate(target.url) catch |err| {
+            log.warn("failed to navigate persisted browser history: {s}", .{@errorName(err)});
+            self.browser_state.setLastError("Failed to navigate browser history.") catch {};
+            return false;
+        };
+        self.browser_state.setCurrentUrl(target.url) catch {};
+        self.browser_state.setAddress(target.url);
+        self.browser_address_cursor = self.browser_state.addressInput().len;
+        self.markDirty();
+        return true;
     }
 
     fn showBrowserRuntimeForLiveOpen(self: *AppState) !void {
@@ -7605,9 +7966,10 @@ pub const AppState = struct {
         self.browser_state.controller.shutdown();
         self.browser_state.status = .hidden;
         self.browser_state.setLastError(null) catch {};
-        if (self.projects.items.len > 0) {
-            _ = self.projects.items[self.selected_project_index].workspace_layout.minimizePaneKind(self.allocator, .browser);
+        for (self.projects.items) |*project| {
+            _ = project.workspace_layout.closePaneKind(self.allocator, .browser);
         }
+        self.ensureCurrentProjectWorkspace();
         self.setSidebarNotice("Browser closed.");
         self.markDirty();
     }
@@ -8413,9 +8775,13 @@ pub const AppState = struct {
                     self.browser_state.status = .ready;
                     self.browser_state.setCurrentUrl(url) catch {};
                     self.browser_state.setAddress(url);
+                    self.recordVisibleBrowserPaneNavigation(url);
                     self.browser_state.setLastError(null) catch {};
                 },
-                .title_changed => {},
+                .title_changed => |title| {
+                    self.browser_state.setCurrentTitle(title) catch {};
+                    self.recordVisibleBrowserPaneTitle(title);
+                },
                 .document_loaded => {
                     self.reapplyBrowserInspectorAfterLoad();
                     self.runBrowserStartupEvalIfRequested();
@@ -8502,6 +8868,11 @@ pub const AppState = struct {
             std.mem.startsWith(u8, value, "blob:") or
             std.mem.startsWith(u8, value, "javascript:") or
             std.mem.startsWith(u8, value, "mailto:");
+    }
+
+    fn isBlankBrowserUrl(value: []const u8) bool {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        return std.mem.eql(u8, trimmed, "about:blank");
     }
 
     fn runBrowserStartupEvalIfRequested(self: *AppState) void {
@@ -9845,7 +10216,8 @@ pub const AppState = struct {
             self.setSidebarNotice("Cannot close the last workspace pane.");
             return false;
         }
-        const removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+        var removed_ref = layout.closePane(self.allocator, pane_id) orelse return false;
+        defer deinitWorkspacePaneRef(&removed_ref, self.allocator);
         switch (removed_ref) {
             .chat => self.setSidebarNotice("Chat pane closed."),
             .terminal => |ref| {
@@ -10006,6 +10378,49 @@ pub const AppState = struct {
         self.ensureCurrentProjectWorkspace();
         const pane_id = self.projects.items[self.selected_project_index].workspace_layout.focused_pane_id orelse return false;
         return self.splitCurrentProjectWorkspacePaneWithTerminalPlacement(pane_id, .horizontal, true);
+    }
+
+    fn openCurrentProjectTerminalPaneForCommand(self: *AppState) ?WorkspacePaneId {
+        if (self.projects.items.len == 0) return null;
+        self.ensureCurrentProjectWorkspace();
+
+        var project = &self.projects.items[self.selected_project_index];
+        var layout = &project.workspace_layout;
+        const target_pane_id = layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+            self.setSidebarNotice("No workspace pane selected.");
+            return null;
+        };
+        const target = layout.paneById(target_pane_id) orelse return null;
+        if (target.minimized) return null;
+
+        const dock_id = self.createCurrentProjectTerminalDock() catch |err| {
+            log.err("failed to allocate editor terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create terminal dock.");
+            return null;
+        };
+        project = &self.projects.items[self.selected_project_index];
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return null;
+        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+            log.err("failed to start editor terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start terminal.");
+            return null;
+        };
+
+        layout = &project.workspace_layout;
+        const new_pane_id = layout.createTerminalPaneWithPurpose(self.allocator, dock_id, .editor) catch |err| {
+            log.err("failed to create editor terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create terminal pane.");
+            return null;
+        };
+        layout.splitPaneWithLeaf(self.allocator, target_pane_id, new_pane_id, .horizontal, true) catch |err| {
+            log.err("failed to split editor terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return null;
+        };
+        layout.maximized_pane_id = null;
+        dock.visible = false;
+        self.requestTerminalDockFocus(dock_id);
+        return new_pane_id;
     }
 
     pub fn openThreadInTui(self: *AppState, project_index: usize, thread_index: usize) void {
@@ -10215,6 +10630,7 @@ pub const AppState = struct {
                     if (self.selected_project_index == project_index) self.requestTerminalFocus();
                 },
                 .browser => {
+                    self.applyBrowserPaneSnapshotToRuntime(project_index, pane_id);
                     if (self.selected_project_index == project_index) {
                         self.terminal_focused = false;
                         self.composer_focused = false;
@@ -10971,6 +11387,7 @@ pub const AppState = struct {
     }
 
     pub fn navigateBrowserHistory(self: *AppState, delta: i32) void {
+        if (self.navigatePersistedBrowserHistory(delta)) return;
         const result = if (delta < 0)
             self.browser_state.controller.goBack()
         else

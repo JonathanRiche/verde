@@ -10,6 +10,7 @@ const log = std.log.scoped(.native_keybinds);
 pub const NativeKeyboardAction = enum {
     refresh,
     open_default,
+    open_editor,
     new_thread,
     command_palette,
     toggle_sidebar,
@@ -109,6 +110,7 @@ pub const NativeKeyboardConfig = struct {
     allocator: std.mem.Allocator,
     refresh: []Keybind,
     open_default: []Keybind,
+    open_editor: []Keybind,
     new_thread: []Keybind,
     command_palette: []Keybind,
     toggle_sidebar: []Keybind,
@@ -159,6 +161,7 @@ pub const NativeKeyboardConfig = struct {
             .allocator = allocator,
             .refresh = try cloneDefaultKeybinds(allocator),
             .open_default = try cloneDefaultOpenKeybinds(allocator),
+            .open_editor = try cloneDefaultOpenEditorKeybinds(allocator),
             .new_thread = try cloneDefaultNewThreadKeybinds(allocator),
             .command_palette = try cloneDefaultCommandPaletteKeybinds(allocator),
             .toggle_sidebar = try cloneDefaultSidebarKeybinds(allocator),
@@ -220,6 +223,7 @@ pub const NativeKeyboardConfig = struct {
     pub fn deinit(self: *NativeKeyboardConfig) void {
         self.allocator.free(self.refresh);
         self.allocator.free(self.open_default);
+        self.allocator.free(self.open_editor);
         self.allocator.free(self.new_thread);
         self.allocator.free(self.command_palette);
         self.allocator.free(self.toggle_sidebar);
@@ -272,6 +276,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.open_default, event)) {
             return .open_default;
+        }
+        if (matchesAny(self.open_editor, event)) {
+            return .open_editor;
         }
         if (matchesAny(self.new_thread, event)) {
             return .new_thread;
@@ -460,6 +467,12 @@ pub const NativeKeyboardConfig = struct {
             if (self.parseOverrideValue(open_value, "open")) |bindings| {
                 self.allocator.free(self.open_default);
                 self.open_default = bindings;
+            }
+        }
+        if (keybinds_value.object.get("open_editor")) |open_editor_value| {
+            if (self.parseOverrideValue(open_editor_value, "open_editor")) |bindings| {
+                self.allocator.free(self.open_editor);
+                self.open_editor = bindings;
             }
         }
         if (keybinds_value.object.get("new_thread")) |new_thread_value| {
@@ -837,6 +850,12 @@ fn cloneEmptyKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 fn cloneDefaultOpenKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("Alt+O"),
+    });
+}
+
+fn cloneDefaultOpenEditorKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+O"),
     });
 }
 
@@ -1414,6 +1433,19 @@ test "default open keybind uses alt plus o" {
     try std.testing.expect(!config.open_default[0].meta);
     try std.testing.expect(!config.open_default[0].primary);
     try std.testing.expectEqual(sdl.Keycode.o, config.open_default[0].key);
+}
+
+test "default open editor keybind uses ctrl shift o" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.open_editor.len);
+    try std.testing.expect(!config.open_editor[0].alt);
+    try std.testing.expect(config.open_editor[0].ctrl);
+    try std.testing.expect(!config.open_editor[0].meta);
+    try std.testing.expect(!config.open_editor[0].primary);
+    try std.testing.expect(config.open_editor[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.o, config.open_editor[0].key);
 }
 
 test "default browser keybind uses ctrl plus b" {

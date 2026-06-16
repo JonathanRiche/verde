@@ -1894,7 +1894,8 @@ fn handleKeyboardAction(
 ) void {
     switch (action) {
         .refresh => reloadApplication(state, keyboard),
-        .open_default => state.runDefaultOpenAction(),
+        .open_default => state.openCurrentProjectEditor(.configured),
+        .open_editor => state.openCurrentProjectEditor(.configured),
         .new_thread => _ = openHotkeyWorkspaceChatThread(state),
         .command_palette => state.openCommandPalette(null),
         .toggle_sidebar => state.toggleSidebarCollapsed(),

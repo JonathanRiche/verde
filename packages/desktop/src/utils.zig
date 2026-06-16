@@ -141,6 +141,17 @@ pub fn configuredEditorDisplayName() ?[]const u8 {
     return executable;
 }
 
+pub fn configuredEditorIsNeovim() bool {
+    const editor = preferredEditorEnv() orelse return false;
+    return std.ascii.eqlIgnoreCase(commandExecutableName(editor.value), "nvim");
+}
+
+pub fn configuredEditorTerminalCommandAlloc(allocator: std.mem.Allocator) !?[]u8 {
+    const editor = preferredEditorEnv() orelse return null;
+    if (!std.ascii.eqlIgnoreCase(commandExecutableName(editor.value), "nvim")) return null;
+    return try std.fmt.allocPrint(allocator, "exec ${s}\n", .{editor.name});
+}
+
 pub fn executableNameForCommand(command: []const u8) []const u8 {
     return commandExecutableName(command);
 }
