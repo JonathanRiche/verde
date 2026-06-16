@@ -1589,7 +1589,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
         const item_h = transcriptCommittedMessageHeight(state, msg_idx, message, column.w);
         if (content_y + item_h >= column.y and content_y <= column.y + column.h) {
-            renderTranscriptMessage(state, column, content_y, item_h, message, clip, msg_idx);
+            renderTranscriptMessage(state, thread, column, content_y, item_h, message, clip, msg_idx);
         }
         content_y += item_h + theme.scaledUi(12.0);
     }
@@ -1683,8 +1683,9 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
         const item_h = transcriptMessageHeight(state, msg_idx, event.body, event.role, column.w, event.author, false);
         if (event.role == .system and shouldRenderPaletteCommandRow(event.author, event.body)) {
             const is_last = pi + 1 == pending_count;
+            const is_backgrounded = std.mem.eql(u8, event.author, "Backgrounded command");
             if (y + item_h >= column.y and y <= column.y + column.h) {
-                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last);
+                renderCommandEventRow(state, column, y, item_h, event.author, event.body, clip, msg_idx, is_last or is_backgrounded);
             }
         } else if (event.role == .system and isDiffSummaryMessage(event.author, event.body)) {
             if (y + item_h >= column.y and y <= column.y + column.h) {
@@ -1738,7 +1739,13 @@ fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {
 }
 
 fn isCommandSystemEvent(author: []const u8) bool {
-    return std.mem.eql(u8, author, "Ran command") or std.mem.eql(u8, author, "Command failed");
+    return std.mem.eql(u8, author, "Ran command") or
+        std.mem.eql(u8, author, "Command failed") or
+        std.mem.eql(u8, author, "Backgrounded command") or
+        std.mem.eql(u8, author, "Background task completed") or
+        std.mem.eql(u8, author, "Background task failed") or
+        std.mem.eql(u8, author, "Background task stopped") or
+        std.mem.eql(u8, author, "Failed to background command");
 }
 
 /// True when the body looks like an executed shell one-liner (e.g. Codex/OpenCode style `/usr/bin/bash -lc '…'`).
@@ -1961,9 +1968,9 @@ fn queueRoundedShellClipped(
     }
 }
 
-fn renderTranscriptMessage(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
+fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
-        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, false);
+        renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body));
         return;
     }
     if (message.role == .system and isDiffSummaryMessage(message.author, message.body)) {
@@ -2304,12 +2311,15 @@ fn renderCommandEventRow(
 ) void {
     const bubble = palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height };
     const rr = transcriptBubbleCornerRadius();
-    const failed = std.mem.eql(u8, original_author, "Command failed");
+    const failed = std.mem.eql(u8, original_author, "Command failed") or
+        std.mem.eql(u8, original_author, "Background task failed") or
+        std.mem.eql(u8, original_author, "Failed to background command");
+    const stopped = std.mem.eql(u8, original_author, "Background task stopped");
     queueRoundedShellClipped(
         state,
         bubble,
         paletteColor(theme.COLOR_PANEL_ALT),
-        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else theme.borderMuted()),
+        paletteColor(if (failed) theme.COLOR_DIFF_REMOVE else if (stopped) theme.COLOR_YELLOW else theme.borderMuted()),
         rr,
         clip,
     );
@@ -2331,6 +2341,7 @@ fn renderCommandEventRow(
     const status_cy = bubble.y + pad_y + line_h * 0.5;
     const status_color: [4]f32 = blk: {
         if (failed) break :blk theme.COLOR_DIFF_REMOVE;
+        if (stopped) break :blk theme.COLOR_YELLOW;
         if (running) {
             const t_ns: i128 = profiler.nowNs();
             const period_ns: i128 = 1_400_000_000;

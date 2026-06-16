@@ -74,6 +74,9 @@ const PIP_PULSE_WAIT_TIMEOUT_MS: c_int = 33;
 // even when no streamed tokens or input events arrive. Streamed tokens wake
 // the loop immediately via loop_wakeup; this is only the fallback heartbeat.
 const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
+// Detached shell tasks only need coarse liveness checks. A 1s wake keeps
+// completion rows prompt without turning idle background work into animation.
+const BACKGROUND_TASK_WAIT_TIMEOUT_MS: c_int = 1000;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
@@ -481,6 +484,12 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollSend();
             }
         }.run, .{ &state, &send_needs_render });
+        var background_tasks_need_render = false;
+        recordSpan(&frame_sample, .poll_background_tasks, struct {
+            fn run(app_state: *AppState, changed: *bool) void {
+                changed.* = app_state.pollBackgroundTasks();
+            }
+        }.run, .{ &state, &background_tasks_need_render });
         var browser_needs_render = false;
         recordSpan(&frame_sample, .poll_browser, struct {
             fn run(app_state: *AppState, changed: *bool) void {
@@ -527,7 +536,7 @@ fn mainInner(init: std.process.Init) !void {
         const continuous_frames = appNeedsContinuousFrames(&state);
         const event_needs_render = event_flags.has_non_mouse_motion or
             shouldRenderMouseMotion(event_flags.has_mouse_motion, continuous_frames, &last_mouse_motion_render_ms);
-        needs_render = needs_render or send_needs_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
+        needs_render = needs_render or send_needs_render or background_tasks_need_render or browser_needs_render or terminal_needs_render or event_needs_render or framebuffer_size_changed or continuous_frames;
         if (!needs_render) {
             profiler.recordFrame(frame_sample);
             maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
@@ -1101,6 +1110,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
     // label to tick. pollSend bumps once per whole second; this just caps
     // the SDL wait so we actually reach pollSend before that second elapses.
     if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
     return IDLE_WAIT_TIMEOUT_MS;
 }
 
