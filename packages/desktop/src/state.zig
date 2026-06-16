@@ -25,6 +25,7 @@ const utils = @import("utils.zig");
 /// Arrow-key line step for transcript scroll (scaled px per key repeat).
 const TRANSCRIPT_KEYBOARD_LINE_PX: f32 = 29.0;
 const STACK_CONFIG_REFRESH_MS: i64 = 2000;
+const BACKGROUND_TASK_POLL_MS: i64 = 1000;
 const MANAGED_PROCESS_BASE_RESTART_BACKOFF_MS: i64 = 1000;
 const MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS: i64 = 30000;
 const MANAGED_PROCESS_WATCH_SCAN_MS: i64 = 1000;
@@ -1069,6 +1070,30 @@ pub const ChatImageAttachment = struct {
     }
 };
 
+pub const BackgroundTaskStatus = enum {
+    running,
+    completed,
+    failed,
+    stopped,
+};
+
+pub const BackgroundTask = struct {
+    command: [:0]const u8,
+    task_id: ?[:0]const u8 = null,
+    pid_path: ?[:0]const u8 = null,
+    log_path: ?[:0]const u8 = null,
+    status: BackgroundTaskStatus,
+    updated_at_ms: i64 = 0,
+    last_poll_ms: i64 = 0,
+
+    fn deinit(self: BackgroundTask, allocator: std.mem.Allocator) void {
+        allocator.free(self.command);
+        if (self.task_id) |value| allocator.free(value);
+        if (self.pid_path) |value| allocator.free(value);
+        if (self.log_path) |value| allocator.free(value);
+    }
+};
+
 pub const ChatThread = struct {
     title: [:0]const u8,
     archived: bool = false,
@@ -1085,6 +1110,7 @@ pub const ChatThread = struct {
     harness: Harness = .local_cli,
     tui_dock_id: ?u32 = null,
     messages: std.ArrayList(ChatMessage),
+    background_tasks: std.ArrayList(BackgroundTask),
     send_state: *SendState,
     transcript_markdown_entries: std.ArrayList(?*TranscriptMarkdownBody),
     transcript_height_entries: std.ArrayList(TranscriptHeightEntry),
@@ -1111,6 +1137,7 @@ pub const ChatThread = struct {
             .harness = .local_cli,
             .tui_dock_id = null,
             .messages = .empty,
+            .background_tasks = .empty,
             .send_state = send_state,
             .transcript_markdown_entries = .empty,
             .transcript_height_entries = .empty,
@@ -1263,6 +1290,119 @@ pub const ChatThread = struct {
         self.transcript_height_entries.clearRetainingCapacity();
     }
 
+    fn backgroundCommandFromEventBody(body_raw: []const u8) []const u8 {
+        const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+        if (std.mem.find(u8, body, "\n\n")) |index| {
+            return std.mem.trim(u8, body[0..index], "\n\r\t ");
+        }
+        return body;
+    }
+
+    fn backgroundTaskStatusForEvent(author: []const u8) ?BackgroundTaskStatus {
+        if (std.mem.eql(u8, author, "Backgrounded command")) return .running;
+        if (std.mem.eql(u8, author, "Background task completed")) return .completed;
+        if (std.mem.eql(u8, author, "Background task failed")) return .failed;
+        if (std.mem.eql(u8, author, "Background task stopped")) return .stopped;
+        return null;
+    }
+
+    fn backgroundTaskMetadataValue(body_raw: []const u8, label: []const u8) ?[]const u8 {
+        var lines = std.mem.splitScalar(u8, body_raw, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, "\r\t ");
+            if (!std.mem.startsWith(u8, line, label)) continue;
+            return std.mem.trim(u8, line[label.len..], "\r\t ");
+        }
+        return null;
+    }
+
+    fn allocPrintZCompat(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+        const raw = try std.fmt.allocPrint(allocator, fmt, args);
+        defer allocator.free(raw);
+        return try allocator.dupeZ(u8, raw);
+    }
+
+    fn backgroundTaskPidPathForId(allocator: std.mem.Allocator, task_id: []const u8) ![:0]const u8 {
+        return try allocPrintZCompat(allocator, "/tmp/verde-claude-bg-{s}.pid", .{task_id});
+    }
+
+    fn replaceOptionalZ(
+        allocator: std.mem.Allocator,
+        slot: *?[:0]const u8,
+        value: ?[]const u8,
+    ) !void {
+        const raw = value orelse return;
+        if (raw.len == 0) return;
+        if (slot.*) |existing| {
+            if (std.mem.eql(u8, existing, raw)) return;
+            allocator.free(existing);
+        }
+        slot.* = try allocator.dupeZ(u8, raw);
+    }
+
+    fn refreshBackgroundTaskMetadata(task: *BackgroundTask, allocator: std.mem.Allocator, body_raw: []const u8) !void {
+        if (backgroundTaskMetadataValue(body_raw, "Verde task ID:")) |task_id| {
+            const previous_matches = task.task_id != null and std.mem.eql(u8, task.task_id.?, task_id);
+            try replaceOptionalZ(allocator, &task.task_id, task_id);
+            if (task.pid_path == null or !previous_matches) {
+                if (task.pid_path) |existing| allocator.free(existing);
+                task.pid_path = try backgroundTaskPidPathForId(allocator, task_id);
+            }
+        }
+        try replaceOptionalZ(allocator, &task.log_path, backgroundTaskMetadataValue(body_raw, "Output log:"));
+    }
+
+    fn noteBackgroundTaskEvent(self: *ChatThread, allocator: std.mem.Allocator, author: []const u8, body_raw: []const u8) !void {
+        const status = backgroundTaskStatusForEvent(author) orelse return;
+        const command = backgroundCommandFromEventBody(body_raw);
+        if (command.len == 0) return;
+
+        for (self.background_tasks.items) |*task| {
+            if (!std.mem.eql(u8, task.command, command)) continue;
+            task.status = status;
+            task.updated_at_ms = unixTimestampMs();
+            try refreshBackgroundTaskMetadata(task, allocator, body_raw);
+            return;
+        }
+
+        var task: BackgroundTask = .{
+            .command = try allocator.dupeZ(u8, command),
+            .status = status,
+            .updated_at_ms = unixTimestampMs(),
+        };
+        errdefer task.deinit(allocator);
+        try refreshBackgroundTaskMetadata(&task, allocator, body_raw);
+        try self.background_tasks.append(allocator, task);
+    }
+
+    fn rebuildBackgroundTasksFromMessages(self: *ChatThread, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |message| {
+            if (message.role != .system) continue;
+            self.noteBackgroundTaskEvent(allocator, message.author, message.body) catch |err| {
+                log.warn("failed to restore background task metadata: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    pub fn backgroundCommandIsRunning(self: *const ChatThread, body_raw: []const u8) bool {
+        const command = backgroundCommandFromEventBody(body_raw);
+        if (command.len == 0) return false;
+        for (self.background_tasks.items) |task| {
+            if (task.status == .running and std.mem.eql(u8, task.command, command)) return true;
+        }
+        return false;
+    }
+
+    fn stopRunningBackgroundTasks(self: *ChatThread) void {
+        const now_ms = unixTimestampMs();
+        for (self.background_tasks.items) |*task| {
+            if (task.status == .running) {
+                task.status = .stopped;
+                task.updated_at_ms = now_ms;
+            }
+        }
+    }
+
     fn deinitSendState(self: *ChatThread, allocator: std.mem.Allocator) void {
         self.finishSendThread();
         if (self.send_state.result) |result| {
@@ -1307,6 +1447,8 @@ pub const ChatThread = struct {
             allocator.free(message.extra_images);
         }
         self.messages.deinit(allocator);
+        for (self.background_tasks.items) |task| task.deinit(allocator);
+        self.background_tasks.deinit(allocator);
         self.clearDraftImage(allocator);
         self.draft_extra_images.deinit(allocator);
     }
@@ -5426,6 +5568,7 @@ pub const AppState = struct {
                                 null,
                         });
                     }
+                    thread.rebuildBackgroundTasksFromMessages(self.allocator);
                     if (thread.last_activity_at == 0 and thread.messages.items.len > 0) {
                         thread.touch();
                     }
@@ -5462,6 +5605,7 @@ pub const AppState = struct {
                             null,
                     });
                 }
+                thread.rebuildBackgroundTasksFromMessages(self.allocator);
                 if (thread.archived) {
                     try loaded.archived_threads.append(self.allocator, thread);
                 } else {
@@ -5486,6 +5630,7 @@ pub const AppState = struct {
                             null,
                     });
                 }
+                fallback_thread.rebuildBackgroundTasksFromMessages(self.allocator);
             }
 
             try loaded.normalize(self.allocator, self.app_config.terminal_font_size);
@@ -12320,6 +12465,126 @@ pub const AppState = struct {
         return changed;
     }
 
+    pub fn hasRunningBackgroundTasks(self: *const AppState) bool {
+        for (self.projects.items) |project| {
+            for (project.threads.items) |thread| {
+                if (threadHasRunningBackgroundTasks(&thread)) return true;
+            }
+            for (project.archived_threads.items) |thread| {
+                if (threadHasRunningBackgroundTasks(&thread)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn threadHasRunningBackgroundTasks(thread: *const ChatThread) bool {
+        for (thread.background_tasks.items) |task| {
+            if (task.status == .running and task.pid_path != null) return true;
+        }
+        return false;
+    }
+
+    pub fn pollBackgroundTasks(self: *AppState) bool {
+        var changed = false;
+        for (self.projects.items, 0..) |*project, project_index| {
+            for (project.threads.items, 0..) |*thread, thread_index| {
+                changed = self.pollThreadBackgroundTasks(project_index, thread_index, thread) or changed;
+            }
+            for (project.archived_threads.items) |*thread| {
+                changed = self.pollThreadBackgroundTasks(project_index, null, thread) or changed;
+            }
+        }
+        return changed;
+    }
+
+    fn pollThreadBackgroundTasks(self: *AppState, project_index: usize, thread_index: ?usize, thread: *ChatThread) bool {
+        const now_ms = unixTimestampMs();
+        var changed = false;
+
+        for (thread.background_tasks.items) |*task| {
+            if (task.status != .running) continue;
+            if (task.pid_path == null) continue;
+            if (task.last_poll_ms != 0 and now_ms - task.last_poll_ms < BACKGROUND_TASK_POLL_MS) continue;
+            task.last_poll_ms = now_ms;
+
+            const pid = readBackgroundTaskPid(self.allocator, task.pid_path.?) orelse continue;
+            if (backgroundTaskProcessIsAlive(pid)) continue;
+
+            task.status = .completed;
+            task.updated_at_ms = now_ms;
+            const body = backgroundTaskCompletionBodyAlloc(self.allocator, task) catch |err| {
+                log.warn("failed to build background task completion body: {s}", .{@errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(body);
+            self.appendMessageToThread(
+                thread,
+                .system,
+                "Background task completed",
+                body,
+                null,
+                &.{},
+            ) catch |err| {
+                log.warn("failed to append background task completion: {s}", .{@errorName(err)});
+                continue;
+            };
+            if (project_index < self.projects.items.len) {
+                self.projects.items[project_index].invalidateSidebarThreadCache();
+            }
+            if (project_index == self.selected_project_index and thread_index != null and thread_index.? == self.currentProject().selected_thread_index) {
+                self.requestTranscriptScrollToBottom();
+            }
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    fn backgroundTaskCompletionBodyAlloc(allocator: std.mem.Allocator, task: *const BackgroundTask) ![:0]u8 {
+        if (task.task_id) |task_id| {
+            if (task.log_path) |log_path| {
+                return try ChatThread.allocPrintZCompat(allocator, "{s}\n\nVerde task ID: {s}\nOutput log: {s}", .{
+                    task.command,
+                    task_id,
+                    log_path,
+                });
+            }
+            return try ChatThread.allocPrintZCompat(allocator, "{s}\n\nVerde task ID: {s}", .{
+                task.command,
+                task_id,
+            });
+        }
+        return try allocator.dupeZ(u8, task.command);
+    }
+
+    fn readBackgroundTaskPid(allocator: std.mem.Allocator, pid_path: []const u8) ?std.posix.pid_t {
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const raw = std.Io.Dir.cwd().readFileAlloc(threaded.io(), pid_path, allocator, .limited(256)) catch return null;
+        defer allocator.free(raw);
+        const trimmed = std.mem.trim(u8, raw, "\n\r\t ");
+        if (trimmed.len == 0) return null;
+        return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch null;
+    }
+
+    fn backgroundTaskProcessIsAlive(pid: std.posix.pid_t) bool {
+        if (pid <= 0) return false;
+        const group_alive = blk: {
+            std.posix.kill(-pid, @enumFromInt(0)) catch |group_err| switch (group_err) {
+                error.ProcessNotFound => break :blk false,
+                error.PermissionDenied => break :blk true,
+                else => break :blk false,
+            };
+            break :blk true;
+        };
+        if (group_alive) return true;
+        std.posix.kill(pid, @enumFromInt(0)) catch |pid_err| switch (pid_err) {
+            error.ProcessNotFound => return false,
+            error.PermissionDenied => return true,
+            else => return false,
+        };
+        return true;
+    }
+
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
         self.capturePendingProviderThreadId(thread);
         self.issuePendingCodexSteer(self.projects.items[project_index].path, project_index, thread_index, thread);
@@ -12485,6 +12750,7 @@ pub const AppState = struct {
                 self.applyPendingTimelineEvents(thread, &completed_events) catch |err| {
                     log.err("failed to apply aborted timeline events: {s}", .{@errorName(err)});
                 };
+                thread.stopRunningBackgroundTasks();
                 if (!had_pending_followup) {
                     self.appendMessageToThread(
                         thread,
@@ -12607,7 +12873,7 @@ pub const AppState = struct {
             else
                 null;
             if (pending_thread_id) |resolved_thread_id| {
-                if (provider == .opencode or send_state.active_turn_id != null) {
+                if (provider == .opencode or provider == .claude or send_state.active_turn_id != null) {
                     thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                     turn_id = if (send_state.active_turn_id) |active_turn_id|
                         self.allocator.dupe(u8, active_turn_id) catch null
@@ -12615,6 +12881,12 @@ pub const AppState = struct {
                         null;
                     send_state.stop_signal_sent = thread_id != null;
                 }
+            } else if (provider == .claude) {
+                // Claude's current interrupt path targets the active bridge
+                // process group, so it can still stop a fresh turn before the
+                // SDK has emitted a session id.
+                thread_id = self.allocator.dupe(u8, "") catch null;
+                send_state.stop_signal_sent = thread_id != null;
             }
         }
         send_state.mutex.unlock();
@@ -12988,6 +13260,11 @@ pub const AppState = struct {
                 .body = try self.dupeZ(event.body),
                 .image = null,
             });
+            if (event.role == .system) {
+                thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
+                    log.warn("failed to record background task event: {s}", .{@errorName(err)});
+                };
+            }
         }
         thread.touch();
         self.markDirty();
@@ -13007,6 +13284,11 @@ pub const AppState = struct {
                 .body = try self.dupeZ(event.body),
                 .image = null,
             });
+            if (event.role == .system) {
+                thread.noteBackgroundTaskEvent(self.allocator, event.author, event.body) catch |err| {
+                    log.warn("failed to record background task event: {s}", .{@errorName(err)});
+                };
+            }
         }
         try thread.messages.append(self.allocator, .{
             .role = .system,

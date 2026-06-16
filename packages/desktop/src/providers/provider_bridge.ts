@@ -136,37 +136,154 @@ function commandFromClaudeToolUse(item) {
   return input.command ?? input.cmd ?? null;
 }
 
-function commandShouldRunInBackground(command) {
-  return /\b(bun|npm|pnpm|yarn)\s+(run\s+)?(dev|dev:[\w:-]+|start)\b/.test(command) ||
-    /\b(vite|next|astro|wrangler|alchemy)\s+(dev|start|preview|serve)\b/.test(command);
+function backgroundCommandMode(command) {
+  if (/\bgh\s+run\s+watch\b/.test(command)) return "tracked";
+  if (/\b(bun|npm|pnpm|yarn)\s+(run\s+)?(dev|dev:[\w:-]+|start)\b/.test(command)) return "detached";
+  if (/\b(vite|next|astro|wrangler|alchemy)\s+(dev|start|preview|serve)\b/.test(command)) return "detached";
+  if (/\btail\s+-(?:[^\s]*[fF][^\s]*)\b/.test(command)) return "detached";
+  if (/(?:^|[;&|]\s*)watch\s+(?:-[^\s]+\s+)*/.test(command)) return "detached";
+  if (/(?:^|[;&|]\s*)while\s+(?:true|:)\s*;\s*do\b/.test(command)) return "detached";
+  if (/(?:^|[;&|]\s*)for\s*\(\(\s*;\s*;\s*\)\)\s*;\s*do\b/.test(command)) return "detached";
+  if (/(?:^|[;&|]\s*)for\s+\w+\s+in\b[\s\S]*;\s*do\b[\s\S]*\bsleep\s+\d+/.test(command)) return "detached";
+  return null;
 }
 
-function scheduleBackgroundTask(query, toolUseId, command) {
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function randomTaskId() {
+  return `vbg${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function detachedTaskPaths(taskId) {
+  return {
+    command: `/tmp/verde-claude-bg-${taskId}.command`,
+    log: `/tmp/verde-claude-bg-${taskId}.log`,
+    pid: `/tmp/verde-claude-bg-${taskId}.pid`,
+  };
+}
+
+function detachedTaskStopCommand(taskId) {
+  const { pid } = detachedTaskPaths(taskId);
+  return `pid=$(cat ${shellQuote(pid)}); kill -TERM -- -$pid 2>/dev/null || kill -TERM "$pid"`;
+}
+
+function detachedTaskSummary(taskId) {
+  const paths = detachedTaskPaths(taskId);
+  return [
+    `Verde task ID: ${taskId}`,
+    `Output log: ${paths.log}`,
+    `Stop command: ${detachedTaskStopCommand(taskId)}`,
+  ].join("\n");
+}
+
+function detachedShellCommand(command, taskId) {
+  const paths = detachedTaskPaths(taskId);
+  const quotedCommand = shellQuote(command);
+  const quotedCommandFile = shellQuote(paths.command);
+  const quotedLog = shellQuote(paths.log);
+  const quotedPid = shellQuote(paths.pid);
+  const quotedStop = shellQuote(detachedTaskStopCommand(taskId));
+  return [
+    `printf '%s\\n' ${quotedCommand} > ${quotedCommandFile}`,
+    `if command -v setsid >/dev/null 2>&1; then setsid sh -lc ${quotedCommand} > ${quotedLog} 2>&1 & else sh -lc ${quotedCommand} > ${quotedLog} 2>&1 & fi`,
+    "pid=$!",
+    `printf '%s\\n' "$pid" > ${quotedPid}`,
+    `printf 'Verde background task ${taskId} started. PID: %s. Output log: ${paths.log}. Stop command: %s\\n' "$pid" ${quotedStop}`,
+  ].join("; ");
+}
+
+function backgroundTaskResultTitle(status) {
+  switch (status) {
+    case "completed":
+      return "Background task completed";
+    case "failed":
+      return "Background task failed";
+    case "stopped":
+      return "Background task stopped";
+    default:
+      return "Background task updated";
+  }
+}
+
+function backgroundTaskBody(command, summary) {
+  if (typeof summary === "string" && summary.trim().length > 0) {
+    return `${command}\n\n${summary.trim()}`;
+  }
+  return command;
+}
+
+function emitClaudeTaskNotification(message, commandByToolUseId, backgroundState) {
+  if (message?.type !== "system" || message?.subtype !== "task_notification") return false;
+  const toolUseId = message.tool_use_id;
+  if (typeof toolUseId !== "string" || !backgroundState.trackedToolUseIds.has(toolUseId)) return false;
+  const command = typeof toolUseId === "string"
+    ? commandByToolUseId.get(toolUseId)
+    : null;
+  if (!command) return false;
+
+  if (typeof toolUseId === "string") backgroundState.trackedToolUseIds.delete(toolUseId);
+  const details = [];
+  if (typeof message.task_id === "string" && message.task_id.length > 0) details.push(`Claude task ID: ${message.task_id}`);
+  if (typeof message.output_file === "string" && message.output_file.length > 0) details.push(`Output log: ${message.output_file}`);
+  if (typeof message.summary === "string" && message.summary.trim().length > 0) details.push(message.summary.trim());
+  write({
+    type: "stream_event",
+    title: backgroundTaskResultTitle(message.status),
+    body: backgroundTaskBody(command, details.join("\n")),
+  });
+  return true;
+}
+
+function commandShouldTrackUntilNotification(command) {
+  return backgroundCommandMode(command) === "tracked";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function scheduleBackgroundTask(query, toolUseId, command, backgroundState) {
   if (!toolUseId || typeof query?.backgroundTasks !== "function") return;
-  setTimeout(async () => {
-    try {
-      const backgrounded = await query.backgroundTasks(toolUseId);
-      if (backgrounded) {
-        write({ type: "stream_event", title: "Backgrounded command", body: command });
+  if (backgroundState.scheduledToolUseIds.has(toolUseId)) return;
+  backgroundState.scheduledToolUseIds.add(toolUseId);
+  backgroundState.sawTracked = true;
+  backgroundState.trackedToolUseIds.add(toolUseId);
+  write({ type: "stream_event", title: "Backgrounded command", body: command });
+
+  const task = (async () => {
+    let lastError = null;
+    for (const delayMs of [500, 750, 1000, 1250, 1500, 2000]) {
+      await sleep(delayMs);
+      try {
+        const backgrounded = await query.backgroundTasks(toolUseId);
+        if (backgrounded) return;
+      } catch (err) {
+        lastError = err;
+        if (query?.isClosed?.()) return;
       }
-    } catch (err) {
-      write({ type: "stream_event", title: "Failed to background command", body: err?.message ?? String(err) });
     }
-  }, 4000).unref?.();
+    if (lastError) {
+      write({ type: "stream_event", title: "Failed to background command", body: lastError?.message ?? String(lastError) });
+    }
+  })();
+  backgroundState.pendingBackgrounds.push(task);
 }
 
-function emitClaudeToolEvents(message, commandByToolUseId, query) {
+function emitClaudeToolEvents(message, commandByToolUseId, query, backgroundState) {
   const content = message?.message?.content ?? message?.content;
-  if (!Array.isArray(content)) return false;
-  let sawBackgroundableCommand = false;
+  if (!Array.isArray(content)) return;
   for (const item of content) {
-    const command = commandFromClaudeToolUse(item);
+    const rawCommand = commandFromClaudeToolUse(item);
+    const command = typeof item?.id === "string" && commandByToolUseId.has(item.id)
+      ? commandByToolUseId.get(item.id)
+      : rawCommand;
     if (typeof command === "string" && command.length > 0) {
       if (typeof item.id === "string") commandByToolUseId.set(item.id, command);
       write({ type: "stream_event", title: "Ran command", body: command });
-      if (commandShouldRunInBackground(command)) {
-        sawBackgroundableCommand = true;
-        scheduleBackgroundTask(query, item.id, command);
+      if (commandShouldTrackUntilNotification(command)) {
+        scheduleBackgroundTask(query, item.id, command, backgroundState);
       }
       continue;
     }
@@ -177,7 +294,42 @@ function emitClaudeToolEvents(message, commandByToolUseId, query) {
       }
     }
   }
-  return sawBackgroundableCommand;
+}
+
+function buildVerdeClaudeHooks() {
+  return {
+    PreToolUse: [{
+      hooks: [async (input) => {
+        const toolName = String(input?.tool_name ?? "").toLowerCase();
+        if (toolName !== "bash" && toolName !== "shell") return { continue: true };
+        const toolInput = input?.tool_input && typeof input.tool_input === "object" ? input.tool_input : {};
+        const command = toolInput.command ?? toolInput.cmd;
+        if (typeof command !== "string" || backgroundCommandMode(command) !== "detached") {
+          return { continue: true };
+        }
+
+        const taskId = randomTaskId();
+        write({
+          type: "stream_event",
+          title: "Backgrounded command",
+          body: backgroundTaskBody(command, detachedTaskSummary(taskId)),
+        });
+
+        return {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "allow",
+            permissionDecisionReason: "Verde detached long-running shell command",
+            updatedInput: {
+              ...toolInput,
+              command: detachedShellCommand(command, taskId),
+            },
+          },
+        };
+      }],
+    }],
+  };
 }
 
 function claudePermissionMode(approvalPolicy, sandboxMode) {
@@ -202,6 +354,7 @@ function buildClaudeOptions(request) {
     model: request.model ?? undefined,
     effort: request.reasoning_effort ?? undefined,
     pathToClaudeCodeExecutable: pathToClaudeCodeExecutable(request),
+    hooks: buildVerdeClaudeHooks(),
   };
 
   const mode = claudePermissionMode(request.approval_policy, request.sandbox_mode);
@@ -286,6 +439,7 @@ async function handleClaudeReadThread(sdk, request) {
 
 async function handleClaudeSendPrompt(sdk, request) {
   const stderrChunks = [];
+  const commandByToolUseId = new Map();
   const options = buildClaudeOptions(request);
   options.stderr = (data) => {
     if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
@@ -299,9 +453,8 @@ async function handleClaudeSendPrompt(sdk, request) {
   try {
     let sessionId = request.thread_id ?? null;
     let reply = "";
-    const commandByToolUseId = new Map();
-    let sawBackgroundableCommand = false;
-    let closeAfterReplyTimer = null;
+    const backgroundState = { trackedToolUseIds: new Set(), scheduledToolUseIds: new Set(), sawTracked: false, pendingBackgrounds: [] };
+    let sawResult = false;
     for await (const message of query) {
       if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
         sessionId = message.session_id;
@@ -311,25 +464,31 @@ async function handleClaudeSendPrompt(sdk, request) {
       if (message?.type === "result") {
         sessionId = message.session_id ?? sessionId;
         if (typeof message.result === "string") reply = message.result;
+        if (backgroundState.pendingBackgrounds.length > 0) {
+          await Promise.allSettled(backgroundState.pendingBackgrounds);
+          backgroundState.pendingBackgrounds.length = 0;
+        }
+        sawResult = true;
+        if (backgroundState.sawTracked && backgroundState.trackedToolUseIds.size === 0 && typeof query?.close === "function") {
+          query.close();
+        }
         continue;
       }
+      const emittedTaskNotification = emitClaudeTaskNotification(message, commandByToolUseId, backgroundState);
+      if (emittedTaskNotification && sawResult && backgroundState.trackedToolUseIds.size === 0 && typeof query?.close === "function") {
+        query.close();
+      }
       emitClaudeSdkMessage(message);
-      sawBackgroundableCommand = emitClaudeToolEvents(message, commandByToolUseId, query) || sawBackgroundableCommand;
+      emitClaudeToolEvents(message, commandByToolUseId, query, backgroundState);
       const delta = textFromContent(message?.message?.content ?? message?.content);
       if (message?.type === "assistant" && delta) {
         reply += delta;
         write({ type: "delta", text: delta });
-        if (sawBackgroundableCommand && typeof query?.close === "function") {
-          if (closeAfterReplyTimer) clearTimeout(closeAfterReplyTimer);
-          closeAfterReplyTimer = setTimeout(() => {
-            write({ type: "stream_event", title: "Finished reply", body: "Closed Claude stream after background dev command." });
-            query.close();
-          }, 3000);
-          closeAfterReplyTimer.unref?.();
-        }
       }
     }
-    if (closeAfterReplyTimer) clearTimeout(closeAfterReplyTimer);
+    if (backgroundState.pendingBackgrounds.length > 0) {
+      await Promise.allSettled(backgroundState.pendingBackgrounds);
+    }
 
     write({ type: "result", thread_id: sessionId, reply_text: reply });
   } catch (err) {
