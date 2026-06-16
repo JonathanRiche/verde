@@ -397,12 +397,16 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     if (!state.command_palette_open) return;
     computeLayout(state, width, height);
 
-    // Scrim + modal chrome. The panel must be fully opaque: the palette
-    // floats over arbitrary transcript/terminal content, and translucent
-    // solid fills render much weaker than their nominal alpha here, which
-    // left background text bleeding through a 248-alpha panel.
-    queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.46 });
-    queueRoundedRect(state, modal_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(16.0));
+    // Scrim + modal chrome. The panel fill derives from the dark `background`
+    // via a small lighten, NOT COLOR_PANEL_ALT: under omarchy themes panel_alt /
+    // panel_muted are sourced from terminal color0/color8, which can be *light*
+    // mid-grays. Using them as the body-text backdrop produced light-text-on-
+    // light-panel and made the palette unreadable. Lightening the (always dark)
+    // background keeps a subtle elevation while guaranteeing the text tokens land
+    // on a dark surface, matching the contrast the rest of the UI gets on PANEL.
+    // The scrim is a touch heavier (0.55) so background content reads as dimmed.
+    queueRect(state, .{ .x = 0.0, .y = 0.0, .w = width, .h = height }, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.55 });
+    queueRoundedRect(state, modal_rect, paletteColor(theme.lighten(theme.background(), 0.04)), theme.scaledUi(16.0));
     queueBorder(state, modal_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(16.0), theme.scaledUi(1.0));
 
     renderSearchField(state);
@@ -1036,7 +1040,7 @@ fn runToggleSidebar(state: *runtime.AppState) void {
 fn renderSearchField(state: *runtime.AppState) void {
     const focused = state.palette_modal_text_focus == .command_palette;
     const value = state.commandPaletteQuery();
-    const border = if (focused) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_MUTED;
+    const border = if (focused) theme.COLOR_GREEN else theme.COLOR_PANEL_MUTED;
     // Recessed field: darker than the (opaque) panel so it reads as an input,
     // matching the sidebar's selected-workspace card treatment.
     queueRoundedRect(state, input_rect, paletteColor(theme.background()), theme.scaledUi(7.0));
@@ -1125,7 +1129,7 @@ fn renderRows(state: *runtime.AppState) void {
                     .y = rect.y + rect.h - theme.scaledUi(18.0),
                     .w = rect.w - theme.scaledUi(8.0),
                     .h = theme.scaledUi(16.0),
-                }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(11.0), row_clip);
+                }, label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.0), row_clip);
             },
             .command => |ci| renderCommandRow(state, i, ci, rect, row_clip),
             .thread => |tr| renderThreadRow(state, i, tr, rect, row_clip),
@@ -1142,10 +1146,16 @@ fn renderRowBackground(state: *runtime.AppState, row_index: usize, rect: palette
     const bg_rect = intersectRects(rect, row_clip);
     if (bg_rect.w <= 0.0 or bg_rect.h <= 0.0) return;
     if (selected) {
-        const bg = if (hovered) theme.lighten(theme.COLOR_PANEL_MUTED, 0.10) else theme.COLOR_PANEL_MUTED;
+        // Accent tint rather than a lighter-gray card: on the dark panel a
+        // translucent accent keeps the active row distinct and on-brand, and
+        // stays independent of the theme-derived (possibly light) panel tokens.
+        // Slightly stronger when also hovered for feedback.
+        const bg = theme.withAlpha(theme.COLOR_GREEN, if (hovered) 76 else 56);
         queueRoundedRect(state, bg_rect, paletteColor(bg), theme.scaledUi(7.0));
     } else if (hovered) {
-        queueRoundedRect(state, bg_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.10)), theme.scaledUi(7.0));
+        // Neutral light wash over the dark panel; theme-independent so hover
+        // never collapses into the surface on light color0/color8 themes.
+        queueRoundedRect(state, bg_rect, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(7.0));
     }
 }
 
@@ -1157,7 +1167,7 @@ fn renderCommandRow(state: *runtime.AppState, row_index: usize, command_index: u
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
 
     // ">" glyph marks action rows apart from thread rows at a glance.
-    queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_SECONDARY_GREEN), font_size, row_clip);
+    queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
 
     const hint = keybindHintFor(state, command.keybind);
     const hint_w = if (hint.len > 0) theme.scaledUi(110.0) else theme.scaledUi(0.0);
@@ -1210,7 +1220,7 @@ fn renderThreadRow(state: *runtime.AppState, row_index: usize, tr: ThreadRef, re
     queueText(state, .{ .x = right, .y = text_y, .w = time_w, .h = font_size * 1.3 }, relative_time, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     if (is_open) {
         right -= open_w;
-        queueText(state, .{ .x = right, .y = text_y, .w = open_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_SECONDARY_GREEN), theme.scaledUi(12.0), row_clip);
+        queueText(state, .{ .x = right, .y = text_y, .w = open_w, .h = font_size * 1.3 }, "open", paletteColor(theme.COLOR_GREEN), theme.scaledUi(12.0), row_clip);
     }
     if (show_workspace) {
         right -= workspace_w;
@@ -1226,7 +1236,7 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
     const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
     var buf: [96]u8 = undefined;
     const label = std.fmt.bufPrint(&buf, "Switch to {s}", .{state.projects.items[project_index].label}) catch "Switch workspace";
-    queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_SECONDARY_GREEN), font_size, row_clip);
+    queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
     const hint_w = theme.scaledUi(64.0);
     queueText(state, .{
         .x = rect.x + theme.scaledUi(34.0),
@@ -1249,8 +1259,10 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
 
 fn renderActionMenu(state: *runtime.AppState) void {
     if (action_count == 0) return;
-    // Slightly lighter than the panel so the submenu reads as a layer above it.
-    queueRoundedRect(state, action_menu_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.06)), theme.scaledUi(10.0));
+    // Lightened from the dark background (a bit more than the modal panel's
+    // 0.04) so the submenu reads as a layer above it. Derived from background
+    // rather than COLOR_PANEL_ALT for the same readability reason as the modal.
+    queueRoundedRect(state, action_menu_rect, paletteColor(theme.lighten(theme.background(), 0.07)), theme.scaledUi(10.0));
     queueBorder(state, action_menu_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(10.0), theme.scaledUi(1.0));
     const font_size = theme.scaledUi(13.0);
     var i: usize = 0;
@@ -1258,7 +1270,7 @@ fn renderActionMenu(state: *runtime.AppState) void {
         const rect = action_rects[i];
         const selected = state.command_palette_action_selected == i;
         if (selected and action_enabled[i]) {
-            queueRoundedRect(state, rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.10)), theme.scaledUi(7.0));
+            queueRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 56)), theme.scaledUi(7.0));
         }
         const color = if (!action_enabled[i])
             theme.COLOR_TEXT_SUBTLE
