@@ -56,6 +56,7 @@ pub const State = struct {
     script_storage: [SCRIPT_CAPACITY:0]u8 = std.mem.zeroes([SCRIPT_CAPACITY:0]u8),
     json_storage: [JSON_CAPACITY:0]u8 = std.mem.zeroes([JSON_CAPACITY:0]u8),
     current_url: ?[]u8 = null,
+    current_title: ?[]u8 = null,
     last_error: ?[]u8 = null,
     last_js_message: ?[]u8 = null,
     last_eval_result: ?[]u8 = null,
@@ -75,6 +76,7 @@ pub const State = struct {
     pub fn deinit(self: *State) void {
         self.controller.deinit();
         if (self.current_url) |url| self.allocator.free(url);
+        if (self.current_title) |title| self.allocator.free(title);
         if (self.last_error) |message| self.allocator.free(message);
         if (self.last_js_message) |message| self.allocator.free(message);
         if (self.last_eval_result) |result| self.allocator.free(result);
@@ -176,6 +178,11 @@ pub const State = struct {
     /// Replaces the last committed URL tracked by app state.
     pub fn setCurrentUrl(self: *State, value: ?[]const u8) !void {
         try self.replaceOptionalOwned(&self.current_url, value);
+    }
+
+    /// Replaces the last committed page title tracked by app state.
+    pub fn setCurrentTitle(self: *State, value: ?[]const u8) !void {
+        try self.replaceOptionalOwned(&self.current_title, value);
     }
 
     /// Replaces the last error message exposed to the desktop UI.

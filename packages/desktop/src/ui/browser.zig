@@ -214,7 +214,11 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .close => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
-                state.closeBrowser();
+                if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+                    _ = state.closeCurrentProjectWorkspacePane(pane_id);
+                } else {
+                    state.closeBrowser();
+                }
             },
         }
         state.noteInteraction();

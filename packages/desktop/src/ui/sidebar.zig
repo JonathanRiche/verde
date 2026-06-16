@@ -1089,7 +1089,7 @@ fn renderOpenPaneRow(
         },
         .browser => {
             queuePaletteGlobeIcon(state, icon_x + theme.scaledUi(7.0), cy, theme.scaledUi(13.0), paletteColor(muted));
-            title = browserPaneTitle(state);
+            title = browserPaneTitle(pane);
         },
     }
 
@@ -1249,8 +1249,15 @@ fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
 }
 
 /// Best-effort human label for the workspace browser pane.
-fn browserPaneTitle(state: *runtime.AppState) []const u8 {
-    const url = state.browserState().current_url orelse return "Browser";
+fn browserPaneTitle(pane: *const native_state.WorkspacePane) []const u8 {
+    const ref = switch (pane.ref) {
+        .browser => |browser| browser,
+        else => return "Browser",
+    };
+    if (ref.title) |title| {
+        if (title.len > 0) return title;
+    }
+    const url = ref.url orelse return "Browser";
     if (url.len == 0) return "Browser";
     return url;
 }
