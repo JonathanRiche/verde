@@ -2,12 +2,13 @@
   "name": "verde-dev-tools",
   "private": true,
   "scripts": {
-    "postinstall": "node ./scripts/dev/patch-agent-ci.mjs",
+    "ci:local": "node ./scripts/dev/run-agent-ci.mjs",
     "package:npm": "node ./scripts/release/package-npm.mjs",
     "publish:npm": "node ./scripts/release/publish-npm.mjs"
   },
   "devDependencies": {
-    "@redwoodjs/agent-ci": "^0.6.0"
+    "@redwoodjs/agent-ci": "0.16.2",
+    "yaml": "^2.8.2"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.132"

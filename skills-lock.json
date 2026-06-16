@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "agent-ci": {
+      "source": "redwoodjs/agent-ci",
+      "sourceType": "github",
+      "skillPath": "skills/agent-ci/SKILL.md",
+      "computedHash": "cb70ff1e30519819f8f93edc59ee0e7e96cdbb26b716c4bd4d3c098331ed3638"
+    }
+  }
+}

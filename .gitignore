@@ -6,6 +6,7 @@ vendor/imgui.ini
 node_modules/
 .agent-ci/
 .env
+.env.agent-ci
 .claude/
 .tmp_video_review/
 notes/mac-webview-smoke/manual-evidence/
