@@ -133,13 +133,13 @@ pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, 
     renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, 0.0);
 }
 
-fn paneOwnsLiveComposer(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) bool {
+fn paneOwnsActiveChatState(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) bool {
     const id = pane_id orelse return true;
     return state.isCurrentProjectWorkspacePaneFocused(id) or state.isCurrentProjectWorkspacePaneMaximized(id);
 }
 
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
-    const live_composer = paneOwnsLiveComposer(state, pane_id);
+    const live_composer = paneOwnsActiveChatState(state, pane_id);
     const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
         state.projects.items[state.selected_project_index].selected_thread_index
     else
@@ -1563,23 +1563,25 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
 
-    const pi = state.selected_project_index;
-    const ti = state.currentProject().selected_thread_index;
-    if (state.transcript_scroll_pending_track_p != pi or state.transcript_scroll_pending_track_t != ti) {
-        state.pending_transcript_scroll_px = 0;
-        state.pending_transcript_page_steps = 0;
-        state.transcript_scroll_pending_track_p = pi;
-        state.transcript_scroll_pending_track_t = ti;
-    }
+    if (paneOwnsActiveChatState(state, pane_id)) {
+        const pi = state.selected_project_index;
+        const ti = state.currentProject().selected_thread_index;
+        if (state.transcript_scroll_pending_track_p != pi or state.transcript_scroll_pending_track_t != ti) {
+            state.pending_transcript_scroll_px = 0;
+            state.pending_transcript_page_steps = 0;
+            state.transcript_scroll_pending_track_p = pi;
+            state.transcript_scroll_pending_track_t = ti;
+        }
 
-    if (state.pending_transcript_scroll_px != 0.0) {
-        scroll_y = snapTranscriptScrollY(scroll_y + state.pending_transcript_scroll_px, max_scroll);
-        state.pending_transcript_scroll_px = 0.0;
-    }
-    if (state.pending_transcript_page_steps != 0) {
-        const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
-        scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_steps)) * page_h, max_scroll);
-        state.pending_transcript_page_steps = 0;
+        if (state.pending_transcript_scroll_px != 0.0) {
+            scroll_y = snapTranscriptScrollY(scroll_y + state.pending_transcript_scroll_px, max_scroll);
+            state.pending_transcript_scroll_px = 0.0;
+        }
+        if (state.pending_transcript_page_steps != 0) {
+            const page_h = column.h * TRANSCRIPT_PAGE_VIEW_FRAC;
+            scroll_y = snapTranscriptScrollY(scroll_y + @as(f32, @floatFromInt(state.pending_transcript_page_steps)) * page_h, max_scroll);
+            state.pending_transcript_page_steps = 0;
+        }
     }
 
     updateTranscriptAutoFollowPalette(state, has_pending_stream, max_scroll, scroll_y);
