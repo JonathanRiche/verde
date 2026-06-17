@@ -133,7 +133,13 @@ pub fn renderWorkspaceAtForPane(state: *app_state.AppState, rect: palette.Rect, 
     renderWorkspaceAtForPaneWithReserve(state, rect, pane_id, 0.0);
 }
 
+fn paneOwnsLiveComposer(state: *const app_state.AppState, pane_id: ?app_state.WorkspacePaneId) bool {
+    const id = pane_id orelse return true;
+    return state.isCurrentProjectWorkspacePaneFocused(id) or state.isCurrentProjectWorkspacePaneMaximized(id);
+}
+
 pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: palette.Rect, pane_id: ?app_state.WorkspacePaneId, header_right_reserve: f32) void {
+    const live_composer = paneOwnsLiveComposer(state, pane_id);
     const restore_thread_index = if (pane_id != null and state.projects.items.len > 0)
         state.projects.items[state.selected_project_index].selected_thread_index
     else
@@ -151,9 +157,11 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         }
     }
 
-    state.invalidateComposerToolbarOverlayHitRects();
-    file_search_hits = .{};
-    process_dashboard_hit_count = 0;
+    if (live_composer) {
+        state.invalidateComposerToolbarOverlayHitRects();
+        file_search_hits = .{};
+    }
+    if (pane_id == null) process_dashboard_hit_count = 0;
     if (pane_id == null) transcript_hit_count = 0;
     queueRect(state, rect, paletteColor(theme.background()));
     if (state.projects.items.len == 0) {
@@ -262,7 +270,11 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     // message geometry or GL text that would otherwise overlap the title bar.
     renderHeader(state, header, header_right_reserve);
 
-    renderComposer(state, composer_rect);
+    if (live_composer) {
+        renderComposer(state, composer_rect);
+    } else {
+        renderInactiveComposer(state, composer_rect);
+    }
     if (terminal_height > 0.0) {
         terminal_panel.renderDockAt(state, .{
             .x = rect.x,
@@ -271,7 +283,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
             .h = terminal_height,
         });
     }
-    composer_pickers.render(state);
+    if (live_composer) composer_pickers.render(state);
 }
 
 fn estimateWorkspaceOriginX(state: *app_state.AppState, workspace_width: f32) f32 {
@@ -2681,6 +2693,45 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
     renderComposerFollowupHint(state);
     renderComposerToolbarIcons(state);
     state.syncComposerToolbarOverlayHitRects();
+}
+
+/// Renders the unfocused split-pane prompt preview without touching the shared live composer widget.
+fn renderInactiveComposer(state: *app_state.AppState, rect: palette.Rect) void {
+    const radius = theme.scaledUi(13.0);
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 185)),
+        paletteColor(theme.withAlpha(theme.borderMuted(), 185)),
+        radius,
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+
+    const draft = state.currentThreadDraft();
+    const text = if (draft.len == 0)
+        "Ask anything, or use / to show available commands"
+    else if (std.mem.findScalar(u8, draft, '\n')) |newline|
+        draft[0..newline]
+    else
+        draft;
+    const color = if (draft.len == 0) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
+    const pad = theme.scaledUi(18.0);
+    const toolbar_h = theme.scaledUi(42.0);
+    queueText(state, .{
+        .x = rect.x + pad,
+        .y = rect.y + theme.scaledUi(18.0),
+        .w = @max(rect.w - pad * 2.0, theme.scaledUi(1.0)),
+        .h = @max(rect.h - toolbar_h - theme.scaledUi(24.0), theme.scaledUi(20.0)),
+    }, text, color, theme.scaledUi(15.5), rect);
+
+    const send_dot_size = theme.scaledUi(28.0);
+    const send_dot = palette.Rect{
+        .x = rect.x + rect.w - pad - send_dot_size,
+        .y = rect.y + rect.h - theme.scaledUi(40.0),
+        .w = send_dot_size,
+        .h = send_dot_size,
+    };
+    queueRounded(state, send_dot, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 130)), send_dot_size * 0.5);
 }
 
 fn renderComposerFileSearchResults(state: *app_state.AppState) void {

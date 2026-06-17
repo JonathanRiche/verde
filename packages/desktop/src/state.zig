@@ -7338,6 +7338,10 @@ pub const AppState = struct {
         return self.currentProject().currentDraft();
     }
 
+    pub fn currentThreadDraft(self: *const AppState) []const u8 {
+        return self.currentDraft();
+    }
+
     pub fn currentThread(self: *const AppState) *const ChatThread {
         return self.currentProject().currentThread();
     }
@@ -10226,6 +10230,7 @@ pub const AppState = struct {
                     self.terminal_focused = false;
                     self.unfocusBrowserPane();
                     self.browser_address_focused = false;
+                    self.syncPaletteComposerFromDraft();
                 }
             },
             .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
