@@ -304,6 +304,21 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.markDirty();
                 return true;
             },
+            .open_pane => {
+                if (openPaneChatThreadIndex(state, hit.project_index, @intCast(hit.thread_index))) |thread_index| {
+                    state.workspace_header_open_menu_open = false;
+                    state.sidebar_context_menu_anchor_x = x;
+                    state.sidebar_context_menu_anchor_y = y;
+                    state.sidebar_context_menu_project_index = hit.project_index;
+                    state.sidebar_context_menu_thread_index = thread_index;
+                    state.sidebar_context_menu_kind = .thread;
+                    state.sidebar_context_menu_open = true;
+                    state.blurPaletteComposer();
+                    state.noteInteraction();
+                    state.markDirty();
+                    return true;
+                }
+            },
             else => {},
         }
     }
@@ -1131,6 +1146,17 @@ fn renderOpenPaneRow(
             }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
         }
     }
+}
+
+fn openPaneChatThreadIndex(state: *const runtime.AppState, project_index: usize, pane_id: native_state.WorkspacePaneId) ?usize {
+    if (project_index >= state.projects.items.len) return null;
+    const project = &state.projects.items[project_index];
+    const pane = project.workspace_layout.paneById(pane_id) orelse return null;
+    if (pane.minimized) return null;
+    return switch (pane.ref) {
+        .chat => |ref| if (ref.thread_index < project.threads.items.len) ref.thread_index else null,
+        else => null,
+    };
 }
 
 /// Quiet per-workspace "History · N" trailing row. The saved-thread list

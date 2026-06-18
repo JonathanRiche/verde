@@ -83,6 +83,8 @@ const WorkspaceHeaderOpenMenuRow = enum {
 };
 
 const WorkspaceHeaderHitCache = struct {
+    used: bool = false,
+    pane_id: ?app_state.WorkspacePaneId = null,
     header_rect: palette.Rect = .{},
     open_main_rect: palette.Rect = .{},
     chevron_rect: palette.Rect = .{},
@@ -94,7 +96,9 @@ const WorkspaceHeaderHitCache = struct {
     menu_row_enabled: [5]bool = [_]bool{false} ** 5,
 };
 
-var workspace_header_hits: WorkspaceHeaderHitCache = .{};
+const MAX_WORKSPACE_HEADER_HITS = 8;
+var workspace_header_hit_count: usize = 0;
+var workspace_header_hits: [MAX_WORKSPACE_HEADER_HITS]WorkspaceHeaderHitCache = [_]WorkspaceHeaderHitCache{.{}} ** MAX_WORKSPACE_HEADER_HITS;
 
 const ProcessDashboardAction = enum {
     start,
@@ -122,6 +126,7 @@ pub fn resetTranscriptHitCache() void {
 }
 
 pub fn renderWorkspaceAt(state: *app_state.AppState, rect: palette.Rect) void {
+    resetWorkspaceHeaderHitCache();
     renderWorkspaceAtForPane(state, rect, null);
 }
 
@@ -166,6 +171,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     queueRect(state, rect, paletteColor(theme.background()));
     if (state.projects.items.len == 0) {
         state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
         renderEmptyProjects(state, rect);
         return;
     }
@@ -268,7 +274,7 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
 
     // Paint after the transcript so the opaque header strip wins over any scrolled
     // message geometry or GL text that would otherwise overlap the title bar.
-    renderHeader(state, header, header_right_reserve);
+    renderHeader(state, header, header_right_reserve, pane_id);
 
     if (live_composer) {
         renderComposer(state, composer_rect);
@@ -321,46 +327,64 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         };
         if (!applied) state.setSidebarNotice("Process not found.");
         state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
         state.blurPaletteComposer();
         state.noteInteraction();
         return true;
     }
 
-    if (state.workspace_header_open_menu_open and rectContains(workspace_header_hits.menu_panel_rect, x, y)) {
-        var i: usize = 0;
-        while (i < workspace_header_hits.menu_row_count) : (i += 1) {
-            if (!rectContains(workspace_header_hits.menu_row_rects[i], x, y)) continue;
-            state.workspace_header_open_menu_open = false;
-            state.blurPaletteComposer();
-            if (!workspace_header_hits.menu_row_enabled[i]) {
+    if (workspaceHeaderMenuHit(state)) |menu_hit| {
+        if (rectContains(menu_hit.menu_panel_rect, x, y)) {
+            var i: usize = 0;
+            while (i < menu_hit.menu_row_count) : (i += 1) {
+                if (!rectContains(menu_hit.menu_row_rects[i], x, y)) continue;
+                state.workspace_header_open_menu_open = false;
+                state.workspace_header_open_menu_pane_id = null;
+                state.blurPaletteComposer();
+                if (menu_hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
+                if (!menu_hit.menu_row_enabled[i]) {
+                    runtime.log.info(
+                        "workspace header open menu row hit (disabled) kind={s} x={d:.1} y={d:.1}",
+                        .{ @tagName(menu_hit.menu_row_kind[i]), x, y },
+                    );
+                    return true;
+                }
                 runtime.log.info(
-                    "workspace header open menu row hit (disabled) kind={s} x={d:.1} y={d:.1}",
-                    .{ @tagName(workspace_header_hits.menu_row_kind[i]), x, y },
+                    "workspace header open menu row kind={s} x={d:.1} y={d:.1}",
+                    .{ @tagName(menu_hit.menu_row_kind[i]), x, y },
                 );
+                switch (menu_hit.menu_row_kind[i]) {
+                    .folder => state.openCurrentProjectDirectory(),
+                    .configured_editor => state.openCurrentProjectEditor(.configured),
+                    .cursor => state.openCurrentProjectEditor(.cursor),
+                    .vscode => state.openCurrentProjectEditor(.vscode),
+                    .zed => state.openCurrentProjectEditor(.zed),
+                }
+                state.noteInteraction();
                 return true;
             }
-            runtime.log.info(
-                "workspace header open menu row kind={s} x={d:.1} y={d:.1}",
-                .{ @tagName(workspace_header_hits.menu_row_kind[i]), x, y },
-            );
-            switch (workspace_header_hits.menu_row_kind[i]) {
-                .folder => state.openCurrentProjectDirectory(),
-                .configured_editor => state.openCurrentProjectEditor(.configured),
-                .cursor => state.openCurrentProjectEditor(.cursor),
-                .vscode => state.openCurrentProjectEditor(.vscode),
-                .zed => state.openCurrentProjectEditor(.zed),
-            }
-            state.noteInteraction();
+            state.workspace_header_open_menu_open = false;
+            state.workspace_header_open_menu_pane_id = null;
+            state.blurPaletteComposer();
+            runtime.log.info("workspace header open menu panel hit (no row) x={d:.1} y={d:.1}", .{ x, y });
             return true;
         }
-        state.workspace_header_open_menu_open = false;
-        state.blurPaletteComposer();
-        runtime.log.info("workspace header open menu panel hit (no row) x={d:.1} y={d:.1}", .{ x, y });
-        return true;
     }
 
-    if (rectContains(workspace_header_hits.open_main_rect, x, y)) {
+    const control_hit = workspaceHeaderControlHit(x, y) orelse {
+        if (state.workspace_header_open_menu_open) {
+            state.workspace_header_open_menu_open = false;
+            state.workspace_header_open_menu_pane_id = null;
+            runtime.log.info("workspace header dismissed open menu (click outside controls) x={d:.1} y={d:.1}", .{ x, y });
+        }
+        return false;
+    };
+
+    if (control_hit.pane_id) |pane_id| _ = state.focusCurrentProjectWorkspacePane(pane_id);
+
+    if (rectContains(control_hit.open_main_rect, x, y)) {
         state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
         state.blurPaletteComposer();
         const can = state.canRunDefaultOpenAction();
         runtime.log.info(
@@ -375,8 +399,10 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         state.noteInteraction();
         return true;
     }
-    if (rectContains(workspace_header_hits.chevron_rect, x, y)) {
-        state.workspace_header_open_menu_open = !state.workspace_header_open_menu_open;
+    if (rectContains(control_hit.chevron_rect, x, y)) {
+        const was_open_here = state.workspace_header_open_menu_open and paneIdEqual(state.workspace_header_open_menu_pane_id, control_hit.pane_id);
+        state.workspace_header_open_menu_open = !was_open_here;
+        state.workspace_header_open_menu_pane_id = if (state.workspace_header_open_menu_open) control_hit.pane_id else null;
         state.blurPaletteComposer();
         runtime.log.info(
             "workspace header chevron click menu_open={} x={d:.1} y={d:.1}",
@@ -385,17 +411,13 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
         state.noteInteraction();
         return true;
     }
-    if (rectContains(workspace_header_hits.browser_rect, x, y)) {
+    if (rectContains(control_hit.browser_rect, x, y)) {
         state.workspace_header_open_menu_open = false;
+        state.workspace_header_open_menu_pane_id = null;
         state.blurPaletteComposer();
         state.toggleBrowser();
         state.noteInteraction();
         return true;
-    }
-
-    if (state.workspace_header_open_menu_open) {
-        state.workspace_header_open_menu_open = false;
-        runtime.log.info("workspace header dismissed open menu (click outside controls) x={d:.1} y={d:.1}", .{ x, y });
     }
     return false;
 }
@@ -1095,9 +1117,58 @@ fn queueGlobeMeridianArc(
     }
 }
 
-fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f32) void {
-    workspace_header_hits = .{};
-    workspace_header_hits.header_rect = rect;
+fn paneIdEqual(a: ?app_state.WorkspacePaneId, b: ?app_state.WorkspacePaneId) bool {
+    if (a) |left| {
+        return if (b) |right| left == right else false;
+    }
+    return b == null;
+}
+
+pub fn resetWorkspaceHeaderHitCache() void {
+    workspace_header_hit_count = 0;
+}
+
+fn appendWorkspaceHeaderHit(pane_id: ?app_state.WorkspacePaneId, rect: palette.Rect) *WorkspaceHeaderHitCache {
+    const index = if (workspace_header_hit_count < workspace_header_hits.len) blk: {
+        const next = workspace_header_hit_count;
+        workspace_header_hit_count += 1;
+        break :blk next;
+    } else workspace_header_hits.len - 1;
+    workspace_header_hits[index] = .{ .used = true, .pane_id = pane_id, .header_rect = rect };
+    return &workspace_header_hits[index];
+}
+
+fn workspaceHeaderMenuHit(state: *const app_state.AppState) ?*WorkspaceHeaderHitCache {
+    if (!state.workspace_header_open_menu_open) return null;
+    var i = workspace_header_hit_count;
+    while (i > 0) {
+        i -= 1;
+        if (!workspace_header_hits[i].used) continue;
+        if (paneIdEqual(workspace_header_hits[i].pane_id, state.workspace_header_open_menu_pane_id)) {
+            return &workspace_header_hits[i];
+        }
+    }
+    return null;
+}
+
+fn workspaceHeaderControlHit(x: f32, y: f32) ?*WorkspaceHeaderHitCache {
+    var i = workspace_header_hit_count;
+    while (i > 0) {
+        i -= 1;
+        const hit = &workspace_header_hits[i];
+        if (!hit.used) continue;
+        if (rectContains(hit.open_main_rect, x, y) or
+            rectContains(hit.chevron_rect, x, y) or
+            rectContains(hit.browser_rect, x, y))
+        {
+            return hit;
+        }
+    }
+    return null;
+}
+
+fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f32, pane_id: ?app_state.WorkspacePaneId) void {
+    const header_hit = appendWorkspaceHeaderHit(pane_id, rect);
 
     queueRect(state, rect, paletteColor(theme.background()));
     queueRect(state, .{ .x = rect.x, .y = rect.y + rect.h - 1.0, .w = rect.w, .h = 1.0 }, paletteColor(theme.borderMuted()));
@@ -1155,9 +1226,9 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const chevron_rect = palette.Rect{ .x = open_combo_x + open_main_w, .y = actions_y, .w = chevron_w, .h = button_h };
     const browser_rect = palette.Rect{ .x = open_combo_x + open_combo_w + button_gap, .y = actions_y, .w = browser_w, .h = button_h };
 
-    workspace_header_hits.open_main_rect = open_main_rect;
-    workspace_header_hits.chevron_rect = chevron_rect;
-    workspace_header_hits.browser_rect = browser_rect;
+    header_hit.open_main_rect = open_main_rect;
+    header_hit.chevron_rect = chevron_rect;
+    header_hit.browser_rect = browser_rect;
 
     const open_main_hover = mouse_ok and rectContains(open_main_rect, mx, my);
     const chevron_hover = mouse_ok and rectContains(chevron_rect, mx, my);
@@ -1238,7 +1309,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
         .h = label_font * 1.25,
     }, browser_label, paletteColor(theme.COLOR_WHITE), label_font, rect);
 
-    if (!state.workspace_header_open_menu_open) return;
+    if (!state.workspace_header_open_menu_open or !paneIdEqual(state.workspace_header_open_menu_pane_id, pane_id)) return;
 
     var kinds: [5]WorkspaceHeaderOpenMenuRow = undefined;
     var enabled: [5]bool = undefined;
@@ -1285,18 +1356,18 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
     const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(count)) * menu_row_h;
     const menu_x = @max(rect.x + theme.scaledUi(12.0), chevron_rect.x + chevron_rect.w - menu_w);
     const menu_y = chevron_rect.y + chevron_rect.h + theme.scaledUi(6.0);
-    workspace_header_hits.menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
+    header_hit.menu_panel_rect = .{ .x = menu_x, .y = menu_y, .w = menu_w, .h = menu_h };
 
-    const menu_clip = workspace_header_hits.menu_panel_rect;
-    queueRounded(state, workspace_header_hits.menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
-    queueBorder(state, workspace_header_hits.menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
+    const menu_clip = header_hit.menu_panel_rect;
+    queueRounded(state, header_hit.menu_panel_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(12.0));
+    queueBorder(state, header_hit.menu_panel_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(12.0), theme.scaledUi(1.0));
 
-    workspace_header_hits.menu_row_count = count;
+    header_hit.menu_row_count = count;
     var ri: usize = 0;
     var ry = menu_y + menu_pad;
     while (ri < count) : (ri += 1) {
-        workspace_header_hits.menu_row_kind[ri] = kinds[ri];
-        workspace_header_hits.menu_row_enabled[ri] = enabled[ri];
+        header_hit.menu_row_kind[ri] = kinds[ri];
+        header_hit.menu_row_enabled[ri] = enabled[ri];
 
         const rr = palette.Rect{
             .x = menu_x + theme.scaledUi(4.0),
@@ -1304,7 +1375,7 @@ fn renderHeader(state: *app_state.AppState, rect: palette.Rect, right_reserve: f
             .w = menu_w - theme.scaledUi(8.0),
             .h = menu_row_h,
         };
-        workspace_header_hits.menu_row_rects[ri] = rr;
+        header_hit.menu_row_rects[ri] = rr;
 
         const row_hover = mouse_ok and enabled[ri] and rectContains(rr, mx, my);
         if (row_hover) {
@@ -2726,14 +2797,145 @@ fn renderInactiveComposer(state: *app_state.AppState, rect: palette.Rect) void {
         .h = @max(rect.h - toolbar_h - theme.scaledUi(24.0), theme.scaledUi(20.0)),
     }, text, color, theme.scaledUi(15.5), rect);
 
-    const send_dot_size = theme.scaledUi(28.0);
-    const send_dot = palette.Rect{
-        .x = rect.x + rect.w - pad - send_dot_size,
-        .y = rect.y + rect.h - theme.scaledUi(40.0),
-        .w = send_dot_size,
-        .h = send_dot_size,
+    renderInactiveComposerToolbar(state, rect);
+    renderInactiveComposerSubmit(state, rect);
+}
+
+// Renders the read-only composer toolbar shown in split panes that do not own live input.
+fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect) void {
+    const thread = state.currentThread();
+    const pad = theme.scaledUi(18.0);
+    const gap = theme.scaledUi(8.0);
+    const pill_h = theme.scaledUi(28.0);
+    const y = rect.y + rect.h - theme.scaledUi(40.0);
+    const max_x = rect.x + rect.w - theme.scaledUi(58.0);
+    var x = rect.x + pad;
+
+    const model_label = state.currentComposerModelLabel();
+    const model_w = inactiveComposerPillWidth(model_label, true);
+    if (x + model_w <= max_x) {
+        const pill = palette.Rect{ .x = x, .y = y, .w = model_w, .h = pill_h };
+        renderInactiveComposerPill(state, pill, model_label, true);
+        renderInactiveComposerProviderIcon(state, pill, thread.provider);
+        x += model_w + gap;
+    }
+
+    const reasoning_label = state.currentComposerReasoningLabel();
+    const reasoning_w = inactiveComposerPillWidth(reasoning_label, false);
+    if (x + reasoning_w <= max_x) {
+        renderInactiveComposerPill(state, .{ .x = x, .y = y, .w = reasoning_w, .h = pill_h }, reasoning_label, false);
+        x += reasoning_w + gap;
+    }
+
+    if (state.currentComposerShowsFastToggle()) {
+        const fast_label = state.currentComposerFastLabel();
+        const fast_w = inactiveComposerPillWidth(fast_label, true);
+        if (x + fast_w <= max_x) {
+            const pill = palette.Rect{ .x = x, .y = y, .w = fast_w, .h = pill_h };
+            renderInactiveComposerPill(state, pill, fast_label, true);
+            const icon_rect = snapIconRectOrigin(.{
+                .x = pill.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
+                .y = pill.y + (pill.h - theme.scaledUi(19.0)) * 0.5,
+                .w = theme.scaledUi(19.0),
+                .h = theme.scaledUi(19.0),
+            });
+            const icon_color = paletteColor(theme.withAlpha(theme.COLOR_WHITE, 165));
+            if (thread.fast_mode == .on) {
+                drawBoltIcon(state, icon_rect, icon_color);
+            } else {
+                drawDefaultModeIcon(state, icon_rect, icon_color);
+            }
+            x += fast_w + gap;
+        }
+    }
+
+    const access_label = state.currentComposerAccessLabel();
+    const access_w = inactiveComposerPillWidth(access_label, true);
+    if (x + access_w <= max_x) {
+        const pill = palette.Rect{ .x = x, .y = y, .w = access_w, .h = pill_h };
+        renderInactiveComposerPill(state, pill, access_label, true);
+        drawAccessIcon(state, snapIconRectOrigin(.{
+            .x = pill.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
+            .y = pill.y + (pill.h - theme.scaledUi(19.0)) * 0.5,
+            .w = theme.scaledUi(19.0),
+            .h = theme.scaledUi(19.0),
+        }), paletteColor(theme.withAlpha(theme.COLOR_WHITE, 165)));
+    }
+}
+
+fn inactiveComposerPillWidth(label: []const u8, has_icon: bool) f32 {
+    const text_w = @as(f32, @floatFromInt(label.len)) * theme.scaledUi(12.5) * 0.54;
+    return theme.clampf(text_w + theme.scaledUi(if (has_icon) 50.0 else 26.0), theme.scaledUi(if (has_icon) 92.0 else 76.0), theme.scaledUi(180.0));
+}
+
+// Renders a muted toolbar pill for the inactive composer preview.
+fn renderInactiveComposerPill(state: *app_state.AppState, rect: palette.Rect, label: []const u8, has_icon: bool) void {
+    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 135)), rect.h * 0.5);
+    const text_x = rect.x + theme.scaledUi(if (has_icon) 43.0 else 13.0);
+    queueChromeLabel(state, .{
+        .x = text_x,
+        .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
+        .w = @max(rect.x + rect.w - text_x - theme.scaledUi(10.0), theme.scaledUi(1.0)),
+        .h = theme.scaledUi(16.0),
+    }, label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 185)), theme.scaledUi(12.5), rect);
+}
+
+// Renders the provider mark inside the inactive composer model pill.
+fn renderInactiveComposerProviderIcon(state: *app_state.AppState, pill: palette.Rect, provider: app_state.Provider) void {
+    const provider_slot = theme.scaledUi(COMPOSER_PROVIDER_LOGO_SLOT_CSS);
+    const icon_slot = palette.Rect{
+        .x = pill.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
+        .y = pill.y + (pill.h - provider_slot) * 0.5,
+        .w = provider_slot,
+        .h = provider_slot,
     };
-    queueRounded(state, send_dot, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 130)), send_dot_size * 0.5);
+    const provider_icon = switch (provider) {
+        .codex => state.codex_logo_texture,
+        .opencode => state.opencode_logo_texture,
+        .claude => state.claude_logo_texture,
+        .cursor => state.cursor_logo_texture,
+    };
+    if (provider_icon) |cached| {
+        const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, icon_slot.x, icon_slot.y, icon_slot.w, icon_slot.h));
+        queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, pill);
+    } else {
+        const fallback_label = switch (provider) {
+            .codex => "C",
+            .opencode => "O",
+            .claude => "A",
+            .cursor => "R",
+        };
+        queueText(state, icon_slot, fallback_label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 175)), theme.scaledUi(13.0), pill);
+    }
+}
+
+// Renders the inactive composer submit/stop affordance without registering hit state.
+fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) void {
+    const size = theme.scaledUi(28.0);
+    const button = palette.Rect{
+        .x = rect.x + rect.w - theme.scaledUi(18.0) - size,
+        .y = rect.y + rect.h - theme.scaledUi(40.0),
+        .w = size,
+        .h = size,
+    };
+    if (state.currentThread().isSendPendingForUi()) {
+        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 185)), size * 0.5);
+        const stop = palette.Rect{
+            .x = button.x + size * 0.34,
+            .y = button.y + size * 0.34,
+            .w = size * 0.32,
+            .h = size * 0.32,
+        };
+        queueRounded(state, stop, paletteColor(theme.withAlpha(theme.background(), 230)), theme.scaledUi(2.0));
+    } else {
+        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 120)), size * 0.5);
+        queueText(state, .{
+            .x = button.x + size * 0.31,
+            .y = button.y + size * 0.12,
+            .w = size * 0.5,
+            .h = size * 0.7,
+        }, "↑", paletteColor(theme.withAlpha(theme.COLOR_WHITE, 190)), theme.scaledUi(16.0), button);
+    }
 }
 
 fn renderComposerFileSearchResults(state: *app_state.AppState) void {

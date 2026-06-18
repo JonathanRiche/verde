@@ -3442,7 +3442,7 @@ fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, lay
                 rows += 1;
                 continue;
             }
-            const take = @min(remaining.len, room);
+            const take = utf8PrefixByteLenForColumns(remaining, room);
             const slice = remaining[0..take];
             const slice_width = transcriptTextWidthForRole(code_fs, .mono, slice);
             queuePaletteRoleText(context, .{
@@ -3452,12 +3452,31 @@ fn renderPaletteCodeLine(context: *PaletteRenderContext, line: CodeLineView, lay
                 .h = lh,
             }, slice, color, code_fs, .mono, clip);
             cursor_x += slice_width;
-            col_on_row += take;
+            col_on_row += utf8ColumnCount(slice);
             remaining = remaining[take..];
         }
     }
 
     return rows;
+}
+
+fn utf8PrefixByteLenForColumns(value: []const u8, max_columns: usize) usize {
+    if (value.len == 0 or max_columns == 0) return 0;
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < value.len and columns < max_columns) {
+        const len = std.unicode.utf8ByteSequenceLength(value[index]) catch 1;
+        if (index + len > value.len) return if (index == 0) 1 else index;
+        const next = value[index .. index + len];
+        if (!std.unicode.utf8ValidateSlice(next)) return if (index == 0) 1 else index;
+        index += len;
+        columns += 1;
+    }
+    return if (index == 0) 1 else index;
+}
+
+fn utf8ColumnCount(value: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(value) catch value.len;
 }
 
 const CodeLineLayout = struct {

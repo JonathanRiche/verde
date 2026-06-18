@@ -995,7 +995,8 @@ pub const Renderer = struct {
                 cursor_y += line_height;
             }
             if (!isTextSpace(slice)) {
-                try self.appendTextGlyph(allocator, frame, slice, cursor_x, cursor_y, color_value, font_size, clip, self.fallbackFontRoleForGlyph(slice, font_size, font_role));
+                const glyph = if (std.unicode.utf8ValidateSlice(slice)) slice else "?";
+                try self.appendTextGlyph(allocator, frame, glyph, cursor_x, cursor_y, color_value, font_size, clip, self.fallbackFontRoleForGlyph(glyph, font_size, font_role));
             }
             cursor_x += advance;
             index += len;
@@ -1088,6 +1089,7 @@ pub const Renderer = struct {
     fn fallbackFontRoleForGlyph(self: *Renderer, value: []const u8, font_size: f32, font_role: ?draw.FontRole) ?draw.FontRole {
         if (font_role != .mono or self.icon_font == null) return font_role;
         if (value.len == 0 or value[0] < 0x80) return font_role;
+        if (!std.unicode.utf8ValidateSlice(value)) return font_role;
         const codepoint = std.unicode.utf8Decode(value) catch return font_role;
         const mono = self.fontForRoleAndSize(font_size, .mono) catch return font_role;
         if (c.TTF_FontHasGlyph(mono, codepoint)) return font_role;

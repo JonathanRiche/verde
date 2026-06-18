@@ -560,6 +560,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     hit_cache.count = 0;
     pane_rect_count = 0;
     browser_pane_rendered = false;
+    chat_panel.resetWorkspaceHeaderHitCache();
     chat_panel.resetTranscriptHitCache();
     terminal_panel.resetHitCache();
 
