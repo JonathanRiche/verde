@@ -923,10 +923,16 @@ fn currentThreadNotPending(state: *runtime.AppState) bool {
 
 fn canSyncCurrentThread(state: *runtime.AppState) bool {
     if (state.selected_project_index >= state.projects.items.len) return false;
+    const thread_index = focusedGuiThreadIndex(state) orelse return false;
     const project = &state.projects.items[state.selected_project_index];
-    if (project.selected_thread_index >= project.threads.items.len) return false;
-    const thread = &project.threads.items[project.selected_thread_index];
+    if (thread_index >= project.threads.items.len) return false;
+    const thread = &project.threads.items[thread_index];
     return thread.provider_thread_id != null and !thread.isSendPendingForUi();
+}
+
+fn focusedGuiThreadIndex(state: *runtime.AppState) ?usize {
+    const pane_id = state.focusedWorkspaceChatPaneId() orelse return null;
+    return state.workspaceChatThreadIndexByPane(pane_id);
 }
 
 fn runNewChat(state: *runtime.AppState) void {
@@ -935,8 +941,8 @@ fn runNewChat(state: *runtime.AppState) void {
 }
 
 fn runSyncCurrentThread(state: *runtime.AppState) void {
-    const project = &state.projects.items[state.selected_project_index];
-    state.syncThreadFromProvider(state.selected_project_index, project.selected_thread_index);
+    const thread_index = focusedGuiThreadIndex(state) orelse return;
+    state.syncThreadFromProvider(state.selected_project_index, thread_index);
 }
 
 fn runArchiveCurrentThread(state: *runtime.AppState) void {

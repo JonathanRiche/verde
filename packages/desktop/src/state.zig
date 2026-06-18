@@ -901,6 +901,16 @@ fn claudeEffortValueLabel(value: []const u8) []const u8 {
     return cursorReasoningValueLabel(value);
 }
 
+fn reasoningEffortDisplayLabel(value: ReasoningEffort) []const u8 {
+    return switch (value) {
+        .low => "Low",
+        .medium => "Medium",
+        .high => "High",
+        .xhigh => "Xhigh",
+        .max => "Max",
+    };
+}
+
 pub const ReasoningOption = struct {
     label: [:0]const u8,
     value: ?ReasoningEffort = null,
@@ -3394,6 +3404,7 @@ pub const AppState = struct {
     browser_context_menu_items: std.ArrayList(BrowserContextMenuItem),
     /// Split "Open" header menu (folder / editors); palette workspace chrome only.
     workspace_header_open_menu_open: bool,
+    workspace_header_open_menu_pane_id: ?WorkspacePaneId,
     sidebar_context_menu_open: bool,
     sidebar_context_menu_kind: SidebarContextMenuKind,
     sidebar_context_menu_project_index: usize,
@@ -3610,6 +3621,7 @@ pub const AppState = struct {
             .browser_context_menu_anchor_y = 0.0,
             .browser_context_menu_items = .empty,
             .workspace_header_open_menu_open = false,
+            .workspace_header_open_menu_pane_id = null,
             .sidebar_context_menu_open = false,
             .sidebar_context_menu_kind = .none,
             .sidebar_context_menu_project_index = 0,
@@ -4538,6 +4550,7 @@ pub const AppState = struct {
         self.selected_project_index = index;
         self.ensureCurrentProjectWorkspace();
         self.workspace_header_open_menu_open = false;
+        self.workspace_header_open_menu_pane_id = null;
         self.sidebar_context_menu_open = false;
         self.syncRenameBuffer();
         self.markDirty();
@@ -4674,6 +4687,7 @@ pub const AppState = struct {
         self.palette_modal_text_focus = .command_palette;
         self.closeSidebarContextMenu();
         self.workspace_header_open_menu_open = false;
+        self.workspace_header_open_menu_pane_id = null;
         self.blurPaletteComposer();
         self.noteInteraction();
         self.markDirty();
@@ -5946,6 +5960,7 @@ pub const AppState = struct {
     pub fn openSettingsModal(self: *AppState) void {
         self.closeSidebarContextMenu();
         self.workspace_header_open_menu_open = false;
+        self.workspace_header_open_menu_pane_id = null;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
         self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
@@ -7342,6 +7357,47 @@ pub const AppState = struct {
         return self.currentDraft();
     }
 
+    pub fn currentComposerModelLabel(self: *const AppState) []const u8 {
+        const thread = self.currentThread();
+        const options = composerModelOptions(self, thread.provider);
+        if (self.composerModelIndex(thread.provider, thread.model_ref)) |index| {
+            if (index < options.len) return std.mem.sliceTo(options[index].label, 0);
+        }
+        return if (thread.model_ref) |model_ref| std.mem.sliceTo(model_ref, 0) else std.mem.sliceTo(composerDefaultModelRef(self, thread.provider), 0);
+    }
+
+    pub fn currentComposerReasoningLabel(self: *const AppState) []const u8 {
+        const thread = self.currentThread();
+        if (self.composerReasoningIndexForThread(thread)) |index| {
+            if (thread.provider == .codex) {
+                if (index < CODEX_REASONING_OPTIONS.len) return std.mem.sliceTo(CODEX_REASONING_OPTIONS[index].label, 0);
+            } else {
+                const rows = self.opencode_reasoning_menu.items;
+                if (index < rows.len) return std.mem.sliceTo(rows[index].label, 0);
+            }
+        }
+        if (thread.reasoning_effort) |effort| return reasoningEffortDisplayLabel(effort);
+        if (thread.opencode_reasoning_variant) |variant| return std.mem.sliceTo(variant, 0);
+        return "Default";
+    }
+
+    pub fn currentComposerShowsFastToggle(self: *const AppState) bool {
+        const thread = self.currentThread();
+        const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
+        return thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
+    }
+
+    pub fn currentComposerFastLabel(self: *const AppState) []const u8 {
+        return if (self.currentThread().fast_mode == .on) "Fast" else "Default";
+    }
+
+    pub fn currentComposerAccessLabel(self: *const AppState) []const u8 {
+        return switch (self.currentThread().access_mode) {
+            .full_access => "Full access",
+            .supervised => "Supervised",
+        };
+    }
+
     pub fn currentThread(self: *const AppState) *const ChatThread {
         return self.currentProject().currentThread();
     }
@@ -8287,6 +8343,7 @@ pub const AppState = struct {
     /// Opens or closes the workspace header Open menu for live overlay parity smokes.
     pub fn setWorkspaceHeaderOpenMenuOpen(self: *AppState, open: bool) void {
         self.workspace_header_open_menu_open = open;
+        if (!open) self.workspace_header_open_menu_pane_id = null;
         if (open) {
             self.browser_inspector_menu_open = false;
             self.browser_address_focused = false;
@@ -8302,6 +8359,7 @@ pub const AppState = struct {
         if (open) {
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         }
@@ -8317,6 +8375,7 @@ pub const AppState = struct {
             _ = self.palette_model_cascade.handleInput(.close);
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         } else {
@@ -8336,6 +8395,7 @@ pub const AppState = struct {
             self.project_import_cursor = self.importDirectoryDraft().len;
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         } else {
@@ -8355,6 +8415,7 @@ pub const AppState = struct {
             self.thread_import_cursor = 0;
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         } else {
@@ -8369,6 +8430,7 @@ pub const AppState = struct {
             self.openImageModal("live-smoke-image.png");
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         } else {
@@ -8385,6 +8447,7 @@ pub const AppState = struct {
             self.transcript_selection_modal_requested = true;
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
+            self.workspace_header_open_menu_pane_id = null;
             self.browser_address_focused = false;
             self.unfocusBrowserPane();
         } else {
