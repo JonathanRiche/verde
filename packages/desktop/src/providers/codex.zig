@@ -398,8 +398,7 @@ pub const Client = struct {
         try self.ensureConnected();
         try self.ensureThreadLoaded(thread_id);
 
-        const payload = try self.callRpcForResultAlloc("thread/compact/start", .{ .threadId = thread_id });
-        defer self.allocator.free(payload);
+        try self.callThreadCompactAndWait(thread_id);
 
         return self.slashTextResultAlloc(
             allocator,
@@ -1117,6 +1116,43 @@ pub const Client = struct {
         }
     }
 
+    fn callThreadCompactAndWait(self: *Client, thread_id: []const u8) !void {
+        const id = try self.sendRequest("thread/compact/start", .{ .threadId = thread_id });
+        var response_received = false;
+        var compaction_completed = false;
+
+        while (true) {
+            const message = try self.readTextMessageAlloc(self.allocator);
+            defer self.allocator.free(message);
+            runtime_log.diagnostic("Codex RPC compact await id={d} message_len={d}", .{ id, message.len });
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (isContextCompactionCompleted(root, thread_id) or isThreadCompactionIdle(root, thread_id)) {
+                compaction_completed = true;
+            }
+
+            if (parseMessageId(root)) |response_id| {
+                if (response_id != id) continue;
+
+                if (getObjectField(root, "error")) |rpc_error| {
+                    runtime_log.diagnostic("Codex RPC compact response id={d} returned error: {s}", .{ id, message });
+                    if (getOptionalObjectInteger(rpc_error, "code")) |code| {
+                        if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
+                    }
+                    return error.CodexRpcFailed;
+                }
+
+                _ = getObjectField(root, "result") orelse return error.MissingRpcResult;
+                response_received = true;
+            }
+
+            if (response_received and compaction_completed) return;
+        }
+    }
+
     fn awaitResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
@@ -1698,6 +1734,38 @@ fn getOptionalObjectBool(value: std.json.Value, field: []const u8) ?bool {
         .bool => |flag| flag,
         else => null,
     };
+}
+
+fn isContextCompactionCompleted(root: std.json.Value, thread_id: []const u8) bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    if (!std.mem.eql(u8, method, "item/completed")) return false;
+
+    const params = getObjectField(root, "params") orelse return false;
+    if (getOptionalObjectString(params, "threadId")) |notification_thread_id| {
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return false;
+    }
+
+    const item = getObjectField(params, "item") orelse return false;
+    const item_type = getOptionalObjectString(item, "type") orelse return false;
+    return std.mem.eql(u8, item_type, "contextCompaction");
+}
+
+fn isThreadCompactionIdle(root: std.json.Value, thread_id: []const u8) bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    if (std.mem.eql(u8, method, "turn/completed")) {
+        const params = getObjectField(root, "params") orelse return false;
+        const notification_thread_id = getOptionalObjectString(params, "threadId") orelse return false;
+        return std.mem.eql(u8, notification_thread_id, thread_id);
+    }
+    if (std.mem.eql(u8, method, "thread/status/changed")) {
+        const params = getObjectField(root, "params") orelse return false;
+        const notification_thread_id = getOptionalObjectString(params, "threadId") orelse return false;
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return false;
+        const status = getObjectField(params, "status") orelse return false;
+        const type_name = getOptionalObjectString(status, "type") orelse return false;
+        return std.mem.eql(u8, type_name, "idle");
+    }
+    return false;
 }
 
 fn isGoalStatus(args: []const u8) bool {
