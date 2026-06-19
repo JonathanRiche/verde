@@ -2341,11 +2341,31 @@ fn renderUsageHeader(state: *app_state.AppState, bubble: palette.Rect, y: f32, h
     const pad = theme.scaledUi(16.0);
     const icon = theme.scaledUi(30.0);
     const icon_rect = palette.Rect{ .x = bubble.x + pad, .y = y + theme.scaledUi(5.0), .w = icon, .h = icon };
-    queueRounded(state, icon_rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), icon * 0.5);
-    queueFixedTextLine(state, .{ .x = icon_rect.x + theme.scaledUi(7.0), .y = icon_rect.y + theme.scaledUi(4.0), .w = icon_rect.w, .h = icon_rect.h }, "◔", paletteColor(theme.COLOR_GREEN), theme.scaledUi(16.0), clip);
+    renderUsageHeaderIcon(state, icon_rect, clip);
     queueChromeLabel(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(3.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(22.0) }, "Codex usage", paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
     queueText(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(27.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(18.0) }, "Rate limits, reset windows, and recent token activity", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
     queueRect(state, .{ .x = bubble.x + pad, .y = y + height - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)));
+}
+
+/// Renders a small bar-chart glyph for the usage card header without relying on font symbols.
+fn renderUsageHeaderIcon(state: *app_state.AppState, rect: palette.Rect, clip: palette.Rect) void {
+    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), rect.w * 0.5);
+
+    const bar_w = theme.scaledUi(3.0);
+    const gap = theme.scaledUi(2.5);
+    const base_y = rect.y + rect.h - theme.scaledUi(8.0);
+    const heights = [_]f32{ theme.scaledUi(8.0), theme.scaledUi(13.0), theme.scaledUi(18.0) };
+    const total_w = bar_w * 3.0 + gap * 2.0;
+    var x = rect.x + (rect.w - total_w) * 0.5;
+    for (heights) |bar_h| {
+        queueRoundedClipped(state, .{
+            .x = x,
+            .y = base_y - bar_h,
+            .w = bar_w,
+            .h = bar_h,
+        }, paletteColor(theme.COLOR_GREEN), bar_w * 0.5, clip);
+        x += bar_w + gap;
+    }
 }
 
 /// Renders a compact all-caps-style section label inside the usage card.
