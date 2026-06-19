@@ -2140,6 +2140,11 @@ fn canHandleTranscriptScrollAction(state: *const AppState) bool {
 }
 
 fn applyAppConfigRuntime(state: *AppState) void {
+    runtime_log.diagnostic("apply app config runtime begin theme={s} font={d:.2} terminal_font={d:.2}", .{
+        @tagName(state.app_config.theme_config.source),
+        state.app_config.font_size,
+        state.app_config.terminal_font_size,
+    });
     ui_theme.applyConfigTheme(state.allocator, state.app_config.theme_config);
     ui_theme.installFonts(
         CAL_SANS_BYTES[0..CAL_SANS_BYTES.len],
@@ -2155,6 +2160,7 @@ fn applyAppConfigRuntime(state: *AppState) void {
         log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
     };
     state.markDirty();
+    runtime_log.diagnostic("apply app config runtime done", .{});
 }
 
 fn pollAppConfigFileChanges(state: *AppState) void {

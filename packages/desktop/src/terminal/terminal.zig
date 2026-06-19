@@ -2925,8 +2925,7 @@ const UnixSession = struct {
     }
 
     fn parseGhosttyThemeFile(allocator: std.mem.Allocator, path: []const u8, terminal_theme: *TerminalTheme, follow_includes: bool) !void {
-        var threaded: std.Io.Threaded = .init(allocator, .{});
-        defer threaded.deinit();
+        var threaded = std.Io.Threaded.init_single_threaded;
         const content = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(64 * 1024));
         defer allocator.free(content);
 

@@ -118,8 +118,7 @@ pub fn configFileMtime(allocator: std.mem.Allocator) !i128 {
     const config_path = try resolveConfigPath(allocator);
     defer allocator.free(config_path);
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
 
     const stat = blk: {
         var file = std.Io.Dir.cwd().openFile(threaded.io(), config_path, .{}) catch |err| switch (err) {
@@ -162,8 +161,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
     if (std.fs.path.dirname(config_path)) |parent| {
@@ -294,8 +292,7 @@ pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
 
     return std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(1024 * 128)) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
