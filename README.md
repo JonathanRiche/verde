@@ -1,11 +1,23 @@
 # verde
 
-`verde` is a desktop GUI for coding agents. It currently supports Codex, Claude Code, OpenCode, and Cursor.
+`verde` is a tiling desktop workspace for AI coding agents. It runs Codex, Claude Code, OpenCode, and Cursor side by side in one native window — tile chat, terminal, and browser panes with vim-style keybinds, jump anywhere from a `Ctrl+P` command palette, and drive long-running project processes from chat. Verde talks to the provider CLIs already installed on your machine; there is no hosted relay, so your tokens, transcripts, and project files stay local.
 
 The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is built with [`palette`](packages/palette), our own Zig GUI framework package for native UI primitives and render-batch driven desktop rendering.
 
 <img width="2536" height="1030" alt="ristretto_verde" src="https://github.com/user-attachments/assets/a4e7d21c-006f-4ff4-87a1-3bfd30b9ae94" />
 
+
+## Features
+
+- **Every agent, one window.** Run Codex, Claude Code, OpenCode, and Cursor as tiled chat threads side by side.
+- **A real tiling workspace.** Split chat, terminal, and browser panes, then rearrange, resize, zoom, and persist layouts with vim-style keybinds.
+- **Command palette (`Ctrl+P`).** A launcher that ranks chat threads, open panes, workspaces, and app commands in one searchable list.
+- **Embedded browser pane.** A native webview (WPE WebKit on Linux, WKWebView on macOS, WebView2 on Windows) tiled next to your agent.
+- **Project-scoped terminal dock.** Ghostty-powered terminals with shell tabs and agent launch-profile tabs that persist with the layout.
+- **Managed workspace processes.** Declare dev servers or workers in `verde.yml` and control them from chat with the `/stack` and `/process` slash commands.
+- **Local-first.** No hosted inference and no relay; Verde drives the provider CLIs already on your machine.
+- **Scriptable.** Every running instance exposes a Unix-socket IPC through `verde live` and `verde state`.
+- **Native, not Electron.** A single Zig + SDL3 binary built on Verde's own Palette UI framework.
 
 ## Getting Started
 
@@ -448,6 +460,8 @@ If prompt sending fails, first check that the selected provider is installed, av
 
 Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` terminal engine.
 
+- Open the command palette with `Ctrl+P` to search chat threads, jump to open panes, switch workspaces, or run an app command. `Ctrl+Enter` opens a thread in a new pane.
+- In a chat composer, run slash commands such as `/stack` and `/process` to control configured workspace processes, alongside each provider's own slash commands.
 - Create a new chat thread with `CommandOrControl+T`, or split a terminal pane below the focused workspace pane with `CommandOrControl+Shift+T`.
 - Switch workspaces by sidebar order with `Alt+1` through `Alt+9`, and `Alt+0` for the tenth workspace.
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
