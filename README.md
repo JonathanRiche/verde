@@ -4,7 +4,8 @@
 
 The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is built with [`palette`](packages/palette), our own Zig GUI framework package for native UI primitives and render-batch driven desktop rendering.
 
-<img width="2536" height="1030" alt="image" src="https://github.com/user-attachments/assets/397a7d76-98c0-4258-9827-61aa329a99df" />
+<img width="2536" height="1030" alt="ristretto_verde" src="https://github.com/user-attachments/assets/a4e7d21c-006f-4ff4-87a1-3bfd30b9ae94" />
+
 
 ## Getting Started
 
