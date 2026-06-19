@@ -13775,7 +13775,7 @@ pub const AppState = struct {
             else
                 null;
             if (pending_thread_id) |resolved_thread_id| {
-                if (provider == .opencode or provider == .claude or send_state.active_turn_id != null) {
+                if (provider == .opencode or provider == .codex or provider == .claude or send_state.active_turn_id != null) {
                     thread_id = self.allocator.dupe(u8, resolved_thread_id) catch null;
                     turn_id = if (send_state.active_turn_id) |active_turn_id|
                         self.allocator.dupe(u8, active_turn_id) catch null

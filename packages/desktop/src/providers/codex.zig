@@ -11,6 +11,7 @@ const DEFAULT_WS_URL = "ws://127.0.0.1:4500";
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_HTTP_LINE_BYTES = 16 * 1024;
 const MAX_RPC_RETRIES = 4;
+const INTERRUPTIBLE_READ_POLL_MS = 250;
 /// Poll interval while waiting for `codex app-server` after spawn (100ms × attempts).
 const MAX_CONNECT_WAIT_ATTEMPTS = 120;
 const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
@@ -905,7 +906,7 @@ pub const Client = struct {
         defer reply.deinit(allocator);
 
         while (true) {
-            const message = try self.readTextMessageAlloc(self.allocator);
+            const message = try self.readTextMessageAllocInterruptible(self.allocator, request);
             defer self.allocator.free(message);
 
             var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
@@ -1259,6 +1260,40 @@ pub const Client = struct {
             }
         }
     }
+
+    fn readTextMessageAllocInterruptible(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.SendPromptRequest,
+    ) ![]u8 {
+        const stream = self.stream orelse return error.NotConnected;
+
+        while (true) {
+            const frame = try readServerFrameAllocInterruptible(allocator, stream, request);
+            errdefer allocator.free(frame.payload);
+
+            switch (frame.opcode) {
+                .pong => {
+                    allocator.free(frame.payload);
+                    continue;
+                },
+                .ping => {
+                    defer allocator.free(frame.payload);
+                    try writeClientFrame(self.allocator, stream, frame.payload, .pong);
+                    continue;
+                },
+                .connection_close => {
+                    allocator.free(frame.payload);
+                    return error.ConnectionClosed;
+                },
+                .text => return frame.payload,
+                else => {
+                    allocator.free(frame.payload);
+                    return error.UnexpectedWebSocketFrame;
+                },
+            }
+        }
+    }
 };
 
 pub fn shutdownOwnedServer() void {
@@ -1372,6 +1407,19 @@ fn readExact(stream: std.Io.net.Stream, buffer: []u8) !void {
     }
 }
 
+fn readExactInterruptible(
+    stream: std.Io.net.Stream,
+    buffer: []u8,
+    request: provider_types.SendPromptRequest,
+) !void {
+    var index: usize = 0;
+    while (index < buffer.len) {
+        const amt = try streamReadInterruptible(stream, buffer[index..], request);
+        if (amt == 0) return error.EndOfStream;
+        index += amt;
+    }
+}
+
 fn writeClientFrame(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
@@ -1431,6 +1479,45 @@ fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
             .AGAIN => error.WouldBlock,
             else => error.InputOutput,
         };
+    }
+}
+
+fn streamReadInterruptible(
+    stream: std.Io.net.Stream,
+    buffer: []u8,
+    request: provider_types.SendPromptRequest,
+) !usize {
+    if (buffer.len == 0) return 0;
+
+    while (true) {
+        if (request.on_should_stop) |should_stop| {
+            if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
+        }
+
+        var fds = [_]std.c.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.c.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.c.poll(&fds, fds.len, INTERRUPTIBLE_READ_POLL_MS);
+        if (ready < 0) {
+            switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+                .INTR => continue,
+                else => return error.InputOutput,
+            }
+        }
+        if (ready == 0) continue;
+        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.HUP | std.c.POLL.NVAL)) != 0) return error.EndOfStream;
+        if ((fds[0].revents & std.c.POLL.IN) == 0) continue;
+
+        const result = std.c.recv(stream.socket.handle, buffer.ptr, buffer.len, 0);
+        if (result >= 0) return @intCast(result);
+
+        switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+            .INTR => continue,
+            .AGAIN => continue,
+            else => return error.InputOutput,
+        }
     }
 }
 
@@ -1497,6 +1584,68 @@ fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream)
     };
     errdefer allocator.free(payload);
     try readExact(stream, payload);
+
+    if (masked) {
+        for (payload, 0..) |*byte, i| {
+            byte.* ^= mask[i % mask.len];
+        }
+    }
+
+    return .{
+        .opcode = opcode,
+        .payload = payload,
+    };
+}
+
+fn readServerFrameAllocInterruptible(
+    allocator: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    request: provider_types.SendPromptRequest,
+) !Frame {
+    var header: [2]u8 = undefined;
+    try readExactInterruptible(stream, &header, request);
+
+    const opcode: FrameOpcode = @enumFromInt(header[0] & 0x0f);
+    const masked = (header[1] & 0x80) != 0;
+    const len_marker = header[1] & 0x7f;
+
+    const payload_len: usize = switch (len_marker) {
+        126 => blk: {
+            var buf: [2]u8 = undefined;
+            try readExactInterruptible(stream, &buf, request);
+            break :blk std.mem.readInt(u16, &buf, .big);
+        },
+        127 => blk: {
+            var buf: [8]u8 = undefined;
+            try readExactInterruptible(stream, &buf, request);
+            const long = std.mem.readInt(u64, &buf, .big);
+            break :blk std.math.cast(usize, long) orelse return error.WebSocketMessageTooLarge;
+        },
+        else => len_marker,
+    };
+
+    if (payload_len > MAX_WS_MESSAGE_BYTES) {
+        runtime_log.diagnostic(
+            "websocket frame too large opcode={s} masked={} payload_len={d}",
+            .{ @tagName(opcode), masked, payload_len },
+        );
+        return error.WebSocketMessageTooLarge;
+    }
+
+    var mask: [4]u8 = undefined;
+    if (masked) {
+        try readExactInterruptible(stream, &mask, request);
+    }
+
+    const payload = allocator.alloc(u8, payload_len) catch |err| {
+        runtime_log.diagnostic(
+            "websocket payload alloc failed opcode={s} payload_len={d}: {s}",
+            .{ @tagName(opcode), payload_len, @errorName(err) },
+        );
+        return err;
+    };
+    errdefer allocator.free(payload);
+    try readExactInterruptible(stream, payload, request);
 
     if (masked) {
         for (payload, 0..) |*byte, i| {
