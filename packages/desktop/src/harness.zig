@@ -9,6 +9,9 @@ const cursor = @import("providers/cursor.zig");
 const runtime_log = @import("runtime_log.zig");
 
 pub const Provider = types.Provider;
+pub const ProviderSlashCommandId = types.ProviderSlashCommandId;
+pub const SlashCommandAvailability = types.SlashCommandAvailability;
+pub const ProviderSlashCommand = types.ProviderSlashCommand;
 pub const HarnessKind = types.HarnessKind;
 pub const AuthState = types.AuthState;
 pub const MessageRole = types.MessageRole;
@@ -26,6 +29,8 @@ pub const StreamDiffFile = types.StreamDiffFile;
 pub const StreamEvent = types.StreamEvent;
 pub const SendPromptRequest = types.SendPromptRequest;
 pub const SendPromptResult = types.SendPromptResult;
+pub const RunSlashCommandRequest = types.RunSlashCommandRequest;
+pub const RunSlashCommandResult = types.RunSlashCommandResult;
 pub const InterruptThreadRequest = types.InterruptThreadRequest;
 pub const SteerThreadRequest = types.SteerThreadRequest;
 pub const freeModelInfos = types.freeModelInfos;
@@ -97,6 +102,24 @@ pub const ProviderClient = union(Provider) {
         };
     }
 
+    pub fn slashCommands(self: *ProviderClient) []const ProviderSlashCommand {
+        return switch (self.*) {
+            .opencode => |*client| client.slashCommands(),
+            .codex => |*client| client.slashCommands(),
+            .claude => |*client| client.slashCommands(),
+            .cursor => |*client| client.slashCommands(),
+        };
+    }
+
+    pub fn runSlashCommand(self: *ProviderClient, allocator: std.mem.Allocator, request: RunSlashCommandRequest) !RunSlashCommandResult {
+        return switch (self.*) {
+            .opencode => |*client| client.runSlashCommand(allocator, request),
+            .codex => |*client| client.runSlashCommand(allocator, request),
+            .claude => |*client| client.runSlashCommand(allocator, request),
+            .cursor => |*client| client.runSlashCommand(allocator, request),
+        };
+    }
+
     pub fn interruptThread(self: *ProviderClient, request: InterruptThreadRequest) !void {
         return switch (self.*) {
             .opencode => |*client| client.interruptThread(request),
@@ -115,6 +138,15 @@ pub const ProviderClient = union(Provider) {
         };
     }
 };
+
+pub fn slashCommandsForProvider(provider: Provider) []const ProviderSlashCommand {
+    return switch (provider) {
+        .opencode => opencode.providerSlashCommands(),
+        .codex => codex.providerSlashCommands(),
+        .claude => claude.providerSlashCommands(),
+        .cursor => cursor.providerSlashCommands(),
+    };
+}
 
 pub fn connect(
     allocator: std.mem.Allocator,

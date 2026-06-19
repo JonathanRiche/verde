@@ -12,9 +12,11 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
 const keybinds = @import("keybinds.zig");
+const loop_wakeup = @import("loop_wakeup.zig");
 const notifier = @import("notifier.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const runtime_log = @import("runtime_log.zig");
+const slash_commands = @import("slash_commands.zig");
 const stack_config = @import("stack.zig");
 const stb_image = @import("stb_image.zig");
 const terminal = @import("terminal/terminal.zig");
@@ -40,7 +42,30 @@ pub const FastMode = db_types.FastMode;
 pub const AccessMode = db_types.AccessMode;
 pub const ChatRole = db_types.ChatRole;
 pub const Provider = db_types.Provider;
+pub const AgentTuiProvider = stack_config.AgentProvider;
 pub const Harness = db_types.Harness;
+
+fn harnessProviderForDbProvider(provider: Provider) ai_harness.Provider {
+    return switch (provider) {
+        .opencode => .opencode,
+        .codex => .codex,
+        .claude => .claude,
+        .cursor => .cursor,
+    };
+}
+
+fn slashCommandPrefix(raw_text: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, raw_text, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, "/")) return null;
+    if (std.mem.startsWith(u8, text, "//")) return null;
+    if (std.mem.indexOfAny(u8, text, " \t\r\n") != null) return null;
+    return text;
+}
+
+fn slashCommandMatchesPrefix(name: []const u8, prefix: []const u8) bool {
+    if (prefix.len == 0 or std.mem.eql(u8, prefix, "/")) return true;
+    return std.mem.startsWith(u8, name, prefix);
+}
 
 pub const SurfaceStatus = enum {
     idle,
@@ -549,6 +574,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
         .text_changed => |text| {
             state.setDraft(text);
             state.updateFileSearch();
+            state.clampSlashCommandPickerSelection();
         },
         .submitted => {
             if (state.currentThread().isSendPendingForUi()) {
@@ -557,6 +583,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             }
             if (state.acceptPrimaryFileSearchResult()) return;
             if (state.handleWorkspaceCommand(state.currentProject().currentDraft())) return;
+            if (state.handleProviderSlashCommand(state.currentProject().currentDraft())) return;
             state.sendDraft() catch |err| {
                 log.err("failed to send draft: {s}", .{@errorName(err)});
             };
@@ -1080,6 +1107,15 @@ pub const ChatImageAttachment = struct {
     }
 };
 
+pub const SlashPickerRow = struct {
+    name: []const u8,
+    summary: []const u8,
+    usage: []const u8,
+    provider_label: []const u8,
+    disabled: bool,
+    requires_thread: bool,
+};
+
 pub const BackgroundTaskStatus = enum {
     running,
     completed,
@@ -1510,6 +1546,33 @@ const ClaudeModelCacheState = struct {
     worker: ?std.Thread = null,
 };
 
+const SlashCommandStatus = enum {
+    idle,
+    pending,
+    completed,
+    failed,
+};
+
+const SlashCommandState = struct {
+    mutex: Mutex = .{},
+    status: SlashCommandStatus = .idle,
+    worker: ?std.Thread = null,
+    project_index: usize = 0,
+    thread_index: usize = 0,
+    result: ?ai_harness.RunSlashCommandResult = null,
+    error_message: ?[]u8 = null,
+};
+
+const SlashCommandWorkerRequest = struct {
+    provider: Provider,
+    harness: Harness,
+    project_path: []u8,
+    thread_id: ?[]u8,
+    command: ai_harness.ProviderSlashCommandId,
+    raw_text: []u8,
+    args: []u8,
+};
+
 const FileSearchToken = struct {
     at_start: usize,
     query_start: usize,
@@ -1885,6 +1948,54 @@ pub const ManagedProcess = struct {
         return true;
     }
 };
+
+const DefaultAgentTui = struct {
+    name: []const u8,
+    command: []const u8,
+    provider: stack_config.AgentProvider,
+    notify: bool = false,
+    mcp: bool = false,
+    hooks: bool = false,
+};
+
+const OPENCODE_TUI_COMMAND =
+    \\candidate=$(find "$HOME/.npm/_npx" -path '*/node_modules/opencode-linux-x64*/bin/opencode' -type f -perm -111 2>/dev/null | sort | tail -n 1)
+    \\if [ -n "$candidate" ]; then exec "$candidate"; fi
+    \\exec opencode
+;
+
+fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
+    return switch (provider) {
+        .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
+        .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
+        .opencode => .{ .name = "opencode", .command = OPENCODE_TUI_COMMAND, .provider = .opencode },
+        .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor },
+        .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
+        .other => null,
+    };
+}
+
+fn isKnownDefaultAgentTuiCommand(provider: stack_config.AgentProvider, command: []const u8) bool {
+    return switch (provider) {
+        .codex => std.mem.eql(u8, command, "codex"),
+        .claude => std.mem.eql(u8, command, "claude"),
+        .opencode => std.mem.eql(u8, command, "opencode") or std.mem.eql(u8, command, OPENCODE_TUI_COMMAND),
+        .cursor => std.mem.eql(u8, command, "agent"),
+        .amp => std.mem.eql(u8, command, "amp"),
+        .other => false,
+    };
+}
+
+fn agentTuiProviderLabel(provider: ?stack_config.AgentProvider) []const u8 {
+    return switch (provider orelse return "Agent") {
+        .codex => "Codex",
+        .claude => "Claude",
+        .opencode => "OpenCode",
+        .cursor => "Cursor",
+        .amp => "Amp",
+        .other => "Agent",
+    };
+}
 
 pub const WorkspaceSplitAxis = enum {
     horizontal,
@@ -3478,6 +3589,7 @@ pub const AppState = struct {
     debug_last_terminal_text: [32:0]u8,
     debug_workspace_visible_pane_count: usize,
     composer_picker_provider: ?Provider,
+    composer_slash_selected: usize,
     composer_locked_model_picker_open: bool,
     opencode_model_options: std.ArrayList(ModelOption),
     claude_model_options: std.ArrayList(ModelOption),
@@ -3532,6 +3644,7 @@ pub const AppState = struct {
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
     picker_state: PickerState,
+    slash_command_state: SlashCommandState,
     opencode_model_cache_state: OpencodeModelCacheState,
     claude_model_cache_state: ClaudeModelCacheState,
     cursor_model_cache_state: CursorModelCacheState,
@@ -3710,6 +3823,7 @@ pub const AppState = struct {
             .debug_last_terminal_text = std.mem.zeroes([32:0]u8),
             .debug_workspace_visible_pane_count = 0,
             .composer_picker_provider = null,
+            .composer_slash_selected = 0,
             .composer_locked_model_picker_open = false,
             .opencode_model_options = .empty,
             .claude_model_options = .empty,
@@ -3754,6 +3868,7 @@ pub const AppState = struct {
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
             .picker_state = .{},
+            .slash_command_state = .{},
             .opencode_model_cache_state = .{},
             .claude_model_cache_state = .{},
             .cursor_model_cache_state = .{},
@@ -7562,6 +7677,142 @@ pub const AppState = struct {
         };
     }
 
+    pub fn slashCommandPickerActive(self: *const AppState) bool {
+        return slashCommandPrefix(self.currentDraft()) != null;
+    }
+
+    pub fn slashCommandPickerSelectedIndex(self: *const AppState) usize {
+        const count = self.slashCommandPickerRowCount();
+        if (count == 0) return 0;
+        return @min(self.composer_slash_selected, count - 1);
+    }
+
+    pub fn slashCommandPickerRowCount(self: *const AppState) usize {
+        var count: usize = 0;
+        const prefix = slashCommandPrefix(self.currentDraft()) orelse return 0;
+        for (slash_commands.LOCAL_COMMANDS) |command| {
+            if (slashCommandMatchesPrefix(command.name, prefix)) count += 1;
+        }
+        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(self.currentThread().provider));
+        for (provider_commands) |command| {
+            if (slashCommandMatchesPrefix(command.name, prefix)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn slashCommandPickerRow(self: *const AppState, index: usize) ?SlashPickerRow {
+        const prefix = slashCommandPrefix(self.currentDraft()) orelse return null;
+        var current: usize = 0;
+        for (slash_commands.LOCAL_COMMANDS) |command| {
+            if (!slashCommandMatchesPrefix(command.name, prefix)) continue;
+            if (current == index) {
+                return .{
+                    .name = command.name,
+                    .summary = command.summary,
+                    .usage = command.usage,
+                    .provider_label = "Verde",
+                    .disabled = false,
+                    .requires_thread = false,
+                };
+            }
+            current += 1;
+        }
+        const thread = self.currentThread();
+        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        for (provider_commands) |command| {
+            if (!slashCommandMatchesPrefix(command.name, prefix)) continue;
+            if (current == index) {
+                const missing_thread = command.requires_thread and thread.provider_thread_id == null;
+                return .{
+                    .name = command.name,
+                    .summary = command.summary,
+                    .usage = command.usage,
+                    .provider_label = utils.providerLabel(thread.provider),
+                    .disabled = command.availability != .available or missing_thread,
+                    .requires_thread = command.requires_thread,
+                };
+            }
+            current += 1;
+        }
+        return null;
+    }
+
+    pub fn selectSlashCommandPickerRow(self: *AppState, index: usize) bool {
+        const count = self.slashCommandPickerRowCount();
+        if (count == 0 or index >= count) return false;
+        self.composer_slash_selected = index;
+        self.noteInteraction();
+        self.markDirty();
+        return true;
+    }
+
+    pub fn activateSlashCommandPickerSelection(self: *AppState) bool {
+        const count = self.slashCommandPickerRowCount();
+        if (count == 0) return false;
+        const index = @min(self.composer_slash_selected, count - 1);
+        const row = self.slashCommandPickerRow(index) orelse return false;
+        if (row.disabled) {
+            if (row.requires_thread and self.currentThread().provider_thread_id == null) {
+                var buffer: [160]u8 = undefined;
+                self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Start a {s} thread before using {s}.", .{ row.provider_label, row.name }) catch "Start a provider thread before using this command.");
+            } else {
+                var buffer: [160]u8 = undefined;
+                self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Command not enabled yet: {s}.", .{row.name}) catch "Command is not enabled yet.");
+            }
+            self.noteInteraction();
+            return true;
+        }
+        if (std.mem.eql(u8, row.provider_label, "Verde")) {
+            self.setDraft(row.name);
+            self.appendSlashCommandInsertionSpace();
+            self.syncPaletteComposerFromDraft();
+            self.palette_composer.cursor = self.palette_composer.text().len;
+            self.requestComposerFocus();
+            self.noteInteraction();
+            return true;
+        }
+        if (std.mem.eql(u8, row.name, "/usage") or std.mem.eql(u8, row.name, "/compact")) {
+            self.setDraft(row.name);
+            self.syncPaletteComposerFromDraft();
+            _ = self.handleProviderSlashCommand(row.name);
+            self.noteInteraction();
+            return true;
+        }
+        self.setDraft(row.name);
+        self.appendSlashCommandInsertionSpace();
+        self.syncPaletteComposerFromDraft();
+        self.palette_composer.cursor = self.palette_composer.text().len;
+        self.requestComposerFocus();
+        self.noteInteraction();
+        return true;
+    }
+
+    fn appendSlashCommandInsertionSpace(self: *AppState) void {
+        const text = self.currentDraft();
+        if (text.len > 0 and text[text.len - 1] == ' ') return;
+        var buffer: [128]u8 = undefined;
+        const next = std.fmt.bufPrint(&buffer, "{s} ", .{text}) catch return;
+        self.setDraft(next);
+    }
+
+    pub fn closeSlashCommandPicker(self: *AppState) bool {
+        if (!self.slashCommandPickerActive()) return false;
+        self.clearDraft();
+        self.syncPaletteComposerFromDraft();
+        self.composer_slash_selected = 0;
+        self.noteInteraction();
+        return true;
+    }
+
+    pub fn clampSlashCommandPickerSelection(self: *AppState) void {
+        const count = self.slashCommandPickerRowCount();
+        if (count == 0) {
+            self.composer_slash_selected = 0;
+            return;
+        }
+        if (self.composer_slash_selected >= count) self.composer_slash_selected = count - 1;
+    }
+
     pub fn currentThread(self: *const AppState) *const ChatThread {
         return self.currentProject().currentThread();
     }
@@ -10007,9 +10258,7 @@ pub const AppState = struct {
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
-        if (process.kind == .agent and process.provider == .codex and process.hooks) {
-            try provider_hooks.ensureCodexProjectHooks(self.allocator, project.path);
-        }
+        try self.ensureManagedAgentProjectHooks(project.path, process);
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const command = try self.managedProcessLaunchCommand(process);
         defer self.allocator.free(command);
@@ -10071,16 +10320,16 @@ pub const AppState = struct {
         };
         const target = layout.paneById(target_pane_id) orelse return false;
         if (target.minimized) return false;
+        const provider_label = agentTuiProviderLabel(process.provider);
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
-        if (process.kind == .agent and process.provider == .codex and process.hooks) {
-            try provider_hooks.ensureCodexProjectHooks(self.allocator, project.path);
-        }
+        try self.ensureManagedAgentProjectHooks(project.path, process);
 
         const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
             log.err("failed to allocate agent terminal dock: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to create Codex TUI terminal.");
+            var notice_buf: [96]u8 = undefined;
+            self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Failed to create {s} TUI terminal.", .{provider_label}) catch "Failed to create TUI terminal.");
             return false;
         };
         project = &self.projects.items[project_index];
@@ -10097,7 +10346,8 @@ pub const AppState = struct {
         layout = &project.workspace_layout;
         const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
             log.err("failed to create agent terminal workspace pane: {s}", .{@errorName(err)});
-            self.setSidebarNotice("Failed to create Codex TUI pane.");
+            var notice_buf: [96]u8 = undefined;
+            self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Failed to create {s} TUI pane.", .{provider_label}) catch "Failed to create TUI pane.");
             return false;
         };
         layout.splitPaneWithLeaf(self.allocator, target_pane_id, new_pane_id, axis, new_after) catch |err| {
@@ -10136,47 +10386,74 @@ pub const AppState = struct {
         layout.maximized_pane_id = null;
         dock.visible = false;
         self.terminal_focused = true;
-        self.setSidebarNotice("Started Codex TUI.");
+        var notice_buf: [96]u8 = undefined;
+        self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Started {s} TUI.", .{provider_label}) catch "Started TUI.");
         self.markDirty();
         return true;
     }
 
-    pub fn openAgentTui(self: *AppState, project_index: usize, provider: Provider) !bool {
+    fn ensureManagedAgentProjectHooks(self: *AppState, project_path: []const u8, process: *const ManagedProcess) !void {
+        if (!(process.kind == .agent and process.hooks)) return;
+        switch (process.provider orelse return) {
+            .codex => try provider_hooks.ensureCodexProjectHooks(self.allocator, project_path),
+            .claude => try provider_hooks.ensureClaudeProjectHooks(self.allocator, project_path),
+            .opencode, .cursor, .amp, .other => {},
+        }
+    }
+
+    pub fn openAgentTui(self: *AppState, project_index: usize, provider: stack_config.AgentProvider) !bool {
         return self.openAgentTuiAtPlacement(project_index, provider, null, .horizontal, true);
     }
 
     pub fn openAgentTuiAtPlacement(
         self: *AppState,
         project_index: usize,
-        provider: Provider,
+        provider: stack_config.AgentProvider,
         requested_pane_id: ?WorkspacePaneId,
         axis: WorkspaceSplitAxis,
         new_after: bool,
     ) !bool {
-        if (provider != .codex) return false;
+        const defaults = defaultAgentTui(provider) orelse return false;
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
-        const name = "codex";
+        const name = defaults.name;
         if (project.managedProcessByName(name) == null) {
             var process: ManagedProcess = .{
                 .name = try self.allocator.dupe(u8, name),
                 .kind = .agent,
-                .command = try self.allocator.dupe(u8, "codex"),
+                .command = try self.allocator.dupe(u8, defaults.command),
                 .cwd = try self.allocator.dupe(u8, "."),
                 .restart = .manual,
-                .provider = .codex,
+                .provider = defaults.provider,
                 .revive = .attach_or_create,
-                .notify = true,
-                .mcp = true,
-                .hooks = true,
+                .notify = defaults.notify,
+                .mcp = defaults.mcp,
+                .hooks = defaults.hooks,
                 .watch = .empty,
             };
             errdefer process.deinit(self.allocator);
             try project.managed_processes.append(self.allocator, process);
         }
         const process = project.managedProcessByName(name) orelse return false;
+        try self.syncDefaultAgentTuiProcess(process, defaults);
         return try self.startManagedProcessInNewPane(project_index, process, requested_pane_id, axis, new_after);
+    }
+
+    fn syncDefaultAgentTuiProcess(self: *AppState, process: *ManagedProcess, defaults: DefaultAgentTui) !void {
+        if (!(process.kind == .agent and process.provider == defaults.provider)) return;
+        if (!isKnownDefaultAgentTuiCommand(defaults.provider, process.command)) return;
+
+        if (!std.mem.eql(u8, process.command, defaults.command)) {
+            const command = try self.allocator.dupe(u8, defaults.command);
+            self.allocator.free(process.command);
+            process.command = command;
+        }
+        process.restart = .manual;
+        process.revive = .attach_or_create;
+        process.notify = defaults.notify;
+        process.mcp = defaults.mcp;
+        process.hooks = defaults.hooks;
     }
 
     fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
@@ -10185,6 +10462,7 @@ pub const AppState = struct {
             .claude => .claude,
             .opencode => .opencode,
             .cursor => .cursor,
+            .amp => null,
             .other => null,
         };
     }
@@ -10406,6 +10684,115 @@ pub const AppState = struct {
         var buffer: [128]u8 = undefined;
         self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Process {s}: {s}.", .{ action, name }) catch "Process command applied.");
         return true;
+    }
+
+    fn handleProviderSlashCommand(self: *AppState, raw_text: []const u8) bool {
+        const thread = self.currentThread();
+        const provider_commands = ai_harness.slashCommandsForProvider(harnessProviderForDbProvider(thread.provider));
+        const parsed = slash_commands.parse(raw_text, provider_commands);
+        switch (parsed) {
+            .not_slash => return false,
+            .local => return false,
+            .literal_prompt => |prompt| {
+                self.setDraft(prompt);
+                self.syncPaletteComposerFromDraft();
+                self.sendDraft() catch |err| {
+                    log.err("failed to send literal slash draft: {s}", .{@errorName(err)});
+                    self.setSidebarNotice("Failed to send message.");
+                };
+                return true;
+            },
+            .unknown => |unknown| {
+                var buffer: [160]u8 = undefined;
+                self.setSidebarNotice(std.fmt.bufPrint(
+                    &buffer,
+                    "Unknown slash command: {s}. Try /stack, /process, or a command supported by this provider.",
+                    .{unknown.name},
+                ) catch "Unknown slash command.");
+                return true;
+            },
+            .provider => |provider_command| {
+                const command = provider_command.command;
+                if (command.availability != .available) {
+                    var buffer: [160]u8 = undefined;
+                    self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Command not enabled yet: {s}. Usage: {s}", .{ command.name, command.usage }) catch "Command is not enabled yet.");
+                    return true;
+                }
+                if (command.requires_thread and thread.provider_thread_id == null) {
+                    var buffer: [160]u8 = undefined;
+                    self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Start a {s} thread before using {s}.", .{ utils.providerLabel(thread.provider), command.name }) catch "Start a provider thread before using this command.");
+                    return true;
+                }
+                self.beginProviderSlashCommand(command, provider_command.args, raw_text) catch |err| {
+                    log.err("failed to start slash command {s}: {s}", .{ command.name, @errorName(err) });
+                    self.setSidebarNotice("Failed to start slash command.");
+                    return true;
+                };
+                return true;
+            },
+        }
+    }
+
+    fn beginProviderSlashCommand(
+        self: *AppState,
+        command: ai_harness.ProviderSlashCommand,
+        args: []const u8,
+        raw_text: []const u8,
+    ) !void {
+        const page_alloc = std.heap.page_allocator;
+        const project_index = self.selected_project_index;
+        const thread_index = self.currentProject().selected_thread_index;
+        const project = self.currentProject();
+        const thread = self.currentThread();
+
+        self.slash_command_state.mutex.lock();
+        if (self.slash_command_state.status == .pending) {
+            self.slash_command_state.mutex.unlock();
+            self.setSidebarNotice("A slash command is already running.");
+            return;
+        }
+        self.slash_command_state.mutex.unlock();
+
+        const request = try page_alloc.create(SlashCommandWorkerRequest);
+        errdefer page_alloc.destroy(request);
+        request.* = .{
+            .provider = thread.provider,
+            .harness = thread.harness,
+            .project_path = try page_alloc.dupe(u8, project.path),
+            .thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
+            .command = command.id,
+            .raw_text = try page_alloc.dupe(u8, raw_text),
+            .args = try page_alloc.dupe(u8, args),
+        };
+        errdefer {
+            page_alloc.free(request.project_path);
+            if (request.thread_id) |thread_id| page_alloc.free(thread_id);
+            page_alloc.free(request.raw_text);
+            page_alloc.free(request.args);
+        }
+
+        self.slash_command_state.mutex.lock();
+        defer self.slash_command_state.mutex.unlock();
+        if (self.slash_command_state.error_message) |message| {
+            page_alloc.free(message);
+            self.slash_command_state.error_message = null;
+        }
+        if (self.slash_command_state.result) |result| {
+            result.deinit(page_alloc);
+            self.slash_command_state.result = null;
+        }
+        self.slash_command_state.project_index = project_index;
+        self.slash_command_state.thread_index = thread_index;
+        self.slash_command_state.status = .pending;
+        self.slash_command_state.worker = std.Thread.spawn(.{}, slashCommandWorker, .{ &self.slash_command_state, request }) catch |err| {
+            self.slash_command_state.status = .idle;
+            return err;
+        };
+
+        self.clearDraft();
+        self.syncPaletteComposerFromDraft();
+        var buffer: [128]u8 = undefined;
+        self.setSidebarNotice(std.fmt.bufPrint(&buffer, "Running {s}...", .{command.name}) catch "Running slash command...");
     }
 
     fn resolveManagedProcessCwd(self: *AppState, project_path: []const u8, raw_cwd: []const u8) ![]u8 {
@@ -11615,6 +12002,7 @@ pub const AppState = struct {
         }
         if (self.routePaletteModelCascadeKey(palette_key)) return true;
         if (!self.palette_composer.focused) return false;
+        if (self.routeSlashCommandPickerKey(palette_key)) return true;
         if (self.handlePaletteComposerNavigationKey(palette_key)) {
             self.noteInteraction();
             return true;
@@ -11729,6 +12117,32 @@ pub const AppState = struct {
         const handled = self.palette_model_cascade.handleInput(.{ .key = key });
         if (handled) self.noteInteraction();
         return handled;
+    }
+
+    fn routeSlashCommandPickerKey(self: *AppState, key: palette.Key) bool {
+        if (!self.slashCommandPickerActive()) return false;
+        const count = self.slashCommandPickerRowCount();
+        if (count == 0) {
+            if (key.code == .escape) return self.closeSlashCommandPicker();
+            return false;
+        }
+        switch (key.code) {
+            .up => {
+                self.composer_slash_selected = if (self.composer_slash_selected == 0) count - 1 else self.composer_slash_selected - 1;
+                self.noteInteraction();
+                self.markDirty();
+                return true;
+            },
+            .down => {
+                self.composer_slash_selected = (self.composer_slash_selected + 1) % count;
+                self.noteInteraction();
+                self.markDirty();
+                return true;
+            },
+            .enter => return self.activateSlashCommandPickerSelection(),
+            .escape => return self.closeSlashCommandPicker(),
+            else => return false,
+        }
     }
 
     fn routePaletteModelCascadeMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
@@ -12557,6 +12971,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit pending sends prepared", .{});
         self.finishPickerThread();
         runtime_log.diagnostic("AppState.deinit picker finished", .{});
+        self.finishSlashCommandThread();
+        runtime_log.diagnostic("AppState.deinit slash command finished", .{});
         self.finishOpencodeModelCacheThread();
         runtime_log.diagnostic("AppState.deinit opencode model cache finished", .{});
         self.finishClaudeModelCacheThread();
@@ -12825,6 +13241,92 @@ pub const AppState = struct {
             }
         }
         return changed;
+    }
+
+    pub fn pollSlashCommand(self: *AppState) bool {
+        var result: ?ai_harness.RunSlashCommandResult = null;
+        var error_message: ?[]u8 = null;
+        var project_index: usize = 0;
+        var thread_index: usize = 0;
+        var next_status: SlashCommandStatus = .idle;
+
+        self.slash_command_state.mutex.lock();
+        switch (self.slash_command_state.status) {
+            .completed => {
+                result = self.slash_command_state.result;
+                self.slash_command_state.result = null;
+                project_index = self.slash_command_state.project_index;
+                thread_index = self.slash_command_state.thread_index;
+                self.slash_command_state.status = .idle;
+                next_status = .completed;
+            },
+            .failed => {
+                error_message = self.slash_command_state.error_message;
+                self.slash_command_state.error_message = null;
+                project_index = self.slash_command_state.project_index;
+                thread_index = self.slash_command_state.thread_index;
+                self.slash_command_state.status = .idle;
+                next_status = .failed;
+            },
+            else => {},
+        }
+        self.slash_command_state.mutex.unlock();
+
+        if (next_status != .idle) {
+            self.finishSlashCommandThread();
+        }
+
+        switch (next_status) {
+            .completed => {
+                const command_result = result orelse return true;
+                defer command_result.deinit(std.heap.page_allocator);
+                self.applySlashCommandResult(project_index, thread_index, command_result);
+            },
+            .failed => {
+                if (error_message) |message| {
+                    defer std.heap.page_allocator.free(message);
+                    self.setSidebarNotice(message);
+                } else {
+                    self.setSidebarNotice("Slash command failed.");
+                }
+            },
+            else => {},
+        }
+
+        return next_status != .idle;
+    }
+
+    fn applySlashCommandResult(
+        self: *AppState,
+        project_index: usize,
+        thread_index: usize,
+        result: ai_harness.RunSlashCommandResult,
+    ) void {
+        if (!result.handled) {
+            self.setSidebarNotice("Slash command was not handled by this provider.");
+            return;
+        }
+
+        if (project_index < self.projects.items.len and thread_index < self.projects.items[project_index].threads.items.len) {
+            if (result.transcript_title != null or result.transcript_body != null) {
+                const title = result.transcript_title orelse "Provider command";
+                const body = result.transcript_body orelse "Done.";
+                const thread = &self.projects.items[project_index].threads.items[thread_index];
+                self.appendMessageToThread(thread, .system, title, body, null, &.{}) catch |err| {
+                    log.warn("failed to append slash command result: {s}", .{@errorName(err)});
+                };
+                if (project_index == self.selected_project_index and thread_index == self.currentProject().selected_thread_index) {
+                    self.requestTranscriptScrollToBottom();
+                }
+            }
+        }
+
+        if (result.notice) |notice| {
+            self.setSidebarNotice(notice);
+        } else {
+            self.setSidebarNotice("Slash command completed.");
+        }
+        self.markDirty();
     }
 
     pub fn hasRunningBackgroundTasks(self: *const AppState) bool {
@@ -13431,6 +13933,32 @@ pub const AppState = struct {
         }
     }
 
+    fn finishSlashCommandThread(self: *AppState) void {
+        self.slash_command_state.mutex.lock();
+        const maybe_worker = self.slash_command_state.worker;
+        self.slash_command_state.worker = null;
+        self.slash_command_state.mutex.unlock();
+
+        if (maybe_worker) |worker| {
+            worker.join();
+        }
+
+        self.slash_command_state.mutex.lock();
+        const maybe_result = self.slash_command_state.result;
+        const maybe_error = self.slash_command_state.error_message;
+        self.slash_command_state.result = null;
+        self.slash_command_state.error_message = null;
+        self.slash_command_state.status = .idle;
+        self.slash_command_state.mutex.unlock();
+
+        if (maybe_result) |result| {
+            result.deinit(std.heap.page_allocator);
+        }
+        if (maybe_error) |message| {
+            std.heap.page_allocator.free(message);
+        }
+    }
+
     fn finishOpencodeModelCacheThread(self: *AppState) void {
         self.opencode_model_cache_state.mutex.lock();
         const maybe_worker = self.opencode_model_cache_state.worker;
@@ -13973,6 +14501,111 @@ fn claudeModelCacheWorker(state: *ClaudeModelCacheState) void {
     } else {
         state.status = .failed;
     }
+}
+
+fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorkerRequest) void {
+    const page_alloc = std.heap.page_allocator;
+    defer {
+        page_alloc.free(request.project_path);
+        if (request.thread_id) |thread_id| page_alloc.free(thread_id);
+        page_alloc.free(request.raw_text);
+        page_alloc.free(request.args);
+        page_alloc.destroy(request);
+    }
+
+    runtime_log.diagnostic(
+        "slash command worker begin provider={s} command={s} thread_id={s}",
+        .{ @tagName(request.provider), @tagName(request.command), request.thread_id orelse "(none)" },
+    );
+
+    const result = runSlashCommandWorker(page_alloc, request);
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    defer loop_wakeup.notify();
+
+    if (result) |payload| {
+        runtime_log.diagnostic("slash command worker completed provider={s} command={s}", .{ @tagName(request.provider), @tagName(request.command) });
+        state.result = payload;
+        state.error_message = null;
+        state.status = .completed;
+    } else |err| {
+        runtime_log.diagnostic("slash command worker failed provider={s} command={s}: {s}", .{ @tagName(request.provider), @tagName(request.command), @errorName(err) });
+        state.result = null;
+        state.error_message = formatSlashCommandError(page_alloc, request.provider, err) catch null;
+        state.status = .failed;
+    }
+}
+
+fn runSlashCommandWorker(
+    allocator: std.mem.Allocator,
+    request: *const SlashCommandWorkerRequest,
+) !ai_harness.RunSlashCommandResult {
+    if (request.harness != .local_cli) return error.UnsupportedHarnessMode;
+
+    const provider_config = switch (request.provider) {
+        .opencode => ai_harness.ProviderConfig{
+            .opencode = .{
+                .allocator = allocator,
+                .working_directory = request.project_path,
+                .launch_if_missing = true,
+            },
+        },
+        .codex => ai_harness.ProviderConfig{
+            .codex = .{
+                .cwd = request.project_path,
+                .launch_on_connect = true,
+            },
+        },
+        .claude => ai_harness.ProviderConfig{
+            .claude = .{
+                .cwd = request.project_path,
+            },
+        },
+        .cursor => ai_harness.ProviderConfig{
+            .cursor = .{
+                .cwd = request.project_path,
+            },
+        },
+    };
+
+    var client = try ai_harness.connect(allocator, provider_config);
+    defer client.deinit();
+
+    return client.runSlashCommand(allocator, .{
+        .thread_id = request.thread_id,
+        .cwd = request.project_path,
+        .command = request.command,
+        .raw_text = request.raw_text,
+        .args = request.args,
+    });
+}
+
+fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err: anyerror) ![]u8 {
+    const message: []const u8 = switch (provider) {
+        .codex => switch (err) {
+            error.CodexRpcFailed => "Codex slash command failed.",
+            error.ConnectionClosed => "Codex app-server connection closed.",
+            error.NotConnected => "Could not connect to Codex app-server.",
+            error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
+            error.FileNotFound => "The codex executable was not found on PATH.",
+            error.UnsupportedOperation => "Codex does not support this slash command yet.",
+            else => "Codex slash command failed.",
+        },
+        .opencode => switch (err) {
+            error.UnsupportedOperation => "OpenCode does not support this slash command yet.",
+            else => "OpenCode slash command failed.",
+        },
+        .claude => switch (err) {
+            error.UnsupportedOperation => "Claude does not support this slash command yet.",
+            else => "Claude slash command failed.",
+        },
+        .cursor => switch (err) {
+            error.UnsupportedOperation => "Cursor does not support this slash command yet.",
+            else => "Cursor slash command failed.",
+        },
+    };
+    return allocator.dupe(u8, message);
 }
 
 fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {

@@ -32,6 +32,10 @@ const ActiveProcessState = struct {
 
 var active_process_state: ActiveProcessState = .{};
 
+pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
+    return &.{};
+}
+
 pub const Config = struct {
     executable: []const u8 = DEFAULT_EXECUTABLE,
     cwd: ?[]const u8 = null,
@@ -49,6 +53,22 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         _ = self;
+    }
+
+    pub fn slashCommands(self: *Client) []const provider_types.ProviderSlashCommand {
+        _ = self;
+        return providerSlashCommands();
+    }
+
+    pub fn runSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+        _ = allocator;
+        _ = request;
+        return error.UnsupportedOperation;
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {

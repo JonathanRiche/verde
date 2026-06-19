@@ -65,6 +65,10 @@ const SharedServerState = struct {
 
 var shared_server_state: SharedServerState = .{};
 
+pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
+    return &.{};
+}
+
 /// When `VERDE_DUMP_OPENCODE_PROVIDERS` is set to a non-empty value other than `0`, writes the raw
 /// JSON body from `GET /config/providers` to disk for inspection (reasoning/thinking fields, variants, etc.).
 /// Override path with `VERDE_DUMP_OPENCODE_PROVIDERS_PATH` (absolute recommended on Unix: `/tmp/...`).
@@ -110,6 +114,22 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         _ = self;
+    }
+
+    pub fn slashCommands(self: *Client) []const provider_types.ProviderSlashCommand {
+        _ = self;
+        return providerSlashCommands();
+    }
+
+    pub fn runSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+        _ = allocator;
+        _ = request;
+        return error.UnsupportedOperation;
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {

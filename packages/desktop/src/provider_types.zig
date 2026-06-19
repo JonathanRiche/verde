@@ -7,6 +7,30 @@ pub const Provider = enum(u8) {
     cursor,
 };
 
+pub const ProviderSlashCommandId = enum(u8) {
+    compact,
+    goal,
+    usage,
+    review,
+    shell,
+};
+
+pub const SlashCommandAvailability = enum(u8) {
+    available,
+    disabled,
+    unsupported,
+};
+
+pub const ProviderSlashCommand = struct {
+    id: ProviderSlashCommandId,
+    name: []const u8,
+    summary: []const u8,
+    usage: []const u8,
+    requires_thread: bool,
+    destructive_or_sensitive: bool = false,
+    availability: SlashCommandAvailability = .available,
+};
+
 pub const HarnessKind = enum(u8) {
     local_cli,
     remote_session,
@@ -176,6 +200,28 @@ pub const SendPromptRequest = struct {
 pub const SendPromptResult = struct {
     thread_id: []const u8,
     reply_text: []const u8,
+};
+
+pub const RunSlashCommandRequest = struct {
+    thread_id: ?[]const u8,
+    cwd: ?[]const u8 = null,
+    command: ProviderSlashCommandId,
+    raw_text: []const u8,
+    args: []const u8,
+};
+
+pub const RunSlashCommandResult = struct {
+    handled: bool,
+    notice: ?[]const u8 = null,
+    transcript_title: ?[]const u8 = null,
+    transcript_body: ?[]const u8 = null,
+
+    /// Frees allocator-owned strings returned by provider command execution.
+    pub fn deinit(self: RunSlashCommandResult, allocator: anytype) void {
+        if (self.notice) |value| allocator.free(value);
+        if (self.transcript_title) |value| allocator.free(value);
+        if (self.transcript_body) |value| allocator.free(value);
+    }
 };
 
 pub const InterruptThreadRequest = struct {

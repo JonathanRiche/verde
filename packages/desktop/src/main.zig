@@ -481,7 +481,9 @@ fn mainInner(init: std.process.Init) !void {
         var send_needs_render = false;
         recordSpan(&frame_sample, .poll_send, struct {
             fn run(app_state: *AppState, changed: *bool) void {
-                changed.* = app_state.pollSend();
+                const send_changed = app_state.pollSend();
+                const slash_changed = app_state.pollSlashCommand();
+                changed.* = send_changed or slash_changed;
             }
         }.run, .{ &state, &send_needs_render });
         var background_tasks_need_render = false;
@@ -1458,6 +1460,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            if (event.button.button == 1 and chat_panel_ui.handleSlashCommandPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.button.button == 1 and chat_panel_ui.handleFileSearchPaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
                 syncWindowTextInput(window, state);
                 return true;
@@ -2191,5 +2197,6 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
 
 test {
     _ = @import("providers/claude.zig");
+    _ = @import("slash_commands.zig");
     _ = @import("ui/command_palette.zig");
 }

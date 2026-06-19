@@ -74,6 +74,15 @@ const FileSearchHitCache = struct {
 
 var file_search_hits: FileSearchHitCache = .{};
 
+const SlashPickerHitCache = struct {
+    panel_rect: palette.Rect = .{},
+    row_count: usize = 0,
+    row_rects: [8]palette.Rect = [_]palette.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 8,
+    row_indices: [8]usize = [_]usize{0} ** 8,
+};
+
+var slash_picker_hits: SlashPickerHitCache = .{};
+
 const WorkspaceHeaderOpenMenuRow = enum {
     folder,
     configured_editor,
@@ -432,6 +441,23 @@ pub fn handleFileSearchPaletteMouseButton(state: *app_state.AppState, x: f32, y:
     while (index < file_search_hits.row_count) : (index += 1) {
         if (rectContains(file_search_hits.row_rects[index], x, y)) {
             _ = state.selectFileSearchResult(file_search_hits.row_indices[index]);
+            return true;
+        }
+    }
+    return true;
+}
+
+pub fn handleSlashCommandPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    if (!down) return false;
+    if (!state.slashCommandPickerActive()) return false;
+    if (slash_picker_hits.row_count == 0) return false;
+    if (!rectContains(slash_picker_hits.panel_rect, x, y)) return false;
+
+    var index: usize = 0;
+    while (index < slash_picker_hits.row_count) : (index += 1) {
+        if (rectContains(slash_picker_hits.row_rects[index], x, y)) {
+            _ = state.selectSlashCommandPickerRow(slash_picker_hits.row_indices[index]);
+            _ = state.activateSlashCommandPickerSelection();
             return true;
         }
     }
@@ -2762,6 +2788,7 @@ fn renderComposer(state: *app_state.AppState, rect: palette.Rect) void {
         app_state.log.warn("failed to stage palette composer render commands: {s}", .{@errorName(err)});
     };
     renderComposerFileSearchResults(state);
+    renderComposerSlashCommands(state);
     renderComposerDraftImage(state);
     renderComposerFollowupHint(state);
     renderComposerToolbarIcons(state);
@@ -3035,6 +3062,101 @@ fn renderComposerFileSearchResults(state: *app_state.AppState) void {
             .w = row.w - (text_x - row.x) - theme.scaledUi(12.0),
             .h = theme.scaledUi(16.0),
         }, result.relative_path, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), row);
+    }
+}
+
+fn renderComposerSlashCommands(state: *app_state.AppState) void {
+    slash_picker_hits = .{};
+    if (!state.slashCommandPickerActive()) return;
+
+    const total = state.slashCommandPickerRowCount();
+    if (total == 0) return;
+
+    const composer = state.palette_composer.bounds();
+    if (composer.w <= theme.scaledUi(160.0)) return;
+
+    const row_height = theme.scaledUi(46.0);
+    const visible_rows: usize = @min(total, slash_picker_hits.row_rects.len - 1, 7);
+    const pad = theme.scaledUi(8.0);
+    const gap = theme.scaledUi(8.0);
+    const panel_w = @min(composer.w, theme.scaledUi(760.0));
+    const panel_h = pad * 2.0 + row_height * @as(f32, @floatFromInt(visible_rows));
+    const panel = palette.Rect{
+        .x = composer.x,
+        .y = @max(theme.scaledUi(8.0), composer.y - gap - panel_h),
+        .w = panel_w,
+        .h = panel_h,
+    };
+    slash_picker_hits.panel_rect = panel;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FILE_SEARCH_Z + 1);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    queueRoundedShellClipped(
+        state,
+        panel,
+        paletteColor(theme.withAlpha(theme.background(), 252)),
+        paletteColor(theme.COLOR_PANEL_MUTED),
+        theme.scaledUi(12.0),
+        panel,
+    );
+
+    const selected = state.slashCommandPickerSelectedIndex();
+    const first_index = if (selected >= visible_rows) selected + 1 - visible_rows else 0;
+    const end_index = @min(first_index + visible_rows, total);
+    const mouse_ok = state.palette_mouse_in_workspace;
+    const mx = state.palette_mouse_x;
+    const my = state.palette_mouse_y;
+
+    var visible_index: usize = 0;
+    var row_index = first_index;
+    while (row_index < end_index) : ({
+        row_index += 1;
+        visible_index += 1;
+    }) {
+        const data = state.slashCommandPickerRow(row_index) orelse continue;
+        const row = palette.Rect{
+            .x = panel.x + pad,
+            .y = panel.y + pad + @as(f32, @floatFromInt(visible_index)) * row_height,
+            .w = panel.w - pad * 2.0,
+            .h = row_height,
+        };
+        slash_picker_hits.row_rects[visible_index] = row;
+        slash_picker_hits.row_indices[visible_index] = row_index;
+        slash_picker_hits.row_count = visible_index + 1;
+
+        const hovered = mouse_ok and rectContains(row, mx, my);
+        if (row_index == selected or hovered) {
+            queueRounded(state, row, paletteColor(if (row_index == selected) theme.withAlpha(theme.selection(), 230) else theme.withAlpha(theme.COLOR_PANEL_MUTED, 230)), theme.scaledUi(8.0));
+        }
+
+        const text_color = paletteColor(if (data.disabled) theme.COLOR_TEXT_MUTED else theme.COLOR_WHITE);
+        const meta_color = paletteColor(theme.COLOR_TEXT_MUTED);
+        queueChromeLabel(state, .{
+            .x = row.x + theme.scaledUi(12.0),
+            .y = row.y + theme.scaledUi(6.0),
+            .w = theme.scaledUi(140.0),
+            .h = theme.scaledUi(18.0),
+        }, data.name, text_color, theme.scaledUi(14.5), row);
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(156.0),
+            .y = row.y + theme.scaledUi(7.0),
+            .w = @max(row.w - theme.scaledUi(250.0), theme.scaledUi(80.0)),
+            .h = theme.scaledUi(18.0),
+        }, data.summary, text_color, theme.scaledUi(13.0), row);
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(12.0),
+            .y = row.y + theme.scaledUi(25.0),
+            .w = row.w - theme.scaledUi(120.0),
+            .h = theme.scaledUi(16.0),
+        }, data.usage, meta_color, theme.scaledUi(11.5), row);
+        const badge = if (data.disabled) "Unavailable" else data.provider_label;
+        queueText(state, .{
+            .x = row.x + row.w - theme.scaledUi(104.0),
+            .y = row.y + theme.scaledUi(16.0),
+            .w = theme.scaledUi(92.0),
+            .h = theme.scaledUi(16.0),
+        }, badge, meta_color, theme.scaledUi(11.5), row);
     }
 }
 
