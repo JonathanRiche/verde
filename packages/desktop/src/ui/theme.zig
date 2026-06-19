@@ -275,8 +275,7 @@ pub fn applyConfigTheme(allocator: std.mem.Allocator, config: ThemeConfig) void 
 }
 
 pub fn loadOmarchyThemeFile(allocator: std.mem.Allocator, path: []const u8) !void {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
 
     const raw = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(1024 * 64));
     defer allocator.free(raw);
@@ -455,8 +454,7 @@ fn readOmarchyCurrentThemeName(allocator: std.mem.Allocator) !?[]u8 {
     for (candidates) |candidate| {
         const path = try std.fs.path.join(allocator, &.{ config_home, candidate });
         defer allocator.free(path);
-        var threaded: std.Io.Threaded = .init(allocator, .{});
-        defer threaded.deinit();
+        var threaded = std.Io.Threaded.init_single_threaded;
         const raw = std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, allocator, .limited(4096)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -510,8 +508,7 @@ fn configHome(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn fileExists(path: []const u8) bool {
-    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
     std.Io.Dir.cwd().access(threaded.io(), path, .{}) catch return false;
     return true;
 }

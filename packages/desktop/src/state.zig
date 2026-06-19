@@ -6316,6 +6316,11 @@ pub const AppState = struct {
     }
 
     pub fn saveSettingsModal(self: *AppState) !void {
+        runtime_log.diagnostic("settings save begin theme={s} font={d:.2} terminal_font={d:.2}", .{
+            @tagName(self.settings_draft.theme_source),
+            self.settings_draft.font_size,
+            self.settings_draft.terminal_font_size,
+        });
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.theme_config.source = self.settings_draft.theme_source;
@@ -6331,6 +6336,7 @@ pub const AppState = struct {
         self.settings_close_hovered = false;
         self.palette_modal_text_focus = .none;
         self.markDirty();
+        runtime_log.diagnostic("settings save done", .{});
     }
 
     pub fn applyTerminalFontSizesFromConfig(self: *AppState) void {
@@ -11029,6 +11035,12 @@ pub const AppState = struct {
         var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
         if (pane.minimized) return false;
+        runtime_log.diagnostic("pane maximize toggle begin project={d} pane={d} kind={s} currently_maximized={any}", .{
+            project_index,
+            pane_id,
+            @tagName(pane.ref),
+            layout.maximized_pane_id,
+        });
         layout.maximized_pane_id = if (layout.maximized_pane_id == pane_id) null else pane_id;
         layout.focused_pane_id = pane_id;
         switch (pane.ref) {
@@ -11048,6 +11060,11 @@ pub const AppState = struct {
             },
         }
         self.markDirty();
+        runtime_log.diagnostic("pane maximize toggle done project={d} pane={d} maximized={any}", .{
+            project_index,
+            pane_id,
+            layout.maximized_pane_id,
+        });
         return true;
     }
 
