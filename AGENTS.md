@@ -539,26 +539,6 @@ If a future change needs a one-off hard-coded number, leave a brief comment expl
 
 ## CI
 
-If this is a Node.js project, install Agent CI as a dev dependency
-using the project's package manager (npm, pnpm, yarn, or bun):
-
-```bash
-<package-manager> install -D @redwoodjs/agent-ci
-```
-
-If this is not a Node.js project, you can run Agent CI directly
-with npx:
-
-```bash
-npx @redwoodjs/agent-ci
-```
-
-Install the agent skill:
-
-```bash
-npx skills add redwoodjs/agent-ci --skill agent-ci
-```
-
-Before completing any work, run the `agent-ci` skill to validate
-your changes locally. If it fails, fix the issue and re-run.
-Do not report work as done until it passes.
+Use the focused verification commands above during normal development. Do not
+run Agent CI for routine changes; reserve Agent CI for release/tag validation or
+when the user explicitly asks for the full local CI workflow.
