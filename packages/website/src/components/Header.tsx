@@ -15,11 +15,14 @@ export default function Header() {
           <a href="/#providers" class="nav-link">
             Providers
           </a>
-          <a href="/#tiling" class="nav-link">
-            Tiling
+          <a href="/#features" class="nav-link">
+            Features
           </a>
-          <a href="/#scripting" class="nav-link">
+          <a href="/#cli" class="nav-link">
             CLI
+          </a>
+          <a href="/#compare" class="nav-link">
+            Compare
           </a>
           <a href="/#install" class="nav-link">
             Install
