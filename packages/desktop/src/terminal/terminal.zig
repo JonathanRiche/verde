@@ -378,7 +378,7 @@ pub const Dock = struct {
         self.launch_profile = profile;
         defer self.launch_profile = previous_profile;
 
-        try self.tabs.append(allocator, try self.buildSinglePaneTab(allocator));
+        try self.tabs.append(allocator, try self.buildSinglePaneTabWithRevivePolicy(allocator, .restart));
         self.active_tab_index = self.tabs.items.len - 1;
         self.visible = true;
         self.workspace_changed = true;
@@ -978,6 +978,13 @@ pub const Dock = struct {
         return tab;
     }
 
+    fn buildSinglePaneTabWithRevivePolicy(self: *Dock, allocator: std.mem.Allocator, revive_policy: TerminalRevivePolicy) !Tab {
+        const tab = try self.buildSinglePaneTabWithoutSession(allocator);
+        setRevivePolicyInNode(tab.root, revive_policy);
+        try self.ensureSessionsInNode(allocator, tab.root);
+        return tab;
+    }
+
     fn buildSinglePaneTabWithoutSession(self: *Dock, allocator: std.mem.Allocator) !Tab {
         const root = try self.createLeafNode(allocator, false);
         return .{
@@ -1158,6 +1165,16 @@ fn terminatePaneNodeSessions(node: *PaneNode) void {
         .split => |*split| {
             terminatePaneNodeSessions(split.first);
             terminatePaneNodeSessions(split.second);
+        },
+    }
+}
+
+fn setRevivePolicyInNode(node: *PaneNode, revive_policy: TerminalRevivePolicy) void {
+    switch (node.*) {
+        .leaf => |*leaf| leaf.revive_policy = revive_policy,
+        .split => |*split| {
+            setRevivePolicyInNode(split.first, revive_policy);
+            setRevivePolicyInNode(split.second, revive_policy);
         },
     }
 }

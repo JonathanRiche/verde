@@ -1739,6 +1739,27 @@ pub const WorkspacePane = struct {
     minimized: bool = false,
 };
 
+pub const WorkspacePanePlacement = struct {
+    pane_id: WorkspacePaneId,
+    axis: WorkspaceSplitAxis,
+    new_after: bool,
+};
+
+const WorkspaceLayoutRect = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+const WorkspacePaneLayoutRect = struct {
+    pane_id: WorkspacePaneId,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
 pub const WorkspaceMinimizedPane = struct {
     id: WorkspacePaneId,
     kind: WorkspacePaneKind,
@@ -1915,16 +1936,50 @@ pub const WorkspaceLayout = struct {
         self.* = .{};
     }
 
-    fn ensureDefaultChat(self: *WorkspaceLayout, allocator: std.mem.Allocator) !void {
+    fn ensureDefaultChat(self: *WorkspaceLayout, allocator: std.mem.Allocator) !bool {
         if (self.root != null and self.panes.items.len > 0 and self.firstVisiblePaneId() != null) {
-            if (self.focused_pane_id == null) {
-                self.focused_pane_id = self.firstVisiblePaneId();
-            }
-            return;
+            return try self.repairVisibleRoot(allocator);
         }
 
         self.deinit(allocator);
         self.* = try WorkspaceLayout.initDefaultChat(allocator);
+        return true;
+    }
+
+    fn repairVisibleRoot(self: *WorkspaceLayout, allocator: std.mem.Allocator) !bool {
+        var changed = false;
+        if (self.root) |root_node| {
+            const repaired = pruneRootToVisiblePanes(allocator, self, root_node);
+            self.root = repaired.node;
+            changed = changed or repaired.changed;
+        }
+        if (self.root == null) {
+            if (self.firstVisiblePaneId()) |pane_id| {
+                self.root = try createLeafNode(allocator, pane_id);
+                changed = true;
+            }
+        }
+        if (self.focused_pane_id) |pane_id| {
+            if (!self.paneIdVisible(pane_id)) {
+                self.focused_pane_id = self.firstVisiblePaneId();
+                changed = true;
+            }
+        } else {
+            self.focused_pane_id = self.firstVisiblePaneId();
+            changed = changed or self.focused_pane_id != null;
+        }
+        if (self.maximized_pane_id) |pane_id| {
+            if (!self.paneIdVisible(pane_id)) {
+                self.maximized_pane_id = null;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    fn paneIdVisible(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) bool {
+        const pane = self.paneById(pane_id) orelse return false;
+        return !pane.minimized;
     }
 
     fn firstVisiblePaneId(self: *const WorkspaceLayout) ?WorkspacePaneId {
@@ -1992,6 +2047,74 @@ pub const WorkspaceLayout = struct {
             if (!pane.minimized) count += 1;
         }
         return count;
+    }
+
+    fn gridNewPanePlacement(self: *const WorkspaceLayout) ?WorkspacePanePlacement {
+        if (self.maximized_pane_id != null) return null;
+        const visible = self.visiblePaneCount();
+        if (visible == 0 or visible >= 4) return null;
+
+        const root_node = self.root orelse return null;
+        var rects: [48]WorkspacePaneLayoutRect = undefined;
+        var count: usize = 0;
+        self.collectVisiblePaneRects(root_node, .{ .x = 0, .y = 0, .w = 1, .h = 1 }, &rects, &count);
+        if (count == 0) return null;
+
+        if (visible == 1) {
+            return .{ .pane_id = rects[0].pane_id, .axis = .vertical, .new_after = true };
+        }
+
+        var best: usize = 0;
+        var i: usize = 1;
+        while (i < count) : (i += 1) {
+            const a = rects[i];
+            const b = rects[best];
+            if (a.h > b.h + 0.001) {
+                best = i;
+            } else if (a.h > b.h - 0.001 and a.x < b.x - 0.001) {
+                best = i;
+            }
+        }
+        return .{ .pane_id = rects[best].pane_id, .axis = .horizontal, .new_after = true };
+    }
+
+    fn collectVisiblePaneRects(
+        self: *const WorkspaceLayout,
+        node: *const WorkspaceNode,
+        rect: WorkspaceLayoutRect,
+        rects: *[48]WorkspacePaneLayoutRect,
+        count: *usize,
+    ) void {
+        switch (node.*) {
+            .leaf => |pane_id| {
+                if (!self.paneIdVisible(pane_id) or count.* >= rects.len) return;
+                rects[count.*] = .{
+                    .pane_id = pane_id,
+                    .x = rect.x,
+                    .y = rect.y,
+                    .w = rect.w,
+                    .h = rect.h,
+                };
+                count.* += 1;
+            },
+            .split => |split| {
+                const ratio = std.math.clamp(split.ratio, 0.05, 0.95);
+                switch (split.axis) {
+                    .vertical => {
+                        const first_w = rect.w * ratio;
+                        const second_x = rect.x + first_w;
+                        self.collectVisiblePaneRects(split.first, .{ .x = rect.x, .y = rect.y, .w = first_w, .h = rect.h }, rects, count);
+                        self.collectVisiblePaneRects(split.second, .{ .x = second_x, .y = rect.y, .w = rect.w - first_w, .h = rect.h }, rects, count);
+                    },
+                    .horizontal => {
+                        const first_h = rect.h * ratio;
+                        const second_y = rect.y + first_h;
+                        self.collectVisiblePaneRects(split.first, .{ .x = rect.x, .y = rect.y, .w = rect.w, .h = first_h }, rects, count);
+                        self.collectVisiblePaneRects(split.second, .{ .x = rect.x, .y = second_y, .w = rect.w, .h = rect.h - first_h }, rects, count);
+                    },
+                }
+            },
+        }
     }
 
     fn paneIndexById(self: *const WorkspaceLayout, pane_id: WorkspacePaneId) ?usize {
@@ -2491,7 +2614,7 @@ pub const WorkspaceLayout = struct {
     }
 
     fn applyLegacyPersistedWorkspaceJson(self: *WorkspaceLayout, allocator: std.mem.Allocator, json: []const u8) !void {
-        try self.ensureDefaultChat(allocator);
+        _ = try self.ensureDefaultChat(allocator);
         if (std.mem.indexOf(u8, json, "\"terminal_visible\":true") != null) {
             _ = try self.ensureTerminalPane(allocator, 0);
         }
@@ -2563,6 +2686,47 @@ pub const WorkspaceLayout = struct {
             .leaf => |leaf_id| leaf_id == pane_id,
             .split => |split| nodeContainsPane(split.first, pane_id) or nodeContainsPane(split.second, pane_id),
         };
+    }
+
+    const PruneRootResult = struct {
+        node: ?*WorkspaceNode,
+        changed: bool,
+    };
+
+    fn pruneRootToVisiblePanes(allocator: std.mem.Allocator, layout: *const WorkspaceLayout, node: *WorkspaceNode) PruneRootResult {
+        switch (node.*) {
+            .leaf => |pane_id| {
+                if (layout.paneIdVisible(pane_id)) return .{ .node = node, .changed = false };
+                allocator.destroy(node);
+                return .{ .node = null, .changed = true };
+            },
+            .split => |split| {
+                const axis = split.axis;
+                const ratio = split.ratio;
+                const first = pruneRootToVisiblePanes(allocator, layout, split.first);
+                const second = pruneRootToVisiblePanes(allocator, layout, split.second);
+                const child_changed = first.changed or second.changed;
+                if (first.node) |first_node| {
+                    if (second.node) |second_node| {
+                        node.* = .{ .split = .{
+                            .axis = axis,
+                            .ratio = ratio,
+                            .first = first_node,
+                            .second = second_node,
+                        } };
+                        return .{ .node = node, .changed = child_changed };
+                    }
+                    allocator.destroy(node);
+                    return .{ .node = first_node, .changed = true };
+                }
+                if (second.node) |second_node| {
+                    allocator.destroy(node);
+                    return .{ .node = second_node, .changed = true };
+                }
+                allocator.destroy(node);
+                return .{ .node = null, .changed = true };
+            },
+        }
     }
 
     fn resizeNodeSplit(node: *WorkspaceNode, first_pane_id: WorkspacePaneId, second_pane_id: WorkspacePaneId, axis: WorkspaceSplitAxis, ratio: f32) bool {
@@ -5130,7 +5294,7 @@ pub const AppState = struct {
         var project = &self.projects.items[project_index];
         if (thread_index >= project.threads.items.len) return;
         var layout = &project.workspace_layout;
-        try layout.ensureDefaultChat(self.allocator);
+        _ = try layout.ensureDefaultChat(self.allocator);
 
         var chat_pane_id: ?WorkspacePaneId = null;
         for (layout.panes.items) |*pane| {
@@ -9429,9 +9593,11 @@ pub const AppState = struct {
 
     pub fn ensureCurrentProjectWorkspace(self: *AppState) void {
         if (self.projects.items.len == 0) return;
-        self.projects.items[self.selected_project_index].workspace_layout.ensureDefaultChat(self.allocator) catch |err| {
+        const changed = self.projects.items[self.selected_project_index].workspace_layout.ensureDefaultChat(self.allocator) catch |err| {
             log.err("failed to initialize workspace panes: {s}", .{@errorName(err)});
+            return;
         };
+        if (changed) self.markDirty();
     }
 
     pub fn focusedWorkspacePaneKind(self: *const AppState) ?WorkspacePaneKind {
@@ -9885,7 +10051,108 @@ pub const AppState = struct {
         return true;
     }
 
+    fn startManagedProcessInNewPane(
+        self: *AppState,
+        project_index: usize,
+        process: *ManagedProcess,
+        requested_pane_id: ?WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        const target_pane_id = requested_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+            self.setSidebarNotice("No workspace pane selected.");
+            return false;
+        };
+        const target = layout.paneById(target_pane_id) orelse return false;
+        if (target.minimized) return false;
+
+        const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
+        defer self.allocator.free(cwd);
+        if (process.kind == .agent and process.provider == .codex and process.hooks) {
+            try provider_hooks.ensureCodexProjectHooks(self.allocator, project.path);
+        }
+
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+            log.err("failed to allocate agent terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create Codex TUI terminal.");
+            return false;
+        };
+        project = &self.projects.items[project_index];
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        const command = try self.managedProcessLaunchCommand(process);
+        defer self.allocator.free(command);
+        const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
+        try dock.restartWithProfilePersistent(self.allocator, cwd, .{
+            .kind = .custom,
+            .label = process.name,
+            .command = &command_args,
+        }, self.storage.pref_path, dock_id);
+
+        layout = &project.workspace_layout;
+        const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create agent terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create Codex TUI pane.");
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, target_pane_id, new_pane_id, axis, new_after) catch |err| {
+            log.err("failed to split agent terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return false;
+        };
+
+        process.dock_id = dock_id;
+        process.pane_id = new_pane_id;
+        process.status = .running;
+        process.exit_code = null;
+        process.signal = null;
+        process.last_start_ms = unixTimestampMs();
+        process.last_exit_ms = 0;
+        process.next_restart_ms = 0;
+        process.pending_watch_restart_ms = 0;
+        process.explicit_stop = false;
+        if (process.kind == .agent and process.notify) {
+            if (dock.activeSessionId()) |session_id| {
+                _ = try self.updateSurface(.{
+                    .session_id = session_id,
+                    .workspace_id = project.id,
+                    .workspace_path = project.path,
+                    .dock_id = dock_id,
+                    .pane_id = process.pane_id,
+                    .provider = providerFromStack(process.provider),
+                    .title = process.name,
+                    .status = .working,
+                    .attention = false,
+                    .last_event_title = process.name,
+                    .last_event_body = "Agent started.",
+                });
+            }
+        }
+        layout.maximized_pane_id = null;
+        dock.visible = false;
+        self.terminal_focused = true;
+        self.setSidebarNotice("Started Codex TUI.");
+        self.markDirty();
+        return true;
+    }
+
     pub fn openAgentTui(self: *AppState, project_index: usize, provider: Provider) !bool {
+        return self.openAgentTuiAtPlacement(project_index, provider, null, .horizontal, true);
+    }
+
+    pub fn openAgentTuiAtPlacement(
+        self: *AppState,
+        project_index: usize,
+        provider: Provider,
+        requested_pane_id: ?WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) !bool {
         if (provider != .codex) return false;
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
@@ -9909,7 +10176,7 @@ pub const AppState = struct {
             try project.managed_processes.append(self.allocator, process);
         }
         const process = project.managedProcessByName(name) orelse return false;
-        return try self.startManagedProcessDirect(project, process);
+        return try self.startManagedProcessInNewPane(project_index, process, requested_pane_id, axis, new_after);
     }
 
     fn providerFromStack(provider: ?stack_config.AgentProvider) ?Provider {
@@ -10658,17 +10925,39 @@ pub const AppState = struct {
         project = &self.projects.items[project_index];
         thread = &project.threads.items[thread_index];
         var layout = &project.workspace_layout;
-        const pane_id = layout.visibleChatPaneIdForThread(thread_index) orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse return;
-        const pane = layout.paneByIdMutable(pane_id) orelse return;
 
-        const dock_id = thread.tui_dock_id orelse self.createCurrentProjectTerminalDock() catch |err| {
+        const previous_dock_id = thread.tui_dock_id;
+        const pane_id = if (previous_dock_id) |dock_id|
+            layout.visibleTerminalPaneIdForDock(dock_id) orelse
+                layout.visibleChatPaneIdForThread(thread_index) orelse
+                layout.focused_pane_id orelse
+                layout.firstVisiblePaneId() orelse
+                return
+        else
+            layout.visibleChatPaneIdForThread(thread_index) orelse
+                layout.focused_pane_id orelse
+                layout.firstVisiblePaneId() orelse
+                return;
+
+        if (previous_dock_id) |dock_id| {
+            if (self.currentProjectTerminalDockMutable(dock_id)) |old_dock| {
+                old_dock.terminateAllSessions();
+            }
+        }
+
+        const dock_id = self.createCurrentProjectTerminalDock() catch |err| {
             log.err("failed to allocate TUI terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to create TUI terminal.");
             return;
         };
+
+        project = &self.projects.items[project_index];
+        thread = &project.threads.items[thread_index];
+        layout = &project.workspace_layout;
         thread.tui_dock_id = dock_id;
+        const pane = layout.paneByIdMutable(pane_id) orelse return;
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
-        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+        dock.restartWithProfilePersistent(self.allocator, project.path, .{}, self.storage.pref_path, dock_id) catch |err| {
             log.err("failed to start TUI terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start TUI terminal.");
             return;
@@ -10937,6 +11226,11 @@ pub const AppState = struct {
     pub fn currentProjectWorkspaceVisiblePaneCount(self: *const AppState) usize {
         if (self.projects.items.len == 0) return 0;
         return self.projects.items[self.selected_project_index].workspace_layout.visiblePaneCount();
+    }
+
+    pub fn currentProjectGridNewPanePlacement(self: *const AppState) ?WorkspacePanePlacement {
+        if (self.projects.items.len == 0) return null;
+        return self.projects.items[self.selected_project_index].workspace_layout.gridNewPanePlacement();
     }
 
     pub fn currentProjectWorkspaceMinimizedPaneCount(self: *const AppState) usize {
@@ -13819,6 +14113,62 @@ fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
         .query_start = token_start + 1,
         .end = draft.len,
     };
+}
+
+test "workspace layout prunes stale root leaves" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    const stale_leaf = try WorkspaceLayout.createLeafNode(allocator, 999);
+    const existing_root = layout.root.?;
+    const split = allocator.create(WorkspaceNode) catch |err| {
+        WorkspaceLayout.destroyNode(allocator, stale_leaf);
+        return err;
+    };
+    split.* = .{ .split = .{
+        .axis = .vertical,
+        .ratio = 0.5,
+        .first = stale_leaf,
+        .second = existing_root,
+    } };
+    layout.root = split;
+
+    _ = try layout.ensureDefaultChat(allocator);
+
+    const root = layout.root orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), switch (root.*) {
+        .leaf => |pane_id| pane_id,
+        .split => return error.TestExpectedEqual,
+    });
+    try std.testing.expectEqual(@as(?WorkspacePaneId, 1), layout.focused_pane_id);
+}
+
+test "workspace layout grid placement follows pane hotkey order" {
+    const allocator = std.testing.allocator;
+    var layout = try WorkspaceLayout.initDefaultChat(allocator);
+    defer layout.deinit(allocator);
+
+    var placement = layout.gridNewPanePlacement() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), placement.pane_id);
+    try std.testing.expectEqual(WorkspaceSplitAxis.vertical, placement.axis);
+    try std.testing.expect(placement.new_after);
+
+    const pane2 = try layout.createTerminalPane(allocator, 10);
+    try layout.splitPaneWithLeaf(allocator, placement.pane_id, pane2, placement.axis, placement.new_after);
+
+    placement = layout.gridNewPanePlacement() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(WorkspacePaneId, 1), placement.pane_id);
+    try std.testing.expectEqual(WorkspaceSplitAxis.horizontal, placement.axis);
+    try std.testing.expect(placement.new_after);
+
+    const pane3 = try layout.createTerminalPane(allocator, 11);
+    try layout.splitPaneWithLeaf(allocator, placement.pane_id, pane3, placement.axis, placement.new_after);
+
+    placement = layout.gridNewPanePlacement() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(pane2, placement.pane_id);
+    try std.testing.expectEqual(WorkspaceSplitAxis.horizontal, placement.axis);
+    try std.testing.expect(placement.new_after);
 }
 
 fn unixTimestampSeconds() i64 {
