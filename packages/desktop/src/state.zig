@@ -7778,7 +7778,7 @@ pub const AppState = struct {
             self.noteInteraction();
             return true;
         }
-        if (std.mem.eql(u8, row.name, "/usage") or std.mem.eql(u8, row.name, "/compact")) {
+        if (std.mem.eql(u8, row.name, "/usage") or std.mem.eql(u8, row.name, "/compact") or std.mem.eql(u8, row.name, "/review")) {
             self.setDraft(row.name);
             self.syncPaletteComposerFromDraft();
             _ = self.handleProviderSlashCommand(row.name);

@@ -41,19 +41,17 @@ const CODEX_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
     .{
         .id = .review,
         .name = "/review",
-        .summary = "Start a Codex code review after ReviewTarget support is confirmed.",
-        .usage = "/review",
+        .summary = "Start a Codex code review for changes, a base branch, a commit, or custom instructions.",
+        .usage = "/review [changes|base <branch>|commit <sha> [title]|custom <instructions>]",
         .requires_thread = true,
-        .availability = .disabled,
     },
     .{
         .id = .shell,
         .name = "/shell",
-        .summary = "Run a shell command after explicit confirmation is implemented.",
-        .usage = "/shell <command>",
+        .summary = "Run an unsandboxed Codex shell command after explicit typed confirmation.",
+        .usage = "/shell confirm <command>",
         .requires_thread = true,
         .destructive_or_sensitive = true,
-        .availability = .disabled,
     },
 };
 
@@ -324,7 +322,8 @@ pub const Client = struct {
             .usage => self.runUsageSlashCommand(allocator),
             .goal => self.runGoalSlashCommand(allocator, request),
             .compact => self.runCompactSlashCommand(allocator, request),
-            else => error.UnsupportedOperation,
+            .review => self.runReviewSlashCommand(allocator, request),
+            .shell => self.runShellSlashCommand(allocator, request),
         };
     }
 
@@ -405,6 +404,60 @@ pub const Client = struct {
             "Compact",
             "Compacted thread context.",
             "Thread context compacted.\n\nFuture Codex turns will continue from the compacted conversation summary.",
+        );
+    }
+
+    fn runReviewSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        const thread_id = request.thread_id orelse return error.MissingThreadId;
+        try self.ensureConnected();
+        try self.ensureThreadLoaded(thread_id);
+
+        const review_text = try self.callReviewStartAndWait(allocator, thread_id, request.args);
+        defer allocator.free(review_text);
+        const body = if (std.mem.trim(u8, review_text, &std.ascii.whitespace).len == 0)
+            "Codex review completed with no findings."
+        else
+            review_text;
+
+        return self.slashTextResultAlloc(
+            allocator,
+            "Review",
+            "Codex review completed.",
+            body,
+        );
+    }
+
+    fn runShellSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        const thread_id = request.thread_id orelse return error.MissingThreadId;
+        const command = confirmedShellCommand(request.args) orelse {
+            return self.slashTextResultAlloc(
+                allocator,
+                "Shell",
+                "Shell command was not run.",
+                "Codex shell commands run unsandboxed with full access. To confirm, use:\n\n/shell confirm <command>",
+            );
+        };
+        try self.ensureConnected();
+        try self.ensureThreadLoaded(thread_id);
+
+        const output = try self.callShellCommandAndWait(allocator, thread_id, command);
+        defer allocator.free(output);
+        const body = try formatShellCommandResultAlloc(allocator, command, output);
+        defer allocator.free(body);
+
+        return self.slashTextResultAlloc(
+            allocator,
+            "Shell",
+            "Codex shell command completed.",
+            body,
         );
     }
 
@@ -1179,6 +1232,132 @@ pub const Client = struct {
         }
     }
 
+    fn callReviewStartAndWait(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+        args: []const u8,
+    ) ![]u8 {
+        const id = try self.sendReviewStartRequest(thread_id, args);
+        var response_received = false;
+        var review_text: std.ArrayList(u8) = .empty;
+        defer review_text.deinit(allocator);
+
+        while (true) {
+            const message = try self.readTextMessageAlloc(self.allocator);
+            defer self.allocator.free(message);
+            runtime_log.diagnostic("Codex RPC review await id={d} message_len={d}", .{ id, message.len });
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (extractReviewCompletedText(root, thread_id)) |text| {
+                review_text.clearRetainingCapacity();
+                try review_text.appendSlice(allocator, text);
+            } else if (try appendNotificationDelta(root, allocator, &review_text)) {
+                // Keep assistant deltas as a fallback for protocol versions that
+                // complete review without an `exitedReviewMode` payload.
+            }
+
+            if (parseMessageId(root)) |response_id| {
+                if (response_id != id) continue;
+                if (getObjectField(root, "error")) |rpc_error| {
+                    runtime_log.diagnostic("Codex RPC review response id={d} returned error: {s}", .{ id, message });
+                    if (getOptionalObjectInteger(rpc_error, "code")) |code| {
+                        if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
+                    }
+                    return error.CodexRpcFailed;
+                }
+                _ = getObjectField(root, "result") orelse return error.MissingRpcResult;
+                response_received = true;
+            }
+
+            if (response_received and isThreadCompactionIdle(root, thread_id)) {
+                return review_text.toOwnedSlice(allocator);
+            }
+        }
+    }
+
+    fn callShellCommandAndWait(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        thread_id: []const u8,
+        command: []const u8,
+    ) ![]u8 {
+        const id = try self.sendRequest("thread/shellCommand", .{
+            .threadId = thread_id,
+            .command = command,
+        });
+        var response_received = false;
+        var command_completed = false;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(allocator);
+
+        while (true) {
+            const message = try self.readTextMessageAlloc(self.allocator);
+            defer self.allocator.free(message);
+            runtime_log.diagnostic("Codex RPC shell await id={d} message_len={d}", .{ id, message.len });
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, message, .{});
+            defer parsed.deinit();
+
+            const root = parsed.value;
+            if (extractShellOutputDelta(root)) |delta| try output.appendSlice(allocator, delta);
+            if (isShellCommandCompleted(root, thread_id)) command_completed = true;
+
+            if (parseMessageId(root)) |response_id| {
+                if (response_id != id) continue;
+                if (getObjectField(root, "error")) |rpc_error| {
+                    runtime_log.diagnostic("Codex RPC shell response id={d} returned error: {s}", .{ id, message });
+                    if (getOptionalObjectInteger(rpc_error, "code")) |code| {
+                        if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
+                    }
+                    return error.CodexRpcFailed;
+                }
+                _ = getObjectField(root, "result") orelse return error.MissingRpcResult;
+                response_received = true;
+            }
+
+            if (response_received and command_completed) return output.toOwnedSlice(allocator);
+        }
+    }
+
+    fn sendReviewStartRequest(self: *Client, thread_id: []const u8, args: []const u8) !u64 {
+        const id = self.next_request_id;
+        self.next_request_id += 1;
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer writer.deinit();
+
+        var stringify: std.json.Stringify = .{
+            .writer = &writer.writer,
+            .options = .{},
+        };
+
+        try stringify.beginObject();
+        try stringify.objectField("method");
+        try stringify.write("review/start");
+        try stringify.objectField("id");
+        try stringify.write(id);
+        try stringify.objectField("params");
+        try stringify.beginObject();
+        try stringify.objectField("threadId");
+        try stringify.write(thread_id);
+        try stringify.objectField("delivery");
+        try stringify.write("inline");
+        try stringify.objectField("target");
+        try writeReviewTarget(&stringify, args);
+        try stringify.endObject();
+        try stringify.endObject();
+
+        const payload = try writer.toOwnedSlice();
+        defer self.allocator.free(payload);
+        runtime_log.diagnostic("Codex RPC review/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
+        try self.writeTextMessage(payload);
+        return id;
+    }
+
     fn awaitResultPayloadAlloc(self: *Client, id: u64) ![]u8 {
         while (true) {
             const message = try self.readTextMessageAlloc(self.allocator);
@@ -1792,6 +1971,112 @@ fn isThreadCompactionIdle(root: std.json.Value, thread_id: []const u8) bool {
         return std.mem.eql(u8, type_name, "idle");
     }
     return false;
+}
+
+fn writeReviewTarget(stringify: *std.json.Stringify, raw_args: []const u8) !void {
+    const args = std.mem.trim(u8, raw_args, " \t\r\n");
+    if (args.len == 0 or std.mem.eql(u8, args, "changes") or std.mem.eql(u8, args, "uncommitted")) {
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("uncommittedChanges");
+        try stringify.endObject();
+        return;
+    }
+
+    var parts = std.mem.tokenizeAny(u8, args, " \t\r\n");
+    const kind = parts.next() orelse "";
+    if (std.mem.eql(u8, kind, "base")) {
+        const branch = parts.next() orelse "main";
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("baseBranch");
+        try stringify.objectField("branch");
+        try stringify.write(branch);
+        try stringify.endObject();
+        return;
+    }
+    if (std.mem.eql(u8, kind, "commit")) {
+        const sha = parts.next() orelse args;
+        const title_start = if (std.mem.indexOf(u8, args, sha)) |sha_start|
+            @min(args.len, sha_start + sha.len)
+        else
+            args.len;
+        const title = std.mem.trim(u8, args[title_start..], " \t\r\n");
+        try stringify.beginObject();
+        try stringify.objectField("type");
+        try stringify.write("commit");
+        try stringify.objectField("sha");
+        try stringify.write(sha);
+        if (title.len > 0) {
+            try stringify.objectField("title");
+            try stringify.write(title);
+        }
+        try stringify.endObject();
+        return;
+    }
+
+    const instructions = if (std.mem.startsWith(u8, args, "custom"))
+        std.mem.trim(u8, args["custom".len..], " \t\r\n")
+    else
+        args;
+    try stringify.beginObject();
+    try stringify.objectField("type");
+    try stringify.write("custom");
+    try stringify.objectField("instructions");
+    try stringify.write(instructions);
+    try stringify.endObject();
+}
+
+fn confirmedShellCommand(raw_args: []const u8) ?[]const u8 {
+    const args = std.mem.trim(u8, raw_args, " \t\r\n");
+    if (!std.mem.startsWith(u8, args, "confirm")) return null;
+    if (args.len > "confirm".len and !std.ascii.isWhitespace(args["confirm".len])) return null;
+    const command = std.mem.trim(u8, args["confirm".len..], " \t\r\n");
+    return if (command.len == 0) null else command;
+}
+
+fn formatShellCommandResultAlloc(allocator: std.mem.Allocator, command: []const u8, output: []const u8) ![]u8 {
+    const trimmed_output = std.mem.trim(u8, output, "\r\n");
+    if (trimmed_output.len == 0) {
+        return std.fmt.allocPrint(allocator, "Command:\n{s}\n\nNo output captured.", .{command});
+    }
+    return std.fmt.allocPrint(allocator, "Command:\n{s}\n\nOutput:\n{s}", .{ command, trimmed_output });
+}
+
+fn extractReviewCompletedText(root: std.json.Value, thread_id: []const u8) ?[]const u8 {
+    const method = getOptionalObjectString(root, "method") orelse return null;
+    if (!std.mem.eql(u8, method, "item/completed")) return null;
+    const params = getObjectField(root, "params") orelse return null;
+    if (getOptionalObjectString(params, "threadId")) |notification_thread_id| {
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return null;
+    }
+    const item = getObjectField(params, "item") orelse return null;
+    const item_type = getOptionalObjectString(item, "type") orelse return null;
+    if (!std.mem.eql(u8, item_type, "exitedReviewMode")) return null;
+    return getOptionalObjectString(item, "review");
+}
+
+fn extractShellOutputDelta(root: std.json.Value) ?[]const u8 {
+    const method = getOptionalObjectString(root, "method") orelse return null;
+    if (!std.mem.eql(u8, method, "item/commandExecution/outputDelta")) return null;
+    const params = getObjectField(root, "params") orelse return null;
+    return findFirstStringByPath(params, &.{ "delta", "text" }) orelse
+        findFirstStringByPath(params, &.{ "delta", "output" }) orelse
+        findFirstStringByPath(params, &.{"delta"}) orelse
+        findFirstStringByPath(params, &.{"output"}) orelse
+        findFirstStringByPath(params, &.{"text"});
+}
+
+fn isShellCommandCompleted(root: std.json.Value, thread_id: []const u8) bool {
+    const method = getOptionalObjectString(root, "method") orelse return false;
+    if (!std.mem.eql(u8, method, "item/completed")) return false;
+    const params = getObjectField(root, "params") orelse return false;
+    if (getOptionalObjectString(params, "threadId")) |notification_thread_id| {
+        if (!std.mem.eql(u8, notification_thread_id, thread_id)) return false;
+    }
+    const item = getObjectField(params, "item") orelse return false;
+    const item_type = getOptionalObjectString(item, "type") orelse return false;
+    return std.mem.eql(u8, item_type, "commandExecution");
 }
 
 fn isGoalStatus(args: []const u8) bool {
@@ -2853,6 +3138,41 @@ test "formatGoalSummaryAlloc renders empty goal" {
     try std.testing.expectEqualStrings("Codex goal\n\nNo active Codex goal.", body);
 }
 
+test "writeReviewTarget serializes supported target shapes" {
+    const allocator = std.testing.allocator;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try writeReviewTarget(&stringify, "");
+    const changes = try writer.toOwnedSlice();
+    defer allocator.free(changes);
+    try std.testing.expectEqualStrings("{\"type\":\"uncommittedChanges\"}", changes);
+
+    var base_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer base_writer.deinit();
+    var base_stringify: std.json.Stringify = .{ .writer = &base_writer.writer, .options = .{} };
+    try writeReviewTarget(&base_stringify, "base main");
+    const base = try base_writer.toOwnedSlice();
+    defer allocator.free(base);
+    try std.testing.expectEqualStrings("{\"type\":\"baseBranch\",\"branch\":\"main\"}", base);
+
+    var commit_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer commit_writer.deinit();
+    var commit_stringify: std.json.Stringify = .{ .writer = &commit_writer.writer, .options = .{} };
+    try writeReviewTarget(&commit_stringify, "commit abc123 Polish slash commands");
+    const commit = try commit_writer.toOwnedSlice();
+    defer allocator.free(commit);
+    try std.testing.expectEqualStrings("{\"type\":\"commit\",\"sha\":\"abc123\",\"title\":\"Polish slash commands\"}", commit);
+}
+
+test "confirmedShellCommand requires explicit confirmation" {
+    try std.testing.expect(confirmedShellCommand("git status") == null);
+    try std.testing.expect(confirmedShellCommand("confirm") == null);
+    try std.testing.expect(confirmedShellCommand("confirmed git status") == null);
+    try std.testing.expectEqualStrings("git status --short", confirmedShellCommand(" confirm git status --short ").?);
+}
+
 test "formatUsageSummaryAlloc includes remaining rate limits" {
     const allocator = std.testing.allocator;
     const usage_json =
@@ -2986,4 +3306,57 @@ test "isThreadCompactionIdle matches idle fallback" {
 
     try std.testing.expect(isThreadCompactionIdle(parsed.value, "thread-123"));
     try std.testing.expect(!isThreadCompactionIdle(parsed.value, "other-thread"));
+}
+
+test "extractReviewCompletedText reads exited review item" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "item": {
+        \\      "type": "exitedReviewMode",
+        \\      "id": "turn-1",
+        \\      "review": "Looks solid overall."
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("Looks solid overall.", extractReviewCompletedText(parsed.value, "thread-123").?);
+    try std.testing.expect(extractReviewCompletedText(parsed.value, "other-thread") == null);
+}
+
+test "extractShellOutputDelta and completion parse shell notifications" {
+    const allocator = std.testing.allocator;
+    const delta_json =
+        \\{
+        \\  "method": "item/commandExecution/outputDelta",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "delta": { "text": "hello\\n" }
+        \\  }
+        \\}
+    ;
+    var delta = try std.json.parseFromSlice(std.json.Value, allocator, delta_json, .{});
+    defer delta.deinit();
+    try std.testing.expectEqualStrings("hello\\n", extractShellOutputDelta(delta.value).?);
+
+    const completed_json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "item": { "type": "commandExecution", "status": "completed" }
+        \\  }
+        \\}
+    ;
+    var completed = try std.json.parseFromSlice(std.json.Value, allocator, completed_json, .{});
+    defer completed.deinit();
+    try std.testing.expect(isShellCommandCompleted(completed.value, "thread-123"));
+    try std.testing.expect(!isShellCommandCompleted(completed.value, "other-thread"));
 }
