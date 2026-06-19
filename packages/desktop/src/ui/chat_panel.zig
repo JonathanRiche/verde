@@ -1917,6 +1917,11 @@ fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8
         std.mem.eql(u8, body, "completed");
 }
 
+fn isUsageSummaryMessage(author: []const u8, body_raw: []const u8) bool {
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    return std.mem.eql(u8, author, "Usage") and std.mem.startsWith(u8, body, "Codex usage");
+}
+
 /// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
 fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
     if (isCommandSystemEvent(original_author)) return original_author;
@@ -1957,7 +1962,7 @@ fn transcriptCommittedMessageHeight(state: *app_state.AppState, message_index: u
     // height cache key does not include — bypass the cache so toggles take
     // effect immediately.
     const has_dynamic_collapse = message.role == .system and
-        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body));
+        (shouldRenderPaletteCommandRow(message.author, message.body) or isDiffSummaryMessage(message.author, message.body) or isUsageSummaryMessage(message.author, message.body));
     if (!has_dynamic_collapse) {
         if (state.cachedTranscriptMessageHeight(message_index, column_width, message.body, message.role, message.author, false, image_present)) |height| {
             return height;
@@ -2020,6 +2025,9 @@ fn transcriptMessageHeightStream(
     }
     if (role == .system and isDiffSummaryMessage(message_author, body_raw)) {
         return diffSummaryHeight(state, message_index, body_raw, column_width);
+    }
+    if (role == .system and isUsageSummaryMessage(message_author, body_raw)) {
+        return usageSummaryHeight(body_raw, column_width);
     }
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
     const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
@@ -2088,6 +2096,10 @@ fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.
         renderDiffSummaryCard(state, column, y, height, message.body, clip, message_index);
         return;
     }
+    if (message.role == .system and isUsageSummaryMessage(message.author, message.body)) {
+        renderUsageSummaryCard(state, column, y, height, message.body, clip);
+        return;
+    }
     const role_label = switch (message.role) {
         .user => "You",
         .assistant => if (message.author.len > 0) message.author else "Assistant",
@@ -2141,6 +2153,240 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
         }
         image_y += thumb_h + gap;
     }
+}
+
+// ----- Codex usage summary card -----
+
+const UsageLimitRow = struct {
+    label: []const u8,
+    percent_left: i64,
+    reset: []const u8,
+};
+
+const UsageTextRow = struct {
+    label: []const u8,
+    value: []const u8,
+};
+
+const UsageSummary = struct {
+    limits: [8]UsageLimitRow = undefined,
+    limit_count: usize = 0,
+    stats: [8]UsageTextRow = undefined,
+    stat_count: usize = 0,
+    recent: [8]UsageTextRow = undefined,
+    recent_count: usize = 0,
+};
+
+const UsageSection = enum { none, limits, summary, recent };
+
+fn parseUsageSummary(body_raw: []const u8) UsageSummary {
+    var result: UsageSummary = .{};
+    var section: UsageSection = .none;
+    var lines = std.mem.splitScalar(u8, body_raw, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or std.mem.eql(u8, line, "Codex usage")) continue;
+        if (std.mem.eql(u8, line, "Limits")) {
+            section = .limits;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Summary")) {
+            section = .summary;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Recent daily usage")) {
+            section = .recent;
+            continue;
+        }
+
+        if (!std.mem.startsWith(u8, line, "• ")) continue;
+        const item = std.mem.trim(u8, line["• ".len..], " \t\r");
+        switch (section) {
+            .limits => if (parseUsageLimitRow(item)) |row| {
+                if (result.limit_count < result.limits.len) {
+                    result.limits[result.limit_count] = row;
+                    result.limit_count += 1;
+                }
+            },
+            .summary => if (parseUsageTextRow(item)) |row| {
+                if (result.stat_count < result.stats.len) {
+                    result.stats[result.stat_count] = row;
+                    result.stat_count += 1;
+                }
+            },
+            .recent => if (parseUsageTextRow(item)) |row| {
+                if (result.recent_count < result.recent.len) {
+                    result.recent[result.recent_count] = row;
+                    result.recent_count += 1;
+                }
+            },
+            .none => {},
+        }
+    }
+    return result;
+}
+
+fn parseUsageTextRow(item: []const u8) ?UsageTextRow {
+    const colon = std.mem.indexOf(u8, item, ":") orelse return null;
+    return .{
+        .label = std.mem.trim(u8, item[0..colon], " \t"),
+        .value = std.mem.trim(u8, item[colon + 1 ..], " \t"),
+    };
+}
+
+fn parseUsageLimitRow(item: []const u8) ?UsageLimitRow {
+    const colon = std.mem.indexOf(u8, item, ":") orelse return null;
+    const label = std.mem.trim(u8, item[0..colon], " \t");
+    const rest = std.mem.trim(u8, item[colon + 1 ..], " \t");
+    const percent_end = std.mem.indexOf(u8, rest, "% left") orelse return null;
+    const percent = std.fmt.parseInt(i64, std.mem.trim(u8, rest[0..percent_end], " \t"), 10) catch return null;
+    var reset: []const u8 = "";
+    const after_percent = std.mem.trim(u8, rest[percent_end + "% left".len ..], " \t");
+    if (after_percent.len >= 2 and after_percent[0] == '(' and after_percent[after_percent.len - 1] == ')') {
+        reset = after_percent[1 .. after_percent.len - 1];
+    }
+    return .{ .label = label, .percent_left = percent, .reset = reset };
+}
+
+fn usageSummaryHeight(body_raw: []const u8, column_width: f32) f32 {
+    const data = parseUsageSummary(body_raw);
+    const pad = theme.scaledUi(16.0);
+    const gap = theme.scaledUi(12.0);
+    const header_h = theme.scaledUi(54.0);
+    const section_h = theme.scaledUi(21.0);
+    const limit_h = theme.scaledUi(42.0);
+    const tile_h = theme.scaledUi(58.0);
+    const recent_h = theme.scaledUi(21.0);
+
+    var total = pad * 2.0 + header_h;
+    if (data.limit_count > 0) total += section_h + @as(f32, @floatFromInt(data.limit_count)) * limit_h + gap;
+
+    const stat_cols: usize = if (column_width >= theme.scaledUi(560.0)) 2 else 1;
+    const stat_rows = if (data.stat_count == 0) 0 else (data.stat_count + stat_cols - 1) / stat_cols;
+    if (stat_rows > 0) total += section_h + @as(f32, @floatFromInt(stat_rows)) * tile_h + gap;
+
+    const recent_cols: usize = if (column_width >= theme.scaledUi(560.0)) 2 else 1;
+    const recent_rows = if (data.recent_count == 0) 0 else (data.recent_count + recent_cols - 1) / recent_cols;
+    if (recent_rows > 0) total += section_h + @as(f32, @floatFromInt(recent_rows)) * recent_h;
+    return total;
+}
+
+/// Renders the Codex `/usage` transcript row as a structured status card.
+fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, body_raw: []const u8, clip: palette.Rect) void {
+    const data = parseUsageSummary(body_raw);
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    const rr = transcriptBubbleCornerRadius();
+    queueRoundedShellClipped(state, bubble, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)), paletteColor(theme.withAlpha(theme.COLOR_GREEN, 150)), rr, clip);
+
+    const pad = theme.scaledUi(16.0);
+    const gap = theme.scaledUi(12.0);
+    const header_h = theme.scaledUi(54.0);
+    var cursor_y = bubble.y + pad;
+    renderUsageHeader(state, bubble, cursor_y, header_h, clip);
+    cursor_y += header_h;
+
+    if (data.limit_count > 0) {
+        renderUsageSectionTitle(state, bubble, cursor_y, "Remaining limits", clip);
+        cursor_y += theme.scaledUi(21.0);
+        for (data.limits[0..data.limit_count]) |row| {
+            renderUsageLimitRow(state, .{ .x = bubble.x + pad, .y = cursor_y, .w = bubble.w - pad * 2.0, .h = theme.scaledUi(42.0) }, row, clip);
+            cursor_y += theme.scaledUi(42.0);
+        }
+        cursor_y += gap;
+    }
+
+    if (data.stat_count > 0) {
+        renderUsageSectionTitle(state, bubble, cursor_y, "Account activity", clip);
+        cursor_y += theme.scaledUi(21.0);
+        const cols: usize = if (bubble.w >= theme.scaledUi(560.0)) 2 else 1;
+        const tile_gap = theme.scaledUi(10.0);
+        const tile_w = (bubble.w - pad * 2.0 - tile_gap * @as(f32, @floatFromInt(cols - 1))) / @as(f32, @floatFromInt(cols));
+        const tile_h = theme.scaledUi(58.0);
+        for (data.stats[0..data.stat_count], 0..) |row, index| {
+            const col: usize = @mod(index, cols);
+            const row_index: usize = index / cols;
+            renderUsageStatTile(state, .{
+                .x = bubble.x + pad + @as(f32, @floatFromInt(col)) * (tile_w + tile_gap),
+                .y = cursor_y + @as(f32, @floatFromInt(row_index)) * tile_h,
+                .w = tile_w,
+                .h = tile_h - theme.scaledUi(8.0),
+            }, row, clip);
+        }
+        const stat_rows = (data.stat_count + cols - 1) / cols;
+        cursor_y += @as(f32, @floatFromInt(stat_rows)) * tile_h + gap;
+    }
+
+    if (data.recent_count > 0) {
+        renderUsageSectionTitle(state, bubble, cursor_y, "Recent days", clip);
+        cursor_y += theme.scaledUi(21.0);
+        const cols: usize = if (bubble.w >= theme.scaledUi(560.0)) 2 else 1;
+        const col_gap = theme.scaledUi(18.0);
+        const row_h = theme.scaledUi(21.0);
+        const col_w = (bubble.w - pad * 2.0 - col_gap * @as(f32, @floatFromInt(cols - 1))) / @as(f32, @floatFromInt(cols));
+        for (data.recent[0..data.recent_count], 0..) |row, index| {
+            const col: usize = @mod(index, cols);
+            const row_index: usize = index / cols;
+            renderUsageRecentRow(state, .{
+                .x = bubble.x + pad + @as(f32, @floatFromInt(col)) * (col_w + col_gap),
+                .y = cursor_y + @as(f32, @floatFromInt(row_index)) * row_h,
+                .w = col_w,
+                .h = row_h,
+            }, row, clip);
+        }
+    }
+}
+
+/// Renders the title/subtitle region for the usage card.
+fn renderUsageHeader(state: *app_state.AppState, bubble: palette.Rect, y: f32, height: f32, clip: palette.Rect) void {
+    const pad = theme.scaledUi(16.0);
+    const icon = theme.scaledUi(30.0);
+    const icon_rect = palette.Rect{ .x = bubble.x + pad, .y = y + theme.scaledUi(5.0), .w = icon, .h = icon };
+    queueRounded(state, icon_rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), icon * 0.5);
+    queueFixedTextLine(state, .{ .x = icon_rect.x + theme.scaledUi(7.0), .y = icon_rect.y + theme.scaledUi(4.0), .w = icon_rect.w, .h = icon_rect.h }, "◔", paletteColor(theme.COLOR_GREEN), theme.scaledUi(16.0), clip);
+    queueChromeLabel(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(3.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(22.0) }, "Codex usage", paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+    queueText(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(27.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(18.0) }, "Rate limits, reset windows, and recent token activity", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
+    queueRect(state, .{ .x = bubble.x + pad, .y = y + height - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)));
+}
+
+/// Renders a compact all-caps-style section label inside the usage card.
+fn renderUsageSectionTitle(state: *app_state.AppState, bubble: palette.Rect, y: f32, title: []const u8, clip: palette.Rect) void {
+    queueChromeLabel(state, .{ .x = bubble.x + theme.scaledUi(16.0), .y = y, .w = bubble.w - theme.scaledUi(32.0), .h = theme.scaledUi(18.0) }, title, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+}
+
+/// Renders one remaining-limit row with text and a percent-left progress bar.
+fn renderUsageLimitRow(state: *app_state.AppState, rect: palette.Rect, row: UsageLimitRow, clip: palette.Rect) void {
+    const percent = @max(@as(i64, 0), @min(@as(i64, 100), row.percent_left));
+    const bar_h = theme.scaledUi(7.0);
+    const label_h = theme.scaledUi(19.0);
+    const percent_text = std.fmt.allocPrint(state.allocator, "{d}% left", .{percent}) catch "";
+    defer if (percent_text.len > 0) state.allocator.free(percent_text);
+    queueFixedTextLine(state, .{ .x = rect.x, .y = rect.y, .w = rect.w * 0.54, .h = label_h }, row.label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), clip);
+    queueFixedTextLine(state, .{ .x = rect.x + rect.w * 0.56, .y = rect.y, .w = rect.w * 0.18, .h = label_h }, percent_text, paletteColor(usagePercentColor(percent)), theme.scaledUi(13.0), clip);
+    if (row.reset.len > 0) {
+        queueFixedTextLine(state, .{ .x = rect.x + rect.w * 0.73, .y = rect.y, .w = rect.w * 0.27, .h = label_h }, row.reset, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+    }
+    const bar = palette.Rect{ .x = rect.x, .y = rect.y + theme.scaledUi(25.0), .w = rect.w, .h = bar_h };
+    queueRounded(state, bar, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 210)), bar_h * 0.5);
+    queueRounded(state, .{ .x = bar.x, .y = bar.y, .w = bar.w * @as(f32, @floatFromInt(percent)) / 100.0, .h = bar.h }, paletteColor(usagePercentColor(percent)), bar_h * 0.5);
+}
+
+/// Renders one account-activity metric tile in the usage card.
+fn renderUsageStatTile(state: *app_state.AppState, rect: palette.Rect, row: UsageTextRow, clip: palette.Rect) void {
+    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 135)), theme.scaledUi(9.0));
+    queueText(state, .{ .x = rect.x + theme.scaledUi(11.0), .y = rect.y + theme.scaledUi(8.0), .w = rect.w - theme.scaledUi(22.0), .h = theme.scaledUi(16.0) }, row.label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(11.5), clip);
+    queueFixedTextLine(state, .{ .x = rect.x + theme.scaledUi(11.0), .y = rect.y + theme.scaledUi(28.0), .w = rect.w - theme.scaledUi(22.0), .h = theme.scaledUi(19.0) }, row.value, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.5), clip);
+}
+
+/// Renders one recent daily usage row in the usage card.
+fn renderUsageRecentRow(state: *app_state.AppState, rect: palette.Rect, row: UsageTextRow, clip: palette.Rect) void {
+    queueFixedTextLine(state, .{ .x = rect.x, .y = rect.y, .w = rect.w * 0.42, .h = rect.h }, row.label, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+    queueFixedTextLine(state, .{ .x = rect.x + rect.w * 0.44, .y = rect.y, .w = rect.w * 0.56, .h = rect.h }, row.value, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.0), clip);
+}
+
+fn usagePercentColor(percent_left: i64) [4]f32 {
+    if (percent_left >= 50) return theme.COLOR_GREEN;
+    if (percent_left >= 20) return theme.COLOR_YELLOW;
+    return theme.COLOR_DIFF_REMOVE;
 }
 
 // ----- Diff summary card -----
