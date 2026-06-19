@@ -360,13 +360,13 @@ pub const Client = struct {
         if (args.len == 0 or std.mem.eql(u8, args, "status")) {
             const payload = try self.callRpcForResultAlloc("thread/goal/get", .{ .threadId = thread_id });
             defer self.allocator.free(payload);
-            return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal loaded.", payload);
+            return self.slashGoalResultAlloc(allocator, "Codex goal loaded.", payload);
         }
 
         if (std.mem.eql(u8, args, "clear")) {
             const payload = try self.callRpcForResultAlloc("thread/goal/clear", .{ .threadId = thread_id });
             defer self.allocator.free(payload);
-            return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal cleared.", payload);
+            return self.slashGoalResultAlloc(allocator, "Codex goal cleared.", payload);
         }
 
         if (isGoalStatus(args)) {
@@ -378,7 +378,7 @@ pub const Client = struct {
 
             const notice = try std.fmt.allocPrint(allocator, "Codex goal marked {s}.", .{args});
             defer allocator.free(notice);
-            return self.slashJsonResultAlloc(allocator, "Goal", notice, payload);
+            return self.slashGoalResultAlloc(allocator, notice, payload);
         }
 
         const payload = try self.callRpcForResultAlloc("thread/goal/set", .{
@@ -386,7 +386,7 @@ pub const Client = struct {
             .objective = args,
         });
         defer self.allocator.free(payload);
-        return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal updated.", payload);
+        return self.slashGoalResultAlloc(allocator, "Codex goal updated.", payload);
     }
 
     fn runCompactSlashCommand(
@@ -445,6 +445,32 @@ pub const Client = struct {
         errdefer allocator.free(owned_title);
         const body = try std.fmt.allocPrint(allocator, "```json\n{s}\n```", .{payload});
         errdefer allocator.free(body);
+
+        return .{
+            .handled = true,
+            .notice = owned_notice,
+            .transcript_title = owned_title,
+            .transcript_body = body,
+        };
+    }
+
+    fn slashGoalResultAlloc(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        notice: []const u8,
+        payload: []const u8,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+
+        const body = formatGoalSummaryAlloc(allocator, payload) catch |err| switch (err) {
+            error.InvalidGoalPayload => try std.fmt.allocPrint(allocator, "```json\n{s}\n```", .{payload}),
+            else => return err,
+        };
+        errdefer allocator.free(body);
+        const owned_notice = try allocator.dupe(u8, notice);
+        errdefer allocator.free(owned_notice);
+        const owned_title = try allocator.dupe(u8, "Goal");
+        errdefer allocator.free(owned_title);
 
         return .{
             .handled = true,
@@ -1775,6 +1801,38 @@ fn isGoalStatus(args: []const u8) bool {
         std.mem.eql(u8, args, "complete");
 }
 
+fn formatGoalSummaryAlloc(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return error.InvalidGoalPayload;
+    defer parsed.deinit();
+
+    const root = getObjectField(parsed.value, "result") orelse parsed.value;
+    const goal = if (getObjectField(root, "goal")) |goal_value| switch (goal_value) {
+        .null => return allocator.dupe(u8, "Codex goal\n\nNo active Codex goal."),
+        else => goal_value,
+    } else root;
+
+    const objective = getOptionalObjectString(goal, "objective") orelse
+        getOptionalObjectString(goal, "text") orelse
+        getOptionalObjectString(goal, "description");
+    const status = getOptionalObjectString(goal, "status");
+    const token_budget = getOptionalObjectInteger(goal, "tokenBudget") orelse
+        getOptionalObjectInteger(goal, "token_budget");
+
+    if (objective == null and status == null and token_budget == null) {
+        return allocator.dupe(u8, "Codex goal\n\nNo active Codex goal.");
+    }
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+
+    try writer.writer.print("Codex goal\n\n", .{});
+    if (status) |value| try writer.writer.print("Status: {s}\n", .{value});
+    if (objective) |value| try writer.writer.print("Objective: {s}\n", .{value});
+    if (token_budget) |value| try writer.writer.print("Token budget: {d}\n", .{value});
+
+    return writer.toOwnedSlice();
+}
+
 fn formatUsageSummaryAlloc(
     allocator: std.mem.Allocator,
     payload: []const u8,
@@ -2758,6 +2816,43 @@ test "formatUsageSummaryAlloc renders concise usage summary" {
     try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-19: 8 M tokens") != null);
 }
 
+test "formatGoalSummaryAlloc renders active goal" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "goal": {
+        \\    "objective": "Ship GUI slash commands",
+        \\    "status": "active",
+        \\    "tokenBudget": 12000
+        \\  }
+        \\}
+    ;
+
+    const body = try formatGoalSummaryAlloc(allocator, json);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Codex goal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Status: active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Objective: Ship GUI slash commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Token budget: 12000") != null);
+}
+
+test "formatGoalSummaryAlloc renders empty goal" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "result": {
+        \\    "goal": null
+        \\  }
+        \\}
+    ;
+
+    const body = try formatGoalSummaryAlloc(allocator, json);
+    defer allocator.free(body);
+
+    try std.testing.expectEqualStrings("Codex goal\n\nNo active Codex goal.", body);
+}
+
 test "formatUsageSummaryAlloc includes remaining rate limits" {
     const allocator = std.testing.allocator;
     const usage_json =
@@ -2850,4 +2945,45 @@ test "detectTurnTerminalState matches turn completion status for the started tur
     const terminal = detectTurnTerminalState(parsed.value, "thread-123", "turn-456");
     try std.testing.expectEqual(TurnTerminalState.failed, terminal.?);
     try std.testing.expectEqual(@as(?TurnTerminalState, null), detectTurnTerminalState(parsed.value, "thread-123", "other-turn"));
+}
+
+test "isContextCompactionCompleted matches compact item completion" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "method": "item/completed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "item": {
+        \\      "id": "item-1",
+        \\      "type": "contextCompaction"
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(isContextCompactionCompleted(parsed.value, "thread-123"));
+    try std.testing.expect(!isContextCompactionCompleted(parsed.value, "other-thread"));
+}
+
+test "isThreadCompactionIdle matches idle fallback" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "method": "thread/status/changed",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "status": { "type": "idle" }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(isThreadCompactionIdle(parsed.value, "thread-123"));
+    try std.testing.expect(!isThreadCompactionIdle(parsed.value, "other-thread"));
 }
