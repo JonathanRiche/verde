@@ -116,6 +116,28 @@ test "parse recognizes provider slash commands and args" {
     try std.testing.expectEqualStrings("complete", parsed.provider.args);
 }
 
+test "parse recognizes codex phase one provider commands" {
+    const compact = parse("/compact", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(compact == .provider);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.compact, compact.provider.command.id);
+    try std.testing.expectEqualStrings("", compact.provider.args);
+
+    const usage = parse("/usage", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(usage == .provider);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.usage, usage.provider.command.id);
+    try std.testing.expectEqualStrings("", usage.provider.args);
+
+    const goal_clear = parse("/goal clear", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(goal_clear == .provider);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.goal, goal_clear.provider.command.id);
+    try std.testing.expectEqualStrings("clear", goal_clear.provider.args);
+
+    const goal_complete = parse("/goal complete", TEST_PROVIDER_COMMANDS[0..]);
+    try std.testing.expect(goal_complete == .provider);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.goal, goal_complete.provider.command.id);
+    try std.testing.expectEqualStrings("complete", goal_complete.provider.args);
+}
+
 test "parse recognizes local slash commands" {
     const parsed = parse("/stack status", TEST_PROVIDER_COMMANDS[0..]);
     try std.testing.expect(parsed == .local);
