@@ -151,31 +151,8 @@ pub const GridPlacement = struct {
 // collapsed column. (Aspect ratio fails on wide displays, where a half-width
 // pane is still landscape and keeps spawning columns.)
 pub fn gridNewPanePlacement(state: *runtime.AppState) ?GridPlacement {
-    if (state.currentProjectWorkspaceMaximizedPaneId() != null) return null;
-    const visible = state.currentProjectWorkspaceVisiblePaneCount();
-    if (visible == 0 or visible >= 4) return null;
-    if (pane_rect_count == 0) return null;
-
-    if (visible == 1) {
-        // First split: side-by-side, regardless of window aspect.
-        return .{ .pane_id = pane_rects[0].pane_id, .axis = .vertical, .new_after = true };
-    }
-
-    // Panes 3 and 4: split the full-height column into top/bottom. The target is
-    // the tallest pane (the not-yet-rowed column), tie-broken to the left-most so
-    // the left column rows before the right (BL before BR).
-    var best: usize = 0;
-    var i: usize = 1;
-    while (i < pane_rect_count) : (i += 1) {
-        const a = pane_rects[i].rect;
-        const b = pane_rects[best].rect;
-        if (a.h > b.h + 0.5) {
-            best = i;
-        } else if (a.h > b.h - 0.5 and a.x < b.x - 0.5) {
-            best = i;
-        }
-    }
-    return .{ .pane_id = pane_rects[best].pane_id, .axis = .horizontal, .new_after = true };
+    const placement = state.currentProjectGridNewPanePlacement() orelse return null;
+    return .{ .pane_id = placement.pane_id, .axis = placement.axis, .new_after = placement.new_after };
 }
 
 pub const FocusDirection = enum { left, right, up, down };

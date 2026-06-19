@@ -14,6 +14,7 @@ const sdl = @import("zsdl3");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
 const sidebar = @import("sidebar.zig");
+const workspace_panes = @import("workspace_panes.zig");
 const native_state = @import("../state.zig");
 const keybinds = @import("../keybinds.zig");
 const Provider = native_state.Provider;
@@ -76,6 +77,8 @@ const KeybindRef = enum {
 const STATIC_COMMANDS = [_]Command{
     .{ .id = "thread.new", .title = "New Chat", .keywords = "thread conversation start", .section = .threads, .keybind = .new_thread, .run = runNewChat, .enabled = hasProjects },
     .{ .id = "thread.sync_current", .title = "Sync Current Thread", .keywords = "refresh provider", .section = .threads, .run = runSyncCurrentThread, .enabled = canSyncCurrentThread },
+    .{ .id = "thread.open_current_codex_tui", .title = "Open Codex TUI for Current Thread", .keywords = "open codex tui current thread terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedCodexThreadInTui },
+    .{ .id = "thread.open_current_tui", .title = "Open Current Thread in TUI", .keywords = "open agent tui current thread opencode claude cursor terminal resume active focused", .section = .threads, .run = runOpenCurrentThreadInTui, .enabled = canOpenFocusedNonCodexThreadInTui },
     .{ .id = "thread.archive_current", .title = "Archive Current Thread", .keywords = "delete remove chat", .section = .threads, .run = runArchiveCurrentThread, .enabled = currentThreadNotPending },
     .{ .id = "thread.import_codex", .title = "Import Codex Thread", .keywords = "resume session", .section = .threads, .run = runImportCodex, .enabled = hasProjects },
     .{ .id = "thread.import_opencode", .title = "Import OpenCode Thread", .keywords = "resume session", .section = .threads, .run = runImportOpencode, .enabled = hasProjects },
@@ -92,7 +95,7 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.archive", .title = "Archive Workspace", .keywords = "remove project", .section = .workspaces, .run = runArchiveWorkspace, .enabled = workspaceNotBusy },
-    .{ .id = "workspace.codex_tui", .title = "Open Codex TUI", .keywords = "agent terminal", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
+    .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
     .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .run = runSettings },
     .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
@@ -185,7 +188,10 @@ pub fn staticCommandInfo(state: *runtime.AppState, index: usize) ?StaticCommandI
 pub fn runStaticCommandById(state: *runtime.AppState, id: []const u8) RunStaticCommandResult {
     for (STATIC_COMMANDS) |command| {
         if (!std.mem.eql(u8, command.id, id)) continue;
-        if (!command.enabled(state)) return .disabled;
+        if (!command.enabled(state)) {
+            state.setSidebarNotice(disabledNoticeForCommand(state, command.id));
+            return .disabled;
+        }
         if (!command.keeps_open) state.closeCommandPalette();
         command.run(state);
         state.markDirty();
@@ -329,7 +335,10 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
         .header => {},
         .command => |ci| {
             const command = STATIC_COMMANDS[ci];
-            if (!command.enabled(state)) return;
+            if (!command.enabled(state)) {
+                state.setSidebarNotice(disabledNoticeForCommand(state, command.id));
+                return;
+            }
             if (!command.keeps_open) state.closeCommandPalette();
             command.run(state);
             state.markDirty();
@@ -930,9 +939,47 @@ fn canSyncCurrentThread(state: *runtime.AppState) bool {
     return thread.provider_thread_id != null and !thread.isSendPendingForUi();
 }
 
+fn canOpenFocusedThreadInTui(state: *runtime.AppState) bool {
+    if (state.selected_project_index >= state.projects.items.len) return false;
+    const thread_index = focusedGuiThreadIndex(state) orelse return false;
+    const project = &state.projects.items[state.selected_project_index];
+    if (thread_index >= project.threads.items.len) return false;
+    const thread = &project.threads.items[thread_index];
+    return thread.provider_thread_id != null;
+}
+
+fn canOpenFocusedCodexThreadInTui(state: *runtime.AppState) bool {
+    return canOpenFocusedThreadInTui(state) and focusedGuiThreadProvider(state) == .codex;
+}
+
+fn canOpenFocusedNonCodexThreadInTui(state: *runtime.AppState) bool {
+    const provider = focusedGuiThreadProvider(state) orelse return false;
+    return provider != .codex and canOpenFocusedThreadInTui(state);
+}
+
+fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8 {
+    if (std.mem.eql(u8, id, "thread.open_current_codex_tui") or std.mem.eql(u8, id, "thread.open_current_tui")) {
+        const thread_index = focusedGuiThreadIndex(state) orelse return "Focus a GUI chat pane before opening a thread in TUI.";
+        if (state.selected_project_index >= state.projects.items.len) return "No workspace selected.";
+        const project = &state.projects.items[state.selected_project_index];
+        if (thread_index >= project.threads.items.len) return "Focused chat thread is unavailable.";
+        const thread = &project.threads.items[thread_index];
+        if (thread.provider_thread_id == null) return "Thread has no provider session id yet.";
+    }
+    return "Command is unavailable right now.";
+}
+
 fn focusedGuiThreadIndex(state: *runtime.AppState) ?usize {
     const pane_id = state.focusedWorkspaceChatPaneId() orelse return null;
     return state.workspaceChatThreadIndexByPane(pane_id);
+}
+
+fn focusedGuiThreadProvider(state: *runtime.AppState) ?Provider {
+    if (state.selected_project_index >= state.projects.items.len) return null;
+    const thread_index = focusedGuiThreadIndex(state) orelse return null;
+    const project = &state.projects.items[state.selected_project_index];
+    if (thread_index >= project.threads.items.len) return null;
+    return project.threads.items[thread_index].provider;
 }
 
 fn runNewChat(state: *runtime.AppState) void {
@@ -943,6 +990,11 @@ fn runNewChat(state: *runtime.AppState) void {
 fn runSyncCurrentThread(state: *runtime.AppState) void {
     const thread_index = focusedGuiThreadIndex(state) orelse return;
     state.syncThreadFromProvider(state.selected_project_index, thread_index);
+}
+
+fn runOpenCurrentThreadInTui(state: *runtime.AppState) void {
+    const thread_index = focusedGuiThreadIndex(state) orelse return;
+    state.openThreadInTui(state.selected_project_index, thread_index);
 }
 
 fn runArchiveCurrentThread(state: *runtime.AppState) void {
@@ -1017,7 +1069,11 @@ fn runArchiveWorkspace(state: *runtime.AppState) void {
 }
 
 fn runOpenCodexTui(state: *runtime.AppState) void {
-    _ = state.openAgentTui(state.selected_project_index, .codex) catch false;
+    if (workspace_panes.gridNewPanePlacement(state)) |placement| {
+        _ = state.openAgentTuiAtPlacement(state.selected_project_index, .codex, placement.pane_id, placement.axis, placement.new_after) catch false;
+        return;
+    }
+    _ = state.openAgentTuiAtPlacement(state.selected_project_index, .codex, null, .horizontal, true) catch false;
 }
 
 fn runHistoryThisWorkspace(state: *runtime.AppState) void {
