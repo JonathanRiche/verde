@@ -15,6 +15,51 @@ const MAX_RPC_RETRIES = 4;
 const MAX_CONNECT_WAIT_ATTEMPTS = 120;
 const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
 
+const CODEX_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
+    .{
+        .id = .usage,
+        .name = "/usage",
+        .summary = "Show Codex account and usage information.",
+        .usage = "/usage",
+        .requires_thread = false,
+    },
+    .{
+        .id = .goal,
+        .name = "/goal",
+        .summary = "View, set, clear, or update the current Codex goal.",
+        .usage = "/goal [status|clear|active|paused|blocked|complete|<objective>]",
+        .requires_thread = true,
+    },
+    .{
+        .id = .compact,
+        .name = "/compact",
+        .summary = "Compact the current Codex thread context.",
+        .usage = "/compact",
+        .requires_thread = true,
+    },
+    .{
+        .id = .review,
+        .name = "/review",
+        .summary = "Start a Codex code review after ReviewTarget support is confirmed.",
+        .usage = "/review",
+        .requires_thread = true,
+        .availability = .disabled,
+    },
+    .{
+        .id = .shell,
+        .name = "/shell",
+        .summary = "Run a shell command after explicit confirmation is implemented.",
+        .usage = "/shell <command>",
+        .requires_thread = true,
+        .destructive_or_sensitive = true,
+        .availability = .disabled,
+    },
+};
+
+pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
+    return CODEX_SLASH_COMMANDS[0..];
+}
+
 fn sleepMs(ms: u64) void {
     const request: std.c.timespec = .{
         .sec = @intCast(ms / 1000),
@@ -261,6 +306,145 @@ pub const Client = struct {
         return .{
             .thread_id = thread_id,
             .reply_text = reply,
+        };
+    }
+
+    pub fn slashCommands(self: *Client) []const provider_types.ProviderSlashCommand {
+        _ = self;
+        return providerSlashCommands();
+    }
+
+    pub fn runSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        return switch (request.command) {
+            .usage => self.runUsageSlashCommand(allocator),
+            .goal => self.runGoalSlashCommand(allocator, request),
+            .compact => self.runCompactSlashCommand(allocator, request),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    fn runUsageSlashCommand(self: *Client, allocator: std.mem.Allocator) !provider_types.RunSlashCommandResult {
+        try self.ensureConnected();
+
+        const payload = try self.callRpcForResultAlloc("account/usage/read", @as(?u8, null));
+        defer self.allocator.free(payload);
+        const maybe_rate_payload = self.callRpcForResultAlloc("account/rateLimits/read", @as(?u8, null)) catch |err| blk: {
+            runtime_log.diagnostic("codex.runUsageSlashCommand rate limits unavailable: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        defer if (maybe_rate_payload) |rate_payload| self.allocator.free(rate_payload);
+
+        return self.slashUsageResultAlloc(allocator, payload, maybe_rate_payload) catch |err| switch (err) {
+            // If Codex changes the shape, keep the command useful instead of
+            // failing the GUI action just because the prettier formatter broke.
+            error.InvalidUsagePayload => self.slashJsonResultAlloc(allocator, "Usage", "Codex usage loaded.", payload),
+            else => return err,
+        };
+    }
+
+    fn runGoalSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        const thread_id = request.thread_id orelse return error.MissingThreadId;
+        try self.ensureConnected();
+        try self.ensureThreadLoaded(thread_id);
+
+        const args = std.mem.trim(u8, request.args, " \t\r\n");
+        if (args.len == 0 or std.mem.eql(u8, args, "status")) {
+            const payload = try self.callRpcForResultAlloc("thread/goal/get", .{ .threadId = thread_id });
+            defer self.allocator.free(payload);
+            return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal loaded.", payload);
+        }
+
+        if (std.mem.eql(u8, args, "clear")) {
+            const payload = try self.callRpcForResultAlloc("thread/goal/clear", .{ .threadId = thread_id });
+            defer self.allocator.free(payload);
+            return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal cleared.", payload);
+        }
+
+        if (isGoalStatus(args)) {
+            const payload = try self.callRpcForResultAlloc("thread/goal/set", .{
+                .threadId = thread_id,
+                .status = args,
+            });
+            defer self.allocator.free(payload);
+
+            const notice = try std.fmt.allocPrint(allocator, "Codex goal marked {s}.", .{args});
+            defer allocator.free(notice);
+            return self.slashJsonResultAlloc(allocator, "Goal", notice, payload);
+        }
+
+        const payload = try self.callRpcForResultAlloc("thread/goal/set", .{
+            .threadId = thread_id,
+            .objective = args,
+        });
+        defer self.allocator.free(payload);
+        return self.slashJsonResultAlloc(allocator, "Goal", "Codex goal updated.", payload);
+    }
+
+    fn runCompactSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        const thread_id = request.thread_id orelse return error.MissingThreadId;
+        try self.ensureConnected();
+        try self.ensureThreadLoaded(thread_id);
+
+        const payload = try self.callRpcForResultAlloc("thread/compact/start", .{ .threadId = thread_id });
+        defer self.allocator.free(payload);
+        return self.slashJsonResultAlloc(allocator, "Codex command", "Compacted thread context.", payload);
+    }
+
+    fn slashJsonResultAlloc(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        title: []const u8,
+        notice: []const u8,
+        payload: []const u8,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+        const owned_notice = try allocator.dupe(u8, notice);
+        errdefer allocator.free(owned_notice);
+        const owned_title = try allocator.dupe(u8, title);
+        errdefer allocator.free(owned_title);
+        const body = try std.fmt.allocPrint(allocator, "```json\n{s}\n```", .{payload});
+        errdefer allocator.free(body);
+
+        return .{
+            .handled = true,
+            .notice = owned_notice,
+            .transcript_title = owned_title,
+            .transcript_body = body,
+        };
+    }
+
+    fn slashUsageResultAlloc(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        maybe_rate_payload: ?[]const u8,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+
+        const body = try formatUsageSummaryAlloc(allocator, payload, maybe_rate_payload);
+        errdefer allocator.free(body);
+        const owned_notice = try allocator.dupe(u8, "Codex usage loaded.");
+        errdefer allocator.free(owned_notice);
+        const owned_title = try allocator.dupe(u8, "Usage");
+        errdefer allocator.free(owned_title);
+
+        return .{
+            .handled = true,
+            .notice = owned_notice,
+            .transcript_title = owned_title,
+            .transcript_body = body,
         };
     }
 
@@ -1330,6 +1514,221 @@ fn getOptionalObjectInteger(value: std.json.Value, field: []const u8) ?i64 {
     };
 }
 
+fn getOptionalObjectBool(value: std.json.Value, field: []const u8) ?bool {
+    const field_value = getObjectField(value, field) orelse return null;
+    return switch (field_value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn isGoalStatus(args: []const u8) bool {
+    return std.mem.eql(u8, args, "active") or
+        std.mem.eql(u8, args, "paused") or
+        std.mem.eql(u8, args, "blocked") or
+        std.mem.eql(u8, args, "complete");
+}
+
+fn formatUsageSummaryAlloc(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    maybe_rate_payload: ?[]const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return error.InvalidUsagePayload;
+    defer parsed.deinit();
+
+    const root = getObjectField(parsed.value, "result") orelse parsed.value;
+    const summary = getObjectField(root, "summary") orelse return error.InvalidUsagePayload;
+    const buckets = getObjectField(root, "dailyUsageBuckets");
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+
+    try writer.writer.print("Codex usage\n\n", .{});
+    if (maybe_rate_payload) |rate_payload| {
+        try appendRateLimitsSummary(allocator, &writer.writer, rate_payload);
+    }
+
+    try writer.writer.print("Summary\n", .{});
+    if (getOptionalObjectInteger(summary, "lifetimeTokens")) |tokens| {
+        try writer.writer.print("• Lifetime tokens: ", .{});
+        try writeTokenCount(&writer.writer, tokens);
+        try writer.writer.print("\n", .{});
+    }
+    if (getOptionalObjectInteger(summary, "peakDailyTokens")) |tokens| {
+        try writer.writer.print("• Peak day: ", .{});
+        try writeTokenCount(&writer.writer, tokens);
+        if (peakUsageDate(buckets, tokens)) |date| try writer.writer.print(" on {s}", .{date});
+        try writer.writer.print("\n", .{});
+    }
+    if (getOptionalObjectInteger(summary, "currentStreakDays")) |current| {
+        try writer.writer.print("• Current streak: {d} day{s}", .{ current, pluralSuffix(current) });
+        if (getOptionalObjectInteger(summary, "longestStreakDays")) |longest| {
+            try writer.writer.print(" (longest {d})", .{longest});
+        }
+        try writer.writer.print("\n", .{});
+    }
+    if (getOptionalObjectInteger(summary, "longestRunningTurnSec")) |seconds| {
+        try writer.writer.print("• Longest turn: ", .{});
+        try writeDuration(&writer.writer, seconds);
+        try writer.writer.print("\n", .{});
+    }
+
+    if (buckets) |daily| {
+        try appendRecentUsageBuckets(&writer.writer, daily, 7);
+    }
+
+    return writer.toOwnedSlice();
+}
+
+fn appendRateLimitsSummary(allocator: std.mem.Allocator, writer: anytype, payload: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return;
+    defer parsed.deinit();
+
+    const root = getObjectField(parsed.value, "result") orelse parsed.value;
+    var wrote_header = false;
+    if (getObjectField(root, "rateLimits")) |limits| {
+        try appendRateLimitBlock(writer, limits, &wrote_header);
+    }
+    if (getObjectField(root, "rateLimitsByLimitId")) |by_id| {
+        if (by_id == .object) {
+            var it = by_id.object.iterator();
+            while (it.next()) |entry| {
+                const limits = entry.value_ptr.*;
+                if (isDefaultCodexLimit(limits)) continue;
+                try appendRateLimitBlock(writer, limits, &wrote_header);
+            }
+        }
+    }
+    if (getObjectField(root, "rateLimitResetCredits")) |credits| {
+        if (getOptionalObjectInteger(credits, "availableCount")) |count| {
+            if (!wrote_header) {
+                try writer.print("Limits\n", .{});
+                wrote_header = true;
+            }
+            try writer.print("• Reset credits: {d} available\n", .{count});
+        }
+    }
+    if (wrote_header) try writer.print("\n", .{});
+}
+
+fn appendRateLimitBlock(writer: anytype, limits: std.json.Value, wrote_header: *bool) !void {
+    const label = getOptionalObjectString(limits, "limitName") orelse "Codex";
+    if (!wrote_header.*) {
+        try writer.print("Limits\n", .{});
+        wrote_header.* = true;
+    }
+
+    if (getObjectField(limits, "primary")) |primary| {
+        try appendWindowLimit(writer, label, "5h", primary);
+    }
+    if (getObjectField(limits, "secondary")) |secondary| {
+        try appendWindowLimit(writer, label, "weekly", secondary);
+    }
+    if (getObjectField(limits, "credits")) |credits| {
+        if (getOptionalObjectBool(credits, "unlimited") == true) {
+            try writer.print("• {s} credits: unlimited\n", .{label});
+        } else if (getOptionalObjectString(credits, "balance")) |balance| {
+            if (getOptionalObjectBool(credits, "hasCredits") == true) {
+                try writer.print("• {s} credits: {s}\n", .{ label, balance });
+            }
+        }
+    }
+}
+
+fn appendWindowLimit(writer: anytype, label: []const u8, window_label: []const u8, window: std.json.Value) !void {
+    const used_percent = getOptionalObjectInteger(window, "usedPercent") orelse return;
+    const left = @max(@as(i64, 0), 100 - @min(@as(i64, 100), @max(@as(i64, 0), used_percent)));
+    try writer.print("• {s} {s}: {d}% left", .{ label, window_label, left });
+    if (getOptionalObjectInteger(window, "resetsAt")) |resets_at| {
+        try writer.print(" (resets ", .{});
+        try writeResetTime(writer, resets_at);
+        try writer.print(")", .{});
+    }
+    try writer.print("\n", .{});
+}
+
+fn isDefaultCodexLimit(limits: std.json.Value) bool {
+    const id = getOptionalObjectString(limits, "limitId") orelse return false;
+    return std.mem.eql(u8, id, "codex");
+}
+
+fn appendRecentUsageBuckets(writer: anytype, buckets: std.json.Value, max_rows: usize) !void {
+    if (buckets != .array or buckets.array.items.len == 0) return;
+
+    try writer.print("\nRecent daily usage\n", .{});
+    const start = if (buckets.array.items.len > max_rows) buckets.array.items.len - max_rows else 0;
+    for (buckets.array.items[start..]) |bucket| {
+        const date = getOptionalObjectString(bucket, "startDate") orelse continue;
+        const tokens = getOptionalObjectInteger(bucket, "tokens") orelse continue;
+        try writer.print("• {s}: ", .{date});
+        try writeTokenCount(writer, tokens);
+        try writer.print("\n", .{});
+    }
+}
+
+fn peakUsageDate(maybe_buckets: ?std.json.Value, peak_tokens: i64) ?[]const u8 {
+    const buckets = maybe_buckets orelse return null;
+    if (buckets != .array) return null;
+    for (buckets.array.items) |bucket| {
+        const tokens = getOptionalObjectInteger(bucket, "tokens") orelse continue;
+        if (tokens == peak_tokens) return getOptionalObjectString(bucket, "startDate");
+    }
+    return null;
+}
+
+fn writeTokenCount(writer: anytype, tokens: i64) !void {
+    const value: u64 = if (tokens <= 0) 0 else @intCast(tokens);
+    if (value >= 1_000_000_000) return writeFixedOne(writer, value, 1_000_000_000, "B tokens");
+    if (value >= 1_000_000) return writeFixedOne(writer, value, 1_000_000, "M tokens");
+    if (value >= 1_000) return writeFixedOne(writer, value, 1_000, "K tokens");
+    try writer.print("{d} tokens", .{value});
+}
+
+fn writeFixedOne(writer: anytype, value: u64, scale: u64, suffix: []const u8) !void {
+    const whole = value / scale;
+    const fraction = (value % scale) * 10 / scale;
+    if (fraction == 0) {
+        try writer.print("{d} {s}", .{ whole, suffix });
+    } else {
+        try writer.print("{d}.{d} {s}", .{ whole, fraction, suffix });
+    }
+}
+
+fn writeDuration(writer: anytype, seconds: i64) !void {
+    const value: u64 = if (seconds <= 0) 0 else @intCast(seconds);
+    const hours = value / 3600;
+    const minutes = (value % 3600) / 60;
+    if (hours > 0) {
+        try writer.print("{d}h {d}m", .{ hours, minutes });
+    } else if (minutes > 0) {
+        try writer.print("{d}m", .{minutes});
+    } else {
+        try writer.print("{d}s", .{value});
+    }
+}
+
+fn writeResetTime(writer: anytype, resets_at: i64) !void {
+    const now = unixTimestampSeconds();
+    if (now <= 0 or resets_at <= now) {
+        try writer.print("soon", .{});
+        return;
+    }
+
+    try writer.print("in ", .{});
+    try writeDuration(writer, resets_at - now);
+}
+
+fn unixTimestampSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
+
+fn pluralSuffix(count: i64) []const u8 {
+    return if (count == 1) "" else "s";
+}
+
 fn appendImportedMessagesForItem(
     allocator: std.mem.Allocator,
     item: std.json.Value,
@@ -2076,6 +2475,85 @@ test "appendImportedMessagesForItem maps transcript items into chat messages" {
     try std.testing.expectEqualStrings("git status", messages.items[2].body);
     try std.testing.expectEqualStrings("Changed files", messages.items[3].author);
     try std.testing.expectEqualStrings("src/main.zig  +1 / -1", messages.items[3].body);
+}
+
+test "formatUsageSummaryAlloc renders concise usage summary" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "summary": {
+        \\    "lifetimeTokens": 9827869446,
+        \\    "peakDailyTokens": 680466423,
+        \\    "longestRunningTurnSec": 72844,
+        \\    "currentStreakDays": 5,
+        \\    "longestStreakDays": 49
+        \\  },
+        \\  "dailyUsageBuckets": [
+        \\    { "startDate": "2026-06-12", "tokens": 1000 },
+        \\    { "startDate": "2026-06-13", "tokens": 2000000 },
+        \\    { "startDate": "2026-06-14", "tokens": 3000000 },
+        \\    { "startDate": "2026-06-15", "tokens": 4000000 },
+        \\    { "startDate": "2026-06-16", "tokens": 5000000 },
+        \\    { "startDate": "2026-06-17", "tokens": 680466423 },
+        \\    { "startDate": "2026-06-18", "tokens": 7000000 },
+        \\    { "startDate": "2026-06-19", "tokens": 8000000 }
+        \\  ]
+        \\}
+    ;
+
+    const body = try formatUsageSummaryAlloc(allocator, json, null);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Lifetime tokens: 9.8 B tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Peak day: 680.4 M tokens on 2026-06-17") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Current streak: 5 days (longest 49)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Longest turn: 20h 14m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-12") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "2026-06-19: 8 M tokens") != null);
+}
+
+test "formatUsageSummaryAlloc includes remaining rate limits" {
+    const allocator = std.testing.allocator;
+    const usage_json =
+        \\{
+        \\  "summary": { "lifetimeTokens": 1000 },
+        \\  "dailyUsageBuckets": []
+        \\}
+    ;
+    const rate_json =
+        \\{
+        \\  "rateLimits": {
+        \\    "limitId": "codex",
+        \\    "limitName": null,
+        \\    "primary": { "usedPercent": 10, "windowDurationMins": 300 },
+        \\    "secondary": { "usedPercent": 2, "windowDurationMins": 10080 },
+        \\    "credits": { "hasCredits": false, "unlimited": false, "balance": "0" }
+        \\  },
+        \\  "rateLimitsByLimitId": {
+        \\    "codex_bengalfox": {
+        \\      "limitId": "codex_bengalfox",
+        \\      "limitName": "GPT-5.3-Codex-Spark",
+        \\      "primary": { "usedPercent": 0, "windowDurationMins": 300 },
+        \\      "secondary": { "usedPercent": 0, "windowDurationMins": 10080 }
+        \\    },
+        \\    "codex": {
+        \\      "limitId": "codex",
+        \\      "limitName": null,
+        \\      "primary": { "usedPercent": 10, "windowDurationMins": 300 },
+        \\      "secondary": { "usedPercent": 2, "windowDurationMins": 10080 }
+        \\    }
+        \\  },
+        \\  "rateLimitResetCredits": { "availableCount": 2 }
+        \\}
+    ;
+
+    const body = try formatUsageSummaryAlloc(allocator, usage_json, rate_json);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Codex 5h: 90% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Codex weekly: 98% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "GPT-5.3-Codex-Spark 5h: 100% left") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Reset credits: 2 available") != null);
 }
 
 test "shouldAutoApproveRequest follows approval policy" {

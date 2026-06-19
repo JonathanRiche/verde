@@ -18,6 +18,7 @@ const workspace_panes = @import("workspace_panes.zig");
 const native_state = @import("../state.zig");
 const keybinds = @import("../keybinds.zig");
 const Provider = native_state.Provider;
+const AgentProvider = native_state.AgentTuiProvider;
 
 const log = std.log.scoped(.native_ui_command_palette);
 
@@ -95,7 +96,11 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
     .{ .id = "workspace.archive", .title = "Archive Workspace", .keywords = "remove project", .section = .workspaces, .run = runArchiveWorkspace, .enabled = workspaceNotBusy },
-    .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
+    .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh openai", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
+    .{ .id = "workspace.claude_tui", .title = "Start New Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
+    .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
+    .{ .id = "workspace.cursor_tui", .title = "Start New Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
+    .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
     .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .run = runSettings },
     .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
@@ -1069,11 +1074,31 @@ fn runArchiveWorkspace(state: *runtime.AppState) void {
 }
 
 fn runOpenCodexTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .codex);
+}
+
+fn runOpenClaudeTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .claude);
+}
+
+fn runOpenOpencodeTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .opencode);
+}
+
+fn runOpenCursorTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .cursor);
+}
+
+fn runOpenAmpTui(state: *runtime.AppState) void {
+    runOpenAgentTui(state, .amp);
+}
+
+fn runOpenAgentTui(state: *runtime.AppState, provider: AgentProvider) void {
     if (workspace_panes.gridNewPanePlacement(state)) |placement| {
-        _ = state.openAgentTuiAtPlacement(state.selected_project_index, .codex, placement.pane_id, placement.axis, placement.new_after) catch false;
+        _ = state.openAgentTuiAtPlacement(state.selected_project_index, provider, placement.pane_id, placement.axis, placement.new_after) catch false;
         return;
     }
-    _ = state.openAgentTuiAtPlacement(state.selected_project_index, .codex, null, .horizontal, true) catch false;
+    _ = state.openAgentTuiAtPlacement(state.selected_project_index, provider, null, .horizontal, true) catch false;
 }
 
 fn runHistoryThisWorkspace(state: *runtime.AppState) void {
