@@ -1559,6 +1559,7 @@ const SlashCommandState = struct {
     worker: ?std.Thread = null,
     project_index: usize = 0,
     thread_index: usize = 0,
+    command: ai_harness.ProviderSlashCommandId = .usage,
     result: ?ai_harness.RunSlashCommandResult = null,
     error_message: ?[]u8 = null,
 };
@@ -10783,6 +10784,7 @@ pub const AppState = struct {
         }
         self.slash_command_state.project_index = project_index;
         self.slash_command_state.thread_index = thread_index;
+        self.slash_command_state.command = command.id;
         self.slash_command_state.status = .pending;
         self.slash_command_state.worker = std.Thread.spawn(.{}, slashCommandWorker, .{ &self.slash_command_state, request }) catch |err| {
             self.slash_command_state.status = .idle;
@@ -13294,6 +13296,25 @@ pub const AppState = struct {
         }
 
         return next_status != .idle;
+    }
+
+    pub fn currentThreadPendingSlashCommandLabel(self: *AppState) ?[]const u8 {
+        if (self.projects.items.len == 0) return null;
+        const project_index = self.selected_project_index;
+        const thread_index = self.currentProject().selected_thread_index;
+
+        self.slash_command_state.mutex.lock();
+        defer self.slash_command_state.mutex.unlock();
+        if (self.slash_command_state.status != .pending) return null;
+        if (self.slash_command_state.project_index != project_index or self.slash_command_state.thread_index != thread_index) return null;
+
+        return switch (self.slash_command_state.command) {
+            .usage => "Loading Codex usage...",
+            .goal => "Updating Codex goal...",
+            .compact => "Compacting thread context...",
+            .review => "Starting Codex review...",
+            .shell => "Running Codex shell command...",
+        };
     }
 
     fn applySlashCommandResult(

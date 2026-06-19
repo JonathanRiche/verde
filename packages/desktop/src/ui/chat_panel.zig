@@ -1645,7 +1645,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     const thread = state.currentThread();
 
-    if (thread.messages.items.len == 0 and !thread.isSendPendingForUi()) {
+    if (thread.messages.items.len == 0 and !thread.isSendPendingForUi() and state.currentThreadPendingSlashCommandLabel() == null) {
         state.transcript_palette_scroll_y = 0.0;
         rememberTranscriptScroll(state, pane_id, 0.0);
         appendTranscriptHit(.{ .pane_id = pane_id, .rect = rect });
@@ -1656,7 +1656,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
 
     const content_height = transcriptContentHeight(state, thread, column.w);
     const max_scroll = @max(0.0, content_height - column.h);
-    const has_pending_stream = state.hasPendingStream();
+    const has_pending_stream = state.hasPendingStream() or state.currentThreadPendingSlashCommandLabel() != null;
 
     var scroll_y = snapTranscriptScrollY(currentTranscriptScrollY(state, pane_id) orelse max_scroll, max_scroll);
 
@@ -1705,6 +1705,7 @@ fn renderTranscript(state: *app_state.AppState, rect: palette.Rect, pane_id: ?ap
         content_y += item_h + theme.scaledUi(12.0);
     }
 
+    content_y = renderPendingSlashCommand(state, column, content_y, clip);
     renderPendingTranscriptStream(state, thread, column, content_y, clip, thread.messages.items.len);
 
     if (max_scroll > 1.0) {
@@ -1756,8 +1757,54 @@ fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f
         if (message.role == .system and shouldHideCursorLifecycleSystemEvent(message.author, message.body)) continue;
         total += transcriptCommittedMessageHeight(state, message_index, message, width) + theme.scaledUi(12.0);
     }
+    total += transcriptPendingSlashCommandHeight(state, width);
     total += transcriptPendingStreamHeight(state, thread, width);
     return total;
+}
+
+fn transcriptPendingSlashCommandHeight(state: *app_state.AppState, column_width: f32) f32 {
+    _ = column_width;
+    if (state.currentThreadPendingSlashCommandLabel() == null) return 0;
+    return theme.scaledUi(52.0) + theme.scaledUi(12.0);
+}
+
+/// Renders a transient in-flight slash-command row after committed transcript messages.
+fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, content_y: f32, clip: palette.Rect) f32 {
+    const label = state.currentThreadPendingSlashCommandLabel() orelse return content_y;
+    const height = theme.scaledUi(52.0);
+    if (content_y + height >= column.y and content_y <= column.y + column.h) {
+        const bubble = snapRect(palette.Rect{ .x = column.x, .y = content_y, .w = column.w, .h = height });
+        queueRoundedShellClipped(
+            state,
+            bubble,
+            paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)),
+            paletteColor(theme.withAlpha(theme.COLOR_GREEN, 150)),
+            transcriptBubbleCornerRadius(),
+            clip,
+        );
+
+        const pad_x = theme.scaledUi(14.0);
+        const dot = theme.scaledUi(8.0);
+        queueRounded(state, .{
+            .x = bubble.x + pad_x,
+            .y = bubble.y + (bubble.h - dot) * 0.5,
+            .w = dot,
+            .h = dot,
+        }, paletteColor(theme.COLOR_GREEN), dot * 0.5);
+        queueChromeLabel(state, .{
+            .x = bubble.x + pad_x + dot + theme.scaledUi(10.0),
+            .y = bubble.y + theme.scaledUi(9.0),
+            .w = bubble.w - pad_x * 2.0 - dot - theme.scaledUi(10.0),
+            .h = theme.scaledUi(18.0),
+        }, "Codex command", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+        queueText(state, .{
+            .x = bubble.x + pad_x + dot + theme.scaledUi(10.0),
+            .y = bubble.y + theme.scaledUi(28.0),
+            .w = bubble.w - pad_x * 2.0 - dot - theme.scaledUi(10.0),
+            .h = theme.scaledUi(18.0),
+        }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+    }
+    return content_y + height + theme.scaledUi(12.0);
 }
 
 fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_state.ChatThread, column_width: f32) f32 {

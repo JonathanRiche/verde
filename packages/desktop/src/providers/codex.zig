@@ -399,7 +399,36 @@ pub const Client = struct {
 
         const payload = try self.callRpcForResultAlloc("thread/compact/start", .{ .threadId = thread_id });
         defer self.allocator.free(payload);
-        return self.slashJsonResultAlloc(allocator, "Codex command", "Compacted thread context.", payload);
+
+        return self.slashTextResultAlloc(
+            allocator,
+            "Compact",
+            "Compacted thread context.",
+            "Thread context compacted.\n\nFuture Codex turns will continue from the compacted conversation summary.",
+        );
+    }
+
+    fn slashTextResultAlloc(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        title: []const u8,
+        notice: []const u8,
+        body_text: []const u8,
+    ) !provider_types.RunSlashCommandResult {
+        _ = self;
+        const owned_notice = try allocator.dupe(u8, notice);
+        errdefer allocator.free(owned_notice);
+        const owned_title = try allocator.dupe(u8, title);
+        errdefer allocator.free(owned_title);
+        const body = try allocator.dupe(u8, body_text);
+        errdefer allocator.free(body);
+
+        return .{
+            .handled = true,
+            .notice = owned_notice,
+            .transcript_title = owned_title,
+            .transcript_body = body,
+        };
     }
 
     fn slashJsonResultAlloc(
