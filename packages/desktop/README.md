@@ -82,6 +82,7 @@ Keep the CEF SDK in a persistent directory such as `$HOME/.cache/verde/cef-sdk`;
 
 The desktop shell includes embedded terminal panes powered by Ghostty's `libghostty-vt`.
 
+- Open the command palette with `Ctrl+P` to search threads, jump to panes, switch workspaces, or run an app command.
 - Create a terminal pane with `CommandOrControl+Shift+T`.
 - Move between workspace panes with `Alt+Arrow` or `Ctrl+H/J/K/L`.
 - It starts in the selected project's directory.
