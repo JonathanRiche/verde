@@ -3114,8 +3114,8 @@ fn renderInactiveComposer(state: *app_state.AppState, rect: palette.Rect) void {
     queuePanel(
         state,
         rect,
-        paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 185)),
-        paletteColor(theme.withAlpha(theme.borderMuted(), 185)),
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)),
+        paletteColor(theme.COLOR_PANEL_MUTED),
         radius,
         @max(theme.scaledUi(1.0), 1.0),
     );
@@ -3127,7 +3127,10 @@ fn renderInactiveComposer(state: *app_state.AppState, rect: palette.Rect) void {
         draft[0..newline]
     else
         draft;
-    const color = if (draft.len == 0) paletteColor(theme.COLOR_TEXT_MUTED) else paletteColor(theme.COLOR_WHITE);
+    const color = if (draft.len == 0)
+        paletteColor(theme.withAlpha(theme.COLOR_TEXT_SUBTLE, 220))
+    else
+        paletteColor(theme.COLOR_WHITE);
     const pad = theme.scaledUi(18.0);
     const toolbar_h = theme.scaledUi(42.0);
     queueText(state, .{
@@ -3179,7 +3182,7 @@ fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect)
                 .w = theme.scaledUi(19.0),
                 .h = theme.scaledUi(19.0),
             });
-            const icon_color = paletteColor(theme.withAlpha(theme.COLOR_WHITE, 165));
+            const icon_color = paletteColor(theme.COLOR_TEXT_MUTED);
             if (thread.fast_mode == .on) {
                 drawBoltIcon(state, icon_rect, icon_color);
             } else {
@@ -3199,7 +3202,7 @@ fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect)
             .y = pill.y + (pill.h - theme.scaledUi(19.0)) * 0.5,
             .w = theme.scaledUi(19.0),
             .h = theme.scaledUi(19.0),
-        }), paletteColor(theme.withAlpha(theme.COLOR_WHITE, 165)));
+        }), paletteColor(theme.COLOR_TEXT_MUTED));
     }
 }
 
@@ -3210,14 +3213,14 @@ fn inactiveComposerPillWidth(label: []const u8, has_icon: bool) f32 {
 
 // Renders a muted toolbar pill for the inactive composer preview.
 fn renderInactiveComposerPill(state: *app_state.AppState, rect: palette.Rect, label: []const u8, has_icon: bool) void {
-    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 135)), rect.h * 0.5);
+    queueRounded(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 86)), rect.h * 0.5);
     const text_x = rect.x + theme.scaledUi(if (has_icon) 43.0 else 13.0);
     queueChromeLabel(state, .{
         .x = text_x,
         .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
         .w = @max(rect.x + rect.w - text_x - theme.scaledUi(10.0), theme.scaledUi(1.0)),
         .h = theme.scaledUi(16.0),
-    }, label, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 185)), theme.scaledUi(12.5), rect);
+    }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.5), rect);
 }
 
 // Renders the provider mark inside the inactive composer model pill.
@@ -3268,14 +3271,44 @@ fn renderInactiveComposerSubmit(state: *app_state.AppState, rect: palette.Rect) 
         };
         queueRounded(state, stop, paletteColor(theme.withAlpha(theme.background(), 230)), theme.scaledUi(2.0));
     } else {
-        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 120)), size * 0.5);
-        queueText(state, .{
-            .x = button.x + size * 0.31,
-            .y = button.y + size * 0.12,
-            .w = size * 0.5,
-            .h = size * 0.7,
-        }, "↑", paletteColor(theme.withAlpha(theme.COLOR_WHITE, 190)), theme.scaledUi(16.0), button);
+        // This preview is read-only; keep the send affordance disabled so it
+        // does not imply that clicks/keystrokes will be handled by this pane.
+        queueRounded(state, button, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 122)), size * 0.5);
+        drawInactiveComposerSendArrow(state, button, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 135)));
     }
+}
+
+// Draws the same submit-arrow shape as PaletteComposerPrompt without depending on a font glyph.
+fn drawInactiveComposerSendArrow(state: *app_state.AppState, button: palette.Rect, color: palette.Color) void {
+    const m_button = @min(button.w, button.h);
+    const inset = m_button * 0.125;
+    const inner = snapRect(.{
+        .x = button.x + inset,
+        .y = button.y + inset,
+        .w = @max(button.w - 2.0 * inset, 1.0),
+        .h = @max(button.h - 2.0 * inset, 1.0),
+    });
+    const m = @min(inner.w, inner.h);
+    const cx = inner.x + inner.w * 0.5;
+    const total_h = m * 0.56;
+    const head_h = total_h * 0.52;
+    const stem_h = total_h * 0.48;
+    const half_w_head = m * 0.175;
+    const half_w_stem = @max(m * 0.052, 1.25);
+    const y0 = inner.y + (inner.h - total_h) * 0.5;
+    queueRect(state, .{
+        .x = cx - half_w_stem,
+        .y = y0 + head_h,
+        .w = half_w_stem * 2.0,
+        .h = stem_h,
+    }, color);
+    queueTriangle(
+        state,
+        .{ .x = @round(cx), .y = @round(y0) },
+        .{ .x = @round(cx - half_w_head), .y = @round(y0 + head_h) },
+        .{ .x = @round(cx + half_w_head), .y = @round(y0 + head_h) },
+        color,
+    );
 }
 
 fn renderComposerFileSearchResults(state: *app_state.AppState) void {
