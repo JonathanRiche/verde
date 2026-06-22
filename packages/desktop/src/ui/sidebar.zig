@@ -880,8 +880,10 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         addPaletteHit(avatar_rect, .workspace_avatar, project_index, 0);
         y += avatar + theme.scaledUi(5.0);
 
-        // Composition dots: one per open (non-minimized) pane, colored by kind.
-        renderCollapsedCompositionDots(state, project, avatar_rect.x + avatar * 0.5, y);
+        // Composition dots: one per open (non-minimized) pane. The selected
+        // pane uses the active color; status colors temporarily take over when
+        // a pane has live work or needs attention.
+        renderCollapsedCompositionDots(state, project_index, project, avatar_rect.x + avatar * 0.5, y);
         y += theme.scaledUi(11.0);
     }
 
@@ -932,9 +934,15 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
     return null;
 }
 
-/// Draws a centered row of small dots — one per open pane, colored by kind —
-/// beneath a collapsed workspace avatar.
-fn renderCollapsedCompositionDots(state: *runtime.AppState, project: *const native_state.Project, center_x: f32, y: f32) void {
+/// Draws a centered row of small dots — one per open pane — beneath a collapsed
+/// workspace avatar, using stable active/inactive colors plus live status pulses.
+fn renderCollapsedCompositionDots(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    center_x: f32,
+    y: f32,
+) void {
     const max_dots = 4;
     var count: usize = 0;
     for (project.workspace_layout.panes.items) |pane| {
@@ -951,15 +959,59 @@ fn renderCollapsedCompositionDots(state: *runtime.AppState, project: *const nati
     for (project.workspace_layout.panes.items) |pane| {
         if (pane.minimized) continue;
         if (drawn >= max_dots) break;
-        const color = switch (pane.ref) {
-            .chat => theme.COLOR_SECONDARY_GREEN,
-            .terminal => theme.COLOR_TEXT_MUTED,
-            .browser => theme.COLOR_GREEN,
-        };
-        queuePaletteRoundedRect(state, .{ .x = dx, .y = y, .w = dot, .h = dot }, paletteColor(color), dot * 0.5);
+        const selected_pane = state.selected_project_index == project_index and
+            project.workspace_layout.focused_pane_id != null and
+            project.workspace_layout.focused_pane_id.? == pane.id;
+        const indicator = collapsedPaneIndicator(state, project_index, project, &pane, selected_pane);
+        const alpha: u8 = @intFromFloat(indicator.opacity * 255.0);
+        queuePaletteRoundedRect(state, .{ .x = dx, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(indicator.color, alpha)), dot * 0.5);
         dx += dot + gap;
         drawn += 1;
     }
+}
+
+const CollapsedPaneIndicator = struct {
+    color: [4]f32,
+    opacity: f32 = 1.0,
+};
+
+/// Returns the collapsed-rail dot color for a pane. Status colors intentionally
+/// share the expanded row pip mapping, while quiet panes fall back to one active
+/// color and one inactive color so pane kind no longer changes dot semantics.
+fn collapsedPaneIndicator(
+    state: *runtime.AppState,
+    project_index: usize,
+    project: *const native_state.Project,
+    pane: *const native_state.WorkspacePane,
+    selected_pane: bool,
+) CollapsedPaneIndicator {
+    var running = false;
+    var status: ?native_state.SurfaceStatus = null;
+    switch (pane.ref) {
+        .chat => |ref| {
+            if (ref.thread_index < project.threads.items.len) {
+                running = project.threads.items[ref.thread_index].isSendPendingForUi();
+            }
+        },
+        .terminal => |ref| {
+            if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
+                status = surface.status;
+                running = surface.status == .working;
+            }
+        },
+        .browser => {},
+    }
+    const show_status_color = !(selected_pane and status != null and status.? == .done);
+    if (show_status_color) {
+        if (paneStatusColor(status, running)) |status_color| {
+            const animated = running or (if (status) |s| s == .waiting else false);
+            return .{
+                .color = status_color,
+                .opacity = if (animated) attentionPulse(state) else 1.0,
+            };
+        }
+    }
+    return .{ .color = if (selected_pane) theme.COLOR_SECONDARY_GREEN else theme.COLOR_TEXT_SUBTLE };
 }
 
 fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette.Color) void {
