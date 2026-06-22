@@ -362,7 +362,7 @@ export function renderLlmsIndex(): string {
     '',
     `> Verde is a native desktop workspace for coding agents. It runs Codex,`,
     `> Claude Code, OpenCode, and Cursor side by side in one tiling window, with`,
-    `> an embedded browser pane, a project-scoped terminal dock, a Ctrl+P command`,
+    `> an embedded browser pane, a project-scoped terminal dock, a Ctrl+Shift+P command`,
     `> palette, and a local IPC socket that's scriptable from \`verde live\` and`,
     `> \`verde state\`. No hosted relay — Verde drives the provider CLIs already`,
     `> on your machine.`,
