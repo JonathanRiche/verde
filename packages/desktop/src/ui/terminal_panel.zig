@@ -25,6 +25,7 @@ const TerminalContextMenuKind = enum {
 };
 
 const TerminalContextMenuAction = enum {
+    copy_selection,
     new_tab,
     new_claude_tab,
     new_opencode_tab,
@@ -313,6 +314,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
         }
         return true;
     }
+    if (button == 3 and rightClickSelectedPane(state, x, y, down)) return true;
     if (routeTerminalMouseButton(state, x, y, button, down)) return true;
     if (button == 1 and selection_state.dragging) {
         if (!down) {
@@ -370,7 +372,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
                 _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
             }
             focusTerminal(state);
-            clearSelection();
+            if (!selectionAffectsPane(target.dock_id, target.pane_id)) clearSelection();
             openContextMenu(.pane, 0, target.pane_id, x, y);
             if (dock.consumeWorkspaceChange()) state.markDirty();
             return true;
@@ -393,6 +395,23 @@ fn routeTerminalMouseButton(state: *app_state.AppState, x: f32, y: f32, button: 
     }
     clearSelection();
     hit_cache.menu_open = false;
+    if (dock.consumeWorkspaceChange()) state.markDirty();
+    state.markDirty();
+    return true;
+}
+
+fn rightClickSelectedPane(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    if (!selectionAffectsPane(target.dock_id, target.pane_id)) return false;
+    if (!down) return true;
+    hit_cache.dock_id = target.dock_id;
+    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    dock.focusPane(target.pane_id);
+    if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
+        _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
+    }
+    focusTerminal(state);
+    openContextMenu(.pane, 0, target.pane_id, x, y);
     if (dock.consumeWorkspaceChange()) state.markDirty();
     state.markDirty();
     return true;
@@ -670,6 +689,12 @@ fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palet
     } else {
         const workspace_pane_id = workspacePaneIdForDock(state, hit_cache.menu_dock_id);
         const has_workspace_pane = workspace_pane_id != null;
+        if (selectionAffectsPane(hit_cache.menu_dock_id, hit_cache.menu_pane_id)) {
+            actions[count] = .copy_selection;
+            labels[count] = "Copy";
+            enabled[count] = true;
+            count += 1;
+        }
         actions[count] = .zoom_pane;
         labels[count] = if (workspace_pane_id) |pane_id|
             if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane"
@@ -743,6 +768,7 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
         else => false,
     };
     switch (action) {
+        .copy_selection => _ = copySelectionToClipboard(state),
         .new_tab => dock.createTab(state.allocator) catch |err| app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)}),
         .new_claude_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .claude, .label = "Claude" }) catch |err| app_state.log.warn("failed to create Claude terminal tab: {s}", .{@errorName(err)}),
         .new_opencode_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .opencode, .label = "OpenCode" }) catch |err| app_state.log.warn("failed to create OpenCode terminal tab: {s}", .{@errorName(err)}),
