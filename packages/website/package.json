@@ -20,6 +20,8 @@
     "@tanstack/solid-router-devtools": "latest",
     "@tanstack/solid-router-ssr-query": "latest",
     "@tanstack/solid-start": "latest",
+    "marked": "^18.0.5",
+    "shiki": "^4.2.0",
     "solid-js": "^1.9.11",
     "tailwindcss": "^4.1.18",
     "vite-tsconfig-paths": "^5.1.4"
