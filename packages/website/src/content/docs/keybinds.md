@@ -1,0 +1,179 @@
+---
+title: Keybinds
+description: Every default keybind in Verde, plus how to remap or disable each binding in verde.json.
+section: Workspace
+order: 4
+slug: keybinds
+---
+
+## Default keybinds
+
+These are the defaults, read from `packages/desktop/src/keybinds.zig`. Override
+any of them under `keybinds` in your Verde config — see [Remapping](#remapping)
+below.
+
+### App
+
+| Combo                       | Action                                |
+| -------------------------- | ------------------------------------- |
+| `Ctrl+P` / `Cmd+P`          | Command palette                       |
+| `Ctrl+T` / `Cmd+T`          | New chat thread                       |
+| `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
+| `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |
+| `Alt+O`                     | Open the default project              |
+| `Ctrl+Shift+O`              | Open in external editor               |
+
+### Sidebar & panes
+
+| Combo                       | Action                                |
+| -------------------------- | ------------------------------------- |
+| `Ctrl+S` / `Cmd+S`          | Toggle the sidebar (visible ↔ icon)   |
+| `Ctrl+Shift+S`             | Toggle the sidebar's hidden mode      |
+| `Ctrl+B`                    | Toggle the embedded browser pane      |
+| `Tab`                       | Inside a chat pane, focus the prompt box |
+| `Alt+1 … Alt+9, Alt+0`     | Jump between workspaces by sidebar order |
+
+### Focus (vim-style)
+
+| Combo          | Action                          |
+| -------------- | ------------------------------- |
+| `Ctrl+H` / `Alt+←` | Focus the pane to the left  |
+| `Ctrl+L` / `Alt+→` | Focus the pane to the right |
+| `Ctrl+K` / `Alt+↑` | Focus the pane above        |
+| `Ctrl+J` / `Alt+↓` | Focus the pane below        |
+
+### Swap (rearrange the tiling)
+
+| Combo              | Action                                |
+| ------------------ | ------------------------------------- |
+| `Ctrl+Shift+H`     | Swap focused pane with the left one   |
+| `Ctrl+Shift+L`     | Swap focused pane with the right one  |
+| `Ctrl+Shift+K`     | Swap focused pane with the one above  |
+| `Ctrl+Shift+J`     | Swap focused pane with the one below  |
+
+### Resize (grow)
+
+| Combo              | Action                       |
+| ------------------ | ---------------------------- |
+| `Alt+Shift+←`      | Grow the focused pane left   |
+| `Alt+Shift+→`      | Grow the focused pane right  |
+| `Alt+Shift+↑`      | Grow the focused pane up     |
+| `Alt+Shift+↓`      | Grow the focused pane down   |
+
+### Zoom
+
+| Combo   | Action                                              |
+| ------- | --------------------------------------------------- |
+| `Alt+Z` | Zoom the focused pane to fill the workspace; toggle again to restore |
+
+### Workspace splits
+
+| Combo             | Action                                            |
+| ----------------- | ------------------------------------------------- |
+| `Ctrl+Shift+T` / `Cmd+Shift+T` | Split a terminal pane next to the focus |
+
+Vertical / horizontal chat splits, terminal-vertical splits, and minimize have
+**no default keybind**. Use the pane header buttons: `C|` / `C-` for chat
+vertical / horizontal, `T|` / `T-` for terminal vertical / horizontal, and the
+minimize button. You can bind these actions yourself — see the table of
+binding keys below.
+
+### Terminal (inside a focused terminal pane)
+
+| Combo                              | Action                          |
+| ---------------------------------- | ------------------------------- |
+| `Ctrl+Alt+T` / `Cmd+Alt+T`         | New terminal tab                |
+| `Ctrl+Shift+W` / `Cmd+Shift+W`     | Close the active terminal tab    |
+| `Ctrl+Shift+R` / `Cmd+Shift+R`     | Rename the active terminal tab  |
+| `Ctrl+Shift+PageUp`                | Previous terminal tab           |
+| `Ctrl+Shift+PageDown`              | Next terminal tab               |
+| `Ctrl+Alt+↑` / `Cmd+Alt+↑`         | Focus the terminal split above  |
+| `Ctrl+Alt+↓` / `Cmd+Alt+↓`         | Focus the terminal split below  |
+| `Ctrl+Alt+←` / `Cmd+Alt+←`         | Focus the terminal split left   |
+| `Ctrl+Alt+→` / `Cmd+Alt+→`         | Focus the terminal split right   |
+| `Ctrl+-` / `Ctrl+=`                | Per-terminal zoom out / in      |
+
+### Chat transcript scrolling
+
+| Combo       | Action                          |
+| ----------- | ------------------------------- |
+| `↑`         | Scroll up one line               |
+| `↓`         | Scroll down one line             |
+| `PageUp`    | Scroll up one page               |
+| `PageDown`  | Scroll down one page             |
+
+Transcript scrolling is **direct** — no inertia or velocity decay. When input
+stops, the view stops. Do not expect a multi-frame glide.
+
+## Remapping
+
+Override any binding under `keybinds` in `$XDG_CONFIG_HOME/verde/verde.json` (or
+`~/.config/verde/verde.json`). Use a string for one shortcut, or a string array
+for multiple shortcuts on the same action:
+
+```json
+{
+  "keybinds": {
+    "new_thread": "CommandOrControl+T",
+    "browser": "Ctrl+B",
+    "workspace": {
+      "focus_up": ["Alt+Up", "Ctrl+K"],
+      "focus_down": ["Alt+Down", "Ctrl+J"],
+      "focus_left": ["Alt+Left", "Ctrl+H"],
+      "focus_right": ["Alt+Right", "Ctrl+L"],
+      "move_left": "Ctrl+Shift+H",
+      "move_right": "Ctrl+Shift+L",
+      "move_up": "Ctrl+Shift+K",
+      "move_down": "Ctrl+Shift+J",
+      "toggle_maximize": "Alt+Z",
+      "close": ["CommandOrControl+W", "Alt+X"],
+      "select": ["Alt+1", "Alt+2", "Alt+3", "Alt+4", "Alt+5", "Alt+6", "Alt+7", "Alt+8", "Alt+9", "Alt+0"]
+    },
+    "terminal": {
+      "new_tab": "CommandOrControl+Alt+T",
+      "close": "CommandOrControl+Shift+W",
+      "rename_tab": "CommandOrControl+Shift+R",
+      "tab_previous": "CommandOrControl+Shift+PageUp",
+      "tab_next": "CommandOrControl+Shift+PageDown",
+      "focus_up": "CommandOrControl+Alt+Up",
+      "focus_down": "CommandOrControl+Alt+Down",
+      "focus_left": "CommandOrControl+Alt+Left",
+      "focus_right": "CommandOrControl+Alt+Right"
+    }
+  }
+}
+```
+
+## Disabling a binding
+
+Set the binding to `null`, an empty string, or an empty array to disable it:
+
+```json
+{
+  "keybinds": {
+    "terminal": {
+      "toggle": null,
+      "split_up": null,
+      "split_down": null,
+      "split_left": null,
+      "split_right": null
+    }
+  }
+}
+```
+
+## Binding keys reference
+
+The keybinds config uses the same accelerator grammar as the desktop defaults.
+The top-level keys group actions by surface; the inner values are one shortcut
+or an array of shortcuts.
+
+| Group       | Keys (subset)                                                                                                                                                                                                                     |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
+| chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select` |
+| `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
+
+Keybinds are loaded on startup and on app refresh. See [Configuration &
+state](/docs/config) for the full `verde.json` schema and where state lives.

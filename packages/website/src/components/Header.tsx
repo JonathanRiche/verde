@@ -27,6 +27,9 @@ export default function Header() {
           <a href="/#install" class="nav-link">
             Install
           </a>
+          <Link to="/docs" class="nav-link" activeProps={{ class: 'nav-link nav-link--active' }}>
+            Docs
+          </Link>
         </div>
 
         <a

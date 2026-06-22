@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/solid-router'
-import { For, Show, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createSignal } from 'solid-js'
 
 import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png'
 import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
@@ -7,106 +7,11 @@ import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
 import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
 import appScreenshot from '../../../../assets/green_verde.png'
+import CopyButton from '../components/CopyButton'
 
 export const Route = createFileRoute('/')({ component: App })
 
 const DEFAULT_INSTALL_COMMAND = 'curl -fsSL https://verdeai.dev/install.sh | sh'
-
-/* ───────────────────────── Copy button ───────────────────────── */
-
-function ClipboardGlyph() {
-  return (
-    <svg class="copy-svg" viewBox="0 0 24 24" aria-hidden="true">
-      <path
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m4 0v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7h16Z"
-      />
-    </svg>
-  )
-}
-
-function CheckGlyph() {
-  return (
-    <svg class="copy-svg" viewBox="0 0 24 24" aria-hidden="true">
-      <path
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2.5"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        d="M5 13l4 4L19 7"
-      />
-    </svg>
-  )
-}
-
-function CopyButton(props: { command: string; size?: 'sm' | 'md' }) {
-  const [copied, setCopied] = createSignal(false)
-  let copyTimer: ReturnType<typeof setTimeout> | undefined
-  let sourceInput: HTMLInputElement | undefined
-
-  onCleanup(() => {
-    if (copyTimer !== undefined) clearTimeout(copyTimer)
-  })
-
-  function showCopied() {
-    setCopied(true)
-    if (copyTimer !== undefined) clearTimeout(copyTimer)
-    copyTimer = setTimeout(() => setCopied(false), 2000)
-  }
-
-  function handleCopy(ev: MouseEvent) {
-    ev.preventDefault()
-    ev.stopPropagation()
-    const el = sourceInput
-    if (el) {
-      el.focus()
-      el.select()
-      el.setSelectionRange(0, el.value.length)
-      try {
-        if (document.execCommand('copy')) {
-          showCopied()
-          return
-        }
-      } catch {
-        /* fall through */
-      }
-    }
-    if (navigator.clipboard?.writeText) {
-      void navigator.clipboard
-        .writeText(props.command)
-        .then(() => showCopied(), () => {})
-    }
-  }
-
-  return (
-    <span class="copy-wrap">
-      <input
-        ref={(el) => {
-          sourceInput = el
-        }}
-        type="text"
-        class="copy-source"
-        readOnly
-        tabIndex={-1}
-        aria-hidden="true"
-        value={props.command}
-      />
-      <button
-        type="button"
-        class={`copy-btn copy-btn--${props.size ?? 'md'}${copied() ? ' copy-btn--done' : ''}`}
-        onClick={handleCopy}
-        aria-label={copied() ? 'Copied to clipboard' : 'Copy to clipboard'}
-      >
-        {copied() ? <CheckGlyph /> : <ClipboardGlyph />}
-      </button>
-    </span>
-  )
-}
 
 /* ───────────────────────── Feature icons ───────────────────────── */
 
@@ -563,9 +468,7 @@ function App() {
           <p class="script-foot">
             Full command surface in{' '}
             <a
-              href="https://github.com/JonathanRiche/verde#cli-and-live-control"
-              target="_blank"
-              rel="noreferrer"
+              href="/docs/cli"
               class="text-link"
             >
               the CLI reference
@@ -758,14 +661,20 @@ bash ./scripts/release/install-linux-local.sh
 
             <div class="footer-col">
               <p class="footer-col-title">Docs</p>
-              <a href="https://github.com/JonathanRiche/verde#getting-started" target="_blank" rel="noreferrer" class="footer-link">
-                Getting started
+              <a href="/docs/quickstart" class="footer-link">
+                Quickstart
               </a>
-              <a href="https://github.com/JonathanRiche/verde#cli-and-live-control" target="_blank" rel="noreferrer" class="footer-link">
+              <a href="/docs/providers" class="footer-link">
+                Providers
+              </a>
+              <a href="/docs/cli" class="footer-link">
                 CLI reference
               </a>
-              <a href="https://github.com/JonathanRiche/verde#config-and-state" target="_blank" rel="noreferrer" class="footer-link">
-                Config &amp; themes
+              <a href="/docs/config" class="footer-link">
+                Config &amp; state
+              </a>
+              <a href="/docs" class="footer-link">
+                All docs
               </a>
             </div>
 

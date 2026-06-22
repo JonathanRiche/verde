@@ -1,0 +1,118 @@
+---
+title: Quickstart
+description: Install Verde, authenticate a provider CLI, and run your first chat thread in a tiled workspace.
+section: Get started
+order: 1
+slug: quickstart
+---
+
+## Install
+
+Verde ships as a single native binary. Install the latest release from the website:
+
+```bash
+curl -fsSL https://verdeai.dev/install.sh | sh
+```
+
+The installer detects your platform, downloads the matching release artifact from
+GitHub, and drops Verde into `~/.local` (Linux) or `/Applications` (macOS). For
+other paths — Arch Linux via the AUR, an npm launcher, a custom prefix, or a
+source build — see the [install section on the homepage](/#install).
+
+On Linux, the embedded browser pane uses the system WPE WebKit runtime. The
+installer will warn if the required libraries are missing and print the package
+command for your distribution. You can let it install them by setting
+`VERDE_INSTALL_BROWSER_DEPS=1` before running it.
+
+## Authenticate a provider
+
+Verde does not host a model. It drives the coding-agent CLIs already installed on
+your machine, so install and authenticate at least one provider before launching
+the app:
+
+| Provider    | Setup                                                                              |
+| ----------- | ---------------------------------------------------------------------------------- |
+| Codex       | Install the [Codex CLI](https://github.com/openai/codex), then run `codex login`.  |
+| Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in.  |
+| OpenCode    | Install [OpenCode](https://github.com/anomalyco/opencode); ensure `opencode` is on `PATH`. |
+| Cursor      | Install the [Cursor CLI](https://cursor.com/docs/cli/installation), ensure `agent` is on `PATH`, run `agent login`. `CURSOR_API_KEY` is also supported for headless environments. |
+
+See [Provider setup](/docs/providers) for the full per-provider notes.
+
+## Launch
+
+```bash
+verde
+```
+
+The first launch opens an empty workspace. The sidebar on the left lists your
+projects and threads; the main area is where chat, terminal, and browser panes
+live as a tiling tree.
+
+## Import a project
+
+Right-click the sidebar or click the **+** button to import a project. Verde
+watches the project directory you import; threads, processes, and agents all
+operate against that workspace root.
+
+A project can optionally declare a stack in `verde.yml` (or `verde.yaml`) at its
+root — long-running processes and agent CLIs to drive from the terminal dock.
+See [Configuration & state](/docs/config) for the schema.
+
+## Start a chat thread
+
+1. With a project imported, press `Ctrl+T` (or `Cmd+T` on macOS) to create a new chat thread.
+2. Pick a provider from the composer's provider switcher. If a provider CLI is missing or not authenticated, Verde will tell you instead of silently failing.
+3. Type a prompt and press `Enter` to send. The transcript grows as the agent streams; tool calls and command runs render as compact rows underneath the assistant turns.
+4. Press `Tab` while focused in a chat thread to return focus to the prompt box.
+
+## Tile a browser pane
+
+Press `Ctrl+B` to toggle the embedded browser pane next to the focused chat. On
+Linux it uses WPE WebKit, on macOS WKWebView, on Windows WebView2 — never a
+bundled Chromium. Use it to keep docs, a preview server, or a staging URL in
+view while the agent works.
+
+You can drive the browser pane from the CLI too:
+
+```bash
+verde live browser open --url http://localhost:3000
+verde live browser navigate --url http://localhost:3000/dashboard
+verde live browser eval --script "document.title"
+```
+
+## Split a terminal
+
+Press `Ctrl+Shift+T` to split a terminal pane next to the focused workspace pane.
+Right-click inside a terminal to spawn shell tabs or agent launch-profile tabs
+(Claude, OpenCode, Codex, Cursor). Per-terminal zoom (`Ctrl+-` / `Ctrl+=`) and
+the full layout persist across launches.
+
+## Move around
+
+- `Ctrl+H / J / K / L` — move focus across panes, vim-style
+- `Ctrl+Shift+H / J / K / L` — swap the focused pane with its neighbor (rearrange the tiling)
+- `Alt+Shift+← ↑ ↓ →` — resize the focused pane
+- `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore
+- `Alt+1 … Alt+9, Alt+0` — jump between workspaces by sidebar order
+
+The full set of defaults and how to remap them is in [Keybinds](/docs/keybinds).
+
+## Open the command palette
+
+`Ctrl+P` opens a Raycast-style launcher that ranks chat threads, open panes,
+workspaces, and app commands in a single searchable list. Press `Ctrl+Enter` on
+any result to open it in a fresh pane.
+
+Slash commands like `/stack` and `/process` run from the composer alongside each
+provider's own commands. See [Panes & tiling](/docs/panes) for the full pane
+surface.
+
+## Where to go next
+
+- [Provider setup](/docs/providers) — provider-specific notes and troubleshooting.
+- [Panes & tiling](/docs/panes) — splits, focus, resize, zoom, the terminal dock, and the browser pane.
+- [Keybinds](/docs/keybinds) — every default and how to remap.
+- [CLI reference](/docs/cli) — drive Verde from your shell with `verde live` and `verde state`.
+- [Configuration & state](/docs/config) — `verde.json`, `verde.yml`, themes, Omarchy integration.
+- [Troubleshooting](/docs/troubleshooting) — provider auth, browser runtime, source-build issues.
