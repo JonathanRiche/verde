@@ -11025,6 +11025,44 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn moveCurrentProjectWorkspacePaneToPlacement(
+        self: *AppState,
+        source_pane_id: WorkspacePaneId,
+        target_pane_id: WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) bool {
+        if (self.projects.items.len == 0) return false;
+        if (source_pane_id == target_pane_id) return false;
+
+        var layout = &self.projects.items[self.selected_project_index].workspace_layout;
+        const source = layout.paneByIdMutable(source_pane_id) orelse return false;
+        const target = layout.paneById(target_pane_id) orelse return false;
+        if (source.minimized or target.minimized) return false;
+
+        // Temporarily hide the source pane so the existing root-prune logic can
+        // collapse its old split before we reuse the same pane id at the drop target.
+        source.minimized = true;
+        if (layout.root) |root_node| {
+            const repaired = WorkspaceLayout.pruneRootToVisiblePanes(self.allocator, layout, root_node);
+            layout.root = repaired.node;
+        }
+        const source_again = layout.paneByIdMutable(source_pane_id) orelse return false;
+        source_again.minimized = false;
+
+        layout.splitPaneWithLeaf(self.allocator, target_pane_id, source_pane_id, axis, new_after) catch |err| {
+            log.err("failed to move workspace pane: {s}", .{@errorName(err)});
+            layout.ensurePaneInRootSplit(self.allocator, source_pane_id, axis, 0.5) catch {};
+            self.setSidebarNotice("Failed to move workspace pane.");
+            self.markDirty();
+            return false;
+        };
+        layout.maximized_pane_id = null;
+        _ = self.focusCurrentProjectWorkspacePane(source_pane_id);
+        self.markDirty();
+        return true;
+    }
+
     pub fn toggleCurrentProjectWorkspacePaneMaximized(self: *AppState, pane_id: WorkspacePaneId) bool {
         if (self.projects.items.len == 0) return false;
         return self.toggleWorkspacePaneMaximized(self.selected_project_index, pane_id);

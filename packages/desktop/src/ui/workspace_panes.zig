@@ -21,6 +21,7 @@ const FOCUS_ANIM_DURATION_MS: i64 = 160;
 const THREAD_DROP_PREVIEW_Z: i32 = 140;
 const PANE_CONTEXT_MENU_Z: i32 = 180;
 const INACTIVE_PANE_FADE_ALPHA: u8 = 72;
+const PANE_DRAG_THRESHOLD_CSS: f32 = 8.0;
 
 fn nowMs() i64 {
     return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
@@ -86,7 +87,20 @@ const ThreadDropTarget = struct {
     preview: palette.Rect,
 };
 
+const PaneDragState = struct {
+    pending: bool = false,
+    active: bool = false,
+    split_placement: bool = false,
+    pane_id: runtime.WorkspacePaneId = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+};
+
 var last_thread_drop_target: ?ThreadDropTarget = null;
+var pane_drag: PaneDragState = .{};
+var last_pane_drop_target: ?ThreadDropTarget = null;
 
 var pane_rect_count: usize = 0;
 var pane_rects: [MAX_WORKSPACE_PANE_RECTS]WorkspacePaneRect = undefined;
@@ -130,6 +144,10 @@ pub fn isCompletionPulseAnimating() bool {
         if ((now - slot.start_ms) < COMPLETION_PULSE_DURATION_MS) return true;
     }
     return false;
+}
+
+pub fn hasActivePaneDrag() bool {
+    return pane_drag.pending or pane_drag.active;
 }
 
 // Placement for a hotkey-opened pane while auto-building the 2x2 grid.
@@ -571,7 +589,7 @@ pub fn renderAt(state: *runtime.AppState, rect: palette.Rect) void {
     if (!browser_pane_rendered) state.noteBrowserPaneNotRendered();
 }
 
-pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool) bool {
+pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button: u8, down: bool, ctrl_down: bool, shift_down: bool) bool {
     if (button == 3 and down) {
         // Right-click on a pane opens the pane context menu anchored at the cursor.
         var ri: usize = hit_cache.count;
@@ -615,12 +633,14 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
     }
     if (button != 1) return false;
     if (!down) {
+        if (pane_drag.pending or pane_drag.active) return finishPaneDrag(state, x, y);
         if (resize_drag != null) {
             resize_drag = null;
             return true;
         }
         return false;
     }
+    if (ctrl_down and beginPaneDrag(state, x, y, shift_down)) return true;
     var i: usize = hit_cache.count;
     while (i > 0) {
         i -= 1;
@@ -733,7 +753,16 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, button
     return false;
 }
 
-pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
+pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32, ctrl_down: bool) bool {
+    if (pane_drag.pending or pane_drag.active) {
+        if (!ctrl_down) {
+            cancelPaneDrag();
+            state.markDirty();
+            return true;
+        }
+        updatePaneDrag(state, x, y);
+        return true;
+    }
     if (resize_drag) |hit| {
         updateResizeDrag(state, hit, x, y);
         return true;
@@ -756,14 +785,24 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) bool {
     return false;
 }
 
+/// Renders the theme-accent drop overlay while Ctrl-dragging a workspace pane.
+pub fn renderPaneDragPreview(state: *runtime.AppState) void {
+    if (!pane_drag.active) return;
+    const maybe_target = paneDragTargetAt(pane_drag.pane_id, pane_drag.x, pane_drag.y, pane_drag.split_placement);
+    last_pane_drop_target = maybe_target;
+    const target = maybe_target orelse return;
+    const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DROP_PREVIEW_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+    renderPlacementPreview(state, target.preview);
+}
+
 pub fn renderThreadDropPreview(state: *runtime.AppState, x: f32, y: f32) void {
     const maybe_target = threadDropTargetAt(x, y);
     last_thread_drop_target = maybe_target;
     const target = maybe_target orelse return;
     const previous_z = state.palette_overlay_batch.setZIndex(THREAD_DROP_PREVIEW_Z);
     defer state.palette_overlay_batch.restoreZIndex(previous_z);
-    queueRounded(state, target.preview, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 54)), theme.scaledUi(6.0));
-    queueBorder(state, target.preview, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
+    renderPlacementPreview(state, target.preview);
 }
 
 pub fn clearThreadDropTarget() void {
@@ -785,6 +824,93 @@ fn threadDropTargetAt(x: f32, y: f32) ?ThreadDropTarget {
         return threadDropTargetForPane(entry.pane_id, entry.rect, x, y);
     }
     return null;
+}
+
+fn paneDragTargetAt(source_pane_id: runtime.WorkspacePaneId, x: f32, y: f32, split_placement: bool) ?ThreadDropTarget {
+    var i: usize = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
+        const entry = pane_rects[i];
+        if (entry.pane_id == source_pane_id) continue;
+        if (!rectContains(entry.rect, x, y)) continue;
+        if (split_placement) return threadDropTargetForPane(entry.pane_id, entry.rect, x, y);
+        return .{ .pane_id = entry.pane_id, .axis = .vertical, .new_after = true, .preview = entry.rect };
+    }
+    return null;
+}
+
+fn beginPaneDrag(state: *runtime.AppState, x: f32, y: f32, split_placement: bool) bool {
+    if (state.currentProjectWorkspaceVisiblePaneCount() <= 1) return false;
+    var i: usize = pane_rect_count;
+    while (i > 0) {
+        i -= 1;
+        const entry = pane_rects[i];
+        if (!rectContains(entry.rect, x, y)) continue;
+        pane_drag = .{
+            .pending = true,
+            .split_placement = split_placement,
+            .pane_id = entry.pane_id,
+            .start_x = x,
+            .start_y = y,
+            .x = x,
+            .y = y,
+        };
+        last_pane_drop_target = null;
+        split_menu_open_for = null;
+        resize_drag = null;
+        _ = state.focusCurrentProjectWorkspacePane(entry.pane_id);
+        _ = sdl.captureMouse(true);
+        state.markDirty();
+        return true;
+    }
+    return false;
+}
+
+fn updatePaneDrag(state: *runtime.AppState, x: f32, y: f32) void {
+    pane_drag.x = x;
+    pane_drag.y = y;
+    if (pane_drag.pending) {
+        const dx = x - pane_drag.start_x;
+        const dy = y - pane_drag.start_y;
+        const threshold = theme.scaledUi(PANE_DRAG_THRESHOLD_CSS);
+        if (dx * dx + dy * dy >= threshold * threshold) {
+            pane_drag.pending = false;
+            pane_drag.active = true;
+        }
+    }
+    if (pane_drag.active) last_pane_drop_target = paneDragTargetAt(pane_drag.pane_id, x, y, pane_drag.split_placement);
+    state.markDirty();
+}
+
+fn finishPaneDrag(state: *runtime.AppState, x: f32, y: f32) bool {
+    const drag = pane_drag;
+    pane_drag = .{};
+    _ = sdl.captureMouse(false);
+    defer last_pane_drop_target = null;
+    if (!drag.active) return true;
+    const target = paneDragTargetAt(drag.pane_id, x, y, drag.split_placement) orelse last_pane_drop_target orelse return true;
+    if (drag.split_placement) {
+        _ = state.moveCurrentProjectWorkspacePaneToPlacement(drag.pane_id, target.pane_id, target.axis, target.new_after);
+    } else if (state.swapCurrentProjectWorkspacePanes(drag.pane_id, target.pane_id)) {
+        _ = state.focusCurrentProjectWorkspacePane(target.pane_id);
+        if (state.workspaceChatThreadIndexByPane(target.pane_id) != null) {
+            _ = state.focusPromptForFocusedChatWorkspacePane();
+        }
+        state.markDirty();
+    }
+    return true;
+}
+
+fn cancelPaneDrag() void {
+    pane_drag = .{};
+    last_pane_drop_target = null;
+    _ = sdl.captureMouse(false);
+}
+
+fn renderPlacementPreview(state: *runtime.AppState, rect: palette.Rect) void {
+    const accent = theme.current_colors.accent;
+    queueRounded(state, rect, paletteColor(theme.withAlpha(accent, 54)), theme.scaledUi(6.0));
+    queueBorder(state, rect, paletteColor(theme.withAlpha(accent, 210)), theme.scaledUi(6.0), theme.scaledUi(2.0));
 }
 
 fn threadDropTargetForPane(pane_id: runtime.WorkspacePaneId, rect: palette.Rect, x: f32, y: f32) ThreadDropTarget {

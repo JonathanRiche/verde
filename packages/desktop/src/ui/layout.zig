@@ -108,6 +108,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
         sidebar.renderPalette(state, root_layout.sidebar);
         workspace_panes.renderAt(state, root_layout.workspace);
     }
+    workspace_panes.renderPaneDragPreview(state);
     sidebar.renderFloatingDragPreview(state);
     const modal_z = state.palette_overlay_batch.setZIndex(PALETTE_MODAL_Z);
     defer state.palette_overlay_batch.restoreZIndex(modal_z);
