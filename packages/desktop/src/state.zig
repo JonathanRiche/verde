@@ -3616,7 +3616,7 @@ pub const AppState = struct {
     /// Row index in `thread_import_threads` under the cursor (import modal list).
     thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
-    /// Command palette (Ctrl+P overlay). `ui/command_palette.zig` owns result
+    /// Command palette (Ctrl+Shift+P overlay). `ui/command_palette.zig` owns result
     /// building and rendering; these are the cross-cutting bits the input
     /// router and keybind dispatch need.
     command_palette_open: bool,
@@ -4954,7 +4954,7 @@ pub const AppState = struct {
 
     /// Opens the command palette overlay. `scope_project` restricts results to
     /// one workspace's thread history (the sidebar "History" entry point);
-    /// `null` is the global Ctrl+P scope (commands + threads everywhere).
+    /// `null` is the global Ctrl+Shift+P scope (commands + threads everywhere).
     pub fn openCommandPalette(self: *AppState, scope_project: ?usize) void {
         self.command_palette_open = true;
         self.command_palette_scope_project = scope_project;
@@ -10302,7 +10302,7 @@ pub const AppState = struct {
             }
         }
         project.workspace_layout.maximized_pane_id = null;
-        self.terminal_focused = true;
+        self.requestTerminalDockFocus(dock_id);
         self.markDirty();
         return true;
     }
@@ -10392,7 +10392,7 @@ pub const AppState = struct {
         }
         layout.maximized_pane_id = null;
         dock.visible = false;
-        self.terminal_focused = true;
+        self.requestTerminalDockFocus(dock_id);
         var notice_buf: [96]u8 = undefined;
         self.setSidebarNotice(std.fmt.bufPrint(&notice_buf, "Started {s} TUI.", .{provider_label}) catch "Started TUI.");
         self.markDirty();

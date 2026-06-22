@@ -107,7 +107,7 @@ const paletteRows = [
 ]
 
 const keybinds = [
-  { combo: 'Ctrl+P', desc: 'Command palette — threads, panes, workspaces' },
+  { combo: 'Ctrl+Shift+P', desc: 'Command palette — threads, panes, workspaces' },
   { combo: 'Ctrl+T', desc: 'New chat thread' },
   { combo: 'Ctrl+Shift+T', desc: 'Split a terminal pane next to the focus' },
   { combo: 'Ctrl+B', desc: 'Toggle the embedded browser pane' },
@@ -323,7 +323,7 @@ function App() {
           <div class="feature-copy">
             <p class="tag tag-static">Command palette</p>
             <h2 class="heading">
-              Hit <span class="heading-warm">Ctrl+P</span>, type, jump.
+              Hit <span class="heading-warm">Ctrl+Shift+P</span>, type, jump.
             </h2>
             <p class="band-body">
               One Raycast-style launcher ranks your threads, open panes,
@@ -339,7 +339,7 @@ function App() {
           </div>
 
           <div class="feature-visual">
-            {/* Pure-CSS mock of the Ctrl+P launcher overlay */}
+            {/* Pure-CSS mock of the Ctrl+Shift+P launcher overlay */}
             <div class="palette-mock" aria-hidden="true">
               <div class="pm-input">
                 <span class="pm-caret-prefix">›</span>

@@ -100,7 +100,7 @@ The full set of defaults and how to remap them is in [Keybinds](/docs/keybinds).
 
 ## Open the command palette
 
-`Ctrl+P` opens a Raycast-style launcher that ranks chat threads, open panes,
+`Ctrl+Shift+P` opens a Raycast-style launcher that ranks chat threads, open panes,
 workspaces, and app commands in a single searchable list. Press `Ctrl+Enter` on
 any result to open it in a fresh pane.
 

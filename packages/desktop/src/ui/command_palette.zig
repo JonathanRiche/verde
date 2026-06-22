@@ -1,4 +1,4 @@
-//! Command palette overlay (Ctrl+P): a Raycast-style launcher mixing static
+//! Command palette overlay (Ctrl+Shift+P): a Raycast-style launcher mixing static
 //! commands, thread history search, and workspace switching in one ranked
 //! list. The static command set is the `STATIC_COMMANDS` table below — adding
 //! a palette entry is adding one row there. Dynamic results (threads,
@@ -313,7 +313,7 @@ pub fn handleKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) 
             return true;
         },
         .p => {
-            // Ctrl+P while open: scoped → widen to global; global → toggle off.
+            // Ctrl+Shift+P while open: scoped → widen to global; global → toggle off.
             if (primary) {
                 if (state.command_palette_scope_project != null) {
                     state.command_palette_scope_project = null;
@@ -1175,7 +1175,7 @@ fn renderScopeLine(state: *runtime.AppState) void {
     const label = blk: {
         if (state.command_palette_scope_project) |pi| {
             if (pi < state.projects.items.len) {
-                break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+P for all)", .{state.projects.items[pi].label}) catch "history";
+                break :blk std.fmt.bufPrint(&buf, "{s} - history  (Ctrl+Shift+P for all)", .{state.projects.items[pi].label}) catch "history";
             }
         }
         break :blk "All workspaces";
@@ -1427,7 +1427,7 @@ fn formatKeybind(buf: []u8, keybind: keybinds.Keybind) []const u8 {
     if (keybind.shift) n += copyInto(buf[n..], "Shift+");
     const key_name = keycodeLabel(keybind.key);
     n += copyInto(buf[n..], key_name);
-    // Single-letter keys read better uppercased ("Ctrl+P", not "Ctrl+p").
+    // Single-letter keys read better uppercased ("Ctrl+Shift+P", not "Ctrl+Shift+p").
     if (key_name.len == 1 and n > 0) buf[n - 1] = std.ascii.toUpper(buf[n - 1]);
     return buf[0..n];
 }
@@ -1561,8 +1561,8 @@ test "asciiIndexOfIgnoreCase finds case-insensitive needles" {
 
 test "formatKeybind renders modifiers and uppercases single letters" {
     var buf: [32]u8 = undefined;
-    const rendered = formatKeybind(&buf, .{ .primary = true, .key = .p });
-    try std.testing.expectEqualStrings("Ctrl+P", rendered);
+    const rendered = formatKeybind(&buf, .{ .primary = true, .shift = true, .key = .p });
+    try std.testing.expectEqualStrings("Ctrl+Shift+P", rendered);
     const plain = formatKeybind(&buf, .{ .alt = true, .key = .left });
     try std.testing.expectEqualStrings("Alt+Left", plain);
 }

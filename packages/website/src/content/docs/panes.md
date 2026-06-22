@@ -127,7 +127,7 @@ verde live panes --project current --json
 
 ## Command palette and slash commands
 
-`Ctrl+P` opens the command palette — a single ranked list of threads, panes,
+`Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
 workspaces, and app commands. `Ctrl+Enter` on any result opens it in a fresh
 pane. Slash commands run from the composer:
 

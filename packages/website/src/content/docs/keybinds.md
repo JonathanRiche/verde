@@ -16,7 +16,7 @@ below.
 
 | Combo                       | Action                                |
 | -------------------------- | ------------------------------------- |
-| `Ctrl+P` / `Cmd+P`          | Command palette                       |
+| `Ctrl+Shift+P` / `Cmd+Shift+P` | Command palette                    |
 | `Ctrl+T` / `Cmd+T`          | New chat thread                       |
 | `Ctrl+W` / `Cmd+W`, `Alt+X` | Close the focused pane                |
 | `Ctrl+R` / `Cmd+R`, `Ctrl+Shift+R`, `F5` | Refresh / reload app         |

@@ -874,7 +874,7 @@ fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
 
 fn cloneDefaultCommandPaletteKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("CommandOrControl+P"),
+        try parseDefaultAccelerator("CommandOrControl+Shift+P"),
     });
 }
 
