@@ -192,6 +192,11 @@ fn mainInner(init: std.process.Init) !void {
     }
 
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
+    // SDL defaults SDL_VIDEO_ALLOW_SCREENSAVER to "0", which makes it inhibit
+    // the OS idle/screensaver for the whole window lifetime (on Wayland via the
+    // idle-inhibit protocol). Verde is not a media app, so allow the screensaver
+    // so the machine can dim/lock/sleep normally while Verde is open.
+    _ = SDL_SetHint("SDL_VIDEO_ALLOW_SCREENSAVER", "1");
     if (builtin.os.tag == .macos) {
         _ = SDL_SetHint("SDL_MAC_BACKGROUND_APP", "0");
         _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_SHOWN", "1");
