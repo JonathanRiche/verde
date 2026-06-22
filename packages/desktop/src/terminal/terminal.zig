@@ -1917,8 +1917,12 @@ const UnixSession = struct {
                 }
             },
             .daemon => {
+                const needs_initial_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
+                if (needs_initial_replay) {
+                    _ = try self.drainDaemonOutput(allocator);
+                }
                 if (size_changed) {
                     if (growing_rows) self.sendInBandSizeReportAfterResize();
                     self.requestTuiRedrawAfterResize();
@@ -2594,6 +2598,7 @@ const UnixSession = struct {
     fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
+        const initial_attach_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         const response = try sessionizer.requestAlloc(allocator, pref_path, "session.resize", .{
             .id = session_id,
             .attach_id = self.attach_id orelse "",
@@ -2629,6 +2634,17 @@ const UnixSession = struct {
                 @tagName(self.terminal.screens.active_key),
             },
         );
+
+        // When reattaching to a daemon-owned PTY after a Verde restart, the
+        // first UI-driven resize happens before the local terminal model has
+        // replayed the daemon's buffered output. The daemon's resize response is
+        // anchored at the daemon's current tail, so advancing remote_output_offset
+        // here makes the following tail request start at EOF and the pane opens
+        // with only later redraw bytes (often visible as repeated ^L). Keep the
+        // cursor at zero and let drainDaemonOutput replay the bounded tail once,
+        // in chronological order, after the real pane size is known.
+        if (initial_attach_replay) return;
+
         if (next_offset) |offset| {
             if (offset > self.remote_output_offset) self.remote_output_offset = offset;
         }
