@@ -944,29 +944,64 @@ fn renderCollapsedCompositionDots(
     y: f32,
 ) void {
     const max_dots = 4;
-    var count: usize = 0;
-    for (project.workspace_layout.panes.items) |pane| {
-        if (pane.minimized) continue;
-        count += 1;
-    }
-    if (count == 0) return;
-    const shown = @min(count, max_dots);
+    const layout = &project.workspace_layout;
+    var order: CollapsedPaneOrder(max_dots) = .{};
+    if (layout.root) |root| collectCollapsedPaneOrder(layout, root, &order);
+    if (order.total == 0) collectCollapsedPaneOrderFallback(layout, &order);
+    if (order.total == 0) return;
+
+    const shown = @min(order.total, max_dots);
     const dot = theme.scaledUi(4.0);
     const gap = theme.scaledUi(3.0);
     const total_w = @as(f32, @floatFromInt(shown)) * dot + @as(f32, @floatFromInt(shown - 1)) * gap;
     var dx = center_x - total_w * 0.5;
-    var drawn: usize = 0;
-    for (project.workspace_layout.panes.items) |pane| {
-        if (pane.minimized) continue;
-        if (drawn >= max_dots) break;
+    var index: usize = 0;
+    while (index < shown) : (index += 1) {
+        const pane = order.panes[index];
         const selected_pane = state.selected_project_index == project_index and
-            project.workspace_layout.focused_pane_id != null and
-            project.workspace_layout.focused_pane_id.? == pane.id;
-        const indicator = collapsedPaneIndicator(state, project_index, project, &pane, selected_pane);
+            layout.focused_pane_id != null and
+            layout.focused_pane_id.? == pane.id;
+        const indicator = collapsedPaneIndicator(state, project_index, project, pane, selected_pane);
         const alpha: u8 = @intFromFloat(indicator.opacity * 255.0);
         queuePaletteRoundedRect(state, .{ .x = dx, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(indicator.color, alpha)), dot * 0.5);
         dx += dot + gap;
-        drawn += 1;
+    }
+}
+
+fn CollapsedPaneOrder(comptime capacity: usize) type {
+    return struct {
+        panes: [capacity]*const native_state.WorkspacePane = undefined,
+        total: usize = 0,
+    };
+}
+
+/// Collects collapsed pips from the split tree, which reflects the current
+/// visual pane order after splits, closes, swaps, and drag re-arrangements.
+fn collectCollapsedPaneOrder(
+    layout: *const native_state.WorkspaceLayout,
+    node: *const native_state.WorkspaceNode,
+    order: anytype,
+) void {
+    switch (node.*) {
+        .leaf => |pane_id| {
+            const pane = layout.paneById(pane_id) orelse return;
+            if (pane.minimized) return;
+            if (order.total < order.panes.len) order.panes[order.total] = pane;
+            order.total += 1;
+        },
+        .split => |split| {
+            collectCollapsedPaneOrder(layout, split.first, order);
+            collectCollapsedPaneOrder(layout, split.second, order);
+        },
+    }
+}
+
+/// Falls back to the storage order only if the visual split tree is unavailable.
+fn collectCollapsedPaneOrderFallback(layout: *const native_state.WorkspaceLayout, order: anytype) void {
+    for (layout.panes.items) |*pane| {
+        if (pane.minimized) continue;
+        if (order.total < order.panes.len) order.panes[order.total] = pane;
+        order.total += 1;
     }
 }
 
