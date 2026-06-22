@@ -2091,12 +2091,10 @@ const UnixSession = struct {
     pub fn handleMouseButton(self: *UnixSession, button: u8, down: bool, local_x: f32, local_y: f32, width: f32, height: f32) !bool {
         const mouse_button = terminalMouseButton(button) orelse return false;
         if (self.terminal.flags.mouse_event != .none) {
-            try self.writeMouseInput(mouse_button, if (down) .press else .release, local_x, local_y, width, height, false);
+            try self.writeMouseInput(mouse_button, if (down) .press else .release, local_x, local_y, width, height);
             return true;
         }
-        if (self.terminal.screens.active_key != .alternate and !self.hasForegroundProcessAwayFromShell()) return false;
-        try self.writeMouseInput(mouse_button, if (down) .press else .release, local_x, local_y, width, height, true);
-        return true;
+        return false;
     }
 
     fn shouldRequestTuiRedrawAfterResize(self: *const UnixSession) bool {
@@ -2205,26 +2203,22 @@ const UnixSession = struct {
         const button: ghostty_vt.input.MouseButton = if (wheel_y > 0.0) .four else .five;
         var i: isize = 0;
         while (i < line_count) : (i += 1) {
-            try self.writeMouseInput(button, .press, local_x, local_y, width, height, false);
+            try self.writeMouseInput(button, .press, local_x, local_y, width, height);
         }
     }
 
-    fn writeMouseInput(self: *UnixSession, button: ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32, force_sgr: bool) !void {
+    fn writeMouseInput(self: *UnixSession, button: ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32) !void {
         const screen_width: u32 = @intFromFloat(@max(@round(width), 1.0));
         const screen_height: u32 = @intFromFloat(@max(@round(height), 1.0));
         const cols_f = @as(f32, @floatFromInt(@max(self.cols, 1)));
         const rows_f = @as(f32, @floatFromInt(@max(self.rows, 1)));
         const cell_width: u32 = @intFromFloat(@max(@round(width / cols_f), 1.0));
         const cell_height: u32 = @intFromFloat(@max(@round(height / rows_f), 1.0));
-        var options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
+        const options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
             .screen = .{ .width = screen_width, .height = screen_height },
             .cell = .{ .width = cell_width, .height = cell_height },
             .padding = .{},
         });
-        if (force_sgr) {
-            options.event = .normal;
-            options.format = .sgr;
-        }
         var buffer: [64]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try ghostty_vt.input.encodeMouse(&writer, .{
