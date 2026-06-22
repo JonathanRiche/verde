@@ -1372,10 +1372,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
+            const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
+            if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
+                return true;
+            }
             if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
                 return true;
             }
-            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+            if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
             }
             browser_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
@@ -1397,6 +1401,14 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and debug_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
+            const shift_down = isKeymodPressed(SDL_GetModState(), sdl.Keymod.shift);
+            if (event.button.button == 1 and (ctrl_down or workspace_panes_ui.hasActivePaneDrag()) and
+                workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, ctrl_down, shift_down))
+            {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1452,7 +1464,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
-            if (workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down)) {
+            if (workspace_panes_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.button, event.button.down, ctrl_down, shift_down)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
