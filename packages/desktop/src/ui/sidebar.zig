@@ -1519,7 +1519,7 @@ fn queuePaletteLogoMark(state: *runtime.AppState, rect: palette.Rect) void {
             .w = dims[0],
             .h = dims[1],
         };
-        if (queuePaletteImage(state, image_rect, cached, paletteColor(theme.COLOR_WHITE), null)) return;
+        if (queuePaletteImage(state, image_rect, cached, paletteColor(theme.COLOR_GREEN), null)) return;
     }
 
     const mark_color = paletteColor(theme.COLOR_GREEN);
