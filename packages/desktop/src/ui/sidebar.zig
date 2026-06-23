@@ -152,7 +152,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
     var new_settings_hover = false;
-    if (!state.isSidebarCollapsed() and rectContainsPoint(palette_sidebar_rect, x, y)) {
+    if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
         // overlapping during scroll edge cases.
         var index = palette_hit_count;
@@ -162,10 +162,10 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
             if (!rectContainsPoint(hit.rect, x, y)) continue;
             switch (hit.kind) {
                 .workspace_row => {
-                    if (new_project_hover == null) new_project_hover = hit.project_index;
+                    if (!state.isSidebarCollapsed() and new_project_hover == null) new_project_hover = hit.project_index;
                 },
                 .new_thread => {
-                    if (new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
+                    if (!state.isSidebarCollapsed() and new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
                 },
                 .settings => new_settings_hover = true,
                 else => {},
@@ -753,8 +753,6 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             .h = theme.scaledUi(1.0),
         }, paletteColor(theme.borderMuted()));
 
-        // Compact gear icon button aligned to the rail, with a square
-        // hover-highlight matching the rest of the sidebar's row language.
         const btn = theme.scaledUi(34.0);
         const btn_rect: palette.Rect = .{
             .x = rect.x + rect.w - pad_x - btn,
@@ -762,19 +760,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
             .w = btn,
             .h = btn,
         };
-        const settings_hover = state.palette_mouse_in_workspace and rectContainsPoint(btn_rect, state.palette_mouse_x, state.palette_mouse_y);
-        if (settings_hover) {
-            queuePaletteRoundedRect(state, btn_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
-        }
-        const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
-        const icon_font = theme.scaledUi(17.0);
-        queuePaletteIcon(state, .{
-            .x = btn_rect.x + (btn_rect.w - icon_font) * 0.5,
-            .y = btn_rect.y + (btn_rect.h - icon_font) * 0.5,
-            .w = icon_font,
-            .h = icon_font,
-        }, NF_COD_GEAR, icon_font, paletteColor(fg), footer_rect);
-        addPaletteHit(btn_rect, .settings, 0, 0);
+        renderPaletteSettingsButton(state, btn_rect, footer_rect);
     }
 
     // Pinned header — painted last so any scrolled rows in the header band
@@ -803,6 +789,10 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     queuePaletteButton(state, expand_rect, ">", false);
     addPaletteHit(expand_rect, .expand, 0, 0);
     y += theme.scaledUi(38.0);
+    const add_top_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
+    queuePaletteButton(state, add_top_rect, "+", true);
+    addPaletteHit(add_top_rect, .add_workspace, 0, 0);
+    y += theme.scaledUi(34.0);
     const new_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, theme.COLOR_TEXT_MUTED);
     addPaletteHit(new_rect, .new_thread, state.selected_project_index, 0);
@@ -887,9 +877,25 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
         y += theme.scaledUi(11.0);
     }
 
-    const add_rect: palette.Rect = .{ .x = x, .y = rect.y + rect.h - theme.scaledUi(42.0), .w = button, .h = theme.scaledUi(30.0) };
-    queuePaletteButton(state, add_rect, "+", true);
-    addPaletteHit(add_rect, .add_workspace, 0, 0);
+    const settings_rect: palette.Rect = .{ .x = x, .y = rect.y + rect.h - theme.scaledUi(42.0), .w = button, .h = theme.scaledUi(30.0) };
+    renderPaletteSettingsButton(state, settings_rect, rect);
+}
+
+/// Renders the sidebar settings gear button used by both expanded and collapsed rails.
+fn renderPaletteSettingsButton(state: *runtime.AppState, rect: palette.Rect, clip: ?palette.Rect) void {
+    const settings_hover = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (settings_hover) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+    }
+    const fg = if (settings_hover) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_font = theme.scaledUi(17.0);
+    queuePaletteIcon(state, .{
+        .x = rect.x + (rect.w - icon_font) * 0.5,
+        .y = rect.y + (rect.h - icon_font) * 0.5,
+        .w = icon_font,
+        .h = icon_font,
+    }, NF_COD_GEAR, icon_font, paletteColor(fg), clip);
+    addPaletteHit(rect, .settings, 0, 0);
 }
 
 /// Writes the uppercase first letter of a workspace label into `buf` for use as
