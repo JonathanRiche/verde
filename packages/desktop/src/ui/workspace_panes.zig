@@ -1129,7 +1129,7 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const copy_count: usize = if (is_chat_context and state.transcriptMarkdownSelectionActive()) 1 else 0;
     const paste_count: usize = if (is_chat_context and split_menu_show_paste) 1 else 0;
     const chat_command_count: usize = if (is_chat_context) copy_count + paste_count + 2 else 0;
-    const command_count: usize = chat_command_count + 2;
+    const command_count: usize = chat_command_count + 3;
     const split_count: usize = 8;
     const menu_h = menu_pad_top + menu_pad_bottom +
         @as(f32, @floatFromInt(command_count)) * row_h +
@@ -1168,6 +1168,8 @@ fn renderSplitMenuOverlay(state: *runtime.AppState, workspace_rect: palette.Rect
     const zoom_label = if (state.isCurrentProjectWorkspacePaneMaximized(pane_id)) "Unzoom Pane" else "Zoom Pane";
     y = renderContextMenuRow(state, pane_id, .maximize, zoom_label, menu_rect, menu_pad_x, y, row_rect_w, row_h) + row_gap;
     const split_trigger_rect = renderContextMenuStaticRow(state, "Split Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h, true);
+    y = split_trigger_rect.y + split_trigger_rect.h + row_gap;
+    _ = renderContextMenuRow(state, pane_id, .close, "Close Pane", menu_rect, menu_pad_x, y, row_rect_w, row_h);
 
     const rows = [_]MenuRow{
         .{ .action = .split_chat_left, .label = "Chat Left" },

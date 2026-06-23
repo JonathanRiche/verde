@@ -28,6 +28,11 @@ const TOOLBAR_GAP: f32 = 6.0;
 const TOOLBAR_DROPDOWN_WIDTH: f32 = 20.0;
 const TOOLBAR_FIELD_MIN_WIDTH: f32 = 120.0;
 
+const BrowserContextMenuAction = union(enum) {
+    backend_item: app_state.BrowserContextMenuItem,
+    close_pane,
+};
+
 const BrowserHitKind = enum {
     address,
     back,
@@ -128,9 +133,19 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             return rectContainsPoint(palette_context_menu_rect, x, y);
         }
         if (rectContainsPoint(palette_context_menu_rect, x, y)) {
-            if (browserContextMenuItemAtPoint(state, x, y)) |item| {
-                if (item.enabled and !item.separator and !item.submenu) {
-                    state.activateBrowserContextMenuItem(item.index);
+            if (browserContextMenuActionAtPoint(state, x, y)) |action| {
+                switch (action) {
+                    .backend_item => |item| {
+                        if (item.enabled and !item.separator and !item.submenu) {
+                            state.activateBrowserContextMenuItem(item.index);
+                        }
+                    },
+                    .close_pane => {
+                        state.dismissBrowserContextMenu();
+                        if (state.currentProjectVisibleBrowserPaneId()) |pane_id| {
+                            _ = state.closeCurrentProjectWorkspacePane(pane_id);
+                        }
+                    },
                 }
             }
             state.noteInteraction();
@@ -639,10 +654,12 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
     const row_height = theme.scaledUi(30.0);
     const separator_height = theme.scaledUi(9.0);
     const pad = theme.scaledUi(6.0);
+    const show_close_pane = state.currentProjectVisibleBrowserPaneId() != null;
     var content_height = pad * 2.0;
     for (state.browser_context_menu_items.items) |item| {
         content_height += if (item.separator) separator_height else row_height;
     }
+    if (show_close_pane) content_height += separator_height + row_height;
 
     var x = state.browser_context_menu_anchor_x;
     var y = state.browser_context_menu_anchor_y;
@@ -688,9 +705,35 @@ fn renderBrowserContextMenu(state: *app_state.AppState) void {
         }, item.label, paletteColor(if (usable) theme.COLOR_TEXT_MUTED else theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), row_rect);
         row_y += row_height;
     }
+    if (show_close_pane) {
+        queuePaletteRect(state, snapRect(.{
+            .x = palette_context_menu_rect.x + pad,
+            .y = row_y + separator_height * 0.5,
+            .w = palette_context_menu_rect.w - pad * 2.0,
+            .h = theme.scaledUi(1.0),
+        }), paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+        row_y += separator_height;
+
+        const close_rect: palette.Rect = .{
+            .x = palette_context_menu_rect.x + pad,
+            .y = row_y,
+            .w = palette_context_menu_rect.w - pad * 2.0,
+            .h = row_height,
+        };
+        if (rectHovered(close_rect)) {
+            queuePaletteRoundedRect(state, close_rect, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)), theme.scaledUi(5.0));
+        }
+        queuePaletteText(state, .{
+            .x = close_rect.x + theme.scaledUi(8.0),
+            .y = close_rect.y + (close_rect.h - theme.scaledUi(13.0) * 1.25) * 0.5,
+            .w = close_rect.w - theme.scaledUi(16.0),
+            .h = theme.scaledUi(13.0) * 1.25,
+        }, "Close Pane", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(13.0), close_rect);
+        row_y += row_height;
+    }
 }
 
-fn browserContextMenuItemAtPoint(state: *app_state.AppState, x: f32, y: f32) ?app_state.BrowserContextMenuItem {
+fn browserContextMenuActionAtPoint(state: *app_state.AppState, x: f32, y: f32) ?BrowserContextMenuAction {
     if (!rectContainsPoint(palette_context_menu_rect, x, y)) return null;
     const row_height = theme.scaledUi(30.0);
     const separator_height = theme.scaledUi(9.0);
@@ -698,8 +741,12 @@ fn browserContextMenuItemAtPoint(state: *app_state.AppState, x: f32, y: f32) ?ap
     var row_y = palette_context_menu_rect.y + pad;
     for (state.browser_context_menu_items.items) |item| {
         const height = if (item.separator) separator_height else row_height;
-        if (!item.separator and y >= row_y and y <= row_y + height) return item;
+        if (!item.separator and y >= row_y and y <= row_y + height) return .{ .backend_item = item };
         row_y += height;
+    }
+    if (state.currentProjectVisibleBrowserPaneId() != null) {
+        row_y += separator_height;
+        if (y >= row_y and y <= row_y + row_height) return .close_pane;
     }
     return null;
 }
