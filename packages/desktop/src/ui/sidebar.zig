@@ -45,6 +45,8 @@ const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 const SIDEBAR_FOOTER_RESERVE_CSS: f32 = 56.0;
 const THREAD_DRAG_THRESHOLD_CSS: f32 = 5.0;
 const THREAD_DRAG_FLOATING_Z: i32 = 160;
+/// Sidebar context menus can extend over workspace panes when the rail is collapsed.
+const SIDEBAR_CONTEXT_MENU_Z: i32 = 180;
 
 const SidebarHitKind = enum {
     collapse,
@@ -101,6 +103,7 @@ const WorkspaceDragState = struct {
     pending: bool = false,
     active: bool = false,
     project_index: usize = 0,
+    toggle_project_on_click: bool = true,
     start_x: f32 = 0.0,
     start_y: f32 = 0.0,
     x: f32 = 0.0,
@@ -218,31 +221,13 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
             },
             .workspace_row => {
-                if (hit.project_index < state.projects.items.len) {
-                    // Begin a pending drag; a release without movement is
-                    // treated as a click (select + collapse toggle) in
-                    // finishWorkspaceDrag, while movement past the threshold
-                    // promotes to a reorder drag.
-                    workspace_drop_valid = false;
-                    workspace_drag = .{
-                        .pending = true,
-                        .project_index = hit.project_index,
-                        .start_x = x,
-                        .start_y = y,
-                        .x = x,
-                        .y = y,
-                    };
-                    _ = sdl.captureMouse(true);
-                }
+                startWorkspaceDrag(state, hit.project_index, x, y, true);
             },
             .open_pane => {
                 state.focusWorkspaceOpenPane(hit.project_index, @intCast(hit.thread_index));
             },
             .workspace_avatar => {
-                if (hit.project_index < state.projects.items.len) {
-                    state.selected_project_index = hit.project_index;
-                    state.markDirty();
-                }
+                startWorkspaceDrag(state, hit.project_index, x, y, false);
             },
             .history => {
                 if (hit.project_index < state.projects.items.len) {
@@ -291,7 +276,7 @@ pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f3
                 state.markDirty();
                 return true;
             },
-            .workspace_row => {
+            .workspace_row, .workspace_avatar => {
                 state.workspace_header_open_menu_open = false;
                 state.sidebar_context_menu_anchor_x = x;
                 state.sidebar_context_menu_anchor_y = y;
@@ -365,7 +350,7 @@ fn computeWorkspaceDropTarget(y: f32) void {
     var index: usize = 0;
     while (index < palette_hit_count) : (index += 1) {
         const hit = palette_hits[index];
-        if (hit.kind != .workspace_row) continue;
+        if (hit.kind != .workspace_row and hit.kind != .workspace_avatar) continue;
         const r = hit.rect;
         if (y < r.y) {
             workspace_drop_before = hit.project_index;
@@ -392,6 +377,24 @@ fn computeWorkspaceDropTarget(y: f32) void {
     }
 }
 
+fn startWorkspaceDrag(state: *runtime.AppState, project_index: usize, x: f32, y: f32, toggle_project_on_click: bool) void {
+    if (project_index >= state.projects.items.len) return;
+    // Begin a pending drag; release without movement is treated as the normal
+    // click behavior for that control, while movement past the threshold
+    // promotes to a workspace reorder drag.
+    workspace_drop_valid = false;
+    workspace_drag = .{
+        .pending = true,
+        .project_index = project_index,
+        .toggle_project_on_click = toggle_project_on_click,
+        .start_x = x,
+        .start_y = y,
+        .x = x,
+        .y = y,
+    };
+    _ = sdl.captureMouse(true);
+}
+
 fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
     _ = x;
     _ = y;
@@ -404,7 +407,9 @@ fn finishWorkspaceDrag(state: *runtime.AppState, x: f32, y: f32) bool {
         if (drag.project_index < state.projects.items.len) {
             state.noteInteraction();
             state.selected_project_index = drag.project_index;
-            state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
+            if (drag.toggle_project_on_click) {
+                state.projects.items[drag.project_index].collapsed = !state.projects.items[drag.project_index].collapsed;
+            }
             state.syncRenameBuffer();
             state.requestTranscriptScrollToBottom();
             state.markDirty();
@@ -584,6 +589,9 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
     }
 
     if (sidebar_menu_row_count == 0) return;
+
+    const previous_z = state.palette_overlay_batch.setZIndex(SIDEBAR_CONTEXT_MENU_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
 
     const menu_h = menu_pad * 2.0 + @as(f32, @floatFromInt(sidebar_menu_row_count)) * menu_row_h;
     var menu_x = state.sidebar_context_menu_anchor_x;
@@ -969,7 +977,15 @@ fn renderCollapsedCompositionDots(
             layout.focused_pane_id.? == pane.id;
         const indicator = collapsedPaneIndicator(state, project_index, project, pane, selected_pane);
         const alpha: u8 = @intFromFloat(indicator.opacity * 255.0);
-        queuePaletteRoundedRect(state, .{ .x = dx, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(indicator.color, alpha)), dot * 0.5);
+        const dot_rect: palette.Rect = .{ .x = dx, .y = y, .w = dot, .h = dot };
+        queuePaletteRoundedRect(state, dot_rect, paletteColor(theme.withAlpha(indicator.color, alpha)), dot * 0.5);
+        const hit_size = theme.scaledUi(12.0);
+        addPaletteHit(.{
+            .x = dot_rect.x + (dot_rect.w - hit_size) * 0.5,
+            .y = dot_rect.y + (dot_rect.h - hit_size) * 0.5,
+            .w = hit_size,
+            .h = hit_size,
+        }, .open_pane, project_index, pane.id);
         dx += dot + gap;
     }
 }
