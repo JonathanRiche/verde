@@ -324,6 +324,7 @@ pub const Client = struct {
             .compact => self.runCompactSlashCommand(allocator, request),
             .review => self.runReviewSlashCommand(allocator, request),
             .shell => self.runShellSlashCommand(allocator, request),
+            .custom => error.UnsupportedOperation,
         };
     }
 

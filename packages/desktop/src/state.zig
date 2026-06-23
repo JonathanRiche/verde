@@ -825,7 +825,7 @@ pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
 pub const IMAGE_MODAL_ID: [:0]const u8 = "AttachmentPreviewModal";
 pub const THREAD_IMPORT_MODAL_ID: [:0]const u8 = "ThreadImportModal";
 pub const TRANSCRIPT_SELECTION_MODAL_ID: [:0]const u8 = "TranscriptSelectionModal";
-pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo.png");
+pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
 pub const CLAUDE_LOGO_BYTES = @embedFile("assets/claude-logo.png");
@@ -1559,6 +1559,7 @@ const SlashCommandState = struct {
     worker: ?std.Thread = null,
     project_index: usize = 0,
     thread_index: usize = 0,
+    provider: Provider = .codex,
     command: ai_harness.ProviderSlashCommandId = .usage,
     result: ?ai_harness.RunSlashCommandResult = null,
     error_message: ?[]u8 = null,
@@ -7778,7 +7779,10 @@ pub const AppState = struct {
             self.noteInteraction();
             return true;
         }
-        if (std.mem.eql(u8, row.name, "/usage") or std.mem.eql(u8, row.name, "/compact") or std.mem.eql(u8, row.name, "/review")) {
+        const should_submit_immediately = std.mem.eql(u8, row.name, "/usage") or
+            std.mem.eql(u8, row.name, "/review") or
+            (std.mem.eql(u8, row.name, "/compact") and !std.mem.eql(u8, row.provider_label, "Claude"));
+        if (should_submit_immediately) {
             self.setDraft(row.name);
             self.syncPaletteComposerFromDraft();
             _ = self.handleProviderSlashCommand(row.name);
@@ -10770,6 +10774,21 @@ pub const AppState = struct {
                 return true;
             },
             .unknown => |unknown| {
+                if (thread.provider == .claude) {
+                    const command: ai_harness.ProviderSlashCommand = .{
+                        .id = .custom,
+                        .name = unknown.name,
+                        .summary = "Claude SDK slash command.",
+                        .usage = unknown.name,
+                        .requires_thread = false,
+                    };
+                    self.beginProviderSlashCommand(command, unknown.args, raw_text) catch |err| {
+                        log.err("failed to start Claude slash command {s}: {s}", .{ unknown.name, @errorName(err) });
+                        self.setSidebarNotice("Failed to start Claude slash command.");
+                        return true;
+                    };
+                    return true;
+                }
                 var buffer: [160]u8 = undefined;
                 self.setSidebarNotice(std.fmt.bufPrint(
                     &buffer,
@@ -10850,6 +10869,7 @@ pub const AppState = struct {
         }
         self.slash_command_state.project_index = project_index;
         self.slash_command_state.thread_index = thread_index;
+        self.slash_command_state.provider = thread.provider;
         self.slash_command_state.command = command.id;
         self.slash_command_state.status = .pending;
         self.slash_command_state.worker = std.Thread.spawn(.{}, slashCommandWorker, .{ &self.slash_command_state, request }) catch |err| {
@@ -13423,12 +13443,22 @@ pub const AppState = struct {
         if (self.slash_command_state.status != .pending) return null;
         if (self.slash_command_state.project_index != project_index or self.slash_command_state.thread_index != thread_index) return null;
 
-        return switch (self.slash_command_state.command) {
-            .usage => "Loading Codex usage...",
-            .goal => "Updating Codex goal...",
-            .compact => "Compacting thread context...",
-            .review => "Starting Codex review...",
-            .shell => "Running Codex shell command...",
+        return switch (self.slash_command_state.provider) {
+            .claude => switch (self.slash_command_state.command) {
+                .usage => "Loading Claude usage...",
+                .compact => "Compacting Claude thread context...",
+                else => "Running Claude command...",
+            },
+            .codex => switch (self.slash_command_state.command) {
+                .usage => "Loading Codex usage...",
+                .goal => "Updating Codex goal...",
+                .compact => "Compacting Codex thread context...",
+                .review => "Starting Codex review...",
+                .shell => "Running Codex shell command...",
+                .custom => "Running Codex command...",
+            },
+            .opencode => "Running OpenCode command...",
+            .cursor => "Running Cursor command...",
         };
     }
 
@@ -13439,15 +13469,33 @@ pub const AppState = struct {
         result: ai_harness.RunSlashCommandResult,
     ) void {
         if (!result.handled) {
-            self.setSidebarNotice("Slash command was not handled by this provider.");
+            if (result.notice) |notice| {
+                self.setSidebarNotice(notice);
+            } else {
+                self.setSidebarNotice("Slash command was not handled by this provider.");
+            }
             return;
         }
 
         if (project_index < self.projects.items.len and thread_index < self.projects.items[project_index].threads.items.len) {
+            const thread = &self.projects.items[project_index].threads.items[thread_index];
+            if (result.thread_id) |provider_thread_id| {
+                const changed = thread.provider_thread_id == null or !std.mem.eql(u8, thread.provider_thread_id.?, provider_thread_id);
+                if (changed) {
+                    const owned = self.allocator.dupeZ(u8, provider_thread_id) catch |err| blk: {
+                        log.warn("failed to persist slash command thread id: {s}", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (owned) |next| {
+                        if (thread.provider_thread_id) |old| self.allocator.free(old);
+                        thread.provider_thread_id = next;
+                    }
+                }
+            }
+
             if (result.transcript_title != null or result.transcript_body != null) {
                 const title = result.transcript_title orelse "Provider command";
                 const body = result.transcript_body orelse "Done.";
-                const thread = &self.projects.items[project_index].threads.items[thread_index];
                 self.appendMessageToThread(thread, .system, title, body, null, &.{}) catch |err| {
                     log.warn("failed to append slash command result: {s}", .{@errorName(err)});
                 };

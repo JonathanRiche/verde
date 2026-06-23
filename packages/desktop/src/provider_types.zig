@@ -13,6 +13,8 @@ pub const ProviderSlashCommandId = enum(u8) {
     usage,
     review,
     shell,
+    /// Provider-native slash command selected by its raw `/name` text.
+    custom,
 };
 
 pub const SlashCommandAvailability = enum(u8) {
@@ -212,12 +214,14 @@ pub const RunSlashCommandRequest = struct {
 
 pub const RunSlashCommandResult = struct {
     handled: bool,
+    thread_id: ?[]const u8 = null,
     notice: ?[]const u8 = null,
     transcript_title: ?[]const u8 = null,
     transcript_body: ?[]const u8 = null,
 
     /// Frees allocator-owned strings returned by provider command execution.
     pub fn deinit(self: RunSlashCommandResult, allocator: anytype) void {
+        if (self.thread_id) |value| allocator.free(value);
         if (self.notice) |value| allocator.free(value);
         if (self.transcript_title) |value| allocator.free(value);
         if (self.transcript_body) |value| allocator.free(value);

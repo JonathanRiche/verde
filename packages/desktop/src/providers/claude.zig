@@ -28,8 +28,60 @@ const ActiveProcessState = struct {
 
 var active_process_state: ActiveProcessState = .{};
 
+const CLAUDE_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
+    .{
+        .id = .usage,
+        .name = "/usage",
+        .summary = "Show Claude session cost, token, context, and plan usage estimates.",
+        .usage = "/usage",
+        .requires_thread = false,
+    },
+    .{
+        .id = .compact,
+        .name = "/compact",
+        .summary = "Compact the current Claude Code session context when the SDK exposes the command.",
+        .usage = "/compact [instructions]",
+        .requires_thread = true,
+    },
+    .{
+        .id = .custom,
+        .name = "/code-review",
+        .summary = "Run Claude's code-review skill for the current workspace or instructions.",
+        .usage = "/code-review [instructions]",
+        .requires_thread = false,
+    },
+    .{
+        .id = .custom,
+        .name = "/debug",
+        .summary = "Run Claude's debugging skill with optional symptoms or context.",
+        .usage = "/debug [symptoms]",
+        .requires_thread = false,
+    },
+    .{
+        .id = .custom,
+        .name = "/loop",
+        .summary = "Run Claude's iterative implementation/test loop skill.",
+        .usage = "/loop [goal]",
+        .requires_thread = false,
+    },
+    .{
+        .id = .custom,
+        .name = "/batch",
+        .summary = "Run Claude's batch skill for multi-step or parallelizable work.",
+        .usage = "/batch [goal]",
+        .requires_thread = false,
+    },
+    .{
+        .id = .custom,
+        .name = "/skills",
+        .summary = "List or use Claude skills exposed by the SDK for this project.",
+        .usage = "/skills [query]",
+        .requires_thread = false,
+    },
+};
+
 pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
-    return &.{};
+    return CLAUDE_SLASH_COMMANDS[0..];
 }
 
 pub const Config = struct {
@@ -60,10 +112,32 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         request: provider_types.RunSlashCommandRequest,
     ) !provider_types.RunSlashCommandResult {
-        _ = self;
-        _ = allocator;
-        _ = request;
-        return error.UnsupportedOperation;
+        return switch (request.command) {
+            .usage, .compact, .custom => self.runBridgeSlashCommand(allocator, request),
+            else => error.UnsupportedOperation,
+        };
+    }
+
+    fn runBridgeSlashCommand(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        request: provider_types.RunSlashCommandRequest,
+    ) !provider_types.RunSlashCommandResult {
+        const command_name = slashCommandName(request) orelse return error.UnsupportedOperation;
+        var response = try self.runBridge(.{
+            .provider = "claude",
+            .command = "run_slash_command",
+            .thread_id = request.thread_id,
+            .slash_command = command_name,
+            .raw_text = request.raw_text,
+            .args = request.args,
+            .cwd = if (request.cwd) |cwd| cwd else self.config.cwd,
+            .claude_executable = self.config.claude_executable,
+        }, null);
+        defer response.deinit(self.allocator);
+
+        const result = response.result orelse return error.ClaudeRequestFailed;
+        return slashCommandResultAlloc(allocator, result);
     }
 
     pub fn authState(self: *Client) !provider_types.AuthState {
@@ -564,6 +638,41 @@ fn getOptionalObjectInt(value: std.json.Value, field: []const u8) ?i64 {
     };
 }
 
+fn dupeOptionalObjectString(allocator: std.mem.Allocator, value: std.json.Value, field: []const u8) !?[]u8 {
+    const text = getOptionalObjectString(value, field) orelse return null;
+    return try allocator.dupe(u8, text);
+}
+
+fn slashCommandName(request: provider_types.RunSlashCommandRequest) ?[]const u8 {
+    return switch (request.command) {
+        .usage => "/usage",
+        .compact => "/compact",
+        .custom => slashCommandRoot(request.raw_text),
+        else => null,
+    };
+}
+
+fn slashCommandRoot(raw_text: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, raw_text, " \t\r\n");
+    if (!std.mem.startsWith(u8, text, "/")) return null;
+    const root_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+    if (root_end <= 1) return null;
+    return text[0..root_end];
+}
+
+fn slashCommandResultAlloc(allocator: std.mem.Allocator, value: std.json.Value) !provider_types.RunSlashCommandResult {
+    var result: provider_types.RunSlashCommandResult = .{
+        .handled = getOptionalObjectBool(value, "handled") orelse true,
+    };
+    errdefer result.deinit(allocator);
+
+    result.thread_id = try dupeOptionalObjectString(allocator, value, "thread_id");
+    result.notice = try dupeOptionalObjectString(allocator, value, "notice");
+    result.transcript_title = try dupeOptionalObjectString(allocator, value, "transcript_title");
+    result.transcript_body = try dupeOptionalObjectString(allocator, value, "transcript_body");
+    return result;
+}
+
 fn parseStringArrayField(allocator: std.mem.Allocator, value: std.json.Value, field: []const u8) !?[][:0]const u8 {
     const field_value = getObjectField(value, field) orelse return null;
     if (field_value != .array) return null;
@@ -590,6 +699,35 @@ test "parseRole maps Claude roles" {
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("assistant"));
     try std.testing.expectEqual(provider_types.MessageRole.system, parseRole("system"));
     try std.testing.expectEqual(provider_types.MessageRole.assistant, parseRole("other"));
+}
+
+test "providerSlashCommands exposes Claude usage and compact" {
+    const commands = providerSlashCommands();
+    try std.testing.expectEqual(@as(usize, 7), commands.len);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.usage, commands[0].id);
+    try std.testing.expectEqualStrings("/usage", commands[0].name);
+    try std.testing.expect(!commands[0].requires_thread);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.compact, commands[1].id);
+    try std.testing.expectEqualStrings("/compact", commands[1].name);
+    try std.testing.expect(commands[1].requires_thread);
+    try std.testing.expectEqual(provider_types.ProviderSlashCommandId.custom, commands[2].id);
+    try std.testing.expectEqualStrings("/code-review", commands[2].name);
+}
+
+test "slashCommandResultAlloc duplicates bridge result strings" {
+    const payload =
+        \\{"handled":true,"notice":"Claude usage loaded.","transcript_title":"Usage","transcript_body":"Cost: $0.01"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const result = try slashCommandResultAlloc(std.testing.allocator, parsed.value);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.handled);
+    try std.testing.expectEqualStrings("Claude usage loaded.", result.notice.?);
+    try std.testing.expectEqualStrings("Usage", result.transcript_title.?);
+    try std.testing.expectEqualStrings("Cost: $0.01", result.transcript_body.?);
 }
 
 test "collectImageAttachments preserves multi-image and legacy compatibility" {
