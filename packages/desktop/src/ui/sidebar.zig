@@ -132,13 +132,13 @@ pub fn renderPalette(state: *runtime.AppState, rect: palette.Rect) void {
     } else {
         renderPaletteExpandedSidebar(state, rect);
     }
-    if (state.sidebar_context_menu_open and !state.isSidebarCollapsed()) {
+    if (state.sidebar_context_menu_open) {
         renderSidebarContextMenu(state, rect);
     }
 }
 
 pub fn pointerOverSidebar(x: f32, y: f32) bool {
-    return rectContainsPoint(palette_sidebar_rect, x, y);
+    return rectContainsPoint(palette_sidebar_rect, x, y) or rectContainsPoint(sidebar_menu_panel_rect, x, y);
 }
 
 pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
@@ -187,13 +187,14 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) {
         if (workspace_drag.pending or workspace_drag.active) return finishWorkspaceDrag(state, x, y);
-        return rectContainsPoint(palette_sidebar_rect, x, y);
+        return rectContainsPoint(palette_sidebar_rect, x, y) or (state.sidebar_context_menu_open and rectContainsPoint(sidebar_menu_panel_rect, x, y));
     }
-    if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
 
     if (state.sidebar_context_menu_open and handleSidebarContextMenuPrimary(state, x, y)) {
         return true;
     }
+
+    if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
 
     var index = palette_hit_count;
     while (index > 0) {
@@ -268,7 +269,6 @@ pub const palette_mouse_button_secondary: u8 = 3;
 
 pub fn handlePaletteSecondaryMouseButton(state: *runtime.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
-    if (state.isSidebarCollapsed()) return false;
     if (!rectContainsPoint(palette_sidebar_rect, x, y)) return false;
 
     var index = palette_hit_count;

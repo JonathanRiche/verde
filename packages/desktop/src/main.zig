@@ -1452,6 +1452,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             {
                 state.closeSidebarContextMenu();
             }
+            if (event.button.button == 1 and event.button.down and state.sidebar_context_menu_open and
+                sidebar_ui.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down))
+            {
+                syncWindowTextInput(window, state);
+                return true;
+            }
             if (event.button.down and event.button.button == sidebar_ui.palette_mouse_button_secondary and
                 sidebar_ui.handlePaletteSecondaryMouseButton(state, event.button.x, event.button.y, event.button.down))
             {
