@@ -1796,7 +1796,7 @@ fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, c
             .y = bubble.y + theme.scaledUi(9.0),
             .w = bubble.w - pad_x * 2.0 - dot - theme.scaledUi(10.0),
             .h = theme.scaledUi(18.0),
-        }, "Codex command", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+        }, "Provider command", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
         queueText(state, .{
             .x = bubble.x + pad_x + dot + theme.scaledUi(10.0),
             .y = bubble.y + theme.scaledUi(28.0),
@@ -1964,9 +1964,15 @@ fn shouldHideCursorLifecycleSystemEvent(author: []const u8, body_raw: []const u8
         std.mem.eql(u8, body, "completed");
 }
 
+fn isUsageSummaryBody(body: []const u8, title: []const u8) bool {
+    return std.mem.eql(u8, body, title) or
+        (body.len > title.len and std.mem.startsWith(u8, body, title) and body[title.len] == '\n');
+}
+
 fn isUsageSummaryMessage(author: []const u8, body_raw: []const u8) bool {
     const body = std.mem.trim(u8, body_raw, "\n\r\t ");
-    return std.mem.eql(u8, author, "Usage") and std.mem.startsWith(u8, body, "Codex usage");
+    return std.mem.eql(u8, author, "Usage") and
+        (isUsageSummaryBody(body, "Codex usage") or isUsageSummaryBody(body, "Claude usage"));
 }
 
 /// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
@@ -2202,7 +2208,7 @@ fn renderTranscriptImages(state: *app_state.AppState, column: palette.Rect, y: f
     }
 }
 
-// ----- Codex usage summary card -----
+// ----- Provider usage summary card -----
 
 const UsageLimitRow = struct {
     label: []const u8,
@@ -2232,7 +2238,7 @@ fn parseUsageSummary(body_raw: []const u8) UsageSummary {
     var lines = std.mem.splitScalar(u8, body_raw, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0 or std.mem.eql(u8, line, "Codex usage")) continue;
+        if (line.len == 0 or std.mem.eql(u8, line, "Codex usage") or std.mem.eql(u8, line, "Claude usage")) continue;
         if (std.mem.eql(u8, line, "Limits")) {
             section = .limits;
             continue;
@@ -2318,7 +2324,13 @@ fn usageSummaryHeight(body_raw: []const u8, column_width: f32) f32 {
     return total;
 }
 
-/// Renders the Codex `/usage` transcript row as a structured status card.
+fn usageSummaryTitle(body_raw: []const u8) []const u8 {
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    if (isUsageSummaryBody(body, "Claude usage")) return "Claude usage";
+    return "Codex usage";
+}
+
+/// Renders a provider `/usage` transcript row as a structured status card.
 fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f32, height: f32, body_raw: []const u8, clip: palette.Rect) void {
     const data = parseUsageSummary(body_raw);
     const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
@@ -2329,7 +2341,7 @@ fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f
     const gap = theme.scaledUi(12.0);
     const header_h = theme.scaledUi(54.0);
     var cursor_y = bubble.y + pad;
-    renderUsageHeader(state, bubble, cursor_y, header_h, clip);
+    renderUsageHeader(state, bubble, cursor_y, header_h, usageSummaryTitle(body_raw), clip);
     cursor_y += header_h;
 
     if (data.limit_count > 0) {
@@ -2384,12 +2396,12 @@ fn renderUsageSummaryCard(state: *app_state.AppState, column: palette.Rect, y: f
 }
 
 /// Renders the title/subtitle region for the usage card.
-fn renderUsageHeader(state: *app_state.AppState, bubble: palette.Rect, y: f32, height: f32, clip: palette.Rect) void {
+fn renderUsageHeader(state: *app_state.AppState, bubble: palette.Rect, y: f32, height: f32, title: []const u8, clip: palette.Rect) void {
     const pad = theme.scaledUi(16.0);
     const icon = theme.scaledUi(30.0);
     const icon_rect = palette.Rect{ .x = bubble.x + pad, .y = y + theme.scaledUi(5.0), .w = icon, .h = icon };
     renderUsageHeaderIcon(state, icon_rect, clip);
-    queueChromeLabel(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(3.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(22.0) }, "Codex usage", paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
+    queueChromeLabel(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(3.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(22.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(16.0), clip);
     queueText(state, .{ .x = icon_rect.x + icon + theme.scaledUi(11.0), .y = y + theme.scaledUi(27.0), .w = bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0), .h = theme.scaledUi(18.0) }, "Rate limits, reset windows, and recent token activity", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
     queueRect(state, .{ .x = bubble.x + pad, .y = y + height - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)));
 }

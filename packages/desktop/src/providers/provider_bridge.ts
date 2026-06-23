@@ -379,6 +379,191 @@ function claudeModelDisplayName(model) {
   return version;
 }
 
+function slashName(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  return raw.startsWith("/") ? raw.slice(1).split(/\s+/, 1)[0] : raw.split(/\s+/, 1)[0];
+}
+
+function withSlash(value) {
+  const name = slashName(value);
+  return name ? `/${name}` : "";
+}
+
+function slashPromptFromRequest(request) {
+  const raw = typeof request.raw_text === "string" ? request.raw_text.trim() : "";
+  if (raw.startsWith("/")) return raw;
+  const command = withSlash(request.slash_command);
+  const args = typeof request.args === "string" ? request.args.trim() : "";
+  return args ? `${command} ${args}` : command;
+}
+
+function slashCommandSupported(commands, name) {
+  const target = slashName(name);
+  if (!target) return false;
+  for (const command of Array.isArray(commands) ? commands : []) {
+    if (slashName(command?.name) === target) return true;
+    for (const alias of Array.isArray(command?.aliases) ? command.aliases : []) {
+      if (slashName(alias) === target) return true;
+    }
+  }
+  return false;
+}
+
+function serializeSlashCommand(command) {
+  return {
+    name: withSlash(command?.name),
+    description: typeof command?.description === "string" ? command.description : "",
+    argument_hint: typeof command?.argumentHint === "string" ? command.argumentHint : "",
+    aliases: (Array.isArray(command?.aliases) ? command.aliases : []).map(withSlash).filter(Boolean),
+  };
+}
+
+function formatUsd(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unavailable";
+  if (value === 0) return "$0.00";
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+function formatInteger(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unavailable";
+  return Math.round(value).toLocaleString("en-US");
+}
+
+function formatDurationMs(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unavailable";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  if (value < 60_000) return `${(value / 1000).toFixed(1)}s`;
+  return `${Math.round(value / 60_000)}m ${Math.round((value % 60_000) / 1000)}s`;
+}
+
+function formatPercent(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unavailable";
+  return `${value.toFixed(value < 10 ? 1 : 0)}%`;
+}
+
+function formatPercentLeftFromUtilization(utilization) {
+  if (typeof utilization !== "number" || !Number.isFinite(utilization)) return null;
+  return Math.max(0, Math.min(100, Math.round(100 - utilization)));
+}
+
+function formatResetText(value) {
+  if (typeof value !== "string" || value.length === 0) return "";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return `resets ${value}`;
+  const diffMs = timestamp - Date.now();
+  if (diffMs <= 0) return "resets soon";
+  const totalMinutes = Math.max(1, Math.round(diffMs / 60_000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `resets in ${days}d ${hours}h`;
+  if (hours > 0) return `resets in ${hours}h ${minutes}m`;
+  return `resets in ${minutes}m`;
+}
+
+function addClaudeLimitLine(lines, label, window) {
+  if (!window || typeof window !== "object") return;
+  const left = formatPercentLeftFromUtilization(window.utilization);
+  if (left === null) return;
+  const reset = formatResetText(window.resets_at);
+  lines.push(`• ${label}: ${left}% left${reset ? ` (${reset})` : ""}`);
+}
+
+function addClaudeRateLimitLines(lines, usage) {
+  const limits = usage?.rate_limits;
+  if (!limits || typeof limits !== "object") {
+    if (usage?.rate_limits_available === false) lines.push("• Plan rate limits: unavailable for this Claude account/session type.");
+    return;
+  }
+  const beforeCount = lines.length;
+  addClaudeLimitLine(lines, "Claude 5h", limits.five_hour);
+  addClaudeLimitLine(lines, "Claude weekly", limits.seven_day);
+  addClaudeLimitLine(lines, "Claude Opus weekly", limits.seven_day_opus);
+  addClaudeLimitLine(lines, "Claude Sonnet weekly", limits.seven_day_sonnet);
+  if (lines.length === beforeCount && usage?.rate_limits_available === false) {
+    lines.push("• Plan rate limits: unavailable for this Claude account/session type.");
+  }
+}
+
+function addClaudeExtraUsageSummary(lines, usage) {
+  const extra = usage?.rate_limits?.extra_usage;
+  if (!extra || typeof extra !== "object") return;
+  const used = extra.used_credits ?? "unavailable";
+  const currency = extra.currency ? ` ${extra.currency}` : "";
+  lines.push(`• Extra usage: ${extra.is_enabled ? "enabled" : "disabled"} · ${formatPercent(extra.utilization)} used · ${used}${currency}`);
+}
+
+function addClaudeBehaviorRows(lines, usage) {
+  const behaviors = usage?.behaviors;
+  if (!behaviors || typeof behaviors !== "object") return;
+  const day = behaviors.day;
+  const week = behaviors.week;
+  if (day && typeof day === "object") {
+    lines.push(`• Last 24h: ${formatInteger(day.request_count)} requests · ${formatInteger(day.session_count)} sessions`);
+  }
+  if (week && typeof week === "object") {
+    lines.push(`• Last 7d: ${formatInteger(week.request_count)} requests · ${formatInteger(week.session_count)} sessions`);
+  }
+}
+
+function formatClaudeUsageSummary(usage, contextUsage) {
+  const lines = ["Claude usage", ""];
+
+  const limitLines = [];
+  addClaudeRateLimitLines(limitLines, usage);
+  if (limitLines.length > 0) lines.push("Limits", ...limitLines, "");
+
+  lines.push("Summary");
+
+  const session = usage?.session;
+  if (session && typeof session === "object") {
+    lines.push(`• Session cost estimate: ${formatUsd(session.total_cost_usd)}`);
+    lines.push(`• API duration: ${formatDurationMs(session.total_api_duration_ms)} · wall time ${formatDurationMs(session.total_duration_ms)}`);
+    lines.push(`• Changed lines: +${formatInteger(session.total_lines_added)} / -${formatInteger(session.total_lines_removed)}`);
+  }
+
+  if (contextUsage && typeof contextUsage === "object") {
+    lines.push(`• Context window: ${formatInteger(contextUsage.totalTokens)} / ${formatInteger(contextUsage.maxTokens)} tokens (${formatPercent(contextUsage.percentage)})`);
+    if (typeof contextUsage.model === "string" && contextUsage.model.length > 0) {
+      lines.push(`• Context model: ${contextUsage.model}`);
+    }
+  }
+
+  if (typeof usage?.subscription_type === "string" && usage.subscription_type.length > 0) {
+    lines.push(`• Subscription: ${usage.subscription_type}`);
+  }
+  addClaudeExtraUsageSummary(lines, usage);
+
+  if (!session && !contextUsage) {
+    lines.push("• Status: Claude did not return structured usage data for this session.");
+  }
+  lines.push("• Estimate: SDK costs are not authoritative billing.");
+
+  const behaviorLines = [];
+  addClaudeBehaviorRows(behaviorLines, usage);
+  if (behaviorLines.length > 0) lines.push("", "Recent daily usage", ...behaviorLines);
+  return lines.join("\n");
+}
+
+function formatClaudeCompactSummary(metadata, fallbackText) {
+  const lines = [
+    "Claude thread context compacted.",
+    "",
+    "Future Claude turns will continue from the compacted conversation summary.",
+  ];
+  if (metadata && typeof metadata === "object") {
+    lines.push("", `Trigger: ${metadata.trigger ?? "manual"}`);
+    if (typeof metadata.pre_tokens === "number") lines.push(`Before: ${formatInteger(metadata.pre_tokens)} tokens`);
+    if (typeof metadata.post_tokens === "number") lines.push(`After: ${formatInteger(metadata.post_tokens)} tokens`);
+    if (typeof metadata.duration_ms === "number") lines.push(`Duration: ${formatDurationMs(metadata.duration_ms)}`);
+  }
+  const trimmed = typeof fallbackText === "string" ? fallbackText.trim() : "";
+  if (trimmed) lines.push("", trimmed);
+  return lines.join("\n");
+}
+
 async function loadClaudeSdk() {
   return claudeSdkStatic;
 }
@@ -435,6 +620,139 @@ async function handleClaudeReadThread(sdk, request) {
       text: textFromContent(message?.message?.content ?? message?.content),
     })).filter((message) => message.text),
   });
+}
+
+async function handleClaudeSlashCommands(sdk, request) {
+  const options = { ...buildClaudeOptions(request), maxTurns: 0 };
+  const query = sdk.query({ prompt: "", options });
+  try {
+    const commands = typeof query.supportedCommands === "function"
+      ? await query.supportedCommands()
+      : [];
+    write({
+      type: "result",
+      commands: (commands ?? []).map(serializeSlashCommand).filter((command) => command.name),
+    });
+  } finally {
+    query.close?.();
+  }
+}
+
+async function handleClaudeUsageSlashCommand(sdk, request) {
+  const options = { ...buildClaudeOptions(request), maxTurns: 0 };
+  const query = sdk.query({ prompt: "", options });
+  let usage = null;
+  let contextUsage = null;
+  try {
+    if (typeof query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET === "function") {
+      try {
+        usage = await query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      } catch {
+        usage = null;
+      }
+    }
+    if (typeof query.getContextUsage === "function") {
+      try {
+        contextUsage = await query.getContextUsage();
+      } catch {
+        contextUsage = null;
+      }
+    }
+  } finally {
+    query.close?.();
+  }
+
+  if (usage || contextUsage) {
+    write({
+      type: "result",
+      handled: true,
+      notice: "Claude usage loaded.",
+      transcript_title: "Usage",
+      transcript_body: formatClaudeUsageSummary(usage, contextUsage),
+    });
+    return;
+  }
+
+  await handleClaudeDispatchSlashCommand(sdk, request);
+}
+
+async function handleClaudeDispatchSlashCommand(sdk, request) {
+  const prompt = slashPromptFromRequest(request);
+  const commandName = slashName(prompt);
+  const stderrChunks = [];
+  const options = buildClaudeOptions(request);
+  options.stderr = (data) => {
+    if (typeof data === "string" && data.length > 0) stderrChunks.push(data);
+  };
+
+  const query = sdk.query({ prompt, options });
+  try {
+    const commands = typeof query.supportedCommands === "function"
+      ? await query.supportedCommands()
+      : null;
+    if (!slashCommandSupported(commands, commandName)) {
+      query.close?.();
+      write({
+        type: "result",
+        handled: false,
+        notice: `Claude Code does not expose /${commandName} for this session.`,
+      });
+      return;
+    }
+
+    let sessionId = request.thread_id ?? null;
+    let reply = "";
+    let localOutput = "";
+    let compactMetadata = null;
+
+    for await (const message of query) {
+      if (message?.type === "system" && message?.subtype === "init" && message.session_id) {
+        sessionId = message.session_id;
+        continue;
+      }
+      if (message?.type === "system" && message?.subtype === "compact_boundary") {
+        compactMetadata = message.compact_metadata ?? null;
+        continue;
+      }
+      if (message?.type === "system" && message?.subtype === "local_command_output") {
+        if (typeof message.content === "string") localOutput += message.content;
+        continue;
+      }
+      if (message?.type === "result") {
+        sessionId = message.session_id ?? sessionId;
+        if (typeof message.result === "string") reply = message.result;
+        continue;
+      }
+      const delta = textFromContent(message?.message?.content ?? message?.content);
+      if (message?.type === "assistant" && delta) reply += delta;
+    }
+
+    const outputText = localOutput.trim() || reply.trim();
+    if (commandName === "compact") {
+      write({
+        type: "result",
+        handled: true,
+        thread_id: sessionId,
+        notice: "Claude context compacted.",
+        transcript_title: "Compact",
+        transcript_body: formatClaudeCompactSummary(compactMetadata, outputText),
+      });
+      return;
+    }
+
+    write({
+      type: "result",
+      handled: true,
+      thread_id: sessionId,
+      notice: `Claude /${commandName} completed.`,
+      transcript_title: "Claude command",
+      transcript_body: outputText || `/${commandName} completed.`,
+    });
+  } catch (err) {
+    const stderr = stderrChunks.join("").trim();
+    if (stderr) throw new Error(`${err?.message ?? String(err)}\n${stderr}`);
+    throw err;
+  }
 }
 
 async function handleClaudeSendPrompt(sdk, request) {
@@ -511,6 +829,11 @@ async function dispatchClaude(request) {
       return handleClaudeReadThread(sdk, request);
     case "send_prompt":
       return handleClaudeSendPrompt(sdk, request);
+    case "slash_commands":
+      return handleClaudeSlashCommands(sdk, request);
+    case "run_slash_command":
+      if (slashName(request.slash_command) === "usage") return handleClaudeUsageSlashCommand(sdk, request);
+      return handleClaudeDispatchSlashCommand(sdk, request);
     default:
       throw new Error(`Unknown Claude command: ${request.command}`);
   }
