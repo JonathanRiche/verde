@@ -10420,6 +10420,9 @@ pub const AppState = struct {
         axis: WorkspaceSplitAxis,
         new_after: bool,
     ) !bool {
+        if (provider == .amp) {
+            return try self.openAmpTuiInShellPane(project_index, requested_pane_id, axis, new_after);
+        }
         const defaults = defaultAgentTui(provider) orelse return false;
         if (project_index >= self.projects.items.len) return false;
         self.selected_project_index = project_index;
@@ -10445,6 +10448,63 @@ pub const AppState = struct {
         const process = project.managedProcessByName(name) orelse return false;
         try self.syncDefaultAgentTuiProcess(process, defaults);
         return try self.startManagedProcessInNewPane(project_index, process, requested_pane_id, axis, new_after);
+    }
+
+    fn openAmpTuiInShellPane(
+        self: *AppState,
+        project_index: usize,
+        requested_pane_id: ?WorkspacePaneId,
+        axis: WorkspaceSplitAxis,
+        new_after: bool,
+    ) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        const target_pane_id = requested_pane_id orelse layout.focused_pane_id orelse layout.firstVisiblePaneId() orelse {
+            self.setSidebarNotice("No workspace pane selected.");
+            return false;
+        };
+        const target = layout.paneById(target_pane_id) orelse return false;
+        if (target.minimized) return false;
+
+        const dock_id = self.createProjectTerminalDock(project_index) catch |err| {
+            log.err("failed to allocate Amp terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create Amp TUI terminal.");
+            return false;
+        };
+        project = &self.projects.items[project_index];
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+            log.err("failed to start Amp terminal dock: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to start Amp TUI terminal.");
+            return false;
+        };
+
+        layout = &project.workspace_layout;
+        const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
+            log.err("failed to create Amp terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create Amp TUI pane.");
+            return false;
+        };
+        layout.splitPaneWithLeaf(self.allocator, target_pane_id, new_pane_id, axis, new_after) catch |err| {
+            log.err("failed to split Amp terminal workspace pane: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to split workspace.");
+            return false;
+        };
+        layout.maximized_pane_id = null;
+        dock.visible = false;
+        self.requestTerminalDockFocus(dock_id);
+        _ = self.writeWorkspaceTerminalPaneForProject(project_index, new_pane_id, "amp\r") catch |err| {
+            log.warn("failed to write Amp TUI command: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to launch Amp TUI.");
+            return false;
+        };
+        self.setSidebarNotice("Started Amp TUI.");
+        self.markDirty();
+        return true;
     }
 
     fn syncDefaultAgentTuiProcess(self: *AppState, process: *ManagedProcess, defaults: DefaultAgentTui) !void {
