@@ -734,7 +734,7 @@ async function handleClaudeDispatchSlashCommand(sdk, request) {
         handled: true,
         thread_id: sessionId,
         notice: "Claude context compacted.",
-        transcript_title: "Compact",
+        transcript_title: "Claude /compact",
         transcript_body: formatClaudeCompactSummary(compactMetadata, outputText),
       });
       return;
@@ -745,7 +745,7 @@ async function handleClaudeDispatchSlashCommand(sdk, request) {
       handled: true,
       thread_id: sessionId,
       notice: `Claude /${commandName} completed.`,
-      transcript_title: "Claude command",
+      transcript_title: `Claude /${commandName}`,
       transcript_body: outputText || `/${commandName} completed.`,
     });
   } catch (err) {

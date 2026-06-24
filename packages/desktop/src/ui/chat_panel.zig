@@ -24,6 +24,12 @@ const COMPOSER_TOOLBAR_OVERLAY_Z: i32 = 130;
 const COMPOSER_FOLLOWUP_HINT_Z: i32 = 128;
 /// Draft attachment previews sit above the composer card when they overlap the dock.
 const COMPOSER_DRAFT_IMAGE_Z: i32 = 125;
+/// Pinned queued/steering follow-up card sits above the composer card (z 120)
+/// and draft attachments (125) so the staged prompt stays visible mid-turn.
+const COMPOSER_FOLLOWUP_PIN_Z: i32 = 126;
+/// Height of the pinned follow-up card shown above the composer while a reply
+/// streams and a message is queued/steered. One label line plus two prompt lines.
+const FOLLOWUP_PIN_HEIGHT: f32 = 60.0;
 /// File mention search must sit above composer chrome and toolbar menus.
 const COMPOSER_FILE_SEARCH_Z: i32 = 150;
 /// Must match `PaletteComposerPrompt` `pill_padding_x` in `state.zig` so toolbar glyphs align with label insets.
@@ -212,11 +218,25 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
     else
         0.0;
 
+    // Pin the queued/steered follow-up just above the composer (AMP-TUI style) so
+    // every provider gets a visible "this is waiting to send" affordance, not just
+    // Codex inline steering. Snapshotted once per frame; the prompt copy is freed
+    // at the end of this layout pass after `stableText` has duped it into the frame
+    // arena for the render commands. Hidden once Codex accepts steering inline
+    // (`.sent_inline`), since that prompt then appears in the transcript instead.
+    const followup_pin = state.pendingFollowupSnapshot() catch null;
+    defer if (followup_pin) |fp| state.allocator.free(fp.prompt);
+    const show_followup_pin = if (followup_pin) |fp| fp.state != .sent_inline else false;
+    const followup_reserve = if (show_followup_pin)
+        theme.scaledUi(FOLLOWUP_PIN_HEIGHT) + theme.scaledUi(10.0)
+    else
+        0.0;
+
     const body = palette.Rect{
         .x = rect.x,
         .y = header.y + header.h,
         .w = rect.w,
-        .h = @max(composer_y - (header.y + header.h) - attachment_reserve, theme.scaledUi(120.0)),
+        .h = @max(composer_y - (header.y + header.h) - attachment_reserve - followup_reserve, theme.scaledUi(120.0)),
     };
     const process_strip_height = if (pane_id == null and state.currentProject().managed_processes.items.len > 0)
         theme.scaledUi(52.0)
@@ -289,6 +309,26 @@ pub fn renderWorkspaceAtForPaneWithReserve(state: *app_state.AppState, rect: pal
         renderComposer(state, composer_rect);
     } else {
         renderInactiveComposer(state, composer_rect);
+    }
+
+    // The pin sits above the composer and any draft-image attachments, in the
+    // strip reserved by `followup_reserve`. Bottom edge clears the attachments.
+    if (show_followup_pin) {
+        if (followup_pin) |fp| {
+            const pin_rect = palette.Rect{
+                .x = composer_rect.x,
+                .y = composer_rect.y - attachment_reserve - theme.scaledUi(FOLLOWUP_PIN_HEIGHT) - theme.scaledUi(8.0),
+                .w = composer_rect.w,
+                .h = theme.scaledUi(FOLLOWUP_PIN_HEIGHT),
+            };
+            renderPendingFollowupPin(state, pin_rect, fp, state.currentThread().provider);
+            // Register the hit rect so a double-click can pull it back for editing.
+            state.setFollowupPinRect(pin_rect);
+        } else {
+            state.setFollowupPinRect(null);
+        }
+    } else {
+        state.setFollowupPinRect(null);
     }
     if (terminal_height > 0.0) {
         terminal_panel.renderDockAt(state, .{
@@ -1764,47 +1804,137 @@ fn transcriptContentHeight(state: *app_state.AppState, thread: anytype, width: f
 
 fn transcriptPendingSlashCommandHeight(state: *app_state.AppState, column_width: f32) f32 {
     _ = column_width;
-    if (state.currentThreadPendingSlashCommandLabel() == null) return 0;
-    return theme.scaledUi(52.0) + theme.scaledUi(12.0);
+    if (state.currentThreadPendingSlashCommand() == null) return 0;
+    return theme.scaledUi(66.0) + theme.scaledUi(12.0);
 }
 
 /// Renders a transient in-flight slash-command row after committed transcript messages.
 fn renderPendingSlashCommand(state: *app_state.AppState, column: palette.Rect, content_y: f32, clip: palette.Rect) f32 {
-    const label = state.currentThreadPendingSlashCommandLabel() orelse return content_y;
-    const height = theme.scaledUi(52.0);
+    const details = state.currentThreadPendingSlashCommand() orelse return content_y;
+    const height = theme.scaledUi(66.0);
     if (content_y + height >= column.y and content_y <= column.y + column.h) {
         const bubble = snapRect(palette.Rect{ .x = column.x, .y = content_y, .w = column.w, .h = height });
+        const phase = animationPhase(1_250_000_000);
+        const pulse = 0.5 + 0.5 * std.math.sin(phase * std.math.tau);
+        const border_alpha: u8 = @intFromFloat(135.0 + pulse * 95.0);
         queueRoundedShellClipped(
             state,
             bubble,
             paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 245)),
-            paletteColor(theme.withAlpha(theme.COLOR_GREEN, 150)),
+            paletteColor(theme.withAlpha(theme.COLOR_GREEN, border_alpha)),
             transcriptBubbleCornerRadius(),
             clip,
         );
 
         const pad_x = theme.scaledUi(14.0);
-        const dot = theme.scaledUi(8.0);
-        queueRounded(state, .{
-            .x = bubble.x + pad_x,
-            .y = bubble.y + (bubble.h - dot) * 0.5,
-            .w = dot,
-            .h = dot,
-        }, paletteColor(theme.COLOR_GREEN), dot * 0.5);
+        const provider_label = utils.providerLabel(details.provider);
+        var title_buf: [72]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "{s} slash command", .{provider_label}) catch "Provider slash command";
+        var main_buf: [128]u8 = undefined;
+        const main_label = std.fmt.bufPrint(&main_buf, "Running {s}", .{details.display_name}) catch "Running command";
+        var elapsed_buf: [32]u8 = undefined;
+        const elapsed = formatElapsedDuration(&elapsed_buf, details.started_at_ms);
+
+        const status_dia = theme.scaledUi(10.0);
+        const status_cx = bubble.x + pad_x + status_dia * 0.5;
+        const status_cy = bubble.y + theme.scaledUi(32.0);
+        queueRoundedClipped(state, .{
+            .x = status_cx - status_dia,
+            .y = status_cy - status_dia,
+            .w = status_dia * 2.0,
+            .h = status_dia * 2.0,
+        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(35.0 + pulse * 55.0))), status_dia, clip);
+        queueRoundedClipped(state, .{
+            .x = status_cx - status_dia * 0.5,
+            .y = status_cy - status_dia * 0.5,
+            .w = status_dia,
+            .h = status_dia,
+        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, @intFromFloat(180.0 + pulse * 60.0))), status_dia * 0.5, clip);
+
+        const text_x = bubble.x + pad_x + status_dia * 2.0 + theme.scaledUi(12.0);
+        const right_w = theme.scaledUi(96.0);
+        const text_right = bubble.x + bubble.w - pad_x - right_w;
         queueChromeLabel(state, .{
-            .x = bubble.x + pad_x + dot + theme.scaledUi(10.0),
+            .x = text_x,
             .y = bubble.y + theme.scaledUi(9.0),
-            .w = bubble.w - pad_x * 2.0 - dot - theme.scaledUi(10.0),
+            .w = @max(text_right - text_x, theme.scaledUi(40.0)),
             .h = theme.scaledUi(18.0),
-        }, "Provider command", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+        }, title, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
         queueText(state, .{
-            .x = bubble.x + pad_x + dot + theme.scaledUi(10.0),
-            .y = bubble.y + theme.scaledUi(28.0),
-            .w = bubble.w - pad_x * 2.0 - dot - theme.scaledUi(10.0),
+            .x = text_x,
+            .y = bubble.y + theme.scaledUi(29.0),
+            .w = @max(text_right - text_x, theme.scaledUi(40.0)),
             .h = theme.scaledUi(18.0),
-        }, label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+        }, main_label, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.0), clip);
+        queueChromeLabel(state, .{
+            .x = bubble.x + bubble.w - pad_x - right_w,
+            .y = bubble.y + theme.scaledUi(10.0),
+            .w = right_w,
+            .h = theme.scaledUi(18.0),
+        }, elapsed, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), clip);
+
+        renderPendingSlashCommandDots(state, .{
+            .x = bubble.x + bubble.w - pad_x - right_w,
+            .y = bubble.y + theme.scaledUi(34.0),
+            .w = right_w,
+            .h = theme.scaledUi(14.0),
+        }, phase, clip);
+
+        const rail_h = theme.scaledUi(3.0);
+        const rail = palette.Rect{
+            .x = bubble.x + pad_x,
+            .y = bubble.y + bubble.h - theme.scaledUi(8.0),
+            .w = bubble.w - pad_x * 2.0,
+            .h = rail_h,
+        };
+        queueRoundedClipped(state, rail, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 170)), rail_h * 0.5, clip);
+        const segment_w = @max(rail.w * 0.26, theme.scaledUi(56.0));
+        const segment_x = rail.x + @max(rail.w - segment_w, 0.0) * phase;
+        queueRoundedClipped(state, .{
+            .x = segment_x,
+            .y = rail.y,
+            .w = @min(segment_w, rail.w),
+            .h = rail.h,
+        }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 220)), rail_h * 0.5, clip);
     }
     return content_y + height + theme.scaledUi(12.0);
+}
+
+fn animationPhase(period_ns: i128) f32 {
+    const t_ns: i128 = profiler.nowNs();
+    return @as(f32, @floatFromInt(@mod(t_ns, period_ns))) / @as(f32, @floatFromInt(period_ns));
+}
+
+fn formatElapsedDuration(buf: []u8, started_at_ms: i64) []const u8 {
+    const now_ms = unixTimestampMs();
+    const elapsed_ms = @max(now_ms - @max(started_at_ms, 0), 0);
+    const total_seconds: u64 = @intCast(@divTrunc(elapsed_ms, std.time.ms_per_s));
+    const hours = total_seconds / 3600;
+    const minutes = (total_seconds / 60) % 60;
+    const seconds = total_seconds % 60;
+
+    if (hours > 0) {
+        return std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ hours, minutes, seconds }) catch "0:00";
+    }
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ minutes, seconds }) catch "0:00";
+}
+
+/// Renders the animated activity dots on the in-flight slash-command row.
+fn renderPendingSlashCommandDots(state: *app_state.AppState, rect: palette.Rect, phase: f32, clip: palette.Rect) void {
+    const dot = theme.scaledUi(5.0);
+    const gap = theme.scaledUi(8.0);
+    const total_w = dot * 3.0 + gap * 2.0;
+    var x = rect.x + @max(rect.w - total_w, 0.0);
+    const y = rect.y + (rect.h - dot) * 0.5;
+    var index: usize = 0;
+    while (index < 3) : (index += 1) {
+        const offset = @as(f32, @floatFromInt(index)) / 3.0;
+        const local = @mod(phase + offset, 1.0);
+        const wave = 0.5 + 0.5 * std.math.sin(local * std.math.tau);
+        const alpha: u8 = @intFromFloat(85.0 + wave * 155.0);
+        queueRoundedClipped(state, .{ .x = x, .y = y, .w = dot, .h = dot }, paletteColor(theme.withAlpha(theme.COLOR_GREEN, alpha)), dot * 0.5, clip);
+        x += dot + gap;
+    }
 }
 
 fn transcriptPendingStreamHeight(state: *app_state.AppState, thread: *const app_state.ChatThread, column_width: f32) f32 {
@@ -1975,6 +2105,22 @@ fn isUsageSummaryMessage(author: []const u8, body_raw: []const u8) bool {
         (isUsageSummaryBody(body, "Codex usage") or isUsageSummaryBody(body, "Claude usage"));
 }
 
+fn isSlashCommandResultMessage(author: []const u8, body_raw: []const u8) bool {
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    if (body.len == 0) return false;
+    if (std.mem.eql(u8, author, "Shell")) {
+        return std.mem.startsWith(u8, body, "Command:\n") and
+            (std.mem.indexOf(u8, body, "\n\nOutput:") != null or
+                std.mem.indexOf(u8, body, "\n\nNo output captured.") != null);
+    }
+    if (std.mem.eql(u8, author, "Claude command")) return true;
+    if (std.mem.startsWith(u8, author, "Claude /")) return true;
+    if (std.mem.startsWith(u8, author, "Codex /")) return true;
+    return std.mem.eql(u8, author, "Review") or
+        std.mem.eql(u8, author, "Goal") or
+        std.mem.eql(u8, author, "Compact");
+}
+
 /// Label shown after `>_` in the compact command row (Codex-native titles preserved; Cursor/shell-like bodies default to "Ran command").
 fn paletteCommandRowDisplayAuthor(original_author: []const u8, body_raw: []const u8) []const u8 {
     if (isCommandSystemEvent(original_author)) return original_author;
@@ -2073,6 +2219,9 @@ fn transcriptMessageHeightStream(
     assistant_plain_layout: bool,
     streaming: bool,
 ) f32 {
+    if (role == .system and isSlashCommandResultMessage(message_author, body_raw)) {
+        return slashCommandResultHeight(state, message_index, body_raw, column_width);
+    }
     if (role == .system and shouldRenderPaletteCommandRow(message_author, body_raw)) {
         return transcriptCommandEventHeight(state, message_index, body_raw, column_width);
     }
@@ -2141,6 +2290,10 @@ fn queueRoundedShellClipped(
 }
 
 fn renderTranscriptMessage(state: *app_state.AppState, thread: *const app_state.ChatThread, column: palette.Rect, y: f32, height: f32, message: app_state.ChatMessage, clip: palette.Rect, message_index: usize) void {
+    if (message.role == .system and isSlashCommandResultMessage(message.author, message.body)) {
+        renderSlashCommandResultCard(state, column, y, height, message.author, message.body, clip, message_index);
+        return;
+    }
     if (message.role == .system and shouldRenderPaletteCommandRow(message.author, message.body)) {
         renderCommandEventRow(state, column, y, height, message.author, message.body, clip, message_index, thread.backgroundCommandIsRunning(message.body));
         return;
@@ -2466,6 +2619,111 @@ fn usagePercentColor(percent_left: i64) [4]f32 {
     if (percent_left >= 50) return theme.COLOR_GREEN;
     if (percent_left >= 20) return theme.COLOR_YELLOW;
     return theme.COLOR_DIFF_REMOVE;
+}
+
+// ----- Provider slash-command result card -----
+
+fn slashCommandResultHeight(state: ?*app_state.AppState, message_index: ?usize, body_raw: []const u8, column_width: f32) f32 {
+    const pad = theme.scaledUi(16.0);
+    const header_h = theme.scaledUi(46.0);
+    const gap = theme.scaledUi(12.0);
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const body_inner_width = @max(column_width - pad * 2.0, theme.scaledUi(80.0));
+    const font_size = theme.scaledUi(TRANSCRIPT_MARKDOWN_FONT_SIZE);
+
+    const measured = blk: {
+        if (state) |app| {
+            if (message_index) |index| {
+                if (app.transcriptMarkdownBodyView(index, body)) |view| {
+                    break :blk chat_markdown.measureBodyHeight(view.*, body_inner_width, markdownOptions(font_size));
+                }
+            }
+        }
+        var view = chat_markdown.buildBodyView(std.heap.page_allocator, body) catch {
+            const chars_per_line = @max(@as(usize, @intFromFloat(body_inner_width / (font_size * 0.52))), 1);
+            const line_count = wrappedLineCount(body, chars_per_line);
+            break :blk @as(f32, @floatFromInt(line_count)) * font_size * 1.38;
+        };
+        defer view.deinit(std.heap.page_allocator);
+        break :blk chat_markdown.measureBodyHeight(view, body_inner_width, markdownOptions(font_size));
+    };
+
+    return pad + header_h + gap + measured + pad;
+}
+
+/// Renders a completed provider slash-command result with assistant-style Markdown output.
+fn renderSlashCommandResultCard(
+    state: *app_state.AppState,
+    column: palette.Rect,
+    y: f32,
+    height: f32,
+    author: []const u8,
+    body_raw: []const u8,
+    clip: palette.Rect,
+    message_index: usize,
+) void {
+    const bubble = snapRect(palette.Rect{ .x = column.x, .y = y, .w = column.w, .h = height });
+    queueRoundedShellClipped(
+        state,
+        bubble,
+        paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)),
+        paletteColor(theme.withAlpha(theme.COLOR_GREEN, 135)),
+        transcriptBubbleCornerRadius(),
+        clip,
+    );
+
+    const pad = theme.scaledUi(16.0);
+    const header_h = theme.scaledUi(46.0);
+    const icon = theme.scaledUi(30.0);
+    const icon_rect = palette.Rect{ .x = bubble.x + pad, .y = bubble.y + pad + theme.scaledUi(3.0), .w = icon, .h = icon };
+    renderSlashCommandResultIcon(state, icon_rect, clip);
+
+    const pill_w = theme.scaledUi(84.0);
+    const title_x = icon_rect.x + icon + theme.scaledUi(11.0);
+    const title_w = @max(bubble.w - pad * 2.0 - icon - theme.scaledUi(11.0) - pill_w - theme.scaledUi(10.0), theme.scaledUi(40.0));
+    queueChromeLabel(state, .{
+        .x = title_x,
+        .y = bubble.y + pad + theme.scaledUi(1.0),
+        .w = title_w,
+        .h = theme.scaledUi(22.0),
+    }, author, paletteColor(theme.COLOR_WHITE), theme.scaledUi(15.5), clip);
+    queueText(state, .{
+        .x = title_x,
+        .y = bubble.y + pad + theme.scaledUi(25.0),
+        .w = title_w,
+        .h = theme.scaledUi(18.0),
+    }, "Slash command output", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.5), clip);
+
+    const pill = palette.Rect{ .x = bubble.x + bubble.w - pad - pill_w, .y = bubble.y + pad + theme.scaledUi(8.0), .w = pill_w, .h = theme.scaledUi(24.0) };
+    queueRoundedClipped(state, pill, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 48)), pill.h * 0.5, clip);
+    queueChromeLabel(state, .{
+        .x = pill.x + theme.scaledUi(10.0),
+        .y = pill.y + theme.scaledUi(4.0),
+        .w = pill.w - theme.scaledUi(20.0),
+        .h = theme.scaledUi(16.0),
+    }, "completed", paletteColor(theme.COLOR_GREEN), theme.scaledUi(11.5), clip);
+
+    queueRect(state, .{ .x = bubble.x + pad, .y = bubble.y + pad + header_h - 1.0, .w = bubble.w - pad * 2.0, .h = 1.0 }, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 180)));
+
+    const body = std.mem.trim(u8, body_raw, "\n\r\t ");
+    const body_y = bubble.y + pad + header_h + theme.scaledUi(12.0);
+    renderMarkdownBody(state, message_index, .{
+        .x = bubble.x + pad,
+        .y = body_y,
+        .w = bubble.w - pad * 2.0,
+        .h = @max(bubble.y + bubble.h - body_y - pad, theme.scaledUi(1.0)),
+    }, body, clip, false);
+}
+
+/// Renders the slash glyph used in completed provider-command result cards.
+fn renderSlashCommandResultIcon(state: *app_state.AppState, rect: palette.Rect, clip: palette.Rect) void {
+    queueRoundedClipped(state, rect, paletteColor(theme.withAlpha(theme.COLOR_GREEN, 42)), rect.w * 0.5, clip);
+    queueChromeLabel(state, .{
+        .x = rect.x,
+        .y = rect.y + theme.scaledUi(2.0),
+        .w = rect.w,
+        .h = rect.h,
+    }, "/", paletteColor(theme.COLOR_GREEN), theme.scaledUi(18.0), clip);
 }
 
 // ----- Diff summary card -----
@@ -3622,6 +3880,90 @@ fn renderComposerFollowupHint(state: *app_state.AppState) void {
         .w = label_w,
         .h = font,
     }, hint, paletteColor(theme.COLOR_TEXT_MUTED), font, clip);
+}
+
+/// Returns the short status label shown at the top of the pinned follow-up card.
+fn pendingFollowupPinLabel(
+    kind: app_state.FollowupKind,
+    fstate: app_state.FollowupState,
+    provider: app_state.Provider,
+) []const u8 {
+    if (fstate == .fallback_next_turn) return "Sends after the current reply";
+    return switch (kind) {
+        .queue => "Queued \u{00B7} sends after this reply",
+        .steer => switch (provider) {
+            .codex => "Steering \u{00B7} waiting for Codex to accept",
+            else => "Steering current turn",
+        },
+    };
+}
+
+/// Renders the pinned follow-up card above the composer. Mirrors the AMP TUI:
+/// the queued/steered prompt stays pinned ("waiting to send") for every provider
+/// until it is dispatched as the next turn (or accepted inline by Codex, which
+/// removes the pin and shows it in the transcript instead). Reuses the amber tint
+/// of the transcript steering bubble (`COLOR_YELLOW`) for visual continuity.
+fn renderPendingFollowupPin(
+    state: *app_state.AppState,
+    rect: palette.Rect,
+    followup: app_state.PendingFollowup,
+    provider: app_state.Provider,
+) void {
+    const previous_z = state.palette_overlay_batch.setZIndex(COMPOSER_FOLLOWUP_PIN_Z);
+    defer state.palette_overlay_batch.restoreZIndex(previous_z);
+
+    const radius = theme.scaledUi(11.0);
+    queuePanel(
+        state,
+        rect,
+        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 54)),
+        paletteColor(theme.withAlpha(theme.COLOR_YELLOW, 150)),
+        radius,
+        @max(theme.scaledUi(1.0), 1.0),
+    );
+
+    const pad_x = theme.scaledUi(14.0);
+    const inner_w = @max(rect.w - pad_x * 2.0, theme.scaledUi(1.0));
+
+    const label = pendingFollowupPinLabel(followup.kind, followup.state, provider);
+    const label_font = theme.scaledUi(12.0);
+
+    // Right-aligned "note" hinting the double-click edit affordance. Hidden on
+    // narrow cards so it never collides with the status label on the left.
+    const note = "Double-click to edit";
+    const note_font = theme.scaledUi(11.0);
+    const note_w = @as(f32, @floatFromInt(note.len)) * note_font * 0.52;
+    const label_room = if (rect.w >= theme.scaledUi(360.0)) inner_w - note_w - theme.scaledUi(10.0) else inner_w;
+
+    queueText(state, .{
+        .x = rect.x + pad_x,
+        .y = rect.y + theme.scaledUi(8.0),
+        .w = @max(label_room, theme.scaledUi(1.0)),
+        .h = label_font + theme.scaledUi(2.0),
+    }, label, paletteColor(theme.lighten(theme.COLOR_YELLOW, 0.18)), label_font, rect);
+
+    if (rect.w >= theme.scaledUi(360.0)) {
+        queueText(state, .{
+            .x = rect.x + rect.w - pad_x - note_w,
+            .y = rect.y + theme.scaledUi(9.0),
+            .w = note_w,
+            .h = note_font + theme.scaledUi(2.0),
+        }, note, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 220)), note_font, rect);
+    }
+
+    // Preview only the first line so the pinned card stays compact; the renderer
+    // truncates to the available width for us.
+    const prompt = if (std.mem.findScalar(u8, followup.prompt, '\n')) |nl|
+        followup.prompt[0..nl]
+    else
+        followup.prompt;
+    const body_font = theme.scaledUi(14.0);
+    queueText(state, .{
+        .x = rect.x + pad_x,
+        .y = rect.y + theme.scaledUi(26.0),
+        .w = inner_w,
+        .h = @max(rect.h - theme.scaledUi(30.0), body_font),
+    }, prompt, paletteColor(theme.COLOR_WHITE), body_font, rect);
 }
 
 fn snapIconRectOrigin(rect: palette.Rect) palette.Rect {

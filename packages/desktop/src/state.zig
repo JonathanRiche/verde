@@ -1561,8 +1561,17 @@ const SlashCommandState = struct {
     thread_index: usize = 0,
     provider: Provider = .codex,
     command: ai_harness.ProviderSlashCommandId = .usage,
+    display_name: ?[]u8 = null,
+    started_at_ms: i64 = 0,
     result: ?ai_harness.RunSlashCommandResult = null,
     error_message: ?[]u8 = null,
+};
+
+pub const PendingSlashCommandDetails = struct {
+    provider: Provider,
+    command: ai_harness.ProviderSlashCommandId,
+    display_name: []const u8,
+    started_at_ms: i64,
 };
 
 const SlashCommandWorkerRequest = struct {
@@ -3533,6 +3542,10 @@ pub const AppState = struct {
     composer_draft_image_clear_count: usize,
     composer_draft_image_clear_rects: [16]palette.Rect,
     composer_draft_image_clear_indices: [16]usize,
+    /// Hit rect of the pinned queued/steered follow-up card (above the composer).
+    /// Double-clicking it pulls the queued prompt back into the composer to edit.
+    followup_pin_valid: bool,
+    followup_pin_rect: palette.Rect,
     composer_overlay_scroll_y: f32,
     composer_overlay_follow_cursor: bool,
     composer_overlay_last_cursor_pos: usize,
@@ -3778,6 +3791,8 @@ pub const AppState = struct {
             .composer_draft_image_clear_count = 0,
             .composer_draft_image_clear_rects = [_]palette.Rect{.{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 }} ** 16,
             .composer_draft_image_clear_indices = [_]usize{0} ** 16,
+            .followup_pin_valid = false,
+            .followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_overlay_scroll_y = 0.0,
             .composer_overlay_follow_cursor = true,
             .composer_overlay_last_cursor_pos = 0,
@@ -5534,7 +5549,7 @@ pub const AppState = struct {
         thread.clearDraftImage(self.allocator);
         self.resetComposerInputWidget();
         self.setSidebarNotice(switch (kind) {
-            .queue => "Queued for the next OpenCode turn.",
+            .queue => "Queued. Sends after the current reply.",
             .steer => "Steer queued. Waiting for Codex to accept it.",
         });
     }
@@ -10839,6 +10854,9 @@ pub const AppState = struct {
         }
         self.slash_command_state.mutex.unlock();
 
+        const command_display_name = try page_alloc.dupe(u8, command.name);
+        errdefer page_alloc.free(command_display_name);
+
         const request = try page_alloc.create(SlashCommandWorkerRequest);
         errdefer page_alloc.destroy(request);
         request.* = .{
@@ -10867,13 +10885,21 @@ pub const AppState = struct {
             result.deinit(page_alloc);
             self.slash_command_state.result = null;
         }
+        if (self.slash_command_state.display_name) |name| {
+            page_alloc.free(name);
+            self.slash_command_state.display_name = null;
+        }
         self.slash_command_state.project_index = project_index;
         self.slash_command_state.thread_index = thread_index;
         self.slash_command_state.provider = thread.provider;
         self.slash_command_state.command = command.id;
+        self.slash_command_state.display_name = command_display_name;
+        self.slash_command_state.started_at_ms = unixTimestampMs();
         self.slash_command_state.status = .pending;
         self.slash_command_state.worker = std.Thread.spawn(.{}, slashCommandWorker, .{ &self.slash_command_state, request }) catch |err| {
             self.slash_command_state.status = .idle;
+            self.slash_command_state.display_name = null;
+            self.slash_command_state.started_at_ms = 0;
             return err;
         };
 
@@ -12411,6 +12437,74 @@ pub const AppState = struct {
         }
     }
 
+    /// Records the pinned follow-up card hit rect for this frame (or clears it).
+    /// Called from the chat workspace render so mouse routing can target the pin.
+    pub fn setFollowupPinRect(self: *AppState, rect: ?palette.Rect) void {
+        if (rect) |value| {
+            self.followup_pin_valid = true;
+            self.followup_pin_rect = value;
+        } else {
+            self.followup_pin_valid = false;
+            self.followup_pin_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+        }
+    }
+
+    /// Routes a click on the pinned follow-up card. A double-click (clicks >= 2)
+    /// pulls the queued prompt back into the composer for editing; a single click
+    /// is swallowed so it does not fall through to the composer/transcript.
+    pub fn handleFollowupPinMouseButton(self: *AppState, x: f32, y: f32, down: bool, clicks: u8) bool {
+        if (!self.followup_pin_valid) return false;
+        const rect = self.followup_pin_rect;
+        if (x < rect.x or y < rect.y or x > rect.x + rect.w or y > rect.y + rect.h) return false;
+        if (down and clicks >= 2) self.editPendingFollowup();
+        return true;
+    }
+
+    /// Pulls the queued/steered follow-up back into the composer so a long-waiting
+    /// queued message can be revised. Removes the pin (it is no longer queued); the
+    /// user re-queues with Tab or sends normally. Refuses to clobber an in-progress
+    /// draft, and ignores Codex steering already accepted inline (`.sent_inline`).
+    pub fn editPendingFollowup(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        const thread = self.currentThreadMutable();
+        const send_state = thread.send_state;
+
+        send_state.mutex.lock();
+        const pending = send_state.pending_followup orelse {
+            send_state.mutex.unlock();
+            return;
+        };
+        if (pending.state == .sent_inline) {
+            send_state.mutex.unlock();
+            return;
+        }
+
+        const current = thread.currentDraft();
+        if (std.mem.trim(u8, current, &std.ascii.whitespace).len != 0) {
+            send_state.mutex.unlock();
+            self.setSidebarNotice("Clear the composer to edit the queued message.");
+            return;
+        }
+
+        const prompt_copy = self.allocator.dupe(u8, pending.prompt) catch {
+            send_state.mutex.unlock();
+            self.setSidebarNotice("Failed to load the queued message.");
+            return;
+        };
+        defer self.allocator.free(prompt_copy);
+        freePendingFollowup(self.allocator, &send_state.pending_followup);
+        send_state.pending_followup_signal_sent = false;
+        send_state.mutex.unlock();
+
+        self.setDraft(prompt_copy);
+        self.resetComposerInputWidget();
+        self.palette_composer.focused = true;
+        self.composer_focused = true;
+        self.setFollowupPinRect(null);
+        self.markDirty();
+        self.setSidebarNotice("Editing queued message. Press Tab to queue it again.");
+    }
+
     pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
         if (!self.composer_draft_image_clear_valid) return false;
         var i: usize = self.composer_draft_image_clear_count;
@@ -13383,6 +13477,7 @@ pub const AppState = struct {
     pub fn pollSlashCommand(self: *AppState) bool {
         var result: ?ai_harness.RunSlashCommandResult = null;
         var error_message: ?[]u8 = null;
+        var display_name: ?[]u8 = null;
         var project_index: usize = 0;
         var thread_index: usize = 0;
         var next_status: SlashCommandStatus = .idle;
@@ -13392,6 +13487,9 @@ pub const AppState = struct {
             .completed => {
                 result = self.slash_command_state.result;
                 self.slash_command_state.result = null;
+                display_name = self.slash_command_state.display_name;
+                self.slash_command_state.display_name = null;
+                self.slash_command_state.started_at_ms = 0;
                 project_index = self.slash_command_state.project_index;
                 thread_index = self.slash_command_state.thread_index;
                 self.slash_command_state.status = .idle;
@@ -13400,6 +13498,9 @@ pub const AppState = struct {
             .failed => {
                 error_message = self.slash_command_state.error_message;
                 self.slash_command_state.error_message = null;
+                display_name = self.slash_command_state.display_name;
+                self.slash_command_state.display_name = null;
+                self.slash_command_state.started_at_ms = 0;
                 project_index = self.slash_command_state.project_index;
                 thread_index = self.slash_command_state.thread_index;
                 self.slash_command_state.status = .idle;
@@ -13411,6 +13512,9 @@ pub const AppState = struct {
 
         if (next_status != .idle) {
             self.finishSlashCommandThread();
+        }
+        if (display_name) |name| {
+            std.heap.page_allocator.free(name);
         }
 
         switch (next_status) {
@@ -13433,7 +13537,7 @@ pub const AppState = struct {
         return next_status != .idle;
     }
 
-    pub fn currentThreadPendingSlashCommandLabel(self: *AppState) ?[]const u8 {
+    pub fn currentThreadPendingSlashCommand(self: *AppState) ?PendingSlashCommandDetails {
         if (self.projects.items.len == 0) return null;
         const project_index = self.selected_project_index;
         const thread_index = self.currentProject().selected_thread_index;
@@ -13443,13 +13547,30 @@ pub const AppState = struct {
         if (self.slash_command_state.status != .pending) return null;
         if (self.slash_command_state.project_index != project_index or self.slash_command_state.thread_index != thread_index) return null;
 
-        return switch (self.slash_command_state.provider) {
-            .claude => switch (self.slash_command_state.command) {
+        return .{
+            .provider = self.slash_command_state.provider,
+            .command = self.slash_command_state.command,
+            .display_name = self.slash_command_state.display_name orelse slashCommandFallbackName(self.slash_command_state.command),
+            .started_at_ms = self.slash_command_state.started_at_ms,
+        };
+    }
+
+    pub fn hasPendingSlashCommand(self: *AppState) bool {
+        self.slash_command_state.mutex.lock();
+        defer self.slash_command_state.mutex.unlock();
+        return self.slash_command_state.status == .pending;
+    }
+
+    pub fn currentThreadPendingSlashCommandLabel(self: *AppState) ?[]const u8 {
+        const details = self.currentThreadPendingSlashCommand() orelse return null;
+
+        return switch (details.provider) {
+            .claude => switch (details.command) {
                 .usage => "Loading Claude usage...",
                 .compact => "Compacting Claude thread context...",
                 else => "Running Claude command...",
             },
-            .codex => switch (self.slash_command_state.command) {
+            .codex => switch (details.command) {
                 .usage => "Loading Codex usage...",
                 .goal => "Updating Codex goal...",
                 .compact => "Compacting Codex thread context...",
@@ -14091,7 +14212,7 @@ pub const AppState = struct {
             self.requestTranscriptScrollToBottom();
         }
         self.setSidebarNotice(switch (followup.kind) {
-            .queue => "Queued OpenCode message sent.",
+            .queue => "Queued message sent.",
             .steer => "Codex follow-up sent as a new turn.",
         });
     }
@@ -14130,8 +14251,11 @@ pub const AppState = struct {
         self.slash_command_state.mutex.lock();
         const maybe_result = self.slash_command_state.result;
         const maybe_error = self.slash_command_state.error_message;
+        const maybe_display_name = self.slash_command_state.display_name;
         self.slash_command_state.result = null;
         self.slash_command_state.error_message = null;
+        self.slash_command_state.display_name = null;
+        self.slash_command_state.started_at_ms = 0;
         self.slash_command_state.status = .idle;
         self.slash_command_state.mutex.unlock();
 
@@ -14140,6 +14264,9 @@ pub const AppState = struct {
         }
         if (maybe_error) |message| {
             std.heap.page_allocator.free(message);
+        }
+        if (maybe_display_name) |name| {
+            std.heap.page_allocator.free(name);
         }
     }
 
@@ -14790,6 +14917,17 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
         },
     };
     return allocator.dupe(u8, message);
+}
+
+fn slashCommandFallbackName(command: ai_harness.ProviderSlashCommandId) []const u8 {
+    return switch (command) {
+        .usage => "/usage",
+        .goal => "/goal",
+        .compact => "/compact",
+        .review => "/review",
+        .shell => "/shell",
+        .custom => "/command",
+    };
 }
 
 fn syncThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {

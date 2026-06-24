@@ -74,6 +74,9 @@ const PIP_PULSE_WAIT_TIMEOUT_MS: c_int = 33;
 // even when no streamed tokens or input events arrive. Streamed tokens wake
 // the loop immediately via loop_wakeup; this is only the fallback heartbeat.
 const PENDING_SEND_WAIT_TIMEOUT_MS: c_int = 250;
+// In-flight provider slash commands currently complete as one bridge result
+// rather than token streaming, so the transcript row owns its liveness cue.
+const SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS: c_int = 33;
 // Detached shell tasks only need coarse liveness checks. A 1s wake keeps
 // completion rows prompt without turning idle background work into animation.
 const BACKGROUND_TASK_WAIT_TIMEOUT_MS: c_int = 1000;
@@ -1098,6 +1101,7 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         workspace_panes_ui.isFocusAnimating() or
         workspace_panes_ui.isCompletionPulseAnimating() or
         ui_layout.isSidebarAnimating() or
+        state.hasPendingSlashCommand() or
         // Pulsing sidebar status pips need a steady tick or the sine wave
         // gets sampled at the 1Hz "Working" label cadence and looks steppy.
         state.sidebar_pulse_animating;
@@ -1117,6 +1121,7 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
     // label to tick. pollSend bumps once per whole second; this just caps
     // the SDL wait so we actually reach pollSend before that second elapses.
     if (state.pending_send_count > 0) return PENDING_SEND_WAIT_TIMEOUT_MS;
+    if (state.hasPendingSlashCommand()) return SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS;
     if (state.hasRunningBackgroundTasks()) return BACKGROUND_TASK_WAIT_TIMEOUT_MS;
     return IDLE_WAIT_TIMEOUT_MS;
 }
@@ -1502,6 +1507,10 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 return true;
             }
             if (event.button.button == 1 and state.handleComposerDraftImageClearMouseButton(event.button.x, event.button.y, event.button.down)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            if (event.button.button == 1 and state.handleFollowupPinMouseButton(event.button.x, event.button.y, event.button.down, event.button.clicks)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
