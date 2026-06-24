@@ -21,6 +21,8 @@ pub const NativeKeyboardAction = enum {
     chat_down,
     chat_page_up,
     chat_page_down,
+    workspace_previous,
+    workspace_next,
     workspace_split_chat_vertical,
     workspace_split_chat_horizontal,
     workspace_split_terminal_vertical,
@@ -121,6 +123,8 @@ pub const NativeKeyboardConfig = struct {
     chat_down: []Keybind,
     chat_page_up: []Keybind,
     chat_page_down: []Keybind,
+    workspace_previous: []Keybind,
+    workspace_next: []Keybind,
     terminal_new_tab: []Keybind,
     terminal_close_active: []Keybind,
     terminal_rename_tab: []Keybind,
@@ -172,6 +176,8 @@ pub const NativeKeyboardConfig = struct {
             .chat_down = try cloneDefaultChatDownKeybinds(allocator),
             .chat_page_up = try cloneDefaultChatPageUpKeybinds(allocator),
             .chat_page_down = try cloneDefaultChatPageDownKeybinds(allocator),
+            .workspace_previous = try cloneDefaultWorkspacePreviousKeybinds(allocator),
+            .workspace_next = try cloneDefaultWorkspaceNextKeybinds(allocator),
             .terminal_new_tab = try cloneDefaultTerminalNewTabKeybinds(allocator),
             .terminal_close_active = try cloneDefaultTerminalCloseActiveKeybinds(allocator),
             .terminal_rename_tab = try cloneDefaultTerminalRenameTabKeybinds(allocator),
@@ -234,6 +240,8 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.chat_down);
         self.allocator.free(self.chat_page_up);
         self.allocator.free(self.chat_page_down);
+        self.allocator.free(self.workspace_previous);
+        self.allocator.free(self.workspace_next);
         self.allocator.free(self.terminal_new_tab);
         self.allocator.free(self.terminal_close_active);
         self.allocator.free(self.terminal_rename_tab);
@@ -309,6 +317,12 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.chat_page_down, event)) {
             return .chat_page_down;
+        }
+        if (matchesAny(self.workspace_previous, event)) {
+            return .workspace_previous;
+        }
+        if (matchesAny(self.workspace_next, event)) {
+            return .workspace_next;
         }
         if (matchesAny(self.workspace_split_chat_vertical, event)) {
             return .workspace_split_chat_vertical;
@@ -765,6 +779,18 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_select = bindings;
             }
         }
+        if (workspace_value.object.get("previous")) |value| {
+            if (self.parseOverrideValue(value, "workspace.previous")) |bindings| {
+                self.allocator.free(self.workspace_previous);
+                self.workspace_previous = bindings;
+            }
+        }
+        if (workspace_value.object.get("next")) |value| {
+            if (self.parseOverrideValue(value, "workspace.next")) |bindings| {
+                self.allocator.free(self.workspace_next);
+                self.workspace_next = bindings;
+            }
+        }
     }
 
     fn parseOverrideValue(self: *const NativeKeyboardConfig, value: std.json.Value, comptime field_name: []const u8) ?[]Keybind {
@@ -1002,29 +1028,37 @@ fn cloneDefaultTerminalFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybi
 
 fn cloneDefaultWorkspaceFocusLeftKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Alt+Left"),
         try parseDefaultAccelerator("Ctrl+H"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusRightKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Alt+Right"),
         try parseDefaultAccelerator("Ctrl+L"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusUpKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Alt+Up"),
         try parseDefaultAccelerator("Ctrl+K"),
     });
 }
 
 fn cloneDefaultWorkspaceFocusDownKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
-        try parseDefaultAccelerator("Alt+Down"),
         try parseDefaultAccelerator("Ctrl+J"),
+    });
+}
+
+fn cloneDefaultWorkspacePreviousKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Up"),
+    });
+}
+
+fn cloneDefaultWorkspaceNextKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Alt+Down"),
     });
 }
 
@@ -1526,33 +1560,38 @@ test "default workspace close supports primary w and alt x" {
     try std.testing.expectEqual(sdl.Keycode.x, config.workspace_close[1].key);
 }
 
-test "default workspace focus supports alt arrows and ctrl hjkl" {
+test "default workspace focus supports ctrl hjkl without alt arrows" {
     var config = try NativeKeyboardConfig.load(std.testing.allocator);
     defer config.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_left.len);
-    try std.testing.expect(config.workspace_focus_left[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.left, config.workspace_focus_left[0].key);
-    try std.testing.expect(config.workspace_focus_left[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[1].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_left.len);
+    try std.testing.expect(config.workspace_focus_left[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.h, config.workspace_focus_left[0].key);
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_down.len);
-    try std.testing.expect(config.workspace_focus_down[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_focus_down[0].key);
-    try std.testing.expect(config.workspace_focus_down[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[1].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_down.len);
+    try std.testing.expect(config.workspace_focus_down[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.j, config.workspace_focus_down[0].key);
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_up.len);
-    try std.testing.expect(config.workspace_focus_up[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_focus_up[0].key);
-    try std.testing.expect(config.workspace_focus_up[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[1].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_up.len);
+    try std.testing.expect(config.workspace_focus_up[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.k, config.workspace_focus_up[0].key);
 
-    try std.testing.expectEqual(@as(usize, 2), config.workspace_focus_right.len);
-    try std.testing.expect(config.workspace_focus_right[0].alt);
-    try std.testing.expectEqual(sdl.Keycode.right, config.workspace_focus_right[0].key);
-    try std.testing.expect(config.workspace_focus_right[1].ctrl);
-    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[1].key);
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_focus_right.len);
+    try std.testing.expect(config.workspace_focus_right[0].ctrl);
+    try std.testing.expectEqual(sdl.Keycode.l, config.workspace_focus_right[0].key);
+}
+
+test "default workspace traversal uses alt up and down" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_previous.len);
+    try std.testing.expect(config.workspace_previous[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.up, config.workspace_previous[0].key);
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_next.len);
+    try std.testing.expect(config.workspace_next[0].alt);
+    try std.testing.expectEqual(sdl.Keycode.down, config.workspace_next[0].key);
 }
 
 test "default workspace prompt and move keybinds are configurable actions" {

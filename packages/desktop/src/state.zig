@@ -4853,6 +4853,14 @@ pub const AppState = struct {
         return true;
     }
 
+    pub fn selectAdjacentProject(self: *AppState, direction: isize) bool {
+        if (self.projects.items.len == 0 or direction == 0) return false;
+        const len: isize = @intCast(self.projects.items.len);
+        const current: isize = @intCast(self.selected_project_index);
+        const next: usize = @intCast(@mod(current + direction, len));
+        return self.selectProjectAtIndex(next);
+    }
+
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.projects.items.len) return;
         if (self.show_project_creator) self.cancelProjectImport();
