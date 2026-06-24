@@ -1220,7 +1220,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             // Pane-level bindings must stay app-owned even when a native webview
             // or embedded terminal has keyboard focus.
             if (action) |resolved_workspace_action| {
-                if (isWorkspacePaneAction(resolved_workspace_action)) {
+                if (isWorkspacePaneAction(resolved_workspace_action) or isWorkspaceTraversalAction(resolved_workspace_action)) {
                     noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
                     handleKeyboardAction(state, keyboard, resolved_workspace_action);
                     syncWindowTextInput(window, state);
@@ -1962,6 +1962,8 @@ fn handleKeyboardAction(
         .chat_page_down => if (canHandleTranscriptScrollAction(state)) {
             state.requestTranscriptPageScroll(1);
         },
+        .workspace_previous => _ = state.selectAdjacentProject(-1),
+        .workspace_next => _ = state.selectAdjacentProject(1),
         .workspace_split_chat_vertical => _ = openHotkeyWorkspacePane(state, .chat, .vertical),
         .workspace_split_chat_horizontal => _ = openHotkeyWorkspacePane(state, .chat, .horizontal),
         .workspace_split_terminal_vertical => _ = openHotkeyWorkspacePane(state, .terminal, .vertical),
@@ -2005,6 +2007,15 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
         .workspace_toggle_maximize,
         .workspace_minimize,
         .workspace_close,
+        => true,
+        else => false,
+    };
+}
+
+fn isWorkspaceTraversalAction(action: keybinds.NativeKeyboardAction) bool {
+    return switch (action) {
+        .workspace_previous,
+        .workspace_next,
         => true,
         else => false,
     };
