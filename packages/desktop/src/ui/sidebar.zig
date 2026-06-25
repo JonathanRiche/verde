@@ -1173,10 +1173,10 @@ fn renderOpenPaneRow(
                 status = s.status;
                 if (s.status == .working) running = true;
             }
-            // Detect a running agent (Claude/Codex/etc.) from the surface
+            // Detect a running agent (Claude/Codex/Amp/etc.) from the surface
             // provider or the foreground process name, and draw a split
             // provider+terminal glyph for it; otherwise a plain terminal glyph.
-            var agent_provider: ?Provider = if (surface) |s| s.provider else null;
+            var agent_provider: ?TerminalAgentProvider = if (surface) |s| terminalAgentProviderFromProvider(s.provider) else null;
             if (agent_provider == null) {
                 if (state.projectTerminalDock(project_index, ref.dock_id)) |dock| {
                     // Live foreground process when running, else the provider
@@ -1184,7 +1184,7 @@ fn renderOpenPaneRow(
                     // available before the agent process is revived).
                     if (dock.activeForegroundProcessName(&comm_buf)) |comm| agent_provider = providerFromComm(comm);
                     if (agent_provider == null) {
-                        if (dock.activeTabPinnedProvider()) |name| agent_provider = std.meta.stringToEnum(Provider, name);
+                        if (dock.activeTabPinnedProvider()) |name| agent_provider = std.meta.stringToEnum(TerminalAgentProvider, name);
                     }
                 }
             }
@@ -1653,7 +1653,7 @@ pub fn formatRelativeTime(buffer: []u8, timestamp: i64) []const u8 {
 
 pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, clip: palette.Rect) void {
     const image_size = theme.scaledUi(SIDEBAR_THREAD_PROVIDER_GLYPH_CSS);
-    queuePaletteProviderGlyphInRect(state, provider, .{
+    queuePaletteProviderGlyphInRect(state, terminalAgentProviderFromProvider(provider).?, .{
         .x = x,
         .y = center_y - image_size * 0.5,
         .w = image_size,
@@ -1661,13 +1661,31 @@ pub fn queuePaletteProviderGlyph(state: *runtime.AppState, provider: Provider, x
     }, clip);
 }
 
+const TerminalAgentProvider = enum {
+    codex,
+    opencode,
+    claude,
+    cursor,
+    amp,
+};
+
+fn terminalAgentProviderFromProvider(provider: ?Provider) ?TerminalAgentProvider {
+    return switch (provider orelse return null) {
+        .codex => .codex,
+        .opencode => .opencode,
+        .claude => .claude,
+        .cursor => .cursor,
+    };
+}
+
 /// Draws a provider logo (or letter fallback) fitted within `box`.
-fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: Provider, box: palette.Rect, clip: ?palette.Rect) void {
+fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: TerminalAgentProvider, box: palette.Rect, clip: ?palette.Rect) void {
     const texture = switch (provider) {
         .codex => state.codex_logo_texture,
         .opencode => state.opencode_logo_texture,
         .claude => state.claude_logo_texture,
         .cursor => state.cursor_logo_texture,
+        .amp => state.amp_logo_texture,
     };
     if (texture) |cached| {
         const r = utils.snapImageRectToPixels(utils.imageRectContain(cached.width, cached.height, box.x, box.y, box.w, box.h));
@@ -1680,30 +1698,33 @@ fn queuePaletteProviderGlyphInRect(state: *runtime.AppState, provider: Provider,
         .opencode => "O",
         .claude => "Cl",
         .cursor => "Cu",
+        .amp => "A",
     };
     const font_size = @min(theme.scaledUi(11.0), box.h);
+    const color = if (provider == .amp) theme.COLOR_YELLOW else theme.COLOR_TEXT_SUBTLE;
     queuePaletteText(state, .{
         .x = box.x,
         .y = box.y + (box.h - font_size * 1.25) * 0.5,
         .w = box.w,
         .h = font_size * 1.25,
-    }, label, paletteColor(theme.COLOR_TEXT_SUBTLE), font_size, clip);
+    }, label, paletteColor(color), font_size, clip);
 }
 
 /// Maps a foreground process `comm` name to a known agent provider, so a
 /// terminal pane running e.g. `claude` shows that provider's split icon.
-fn providerFromComm(comm: []const u8) ?Provider {
+fn providerFromComm(comm: []const u8) ?TerminalAgentProvider {
     if (std.mem.eql(u8, comm, "claude")) return .claude;
     if (std.mem.eql(u8, comm, "codex")) return .codex;
     if (std.mem.eql(u8, comm, "opencode")) return .opencode;
     if (std.mem.startsWith(u8, comm, "cursor")) return .cursor;
+    if (std.mem.eql(u8, comm, "amp")) return .amp;
     return null;
 }
 
 /// Composite glyph for an agent running in a terminal pane: the provider logo
 /// sits in the upper-left, a font-safe `>_` prompt mark in the lower-right, and
 /// a diagonal slash divides them.
-fn queuePaletteAgentTerminalGlyph(state: *runtime.AppState, provider: Provider, x: f32, center_y: f32, term_color: [4]f32, clip: palette.Rect) void {
+fn queuePaletteAgentTerminalGlyph(state: *runtime.AppState, provider: TerminalAgentProvider, x: f32, center_y: f32, term_color: [4]f32, clip: palette.Rect) void {
     // Provider logo, then a `>_` prompt — laid out horizontally and vertically
     // centered. Kept deliberately simple (no diagonal/divider primitives) so it
     // renders cleanly at sidebar size.

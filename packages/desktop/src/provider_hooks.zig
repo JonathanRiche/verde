@@ -281,6 +281,9 @@ const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
 const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
 const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "Stop" };
 
+const AMP_GLOBAL_PLUGIN_REL = ".config/amp/plugins/verde-notify.ts";
+const AMP_GLOBAL_PLUGIN_NEEDLE = "verde-amp-notify-plugin";
+
 fn homeDir() ?[]const u8 {
     const ptr = std.c.getenv("HOME") orelse return null;
     return std.mem.span(ptr);
@@ -424,6 +427,105 @@ pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
     defer if (updated) |u| allocator.free(u);
     if (updated) |u| try writeFileAtomic(allocator, io, hooks_path, u, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
+}
+
+/// True when our managed Amp plugin is present in the global Amp plugin dir.
+pub fn ampGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
+    const home = homeDir() orelse return false;
+    const plugin_path = std.fs.path.join(allocator, &.{ home, AMP_GLOBAL_PLUGIN_REL }) catch return false;
+    defer allocator.free(plugin_path);
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const content = std.Io.Dir.cwd().readFileAlloc(threaded.io(), plugin_path, allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, AMP_GLOBAL_PLUGIN_NEEDLE) != null;
+}
+
+/// Installs the Amp notify integration globally. Amp exposes lifecycle hooks via
+/// TypeScript plugins rather than Claude/Codex-style JSON hook settings, so this
+/// writes one managed plugin under ~/.config/amp/plugins.
+pub fn ensureAmpGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const plugin_path = try std.fs.path.join(allocator, &.{ home, AMP_GLOBAL_PLUGIN_REL });
+    defer allocator.free(plugin_path);
+
+    try ensureParentDir(io, plugin_path);
+    try writeAmpPlugin(allocator, io, plugin_path);
+}
+
+/// Removes the managed Amp notify plugin. Idempotent.
+pub fn removeAmpGlobalHooks(allocator: std.mem.Allocator) !void {
+    const home = homeDir() orelse return error.NoHomeDir;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+
+    const plugin_path = try std.fs.path.join(allocator, &.{ home, AMP_GLOBAL_PLUGIN_REL });
+    defer allocator.free(plugin_path);
+    std.Io.Dir.cwd().deleteFile(threaded.io(), plugin_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const plugin =
+        \\// verde-amp-notify-plugin
+        \\import type { PluginAPI } from '@ampcode/plugin';
+        \\
+        \\function inVerdePane(): boolean {
+        \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
+        \\}
+        \\
+        \\function titleFromMessage(message: unknown): string | undefined {
+        \\  if (typeof message !== 'string') return undefined;
+        \\  const title = message.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 72);
+        \\  return title.length > 0 ? title : undefined;
+        \\}
+        \\
+        \\function verdeCli(): string {
+        \\  const raw = process.env.VERDE_CLI || 'verde';
+        \\  // Linux appends this marker when /proc/self/exe points at a binary
+        \\  // replaced by a rebuild while Verde is still running.
+        \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
+        \\}
+        \\
+        \\async function notify(amp: PluginAPI, shell: PluginAPI['$'], status: 'idle' | 'working' | 'done' | 'waiting' | 'error', title?: string): Promise<void> {
+        \\  if (!inVerdePane()) return;
+        \\  const cli = verdeCli();
+        \\  try {
+        \\    if (title) {
+        \\      await shell`${cli} notify --quiet --status ${status} --title ${title}`;
+        \\    } else {
+        \\      await shell`${cli} notify --quiet --status ${status}`;
+        \\    }
+        \\  } catch (err) {
+        \\    // Best-effort only: Amp should never fail because Verde is absent.
+        \\    amp.logger.log(`Verde notify failed: ${err instanceof Error ? err.message : String(err)}`);
+        \\  }
+        \\}
+        \\
+        \\export default function (amp: PluginAPI) {
+        \\  amp.logger.log('Verde notify plugin initialized');
+        \\
+        \\  amp.on('session.start', async (_event, ctx) => {
+        \\    await notify(amp, ctx.$, 'idle', 'Amp');
+        \\  });
+        \\
+        \\  amp.on('agent.start', async (event, ctx) => {
+        \\    await notify(amp, ctx.$, 'working', titleFromMessage(event?.message) ?? 'Amp');
+        \\  });
+        \\
+        \\  amp.on('agent.end', async (event, ctx) => {
+        \\    await notify(amp, ctx.$, event?.status === 'error' ? 'error' : 'done', 'Amp');
+        \\  });
+        \\}
+        \\
+    ;
+    try writeFileAtomic(allocator, io, path, plugin, .default_file);
 }
 
 fn codexMatcherEntry(arena: std.mem.Allocator, hook_path: []const u8, status_message: []const u8) !std.json.Value {

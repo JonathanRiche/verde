@@ -20,6 +20,7 @@ pub const Control = enum(u8) {
     open_zed,
     hooks_claude,
     hooks_codex,
+    hooks_amp,
     notifications_toggle,
 };
 
@@ -102,6 +103,7 @@ const SettingsLayout = struct {
     integrations_card: palette.Rect,
     hooks_claude: palette.Rect,
     hooks_codex: palette.Rect,
+    hooks_amp: palette.Rect,
     integrations_hint_y: f32,
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
@@ -172,8 +174,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const appearance_h = m.labeledBlockH(2);
     const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
-    // Title, field label, two toggle rows (Claude + Codex), hint.
-    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // Title, field label, three toggle rows (Claude + Codex + Amp), hint.
+    const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
 
@@ -274,7 +276,9 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const hooks_claude: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_claude_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const hooks_codex_y = hooks_claude_y + m.row_h + m.inner_gap;
     const hooks_codex: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_codex_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
-    const integrations_hint_y = hooks_codex_y + m.row_h + m.inner_gap;
+    const hooks_amp_y = hooks_codex_y + m.row_h + m.inner_gap;
+    const hooks_amp: palette.Rect = .{ .x = integrations_card.x + m.card_pad, .y = hooks_amp_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const integrations_hint_y = hooks_amp_y + m.row_h + m.inner_gap;
 
     y += integrations_h + m.card_gap;
 
@@ -307,6 +311,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .integrations_card = integrations_card,
         .hooks_claude = hooks_claude,
         .hooks_codex = hooks_codex,
+        .hooks_amp = hooks_amp,
         .integrations_hint_y = integrations_hint_y,
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
@@ -362,6 +367,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     }
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
+    queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
 }
 
@@ -425,12 +431,14 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawToggleCell(state, layout.hooks_claude, if (claude_on) "Claude  ·  Enabled" else "Claude  ·  Disabled", claude_on, isControlHovered(state, .hooks_claude), layout.body_clip);
     const codex_on = state.settings_hook_codex_installed;
     drawToggleCell(state, layout.hooks_codex, if (codex_on) "Codex  ·  Enabled" else "Codex  ·  Disabled", codex_on, isControlHovered(state, .hooks_codex), layout.body_clip);
+    const amp_on = state.settings_hook_amp_installed;
+    drawToggleCell(state, layout.hooks_amp, if (amp_on) "Amp  ·  Enabled" else "Amp  ·  Disabled", amp_on, isControlHovered(state, .hooks_amp), layout.body_clip);
     queueText(state, .{
         .x = layout.integrations_card.x + m.card_pad,
         .y = layout.integrations_hint_y,
         .w = layout.integrations_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "Writes hooks to ~/.claude & ~/.codex · merges, no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
+    }, "Writes hooks/plugins globally · no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     // Notifications
     drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
@@ -520,6 +528,10 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         },
         .hooks_codex => {
             state.toggleCodexGlobalHooks();
+            return;
+        },
+        .hooks_amp => {
+            state.toggleAmpGlobalHooks();
             return;
         },
         // Draft toggle: persisted to verde.json on Save, like the other fields.

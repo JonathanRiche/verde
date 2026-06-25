@@ -653,6 +653,7 @@ const IntegrationProvider = struct {
 const integration_providers = [_]IntegrationProvider{
     .{ .name = "claude", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Claude Code hooks are supported through project-local .claude/settings.local.json when enabled for a Verde session." },
     .{ .name = "codex", .hook_state = "project-local", .installable = true, .installed = false, .reason = "Codex hooks are supported through project-local .codex/hooks.json when enabled for a Verde session." },
+    .{ .name = "amp", .hook_state = "global-plugin", .installable = true, .installed = false, .reason = "Amp lifecycle events are supported through a global ~/.config/amp/plugins/verde-notify.ts plugin." },
     .{ .name = "opencode", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
     .{ .name = "cursor", .hook_state = "unsupported", .installable = false, .installed = false, .reason = "No stable documented hook installer is enabled in Verde yet." },
 };
@@ -663,13 +664,14 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             \\Usage:
             \\  verde integrations list [--json]
             \\  verde integrations doctor [--json]
-            \\  verde integrations install <claude|codex|opencode|cursor> [--global]
-            \\  verde integrations remove <claude|codex|opencode|cursor> [--global]
-            \\  verde integrations disable <claude|codex|opencode|cursor>
+            \\  verde integrations install <claude|codex|amp|opencode|cursor> [--global]
+            \\  verde integrations remove <claude|codex|amp|opencode|cursor> [--global]
+            \\  verde integrations disable <claude|codex|amp|opencode|cursor>
             \\
             \\  --global installs Claude/Codex hooks in ~/.claude/settings.json or
-            \\  ~/.codex/hooks.json for all projects (merged, preserving existing
-            \\  hooks; no-op outside Verde panes); otherwise hooks are project-local.
+            \\  ~/.codex/hooks.json, and installs Amp's plugin in ~/.config/amp/plugins
+            \\  for all projects (no-op outside Verde panes); otherwise supported hooks
+            \\  are project-local where the provider supports that.
             \\
             \\Provider hooks are optional. Verde does not overwrite provider config
             \\or change provider login/auth behavior.
@@ -740,6 +742,25 @@ fn handleIntegrations(allocator: std.mem.Allocator, out: output.Output, argv: []
             try out.stdout("verde integrations {s} codex --global: removed global Codex hooks from ~/.codex/hooks.json\n", .{command});
             return;
         }
+        if (global and std.mem.eql(u8, provider.name, "amp")) {
+            provider_hooks.removeAmpGlobalHooks(allocator) catch |err| {
+                try out.stderr("verde integrations {s} amp --global: {s}\n", .{ command, @errorName(err) });
+                std.process.exit(1);
+            };
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = command,
+                    .installed = false,
+                    .changed = true,
+                    .status = "removed",
+                    .scope = "global",
+                });
+                return;
+            }
+            try out.stdout("verde integrations {s} amp --global: removed global Amp plugin from ~/.config/amp/plugins/verde-notify.ts\n", .{command});
+            return;
+        }
         try printIntegrationNoInstalledHook(allocator, out, json, command, provider);
         return;
     }
@@ -761,7 +782,7 @@ fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json:
             .providers = integration_providers[0..],
             .policy = .{
                 .writes_config = true,
-                .writes_project_config_only = true,
+                .writes_project_config_only = false,
                 .requires_verde_env = true,
                 .changes_auth = false,
             },
@@ -783,7 +804,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
             .verde_env = std.mem.eql(u8, verde_env, "1"),
             .has_terminal_identity = has_identity,
             .providers = integration_providers[0..],
-            .summary = "Claude and Codex project-local hooks are available; other providers currently use generic verde notify, OSC, and MCP paths.",
+            .summary = "Claude/Codex hooks and the Amp global plugin are available; other providers currently use generic verde notify, OSC, and MCP paths.",
         });
         return;
     }
@@ -791,7 +812,7 @@ fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, jso
         \\Integration doctor:
         \\  VERDE=1: {s}
         \\  terminal identity: {s}
-        \\  hook installers: claude, codex project-local
+        \\  hook installers: claude, codex project-local/global; amp global plugin
         \\  generic paths: verde notify, OSC 777 notify, MCP surface tools
         \\
     , .{
@@ -892,6 +913,37 @@ fn installIntegration(allocator: std.mem.Allocator, out: output.Output, json: bo
             return;
         }
         try out.stdout("verde integrations install codex --global: merged global Codex hooks into ~/.codex/hooks.json\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, provider.name, "amp") and global) {
+        provider_hooks.ensureAmpGlobalHooks(allocator) catch |err| {
+            if (json) {
+                try out.jsonValue(allocator, .{
+                    .provider = provider.name,
+                    .action = "install",
+                    .installed = false,
+                    .status = "error",
+                    .scope = "global",
+                    .reason = @errorName(err),
+                });
+                return;
+            }
+            try out.stderr("verde integrations install amp --global: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .provider = provider.name,
+                .action = "install",
+                .installed = true,
+                .status = "installed",
+                .scope = "global",
+                .path = "~/.config/amp/plugins/verde-notify.ts",
+            });
+            return;
+        }
+        try out.stdout("verde integrations install amp --global: installed global Amp plugin in ~/.config/amp/plugins/verde-notify.ts\n", .{});
         return;
     }
 

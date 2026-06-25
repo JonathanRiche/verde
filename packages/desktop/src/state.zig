@@ -829,6 +829,7 @@ pub const VERDE_LOGO_BYTES = @embedFile("assets/verde_logo_mask.png");
 pub const OPENCODE_LOGO_BYTES = @embedFile("assets/opencode-logo-dark.png");
 pub const CODEX_LOGO_BYTES = @embedFile("assets/OpenAI-white-monoblossom.png");
 pub const CLAUDE_LOGO_BYTES = @embedFile("assets/claude-logo.png");
+pub const AMP_LOGO_BYTES = @embedFile("assets/amp-logo.png");
 pub const THREAD_EDIT_BYTES = @embedFile("assets/thread_edit.png");
 pub const CURSOR_LOGO_BYTES = @embedFile("assets/editor_logos/cursor.png");
 pub const EMACS_LOGO_BYTES = @embedFile("assets/editor_logos/emacs.png");
@@ -3615,6 +3616,7 @@ pub const AppState = struct {
     opencode_logo_texture: ?CachedImageTexture,
     codex_logo_texture: ?CachedImageTexture,
     claude_logo_texture: ?CachedImageTexture,
+    amp_logo_texture: ?CachedImageTexture,
     thread_edit_texture: ?CachedImageTexture,
     cursor_logo_texture: ?CachedImageTexture,
     emacs_logo_texture: ?CachedImageTexture,
@@ -3652,6 +3654,7 @@ pub const AppState = struct {
     settings_draft: SettingsDraft,
     settings_hook_claude_installed: bool,
     settings_hook_codex_installed: bool,
+    settings_hook_amp_installed: bool,
     settings_scroll_y: f32,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
@@ -3851,6 +3854,7 @@ pub const AppState = struct {
             .opencode_logo_texture = null,
             .codex_logo_texture = null,
             .claude_logo_texture = null,
+            .amp_logo_texture = null,
             .thread_edit_texture = null,
             .cursor_logo_texture = null,
             .emacs_logo_texture = null,
@@ -3878,6 +3882,7 @@ pub const AppState = struct {
             .settings_draft = .{},
             .settings_hook_claude_installed = false,
             .settings_hook_codex_installed = false,
+            .settings_hook_amp_installed = false,
             .settings_scroll_y = 0.0,
             .settings_hover_control = null,
             .settings_close_hovered = false,
@@ -3974,6 +3979,7 @@ pub const AppState = struct {
             state.opencode_logo_texture = state.loadEmbeddedTexture(OPENCODE_LOGO_BYTES);
             state.codex_logo_texture = state.loadEmbeddedTexture(CODEX_LOGO_BYTES);
             state.claude_logo_texture = state.loadEmbeddedTexture(CLAUDE_LOGO_BYTES);
+            state.amp_logo_texture = state.loadEmbeddedTexture(AMP_LOGO_BYTES);
             state.thread_edit_texture = state.loadEmbeddedTexture(THREAD_EDIT_BYTES);
             state.cursor_logo_texture = state.loadEmbeddedTexture(CURSOR_LOGO_BYTES);
             state.emacs_logo_texture = state.loadEmbeddedTexture(EMACS_LOGO_BYTES);
@@ -6269,6 +6275,7 @@ pub const AppState = struct {
         self.syncSettingsDraftFromConfig();
         self.settings_hook_claude_installed = provider_hooks.claudeGlobalHooksInstalled(self.allocator);
         self.settings_hook_codex_installed = provider_hooks.codexGlobalHooksInstalled(self.allocator);
+        self.settings_hook_amp_installed = provider_hooks.ampGlobalHooksInstalled(self.allocator);
         self.settings_scroll_y = 0.0;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
@@ -6326,6 +6333,32 @@ pub const AppState = struct {
             };
             self.settings_hook_codex_installed = true;
             self.setSidebarNotice("Enabled global Codex status hooks.");
+        }
+        self.markDirty();
+    }
+
+    /// Installs or removes the global Amp notify plugin and refreshes the
+    /// settings toggle state. Acts immediately (filesystem side effect), like
+    /// the Claude/Codex toggles.
+    pub fn toggleAmpGlobalHooks(self: *AppState) void {
+        if (self.settings_hook_amp_installed) {
+            provider_hooks.removeAmpGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to remove global Amp hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not remove Amp hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_amp_installed = false;
+            self.setSidebarNotice("Disabled global Amp status hooks.");
+        } else {
+            provider_hooks.ensureAmpGlobalHooks(self.allocator) catch |err| {
+                log.warn("failed to install global Amp hooks: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Could not install Amp hooks.");
+                self.markDirty();
+                return;
+            };
+            self.settings_hook_amp_installed = true;
+            self.setSidebarNotice("Enabled global Amp status hooks.");
         }
         self.markDirty();
     }
@@ -7233,6 +7266,10 @@ pub const AppState = struct {
         if (self.claude_logo_texture) |cached| {
             cached.deinit();
             self.claude_logo_texture = null;
+        }
+        if (self.amp_logo_texture) |cached| {
+            cached.deinit();
+            self.amp_logo_texture = null;
         }
         if (self.thread_edit_texture) |cached| {
             cached.deinit();
