@@ -207,7 +207,7 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\
         \\status=""
         \\case "$event" in
-        \\  SessionStart) status="working" ;;
+        \\  SessionStart) status="idle" ;;
         \\  UserPromptSubmit) status="working" ;;
         \\  Notification)
         \\    # Claude fires Notification for both permission requests and the
@@ -223,6 +223,9 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\esac
         \\
         \\cli="${VERDE_CLI:-verde}"
+        \\case "$cli" in
+        \\  *" (deleted)") cli="${cli% (deleted)}" ;;
+        \\esac
         \\if ! command -v "$cli" >/dev/null 2>&1; then
         \\  if [ -x "./zig-out/bin/verde" ]; then
         \\    cli="./zig-out/bin/verde"

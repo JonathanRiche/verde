@@ -1375,7 +1375,7 @@ fn paneStatusColor(status: ?native_state.SurfaceStatus, running: bool) ?[4]f32 {
             .working => theme.COLOR_SECONDARY_GREEN,
             .waiting => theme.COLOR_YELLOW,
             .@"error" => theme.COLOR_DIFF_REMOVE,
-            .done => theme.COLOR_TEXT_SUBTLE,
+            .done => null,
             .idle => if (running) theme.COLOR_SECONDARY_GREEN else null,
         };
     }
