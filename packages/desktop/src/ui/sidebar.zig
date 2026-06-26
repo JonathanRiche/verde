@@ -927,7 +927,6 @@ fn workspaceStatusColor(state: *runtime.AppState, project_index: usize) ?[4]f32 
     for (project.workspace_layout.panes.items) |pane| {
         switch (pane.ref) {
             .terminal => |ref| {
-                if (state.isFocusedTerminalSurface(project_index, ref.dock_id)) continue;
                 if (state.projectTerminalSurface(project_index, ref.dock_id)) |surface| {
                     switch (surface.status) {
                         .@"error" => return theme.COLOR_DIFF_REMOVE,
@@ -1241,19 +1240,16 @@ fn renderOpenPaneRow(
         .h = title_line,
     }, shown, paletteColor(title_color), title_font, clip);
 
-    // No status pip on the pane you're focused in — you're already there.
-    if (!focused) {
-        if (paneStatusColor(status, running)) |pip_color| {
-            const animated = running or (if (status) |s| s == .waiting else false);
-            const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
-            const dot = theme.scaledUi(7.0);
-            queuePaletteRoundedRect(state, .{
-                .x = rect.x + rect.w - theme.scaledUi(10.0),
-                .y = cy - dot * 0.5,
-                .w = dot,
-                .h = dot,
-            }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
-        }
+    if (paneStatusColor(status, running)) |pip_color| {
+        const animated = running or (if (status) |s| s == .waiting else false);
+        const pulse: f32 = if (animated) attentionPulse(state) else 1.0;
+        const dot = theme.scaledUi(7.0);
+        queuePaletteRoundedRect(state, .{
+            .x = rect.x + rect.w - theme.scaledUi(15.0),
+            .y = cy - dot * 0.5,
+            .w = dot,
+            .h = dot,
+        }, paletteColor(theme.withAlpha(pip_color, @intFromFloat(pulse * 255.0))), dot * 0.5);
     }
 }
 
@@ -1356,8 +1352,8 @@ fn paneNeedsAttention(
         },
         .terminal => |ref| {
             const surface = state.projectTerminalSurface(project_index, ref.dock_id) orelse return false;
-            if (state.isFocusedTerminalSurface(project_index, ref.dock_id)) return false;
-            if (surface.attention or surface.unread_count > 0) return true;
+            // Focused panes still need their live pip; only finished/idle states
+            // are suppressed so completion does not leave a static status row.
             return switch (surface.status) {
                 .working, .waiting, .@"error" => true,
                 .done, .idle => false,
