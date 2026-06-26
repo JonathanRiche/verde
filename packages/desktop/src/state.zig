@@ -6557,23 +6557,12 @@ pub const AppState = struct {
     }
 
     // Resolves which agent provider a surface belongs to, for the notification
-    // logo/title. The surface itself usually has no provider (the Codex Stop
-    // hook calls `verde notify` without one), so fall back to the owning
-    // project's managed agent process, then its first chat thread.
+    // logo/title. Only trust explicit notify metadata: falling back to a
+    // workspace chat provider can mislabel one terminal agent as another (for
+    // example an Amp pane in a workspace whose first saved chat is Codex).
     fn resolveSurfaceProvider(self: *const AppState, surface: *const SurfaceState) ?Provider {
+        _ = self;
         if (surface.provider) |p| return p;
-        for (self.projects.items) |*project| {
-            const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
-                std.mem.eql(u8, surface.workspace_path, project.path);
-            if (!owns) continue;
-            for (project.managed_processes.items) |process| {
-                if (process.kind == .agent) {
-                    if (providerFromStack(process.provider)) |p| return p;
-                }
-            }
-            if (project.threads.items.len > 0) return project.threads.items[0].provider;
-            return null;
-        }
         return null;
     }
 
