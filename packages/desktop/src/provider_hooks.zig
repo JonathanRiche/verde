@@ -480,12 +480,6 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  return process.env.VERDE === '1' && Boolean(process.env.VERDE_SESSION_ID);
         \\}
         \\
-        \\function titleFromMessage(message: unknown): string | undefined {
-        \\  if (typeof message !== 'string') return undefined;
-        \\  const title = message.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 72);
-        \\  return title.length > 0 ? title : undefined;
-        \\}
-        \\
         \\function verdeCli(): string {
         \\  const raw = process.env.VERDE_CLI || 'verde';
         \\  // Linux appends this marker when /proc/self/exe points at a binary
@@ -493,15 +487,11 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  return raw.endsWith(' (deleted)') ? raw.slice(0, -10) : raw;
         \\}
         \\
-        \\async function notify(amp: PluginAPI, shell: PluginAPI['$'], status: 'idle' | 'working' | 'done' | 'waiting' | 'error', title?: string): Promise<void> {
+        \\async function notify(amp: PluginAPI, shell: PluginAPI['$'], status: 'idle' | 'working' | 'done' | 'waiting' | 'error'): Promise<void> {
         \\  if (!inVerdePane()) return;
         \\  const cli = verdeCli();
         \\  try {
-        \\    if (title) {
-        \\      await shell`${cli} notify --quiet --status ${status} --title ${title}`;
-        \\    } else {
-        \\      await shell`${cli} notify --quiet --status ${status}`;
-        \\    }
+        \\    await shell`${cli} notify --quiet --status ${status}`;
         \\  } catch (err) {
         \\    // Best-effort only: Amp should never fail because Verde is absent.
         \\    amp.logger.log(`Verde notify failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -512,15 +502,15 @@ fn writeAmpPlugin(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !v
         \\  amp.logger.log('Verde notify plugin initialized');
         \\
         \\  amp.on('session.start', async (_event, ctx) => {
-        \\    await notify(amp, ctx.$, 'idle', 'Amp');
+        \\    await notify(amp, ctx.$, 'idle');
         \\  });
         \\
-        \\  amp.on('agent.start', async (event, ctx) => {
-        \\    await notify(amp, ctx.$, 'working', titleFromMessage(event?.message) ?? 'Amp');
+        \\  amp.on('agent.start', async (_event, ctx) => {
+        \\    await notify(amp, ctx.$, 'working');
         \\  });
         \\
         \\  amp.on('agent.end', async (event, ctx) => {
-        \\    await notify(amp, ctx.$, event?.status === 'error' ? 'error' : 'done', 'Amp');
+        \\    await notify(amp, ctx.$, event?.status === 'error' ? 'error' : 'done');
         \\  });
         \\}
         \\
