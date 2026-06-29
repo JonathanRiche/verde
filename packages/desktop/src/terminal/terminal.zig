@@ -105,6 +105,8 @@ pub const NotificationEvent = struct {
     attention: bool = true,
 };
 
+pub const TerminalScrollbar = ghostty_vt.PageList.Scrollbar;
+
 const SessionCreateOptions = struct {
     cwd: []const u8,
     cols: u16,
@@ -491,6 +493,12 @@ pub const Dock = struct {
     pub fn renderStateForPane(self: *const Dock, pane_id: u32) ?*const ghostty_vt.RenderState {
         const pane = self.findPaneByIdConst(pane_id) orelse return null;
         if (pane.session) |session| return session.renderState();
+        return null;
+    }
+
+    pub fn scrollbarForPane(self: *Dock, pane_id: u32) ?TerminalScrollbar {
+        const pane = self.findPaneById(pane_id) orelse return null;
+        if (pane.session) |session| return session.scrollbar();
         return null;
     }
 
@@ -1626,6 +1634,10 @@ const UnsupportedSession = struct {
 
     pub fn scrollViewport(_: *UnsupportedSession, _: std.mem.Allocator, _: TerminalScroll) !void {}
 
+    pub fn scrollbar(_: *UnsupportedSession) TerminalScrollbar {
+        return .zero;
+    }
+
     pub fn pasteClipboard(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
         return false;
     }
@@ -1926,6 +1938,10 @@ const UnixSession = struct {
 
     pub fn renderState(self: *const UnixSession) *const ghostty_vt.RenderState {
         return &self.render_state;
+    }
+
+    pub fn scrollbar(self: *UnixSession) TerminalScrollbar {
+        return self.terminal.screens.active.pages.scrollbar();
     }
 
     pub fn retheme(self: *UnixSession, allocator: std.mem.Allocator) !void {
