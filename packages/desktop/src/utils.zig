@@ -115,10 +115,20 @@ pub fn canOpenProjectDirectory() bool {
 
 pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const u8) OpenProjectError!void {
     return switch (@import("builtin").os.tag) {
-        .macos => spawnDetached(allocator, &.{ "open", project_path }, null),
+        .macos => {
+            runtime_log.diagnostic("openProjectDirectory launcher=open path={s}", .{project_path});
+            return spawnDetached(allocator, &.{ "open", project_path }, null);
+        },
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
-            if (commandExists("xdg-open")) return spawnDetached(allocator, &.{ "xdg-open", project_path }, null);
-            if (commandExists("gio")) return spawnDetached(allocator, &.{ "gio", "open", project_path }, null);
+            if (commandExists("xdg-open")) {
+                runtime_log.diagnostic("openProjectDirectory launcher=xdg-open path={s}", .{project_path});
+                return spawnDetached(allocator, &.{ "xdg-open", project_path }, null);
+            }
+            if (commandExists("gio")) {
+                runtime_log.diagnostic("openProjectDirectory launcher=gio open path={s}", .{project_path});
+                return spawnDetached(allocator, &.{ "gio", "open", project_path }, null);
+            }
+            runtime_log.diagnostic("openProjectDirectory launcher unavailable path={s}", .{project_path});
             return error.LauncherUnavailable;
         },
         else => error.UnsupportedOperatingSystem,
@@ -695,6 +705,16 @@ fn spawnDetached(
         try argv_storage.appendSlice(allocator, argv);
     }
 
+    runtime_log.diagnostic(
+        "spawnDetached begin arg0={s} resolved_arg0={s} argc={d} cwd={s}",
+        .{
+            if (argv.len > 0) argv[0] else "",
+            resolved_arg0 orelse if (argv_storage.items.len > 0) argv_storage.items[0] else "",
+            argv_storage.items.len,
+            cwd orelse "(inherit)",
+        },
+    );
+
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const child = try std.process.spawn(threaded.io(), .{
@@ -705,7 +725,7 @@ fn spawnDetached(
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .environ_map = &env_map,
     });
-    _ = child;
+    runtime_log.diagnostic("spawnDetached started arg0={s} pid={?}", .{ if (argv.len > 0) argv[0] else "", child.id });
 }
 
 fn runChild(

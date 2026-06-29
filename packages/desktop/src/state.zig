@@ -32,6 +32,7 @@ const MANAGED_PROCESS_BASE_RESTART_BACKOFF_MS: i64 = 1000;
 const MANAGED_PROCESS_MAX_RESTART_BACKOFF_MS: i64 = 30000;
 const MANAGED_PROCESS_WATCH_SCAN_MS: i64 = 1000;
 const MANAGED_PROCESS_WATCH_DEBOUNCE_MS: i64 = 500;
+const EXTERNAL_OPEN_CLOSE_SUPPRESS_MS: i64 = 2000;
 
 pub fn paletteUiTextPrefixWidth(text: []const u8, font_size: f32, end: usize) f32 {
     return text_measure.textPrefixWidth(.ui, text, font_size, end);
@@ -3747,6 +3748,11 @@ pub const AppState = struct {
     /// short fast-poll burst so TUI redraws aren't capped at the idle wake
     /// cadence (terminal output is pull-only; there is no fd to wake on).
     last_terminal_output_ms: i64,
+    /// Wall-clock ms deadline for ignoring Linux close requests immediately
+    /// after a successful xdg-open/gio launch. Some file managers briefly send
+    /// a focused SDL close event back to Verde even though the user only opened
+    /// the workspace folder.
+    external_open_close_suppress_until_ms: i64,
 
     pub const InitOptions = struct {
         gl_texture_uploads_enabled: bool = true,
@@ -3960,6 +3966,7 @@ pub const AppState = struct {
             .pending_send_count = 0,
             .sidebar_pulse_animating = false,
             .last_terminal_output_ms = 0,
+            .external_open_close_suppress_until_ms = 0,
         };
         state.palette_composer.setCallbacks(.{});
 
@@ -6243,6 +6250,12 @@ pub const AppState = struct {
         }
     }
 
+    pub fn shouldSuppressExternalOpenCloseRequest(self: *AppState, now_ms: i64) bool {
+        if (self.external_open_close_suppress_until_ms < now_ms) return false;
+        self.external_open_close_suppress_until_ms = 0;
+        return true;
+    }
+
     pub fn replaceAppConfig(self: *AppState, next_config: app_config.AppConfig) void {
         self.app_config.deinit(self.allocator);
         self.app_config = next_config;
@@ -6788,6 +6801,8 @@ pub const AppState = struct {
             return;
         };
         log.info("openCurrentProjectDirectory completed", .{});
+        self.external_open_close_suppress_until_ms = unixTimestampMs() + EXTERNAL_OPEN_CLOSE_SUPPRESS_MS;
+        runtime_log.diagnostic("openCurrentProjectDirectory close suppress until={d}", .{self.external_open_close_suppress_until_ms});
         self.setSidebarNotice("Opened workspace folder.");
     }
 
