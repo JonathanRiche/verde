@@ -8,4 +8,5 @@ pub const Terminal = root.Terminal;
 pub const RGB = root.color.RGB;
 pub const color = root.color;
 pub const input = root.input;
+pub const PageList = root.PageList;
 pub const size_report = root.size_report;

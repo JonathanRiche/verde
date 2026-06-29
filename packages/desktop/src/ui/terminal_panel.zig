@@ -18,6 +18,10 @@ const MAX_TAB_HITS = 32;
 const TERMINAL_CONTEXT_MENU_WIDTH: f32 = 180.0;
 const TERMINAL_CONTEXT_MENU_ROW_HEIGHT: f32 = 30.0;
 const TERMINAL_CONTEXT_MENU_PAD: f32 = 6.0;
+const TERMINAL_SCROLLBAR_MIN_THUMB_CSS: f32 = 28.0;
+const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
+const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
+const TERMINAL_SCROLLBAR_VERTICAL_PAD_CSS: f32 = 4.0;
 
 const TerminalContextMenuKind = enum {
     pane,
@@ -494,6 +498,9 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         return;
     };
     renderViewport(state, pane_id, render_state, grid_rect, dock.font_scale);
+    if (dock.scrollbarForPane(pane_id)) |scrollbar| {
+        renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
+    }
     dock.markPaneRendered(pane_id);
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
@@ -650,6 +657,33 @@ fn visibleRowStart(render_state: *const ghostty_vt.RenderState, visible_rows: us
     if (render_state.screen != .alternate) return 0;
     if (visible_rows >= render_state.rows) return 0;
     return @as(usize, render_state.rows) - visible_rows;
+}
+
+/// Renders the terminal scrollback position indicator along the pane edge.
+fn renderTerminalScrollbar(state: *app_state.AppState, pane_rect: palette.Rect, grid_rect: palette.Rect, scrollbar: terminal.TerminalScrollbar) void {
+    if (scrollbar.len == 0 or scrollbar.total <= scrollbar.len) return;
+    const pad_y = theme.scaledUi(TERMINAL_SCROLLBAR_VERTICAL_PAD_CSS);
+    if (grid_rect.h <= pad_y * 2.0 + theme.scaledUi(TERMINAL_SCROLLBAR_MIN_THUMB_CSS)) return;
+
+    const track_w = theme.scaledUi(TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS);
+    const edge_pad = theme.scaledUi(TERMINAL_SCROLLBAR_EDGE_PAD_CSS);
+    const track: palette.Rect = .{
+        .x = pane_rect.x + pane_rect.w - edge_pad - track_w,
+        .y = grid_rect.y + pad_y,
+        .w = track_w,
+        .h = grid_rect.h - pad_y * 2.0,
+    };
+
+    const total_f: f32 = @floatFromInt(scrollbar.total);
+    const len_f: f32 = @floatFromInt(scrollbar.len);
+    const scrollable_rows = scrollbar.total - scrollbar.len;
+    const offset_f: f32 = @floatFromInt(@min(scrollbar.offset, scrollable_rows));
+    const scrollable_f: f32 = @floatFromInt(scrollable_rows);
+    const thumb_h = @min(track.h, @max(theme.scaledUi(TERMINAL_SCROLLBAR_MIN_THUMB_CSS), track.h * (len_f / total_f)));
+    const thumb_y = track.y + (track.h - thumb_h) * (offset_f / scrollable_f);
+
+    queueRounded(state, track, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)), theme.scaledUi(2.0));
+    queueRounded(state, .{ .x = track.x, .y = thumb_y, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 220)), theme.scaledUi(2.0));
 }
 
 fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palette.Rect) void {
