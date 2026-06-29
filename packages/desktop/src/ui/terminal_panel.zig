@@ -85,6 +85,7 @@ const TerminalPaneDrawCache = struct {
     rows: u16 = 0,
     cols: u16 = 0,
     font_scale: f32 = 0.0,
+    screen: @TypeOf(ghostty_vt.RenderState.empty.screen) = .primary,
     // Cache the cursor position so a pure cursor move forces a rebuild even
     // if the dirty flag doesn't propagate (e.g. a same-cell SGR that doesn't
     // touch the rendered grid). Otherwise the previous frame's cursor
@@ -107,6 +108,7 @@ const TerminalPaneDrawCache = struct {
             self.rows == render_state.rows and
             self.cols == render_state.cols and
             self.font_scale == font_scale and
+            self.screen == render_state.screen and
             self.cursor_x == cursor_x and
             self.cursor_y == cursor_y and
             self.cursor_visible == render_state.cursor.visible and
@@ -121,6 +123,7 @@ const TerminalPaneDrawCache = struct {
         self.rows = render_state.rows;
         self.cols = render_state.cols;
         self.font_scale = font_scale;
+        self.screen = render_state.screen;
         self.cursor_x = if (render_state.cursor.viewport) |c| @intCast(c.x) else 0;
         self.cursor_y = if (render_state.cursor.viewport) |c| @intCast(c.y) else 0;
         self.cursor_visible = render_state.cursor.visible;
@@ -534,19 +537,23 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     const row_selections = row_data.items(.selection);
     const visible_rows = @min(row_cells.len, @as(usize, @intFromFloat(@ceil(rect.h / cell_h))));
     const visible_cols = @min(@as(usize, render_state.cols), @as(usize, @intFromFloat(@ceil(rect.w / cell_w))));
+    const row_start = visibleRowStart(render_state, visible_rows);
 
-    for (row_cells[0..visible_rows], row_selections[0..visible_rows], 0..) |cells, selection, y| {
+    for (0..visible_rows) |visual_y| {
+        const model_y = row_start + visual_y;
+        const cells = row_cells[model_y];
+        const selection = row_selections[model_y];
         const cells_slice = cells.slice();
         const raw_cells = cells_slice.items(.raw);
         const row_styles = cells_slice.items(.style);
         const row_graphemes = cells_slice.items(.grapheme);
-        const row_y = grid_rect.y + @as(f32, @floatFromInt(y)) * cell_h;
+        const row_y = grid_rect.y + @as(f32, @floatFromInt(visual_y)) * cell_h;
         if (row_y >= rect.y + rect.h) break;
 
         const row_visible_cols = @min(raw_cells.len, visible_cols);
         for (raw_cells[0..row_visible_cols], 0..) |raw_cell, x| {
             const span = @as(f32, @floatFromInt(cellWidthCells(raw_cell)));
-            const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, y, span);
+            const cell_rect = terminalCellRect(grid_rect, cell_w, cell_h, x, visual_y, span);
             if (cell_rect.x >= rect.x + rect.w) break;
             const cell_style = styleForCell(raw_cell, row_styles, x);
             var bg = cell_style.bg(&raw_cell, &render_state.colors.palette) orelse render_state.colors.background;
@@ -568,11 +575,11 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             if (selection) |range| {
                 if (x >= range[0] and x <= range[1]) bg = blendRgb(bg, render_state.colors.foreground, 0.22);
             }
-            if (selectionCoversCell(hit_cache.dock_id, pane_id, x, y)) {
+            if (selectionCoversCell(hit_cache.dock_id, pane_id, x, model_y)) {
                 bg = blendRgb(bg, render_state.colors.foreground, 0.32);
             }
             if (render_state.cursor.viewport) |cursor| {
-                if (cursor.x == x and cursor.y == y and render_state.cursor.visible) {
+                if (cursor.x == x and cursor.y == model_y and render_state.cursor.visible) {
                     if (render_state.cursor.visual_style == .block) {
                         const cursor_fill = render_state.colors.cursor orelse render_state.colors.foreground;
                         bg = blendRgb(bg, cursor_fill, 0.62);
@@ -637,6 +644,12 @@ fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDr
 
 fn selectionAffectsPane(dock_id: u32, pane_id: u32) bool {
     return selection_state.active and selection_state.dock_id == dock_id and selection_state.pane_id == pane_id;
+}
+
+fn visibleRowStart(render_state: *const ghostty_vt.RenderState, visible_rows: usize) usize {
+    if (render_state.screen != .alternate) return 0;
+    if (visible_rows >= render_state.rows) return 0;
+    return @as(usize, render_state.rows) - visible_rows;
 }
 
 fn renderContextMenu(state: *app_state.AppState, dock: anytype, dock_rect: palette.Rect) void {
@@ -863,13 +876,15 @@ fn cellAtPoint(state: *app_state.AppState, target: PaneHitTarget, x: f32, y: f32
     const dock = state.currentProjectTerminalDock(target.dock_id) orelse return null;
     const render_state = dock.renderStateForPane(target.pane_id) orelse return null;
     if (render_state.cols == 0 or render_state.rows == 0) return null;
-    const cell_w = @max(rect.w / @as(f32, @floatFromInt(render_state.cols)), 1.0);
-    const cell_h = @max(rect.h / @as(f32, @floatFromInt(render_state.rows)), 1.0);
+    const cell_w = terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, dock.font_scale);
+    const cell_h = terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, dock.font_scale);
+    const visible_rows = @min(@as(usize, render_state.rows), @as(usize, @intFromFloat(@ceil(rect.h / cell_h))));
+    const row_start = visibleRowStart(render_state, visible_rows);
     const clamped_x = theme.clampf(x, rect.x, rect.x + rect.w - 1.0);
     const clamped_y = theme.clampf(y, rect.y, rect.y + rect.h - 1.0);
     const cell_x = theme.clampf(@floor((clamped_x - rect.x) / cell_w), 0.0, @as(f32, @floatFromInt(render_state.cols - 1)));
-    const cell_y = theme.clampf(@floor((clamped_y - rect.y) / cell_h), 0.0, @as(f32, @floatFromInt(render_state.rows - 1)));
-    return .{ .x = @intFromFloat(cell_x), .y = @intFromFloat(cell_y) };
+    const visual_y = theme.clampf(@floor((clamped_y - rect.y) / cell_h), 0.0, @as(f32, @floatFromInt(@max(visible_rows, 1) - 1)));
+    return .{ .x = @intFromFloat(cell_x), .y = row_start + @as(usize, @intFromFloat(visual_y)) };
 }
 
 fn paneRect(dock_id: u32, pane_id: u32) ?palette.Rect {
