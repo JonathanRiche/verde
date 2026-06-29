@@ -34,7 +34,6 @@ const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 const LOCAL_TERMINAL_SCREEN_CLEAR = "\x1b[0m\x1b[2J\x1b[H";
-const TUI_REDRAW_INPUT = "\x0c";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
@@ -1849,7 +1848,6 @@ const UnixSession = struct {
         const next_rows = sanitizeCellCount(rows, MIN_ROWS);
         const next_cell_width = @max(cell_width, 1);
         const next_cell_height = @max(cell_height, 1);
-        const shrinking_rows = next_rows < self.rows;
         const growing_rows = next_rows > self.rows;
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
@@ -1869,25 +1867,23 @@ const UnixSession = struct {
         self.rows = next_rows;
         self.cell_width = next_cell_width;
         self.cell_height = next_cell_height;
+        const needs_initial_replay = self.backend == .daemon and self.suppress_next_daemon_replay and self.remote_output_offset == 0;
+        switch (self.backend) {
+            .local => {
+                if (size_changed) self.applyWinsize();
+            },
+            .daemon => {
+                try self.resizeDaemon(allocator);
+                self.defer_daemon_replay_until_resize = false;
+            },
+        }
         if (size_changed) {
-            // libghostty's PageList.resizeWithoutReflow keeps the BOTTOM
-            // `next_rows` of the active area on a row shrink (alt screen has
-            // no scrollback, so the upper rows are dropped via eraseHistory).
-            // For TUIs that draw top-down (Neovim/LazyVim), the lower
-            // dashboard rows ("Find Text", etc.) become the new top rows
-            // BEFORE the app has a chance to repaint. We wipe the alt screen
-            // so the kept rows are all blank and the TUI's SIGWINCH redraw
-            // plus the Ctrl-L kick are the sole source of small-pane content.
-            // Using the Terminal model API (not stream bytes) avoids the
-            // ESC[2J replay regression that caused blank-pane-with-cursor.
-            if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
-                self.clearAltShrinkKeepRegion(next_rows);
-            }
+            // Match Ghostty's ordering: notify the PTY/backend first, then
+            // resize the terminal model. Verde must not add emulator-side clears
+            // or synthetic redraw input around this resize; the app owns its
+            // repaint behavior.
             try self.terminal.resize(allocator, next_cols, next_rows);
             self.terminal.modes.set(.synchronized_output, false);
-            if (shrinking_rows and self.terminal.screens.active_key == .alternate) {
-                self.resetAlternateViewport();
-            }
             if (terminalLayoutDiagnosticsEnabled()) {
                 // Capture the inputs that decide reflow behavior so we can
                 // diagnose "zoom-then-scroll shows narrow ghost rows" without
@@ -1910,22 +1906,16 @@ const UnixSession = struct {
         }
         switch (self.backend) {
             .local => {
-                self.applyWinsize();
                 if (size_changed) {
                     if (growing_rows) self.sendInBandSizeReportAfterResize();
-                    self.requestTuiRedrawAfterResize();
                 }
             },
             .daemon => {
-                const needs_initial_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
-                try self.resizeDaemon(allocator);
-                self.defer_daemon_replay_until_resize = false;
                 if (needs_initial_replay) {
                     _ = try self.drainDaemonOutput(allocator);
                 }
                 if (size_changed) {
                     if (growing_rows) self.sendInBandSizeReportAfterResize();
-                    self.requestTuiRedrawAfterResize();
                 }
                 _ = try self.drainDaemonOutput(allocator);
             },
@@ -2101,30 +2091,6 @@ const UnixSession = struct {
         return false;
     }
 
-    fn shouldRequestTuiRedrawAfterResize(self: *const UnixSession) bool {
-        if (self.terminal.screens.active_key == .alternate) return true;
-        return self.hasForegroundProcessAwayFromShell();
-    }
-
-    fn requestTuiRedrawAfterResize(self: *UnixSession) void {
-        const should_request = self.shouldRequestTuiRedrawAfterResize();
-        log.info(
-            "resize-redraw-check session={?s} backend={s} active_screen={s} shell_pid={?d} pgrp={?d} should={}",
-            .{
-                self.session_id,
-                @tagName(self.backend),
-                @tagName(self.terminal.screens.active_key),
-                self.daemon_shell_pid,
-                self.daemon_foreground_process_group,
-                should_request,
-            },
-        );
-        if (!should_request) return;
-        _ = self.writeRawInput(TUI_REDRAW_INPUT) catch |err| {
-            log.debug("failed to request terminal redraw after resize: {s}", .{@errorName(err)});
-        };
-    }
-
     fn sendInBandSizeReportAfterResize(self: *UnixSession) void {
         if (!self.terminal.modes.get(.in_band_size_reports)) return;
         var buffer: [128]u8 = undefined;
@@ -2212,23 +2178,45 @@ const UnixSession = struct {
     }
 
     fn writeMouseInput(self: *UnixSession, button: ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32) !void {
-        const screen_width: u32 = @intFromFloat(@max(@round(width), 1.0));
-        const screen_height: u32 = @intFromFloat(@max(@round(height), 1.0));
-        const cols_f = @as(f32, @floatFromInt(@max(self.cols, 1)));
-        const rows_f = @as(f32, @floatFromInt(@max(self.rows, 1)));
-        const cell_width: u32 = @intFromFloat(@max(@round(width / cols_f), 1.0));
-        const cell_height: u32 = @intFromFloat(@max(@round(height / rows_f), 1.0));
+        const logical_cell_width = @max(self.cell_width, 1);
+        const logical_cell_height = @max(self.cell_height, 1);
+        const visible_rows = @min(
+            @as(usize, @max(self.rows, 1)),
+            @as(usize, @intFromFloat(@max(@ceil(height / @as(f32, @floatFromInt(logical_cell_height))), 1.0))),
+        );
+        const clipped_alt = self.terminal.screens.active_key == .alternate and visible_rows < self.rows;
+        const screen_width: u32 = if (clipped_alt)
+            @as(u32, @max(self.cols, 1)) * logical_cell_width
+        else
+            @intFromFloat(@max(@round(width), 1.0));
+        const screen_height: u32 = if (clipped_alt)
+            @as(u32, @max(self.rows, 1)) * logical_cell_height
+        else
+            @intFromFloat(@max(@round(height), 1.0));
+        const cell_width: u32 = if (clipped_alt)
+            logical_cell_width
+        else
+            @intFromFloat(@max(@round(width / @as(f32, @floatFromInt(@max(self.cols, 1)))), 1.0));
+        const cell_height: u32 = if (clipped_alt)
+            logical_cell_height
+        else
+            @intFromFloat(@max(@round(height / @as(f32, @floatFromInt(@max(self.rows, 1)))), 1.0));
         const options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
             .screen = .{ .width = screen_width, .height = screen_height },
             .cell = .{ .width = cell_width, .height = cell_height },
             .padding = .{},
         });
+        const row_offset = if (clipped_alt)
+            @as(usize, self.rows) - visible_rows
+        else
+            0;
+        const adjusted_y = local_y + @as(f32, @floatFromInt(row_offset * @as(usize, logical_cell_height)));
         var buffer: [64]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try ghostty_vt.input.encodeMouse(&writer, .{
             .button = button,
             .action = action,
-            .pos = .{ .x = local_x, .y = local_y },
+            .pos = .{ .x = local_x, .y = adjusted_y },
         }, options);
         const encoded = writer.buffered();
         if (encoded.len == 0) return;
@@ -2561,37 +2549,6 @@ const UnixSession = struct {
                     .{ self.session_id, self.cols, self.rows },
                 );
             }
-        }
-    }
-
-    /// Wipe the alternate screen before a row shrink so that libghostty's
-    /// keep-bottom-N-rows behavior cannot leak stale tall-layout content into
-    /// the small pane. With every active row blank, `trimTrailingBlankRows`
-    /// inside `PageList.resizeWithoutReflow` eats `old_rows - next_rows`
-    /// trailing rows, the kept `next_rows` are all blank, and the TUI's own
-    /// SIGWINCH-triggered redraw (plus the Ctrl-L kick we send after resize)
-    /// is the only thing that paints content. No surviving rows means nothing
-    /// to misposition.
-    ///
-    /// Prior attempts (scroll-down-by-29 to shift the top into the keep
-    /// region, blank-only-the-bottom-then-resize) both lost content in
-    /// different ways: the shift attempt kept the dashboard's empty top
-    /// padding and discarded the menu items, and the blank-only-bottom
-    /// attempt got the kept region shifted up by trimTrailingBlankRows.
-    /// A full-screen erase sidesteps both: there's nothing to misposition
-    /// because there's nothing left.
-    ///
-    /// Must be called only when the alternate screen is active and the current
-    /// terminal row count is strictly larger than `next_rows`.
-    fn clearAltShrinkKeepRegion(self: *UnixSession, next_rows: u16) void {
-        const old_rows = self.terminal.rows;
-        if (old_rows <= next_rows) return;
-        self.terminal.eraseDisplay(.complete, false);
-        if (terminalLayoutDiagnosticsEnabled()) {
-            runtime_log.diagnostic(
-                "terminal alt shrink pre-erase session={?s} old_rows={d} new_rows={d}",
-                .{ self.session_id, old_rows, next_rows },
-            );
         }
     }
 
@@ -4139,6 +4096,59 @@ test "unix session clears render dirty state after render" {
     for (row_dirties) |dirty| {
         try testing.expect(!dirty);
     }
+}
+
+test "unix session alternate-screen resize follows terminal model without clearing" {
+    if (!SESSION_SUPPORTED) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 10,
+    });
+    defer {
+        session.deinit(allocator);
+        allocator.destroy(session);
+    }
+
+    session.stream.nextSlice(
+        "\x1b[?1049h" ++
+            "ALT-KEEP-01\r\n" ++
+            "ALT-KEEP-02\r\n" ++
+            "ALT-KEEP-03\r\n" ++
+            "ALT-KEEP-04\r\n" ++
+            "ALT-KEEP-05\r\n" ++
+            "ALT-KEEP-06\r\n" ++
+            "ALT-KEEP-07\r\n" ++
+            "ALT-KEEP-08\r\n" ++
+            "ALT-KEEP-09",
+    );
+    try session.refreshRenderState(allocator);
+
+    try testing.expectEqual(.alternate, session.terminal.screens.active_key);
+
+    try session.resize(allocator, 80, 6, CELL_PIXEL_WIDTH, CELL_PIXEL_HEIGHT);
+    try testing.expectEqual(@as(u16, 80), session.cols);
+    try testing.expectEqual(@as(u16, 80), session.terminal.cols);
+    try testing.expectEqual(@as(u16, 6), session.rows);
+    try testing.expectEqual(@as(u16, 6), session.terminal.rows);
+
+    const screen = try session.terminal.plainString(allocator);
+    defer allocator.free(screen);
+
+    try testing.expect(std.mem.indexOf(u8, screen, "ALT-KEEP-04") != null);
+    try testing.expect(std.mem.indexOf(u8, screen, "ALT-KEEP-09") != null);
+
+    try session.resize(allocator, 80, 12, CELL_PIXEL_WIDTH, CELL_PIXEL_HEIGHT);
+    try testing.expectEqual(@as(u16, 80), session.cols);
+    try testing.expectEqual(@as(u16, 80), session.terminal.cols);
+    try testing.expectEqual(@as(u16, 12), session.rows);
+    try testing.expectEqual(@as(u16, 12), session.terminal.rows);
 }
 
 test "terminal geometry sanitization never returns zero cells" {

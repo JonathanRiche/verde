@@ -1160,6 +1160,19 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 syncWindowTextInput(window, state);
                 return true;
             }
+            const action = keyboard.actionForEvent(&event.key);
+            // Pane-level bindings must stay app-owned even when an embedded
+            // terminal has keyboard focus. Resolve them before terminal-owned
+            // shortcut routing so Alt+Z zoom does not leak into TUIs such as
+            // Codex, which treats it as a redraw/reset input.
+            if (action) |resolved_workspace_action| {
+                if (isWorkspacePaneAction(resolved_workspace_action) or isWorkspaceTraversalAction(resolved_workspace_action)) {
+                    noteMacosWorkspaceCloseShortcut(&event.key, resolved_workspace_action);
+                    handleKeyboardAction(state, keyboard, resolved_workspace_action);
+                    syncWindowTextInput(window, state);
+                    return true;
+                }
+            }
             if (state.terminal_focused and terminalOwnedShortcut(&event.key)) {
                 const terminal_key_handled = state.handleTerminalKeyDown(keyboard, &event.key);
                 state.noteTerminalKeyRouting(&event.key, terminal_key_handled);
@@ -1167,7 +1180,6 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                     return true;
                 }
             }
-            const action = keyboard.actionForEvent(&event.key);
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
             if (paste_shortcut) {
