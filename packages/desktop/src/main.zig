@@ -2053,11 +2053,28 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
         _ = SDL_HideWindow(window);
     }
     if (builtin.os.tag == .linux) {
+        const now_ms = currentTimeMillis();
         if (state.isPickerPending()) {
             runtime_log.diagnostic("ignoring linux window close request while folder picker is pending", .{});
             return true;
         }
         const window_flags = SDL_GetWindowFlags(window);
+        runtime_log.diagnostic(
+            "linux window close request flags focus={} mouse_focus={} hidden={} minimized={} occluded={} selected_project={d} focused_pane={?}",
+            .{
+                window_flags.input_focus,
+                window_flags.mouse_focus,
+                window_flags.hidden,
+                window_flags.minimized,
+                window_flags.occluded,
+                state.selected_project_index,
+                if (state.projects.items.len > state.selected_project_index) state.currentProject().workspace_layout.focused_pane_id else null,
+            },
+        );
+        if (state.shouldSuppressExternalOpenCloseRequest(now_ms)) {
+            runtime_log.diagnostic("ignoring linux window close request after external open launch", .{});
+            return true;
+        }
         const suspicious_close = !window_flags.input_focus or
             !window_flags.mouse_focus or
             window_flags.hidden or
