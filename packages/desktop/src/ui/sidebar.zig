@@ -38,6 +38,8 @@ const SIDEBAR_THREAD_ICON_TITLE_GAP_CSS: f32 = 10.0;
 const SIDEBAR_THREAD_TIME_COLUMN_CSS: f32 = 60.0;
 /// Padding between truncated title and the time column.
 const SIDEBAR_THREAD_TITLE_TIME_GAP_CSS: f32 = 2.0;
+/// Compact workspace-row badge width for Herdr-backed workspaces.
+const SIDEBAR_HERDR_BADGE_W_CSS: f32 = 50.0;
 const HIDDEN_SIDEBAR_EDGE_REVEAL_CSS: f32 = 8.0;
 /// Reserved band at the bottom of the rail for sticky chrome (settings, etc.).
 /// The scrolling workspace list stops short of this so its last row never
@@ -79,6 +81,10 @@ const SidebarContextMenuAction = enum {
     workspace_new_chat,
     workspace_open_codex_tui,
     workspace_open_terminal,
+    workspace_herdr_handoff,
+    workspace_herdr_handoff_remote,
+    workspace_herdr_focus_terminal,
+    workspace_herdr_unlink,
     workspace_rename,
     workspace_import_codex,
     workspace_import_opencode,
@@ -485,6 +491,10 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 },
                 .workspace_open_codex_tui => _ = state.openAgentTui(pi, .codex) catch false,
                 .workspace_open_terminal => _ = state.openTerminalPaneForProjectIndex(pi),
+                .workspace_herdr_handoff => state.handoffProjectToLocalHerdrFromUi(pi),
+                .workspace_herdr_handoff_remote => state.beginHerdrProfilePicker(pi),
+                .workspace_herdr_focus_terminal => _ = state.focusProjectHerdrAttachTerminal(pi),
+                .workspace_herdr_unlink => state.unlinkProjectHerdrFromUi(pi),
                 .workspace_rename => state.beginProjectRename(pi),
                 .workspace_import_codex => state.beginThreadImport(pi, .codex),
                 .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
@@ -538,9 +548,19 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
         .none => return,
         .project => {
             const pi = state.sidebar_context_menu_project_index;
+            const herdr_link = if (pi < state.projects.items.len) state.projects.items[pi].herdr_link else null;
             appendSidebarContextMenuRow(.workspace_new_chat, true, "Start a new chat");
             appendSidebarContextMenuRow(.workspace_open_codex_tui, pi < state.projects.items.len, "Open Codex TUI");
             appendSidebarContextMenuRow(.workspace_open_terminal, pi < state.projects.items.len, "Open terminal");
+            if (herdr_link) |link| {
+                appendSidebarContextMenuRow(.workspace_herdr_focus_terminal, pi < state.projects.items.len, if (link.attach_dock_id != null) "Focus Herdr terminal" else "Open Herdr terminal");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.projects.items.len, "Refresh Herdr handoff");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.projects.items.len, "Handoff to remote Herdr");
+                appendSidebarContextMenuRow(.workspace_herdr_unlink, pi < state.projects.items.len, "Run locally (unlink Herdr)");
+            } else {
+                appendSidebarContextMenuRow(.workspace_herdr_handoff, pi < state.projects.items.len, "Handoff to Herdr");
+                appendSidebarContextMenuRow(.workspace_herdr_handoff_remote, pi < state.projects.items.len, "Handoff to remote Herdr");
+            }
             appendSidebarContextMenuRow(.workspace_rename, true, "Rename workspace");
             appendSidebarContextMenuRow(.workspace_import_codex, true, "Import Codex thread");
             appendSidebarContextMenuRow(.workspace_import_opencode, true, "Import OpenCode thread");
@@ -707,7 +727,16 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         tx += theme.scaledUi(18.0);
         if (project_visible) queuePaletteFolderIcon(state, tx, cy, theme.scaledUi(14.0), theme.scaledUi(10.0), if (selected) theme.COLOR_SECONDARY_GREEN else if (project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE, selected);
         tx += theme.scaledUi(20.0);
-        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = row_rect.x + row_rect.w - tx, .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        const badge_label = herdrRuntimeBadgeLabel(project);
+        const badge_w = theme.scaledUi(SIDEBAR_HERDR_BADGE_W_CSS);
+        const badge_gap = theme.scaledUi(6.0);
+        const label_right = if (badge_label != null) row_rect.x + row_rect.w - badge_w - badge_gap else row_rect.x + row_rect.w;
+        if (project_visible) queuePaletteText(state, .{ .x = tx, .y = y + theme.scaledUi(4.0), .w = @max(label_right - tx, theme.scaledUi(24.0)), .h = row_h }, project.label, paletteColor(if (selected or project_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(15.0), row_rect);
+        if (project_visible) {
+            if (badge_label) |label| {
+                renderHerdrRuntimeBadge(state, .{ .x = row_rect.x + row_rect.w - badge_w, .y = y + theme.scaledUi(5.0), .w = badge_w, .h = row_h - theme.scaledUi(10.0) }, label, selected or project_hovered, row_rect);
+            }
+        }
         const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
         const new_hovered = state.sidebar_new_thread_hover == project_index;
         if (project_visible) {
@@ -785,6 +814,26 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
     queuePaletteButton(state, add_rect, "+", true);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
+}
+
+fn herdrRuntimeBadgeLabel(project: *const native_state.Project) ?[]const u8 {
+    const link = project.herdr_link orelse return null;
+    return if (link.remote_alias.len > 0) "REMOTE" else "HERDR";
+}
+
+// Renders the compact Herdr runtime badge inside a workspace row.
+fn renderHerdrRuntimeBadge(state: *runtime.AppState, rect: palette.Rect, label: []const u8, emphasized: bool, clip: palette.Rect) void {
+    const bg = if (emphasized)
+        theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 210)
+    else
+        theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 95);
+    queuePaletteRoundedRect(state, rect, paletteColor(bg), theme.scaledUi(6.0));
+    queuePaletteText(state, .{
+        .x = rect.x + theme.scaledUi(6.0),
+        .y = rect.y + theme.scaledUi(1.0),
+        .w = rect.w - theme.scaledUi(12.0),
+        .h = rect.h,
+    }, label, paletteColor(if (emphasized) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), theme.scaledUi(9.0), clip);
 }
 
 fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) void {

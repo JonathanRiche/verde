@@ -236,6 +236,7 @@ pub const Dock = struct {
     rename_storage: [96:0]u8 = std.mem.zeroes([96:0]u8),
     workspace_changed: bool = false,
     focus_requested: bool = false,
+    orphan_prune_done: bool = false,
     launch_profile: TerminalLaunchProfile = .{},
 
     pub fn init(_: std.mem.Allocator) !Dock {
@@ -321,6 +322,7 @@ pub const Dock = struct {
             self.cwd = try allocator.dupe(u8, project_path);
         }
 
+        if (cwd_changed or self.session_dock_id != dock_id) self.orphan_prune_done = false;
         self.session_dock_id = dock_id;
         if (pref_path) |path| {
             const pref_changed = if (self.pref_path) |existing|
@@ -330,10 +332,14 @@ pub const Dock = struct {
             if (pref_changed) {
                 if (self.pref_path) |existing| allocator.free(existing);
                 self.pref_path = try allocator.dupe(u8, path);
+                self.orphan_prune_done = false;
             }
         }
 
         try self.ensureWorkspace(allocator);
+        self.pruneOrphanDaemonSessions(allocator) catch |err| {
+            log.debug("failed to prune orphan daemon terminal sessions for dock {d}: {s}", .{ self.session_dock_id, @errorName(err) });
+        };
     }
 
     pub fn restartWithProfile(self: *Dock, allocator: std.mem.Allocator, cwd: []const u8, profile: TerminalLaunchProfile) !void {
@@ -496,6 +502,12 @@ pub const Dock = struct {
         return null;
     }
 
+    pub fn paneWantsMouseInput(self: *const Dock, pane_id: u32) bool {
+        const pane = self.findPaneByIdConst(pane_id) orelse return false;
+        if (pane.session) |session| return session.terminal.flags.mouse_event != .none;
+        return false;
+    }
+
     pub fn scrollbarForPane(self: *Dock, pane_id: u32) ?TerminalScrollbar {
         const pane = self.findPaneById(pane_id) orelse return null;
         if (pane.session) |session| return session.scrollbar();
@@ -510,6 +522,13 @@ pub const Dock = struct {
     pub fn hasRunningSession(self: *const Dock) bool {
         for (self.tabs.items) |*tab| {
             if (paneNodeHasRunningSession(tab.root)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasRestorableSession(self: *const Dock) bool {
+        for (self.tabs.items) |*tab| {
+            if (paneNodeHasSessionId(tab.root)) return true;
         }
         return false;
     }
@@ -972,6 +991,51 @@ pub const Dock = struct {
         }
     }
 
+    fn pruneOrphanDaemonSessions(self: *Dock, allocator: std.mem.Allocator) !void {
+        if (self.orphan_prune_done) return;
+        const pref_path = self.pref_path orelse return;
+        const cwd = self.cwd orelse return;
+        self.orphan_prune_done = true;
+
+        var live_session_ids: std.ArrayList([]const u8) = .empty;
+        defer live_session_ids.deinit(allocator);
+        for (self.tabs.items) |*tab| try collectPaneSessionIds(allocator, tab.root, &live_session_ids);
+
+        const list_response = try sessionizer.requestAlloc(allocator, pref_path, "session.list", .{}, 1);
+        defer allocator.free(list_response);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, list_response, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        if (parsed.value.object.get("error")) |_| return;
+        const result = parsed.value.object.get("result") orelse return;
+        if (result != .object) return;
+        const sessions = result.object.get("sessions") orelse return;
+        if (sessions != .array) return;
+
+        for (sessions.array.items) |session| {
+            if (session != .object) continue;
+            const session_id = jsonString(session.object.get("session_id") orelse session.object.get("id") orelse .null) orelse continue;
+            const session_dock_id = jsonUsize(session.object.get("dock_id") orelse .null) orelse continue;
+            if (session_dock_id != self.session_dock_id) continue;
+            const session_project = jsonString(session.object.get("workspace_path") orelse .null) orelse
+                jsonString(session.object.get("workspace_id") orelse .null) orelse
+                jsonString(session.object.get("project_path") orelse .null) orelse
+                jsonString(session.object.get("project_id") orelse .null) orelse "";
+            if (!std.mem.eql(u8, session_project, cwd)) continue;
+            if (containsSessionId(live_session_ids.items, session_id)) continue;
+            const attached_clients = jsonUsize(session.object.get("attached_clients") orelse .null) orelse 0;
+            if (attached_clients != 0) continue;
+
+            const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch |err| {
+                log.debug("failed to kill orphan daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
+                continue;
+            };
+            allocator.free(kill_response);
+            log.info("pruned orphan daemon terminal session {s}", .{session_id});
+        }
+    }
+
     fn clearTabs(self: *Dock, allocator: std.mem.Allocator) void {
         for (self.tabs.items) |*tab| tab.deinit(allocator);
         self.tabs.clearRetainingCapacity();
@@ -1048,6 +1112,9 @@ pub const Dock = struct {
             .pane_id = leaf.id,
             .revive_policy = leaf.revive_policy,
         });
+        // Restart is a one-shot user action. Once the fresh daemon session is
+        // created, future app launches should reattach like normal terminals.
+        if (leaf.revive_policy == .restart) leaf.revive_policy = .attach_or_create;
     }
 
     fn ensureSessionsInNode(self: *Dock, allocator: std.mem.Allocator, node: *PaneNode) !void {
@@ -1176,6 +1243,25 @@ fn terminatePaneNodeSessions(node: *PaneNode) void {
     }
 }
 
+fn collectPaneSessionIds(allocator: std.mem.Allocator, node: *PaneNode, session_ids: *std.ArrayList([]const u8)) !void {
+    switch (node.*) {
+        .leaf => |*leaf| {
+            if (leaf.session_id) |session_id| try session_ids.append(allocator, session_id);
+        },
+        .split => |*split| {
+            try collectPaneSessionIds(allocator, split.first, session_ids);
+            try collectPaneSessionIds(allocator, split.second, session_ids);
+        },
+    }
+}
+
+fn containsSessionId(session_ids: []const []const u8, needle: []const u8) bool {
+    for (session_ids) |session_id| {
+        if (std.mem.eql(u8, session_id, needle)) return true;
+    }
+    return false;
+}
+
 fn setRevivePolicyInNode(node: *PaneNode, revive_policy: TerminalRevivePolicy) void {
     switch (node.*) {
         .leaf => |*leaf| leaf.revive_policy = revive_policy,
@@ -1233,6 +1319,13 @@ fn paneNodeHasRunningSession(node: *const PaneNode) bool {
     return switch (node.*) {
         .leaf => |leaf| if (leaf.session) |session| session.isRunning() else false,
         .split => |split| paneNodeHasRunningSession(split.first) or paneNodeHasRunningSession(split.second),
+    };
+}
+
+fn paneNodeHasSessionId(node: *const PaneNode) bool {
+    return switch (node.*) {
+        .leaf => |leaf| leaf.session_id != null,
+        .split => |split| paneNodeHasSessionId(split.first) or paneNodeHasSessionId(split.second),
     };
 }
 
@@ -1477,7 +1570,7 @@ fn serializePaneNode(
                 .launch_kind = launch_kind,
                 .launch_label = launch_label,
                 .launch_command = try dupeStringSlice(allocator, leaf.launch_command),
-                .revive_policy = leaf.revive_policy,
+                .revive_policy = persistedRevivePolicy(leaf.revive_policy),
             });
         },
         .split => |split| {
@@ -1495,6 +1588,15 @@ fn serializePaneNode(
     }
 
     return node_id;
+}
+
+fn persistedRevivePolicy(revive_policy: TerminalRevivePolicy) TerminalRevivePolicy {
+    return switch (revive_policy) {
+        // Restart deliberately kills the existing daemon PTY. It must not leak
+        // into saved layout state or reopening Verde stops preserving terminals.
+        .restart => .attach_or_create,
+        else => revive_policy,
+    };
 }
 
 fn buildPaneNodeFromPersisted(
@@ -1517,7 +1619,7 @@ fn buildPaneNodeFromPersisted(
                     .launch_kind = persisted.launch_kind,
                     .launch_label = if (persisted.launch_label) |label| try allocator.dupe(u8, label) else null,
                     .launch_command = try dupeStringSlice(allocator, persisted.launch_command),
-                    .revive_policy = persisted.revive_policy orelse .attach_or_create,
+                    .revive_policy = persistedRevivePolicy(persisted.revive_policy orelse .attach_or_create),
                 } };
             },
             .split => {
@@ -4039,6 +4141,31 @@ test "persisted layout accepts leaves without session metadata" {
     try std.testing.expectEqual(@as(?[]u8, null), pane.session_id);
     try std.testing.expectEqual(@as(?TerminalLaunchKind, null), pane.launch_kind);
     try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, pane.revive_policy);
+}
+
+test "persisted restart revive policy reloads as attach" {
+    const allocator = std.testing.allocator;
+    var dock = try Dock.init(allocator);
+    defer dock.deinit(allocator);
+
+    const layout_json =
+        \\{
+        \\  "active_tab_index": 0,
+        \\  "tabs": [{
+        \\    "active_pane_id": 1,
+        \\    "root_node_id": 1,
+        \\    "nodes": [{
+        \\      "node_id": 1,
+        \\      "kind": "leaf",
+        \\      "pane_id": 1,
+        \\      "revive_policy": "restart"
+        \\    }]
+        \\  }]
+        \\}
+    ;
+
+    try dock.applyPersistedLayoutJson(allocator, layout_json);
+    try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, dock.activePaneConst().?.revive_policy);
 }
 
 test "unix session PTY smoke" {

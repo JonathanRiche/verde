@@ -39,6 +39,19 @@ pub const PersistedImageAttachment = struct {
     byte_size: usize = 0,
 };
 
+pub const PersistedHerdrWorkspaceLink = struct {
+    remote_alias: []const u8 = "",
+    session_name: []const u8,
+    workspace_id: []const u8,
+    local_dir: []const u8,
+    remote_cwd: ?[]const u8 = null,
+    last_pane_id: ?[]const u8 = null,
+    attach_dock_id: ?u32 = null,
+    attach_pane_id: ?u32 = null,
+    pane_links_json: ?[]const u8 = null,
+    updated_at_ms: i64 = 0,
+};
+
 pub const PersistedMessage = struct {
     role: ChatRole,
     author: []const u8,
@@ -50,6 +63,7 @@ pub const PersistedThread = struct {
     title: []const u8,
     archived: bool = false,
     committed: bool = true,
+    local_thread_id: ?[]const u8 = null,
     last_activity_at: ?i64 = null,
     provider_thread_id: ?[]const u8 = null,
     model_ref: ?[]const u8 = null,
@@ -79,6 +93,7 @@ pub const PersistedProject = struct {
     terminal_docks_json: ?[]const u8 = null,
     workspace_layout_json: ?[]const u8 = null,
     selected_thread_index: usize = 0,
+    herdr_link: ?PersistedHerdrWorkspaceLink = null,
     threads: ?[]const PersistedThread = null,
     provider: Provider = .opencode,
     harness: Harness = .local_cli,

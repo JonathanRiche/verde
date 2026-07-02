@@ -4,6 +4,7 @@ const app_state = @import("../state.zig");
 const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
+const herdr = @import("../herdr.zig");
 const provider_types = @import("../provider_types.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -187,6 +188,10 @@ fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, reque
     if (std.mem.eql(u8, method, "active")) return try activeResponse(allocator, id_value, state);
     if (std.mem.eql(u8, method, "threads")) return try threadsResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "terminals")) return try terminalsResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "herdr.open")) return try herdrOpenResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "herdr.handoff")) return try herdrHandoffResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "herdr.unlink")) return try herdrUnlinkResponse(allocator, id_value, state, params);
+    if (std.mem.eql(u8, method, "herdr.status")) return try herdrStatusResponse(allocator, id_value, state);
     if (std.mem.eql(u8, method, "surfaces") or std.mem.eql(u8, method, "surface.list")) return try surfacesResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.inspect")) return try surfaceInspectResponse(allocator, id_value, state, params);
     if (std.mem.eql(u8, method, "surface.focus")) return try surfaceFocusResponse(allocator, id_value, state, params);
@@ -350,6 +355,7 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
         .commands = &.{
             "status",                              "capabilities",                         "workspaces",                         "panes",
             "active",                              "inspect",                              "threads",                            "terminals",
+            "herdr.open",                          "herdr.handoff",                        "herdr.unlink",                       "herdr.status",
             "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
             "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
             "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
@@ -482,6 +488,162 @@ fn terminalsResponse(allocator: std.mem.Allocator, id_value: std.json.Value, sta
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+fn herdrOpenResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.open requires params");
+    const session = stringParam(params, "session") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.open requires session");
+    const workspace = stringParam(params, "herdr_workspace") orelse stringParam(params, "herdr-workspace") orelse
+        return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.open requires herdr_workspace");
+    const request: herdr.OpenRequest = .{
+        .session = session,
+        .herdr_workspace = workspace,
+        .remote = stringParam(params, "remote"),
+        .cwd = stringParam(params, "cwd"),
+        .remote_cwd = stringParam(params, "remote_cwd") orelse stringParam(params, "remote-cwd"),
+        .local_dir = stringParam(params, "local_dir") orelse stringParam(params, "local-dir"),
+        .pane = stringParam(params, "pane"),
+    };
+    const result = state.openOrCreateHerdrWorkspace(request) catch |err| switch (err) {
+        error.MissingHerdrSession, error.MissingHerdrWorkspace, error.EmptyProjectPath => return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err)),
+        error.FileNotFound, error.NotDir, error.AccessDenied => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace directory not found"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn herdrHandoffResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.handoff requires params");
+    const request: herdr.HandoffRequest = .{
+        .session = stringParam(params, "session") orelse "default",
+        .remote = stringParam(params, "remote"),
+        .remote_cwd = stringParam(params, "remote_cwd") orelse stringParam(params, "remote-cwd"),
+        .workspace = stringParam(params, "workspace") orelse stringParam(params, "project"),
+        .all = boolParam(params, "all") orelse false,
+        .dry_run = boolParam(params, "dry_run") orelse boolParam(params, "dry-run") orelse false,
+    };
+    var result = state.handoffHerdrWorkspaces(allocator, request) catch |err| switch (err) {
+        error.MissingHerdrSession, error.EmptyHerdrWorkspaceSelector => return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err)),
+        error.NoProjectSelected => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+        error.HerdrCommandFailed => return try errorResponseAlloc(allocator, id_value, "rejected", "Herdr command failed"),
+        error.InvalidHerdrResponse => return try errorResponseAlloc(allocator, id_value, "rejected", "Herdr returned an unexpected response"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    defer result.deinit(allocator);
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn herdrUnlinkResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {
+    if (params != .object) return try errorResponseAlloc(allocator, id_value, "invalid_request", "herdr.unlink requires params");
+    const request: herdr.UnlinkRequest = .{
+        .workspace = stringParam(params, "workspace") orelse stringParam(params, "project"),
+        .all = boolParam(params, "all") orelse false,
+    };
+    var result = state.unlinkHerdrWorkspaces(allocator, request) catch |err| switch (err) {
+        error.AmbiguousHerdrWorkspaceSelector, error.EmptyHerdrWorkspaceSelector => return try errorResponseAlloc(allocator, id_value, "invalid_request", @errorName(err)),
+        error.NoProjectSelected => return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found"),
+        else => return try errorResponseAlloc(allocator, id_value, "internal_error", @errorName(err)),
+    };
+    defer result.deinit(allocator);
+    return try okValueResponse(allocator, id_value, result);
+}
+
+fn herdrStatusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try beginOk(&s, id_value);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("workspace_count");
+    try s.write(state.projects.items.len);
+    try s.objectField("links");
+    try s.beginArray();
+    for (state.projects.items, 0..) |*project, index| {
+        const link = project.herdr_link orelse continue;
+        try writeHerdrStatusLink(&s, state, project, index, link);
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+    return try writer.toOwnedSlice();
+}
+
+fn writeHerdrStatusLink(
+    s: *std.json.Stringify,
+    state: *app_state.AppState,
+    project: *const app_state.Project,
+    project_index: usize,
+    link: app_state.HerdrWorkspaceLink,
+) !void {
+    try s.beginObject();
+    try s.objectField("workspace_index");
+    try s.write(project_index);
+    try s.objectField("workspace_id");
+    try s.write(project.id);
+    try s.objectField("label");
+    try s.write(project.label);
+    try s.objectField("path");
+    try s.write(project.path);
+    try s.objectField("remote");
+    try s.write(link.remote_alias);
+    try s.objectField("session");
+    try s.write(link.session_name);
+    try s.objectField("herdr_workspace");
+    try s.write(link.workspace_id);
+    try s.objectField("remote_cwd");
+    if (link.remote_cwd) |value| try s.write(value) else try s.write(null);
+    try s.objectField("herdr_pane");
+    if (link.last_pane_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("terminal_dock_id");
+    if (link.attach_dock_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("terminal_pane_id");
+    if (link.attach_pane_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("terminal_running");
+    if (link.attach_dock_id) |dock_id| {
+        if (state.projectTerminalDock(project_index, dock_id)) |dock| {
+            try s.write(dock.hasRunningSession());
+        } else {
+            try s.write(false);
+        }
+    } else {
+        try s.write(false);
+    }
+    try s.objectField("pane_links");
+    try writeHerdrPaneLinks(s, link.pane_links.items);
+    try s.objectField("updated_at_ms");
+    try s.write(link.updated_at_ms);
+    try s.endObject();
+}
+
+fn writeHerdrPaneLinks(s: *std.json.Stringify, pane_links: []const app_state.HerdrPaneLink) !void {
+    try s.beginArray();
+    for (pane_links) |pane_link| {
+        try s.beginObject();
+        try s.objectField("verde_pane_id");
+        try s.write(pane_link.verde_pane_id);
+        try s.objectField("herdr_tab_id");
+        if (pane_link.herdr_tab_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("herdr_pane_id");
+        if (pane_link.herdr_pane_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("provider");
+        try s.write(@tagName(pane_link.provider));
+        try s.objectField("presentation");
+        try s.write(@tagName(pane_link.presentation));
+        try s.objectField("provider_thread_id");
+        if (pane_link.provider_thread_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("provider_session_ref");
+        if (pane_link.provider_session_ref) |value| try s.write(value) else try s.write(null);
+        try s.objectField("cwd");
+        if (pane_link.cwd) |value| try s.write(value) else try s.write(null);
+        try s.objectField("title");
+        if (pane_link.title) |value| try s.write(value) else try s.write(null);
+        try s.objectField("updated_at_ms");
+        try s.write(pane_link.updated_at_ms);
+        try s.endObject();
+    }
+    try s.endArray();
 }
 
 fn surfacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, params: std.json.Value) ![]u8 {

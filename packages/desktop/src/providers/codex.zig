@@ -15,6 +15,9 @@ const INTERRUPTIBLE_READ_POLL_MS = 250;
 /// Poll interval while waiting for `codex app-server` after spawn (100ms × attempts).
 const MAX_CONNECT_WAIT_ATTEMPTS = 120;
 const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
+const REMOTE_CODEX_LOCAL_PORT: u16 = 14510;
+const REMOTE_CODEX_SERVER_PORT: u16 = 14511;
+const REMOTE_CODEX_WS_URL = "ws://127.0.0.1:14510";
 
 const CODEX_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
     .{
@@ -90,6 +93,13 @@ pub const Config = struct {
     transport: Transport = .websocket,
     websocket_url: ?[]const u8 = DEFAULT_WS_URL,
     launch_on_connect: bool = true,
+    remote_ssh: ?RemoteSshConfig = null,
+};
+
+pub const RemoteSshConfig = struct {
+    host: []const u8,
+    cwd: []const u8,
+    executable: []const u8 = "codex",
 };
 
 const SharedServerState = struct {
@@ -99,6 +109,14 @@ const SharedServerState = struct {
 };
 
 var shared_server_state: SharedServerState = .{};
+
+const RemoteServerState = struct {
+    mutex: Mutex = .{},
+    child: ?std.process.Child = null,
+    key: ?[]u8 = null,
+};
+
+var remote_server_state: RemoteServerState = .{};
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -624,7 +642,9 @@ pub const Client = struct {
     }
 
     fn connectWebSocket(self: *Client) !void {
-        const raw_url = self.config.websocket_url orelse return error.MissingWebSocketUrl;
+        if (self.config.remote_ssh != null) return self.connectRemoteWebSocket();
+
+        const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
         runtime_log.diagnostic("codex.connectWebSocket begin raw_url={s}", .{raw_url});
         const uri = std.Uri.parse(raw_url) catch |err| {
             runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
@@ -701,6 +721,127 @@ pub const Client = struct {
         return error.NotConnected;
     }
 
+    fn effectiveWebSocketUrl(self: *const Client) ?[]const u8 {
+        const raw_url = self.config.websocket_url orelse return null;
+        if (self.config.remote_ssh != null and std.mem.eql(u8, raw_url, DEFAULT_WS_URL)) {
+            return REMOTE_CODEX_WS_URL;
+        }
+        return raw_url;
+    }
+
+    fn connectRemoteWebSocket(self: *Client) !void {
+        const remote = self.config.remote_ssh orelse return error.MissingRemoteConfig;
+        const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
+        runtime_log.diagnostic("codex.connectRemoteWebSocket begin host={s} cwd={s} url={s}", .{ remote.host, remote.cwd, raw_url });
+
+        const uri = std.Uri.parse(raw_url) catch |err| {
+            runtime_log.diagnostic("codex.connectRemoteWebSocket Uri.parse failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host_name = uri.getHost(&host_buffer) catch |err| {
+            runtime_log.diagnostic("codex.connectRemoteWebSocket getHost failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        const host = host_name.bytes;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "ws")) return error.UnsupportedWebSocketScheme;
+        const port = uri.port orelse REMOTE_CODEX_LOCAL_PORT;
+
+        const key = try remoteServerKeyAlloc(self.allocator, remote);
+        defer self.allocator.free(key);
+
+        remote_server_state.mutex.lock();
+        defer remote_server_state.mutex.unlock();
+
+        if (!remoteServerKeyMatches(key)) {
+            stopRemoteServerLocked();
+        }
+
+        if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
+            runtime_log.diagnostic("codex.connectRemoteWebSocket connected existing tunnel", .{});
+            self.stream = stream;
+            return;
+        }
+
+        if (!self.config.launch_on_connect) return error.NotConnected;
+
+        if (remote_server_state.child != null) {
+            if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+                self.stream = stream;
+                return;
+            }
+            stopRemoteServerLocked();
+        }
+
+        try self.spawnRemoteWebSocketServerLocked(remote, key, port);
+        sleepMs(120);
+
+        if (try self.waitForWebSocket(uri, host, port, MAX_CONNECT_WAIT_ATTEMPTS)) |stream| {
+            runtime_log.diagnostic("codex.connectRemoteWebSocket connected after spawn", .{});
+            self.stream = stream;
+            return;
+        }
+
+        stopRemoteServerLocked();
+        return error.NotConnected;
+    }
+
+    fn spawnRemoteWebSocketServerLocked(
+        self: *Client,
+        remote: RemoteSshConfig,
+        key: []const u8,
+        local_port: u16,
+    ) !void {
+        const remote_command = try buildRemoteCodexCommandLineAlloc(self.allocator, remote, REMOTE_CODEX_SERVER_PORT);
+        defer self.allocator.free(remote_command);
+        const forward = try std.fmt.allocPrint(
+            self.allocator,
+            "127.0.0.1:{d}:127.0.0.1:{d}",
+            .{ local_port, REMOTE_CODEX_SERVER_PORT },
+        );
+        defer self.allocator.free(forward);
+
+        var argv = [_][]const u8{
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ConnectTimeout=20",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-L",
+            forward,
+            remote.host,
+            remote_command,
+        };
+
+        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        defer env_map.deinit();
+        var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer threaded_spawn.deinit();
+        const child = std.process.spawn(threaded_spawn.io(), .{
+            .argv = argv[0..],
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+            .environ_map = &env_map,
+        }) catch |err| {
+            runtime_log.diagnostic("codex.spawnRemoteWebSocketServer process.spawn failed host={s}: {s}", .{ remote.host, @errorName(err) });
+            return err;
+        };
+
+        const owned_key = try std.heap.page_allocator.dupe(u8, key);
+        errdefer std.heap.page_allocator.free(owned_key);
+        remote_server_state.child = child;
+        remote_server_state.key = owned_key;
+        runtime_log.diagnostic("codex.spawnRemoteWebSocketServer started pid={d} host={s}", .{ child.id orelse -1, remote.host });
+    }
+
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (shared_server_state.child != null) return;
 
@@ -756,7 +897,11 @@ pub const Client = struct {
         const stream = address.connect(threaded.io(), .{ .mode = .stream }) catch return null;
         errdefer stream.close(threaded.io());
 
-        try self.performWebSocketHandshake(stream, uri, host, port);
+        self.performWebSocketHandshake(stream, uri, host, port) catch |err| {
+            runtime_log.diagnostic("codex.tryConnectWebSocket handshake not ready: {s}", .{@errorName(err)});
+            stream.close(threaded.io());
+            return null;
+        };
         return stream;
     }
 
@@ -1542,6 +1687,10 @@ pub fn shutdownOwnedServer() void {
     shared_server_state.mutex.lock();
     defer shared_server_state.mutex.unlock();
     stopOwnedServerLocked();
+
+    remote_server_state.mutex.lock();
+    defer remote_server_state.mutex.unlock();
+    stopRemoteServerLocked();
 }
 
 fn stopOwnedServerLocked() void {
@@ -1554,6 +1703,65 @@ fn stopOwnedServerLocked() void {
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
     }
+}
+
+fn stopRemoteServerLocked() void {
+    if (remote_server_state.child) |*child| {
+        runtime_log.diagnostic("codex.stopRemoteServer stopping pid={d}", .{child.id orelse -1});
+        var threaded = std.Io.Threaded.init_single_threaded;
+        child.kill(threaded.io());
+        remote_server_state.child = null;
+    }
+    if (remote_server_state.key) |key| {
+        std.heap.page_allocator.free(key);
+        remote_server_state.key = null;
+    }
+}
+
+fn remoteServerKeyAlloc(allocator: std.mem.Allocator, remote: RemoteSshConfig) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{ remote.host, remote.cwd, remote.executable });
+}
+
+fn remoteServerKeyMatches(key: []const u8) bool {
+    const current = remote_server_state.key orelse return false;
+    return std.mem.eql(u8, current, key);
+}
+
+fn buildRemoteCodexCommandLineAlloc(allocator: std.mem.Allocator, remote: RemoteSshConfig, port: u16) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    // Non-login SSH shells often miss user-local tool directories. Keep this
+    // narrow to common CLI install paths without depending on remote shell rc files.
+    try writer.writer.writeAll("export PATH=\"$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH\"; cd ");
+    try shellQuote(&writer.writer, remote.cwd);
+    try writer.writer.writeAll(" && exec ");
+    try shellQuote(&writer.writer, remote.executable);
+    try writer.writer.writeAll(" app-server --listen ");
+    const url = try std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}", .{port});
+    defer allocator.free(url);
+    try shellQuote(&writer.writer, url);
+    return try writer.toOwnedSlice();
+}
+
+fn shellQuote(writer: *std.Io.Writer, arg: []const u8) !void {
+    if (arg.len == 0) return writer.writeAll("''");
+    var needs_quote = false;
+    for (arg) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '/' or byte == '.' or byte == '_' or byte == '-' or byte == ':' or byte == '=')) {
+            needs_quote = true;
+            break;
+        }
+    }
+    if (!needs_quote) return writer.writeAll(arg);
+    try writer.writeByte('\'');
+    for (arg) |byte| {
+        if (byte == '\'') {
+            try writer.writeAll("'\\''");
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+    try writer.writeByte('\'');
 }
 
 const FrameOpcode = enum(u4) {
@@ -2983,6 +3191,18 @@ fn approvalDecisionString(value: provider_types.ApprovalDecision) []const u8 {
         .approve => "accept",
         .deny => "decline",
     };
+}
+
+test "remote codex app-server command quotes cwd" {
+    const command = try buildRemoteCodexCommandLineAlloc(std.testing.allocator, .{
+        .host = "zod",
+        .cwd = "/home/rtg/project with spaces",
+    }, 14511);
+    defer std.testing.allocator.free(command);
+    try std.testing.expectEqualStrings(
+        "export PATH=\"$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH\"; cd '/home/rtg/project with spaces' && exec codex app-server --listen ws://127.0.0.1:14511",
+        command,
+    );
 }
 
 test "build request target preserves path and query" {

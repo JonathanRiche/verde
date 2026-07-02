@@ -25,7 +25,17 @@ pub const INIT_SQL: [:0]const u8 =
     \\    terminal_layout_json text,
     \\    terminal_docks_json text,
     \\    workspace_layout_json text,
-    \\    selected_thread_index integer not null default 0
+    \\    selected_thread_index integer not null default 0,
+    \\    herdr_remote_alias text,
+    \\    herdr_session_name text,
+    \\    herdr_workspace_id text,
+    \\    herdr_local_dir text,
+    \\    herdr_remote_cwd text,
+    \\    herdr_last_pane_id text,
+    \\    herdr_attach_dock_id integer,
+    \\    herdr_attach_pane_id integer,
+    \\    herdr_pane_links_json text,
+    \\    herdr_updated_at_ms integer
     \\);
     \\create unique index if not exists workspaces_sort_index_idx on workspaces(sort_index);
     \\create table if not exists threads (
@@ -35,6 +45,7 @@ pub const INIT_SQL: [:0]const u8 =
     \\    title text not null,
     \\    archived integer not null default 0,
     \\    committed integer not null default 1,
+    \\    local_thread_id text,
     \\    last_activity_at integer,
     \\    provider_thread_id text,
     \\    model_ref text,
@@ -73,7 +84,18 @@ pub fn initialize(conn: zqlite.Conn) !void {
     try ensureColumn(conn, "workspaces", "terminal_layout_json", "alter table workspaces add column terminal_layout_json text");
     try ensureColumn(conn, "workspaces", "terminal_docks_json", "alter table workspaces add column terminal_docks_json text");
     try ensureColumn(conn, "workspaces", "workspace_layout_json", "alter table workspaces add column workspace_layout_json text");
+    try ensureColumn(conn, "workspaces", "herdr_remote_alias", "alter table workspaces add column herdr_remote_alias text");
+    try ensureColumn(conn, "workspaces", "herdr_session_name", "alter table workspaces add column herdr_session_name text");
+    try ensureColumn(conn, "workspaces", "herdr_workspace_id", "alter table workspaces add column herdr_workspace_id text");
+    try ensureColumn(conn, "workspaces", "herdr_local_dir", "alter table workspaces add column herdr_local_dir text");
+    try ensureColumn(conn, "workspaces", "herdr_remote_cwd", "alter table workspaces add column herdr_remote_cwd text");
+    try ensureColumn(conn, "workspaces", "herdr_last_pane_id", "alter table workspaces add column herdr_last_pane_id text");
+    try ensureColumn(conn, "workspaces", "herdr_attach_dock_id", "alter table workspaces add column herdr_attach_dock_id integer");
+    try ensureColumn(conn, "workspaces", "herdr_attach_pane_id", "alter table workspaces add column herdr_attach_pane_id integer");
+    try ensureColumn(conn, "workspaces", "herdr_pane_links_json", "alter table workspaces add column herdr_pane_links_json text");
+    try ensureColumn(conn, "workspaces", "herdr_updated_at_ms", "alter table workspaces add column herdr_updated_at_ms integer");
     try ensureColumn(conn, "threads", "archived", "alter table threads add column archived integer not null default 0");
+    try ensureColumn(conn, "threads", "local_thread_id", "alter table threads add column local_thread_id text");
     try ensureColumn(conn, "threads", "reasoning_variant", "alter table threads add column reasoning_variant text");
     try ensureColumn(conn, "threads", "tui_dock_id", "alter table threads add column tui_dock_id integer");
 }

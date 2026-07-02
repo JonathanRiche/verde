@@ -11,6 +11,7 @@ const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const fff = @import("fff.zig");
+const herdr = @import("herdr.zig");
 const keybinds = @import("keybinds.zig");
 const loop_wakeup = @import("loop_wakeup.zig");
 const notifier = @import("notifier.zig");
@@ -19,6 +20,7 @@ const runtime_log = @import("runtime_log.zig");
 const slash_commands = @import("slash_commands.zig");
 const stack_config = @import("stack.zig");
 const stb_image = @import("stb_image.zig");
+const sessionizer = @import("terminal/sessionizer.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
@@ -132,6 +134,10 @@ pub const PaletteModalAction = enum {
     thread_import_cancel,
     thread_import_submit,
     thread_import_select,
+    herdr_profile_refresh,
+    herdr_profile_cancel,
+    herdr_profile_submit,
+    herdr_profile_select,
     project_import_browse,
     project_import_submit,
     project_import_cancel,
@@ -163,6 +169,7 @@ pub const SettingsDraft = struct {
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
     theme_source: theme.ThemeSource = .omarchy,
     open_action: SettingsOpenAction = .folder,
+    link_open_target: app_config.LinkOpenTarget = .verde_browser,
     notifications_enabled: bool = true,
 };
 
@@ -840,6 +847,7 @@ pub const ZED_LOGO_BYTES = @embedFile("assets/editor_logos/zed.png");
 
 const LoadedPersistedState = db_types.LoadedState;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
+const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
 const PersistedState = db_types.PersistedState;
@@ -1056,6 +1064,8 @@ const CLAUDE_OPUS_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhi
 
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Default (Sonnet)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
+    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7", .reasoning_supported = true, .claude_effort_values = CLAUDE_OPUS_EFFORT_VALUES[0..] },
+    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5", .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
     .{ .label = "Sonnet (1M context)", .value = "sonnet[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
     .{ .label = "Opus", .value = "opus", .reasoning_supported = true, .claude_effort_values = CLAUDE_OPUS_EFFORT_VALUES[0..] },
     .{ .label = "Haiku", .value = "haiku", .reasoning_supported = false },
@@ -1146,6 +1156,7 @@ pub const ChatThread = struct {
     title: [:0]const u8,
     archived: bool = false,
     committed: bool = false,
+    local_thread_id: [:0]const u8,
     last_activity_at: i64 = 0,
     provider_thread_id: ?[:0]const u8 = null,
     model_ref: ?[:0]const u8 = null,
@@ -1172,9 +1183,12 @@ pub const ChatThread = struct {
         const send_state = try allocator.create(SendState);
         errdefer allocator.destroy(send_state);
         send_state.* = .{};
+        const local_thread_id = try allocPrintZCompat(allocator, "chat-{d}-{x}", .{ unixTimestampMs(), @intFromPtr(send_state) });
+        errdefer allocator.free(local_thread_id);
 
         return .{
             .title = try allocator.dupeZ(u8, title),
+            .local_thread_id = local_thread_id,
             .committed = false,
             .last_activity_at = 0,
             .model_ref = try allocator.dupeZ(u8, DEFAULT_CODEX_MODEL),
@@ -1470,6 +1484,10 @@ pub const ChatThread = struct {
             std.heap.page_allocator.free(turn_id);
             self.send_state.active_turn_id = null;
         }
+        if (self.send_state.daemon_turn_id) |turn_id| {
+            std.heap.page_allocator.free(turn_id);
+            self.send_state.daemon_turn_id = null;
+        }
         freePendingFollowup(std.heap.page_allocator, &self.send_state.pending_followup);
         self.send_state.partial_text.deinit(std.heap.page_allocator);
         freePendingTimelineEvents(std.heap.page_allocator, &self.send_state.pending_events);
@@ -1484,6 +1502,7 @@ pub const ChatThread = struct {
         self.transcript_markdown_entries.deinit(allocator);
         self.transcript_height_entries.deinit(allocator);
         allocator.free(self.title);
+        allocator.free(self.local_thread_id);
         if (self.provider_thread_id) |thread_id| allocator.free(thread_id);
         if (self.model_ref) |model_ref| allocator.free(model_ref);
         if (self.opencode_reasoning_variant) |variant| allocator.free(variant);
@@ -1580,6 +1599,8 @@ const SlashCommandWorkerRequest = struct {
     provider: Provider,
     harness: Harness,
     project_path: []u8,
+    remote_ssh_host: ?[]u8 = null,
+    remote_cwd: ?[]u8 = null,
     thread_id: ?[]u8,
     command: ai_harness.ProviderSlashCommandId,
     raw_text: []u8,
@@ -1611,6 +1632,22 @@ pub const ImportThreadSummary = struct {
     fn deinit(self: ImportThreadSummary, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.title);
+    }
+};
+
+pub const HerdrProfileSummary = struct {
+    name: [:0]const u8,
+    ssh_target: [:0]const u8,
+    session: [:0]const u8,
+    remote_cwd: ?[:0]const u8 = null,
+    local_dir: ?[:0]const u8 = null,
+
+    fn deinit(self: HerdrProfileSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.ssh_target);
+        allocator.free(self.session);
+        if (self.remote_cwd) |value| allocator.free(value);
+        if (self.local_dir) |value| allocator.free(value);
     }
 };
 
@@ -3033,10 +3070,459 @@ pub const WorkspaceLayout = struct {
     }
 };
 
+pub const HerdrPanePresentation = enum(u8) {
+    gui_chat,
+    tui_agent,
+    terminal,
+    browser_link,
+    unknown,
+};
+
+pub const HerdrPaneProvider = enum(u8) {
+    codex,
+    claude,
+    opencode,
+    cursor,
+    terminal,
+    browser,
+    unknown,
+};
+
+const ProviderExecutionTarget = union(enum) {
+    local: []const u8,
+    remote_ssh: struct {
+        host: []const u8,
+        cwd: []const u8,
+    },
+
+    fn cwd(self: ProviderExecutionTarget) []const u8 {
+        return switch (self) {
+            .local => |path| path,
+            .remote_ssh => |remote| remote.cwd,
+        };
+    }
+
+    fn remoteHost(self: ProviderExecutionTarget) ?[]const u8 {
+        return switch (self) {
+            .local => null,
+            .remote_ssh => |remote| remote.host,
+        };
+    }
+};
+
+pub const HerdrPaneLink = struct {
+    verde_pane_id: WorkspacePaneId = 0,
+    herdr_tab_id: ?[]u8 = null,
+    herdr_pane_id: ?[]u8 = null,
+    provider: HerdrPaneProvider = .unknown,
+    presentation: HerdrPanePresentation = .unknown,
+    provider_thread_id: ?[]u8 = null,
+    provider_session_ref: ?[]u8 = null,
+    cwd: ?[]u8 = null,
+    title: ?[]u8 = null,
+    updated_at_ms: i64 = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        verde_pane_id: WorkspacePaneId,
+        herdr_tab_id: ?[]const u8,
+        herdr_pane_id: ?[]const u8,
+        provider: HerdrPaneProvider,
+        presentation: HerdrPanePresentation,
+        provider_thread_id: ?[]const u8,
+        provider_session_ref: ?[]const u8,
+        cwd: ?[]const u8,
+        title: ?[]const u8,
+    ) !HerdrPaneLink {
+        return .{
+            .verde_pane_id = verde_pane_id,
+            .herdr_tab_id = if (herdr_tab_id) |value| try allocator.dupe(u8, value) else null,
+            .herdr_pane_id = if (herdr_pane_id) |value| try allocator.dupe(u8, value) else null,
+            .provider = provider,
+            .presentation = presentation,
+            .provider_thread_id = if (provider_thread_id) |value| try allocator.dupe(u8, value) else null,
+            .provider_session_ref = if (provider_session_ref) |value| try allocator.dupe(u8, value) else null,
+            .cwd = if (cwd) |value| try allocator.dupe(u8, value) else null,
+            .title = if (title) |value| try allocator.dupe(u8, value) else null,
+            .updated_at_ms = unixTimestampMs(),
+        };
+    }
+
+    fn deinit(self: *HerdrPaneLink, allocator: std.mem.Allocator) void {
+        if (self.herdr_tab_id) |value| allocator.free(value);
+        if (self.herdr_pane_id) |value| allocator.free(value);
+        if (self.provider_thread_id) |value| allocator.free(value);
+        if (self.provider_session_ref) |value| allocator.free(value);
+        if (self.cwd) |value| allocator.free(value);
+        if (self.title) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const HerdrWorkspaceLink = struct {
+    remote_alias: []u8,
+    session_name: []u8,
+    workspace_id: []u8,
+    local_dir: []u8,
+    remote_cwd: ?[]u8 = null,
+    last_pane_id: ?[]u8 = null,
+    attach_dock_id: ?u32 = null,
+    attach_pane_id: ?WorkspacePaneId = null,
+    pane_links: std.ArrayList(HerdrPaneLink) = .empty,
+    updated_at_ms: i64 = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        remote_alias: []const u8,
+        session_name: []const u8,
+        workspace_id: []const u8,
+        local_dir: []const u8,
+        remote_cwd: ?[]const u8,
+        last_pane_id: ?[]const u8,
+        attach_dock_id: ?u32,
+        attach_pane_id: ?WorkspacePaneId,
+    ) !HerdrWorkspaceLink {
+        const remote_copy = try allocator.dupe(u8, remote_alias);
+        errdefer allocator.free(remote_copy);
+        const session_copy = try allocator.dupe(u8, session_name);
+        errdefer allocator.free(session_copy);
+        const workspace_copy = try allocator.dupe(u8, workspace_id);
+        errdefer allocator.free(workspace_copy);
+        const local_dir_copy = try allocator.dupe(u8, local_dir);
+        errdefer allocator.free(local_dir_copy);
+        var remote_cwd_copy: ?[]u8 = null;
+        errdefer if (remote_cwd_copy) |value| allocator.free(value);
+        remote_cwd_copy = if (remote_cwd) |value| try allocator.dupe(u8, value) else null;
+        var last_pane_copy: ?[]u8 = null;
+        errdefer if (last_pane_copy) |value| allocator.free(value);
+        last_pane_copy = if (last_pane_id) |value| try allocator.dupe(u8, value) else null;
+        return .{
+            .remote_alias = remote_copy,
+            .session_name = session_copy,
+            .workspace_id = workspace_copy,
+            .local_dir = local_dir_copy,
+            .remote_cwd = remote_cwd_copy,
+            .last_pane_id = last_pane_copy,
+            .attach_dock_id = attach_dock_id,
+            .attach_pane_id = attach_pane_id,
+            .pane_links = .empty,
+            .updated_at_ms = unixTimestampMs(),
+        };
+    }
+
+    fn initFromPersisted(allocator: std.mem.Allocator, persisted: PersistedHerdrWorkspaceLink) !HerdrWorkspaceLink {
+        var link = try init(
+            allocator,
+            persisted.remote_alias,
+            persisted.session_name,
+            persisted.workspace_id,
+            persisted.local_dir,
+            persisted.remote_cwd,
+            persisted.last_pane_id,
+            persisted.attach_dock_id,
+            persisted.attach_pane_id,
+        );
+        errdefer link.deinit(allocator);
+        link.updated_at_ms = persisted.updated_at_ms;
+        if (persisted.pane_links_json) |json| try link.applyPaneLinksJson(allocator, json);
+        return link;
+    }
+
+    fn deinit(self: *HerdrWorkspaceLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.remote_alias);
+        allocator.free(self.session_name);
+        allocator.free(self.workspace_id);
+        allocator.free(self.local_dir);
+        if (self.remote_cwd) |value| allocator.free(value);
+        if (self.last_pane_id) |value| allocator.free(value);
+        for (self.pane_links.items) |*pane_link| pane_link.deinit(allocator);
+        self.pane_links.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn toPersisted(self: *const HerdrWorkspaceLink, allocator: std.mem.Allocator) !PersistedHerdrWorkspaceLink {
+        return .{
+            .remote_alias = try allocator.dupe(u8, self.remote_alias),
+            .session_name = try allocator.dupe(u8, self.session_name),
+            .workspace_id = try allocator.dupe(u8, self.workspace_id),
+            .local_dir = try allocator.dupe(u8, self.local_dir),
+            .remote_cwd = if (self.remote_cwd) |value| try allocator.dupe(u8, value) else null,
+            .last_pane_id = if (self.last_pane_id) |value| try allocator.dupe(u8, value) else null,
+            .attach_dock_id = self.attach_dock_id,
+            .attach_pane_id = self.attach_pane_id,
+            .pane_links_json = try self.paneLinksJsonAlloc(allocator),
+            .updated_at_ms = self.updated_at_ms,
+        };
+    }
+
+    fn replacePaneLinks(self: *HerdrWorkspaceLink, allocator: std.mem.Allocator, next_links: *std.ArrayList(HerdrPaneLink)) void {
+        for (self.pane_links.items) |*pane_link| pane_link.deinit(allocator);
+        self.pane_links.deinit(allocator);
+        self.pane_links = next_links.*;
+        next_links.* = .empty;
+        self.updated_at_ms = unixTimestampMs();
+    }
+
+    fn paneLinkForVerdePane(self: *const HerdrWorkspaceLink, pane_id: WorkspacePaneId) ?HerdrPaneLink {
+        for (self.pane_links.items) |pane_link| {
+            if (pane_link.verde_pane_id == pane_id) return pane_link;
+        }
+        return null;
+    }
+
+    fn removePaneLinkForVerdePane(self: *HerdrWorkspaceLink, allocator: std.mem.Allocator, pane_id: WorkspacePaneId) bool {
+        for (self.pane_links.items, 0..) |*pane_link, index| {
+            if (pane_link.verde_pane_id != pane_id) continue;
+            var removed = self.pane_links.orderedRemove(index);
+            removed.deinit(allocator);
+            self.updated_at_ms = unixTimestampMs();
+            return true;
+        }
+        return false;
+    }
+
+    fn paneLinksJsonAlloc(self: *const HerdrWorkspaceLink, allocator: std.mem.Allocator) !?[]u8 {
+        if (self.pane_links.items.len == 0) return null;
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var stringify: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try stringify.beginArray();
+        for (self.pane_links.items) |pane_link| {
+            try stringify.beginObject();
+            try stringify.objectField("verde_pane_id");
+            try stringify.write(pane_link.verde_pane_id);
+            try stringify.objectField("herdr_tab_id");
+            if (pane_link.herdr_tab_id) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("herdr_pane_id");
+            if (pane_link.herdr_pane_id) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("provider");
+            try stringify.write(@tagName(pane_link.provider));
+            try stringify.objectField("presentation");
+            try stringify.write(@tagName(pane_link.presentation));
+            try stringify.objectField("provider_thread_id");
+            if (pane_link.provider_thread_id) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("provider_session_ref");
+            if (pane_link.provider_session_ref) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("cwd");
+            if (pane_link.cwd) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("title");
+            if (pane_link.title) |value| try stringify.write(value) else try stringify.write(null);
+            try stringify.objectField("updated_at_ms");
+            try stringify.write(pane_link.updated_at_ms);
+            try stringify.endObject();
+        }
+        try stringify.endArray();
+        return try writer.toOwnedSlice();
+    }
+
+    fn applyPaneLinksJson(self: *HerdrWorkspaceLink, allocator: std.mem.Allocator, json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |entry| {
+            if (entry != .object) continue;
+            const pane_id: WorkspacePaneId = @intCast(herdrJsonInt(entry.object.get("verde_pane_id") orelse .null) orelse continue);
+            var link = try HerdrPaneLink.init(
+                allocator,
+                pane_id,
+                herdrJsonString(entry.object.get("herdr_tab_id") orelse .null),
+                herdrJsonString(entry.object.get("herdr_pane_id") orelse .null),
+                herdrPaneProviderFromLabel(herdrJsonString(entry.object.get("provider") orelse .null) orelse "unknown"),
+                herdrPanePresentationFromLabel(herdrJsonString(entry.object.get("presentation") orelse .null) orelse "unknown"),
+                herdrJsonString(entry.object.get("provider_thread_id") orelse .null),
+                herdrJsonString(entry.object.get("provider_session_ref") orelse .null),
+                herdrJsonString(entry.object.get("cwd") orelse .null),
+                herdrJsonString(entry.object.get("title") orelse .null),
+            );
+            link.updated_at_ms = herdrJsonInt(entry.object.get("updated_at_ms") orelse .null) orelse link.updated_at_ms;
+            errdefer link.deinit(allocator);
+            try self.pane_links.append(allocator, link);
+        }
+    }
+};
+
+fn herdrJsonString(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn herdrJsonInt(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
+}
+
+fn herdrPaneProviderFromLabel(label: []const u8) HerdrPaneProvider {
+    if (std.mem.eql(u8, label, "codex")) return .codex;
+    if (std.mem.eql(u8, label, "claude")) return .claude;
+    if (std.mem.eql(u8, label, "opencode")) return .opencode;
+    if (std.mem.eql(u8, label, "cursor")) return .cursor;
+    if (std.mem.eql(u8, label, "terminal")) return .terminal;
+    if (std.mem.eql(u8, label, "browser")) return .browser;
+    return .unknown;
+}
+
+fn herdrPanePresentationFromLabel(label: []const u8) HerdrPanePresentation {
+    if (std.mem.eql(u8, label, "gui_chat")) return .gui_chat;
+    if (std.mem.eql(u8, label, "tui_agent")) return .tui_agent;
+    if (std.mem.eql(u8, label, "terminal")) return .terminal;
+    if (std.mem.eql(u8, label, "browser_link")) return .browser_link;
+    return .unknown;
+}
+
+fn herdrPaneProviderForThreadProvider(provider: Provider) HerdrPaneProvider {
+    return switch (provider) {
+        .codex => .codex,
+        .claude => .claude,
+        .opencode => .opencode,
+        .cursor => .cursor,
+    };
+}
+
+fn herdrAgentCommandForProvider(allocator: std.mem.Allocator, provider: HerdrPaneProvider, thread_id: ?[]const u8) !?[]u8 {
+    if (thread_id) |id| {
+        return switch (provider) {
+            .codex => try std.fmt.allocPrint(allocator, "codex resume {s}", .{id}),
+            .claude => try std.fmt.allocPrint(allocator, "claude --resume {s}", .{id}),
+            .opencode => if (std.mem.startsWith(u8, id, "ses"))
+                try std.fmt.allocPrint(allocator, "{s} --session {s}", .{ OPENCODE_TUI_COMMAND, id })
+            else
+                try allocator.dupe(u8, OPENCODE_TUI_COMMAND),
+            .cursor => try std.fmt.allocPrint(allocator, "agent --resume {s}", .{id}),
+            .terminal, .browser, .unknown => null,
+        };
+    }
+
+    const command: ?[]const u8 = switch (provider) {
+        .codex => "codex",
+        .claude => "claude",
+        .opencode => OPENCODE_TUI_COMMAND,
+        .cursor => "agent",
+        .terminal, .browser, .unknown => null,
+    };
+    return if (command) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn parseHerdrJsonStringAlloc(allocator: std.mem.Allocator, json: []const u8, key: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const value = herdr.findJsonString(parsed.value, key) orelse return error.InvalidHerdrResponse;
+    return try allocator.dupe(u8, value);
+}
+
+pub const HerdrOpenResult = struct {
+    workspace_index: usize,
+    workspace_id: []const u8,
+    workspace_path: []const u8,
+    created: bool,
+    restored: bool,
+    remote: []const u8,
+    session: []const u8,
+    herdr_workspace: []const u8,
+    herdr_pane: ?[]const u8,
+    terminal_dock_id: ?u32,
+    terminal_pane_id: ?WorkspacePaneId,
+};
+
+pub const HerdrHandoffWorkspaceResult = struct {
+    workspace_index: usize,
+    workspace_id: []const u8,
+    label: []const u8,
+    path: []const u8,
+    remote: []const u8,
+    session: []const u8,
+    herdr_workspace: []const u8,
+    herdr_tab: ?[]const u8,
+    created: bool,
+    pane_count: usize,
+};
+
+pub const HerdrHandoffResult = struct {
+    dry_run: bool,
+    workspace_count: usize,
+    workspaces: []HerdrHandoffWorkspaceResult,
+
+    pub fn deinit(self: HerdrHandoffResult, allocator: std.mem.Allocator) void {
+        if (self.workspaces.len > 0) allocator.free(self.workspaces);
+    }
+};
+
+pub const HerdrUnlinkPreviousLink = struct {
+    remote: []const u8,
+    session: []const u8,
+    herdr_workspace: []const u8,
+    remote_cwd: ?[]const u8 = null,
+    herdr_pane: ?[]const u8 = null,
+    terminal_dock_id: ?u32 = null,
+    terminal_pane_id: ?WorkspacePaneId = null,
+    pane_links_len: usize = 0,
+    updated_at_ms: i64 = 0,
+
+    fn init(allocator: std.mem.Allocator, link: HerdrWorkspaceLink) !HerdrUnlinkPreviousLink {
+        const remote = try allocator.dupe(u8, link.remote_alias);
+        errdefer allocator.free(remote);
+        const session = try allocator.dupe(u8, link.session_name);
+        errdefer allocator.free(session);
+        const workspace = try allocator.dupe(u8, link.workspace_id);
+        errdefer allocator.free(workspace);
+        const remote_cwd = if (link.remote_cwd) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (remote_cwd) |value| allocator.free(value);
+        const herdr_pane = if (link.last_pane_id) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (herdr_pane) |value| allocator.free(value);
+        return .{
+            .remote = remote,
+            .session = session,
+            .herdr_workspace = workspace,
+            .remote_cwd = remote_cwd,
+            .herdr_pane = herdr_pane,
+            .terminal_dock_id = link.attach_dock_id,
+            .terminal_pane_id = link.attach_pane_id,
+            .pane_links_len = link.pane_links.items.len,
+            .updated_at_ms = link.updated_at_ms,
+        };
+    }
+
+    fn deinit(self: HerdrUnlinkPreviousLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.remote);
+        allocator.free(self.session);
+        allocator.free(self.herdr_workspace);
+        if (self.remote_cwd) |value| allocator.free(value);
+        if (self.herdr_pane) |value| allocator.free(value);
+    }
+};
+
+pub const HerdrUnlinkWorkspaceResult = struct {
+    workspace_index: usize,
+    workspace_id: []const u8,
+    label: []const u8,
+    path: []const u8,
+    unlinked: bool,
+    previous: ?HerdrUnlinkPreviousLink = null,
+
+    fn deinit(self: HerdrUnlinkWorkspaceResult, allocator: std.mem.Allocator) void {
+        if (self.previous) |previous| previous.deinit(allocator);
+    }
+};
+
+pub const HerdrUnlinkResult = struct {
+    workspace_count: usize,
+    workspaces: []HerdrUnlinkWorkspaceResult,
+
+    pub fn deinit(self: HerdrUnlinkResult, allocator: std.mem.Allocator) void {
+        for (self.workspaces) |workspace| workspace.deinit(allocator);
+        if (self.workspaces.len > 0) allocator.free(self.workspaces);
+    }
+};
+
 pub const Project = struct {
     id: [:0]const u8,
     label: [:0]const u8,
     path: [:0]const u8,
+    herdr_link: ?HerdrWorkspaceLink = null,
     archived: bool = false,
     unread_count: u8 = 0,
     collapsed: bool = false,
@@ -3063,6 +3549,7 @@ pub const Project = struct {
             .id = try allocator.dupeZ(u8, id),
             .label = try allocator.dupeZ(u8, label),
             .path = try allocator.dupeZ(u8, path),
+            .herdr_link = null,
             .archived = false,
             .unread_count = unread_count,
             .collapsed = false,
@@ -3258,6 +3745,7 @@ pub const Project = struct {
         allocator.free(self.id);
         allocator.free(self.label);
         allocator.free(self.path);
+        if (self.herdr_link) |*link| link.deinit(allocator);
         self.terminal_dock.deinit(allocator);
         for (self.terminal_docks.items) |*entry| entry.deinit(allocator);
         self.terminal_docks.deinit(allocator);
@@ -3448,6 +3936,9 @@ pub const SendState = struct {
     provider: ?Provider = null,
     provisional_provider_thread_id: ?[]u8 = null,
     active_turn_id: ?[]u8 = null,
+    daemon_turn_id: ?[]u8 = null,
+    daemon_last_seq: u64 = 0,
+    daemon_owned: bool = false,
     partial_text: std.ArrayListUnmanaged(u8) = .empty,
     pending_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty,
     pending_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty,
@@ -3524,6 +4015,7 @@ pub const AppState = struct {
     sidebar_notice_storage: [256:0]u8,
     import_thread_id_storage: [256:0]u8,
     import_notice_storage: [256:0]u8,
+    herdr_profile_notice_storage: [256:0]u8,
     sidebar_collapsed: bool,
     sidebar_hidden: bool,
     sidebar_hover_revealed: bool,
@@ -3633,6 +4125,11 @@ pub const AppState = struct {
     /// Row index in `thread_import_threads` under the cursor (import modal list).
     thread_import_hover_index: ?usize,
     thread_import_threads: std.ArrayList(ImportThreadSummary),
+    herdr_profile_picker_project_index: ?usize,
+    herdr_profile_selected_index: ?usize,
+    /// Row index in `herdr_profile_summaries` under the cursor (profile picker modal).
+    herdr_profile_hover_index: ?usize,
+    herdr_profile_summaries: std.ArrayList(HerdrProfileSummary),
     /// Command palette (Ctrl+Shift+P overlay). `ui/command_palette.zig` owns result
     /// building and rendering; these are the cross-cutting bits the input
     /// router and keybind dispatch need.
@@ -3780,6 +4277,7 @@ pub const AppState = struct {
             .sidebar_notice_storage = std.mem.zeroes([256:0]u8),
             .import_thread_id_storage = std.mem.zeroes([256:0]u8),
             .import_notice_storage = std.mem.zeroes([256:0]u8),
+            .herdr_profile_notice_storage = std.mem.zeroes([256:0]u8),
             .sidebar_collapsed = false,
             .sidebar_hidden = false,
             .sidebar_hover_revealed = false,
@@ -3875,6 +4373,10 @@ pub const AppState = struct {
             .thread_import_selected_index = null,
             .thread_import_hover_index = null,
             .thread_import_threads = .empty,
+            .herdr_profile_picker_project_index = null,
+            .herdr_profile_selected_index = null,
+            .herdr_profile_hover_index = null,
+            .herdr_profile_summaries = .empty,
             .command_palette_open = false,
             .command_palette_scope_project = null,
             .command_palette_query_storage = std.mem.zeroes([256:0]u8),
@@ -3977,6 +4479,7 @@ pub const AppState = struct {
         } else {
             try state.seedDefaultState();
         }
+        state.restoreDaemonChatTurnsOnLaunch();
         state.loadCursorModelOptionsDiskCache() catch |err| {
             log.warn("failed to load Cursor model cache: {s}", .{@errorName(err)});
             state.clearCursorModelOptions();
@@ -4699,6 +5202,878 @@ pub const AppState = struct {
         };
     }
 
+    pub fn consumePendingHerdrOpenRequest(self: *AppState) !bool {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var loaded = try herdr.readPendingOpen(self.allocator, threaded.io(), self.storage.pref_path) orelse return false;
+        defer loaded.deinit();
+        herdr.deletePendingOpen(self.allocator, threaded.io(), self.storage.pref_path);
+        _ = try self.openOrCreateHerdrWorkspace(loaded.value);
+        return true;
+    }
+
+    pub fn openOrCreateHerdrWorkspace(self: *AppState, request: herdr.OpenRequest) !HerdrOpenResult {
+        try herdr.validateOpenRequest(request);
+        const remote_alias = herdr.remoteAlias(request);
+        var created = false;
+        var restored = false;
+
+        const project_index = if (self.findHerdrProjectIndex(request)) |index| index else blk: {
+            const local_dir = try self.resolveHerdrLocalProjectDir(request);
+            defer self.allocator.free(local_dir);
+            if (self.findProjectIndexByPath(local_dir)) |index| {
+                break :blk index;
+            }
+            const result = try self.createProjectFromPath(local_dir);
+            created = !result.restored;
+            restored = result.restored;
+            break :blk result.index;
+        };
+
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+        const local_dir_for_link = self.projects.items[project_index].path;
+        try self.replaceProjectHerdrLink(project_index, request, local_dir_for_link, null, null);
+        self.syncRenameBuffer();
+        self.setSidebarNotice(if (remote_alias.len > 0) "Remote Herdr workspace opened." else "Herdr workspace opened.");
+        self.markDirty();
+
+        const project = &self.projects.items[project_index];
+        const link = project.herdr_link;
+        return .{
+            .workspace_index = project_index,
+            .workspace_id = project.id,
+            .workspace_path = project.path,
+            .created = created,
+            .restored = restored,
+            .remote = remote_alias,
+            .session = request.session,
+            .herdr_workspace = request.herdr_workspace,
+            .herdr_pane = request.pane,
+            .terminal_dock_id = if (link) |value| value.attach_dock_id else null,
+            .terminal_pane_id = if (link) |value| value.attach_pane_id else null,
+        };
+    }
+
+    pub fn handoffHerdrWorkspaces(self: *AppState, result_allocator: std.mem.Allocator, request: herdr.HandoffRequest) !HerdrHandoffResult {
+        try herdr.validateHandoffRequest(request);
+        if (self.projects.items.len == 0) return .{ .dry_run = request.dry_run, .workspace_count = 0, .workspaces = &.{} };
+
+        var results: std.ArrayList(HerdrHandoffWorkspaceResult) = .empty;
+        errdefer results.deinit(result_allocator);
+
+        if (request.all or request.workspace == null) {
+            for (self.projects.items, 0..) |_, project_index| {
+                try results.append(result_allocator, try self.handoffProjectToHerdr(project_index, request));
+            }
+        } else {
+            const project_index = self.herdrHandoffProjectIndex(request.workspace.?) orelse return error.NoProjectSelected;
+            try results.append(result_allocator, try self.handoffProjectToHerdr(project_index, request));
+        }
+
+        if (!request.dry_run) {
+            self.setSidebarNotice("Handed Verde workspace layout to Herdr.");
+            self.markDirty();
+        }
+
+        const owned = try results.toOwnedSlice(result_allocator);
+        return .{
+            .dry_run = request.dry_run,
+            .workspace_count = owned.len,
+            .workspaces = owned,
+        };
+    }
+
+    pub fn unlinkHerdrWorkspaces(self: *AppState, result_allocator: std.mem.Allocator, request: herdr.UnlinkRequest) !HerdrUnlinkResult {
+        try herdr.validateUnlinkRequest(request);
+        if (self.projects.items.len == 0) return .{ .workspace_count = 0, .workspaces = &.{} };
+
+        var results: std.ArrayList(HerdrUnlinkWorkspaceResult) = .empty;
+        errdefer {
+            for (results.items) |workspace| workspace.deinit(result_allocator);
+            results.deinit(result_allocator);
+        }
+
+        if (request.all) {
+            for (self.projects.items, 0..) |project, project_index| {
+                if (project.herdr_link == null) continue;
+                try self.appendHerdrUnlinkResult(result_allocator, &results, project_index);
+            }
+        } else {
+            const selector = request.workspace orelse "current";
+            const project_index = self.herdrHandoffProjectIndex(selector) orelse return error.NoProjectSelected;
+            try self.appendHerdrUnlinkResult(result_allocator, &results, project_index);
+        }
+
+        var unlinked_count: usize = 0;
+        for (results.items) |result| {
+            if (result.unlinked) unlinked_count += 1;
+        }
+        if (unlinked_count > 0) {
+            self.setSidebarNotice(if (unlinked_count == 1) "Herdr link removed; workspace now runs locally." else "Herdr links removed; workspaces now run locally.");
+            self.markDirty();
+        }
+
+        const owned = try results.toOwnedSlice(result_allocator);
+        return .{
+            .workspace_count = owned.len,
+            .workspaces = owned,
+        };
+    }
+
+    pub fn handoffProjectToLocalHerdrFromUi(self: *AppState, project_index: usize) void {
+        if (project_index >= self.projects.items.len) {
+            self.setSidebarNotice("Workspace not found.");
+            return;
+        }
+        const request: herdr.HandoffRequest = .{
+            .session = if (self.projects.items[project_index].herdr_link) |link| link.session_name else "default",
+            .workspace = self.projects.items[project_index].id,
+            .all = false,
+        };
+        var result = self.handoffHerdrWorkspaces(self.allocator, request) catch |err| {
+            self.setSidebarNotice(herdrUiFailureMessage(err));
+            return;
+        };
+        defer result.deinit(self.allocator);
+        self.setSidebarNotice("Workspace handed off to Herdr.");
+    }
+
+    pub fn unlinkProjectHerdrFromUi(self: *AppState, project_index: usize) void {
+        if (project_index >= self.projects.items.len) {
+            self.setSidebarNotice("Workspace not found.");
+            return;
+        }
+        const request: herdr.UnlinkRequest = .{
+            .workspace = self.projects.items[project_index].id,
+            .all = false,
+        };
+        var result = self.unlinkHerdrWorkspaces(self.allocator, request) catch |err| {
+            self.setSidebarNotice(herdrUiFailureMessage(err));
+            return;
+        };
+        defer result.deinit(self.allocator);
+        if (result.workspace_count == 0 or (result.workspaces.len > 0 and !result.workspaces[0].unlinked)) {
+            self.setSidebarNotice("Workspace is already running locally.");
+        }
+    }
+
+    pub fn focusProjectHerdrAttachTerminal(self: *AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        const link = project.herdr_link orelse {
+            self.setSidebarNotice("Workspace is not linked to Herdr.");
+            return false;
+        };
+        const dock_id = link.attach_dock_id orelse {
+            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
+        };
+        const pane_id = link.attach_pane_id orelse project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) orelse {
+            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
+        };
+        if (project.workspace_layout.paneById(pane_id) == null) {
+            return self.openLinkedHerdrWorkspaceTerminalFromUi(project_index);
+        }
+        self.selected_project_index = project_index;
+        self.ensureCurrentProjectWorkspace();
+        project = &self.projects.items[project_index];
+        project.workspace_layout.focused_pane_id = pane_id;
+        project.workspace_layout.maximized_pane_id = null;
+        self.requestTerminalDockFocus(dock_id);
+        self.syncRenameBuffer();
+        self.markDirty();
+        return true;
+    }
+
+    fn appendHerdrUnlinkResult(
+        self: *AppState,
+        result_allocator: std.mem.Allocator,
+        results: *std.ArrayList(HerdrUnlinkWorkspaceResult),
+        project_index: usize,
+    ) !void {
+        var result = try self.snapshotHerdrUnlinkResult(result_allocator, project_index);
+        var result_owned = true;
+        errdefer if (result_owned) result.deinit(result_allocator);
+        try results.append(result_allocator, result);
+        result_owned = false;
+        if (result.unlinked) self.clearProjectHerdrLink(project_index);
+    }
+
+    fn snapshotHerdrUnlinkResult(self: *AppState, result_allocator: std.mem.Allocator, project_index: usize) !HerdrUnlinkWorkspaceResult {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        const project = &self.projects.items[project_index];
+        const previous = if (project.herdr_link) |link| try HerdrUnlinkPreviousLink.init(result_allocator, link) else null;
+        errdefer if (previous) |value| value.deinit(result_allocator);
+        return .{
+            .workspace_index = project_index,
+            .workspace_id = project.id,
+            .label = project.label,
+            .path = project.path,
+            .unlinked = previous != null,
+            .previous = previous,
+        };
+    }
+
+    fn clearProjectHerdrLink(self: *AppState, project_index: usize) void {
+        var project = &self.projects.items[project_index];
+        if (project.herdr_link) |*link| {
+            link.deinit(self.allocator);
+            project.herdr_link = null;
+        }
+    }
+
+    fn openLinkedHerdrWorkspaceTerminalFromUi(self: *AppState, project_index: usize) bool {
+        if (project_index >= self.projects.items.len) return false;
+        const project = &self.projects.items[project_index];
+        const link = project.herdr_link orelse {
+            self.setSidebarNotice("Workspace is not linked to Herdr.");
+            return false;
+        };
+        const request: herdr.OpenRequest = .{
+            .session = link.session_name,
+            .herdr_workspace = link.workspace_id,
+            .remote = if (link.remote_alias.len > 0) link.remote_alias else null,
+            .cwd = if (link.remote_alias.len == 0) project.path else null,
+            .remote_cwd = link.remote_cwd,
+            .local_dir = project.path,
+            .pane = link.last_pane_id,
+        };
+        const attach = self.ensureHerdrAttachTerminal(project_index, request) catch |err| {
+            self.setSidebarNotice(herdrUiFailureMessage(err));
+            return false;
+        };
+        self.replaceProjectHerdrLink(project_index, request, project.path, attach.dock_id, attach.pane_id) catch |err| {
+            self.setSidebarNotice(herdrUiFailureMessage(err));
+            return false;
+        };
+        self.syncRenameBuffer();
+        self.setSidebarNotice("Herdr terminal opened.");
+        self.markDirty();
+        return true;
+    }
+
+    fn herdrUiFailureMessage(err: anyerror) []const u8 {
+        return switch (err) {
+            error.HerdrCommandFailed => "Herdr command failed. Check Herdr is installed/running.",
+            error.InvalidHerdrResponse => "Herdr returned an unexpected response.",
+            error.NoProjectSelected => "Workspace not found.",
+            error.MissingHerdrSession => "Herdr session name is required.",
+            else => "Herdr action failed.",
+        };
+    }
+
+    fn handoffProjectToHerdr(self: *AppState, project_index: usize, request: herdr.HandoffRequest) !HerdrHandoffWorkspaceResult {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        var project = &self.projects.items[project_index];
+        const existing_link = project.herdr_link;
+        const remote_alias = request.remote orelse if (existing_link) |link| link.remote_alias else "";
+        const session_name = if (existing_link) |link| link.session_name else request.session;
+        var default_remote_cwd: ?[]u8 = null;
+        defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
+        const remote_cwd = if (remote_alias.len > 0)
+            blk: {
+                if (request.remote_cwd) |cwd| break :blk cwd;
+                if (existing_link) |link| {
+                    if (link.remote_cwd) |cwd| {
+                        // Earlier builds used the local project path as the
+                        // implicit remote cwd. Treat that as unset so existing
+                        // links migrate to Verde's remote workspace area.
+                        if (!std.mem.eql(u8, cwd, project.path)) break :blk cwd;
+                    }
+                }
+                default_remote_cwd = try herdr.defaultRemoteCwd(self.allocator, project.label, project.id);
+                break :blk default_remote_cwd.?;
+            }
+        else
+            null;
+        const herdr_cwd = remote_cwd orelse project.path;
+
+        if (request.dry_run) {
+            const workspace_id = if (existing_link) |link| link.workspace_id else "(new)";
+            return .{
+                .workspace_index = project_index,
+                .workspace_id = project.id,
+                .label = project.label,
+                .path = project.path,
+                .remote = remote_alias,
+                .session = session_name,
+                .herdr_workspace = workspace_id,
+                .herdr_tab = null,
+                .created = existing_link == null,
+                .pane_count = project.workspace_layout.visiblePaneCount(),
+            };
+        }
+
+        const target: herdr.CliTarget = .{
+            .session = session_name,
+            .remote = if (remote_alias.len > 0) remote_alias else null,
+        };
+        if (remote_alias.len > 0) try self.ensureHerdrRemoteCwd(target, herdr_cwd);
+        var workspace = if (existing_link) |link|
+            try self.createHerdrMirrorTab(target, link.workspace_id, project.label, herdr_cwd)
+        else
+            try self.createHerdrWorkspace(target, project.label, herdr_cwd);
+        defer workspace.deinit(self.allocator);
+
+        var next_links: std.ArrayList(HerdrPaneLink) = .empty;
+        var next_links_owned = true;
+        errdefer if (next_links_owned) {
+            for (next_links.items) |*pane_link| pane_link.deinit(self.allocator);
+            next_links.deinit(self.allocator);
+        };
+
+        if (project.workspace_layout.root) |root_node| {
+            try self.mirrorHerdrNode(project_index, target, root_node, workspace.root_pane_id, workspace.tab_id, herdr_cwd, &next_links);
+        }
+
+        const open_request: herdr.OpenRequest = .{
+            .session = session_name,
+            .herdr_workspace = workspace.workspace_id,
+            .remote = if (remote_alias.len > 0) remote_alias else null,
+            .cwd = if (remote_alias.len == 0) project.path else null,
+            .remote_cwd = remote_cwd,
+            .local_dir = project.path,
+            .pane = workspace.root_pane_id,
+        };
+        try self.replaceProjectHerdrLink(project_index, open_request, project.path, null, null);
+        project = &self.projects.items[project_index];
+        if (project.herdr_link) |*link| {
+            link.replacePaneLinks(self.allocator, &next_links);
+            next_links_owned = false;
+        }
+        const final_link = project.herdr_link.?;
+
+        return .{
+            .workspace_index = project_index,
+            .workspace_id = project.id,
+            .label = project.label,
+            .path = project.path,
+            .remote = final_link.remote_alias,
+            .session = final_link.session_name,
+            .herdr_workspace = final_link.workspace_id,
+            .herdr_tab = null,
+            .created = workspace.created,
+            .pane_count = final_link.pane_links.items.len,
+        };
+    }
+
+    const HerdrWorkspaceBootstrap = struct {
+        workspace_id: []u8,
+        tab_id: ?[]u8 = null,
+        root_pane_id: []u8,
+        created: bool,
+
+        fn deinit(self: *HerdrWorkspaceBootstrap, allocator: std.mem.Allocator) void {
+            allocator.free(self.workspace_id);
+            if (self.tab_id) |tab_id| allocator.free(tab_id);
+            allocator.free(self.root_pane_id);
+        }
+    };
+
+    fn createHerdrWorkspace(self: *AppState, target: herdr.CliTarget, label: []const u8, cwd: []const u8) !HerdrWorkspaceBootstrap {
+        const cli_args = [_][]const u8{ "workspace", "create", "--cwd", cwd, "--label", label, "--no-focus" };
+        const result = try self.runHerdrCli(target, &cli_args);
+        defer self.freeHerdrRunResult(result);
+        try self.ensureHerdrCliSuccess(result, "workspace create");
+        return .{
+            .workspace_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "workspace_id"),
+            .tab_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "tab_id"),
+            .root_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id"),
+            .created = true,
+        };
+    }
+
+    fn createHerdrMirrorTab(self: *AppState, target: herdr.CliTarget, workspace_id: []const u8, label: []const u8, cwd: []const u8) !HerdrWorkspaceBootstrap {
+        const tab_label = try std.fmt.allocPrint(self.allocator, "Verde: {s}", .{label});
+        defer self.allocator.free(tab_label);
+        const cli_args = [_][]const u8{ "tab", "create", "--workspace", workspace_id, "--cwd", cwd, "--label", tab_label, "--no-focus" };
+        const result = try self.runHerdrCli(target, &cli_args);
+        defer self.freeHerdrRunResult(result);
+        try self.ensureHerdrCliSuccess(result, "tab create");
+        return .{
+            .workspace_id = try self.allocator.dupe(u8, workspace_id),
+            .tab_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "tab_id"),
+            .root_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id"),
+            .created = false,
+        };
+    }
+
+    fn mirrorHerdrNode(
+        self: *AppState,
+        project_index: usize,
+        target: herdr.CliTarget,
+        node: *const WorkspaceNode,
+        herdr_pane_id: []const u8,
+        herdr_tab_id: ?[]const u8,
+        cwd: []const u8,
+        links: *std.ArrayList(HerdrPaneLink),
+    ) !void {
+        switch (node.*) {
+            .leaf => |verde_pane_id| try self.configureHerdrPaneForVerdePane(project_index, target, verde_pane_id, herdr_tab_id, herdr_pane_id, cwd, links),
+            .split => |split| {
+                const ratio_text = try std.fmt.allocPrint(self.allocator, "{d}", .{std.math.clamp(split.ratio, 0.05, 0.95)});
+                defer self.allocator.free(ratio_text);
+                const direction = switch (split.axis) {
+                    .vertical => "right",
+                    .horizontal => "down",
+                };
+                const cli_args = [_][]const u8{ "pane", "split", herdr_pane_id, "--direction", direction, "--ratio", ratio_text, "--cwd", cwd, "--no-focus" };
+                const result = try self.runHerdrCli(target, &cli_args);
+                defer self.freeHerdrRunResult(result);
+                try self.ensureHerdrCliSuccess(result, "pane split");
+                const second_pane_id = try parseHerdrJsonStringAlloc(self.allocator, result.stdout, "pane_id");
+                defer self.allocator.free(second_pane_id);
+                try self.mirrorHerdrNode(project_index, target, split.first, herdr_pane_id, herdr_tab_id, cwd, links);
+                try self.mirrorHerdrNode(project_index, target, split.second, second_pane_id, herdr_tab_id, cwd, links);
+            },
+        }
+    }
+
+    fn configureHerdrPaneForVerdePane(
+        self: *AppState,
+        project_index: usize,
+        target: herdr.CliTarget,
+        verde_pane_id: WorkspacePaneId,
+        herdr_tab_id: ?[]const u8,
+        herdr_pane_id: []const u8,
+        default_cwd: []const u8,
+        links: *std.ArrayList(HerdrPaneLink),
+    ) !void {
+        const project = &self.projects.items[project_index];
+        const pane = project.workspace_layout.paneById(verde_pane_id) orelse return;
+        if (pane.minimized) return;
+
+        const descriptor = try self.herdrPaneDescriptor(project_index, pane, default_cwd);
+        defer descriptor.deinit(self.allocator);
+        var link = try HerdrPaneLink.init(
+            self.allocator,
+            verde_pane_id,
+            herdr_tab_id,
+            herdr_pane_id,
+            descriptor.provider,
+            descriptor.presentation,
+            descriptor.provider_thread_id,
+            null,
+            descriptor.cwd,
+            descriptor.title,
+        );
+        errdefer link.deinit(self.allocator);
+        try links.append(self.allocator, link);
+
+        try self.renameHerdrPane(target, herdr_pane_id, descriptor.title);
+        if (descriptor.command) |command| try self.runHerdrPaneCommand(target, herdr_pane_id, command);
+    }
+
+    const HerdrPaneDescriptor = struct {
+        provider: HerdrPaneProvider,
+        presentation: HerdrPanePresentation,
+        provider_thread_id: ?[]const u8 = null,
+        cwd: []const u8,
+        title: []u8,
+        command: ?[]u8 = null,
+
+        fn deinit(self: HerdrPaneDescriptor, allocator: std.mem.Allocator) void {
+            allocator.free(self.title);
+            if (self.command) |command| allocator.free(command);
+        }
+    };
+
+    fn herdrPaneDescriptor(self: *AppState, project_index: usize, pane: *const WorkspacePane, default_cwd: []const u8) !HerdrPaneDescriptor {
+        const project = &self.projects.items[project_index];
+        return switch (pane.ref) {
+            .chat => |chat_ref| blk: {
+                const maybe_thread = if (chat_ref.thread_index < project.threads.items.len) &project.threads.items[chat_ref.thread_index] else null;
+                const provider = if (maybe_thread) |thread| herdrPaneProviderForThreadProvider(thread.provider) else .unknown;
+                const thread_title = if (maybe_thread) |thread| thread.title else "Chat";
+                const title = try std.fmt.allocPrint(self.allocator, "{s} GUI", .{thread_title});
+                errdefer self.allocator.free(title);
+                const provider_thread_id = if (maybe_thread) |thread| thread.provider_thread_id else null;
+                const command = try herdrAgentCommandForProvider(self.allocator, provider, provider_thread_id);
+                break :blk .{
+                    .provider = provider,
+                    .presentation = .gui_chat,
+                    .provider_thread_id = provider_thread_id,
+                    .cwd = default_cwd,
+                    .title = title,
+                    .command = command,
+                };
+            },
+            .terminal => |terminal_ref| blk: {
+                const dock = self.projectTerminalDock(project_index, terminal_ref.dock_id);
+                const cwd = if (dock) |value| value.cwd orelse default_cwd else default_cwd;
+                const title = try std.fmt.allocPrint(self.allocator, "Terminal {d}", .{terminal_ref.dock_id});
+                break :blk .{ .provider = .terminal, .presentation = .terminal, .cwd = cwd, .title = title };
+            },
+            .browser => |browser_ref| blk: {
+                const label = browser_ref.title orelse browser_ref.url orelse "Browser";
+                const title = try std.fmt.allocPrint(self.allocator, "Browser: {s}", .{label});
+                break :blk .{ .provider = .browser, .presentation = .browser_link, .cwd = default_cwd, .title = title };
+            },
+        };
+    }
+
+    fn herdrHandoffProjectIndex(self: *const AppState, selector: []const u8) ?usize {
+        if (std.mem.eql(u8, selector, "current")) return self.selected_project_index;
+        if (std.fmt.parseInt(usize, selector, 10)) |index| {
+            if (index < self.projects.items.len) return index;
+        } else |_| {}
+        for (self.projects.items, 0..) |project, index| {
+            if (std.mem.eql(u8, project.id, selector) or
+                std.mem.eql(u8, project.path, selector) or
+                std.mem.eql(u8, project.label, selector)) return index;
+        }
+        return null;
+    }
+
+    fn runHerdrCli(self: *AppState, target: herdr.CliTarget, cli_args: []const []const u8) !std.process.RunResult {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        return try herdr.runCli(self.allocator, threaded.io(), target, cli_args, 512 * 1024);
+    }
+
+    fn ensureHerdrRemoteCwd(self: *AppState, target: herdr.CliTarget, cwd: []const u8) !void {
+        const remote = target.remote orelse return;
+        const command = try herdr.remoteMkdirCommandLineAlloc(self.allocator, cwd);
+        defer self.allocator.free(command);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const result = try herdr.runRemoteShell(self.allocator, threaded.io(), remote, command, 64 * 1024);
+        defer self.freeHerdrRunResult(result);
+        try self.ensureHerdrCliSuccess(result, "remote mkdir");
+    }
+
+    fn remoteCwdForWorkspaceCwd(self: *AppState, project: *const Project, cwd: []const u8) ![]u8 {
+        const link = project.herdr_link orelse return error.WorkspaceNotRemote;
+        const base = link.remote_cwd orelse return error.MissingRemoteCwd;
+        const trimmed = std.mem.trim(u8, cwd, &std.ascii.whitespace);
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, project.path)) {
+            return try self.allocator.dupe(u8, base);
+        }
+        if (std.mem.startsWith(u8, trimmed, project.path) and trimmed.len > project.path.len and trimmed[project.path.len] == std.fs.path.sep) {
+            return try std.fs.path.join(self.allocator, &.{ base, trimmed[project.path.len + 1 ..] });
+        }
+        if (std.fs.path.isAbsolute(trimmed)) return try self.allocator.dupe(u8, trimmed);
+        return try std.fs.path.join(self.allocator, &.{ base, trimmed });
+    }
+
+    fn commandArgsForTerminalProfile(profile: terminal.TerminalLaunchProfile) ?[]const []const u8 {
+        if (profile.command.len > 0) return profile.command;
+        return switch (profile.kind) {
+            .shell => null,
+            .claude => &.{"claude"},
+            .opencode => &.{"opencode"},
+            .codex => &.{"codex"},
+            .cursor => &.{"cursor"},
+            .custom => &.{},
+        };
+    }
+
+    fn remoteTerminalLabel(link: HerdrWorkspaceLink, profile: terminal.TerminalLaunchProfile, buffer: []u8) []const u8 {
+        const label = std.mem.trim(u8, profile.label, &std.ascii.whitespace);
+        if (label.len > 0) return label;
+        return std.fmt.bufPrint(buffer, "Remote {s}", .{link.remote_alias}) catch "Remote terminal";
+    }
+
+    fn remoteCommandForTerminalProfile(
+        self: *AppState,
+        project: *const Project,
+        profile: terminal.TerminalLaunchProfile,
+        cwd: []const u8,
+    ) ![]u8 {
+        const link = project.herdr_link orelse return error.WorkspaceNotRemote;
+        if (link.remote_alias.len == 0) return error.WorkspaceNotRemote;
+        const remote_cwd = try self.remoteCwdForWorkspaceCwd(project, cwd);
+        defer self.allocator.free(remote_cwd);
+        try self.ensureHerdrRemoteCwd(.{ .session = link.session_name, .remote = link.remote_alias }, remote_cwd);
+        if (commandArgsForTerminalProfile(profile)) |args| {
+            return try herdr.remoteExecCommandLineAlloc(self.allocator, remote_cwd, args);
+        }
+        return try herdr.remoteLoginShellCommandLineAlloc(self.allocator, remote_cwd);
+    }
+
+    fn restartTerminalDockForWorkspaceProfile(
+        self: *AppState,
+        project_index: usize,
+        dock_id: u32,
+        cwd: []const u8,
+        profile: terminal.TerminalLaunchProfile,
+    ) !void {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        const project = &self.projects.items[project_index];
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+        if (project.herdr_link) |link| {
+            if (link.remote_alias.len > 0) {
+                const remote_command = try self.remoteCommandForTerminalProfile(project, profile, cwd);
+                defer self.allocator.free(remote_command);
+                var label_buf: [160]u8 = undefined;
+                const label = remoteTerminalLabel(link, profile, &label_buf);
+                const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
+                try dock.restartWithProfilePersistent(self.allocator, project.path, .{
+                    .kind = .custom,
+                    .label = label,
+                    .command = &command_args,
+                }, self.storage.pref_path, dock_id);
+                return;
+            }
+        }
+        try dock.restartWithProfilePersistent(self.allocator, cwd, profile, self.storage.pref_path, dock_id);
+    }
+
+    fn restartTerminalDockForWorkspace(self: *AppState, project_index: usize, dock_id: u32) !void {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        const project = &self.projects.items[project_index];
+        try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, project.path, .{});
+    }
+
+    fn createTerminalTabForWorkspaceProfile(
+        self: *AppState,
+        project_index: usize,
+        dock_id: u32,
+        profile: terminal.TerminalLaunchProfile,
+    ) !void {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        const project = &self.projects.items[project_index];
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+        if (project.herdr_link) |link| {
+            if (link.remote_alias.len > 0) {
+                const cwd = dock.cwd orelse project.path;
+                const remote_command = try self.remoteCommandForTerminalProfile(project, profile, cwd);
+                defer self.allocator.free(remote_command);
+                var label_buf: [160]u8 = undefined;
+                const label = remoteTerminalLabel(link, profile, &label_buf);
+                const command_args = [_][]const u8{ "ssh", "-tt", link.remote_alias, remote_command };
+                try dock.createTabWithProfile(self.allocator, .{
+                    .kind = .custom,
+                    .label = label,
+                    .command = &command_args,
+                });
+                return;
+            }
+        }
+        if (profile.kind == .shell and profile.label.len == 0 and profile.command.len == 0) {
+            try dock.createTab(self.allocator);
+        } else {
+            try dock.createTabWithProfile(self.allocator, profile);
+        }
+    }
+
+    fn freeHerdrRunResult(self: *AppState, result: std.process.RunResult) void {
+        self.allocator.free(result.stdout);
+        self.allocator.free(result.stderr);
+    }
+
+    fn ensureHerdrCliSuccess(self: *AppState, result: std.process.RunResult, action: []const u8) !void {
+        _ = self;
+        switch (result.term) {
+            .exited => |code| if (code == 0) return,
+            else => {},
+        }
+        log.warn("Herdr CLI {s} failed stderr={s}", .{ action, result.stderr });
+        return error.HerdrCommandFailed;
+    }
+
+    fn renameHerdrPane(self: *AppState, target: herdr.CliTarget, pane_id: []const u8, title: []const u8) !void {
+        const cli_args = [_][]const u8{ "pane", "rename", pane_id, title };
+        const result = try self.runHerdrCli(target, &cli_args);
+        defer self.freeHerdrRunResult(result);
+        try self.ensureHerdrCliSuccess(result, "pane rename");
+    }
+
+    fn runHerdrPaneCommand(self: *AppState, target: herdr.CliTarget, pane_id: []const u8, command: []const u8) !void {
+        const cli_args = [_][]const u8{ "pane", "run", pane_id, command };
+        const result = try self.runHerdrCli(target, &cli_args);
+        defer self.freeHerdrRunResult(result);
+        try self.ensureHerdrCliSuccess(result, "pane run");
+    }
+
+    const HerdrAttachPane = struct {
+        dock_id: u32,
+        pane_id: WorkspacePaneId,
+    };
+
+    fn ensureHerdrAttachTerminal(self: *AppState, project_index: usize, request: herdr.OpenRequest) !HerdrAttachPane {
+        if (project_index >= self.projects.items.len) return error.NoProjectSelected;
+        var project = &self.projects.items[project_index];
+        if (project.herdr_link) |link| {
+            if (link.attach_dock_id) |dock_id| {
+                if (self.projectTerminalDockMutable(project_index, dock_id)) |dock| {
+                    const pane_id = link.attach_pane_id orelse project.workspace_layout.visibleTerminalPaneIdForDock(dock_id);
+                    if (pane_id) |id| {
+                        if (project.workspace_layout.paneById(id) != null) {
+                            if (!dock.hasRunningSession()) try self.restartHerdrAttachDock(project_index, dock_id, request);
+                            project = &self.projects.items[project_index];
+                            project.workspace_layout.focused_pane_id = id;
+                            project.workspace_layout.maximized_pane_id = null;
+                            self.requestTerminalDockFocus(dock_id);
+                            return .{ .dock_id = dock_id, .pane_id = id };
+                        }
+                    }
+                }
+            }
+        }
+
+        const dock_id = try self.createProjectTerminalDock(project_index);
+        try self.restartHerdrAttachDock(project_index, dock_id, request);
+        if (self.replaceOnlyDraftChatPaneWithTerminal(project_index, dock_id)) |pane_id| {
+            self.requestTerminalDockFocus(dock_id);
+            return .{ .dock_id = dock_id, .pane_id = pane_id };
+        }
+
+        project = &self.projects.items[project_index];
+        const pane_id = try project.workspace_layout.ensureTerminalPane(self.allocator, dock_id);
+        project.workspace_layout.maximized_pane_id = null;
+        self.requestTerminalDockFocus(dock_id);
+        return .{ .dock_id = dock_id, .pane_id = pane_id };
+    }
+
+    fn restartHerdrAttachDock(self: *AppState, project_index: usize, dock_id: u32, request: herdr.OpenRequest) !void {
+        const project = &self.projects.items[project_index];
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return error.NoProjectSelected;
+        const remote_alias = herdr.remoteAlias(request);
+        const label = if (remote_alias.len > 0)
+            try std.fmt.allocPrint(self.allocator, "Herdr {s}@{s}", .{ request.session, remote_alias })
+        else
+            try std.fmt.allocPrint(self.allocator, "Herdr {s}", .{request.session});
+        defer self.allocator.free(label);
+
+        if (remote_alias.len > 0) {
+            const remote_command = try herdr.remoteHerdrCommandLineAlloc(self.allocator, request.session, &.{});
+            defer self.allocator.free(remote_command);
+            // Herdr's ratatui frontend opens the remote TTY directly; without
+            // forced allocation it can panic with ENXIO even though Verde's
+            // local side is already a PTY.
+            const command_args = [_][]const u8{ "ssh", "-tt", remote_alias, remote_command };
+            try dock.restartWithProfilePersistent(self.allocator, project.path, .{
+                .kind = .custom,
+                .label = label,
+                .command = &command_args,
+            }, self.storage.pref_path, dock_id);
+        } else {
+            const command_args = [_][]const u8{ "herdr", "--session", request.session };
+            try dock.restartWithProfilePersistent(self.allocator, project.path, .{
+                .kind = .custom,
+                .label = label,
+                .command = &command_args,
+            }, self.storage.pref_path, dock_id);
+        }
+        dock.visible = false;
+    }
+
+    fn replaceOnlyDraftChatPaneWithTerminal(self: *AppState, project_index: usize, dock_id: u32) ?WorkspacePaneId {
+        var project = &self.projects.items[project_index];
+        var layout = &project.workspace_layout;
+        if (layout.panes.items.len != 1) return null;
+        var pane = &layout.panes.items[0];
+        if (pane.minimized) return null;
+        switch (pane.ref) {
+            .chat => |chat_ref| {
+                if (chat_ref.thread_index >= project.threads.items.len) return null;
+                const thread = &project.threads.items[chat_ref.thread_index];
+                if (thread.committed or thread.messages.items.len > 0 or thread.currentDraft().len > 0) return null;
+                deinitWorkspacePaneRef(&pane.ref, self.allocator);
+                pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
+                layout.focused_pane_id = pane.id;
+                layout.maximized_pane_id = null;
+                return pane.id;
+            },
+            else => return null,
+        }
+    }
+
+    fn replaceProjectHerdrLink(
+        self: *AppState,
+        project_index: usize,
+        request: herdr.OpenRequest,
+        local_dir: []const u8,
+        attach_dock_id: ?u32,
+        attach_pane_id: ?WorkspacePaneId,
+    ) !void {
+        var project = &self.projects.items[project_index];
+        const existing_dock_id = attach_dock_id orelse if (project.herdr_link) |link| link.attach_dock_id else null;
+        const existing_pane_id = attach_pane_id orelse if (project.herdr_link) |link| link.attach_pane_id else null;
+        var next = try HerdrWorkspaceLink.init(
+            self.allocator,
+            herdr.remoteAlias(request),
+            request.session,
+            request.herdr_workspace,
+            local_dir,
+            request.remote_cwd,
+            request.pane,
+            existing_dock_id,
+            existing_pane_id,
+        );
+        errdefer next.deinit(self.allocator);
+        if (project.herdr_link) |*old| {
+            // `verde herdr open` is often a focus/pickup operation; preserve
+            // pane presentation metadata so returning from Herdr still knows
+            // which panes should come back as GUI chat versus terminal/TUI.
+            if (herdrLinkMatchesRequest(old.*, request)) {
+                next.pane_links = old.pane_links;
+                old.pane_links = .empty;
+            }
+            old.deinit(self.allocator);
+        }
+        project.herdr_link = next;
+    }
+
+    fn findHerdrProjectIndex(self: *const AppState, request: herdr.OpenRequest) ?usize {
+        for (self.projects.items, 0..) |project, index| {
+            const link = project.herdr_link orelse continue;
+            if (herdrLinkMatchesRequest(link, request)) return index;
+        }
+        return null;
+    }
+
+    fn herdrLinkMatchesRequest(link: HerdrWorkspaceLink, request: herdr.OpenRequest) bool {
+        return std.mem.eql(u8, link.remote_alias, herdr.remoteAlias(request)) and
+            std.mem.eql(u8, link.session_name, request.session) and
+            std.mem.eql(u8, link.workspace_id, request.herdr_workspace);
+    }
+
+    fn resolveHerdrLocalProjectDir(self: *AppState, request: herdr.OpenRequest) ![]u8 {
+        if (request.local_dir) |local_dir| return try self.ensureDirectoryPath(local_dir);
+        if (herdr.remoteAlias(request).len > 0) {
+            const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
+            defer self.allocator.free(default_dir);
+            return try self.ensureDirectoryPath(default_dir);
+        }
+        if (request.cwd) |cwd| return try self.resolveProjectPath(cwd);
+        const default_dir = try herdr.defaultLocalDir(self.allocator, self.storage.pref_path, request);
+        defer self.allocator.free(default_dir);
+        return try self.ensureDirectoryPath(default_dir);
+    }
+
+    fn ensureDirectoryPath(self: *AppState, raw_path: []const u8) ![]u8 {
+        const absolute = try self.absolutePathForCreate(raw_path);
+        defer self.allocator.free(absolute);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        try std.Io.Dir.cwd().createDirPath(threaded.io(), absolute);
+        var dir = try std.Io.Dir.openDirAbsolute(threaded.io(), absolute, .{});
+        dir.close(threaded.io());
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(threaded.io(), absolute, self.allocator);
+    }
+
+    fn absolutePathForCreate(self: *AppState, raw_path: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
+        if (trimmed.len == 0) return error.EmptyProjectPath;
+        const expanded = if (std.mem.eql(u8, trimmed, "~")) blk: {
+            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
+            break :blk try self.allocator.dupe(u8, home);
+        } else if (std.mem.startsWith(u8, trimmed, "~/")) blk: {
+            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
+            break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, trimmed[2..] });
+        } else try self.allocator.dupe(u8, trimmed);
+        defer self.allocator.free(expanded);
+        if (std.fs.path.isAbsolute(expanded)) return try self.allocator.dupe(u8, expanded);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), ".", self.allocator);
+        defer self.allocator.free(cwd);
+        return try std.fs.path.join(self.allocator, &.{ cwd, expanded });
+    }
+
     fn appendMessageToThread(
         self: *AppState,
         thread: *ChatThread,
@@ -4877,6 +6252,7 @@ pub const AppState = struct {
     pub fn beginThreadImport(self: *AppState, index: usize, provider: Provider) void {
         if (index >= self.projects.items.len) return;
         if (self.show_project_creator) self.cancelProjectImport();
+        if (self.herdr_profile_picker_project_index != null) self.cancelHerdrProfilePicker();
         self.selected_project_index = index;
         self.rename_project_index = null;
         self.thread_import_provider = provider;
@@ -4888,6 +6264,146 @@ pub const AppState = struct {
         self.setThreadImportNotice("");
         self.clearThreadImportThreads();
         self.refreshThreadImportList();
+    }
+
+    pub fn beginHerdrProfilePicker(self: *AppState, index: usize) void {
+        if (index >= self.projects.items.len) return;
+        if (self.show_project_creator) self.cancelProjectImport();
+        if (self.thread_import_provider != null) self.cancelThreadImport();
+        self.selected_project_index = index;
+        self.rename_project_index = null;
+        self.herdr_profile_picker_project_index = index;
+        self.herdr_profile_selected_index = null;
+        self.herdr_profile_hover_index = null;
+        self.palette_modal_text_focus = .none;
+        self.setHerdrProfileNotice("");
+        self.clearHerdrProfileSummaries();
+        self.refreshHerdrProfileList();
+    }
+
+    pub fn cancelHerdrProfilePicker(self: *AppState) void {
+        self.herdr_profile_picker_project_index = null;
+        self.herdr_profile_selected_index = null;
+        self.herdr_profile_hover_index = null;
+        self.palette_modal_text_focus = .none;
+        self.setHerdrProfileNotice("");
+        self.clearHerdrProfileSummaries();
+        self.markDirty();
+    }
+
+    pub fn refreshHerdrProfileList(self: *AppState) void {
+        if (self.herdr_profile_picker_project_index == null) return;
+        self.clearHerdrProfileSummaries();
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        var loaded = herdr.loadProfiles(self.allocator, threaded.io(), self.storage.pref_path) catch |err| {
+            log.warn("failed to load Herdr profiles: {s}", .{@errorName(err)});
+            self.setHerdrProfileNotice("Could not load Herdr profiles.");
+            return;
+        };
+        defer loaded.deinit();
+
+        for (loaded.profiles) |profile| {
+            var summary = self.copyHerdrProfileSummary(profile) catch {
+                self.setHerdrProfileNotice("Could not store Herdr profile list.");
+                return;
+            };
+            errdefer summary.deinit(self.allocator);
+            self.herdr_profile_summaries.append(self.allocator, summary) catch {
+                self.setHerdrProfileNotice("Could not store Herdr profile list.");
+                return;
+            };
+        }
+
+        if (self.herdr_profile_summaries.items.len == 0) {
+            self.setHerdrProfileNotice("No Herdr profiles configured. Use `verde herdr profiles add` first.");
+        } else {
+            self.herdr_profile_selected_index = 0;
+            self.setHerdrProfileNotice("Choose a remote profile for this workspace.");
+        }
+        self.markDirty();
+    }
+
+    fn copyHerdrProfileSummary(self: *AppState, profile: herdr.Profile) !HerdrProfileSummary {
+        const name = try self.allocator.dupeZ(u8, profile.name);
+        errdefer self.allocator.free(name);
+        const ssh_target = try self.allocator.dupeZ(u8, profile.ssh_target);
+        errdefer self.allocator.free(ssh_target);
+        const session = try self.allocator.dupeZ(u8, profile.session);
+        errdefer self.allocator.free(session);
+        const remote_cwd = if (profile.remote_cwd) |value| try self.allocator.dupeZ(u8, value) else null;
+        errdefer if (remote_cwd) |value| self.allocator.free(value);
+        const local_dir = if (profile.local_dir) |value| try self.allocator.dupeZ(u8, value) else null;
+        errdefer if (local_dir) |value| self.allocator.free(value);
+        return .{
+            .name = name,
+            .ssh_target = ssh_target,
+            .session = session,
+            .remote_cwd = remote_cwd,
+            .local_dir = local_dir,
+        };
+    }
+
+    pub fn selectHerdrProfile(self: *AppState, index: usize) void {
+        if (index >= self.herdr_profile_summaries.items.len) return;
+        self.herdr_profile_selected_index = index;
+        self.markDirty();
+    }
+
+    pub fn handoffProjectToSelectedHerdrProfile(self: *AppState) void {
+        const project_index = self.herdr_profile_picker_project_index orelse return;
+        const profile_index = self.herdr_profile_selected_index orelse {
+            self.setHerdrProfileNotice("Select a Herdr profile first.");
+            return;
+        };
+        if (project_index >= self.projects.items.len or profile_index >= self.herdr_profile_summaries.items.len) return;
+        const profile = self.herdr_profile_summaries.items[profile_index];
+        self.handoffProjectToRemoteHerdrProfile(project_index, profile);
+    }
+
+    fn handoffProjectToRemoteHerdrProfile(self: *AppState, project_index: usize, profile: HerdrProfileSummary) void {
+        if (project_index >= self.projects.items.len) return;
+        const project = &self.projects.items[project_index];
+        var default_remote_cwd: ?[]u8 = null;
+        defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
+        const remote_cwd = profile.remote_cwd orelse blk: {
+            default_remote_cwd = herdr.defaultRemoteCwd(self.allocator, project.label, project.id) catch {
+                self.setHerdrProfileNotice("Could not build a remote workspace path.");
+                return;
+            };
+            break :blk default_remote_cwd.?;
+        };
+        const request: herdr.HandoffRequest = .{
+            .session = profile.session,
+            .remote = profile.ssh_target,
+            .remote_cwd = remote_cwd,
+            .workspace = project.id,
+            .all = false,
+        };
+        var result = self.handoffHerdrWorkspaces(self.allocator, request) catch |err| {
+            self.setHerdrProfileNotice(herdrUiFailureMessage(err));
+            return;
+        };
+        defer result.deinit(self.allocator);
+        if (result.workspaces.len == 0) {
+            self.setHerdrProfileNotice("Herdr did not return a workspace.");
+            return;
+        }
+        const workspace_id = result.workspaces[0].herdr_workspace;
+        const open_request: herdr.OpenRequest = .{
+            .session = profile.session,
+            .herdr_workspace = workspace_id,
+            .remote = profile.ssh_target,
+            .remote_cwd = remote_cwd,
+            .local_dir = profile.local_dir orelse project.path,
+        };
+        _ = self.openOrCreateHerdrWorkspace(open_request) catch |err| {
+            self.setHerdrProfileNotice(herdrUiFailureMessage(err));
+            return;
+        };
+        self.cancelHerdrProfilePicker();
+        self.setSidebarNotice("Remote Herdr workspace opened.");
     }
 
     pub fn cancelThreadImport(self: *AppState) void {
@@ -4989,6 +6505,19 @@ pub const AppState = struct {
         return std.mem.sliceTo(self.import_thread_id_storage[0..], 0);
     }
 
+    fn threadImportListTitleForId(self: *const AppState, thread_id: []const u8) ?[]const u8 {
+        if (self.thread_import_selected_index) |index| {
+            if (index < self.thread_import_threads.items.len) {
+                const selected = self.thread_import_threads.items[index];
+                if (std.mem.eql(u8, selected.id, thread_id)) return selected.title;
+            }
+        }
+        for (self.thread_import_threads.items) |thread| {
+            if (std.mem.eql(u8, thread.id, thread_id)) return thread.title;
+        }
+        return null;
+    }
+
     /// Opens the command palette overlay. `scope_project` restricts results to
     /// one workspace's thread history (the sidebar "History" entry point);
     /// `null` is the global Ctrl+Shift+P scope (commands + threads everywhere).
@@ -5073,6 +6602,16 @@ pub const AppState = struct {
         @memcpy(self.import_notice_storage[0..len], value[0..len]);
     }
 
+    pub fn herdrProfileNotice(self: *const AppState) []const u8 {
+        return std.mem.sliceTo(self.herdr_profile_notice_storage[0..], 0);
+    }
+
+    pub fn setHerdrProfileNotice(self: *AppState, value: []const u8) void {
+        @memset(&self.herdr_profile_notice_storage, 0);
+        const len = @min(value.len, self.herdr_profile_notice_storage.len - 1);
+        @memcpy(self.herdr_profile_notice_storage[0..len], value[0..len]);
+    }
+
     pub fn selectThreadImport(self: *AppState, index: usize) void {
         if (index >= self.thread_import_threads.items.len) return;
         self.thread_import_selected_index = index;
@@ -5136,23 +6675,37 @@ pub const AppState = struct {
         defer client.deinit();
 
         const imported_thread = client.readThread(self.allocator, trimmed_id) catch |err| {
-            self.setThreadImportNotice(importThreadFailureMessage(provider, err));
+            log.warn("failed to read {s} thread for import id={s}: {s}", .{ @tagName(provider), trimmed_id, @errorName(err) });
+            self.setThreadImportNotice(readThreadFailureMessage(provider, err));
             return;
         };
         defer imported_thread.deinit(self.allocator);
 
-        var imported = self.buildImportedThread(imported_thread, null) catch {
+        var imported = self.buildImportedThread(imported_thread, null) catch |err| {
+            log.warn("failed to build imported {s} thread id={s}: {s}", .{ @tagName(provider), trimmed_id, @errorName(err) });
             self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
             return;
         };
         errdefer imported.deinit(self.allocator);
+
+        if (std.mem.eql(u8, imported.title, trimmed_id)) {
+            if (self.threadImportListTitleForId(trimmed_id)) |list_title| {
+                const title_copy = self.allocator.dupeZ(u8, list_title) catch {
+                    self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
+                    return;
+                };
+                self.allocator.free(imported.title);
+                imported.title = title_copy;
+            }
+        }
 
         imported.provider = provider;
         if (imported.model_ref) |model_ref| {
             self.allocator.free(model_ref);
             imported.model_ref = null;
         }
-        imported.model_ref = self.allocator.dupeZ(u8, self.cachedDefaultModelRefForProvider(provider)) catch {
+        const model_ref = imported_thread.model_id orelse self.cachedDefaultModelRefForProvider(provider);
+        imported.model_ref = self.allocator.dupeZ(u8, model_ref) catch {
             self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
             return;
         };
@@ -5479,6 +7032,40 @@ pub const AppState = struct {
         self.terminal_focused = false;
     }
 
+    fn providerExecutionTargetForProjectThread(
+        self: *AppState,
+        project_index: usize,
+        thread: *const ChatThread,
+        image_count: usize,
+    ) ?ProviderExecutionTarget {
+        if (project_index >= self.projects.items.len) return null;
+        const project = &self.projects.items[project_index];
+        const link = project.herdr_link orelse return .{ .local = project.path };
+
+        if (link.remote_alias.len == 0) {
+            self.setSidebarNotice("Local Herdr GUI sends use the Herdr terminal/TUI pane for now.");
+            return null;
+        }
+        if (thread.provider != .codex) {
+            var buffer: [160]u8 = undefined;
+            self.setSidebarNotice(std.fmt.bufPrint(
+                &buffer,
+                "Remote Herdr GUI sends support Codex only for now. Use the Herdr TUI pane for {s}.",
+                .{utils.providerLabel(thread.provider)},
+            ) catch "Remote Herdr GUI sends support Codex only for now.");
+            return null;
+        }
+        if (image_count > 0) {
+            self.setSidebarNotice("Remote Herdr Codex GUI sends do not support local image attachments yet.");
+            return null;
+        }
+        const remote_cwd = link.remote_cwd orelse {
+            self.setSidebarNotice("Remote Herdr workspace is missing a remote cwd.");
+            return null;
+        };
+        return .{ .remote_ssh = .{ .host = link.remote_alias, .cwd = remote_cwd } };
+    }
+
     pub fn sendDraft(self: *AppState) !void {
         const draft = self.currentDraft();
         const draft_image = self.currentThread().draft_image;
@@ -5489,6 +7076,11 @@ pub const AppState = struct {
             self.setSidebarNotice("This chat already has a provider request running.");
             return;
         }
+        const execution_target = self.providerExecutionTargetForProjectThread(
+            self.selected_project_index,
+            self.currentThread(),
+            draft_image_count,
+        ) orelse return;
 
         const trimmed_title = std.mem.trim(u8, draft, &std.ascii.whitespace);
         const thread = self.currentThreadMutable();
@@ -5498,7 +7090,11 @@ pub const AppState = struct {
         var draft_image_copy = draft_image;
         try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null, thread.draft_extra_images.items);
         self.currentProjectMutable().invalidateSidebarThreadCache();
-        try self.beginSendForThread(self.currentProject().path, thread, draft);
+        // Persist the user turn before handing provider execution to the daemon,
+        // so a fast app quit can still reattach the daemon-owned reply to a
+        // known local chat thread.
+        self.flushDirtyBlocking();
+        try self.beginSendForThread(self.selected_project_index, thread, draft, execution_target);
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.resetComposerInputWidget();
@@ -5659,33 +7255,39 @@ pub const AppState = struct {
 
     fn interruptThreadViaHarness(
         self: *AppState,
-        project_path: []const u8,
+        execution_target: ProviderExecutionTarget,
         provider: Provider,
         thread_id: []const u8,
         turn_id: ?[]const u8,
     ) !void {
+        if (execution_target.remoteHost() != null and provider != .codex) return error.UnsupportedRemoteProvider;
+        const provider_cwd = execution_target.cwd();
         const provider_config = switch (provider) {
             .opencode => ai_harness.ProviderConfig{
                 .opencode = .{
                     .allocator = self.allocator,
-                    .working_directory = project_path,
+                    .working_directory = provider_cwd,
                     .launch_if_missing = true,
                 },
             },
             .codex => ai_harness.ProviderConfig{
                 .codex = .{
-                    .cwd = project_path,
+                    .cwd = provider_cwd,
                     .launch_on_connect = false,
+                    .remote_ssh = if (execution_target.remoteHost()) |host| .{
+                        .host = host,
+                        .cwd = provider_cwd,
+                    } else null,
                 },
             },
             .claude => ai_harness.ProviderConfig{
                 .claude = .{
-                    .cwd = project_path,
+                    .cwd = provider_cwd,
                 },
             },
             .cursor => ai_harness.ProviderConfig{
                 .cursor = .{
-                    .cwd = project_path,
+                    .cwd = provider_cwd,
                 },
             },
         };
@@ -5701,15 +7303,20 @@ pub const AppState = struct {
 
     fn steerThreadViaHarness(
         self: *AppState,
-        project_path: []const u8,
+        execution_target: ProviderExecutionTarget,
         thread_id: []const u8,
         turn_id: []const u8,
         prompt: []const u8,
     ) !void {
+        const provider_cwd = execution_target.cwd();
         const provider_config = ai_harness.ProviderConfig{
             .codex = .{
-                .cwd = project_path,
+                .cwd = provider_cwd,
                 .launch_on_connect = false,
+                .remote_ssh = if (execution_target.remoteHost()) |host| .{
+                    .host = host,
+                    .cwd = provider_cwd,
+                } else null,
             },
         };
 
@@ -5723,51 +7330,27 @@ pub const AppState = struct {
         });
     }
 
-    fn beginSendForThread(self: *AppState, project_path: []const u8, thread: *ChatThread, prompt: []const u8) !void {
+    fn beginSendForThread(
+        self: *AppState,
+        project_index: usize,
+        thread: *ChatThread,
+        prompt: []const u8,
+        execution_target: ProviderExecutionTarget,
+    ) !void {
         const page_alloc = std.heap.page_allocator;
+        const execution_cwd = execution_target.cwd();
+        const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ self.projects.items[project_index].id, thread.local_thread_id, unixTimestampMs() });
+        errdefer page_alloc.free(turn_id);
+        const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
+        defer if (cursor_model_params_json) |params| page_alloc.free(params);
 
-        const request = try page_alloc.create(SendWorkerRequest);
-        errdefer page_alloc.destroy(request);
-        const extra_image_paths = try page_alloc.alloc([]u8, thread.draft_extra_images.items.len);
-        errdefer page_alloc.free(extra_image_paths);
-        for (thread.draft_extra_images.items, 0..) |image, index| {
-            extra_image_paths[index] = try page_alloc.dupe(u8, image.path);
-        }
-        request.* = .{
-            .send_state_ptr = thread.send_state,
-            .provider = thread.provider,
-            .harness = thread.harness,
-            .project_path = try page_alloc.dupe(u8, project_path),
-            .prompt = try page_alloc.dupe(u8, prompt),
-            .image_path = if (thread.draft_image) |image| try page_alloc.dupe(u8, image.path) else null,
-            .image_paths = extra_image_paths,
-            .provider_thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
-            .thread_title = try page_alloc.dupe(u8, thread.title),
-            .model_ref = if (thread.model_ref) |model_ref| try page_alloc.dupe(u8, model_ref) else null,
-            .reasoning_effort = thread.reasoning_effort,
-            .opencode_reasoning_variant = blk: {
-                if (thread.provider != .opencode) break :blk null;
-                if (thread.opencode_reasoning_variant) |v| {
-                    break :blk try page_alloc.dupe(u8, v);
-                }
-                break :blk null;
-            },
-            .cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null,
-            .fast_mode = thread.fast_mode,
-            .access_mode = thread.access_mode,
-        };
-        errdefer {
-            page_alloc.free(request.project_path);
-            page_alloc.free(request.prompt);
-            if (request.image_path) |image_path| page_alloc.free(image_path);
-            for (request.image_paths) |image_path| page_alloc.free(image_path);
-            page_alloc.free(request.image_paths);
-            if (request.provider_thread_id) |thread_id| page_alloc.free(thread_id);
-            page_alloc.free(request.thread_title);
-            if (request.model_ref) |model_ref| page_alloc.free(model_ref);
-            if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
-            if (request.cursor_model_params_json) |params| page_alloc.free(params);
-        }
+        try self.ensureSessionDaemon();
+        // The daemon response is owned by self.allocator (startDaemonChatTurn ->
+        // sessionizer.requestAlloc); freeing it with page_alloc trips
+        // PageAllocator's alignment safety check and crashes the send.
+        const response = try self.startDaemonChatTurn(project_index, thread, prompt, execution_target, execution_cwd, cursor_model_params_json, turn_id);
+        defer self.allocator.free(response);
+        try ensureJsonRpcOk(self.allocator, response);
 
         const send_state = thread.send_state;
         send_state.mutex.lock();
@@ -5781,10 +7364,17 @@ pub const AppState = struct {
             page_alloc.free(thread_id);
             send_state.provisional_provider_thread_id = null;
         }
-        if (send_state.active_turn_id) |turn_id| {
-            page_alloc.free(turn_id);
+        if (send_state.active_turn_id) |active_turn_id| {
+            page_alloc.free(active_turn_id);
             send_state.active_turn_id = null;
         }
+        if (send_state.daemon_turn_id) |old_turn_id| {
+            page_alloc.free(old_turn_id);
+            send_state.daemon_turn_id = null;
+        }
+        send_state.daemon_turn_id = turn_id;
+        send_state.daemon_last_seq = 0;
+        send_state.daemon_owned = true;
         send_state.partial_text.clearRetainingCapacity();
         freePendingTimelineEventsLocked(page_alloc, &send_state.pending_events);
         freePendingDiffFilesLocked(page_alloc, &send_state.pending_diff_files);
@@ -5798,17 +7388,137 @@ pub const AppState = struct {
         send_state.pending_followup_signal_sent = false;
         send_state.stop_requested = false;
         send_state.stop_signal_sent = false;
-        send_state.worker = std.Thread.spawn(.{}, sendWorker, .{ send_state, request }) catch |err| {
-            send_state.status = .idle;
-            send_state.started_at_ms = 0;
-            send_state.provider = null;
-            return err;
-        };
+        send_state.worker = null;
         self.pending_send_count += 1;
     }
 
     fn beginSendDraft(self: *AppState, prompt: []const u8) !void {
-        return self.beginSendForThread(self.currentProject().path, self.currentThreadMutable(), prompt);
+        const execution_target = self.providerExecutionTargetForProjectThread(
+            self.selected_project_index,
+            self.currentThread(),
+            self.currentThread().draftImageCount(),
+        ) orelse return;
+        return self.beginSendForThread(self.selected_project_index, self.currentThreadMutable(), prompt, execution_target);
+    }
+
+    fn ensureSessionDaemon(self: *AppState) !void {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const exe_path = try std.process.executablePathAlloc(threaded.io(), self.allocator);
+        defer self.allocator.free(exe_path);
+        try sessionizer.ensureDaemon(self.allocator, self.storage.pref_path, exe_path);
+    }
+
+    fn startDaemonChatTurn(
+        self: *AppState,
+        project_index: usize,
+        thread: *const ChatThread,
+        prompt: []const u8,
+        execution_target: ProviderExecutionTarget,
+        execution_cwd: []const u8,
+        cursor_model_params_json: ?[]const u8,
+        turn_id: []const u8,
+    ) ![]u8 {
+        var image_paths: std.ArrayList([]const u8) = .empty;
+        defer image_paths.deinit(self.allocator);
+        if (thread.draft_image) |image| try image_paths.append(self.allocator, image.path);
+        for (thread.draft_extra_images.items) |image| try image_paths.append(self.allocator, image.path);
+
+        return sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.start", .{
+            .turn_id = turn_id,
+            .workspace_id = self.projects.items[project_index].id,
+            .local_thread_id = thread.local_thread_id,
+            .provider = @tagName(harnessProviderForDbProvider(thread.provider)),
+            .harness = @tagName(thread.harness),
+            .project_path = self.projects.items[project_index].path,
+            .prompt = prompt,
+            .image_paths = image_paths.items,
+            .provider_thread_id = if (thread.provider_thread_id) |thread_id| thread_id else null,
+            .thread_title = thread.title,
+            .model_ref = if (thread.model_ref) |model_ref| model_ref else null,
+            .reasoning_effort = if (thread.reasoning_effort) |effort| @tagName(effort) else null,
+            .opencode_reasoning_variant = if (thread.provider == .opencode) thread.opencode_reasoning_variant else null,
+            .cursor_model_params_json = cursor_model_params_json,
+            .fast_mode = thread.fast_mode == .on,
+            .access_mode = @tagName(thread.access_mode),
+            .remote_ssh_host = if (execution_target.remoteHost()) |host| host else null,
+            .remote_cwd = if (execution_target.remoteHost() != null) execution_cwd else null,
+        }, 1);
+    }
+
+    fn cancelDaemonChatTurn(self: *AppState, turn_id: []const u8) void {
+        const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.cancel", .{ .turn_id = turn_id }, 3) catch |err| {
+            log.warn("failed to cancel daemon chat turn: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(response);
+    }
+
+    fn approveDaemonChatTurn(self: *AppState, turn_id: []const u8, call_id: []const u8, decision: ai_harness.ApprovalDecision) void {
+        const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.approve", .{
+            .turn_id = turn_id,
+            .call_id = call_id,
+            .decision = @tagName(decision),
+        }, 4) catch |err| {
+            log.warn("failed to approve daemon chat turn: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(response);
+    }
+
+    fn consumeDaemonChatTurn(self: *AppState, turn_id: ?[]u8) void {
+        const owned_turn_id = turn_id orelse return;
+        defer std.heap.page_allocator.free(owned_turn_id);
+        const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.consume", .{ .turn_id = owned_turn_id }, 5) catch |err| {
+            log.warn("failed to consume daemon chat turn: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(response);
+    }
+
+    fn restoreDaemonChatTurnsOnLaunch(self: *AppState) void {
+        const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.list", .{}, 6) catch return;
+        defer self.allocator.free(response);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch return;
+        defer parsed.deinit();
+        const result = jsonRpcResult(parsed.value) catch return;
+        if (result != .object) return;
+        const turns = result.object.get("turns") orelse return;
+        if (turns != .array) return;
+        for (turns.array.items) |turn_value| {
+            if (turn_value != .object) continue;
+            const workspace_id = jsonValueString(turn_value.object.get("workspace_id") orelse .null) orelse continue;
+            const local_thread_id = jsonValueString(turn_value.object.get("local_thread_id") orelse .null) orelse continue;
+            const turn_id = jsonValueString(turn_value.object.get("turn_id") orelse .null) orelse continue;
+            const status = jsonValueString(turn_value.object.get("status") orelse .null) orelse "running";
+            const thread = self.threadByLocalId(workspace_id, local_thread_id) orelse continue;
+            const send_state = thread.send_state;
+            send_state.mutex.lock();
+            if (send_state.status == .idle and !send_state.daemon_owned) {
+                send_state.status = .pending;
+                send_state.started_at_ms = unixTimestampMs();
+                send_state.provider = thread.provider;
+                send_state.daemon_turn_id = std.heap.page_allocator.dupe(u8, turn_id) catch null;
+                send_state.daemon_last_seq = 0;
+                send_state.daemon_owned = send_state.daemon_turn_id != null;
+                send_state.ui_revision +%= 1;
+                if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "aborted")) {
+                    send_state.polled_working_seconds = 0;
+                }
+                if (send_state.daemon_owned) self.pending_send_count += 1;
+            }
+            send_state.mutex.unlock();
+        }
+    }
+
+    fn threadByLocalId(self: *AppState, workspace_id: []const u8, local_thread_id: []const u8) ?*ChatThread {
+        for (self.projects.items) |*project| {
+            if (!std.mem.eql(u8, project.id, workspace_id)) continue;
+            for (project.threads.items) |*thread| {
+                if (std.mem.eql(u8, thread.local_thread_id, local_thread_id)) return thread;
+            }
+        }
+        return null;
     }
 
     fn applyPersisted(self: *AppState, persisted: PersistedState) !void {
@@ -5832,6 +7542,9 @@ pub const AppState = struct {
             loaded.archived = project.archived;
             loaded.collapsed = project.collapsed orelse false;
             loaded.thread_list_expanded = project.thread_list_expanded orelse false;
+            if (project.herdr_link) |link| {
+                loaded.herdr_link = try HerdrWorkspaceLink.initFromPersisted(self.allocator, link);
+            }
             if (project.terminal_height) |height| {
                 loaded.terminal_dock.preferred_height = terminal.clampPreferredHeight(height);
             }
@@ -5861,6 +7574,10 @@ pub const AppState = struct {
                     var thread = try ChatThread.init(self.allocator, persisted_thread.title);
                     thread.archived = project.archived or persisted_thread.archived;
                     thread.committed = persisted_thread.committed;
+                    if (persisted_thread.local_thread_id) |local_thread_id| {
+                        self.allocator.free(thread.local_thread_id);
+                        thread.local_thread_id = try self.allocator.dupeZ(u8, local_thread_id);
+                    }
                     thread.last_activity_at = persisted_thread.last_activity_at orelse 0;
                     thread.provider_thread_id = if (persisted_thread.provider_thread_id) |thread_id|
                         try self.allocator.dupeZ(u8, thread_id)
@@ -6042,6 +7759,7 @@ pub const AppState = struct {
             .terminal_docks_json = terminal_docks_json,
             .workspace_layout_json = workspace_layout_json,
             .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
+            .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
             .threads = try threads.toOwnedSlice(allocator),
         };
     }
@@ -6130,6 +7848,7 @@ pub const AppState = struct {
             .title = try allocator.dupe(u8, thread.title),
             .archived = thread.archived,
             .committed = thread.committed,
+            .local_thread_id = try allocator.dupe(u8, thread.local_thread_id),
             .last_activity_at = if (thread.last_activity_at == 0) null else thread.last_activity_at,
             .provider_thread_id = try dupeOptionalSlice(allocator, thread.provider_thread_id),
             .model_ref = try dupeOptionalSlice(allocator, thread.model_ref),
@@ -6267,6 +7986,7 @@ pub const AppState = struct {
             .terminal_font_size = self.app_config.terminal_font_size,
             .theme_source = self.app_config.theme_config.source,
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
+            .link_open_target = self.app_config.link_open_target,
             .notifications_enabled = self.app_config.notifications_enabled,
         };
     }
@@ -6276,6 +7996,7 @@ pub const AppState = struct {
         if (draft.font_size != self.app_config.font_size) return true;
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
         if (draft.theme_source != self.app_config.theme_config.source) return true;
+        if (draft.link_open_target != self.app_config.link_open_target) return true;
         if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
         return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
     }
@@ -6394,6 +8115,7 @@ pub const AppState = struct {
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
         self.app_config.theme_config.source = self.settings_draft.theme_source;
+        self.app_config.link_open_target = self.settings_draft.link_open_target;
         self.app_config.notifications_enabled = self.settings_draft.notifications_enabled;
         try self.applySettingsDraftOpenAction();
 
@@ -6890,11 +8612,26 @@ pub const AppState = struct {
     }
 
     pub fn openTranscriptWebLink(self: *AppState, href: []const u8) void {
+        self.openConfiguredWebLink(href);
+    }
+
+    pub fn openConfiguredWebLink(self: *AppState, href: []const u8) void {
         const trimmed = std.mem.trim(u8, href, &std.ascii.whitespace);
         if (trimmed.len == 0) {
             self.setSidebarNotice("No web link selected.");
             return;
         }
+
+        if (self.app_config.link_open_target == .system_browser) {
+            utils.openUrlInDefaultBrowser(self.allocator, trimmed) catch |err| {
+                log.warn("failed to open web link in system browser: {s}", .{@errorName(err)});
+                self.setSidebarNotice("Failed to open web link in default browser.");
+                return;
+            };
+            self.setSidebarNotice("Opened web link in default browser.");
+            return;
+        }
+
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No workspace selected.");
             return;
@@ -7957,6 +9694,18 @@ pub const AppState = struct {
         };
     }
 
+    pub fn createCurrentProjectTerminalTab(self: *AppState, dock_id: u32, profile: terminal.TerminalLaunchProfile) bool {
+        if (self.projects.items.len == 0) return false;
+        self.createTerminalTabForWorkspaceProfile(self.selected_project_index, dock_id, profile) catch |err| {
+            log.warn("failed to create workspace terminal tab: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Failed to create terminal tab.");
+            return false;
+        };
+        self.requestTerminalDockFocus(dock_id);
+        self.markDirty();
+        return true;
+    }
+
     fn createProjectTerminalDock(self: *AppState, project_index: usize) !u32 {
         if (project_index >= self.projects.items.len) return error.NoProjectSelected;
         var project = &self.projects.items[project_index];
@@ -8063,9 +9812,8 @@ pub const AppState = struct {
 
         self.ensureCurrentProjectWorkspace();
         var dock = self.currentProjectTerminalMutable();
-        const project_path = self.currentProject().path;
         if (!dock.hasRunningSession()) {
-            dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, 0) catch |err| {
+            self.restartTerminalDockForWorkspace(self.selected_project_index, 0) catch |err| {
                 log.err("failed to start terminal dock: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to start terminal.");
                 return;
@@ -8108,8 +9856,7 @@ pub const AppState = struct {
 
         var dock = self.currentProjectTerminalMutable();
         if (!dock.visible) {
-            const project_path = self.currentProject().path;
-            dock.ensureSessionPersistent(self.allocator, project_path, self.storage.pref_path, 0) catch |err| {
+            self.restartTerminalDockForWorkspace(self.selected_project_index, 0) catch |err| {
                 log.err("failed to start terminal dock: {s}", .{@errorName(err)});
                 self.setSidebarNotice("Failed to start terminal.");
                 return;
@@ -8153,7 +9900,11 @@ pub const AppState = struct {
                 continue;
             }
             if (project_selected and base_visible and !project.terminal_dock.hasRunningSession()) {
-                project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0) catch |err| {
+                const start_result = if (project.terminal_dock.hasRestorableSession())
+                    project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0)
+                else
+                    self.restartTerminalDockForWorkspace(project_index, 0);
+                start_result catch |err| {
                     log.err("failed to start visible terminal session: {s}", .{@errorName(err)});
                     if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                 };
@@ -8182,7 +9933,11 @@ pub const AppState = struct {
                     break;
                 }
                 if (project_selected and dock_visible and !entry.dock.hasRunningSession()) {
-                    entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id) catch |err| {
+                    const start_result = if (entry.dock.hasRestorableSession())
+                        entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id)
+                    else
+                        self.restartTerminalDockForWorkspace(project_index, entry.id);
+                    start_result catch |err| {
                         log.err("failed to start visible terminal dock {d}: {s}", .{ entry.id, @errorName(err) });
                         if (project_index == self.selected_project_index) self.setSidebarNotice("Terminal session failed.");
                     };
@@ -9891,8 +11646,10 @@ pub const AppState = struct {
         event: *const sdl.KeyboardEvent,
     ) bool {
         if (!self.canRouteTerminalInput()) return false;
+        const dock_id = self.terminalInputDockId() orelse return false;
         if (keyboard.terminalActionForEvent(event)) |action| {
             switch (action) {
+                .new_tab => return self.createCurrentProjectTerminalTab(dock_id, .{}),
                 .split_up => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, false),
                 .split_down => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.horizontal, true),
                 .split_left => return self.splitFocusedWorkspacePaneWithTerminalPlacement(.vertical, false),
@@ -9900,7 +11657,7 @@ pub const AppState = struct {
                 else => {},
             }
         }
-        var dock = self.currentProjectTerminalMutable();
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const handled = dock.handleKeyDown(self.allocator, keyboard, event);
         if (dock.consumeWorkspaceChange()) self.markDirty();
         return handled;
@@ -9908,13 +11665,20 @@ pub const AppState = struct {
 
     pub fn handleTerminalTextInput(self: *AppState, text: [*c]const u8) bool {
         if (!self.canRouteTerminalInput()) return false;
-        return self.currentProjectTerminalMutable().handleTextInput(std.mem.sliceTo(text, 0));
+        const dock_id = self.terminalInputDockId() orelse return false;
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
+        return dock.handleTextInput(std.mem.sliceTo(text, 0));
     }
 
     fn canRouteTerminalInput(self: *const AppState) bool {
         if (!self.terminal_focused or !self.isTerminalVisible()) return false;
         if (self.shouldRenderLegacyTerminalDockInChat()) return true;
         return self.focusedWorkspacePaneKind() == .terminal;
+    }
+
+    fn terminalInputDockId(self: *const AppState) ?u32 {
+        if (self.shouldRenderLegacyTerminalDockInChat()) return 0;
+        return self.focusedWorkspaceTerminalDockId();
     }
 
     pub fn ensureCurrentProjectWorkspace(self: *AppState) void {
@@ -10157,7 +11921,7 @@ pub const AppState = struct {
             else => return false,
         };
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
-        try dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id);
+        if (!dock.hasRunningSession()) try self.restartTerminalDockForWorkspace(project_index, dock_id);
         return try dock.writeInputToActivePane(bytes);
     }
 
@@ -10324,25 +12088,28 @@ pub const AppState = struct {
         self.selected_project_index = project_index;
         var project = &self.projects.items[project_index];
         const process = project.managedProcessByName(name) orelse return false;
-        return try self.startManagedProcessDirect(project, process);
+        return try self.startManagedProcessDirect(project_index, process);
     }
 
-    fn startManagedProcessDirect(self: *AppState, project: *Project, process: *ManagedProcess) !bool {
-        const dock_id = process.dock_id orelse try self.createCurrentProjectTerminalDock();
+    fn startManagedProcessDirect(self: *AppState, project_index: usize, process: *ManagedProcess) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        self.selected_project_index = project_index;
+        var project = &self.projects.items[project_index];
+        const dock_id = process.dock_id orelse try self.createProjectTerminalDock(project_index);
         process.dock_id = dock_id;
 
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
         try self.ensureManagedAgentProjectHooks(project.path, process);
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const command = try self.managedProcessLaunchCommand(process);
         defer self.allocator.free(command);
         const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
-        try dock.restartWithProfilePersistent(self.allocator, cwd, .{
+        try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
             .kind = .custom,
             .label = process.name,
             .command = &command_args,
-        }, self.storage.pref_path, dock_id);
+        });
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
         process.status = .running;
         process.exit_code = null;
         process.signal = null;
@@ -10408,15 +12175,15 @@ pub const AppState = struct {
             return false;
         };
         project = &self.projects.items[project_index];
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
         const command = try self.managedProcessLaunchCommand(process);
         defer self.allocator.free(command);
         const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
-        try dock.restartWithProfilePersistent(self.allocator, cwd, .{
+        try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
             .kind = .custom,
             .label = process.name,
             .command = &command_args,
-        }, self.storage.pref_path, dock_id);
+        });
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
 
         layout = &project.workspace_layout;
         const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
@@ -10544,12 +12311,12 @@ pub const AppState = struct {
             return false;
         };
         project = &self.projects.items[project_index];
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
-        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+        self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
             log.err("failed to start Amp terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start Amp TUI terminal.");
             return false;
         };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
 
         layout = &project.workspace_layout;
         const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
@@ -10903,6 +12670,9 @@ pub const AppState = struct {
         }
         self.slash_command_state.mutex.unlock();
 
+        const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+        const execution_cwd = execution_target.cwd();
+
         const command_display_name = try page_alloc.dupe(u8, command.name);
         errdefer page_alloc.free(command_display_name);
 
@@ -10912,6 +12682,8 @@ pub const AppState = struct {
             .provider = thread.provider,
             .harness = thread.harness,
             .project_path = try page_alloc.dupe(u8, project.path),
+            .remote_ssh_host = if (execution_target.remoteHost()) |host| try page_alloc.dupe(u8, host) else null,
+            .remote_cwd = if (execution_target.remoteHost() != null) try page_alloc.dupe(u8, execution_cwd) else null,
             .thread_id = if (thread.provider_thread_id) |thread_id| try page_alloc.dupe(u8, thread_id) else null,
             .command = command.id,
             .raw_text = try page_alloc.dupe(u8, raw_text),
@@ -10919,6 +12691,8 @@ pub const AppState = struct {
         };
         errdefer {
             page_alloc.free(request.project_path);
+            if (request.remote_ssh_host) |host| page_alloc.free(host);
+            if (request.remote_cwd) |cwd| page_alloc.free(cwd);
             if (request.thread_id) |thread_id| page_alloc.free(thread_id);
             page_alloc.free(request.raw_text);
             page_alloc.free(request.args);
@@ -11328,6 +13102,7 @@ pub const AppState = struct {
                 self.setSidebarNotice("Browser pane closed.");
             },
         }
+        self.clearHerdrClosedPaneMetadata(project_index, pane_id, removed_ref);
         if (layout.root == null) {
             if (layout.firstVisiblePaneId()) |next_id| {
                 layout.replaceRootWithLeaf(self.allocator, next_id) catch {
@@ -11337,6 +13112,34 @@ pub const AppState = struct {
         }
         self.markDirty();
         return true;
+    }
+
+    fn clearHerdrClosedPaneMetadata(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, removed_ref: WorkspacePaneRef) void {
+        if (project_index >= self.projects.items.len) return;
+        var project = &self.projects.items[project_index];
+        if (project.herdr_link) |*link| {
+            var changed = link.removePaneLinkForVerdePane(self.allocator, pane_id);
+            if (link.attach_pane_id) |attach_pane_id| {
+                if (attach_pane_id == pane_id) {
+                    link.attach_pane_id = null;
+                    link.attach_dock_id = null;
+                    changed = true;
+                }
+            }
+            switch (removed_ref) {
+                .terminal => |ref| {
+                    if (link.attach_dock_id) |attach_dock_id| {
+                        if (attach_dock_id == ref.dock_id and !project.workspace_layout.hasTerminalDockPane(ref.dock_id)) {
+                            link.attach_dock_id = null;
+                            link.attach_pane_id = null;
+                            changed = true;
+                        }
+                    }
+                },
+                else => {},
+            }
+            if (changed) link.updated_at_ms = unixTimestampMs();
+        }
     }
 
     pub fn closeFocusedWorkspacePane(self: *AppState) bool {
@@ -11478,12 +13281,12 @@ pub const AppState = struct {
             return null;
         };
         project = &self.projects.items[self.selected_project_index];
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return null;
-        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+        self.restartTerminalDockForWorkspace(self.selected_project_index, dock_id) catch |err| {
             log.err("failed to start editor terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start terminal.");
             return null;
         };
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return null;
 
         layout = &project.workspace_layout;
         const new_pane_id = layout.createTerminalPaneWithPurpose(self.allocator, dock_id, .editor) catch |err| {
@@ -11555,12 +13358,12 @@ pub const AppState = struct {
         layout = &project.workspace_layout;
         thread.tui_dock_id = dock_id;
         const pane = layout.paneByIdMutable(pane_id) orelse return;
-        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
-        dock.restartWithProfilePersistent(self.allocator, project.path, .{}, self.storage.pref_path, dock_id) catch |err| {
+        self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
             log.err("failed to start TUI terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start TUI terminal.");
             return;
         };
+        var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return;
 
         pane.ref = .{ .terminal = .{ .dock_id = dock_id } };
         pane.minimized = false;
@@ -11640,12 +13443,12 @@ pub const AppState = struct {
             self.setSidebarNotice("Failed to create terminal dock.");
             return false;
         };
-        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
-        dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, dock_id) catch |err| {
+        self.restartTerminalDockForWorkspace(project_index, dock_id) catch |err| {
             log.err("failed to start terminal dock: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to start terminal.");
             return false;
         };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
 
         const new_pane_id = layout.createTerminalPane(self.allocator, dock_id) catch |err| {
             log.err("failed to create terminal workspace pane: {s}", .{@errorName(err)});
@@ -11659,7 +13462,7 @@ pub const AppState = struct {
         };
         layout.maximized_pane_id = null;
         dock.visible = false;
-        if (self.selected_project_index == project_index) self.requestTerminalFocus();
+        if (self.selected_project_index == project_index) self.requestTerminalDockFocus(dock_id);
         self.setSidebarNotice("Terminal pane created.");
         self.markDirty();
         return true;
@@ -13151,6 +14954,15 @@ pub const AppState = struct {
         self.thread_import_hover_index = null;
     }
 
+    fn clearHerdrProfileSummaries(self: *AppState) void {
+        for (self.herdr_profile_summaries.items) |profile| {
+            profile.deinit(self.allocator);
+        }
+        self.herdr_profile_summaries.clearRetainingCapacity();
+        self.herdr_profile_selected_index = null;
+        self.herdr_profile_hover_index = null;
+    }
+
     pub fn flushIfDirty(self: *AppState) void {
         if (!self.dirty) return;
         const now = unixTimestampMs();
@@ -13285,6 +15097,8 @@ pub const AppState = struct {
         self.browser_state.deinit();
         self.releaseAllImageTextures();
         self.thread_import_threads.deinit(self.allocator);
+        self.clearHerdrProfileSummaries();
+        self.herdr_profile_summaries.deinit(self.allocator);
         self.clearOpencodeModelOptions();
         self.clearClaudeModelOptions();
         self.clearCursorModelOptions();
@@ -13803,10 +15617,137 @@ pub const AppState = struct {
         return true;
     }
 
+    fn pollDaemonChatTurn(self: *AppState, thread: *ChatThread) bool {
+        const page_alloc = std.heap.page_allocator;
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        const turn_id = if (send_state.status == .pending and send_state.daemon_owned and send_state.daemon_turn_id != null)
+            page_alloc.dupe(u8, send_state.daemon_turn_id.?) catch null
+        else
+            null;
+        const after_seq = send_state.daemon_last_seq;
+        send_state.mutex.unlock();
+
+        const owned_turn_id = turn_id orelse return false;
+        defer page_alloc.free(owned_turn_id);
+
+        const response = sessionizer.requestAlloc(page_alloc, self.storage.pref_path, "chat.turn.tail", .{
+            .turn_id = owned_turn_id,
+            .after_seq = after_seq,
+        }, 2) catch |err| {
+            log.warn("failed to tail daemon chat turn: {s}", .{@errorName(err)});
+            return false;
+        };
+        defer page_alloc.free(response);
+        return self.applyDaemonChatTurnTail(thread, response) catch |err| {
+            log.warn("failed to apply daemon chat turn tail: {s}", .{@errorName(err)});
+            return false;
+        };
+    }
+
+    fn applyDaemonChatTurnTail(self: *AppState, thread: *ChatThread, response: []const u8) !bool {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response, .{});
+        defer parsed.deinit();
+        const result = try jsonRpcResult(parsed.value);
+        if (result != .object) return error.InvalidDaemonResponse;
+        const status_text = jsonValueString(result.object.get("status") orelse .null) orelse "running";
+        const events = result.object.get("events") orelse .null;
+        var changed = false;
+
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        if (send_state.status != .pending) return false;
+
+        if (jsonValueString(result.object.get("provider_thread_id") orelse .null)) |thread_id| {
+            try replacePageOwned(&send_state.provisional_provider_thread_id, thread_id);
+        }
+        if (jsonValueString(result.object.get("active_turn_id") orelse .null)) |turn_id| {
+            try replacePageOwned(&send_state.active_turn_id, turn_id);
+        }
+        if (events == .array) {
+            for (events.array.items) |event_value| {
+                if (event_value != .object) continue;
+                const seq = jsonValueU64(event_value.object.get("seq") orelse .null) orelse continue;
+                const kind = jsonValueString(event_value.object.get("kind") orelse .null) orelse continue;
+                const payload_json = jsonValueString(event_value.object.get("payload_json") orelse .null) orelse "{}";
+                if (seq > send_state.daemon_last_seq) send_state.daemon_last_seq = seq;
+                try self.applyDaemonChatEventLocked(send_state, kind, payload_json);
+                changed = true;
+            }
+        }
+        if (result.object.get("pending_approval")) |approval_value| {
+            if (approval_value == .object) {
+                const call_id = jsonValueString(approval_value.object.get("call_id") orelse .null) orelse "";
+                const title = jsonValueString(approval_value.object.get("title") orelse .null) orelse "Approval requested";
+                const body = jsonValueString(approval_value.object.get("body") orelse .null) orelse "";
+                if (call_id.len > 0 and send_state.pending_approval == null) {
+                    send_state.pending_approval = .{
+                        .call_id = try std.heap.page_allocator.dupe(u8, call_id),
+                        .title = try std.heap.page_allocator.dupe(u8, title),
+                        .body = try std.heap.page_allocator.dupe(u8, body),
+                    };
+                    changed = true;
+                }
+            }
+        }
+        if (std.mem.eql(u8, status_text, "completed")) {
+            const provider_thread_id = jsonValueString(result.object.get("provider_thread_id") orelse .null) orelse send_state.provisional_provider_thread_id orelse "";
+            const reply_text = jsonValueString(result.object.get("result_reply_text") orelse .null) orelse "";
+            send_state.result = .{
+                .provider_thread_id = try std.heap.page_allocator.dupe(u8, provider_thread_id),
+                .reply_text = try std.heap.page_allocator.dupe(u8, reply_text),
+            };
+            send_state.status = .completed;
+            changed = true;
+        } else if (std.mem.eql(u8, status_text, "failed")) {
+            const message = jsonValueString(result.object.get("error_message") orelse .null) orelse "Provider request failed.";
+            send_state.error_message = try std.heap.page_allocator.dupe(u8, message);
+            send_state.status = .failed;
+            changed = true;
+        } else if (std.mem.eql(u8, status_text, "aborted")) {
+            send_state.status = .aborted;
+            changed = true;
+        }
+        if (changed) send_state.ui_revision +%= 1;
+        return changed;
+    }
+
+    fn applyDaemonChatEventLocked(self: *AppState, send_state: *SendState, kind: []const u8, payload_json: []const u8) !void {
+        _ = self;
+        if (std.mem.eql(u8, kind, "assistant_delta")) {
+            const text = daemonPayloadStringAlloc(payload_json, "text") orelse return;
+            defer std.heap.page_allocator.free(text);
+            try send_state.partial_text.appendSlice(std.heap.page_allocator, text);
+        } else if (std.mem.eql(u8, kind, "message")) {
+            flushPendingAssistantTextLocked(send_state, std.heap.page_allocator);
+            const title = daemonPayloadStringAlloc(payload_json, "title") orelse try std.heap.page_allocator.dupe(u8, "System");
+            defer std.heap.page_allocator.free(title);
+            const body = daemonPayloadStringAlloc(payload_json, "body") orelse try std.heap.page_allocator.dupe(u8, "");
+            defer std.heap.page_allocator.free(body);
+            const owned_author = try std.heap.page_allocator.dupe(u8, title);
+            errdefer std.heap.page_allocator.free(owned_author);
+            const owned_body = try std.heap.page_allocator.dupe(u8, body);
+            errdefer std.heap.page_allocator.free(owned_body);
+            try send_state.pending_events.append(std.heap.page_allocator, .{ .role = .system, .author = owned_author, .body = owned_body });
+        } else if (std.mem.eql(u8, kind, "thread_id")) {
+            if (daemonPayloadStringAlloc(payload_json, "thread_id")) |thread_id| {
+                defer std.heap.page_allocator.free(thread_id);
+                try replacePageOwned(&send_state.provisional_provider_thread_id, thread_id);
+            }
+        } else if (std.mem.eql(u8, kind, "turn_id")) {
+            if (daemonPayloadStringAlloc(payload_json, "turn_id")) |turn_id| {
+                defer std.heap.page_allocator.free(turn_id);
+                try replacePageOwned(&send_state.active_turn_id, turn_id);
+            }
+        }
+    }
+
     fn pollThreadSend(self: *AppState, project_index: usize, thread_index: usize, thread: *ChatThread) bool {
+        const daemon_changed = self.pollDaemonChatTurn(thread);
         self.capturePendingProviderThreadId(thread);
-        self.issuePendingCodexSteer(self.projects.items[project_index].path, project_index, thread_index, thread);
-        self.issuePendingThreadStop(self.projects.items[project_index].path, thread);
+        self.issuePendingCodexSteer(project_index, thread_index, thread);
+        self.issuePendingThreadStop(project_index, self.projects.items[project_index].path, thread);
 
         var completed_result: ?SendResultPayload = null;
         var failed_message: ?[]u8 = null;
@@ -13814,6 +15755,7 @@ pub const AppState = struct {
         var next_status: SendStatus = .idle;
         var completed_events: std.ArrayListUnmanaged(PendingTimelineEvent) = .empty;
         var completed_diff_files: std.ArrayListUnmanaged(PendingDiffFile) = .empty;
+        var completed_daemon_turn_id: ?[]u8 = null;
         const send_state = thread.send_state;
         var stream_changed = false;
 
@@ -13858,6 +15800,10 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                completed_daemon_turn_id = send_state.daemon_turn_id;
+                send_state.daemon_turn_id = null;
+                send_state.daemon_owned = false;
+                send_state.daemon_last_seq = 0;
                 send_state.status = .idle;
                 next_status = .completed;
             },
@@ -13880,6 +15826,10 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                completed_daemon_turn_id = send_state.daemon_turn_id;
+                send_state.daemon_turn_id = null;
+                send_state.daemon_owned = false;
+                send_state.daemon_last_seq = 0;
                 send_state.status = .idle;
                 next_status = .aborted;
             },
@@ -13903,6 +15853,10 @@ pub const AppState = struct {
                 send_state.approval_decision = null;
                 send_state.provider = null;
                 send_state.started_at_ms = 0;
+                completed_daemon_turn_id = send_state.daemon_turn_id;
+                send_state.daemon_turn_id = null;
+                send_state.daemon_owned = false;
+                send_state.daemon_last_seq = 0;
                 send_state.status = .idle;
                 next_status = .failed;
             },
@@ -13940,6 +15894,7 @@ pub const AppState = struct {
                         self.requestTranscriptScrollToBottom();
                     }
                     self.flushDirtyNow();
+                    self.consumeDaemonChatTurn(completed_daemon_turn_id);
                 }
             },
             .failed => {
@@ -13958,6 +15913,7 @@ pub const AppState = struct {
                     self.setSidebarNotice("Provider request failed.");
                 }
                 self.flushDirtyNow();
+                self.consumeDaemonChatTurn(completed_daemon_turn_id);
             },
             .aborted => {
                 defer freePendingTimelineEvents(std.heap.page_allocator, &completed_events);
@@ -13985,6 +15941,7 @@ pub const AppState = struct {
                 self.markDirty();
                 self.setSidebarNotice("Provider reply stopped.");
                 self.flushDirtyNow();
+                self.consumeDaemonChatTurn(completed_daemon_turn_id);
             },
             else => {},
         }
@@ -14001,7 +15958,7 @@ pub const AppState = struct {
         if (next_status == .completed and !had_pending_followup) {
             self.maybeNotifyChatCompletion(project_index, thread_index, thread);
         }
-        return next_status != .idle or stream_changed;
+        return next_status != .idle or stream_changed or daemon_changed;
     }
 
     // Fires a desktop notification for a finished in-app chat turn, unless the
@@ -14075,13 +16032,22 @@ pub const AppState = struct {
         self.flushDirtyNow();
     }
 
-    fn issuePendingThreadStop(self: *AppState, project_path: []const u8, thread: *ChatThread) void {
+    fn issuePendingThreadStop(self: *AppState, project_index: ?usize, project_path: []const u8, thread: *ChatThread) void {
         var provider: Provider = undefined;
         var thread_id: ?[]u8 = null;
         var turn_id: ?[]u8 = null;
 
         const send_state = thread.send_state;
         if (!send_state.mutex.tryLock()) return;
+        if (send_state.status == .pending and send_state.daemon_owned and send_state.stop_requested and !send_state.stop_signal_sent) {
+            const daemon_turn_id = if (send_state.daemon_turn_id) |id| self.allocator.dupe(u8, id) catch null else null;
+            send_state.stop_signal_sent = daemon_turn_id != null;
+            send_state.mutex.unlock();
+            const owned_daemon_turn_id = daemon_turn_id orelse return;
+            defer self.allocator.free(owned_daemon_turn_id);
+            self.cancelDaemonChatTurn(owned_daemon_turn_id);
+            return;
+        }
         if (send_state.status == .pending and send_state.stop_requested and !send_state.stop_signal_sent) {
             provider = thread.provider;
             const pending_thread_id: ?[]const u8 = if (thread.provider_thread_id) |existing|
@@ -14113,7 +16079,12 @@ pub const AppState = struct {
         defer self.allocator.free(owned_thread_id);
         defer if (turn_id) |owned_turn_id| self.allocator.free(owned_turn_id);
 
-        self.interruptThreadViaHarness(project_path, provider, owned_thread_id, turn_id) catch |err| {
+        const execution_target = if (project_index) |index|
+            self.providerExecutionTargetForProjectThread(index, thread, 0) orelse return
+        else
+            ProviderExecutionTarget{ .local = project_path };
+
+        self.interruptThreadViaHarness(execution_target, provider, owned_thread_id, turn_id) catch |err| {
             log.warn("failed to interrupt provider turn: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to stop provider reply.");
             return;
@@ -14122,7 +16093,6 @@ pub const AppState = struct {
 
     fn issuePendingCodexSteer(
         self: *AppState,
-        project_path: []const u8,
         project_index: usize,
         thread_index: usize,
         thread: *ChatThread,
@@ -14186,7 +16156,9 @@ pub const AppState = struct {
         defer self.allocator.free(owned_turn_id);
         defer self.allocator.free(owned_prompt);
 
-        self.steerThreadViaHarness(project_path, owned_thread_id, owned_turn_id, owned_prompt) catch |err| {
+        const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+
+        self.steerThreadViaHarness(execution_target, owned_thread_id, owned_turn_id, owned_prompt) catch |err| {
             send_state.mutex.lock();
             defer send_state.mutex.unlock();
             if (send_state.pending_followup) |*pending_followup| {
@@ -14247,12 +16219,14 @@ pub const AppState = struct {
             return;
         }
 
+        const execution_target = self.providerExecutionTargetForProjectThread(project_index, thread, 0) orelse return;
+
         self.appendMessageToThread(thread, .user, "You", followup.prompt, null, &.{}) catch |err| {
             log.err("failed to append pending follow-up: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to append the pending follow-up.");
             return;
         };
-        self.beginSendForThread(self.projects.items[project_index].path, thread, followup.prompt) catch |err| {
+        self.beginSendForThread(project_index, thread, followup.prompt, execution_target) catch |err| {
             log.err("failed to start pending follow-up: {s}", .{@errorName(err)});
             self.setSidebarNotice("Failed to send the pending follow-up.");
             return;
@@ -14396,6 +16370,11 @@ pub const AppState = struct {
             send_state.mutex.unlock();
             return;
         }
+        if (send_state.daemon_owned) {
+            runtime_log.diagnostic("shutdown leaving daemon-owned send running provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
+            send_state.mutex.unlock();
+            return;
+        }
         send_state.stop_requested = true;
         send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
@@ -14403,7 +16382,7 @@ pub const AppState = struct {
         runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
         send_state.mutex.unlock();
 
-        self.issuePendingThreadStop(project_path, thread);
+        self.issuePendingThreadStop(null, project_path, thread);
     }
 
     pub fn hasPendingStream(self: *AppState) bool {
@@ -14457,11 +16436,33 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return;
         const send_state = self.currentThread().send_state;
         send_state.mutex.lock();
-        defer send_state.mutex.unlock();
-        if (send_state.pending_approval == null) return;
+        const daemon_turn_id = if (send_state.daemon_owned and send_state.daemon_turn_id != null)
+            self.allocator.dupe(u8, send_state.daemon_turn_id.?) catch null
+        else
+            null;
+        const call_id = if (send_state.pending_approval) |approval|
+            self.allocator.dupe(u8, approval.call_id) catch null
+        else
+            null;
+        if (send_state.pending_approval == null) {
+            send_state.mutex.unlock();
+            if (daemon_turn_id) |id| self.allocator.free(id);
+            if (call_id) |id| self.allocator.free(id);
+            return;
+        }
         send_state.approval_decision = decision;
         send_state.ui_revision +%= 1;
         send_state.condition.broadcast();
+        send_state.mutex.unlock();
+
+        if (daemon_turn_id) |turn_id| {
+            defer self.allocator.free(turn_id);
+            const approval_call_id = call_id orelse return;
+            defer self.allocator.free(approval_call_id);
+            self.approveDaemonChatTurn(turn_id, approval_call_id, decision);
+        } else if (call_id) |id| {
+            self.allocator.free(id);
+        }
     }
 
     fn applySendSuccess(self: *AppState, thread: *ChatThread, result: SendResultPayload, append_reply_text: bool) !void {
@@ -14772,6 +16773,43 @@ fn importThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
     };
 }
 
+fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
+    return switch (provider) {
+        .codex => switch (err) {
+            error.CodexRpcFailed => "Failed to import the selected Codex thread.",
+            error.ConnectionClosed => "Codex app-server connection closed.",
+            error.NotConnected => "Could not connect to Codex app-server.",
+            error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
+            error.FileNotFound => "The codex executable was not found on PATH.",
+            error.MissingSessionId => "The selected Codex thread could not be found.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to import the selected Codex thread.",
+        },
+        .opencode => switch (err) {
+            error.OpencodeRequestFailed => "Failed to import the selected OpenCode thread.",
+            error.OpencodeServerUnavailable => "OpenCode did not start.",
+            error.FileNotFound => "The opencode executable was not found on PATH.",
+            error.MissingSessionId => "The selected OpenCode thread could not be found.",
+            error.UnsupportedOperation => "This provider does not support thread imports.",
+            else => "Failed to import the selected OpenCode thread.",
+        },
+        .claude => switch (err) {
+            error.ClaudeRequestFailed => "Failed to import the selected Claude thread.",
+            error.FileNotFound => "The node executable was not found on PATH.",
+            error.MissingSessionId => "The selected Claude thread could not be found.",
+            error.UnsupportedOperation => "Claude thread imports are not supported by this SDK.",
+            else => "Failed to import the selected Claude thread.",
+        },
+        .cursor => switch (err) {
+            error.FileNotFound => "Cursor CLI `agent` was not found on PATH.",
+            error.CursorSignedOut => "Cursor is not authenticated. Run `agent login` or set CURSOR_API_KEY.",
+            error.MissingSessionId => "The selected Cursor thread could not be found.",
+            error.UnsupportedOperation => "Cursor CLI does not support thread imports in this version.",
+            else => "Failed to import the selected Cursor thread.",
+        },
+    };
+}
+
 fn opencodeModelCacheWorker(state: *OpencodeModelCacheState) void {
     const provider_config = ai_harness.ProviderConfig{
         .opencode = .{
@@ -14867,6 +16905,8 @@ fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorkerReq
     const page_alloc = std.heap.page_allocator;
     defer {
         page_alloc.free(request.project_path);
+        if (request.remote_ssh_host) |host| page_alloc.free(host);
+        if (request.remote_cwd) |cwd| page_alloc.free(cwd);
         if (request.thread_id) |thread_id| page_alloc.free(thread_id);
         page_alloc.free(request.raw_text);
         page_alloc.free(request.args);
@@ -14902,29 +16942,35 @@ fn runSlashCommandWorker(
     request: *const SlashCommandWorkerRequest,
 ) !ai_harness.RunSlashCommandResult {
     if (request.harness != .local_cli) return error.UnsupportedHarnessMode;
+    if (request.remote_ssh_host != null and request.provider != .codex) return error.UnsupportedRemoteProvider;
+    const request_cwd = request.remote_cwd orelse request.project_path;
 
     const provider_config = switch (request.provider) {
         .opencode => ai_harness.ProviderConfig{
             .opencode = .{
                 .allocator = allocator,
-                .working_directory = request.project_path,
+                .working_directory = request_cwd,
                 .launch_if_missing = true,
             },
         },
         .codex => ai_harness.ProviderConfig{
             .codex = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
                 .launch_on_connect = true,
+                .remote_ssh = if (request.remote_ssh_host) |host| .{
+                    .host = host,
+                    .cwd = request_cwd,
+                } else null,
             },
         },
         .claude => ai_harness.ProviderConfig{
             .claude = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
             },
         },
         .cursor => ai_harness.ProviderConfig{
             .cursor = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
             },
         },
     };
@@ -14934,7 +16980,7 @@ fn runSlashCommandWorker(
 
     return client.runSlashCommand(allocator, .{
         .thread_id = request.thread_id,
-        .cwd = request.project_path,
+        .cwd = request_cwd,
         .command = request.command,
         .raw_text = request.raw_text,
         .args = request.args,
@@ -14949,6 +16995,7 @@ fn formatSlashCommandError(allocator: std.mem.Allocator, provider: Provider, err
             error.NotConnected => "Could not connect to Codex app-server.",
             error.WebSocketUpgradeRejected => "Codex app-server rejected the connection.",
             error.FileNotFound => "The codex executable was not found on PATH.",
+            error.UnsupportedRemoteProvider => "Remote Herdr slash commands currently support Codex only.",
             error.UnsupportedOperation => "Codex does not support this slash command yet.",
             else => "Codex slash command failed.",
         },
@@ -15184,4 +17231,48 @@ fn unixTimestampMs() i64 {
     if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
         @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+fn ensureJsonRpcOk(allocator: std.mem.Allocator, response: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    _ = try jsonRpcResult(parsed.value);
+}
+
+fn jsonRpcResult(value: std.json.Value) !std.json.Value {
+    if (value != .object) return error.InvalidDaemonResponse;
+    if (value.object.get("error")) |_| return error.DaemonRequestFailed;
+    return value.object.get("result") orelse return error.InvalidDaemonResponse;
+}
+
+fn jsonValueString(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonValueU64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |int| if (int >= 0) @intCast(int) else null,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch null,
+        else => null,
+    };
+}
+
+fn replacePageOwned(slot: *?[]u8, value: []const u8) !void {
+    if (slot.*) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    const next = try std.heap.page_allocator.dupe(u8, value);
+    if (slot.*) |existing| std.heap.page_allocator.free(existing);
+    slot.* = next;
+}
+
+fn daemonPayloadStringAlloc(payload_json: []const u8, field: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = jsonValueString(parsed.value.object.get(field) orelse .null) orelse return null;
+    return std.heap.page_allocator.dupe(u8, value) catch null;
 }

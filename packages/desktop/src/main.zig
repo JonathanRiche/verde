@@ -424,6 +424,12 @@ fn mainInner(init: std.process.Init) !void {
     state.openBrowserOnLaunchIfRequested();
     state.restorePersistedBrowserPaneOnLaunch();
     state.applyInitialWorkspaceFocusOnLaunch();
+    if (state.consumePendingHerdrOpenRequest() catch |err| blk: {
+        log.warn("failed to consume pending Herdr open request: {s}", .{@errorName(err)});
+        break :blk false;
+    }) {
+        log.info("consumed pending Herdr open request", .{});
+    }
     state.startOpencodeModelOptionsRefresh();
     state.startCursorModelOptionsRefresh();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
@@ -1390,6 +1396,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             state.notePaletteWorkspaceMouseMotion(event.motion.x, event.motion.y);
             ui_layout.updateThreadImportModalHover(state, event.motion.x, event.motion.y);
+            ui_layout.updateHerdrProfilePickerHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);

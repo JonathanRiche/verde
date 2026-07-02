@@ -46,6 +46,7 @@ pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32
     registerWorkspaceAddModalHits(state, width, height);
     registerWorkspaceRenameModalHits(state, width, height);
     registerThreadImportModalHits(state, width, height);
+    registerHerdrProfilePickerHits(state, width, height);
     settings_modal.registerHits(state, width, height, queueModalHit);
     command_palette.registerHits(state, width, height, queueModalHit);
 }
@@ -89,6 +90,35 @@ pub fn updateThreadImportModalHover(state: *runtime.AppState, x: f32, y: f32) vo
     state.markDirty();
 }
 
+/// Updates Herdr profile-picker row hover using hits from `refreshPaletteModalHits`.
+pub fn updateHerdrProfilePickerHover(state: *runtime.AppState, x: f32, y: f32) void {
+    if (state.herdr_profile_picker_project_index == null) {
+        if (state.herdr_profile_hover_index != null) {
+            state.herdr_profile_hover_index = null;
+            state.markDirty();
+        }
+        return;
+    }
+
+    var new_hover: ?usize = null;
+    var i = state.palette_modal_hits.items.len;
+    while (i > 0) {
+        i -= 1;
+        const hit = state.palette_modal_hits.items[i];
+        if (hit.action != .herdr_profile_select) continue;
+        if (!rectContainsModalPoint(hit.rect, x, y)) continue;
+        new_hover = hit.index;
+        break;
+    }
+    if (new_hover) |hi| {
+        if (hi >= state.herdr_profile_summaries.items.len) new_hover = null;
+    }
+
+    if (state.herdr_profile_hover_index == new_hover) return;
+    state.herdr_profile_hover_index = new_hover;
+    state.markDirty();
+}
+
 fn rectContainsModalPoint(rect: palette.Rect, x: f32, y: f32) bool {
     return x >= rect.x and y >= rect.y and x <= rect.x + rect.w and y <= rect.y + rect.h;
 }
@@ -117,6 +147,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceAddModal(state, width, height);
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
+    renderHerdrProfilePickerModal(state, width, height);
     settings_modal.render(state, width, height);
     command_palette.render(state, width, height);
     debug_window.render(state, width, height);
@@ -234,9 +265,9 @@ fn drawActionButton(state: *runtime.AppState, rect: palette.Rect, label: []const
 
 fn drawModalChromeVisual(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {
     const scrim: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = width, .h = height };
-    queuePaletteRoundedRect(state, scrim, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.46 }, 0.0);
-    queuePaletteRoundedRect(state, modal, paletteColor(theme.withAlpha(theme.COLOR_PANEL_ALT, 248)), theme.scaledUi(16.0));
-    queuePaletteBorder(state, modal, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(16.0), theme.scaledUi(1.0));
+    queuePaletteRoundedRect(state, scrim, .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.68 }, 0.0);
+    queuePaletteRoundedRect(state, modal, paletteColor(theme.COLOR_PANEL), theme.scaledUi(12.0));
+    queuePaletteBorder(state, modal, paletteColor(theme.withAlpha(theme.borderMuted(), 110)), theme.scaledUi(12.0), theme.scaledUi(1.0));
 }
 
 fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect, dismissible: bool) void {
@@ -247,7 +278,7 @@ fn registerModalChromeHits(state: *runtime.AppState, width: f32, height: f32, mo
 
 fn drawTextField(state: *runtime.AppState, rect: palette.Rect, value: []const u8, hint: []const u8, focused: bool, cursor: usize) void {
     const border = if (focused) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_MUTED;
-    queuePaletteRoundedRect(state, rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(7.0));
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(7.0));
     queuePaletteBorder(state, rect, paletteColor(border), theme.scaledUi(7.0), theme.scaledUi(1.0));
     const text = if (value.len > 0) value else hint;
     const color = if (value.len > 0) theme.COLOR_WHITE else theme.COLOR_TEXT_SUBTLE;
@@ -455,6 +486,10 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             .thread_import_cancel => state.cancelThreadImport(),
             .thread_import_submit => state.importSelectedThread(),
             .thread_import_select => state.selectThreadImport(hit.index),
+            .herdr_profile_refresh => state.refreshHerdrProfileList(),
+            .herdr_profile_cancel => state.cancelHerdrProfilePicker(),
+            .herdr_profile_submit => state.handoffProjectToSelectedHerdrProfile(),
+            .herdr_profile_select => state.selectHerdrProfile(hit.index),
             .project_import_browse => unreachable,
             .project_import_submit => {
                 state.importProjectFromInput() catch |err| {
@@ -550,7 +585,15 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 }
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
-    if (state.modal_image_path == null and state.rename_project_index == null and state.transcriptSelectionBuffer() == null and state.thread_import_provider == null and !state.show_project_creator and !state.show_settings_modal and !state.command_palette_open) return false;
+    const has_modal_open = state.modal_image_path != null or
+        state.rename_project_index != null or
+        state.transcriptSelectionBuffer() != null or
+        state.thread_import_provider != null or
+        state.herdr_profile_picker_project_index != null or
+        state.show_project_creator or
+        state.show_settings_modal or
+        state.command_palette_open;
+    if (!has_modal_open) return false;
     // Palette-owned navigation/activation keys; editing keys fall through to
     // the shared modal text path below.
     if (state.command_palette_open and command_palette.handleKeyDown(state, event)) return true;
@@ -575,6 +618,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
                     runtime.log.warn("workspace import failed: {s}", .{@errorName(err)});
                     state.setSidebarNotice("Could not add that directory path.");
                 };
+                return true;
+            }
+            if (state.herdr_profile_picker_project_index != null) {
+                state.handoffProjectToSelectedHerdrProfile();
                 return true;
             }
             return false;
@@ -665,6 +712,8 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.cancelProjectRename();
     } else if (state.thread_import_provider != null) {
         state.cancelThreadImport();
+    } else if (state.herdr_profile_picker_project_index != null) {
+        state.cancelHerdrProfilePicker();
     } else if (state.show_settings_modal) {
         state.cancelSettingsModal();
     }
@@ -857,6 +906,39 @@ fn registerThreadImportModalHits(state: *runtime.AppState, width: f32, height: f
     queueModalHit(state, submit_rect, .thread_import_submit, 0);
 }
 
+fn registerHerdrProfilePickerHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (state.herdr_profile_picker_project_index == null) return;
+    const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
+    const modal_h = theme.clampf(height * 0.58, theme.scaledUi(360.0), theme.scaledUi(540.0));
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    registerModalChromeHits(state, width, height, modal, true);
+    const pad = theme.scaledUi(18.0);
+    var y = modal.y + pad;
+    y += theme.scaledUi(28.0);
+    y += theme.scaledUi(42.0);
+    const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), (modal.w - pad * 2.0) * 0.28), .h = theme.scaledUi(32.0) };
+    queueModalHit(state, refresh_rect, .herdr_profile_refresh, 0);
+    y += theme.scaledUi(42.0);
+    const button_h = theme.scaledUi(34.0);
+    const notice_h = if (state.herdrProfileNotice().len > 0) theme.scaledUi(24.0) else 0.0;
+    const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
+    if (state.herdr_profile_summaries.items.len != 0) {
+        const row_h = theme.scaledUi(50.0);
+        for (state.herdr_profile_summaries.items, 0..) |_, index| {
+            const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
+            if (row.y + row.h > list_rect.y + list_rect.h) break;
+            queueModalHit(state, row, .herdr_profile_select, index);
+        }
+    }
+    const button_y = modal.y + modal.h - pad - button_h;
+    const gap = theme.scaledUi(10.0);
+    const button_w = (modal.w - pad * 2.0 - gap) * 0.5;
+    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
+    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
+    queueModalHit(state, cancel_rect, .herdr_profile_cancel, 0);
+    queueModalHit(state, submit_rect, .herdr_profile_submit, 0);
+}
+
 /// Shows the attachment preview modal for the selected image.
 fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const modal_path = state.modal_image_path orelse return;
@@ -1004,12 +1086,12 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     drawTextField(state, input_rect, state.threadImportThreadId(), threadImportHint(provider), state.palette_modal_text_focus == .thread_import, state.thread_import_cursor);
     y += theme.scaledUi(44.0);
     const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), input_rect.w * 0.28), .h = theme.scaledUi(32.0) };
-    drawActionButton(state, refresh_rect, "Refresh list", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, refresh_rect, "Refresh list", theme.COLOR_PANEL_MUTED);
     y += theme.scaledUi(42.0);
     const notice_h = if (state.threadImportNotice().len > 0) theme.scaledUi(24.0) else 0.0;
     const button_h = theme.scaledUi(34.0);
     const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = input_rect.w, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
-    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
+    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
     queuePaletteBorder(state, list_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
     if (state.thread_import_threads.items.len == 0) {
         queuePaletteText(state, .{ .x = list_rect.x + theme.scaledUi(12.0), .y = list_rect.y + theme.scaledUi(12.0), .w = list_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, emptyThreadImportListNotice(provider), paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), list_rect);
@@ -1027,7 +1109,7 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
                     paletteColor(theme.COLOR_PANEL_MUTED);
                 queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
             } else if (row_hovered) {
-                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.14)), theme.scaledUi(6.0));
+                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
                 queuePaletteBorder(state, row, paletteColor(theme.lighten(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
             }
             const title_col = paletteColor(theme.COLOR_WHITE);
@@ -1045,8 +1127,74 @@ fn renderThreadImportModal(state: *runtime.AppState, width: f32, height: f32) vo
     const button_w = (input_rect.w - gap) * 0.5;
     const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
     const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
-    drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_ALT);
-    drawActionButton(state, submit_rect, "Import", theme.COLOR_SECONDARY_GREEN);
+    drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_MUTED);
+    drawActionButton(state, submit_rect, "Import", theme.COLOR_GREEN);
+}
+
+/// Shows the modal used to choose a saved Herdr remote profile for workspace handoff.
+fn renderHerdrProfilePickerModal(state: *runtime.AppState, width: f32, height: f32) void {
+    const project_index = state.herdr_profile_picker_project_index orelse return;
+    if (project_index >= state.projects.items.len) {
+        state.cancelHerdrProfilePicker();
+        return;
+    }
+    const modal_w = theme.clampf(width * 0.42, theme.scaledUi(460.0), theme.scaledUi(640.0));
+    const modal_h = theme.clampf(height * 0.58, theme.scaledUi(360.0), theme.scaledUi(540.0));
+    const modal: palette.Rect = .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = theme.scaledUi(18.0);
+    var y = modal.y + pad;
+    const project = &state.projects.items[project_index];
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Handoff to remote Herdr", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
+    y += theme.scaledUi(28.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(38.0) }, project.path, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    y += theme.scaledUi(42.0);
+    const refresh_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = @max(theme.scaledUi(112.0), (modal.w - pad * 2.0) * 0.28), .h = theme.scaledUi(32.0) };
+    drawActionButton(state, refresh_rect, "Refresh profiles", theme.COLOR_PANEL_MUTED);
+    y += theme.scaledUi(42.0);
+
+    const button_h = theme.scaledUi(34.0);
+    const notice = state.herdrProfileNotice();
+    const notice_h = if (notice.len > 0) theme.scaledUi(24.0) else 0.0;
+    const list_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = modal.y + modal.h - pad - button_h - notice_h - theme.scaledUi(16.0) - y };
+    queuePaletteRoundedRect(state, list_rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.03)), theme.scaledUi(8.0));
+    queuePaletteBorder(state, list_rect, paletteColor(theme.COLOR_PANEL_MUTED), theme.scaledUi(8.0), theme.scaledUi(1.0));
+    if (state.herdr_profile_summaries.items.len == 0) {
+        queuePaletteText(state, .{ .x = list_rect.x + theme.scaledUi(12.0), .y = list_rect.y + theme.scaledUi(12.0), .w = list_rect.w - theme.scaledUi(24.0), .h = theme.scaledUi(20.0) }, "No profiles found. Add one with `verde herdr profiles add`.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), list_rect);
+    } else {
+        const row_h = theme.scaledUi(50.0);
+        for (state.herdr_profile_summaries.items, 0..) |profile, index| {
+            const row: palette.Rect = .{ .x = list_rect.x + theme.scaledUi(6.0), .y = list_rect.y + theme.scaledUi(6.0) + @as(f32, @floatFromInt(index)) * row_h, .w = list_rect.w - theme.scaledUi(12.0), .h = row_h - theme.scaledUi(2.0) };
+            if (row.y + row.h > list_rect.y + list_rect.h) break;
+            const selected = state.herdr_profile_selected_index != null and state.herdr_profile_selected_index.? == index;
+            const row_hovered = state.herdr_profile_hover_index != null and state.herdr_profile_hover_index.? == index;
+            if (selected) {
+                const sel_bg = if (row_hovered)
+                    paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10))
+                else
+                    paletteColor(theme.COLOR_PANEL_MUTED);
+                queuePaletteRoundedRect(state, row, sel_bg, theme.scaledUi(6.0));
+            } else if (row_hovered) {
+                queuePaletteRoundedRect(state, row, paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)), theme.scaledUi(6.0));
+                queuePaletteBorder(state, row, paletteColor(theme.lighten(theme.borderMuted(), 0.02)), theme.scaledUi(6.0), theme.scaledUi(1.0));
+            }
+            const cwd_label = profile.remote_cwd orelse "default Verde remote workspace dir";
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(5.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(18.0) }, profile.name, paletteColor(theme.COLOR_WHITE), theme.scaledUi(13.0), list_rect);
+            queuePaletteText(state, .{ .x = row.x + theme.scaledUi(8.0), .y = row.y + theme.scaledUi(24.0), .w = row.w - theme.scaledUi(16.0), .h = theme.scaledUi(16.0) }, profile.ssh_target, paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(12.0), list_rect);
+            queuePaletteText(state, .{ .x = row.x + row.w * 0.56, .y = row.y + theme.scaledUi(24.0), .w = row.w * 0.42, .h = theme.scaledUi(16.0) }, cwd_label, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), list_rect);
+        }
+    }
+
+    const button_y = modal.y + modal.h - pad - button_h;
+    if (notice.len > 0) {
+        queuePaletteText(state, .{ .x = modal.x + pad, .y = button_y - theme.scaledUi(26.0), .w = modal.w - pad * 2.0, .h = theme.scaledUi(20.0) }, notice, paletteColor(theme.COLOR_YELLOW), theme.scaledUi(13.0), modal);
+    }
+    const gap = theme.scaledUi(10.0);
+    const button_w = (modal.w - pad * 2.0 - gap) * 0.5;
+    const cancel_rect: palette.Rect = .{ .x = modal.x + pad, .y = button_y, .w = button_w, .h = button_h };
+    const submit_rect: palette.Rect = .{ .x = cancel_rect.x + button_w + gap, .y = button_y, .w = button_w, .h = button_h };
+    drawActionButton(state, cancel_rect, "Cancel", theme.COLOR_PANEL_MUTED);
+    drawActionButton(state, submit_rect, "Handoff", theme.COLOR_GREEN);
 }
 
 fn threadImportHeading(provider: runtime.Provider) []const u8 {

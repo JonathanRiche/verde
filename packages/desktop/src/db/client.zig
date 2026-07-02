@@ -8,6 +8,7 @@ const schema = @import("schema.zig");
 const db_types = @import("types.zig");
 
 const LoadedState = db_types.LoadedState;
+const PersistedHerdrWorkspaceLink = db_types.PersistedHerdrWorkspaceLink;
 const PersistedImageAttachment = db_types.PersistedImageAttachment;
 const PersistedMessage = db_types.PersistedMessage;
 const PersistedProject = db_types.PersistedProject;
@@ -70,7 +71,8 @@ pub const Client = struct {
         defer workspaces.deinit(arena);
 
         var workspace_rows = try self.conn.rows(
-            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index " ++
+            "select id, workspace_id, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, " ++
+                "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms " ++
                 "from workspaces order by sort_index",
             .{},
         );
@@ -91,6 +93,19 @@ pub const Client = struct {
                 .terminal_docks_json = try dupeOptionalText(arena, workspace_row.nullableText(10)),
                 .workspace_layout_json = try dupeOptionalText(arena, workspace_row.nullableText(11)),
                 .selected_thread_index = @intCast(workspace_row.int(12)),
+                .herdr_link = try loadOptionalHerdrLink(
+                    arena,
+                    workspace_row.nullableText(13),
+                    workspace_row.nullableText(14),
+                    workspace_row.nullableText(15),
+                    workspace_row.nullableText(16),
+                    workspace_row.nullableText(17),
+                    workspace_row.nullableText(18),
+                    workspace_row.nullableInt(19),
+                    workspace_row.nullableInt(20),
+                    workspace_row.nullableText(21),
+                    workspace_row.nullableInt(22),
+                ),
                 .threads = try self.loadThreads(arena, workspace_id),
             });
         }
@@ -120,9 +135,11 @@ pub const Client = struct {
         );
 
         for (state.projects, 0..) |project, project_index| {
+            const herdr_link = project.herdr_link;
             try self.conn.exec(
-                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "insert into workspaces (workspace_id, sort_index, label, path, archived, unread_count, collapsed, thread_list_expanded, terminal_height, terminal_layout_json, terminal_docks_json, workspace_layout_json, selected_thread_index, " ++
+                    "herdr_remote_alias, herdr_session_name, herdr_workspace_id, herdr_local_dir, herdr_remote_cwd, herdr_last_pane_id, herdr_attach_dock_id, herdr_attach_pane_id, herdr_pane_links_json, herdr_updated_at_ms) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 .{
                     project.id orelse project.path,
                     @as(i64, @intCast(project_index)),
@@ -137,6 +154,16 @@ pub const Client = struct {
                     project.terminal_docks_json,
                     project.workspace_layout_json,
                     @as(i64, @intCast(project.selected_thread_index)),
+                    if (herdr_link) |link| link.remote_alias else null,
+                    if (herdr_link) |link| link.session_name else null,
+                    if (herdr_link) |link| link.workspace_id else null,
+                    if (herdr_link) |link| link.local_dir else null,
+                    if (herdr_link) |link| link.remote_cwd else null,
+                    if (herdr_link) |link| link.last_pane_id else null,
+                    if (herdr_link) |link| if (link.attach_dock_id) |dock_id| @as(i64, @intCast(dock_id)) else null else null,
+                    if (herdr_link) |link| if (link.attach_pane_id) |pane_id| @as(i64, @intCast(pane_id)) else null else null,
+                    if (herdr_link) |link| link.pane_links_json else null,
+                    if (herdr_link) |link| link.updated_at_ms else null,
                 },
             );
             const workspace_row_id = self.conn.lastInsertedRowId();
@@ -151,7 +178,7 @@ pub const Client = struct {
         defer threads.deinit(allocator);
 
         var thread_rows = try self.conn.rows(
-            "select id, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
+            "select id, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size " ++
                 "from threads where workspace_id = ?1 order by sort_index",
             .{project_id},
         );
@@ -163,22 +190,23 @@ pub const Client = struct {
                 .title = try allocator.dupe(u8, thread_row.text(1)),
                 .archived = thread_row.int(2) != 0,
                 .committed = thread_row.int(3) != 0,
-                .last_activity_at = thread_row.nullableInt(4),
-                .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(5)),
-                .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(6)),
-                .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(7)),
-                .reasoning_variant = try dupeOptionalText(allocator, thread_row.nullableText(8)),
-                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(9)),
-                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(10)),
-                .provider = decodeEnumOr(db_types.Provider, thread_row.int(11), .opencode),
-                .harness = decodeEnumOr(db_types.Harness, thread_row.int(12), .local_cli),
-                .tui_dock_id = if (thread_row.nullableInt(13)) |value| @intCast(value) else null,
-                .draft = try allocator.dupe(u8, thread_row.text(14)),
+                .local_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(4)),
+                .last_activity_at = thread_row.nullableInt(5),
+                .provider_thread_id = try dupeOptionalText(allocator, thread_row.nullableText(6)),
+                .model_ref = try dupeOptionalText(allocator, thread_row.nullableText(7)),
+                .reasoning_effort = decodeOptionalEnum(db_types.ReasoningEffort, thread_row.nullableInt(8)),
+                .reasoning_variant = try dupeOptionalText(allocator, thread_row.nullableText(9)),
+                .fast_mode = decodeOptionalEnum(db_types.FastMode, thread_row.nullableInt(10)),
+                .access_mode = decodeOptionalEnum(db_types.AccessMode, thread_row.nullableInt(11)),
+                .provider = decodeEnumOr(db_types.Provider, thread_row.int(12), .opencode),
+                .harness = decodeEnumOr(db_types.Harness, thread_row.int(13), .local_cli),
+                .tui_dock_id = if (thread_row.nullableInt(14)) |value| @intCast(value) else null,
+                .draft = try allocator.dupe(u8, thread_row.text(15)),
                 .draft_image = try loadOptionalImage(
                     allocator,
-                    thread_row.nullableText(15),
                     thread_row.nullableText(16),
-                    thread_row.nullableInt(17),
+                    thread_row.nullableText(17),
+                    thread_row.nullableInt(18),
                 ),
                 .messages = try self.loadMessages(allocator, thread_id),
             });
@@ -253,14 +281,15 @@ pub const Client = struct {
         for (threads, 0..) |thread, thread_index| {
             const draft_image = thread.draft_image;
             try self.conn.exec(
-                "insert into threads (workspace_id, sort_index, title, archived, committed, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
-                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "insert into threads (workspace_id, sort_index, title, archived, committed, local_thread_id, last_activity_at, provider_thread_id, model_ref, reasoning_effort, reasoning_variant, fast_mode, access_mode, provider, harness, tui_dock_id, draft, draft_image_path, draft_image_mime, draft_image_byte_size) " ++
+                    "values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 .{
                     project_id,
                     @as(i64, @intCast(thread_index)),
                     thread.title,
                     boolToInt(thread.archived),
                     boolToInt(thread.committed),
+                    thread.local_thread_id,
                     thread.last_activity_at,
                     thread.provider_thread_id,
                     thread.model_ref,
@@ -315,6 +344,36 @@ fn loadOptionalImage(
         .path = try allocator.dupe(u8, image_path),
         .mime = try allocator.dupe(u8, image_mime),
         .byte_size = @intCast(byte_size orelse 0),
+    };
+}
+
+fn loadOptionalHerdrLink(
+    allocator: std.mem.Allocator,
+    remote_alias: ?[]const u8,
+    session_name: ?[]const u8,
+    workspace_id: ?[]const u8,
+    local_dir: ?[]const u8,
+    remote_cwd: ?[]const u8,
+    last_pane_id: ?[]const u8,
+    attach_dock_id: ?i64,
+    attach_pane_id: ?i64,
+    pane_links_json: ?[]const u8,
+    updated_at_ms: ?i64,
+) !?PersistedHerdrWorkspaceLink {
+    const session = session_name orelse return null;
+    const workspace = workspace_id orelse return null;
+    const local = local_dir orelse return null;
+    return .{
+        .remote_alias = try allocator.dupe(u8, remote_alias orelse ""),
+        .session_name = try allocator.dupe(u8, session),
+        .workspace_id = try allocator.dupe(u8, workspace),
+        .local_dir = try allocator.dupe(u8, local),
+        .remote_cwd = try dupeOptionalText(allocator, remote_cwd),
+        .last_pane_id = try dupeOptionalText(allocator, last_pane_id),
+        .attach_dock_id = if (attach_dock_id) |value| @intCast(value) else null,
+        .attach_pane_id = if (attach_pane_id) |value| @intCast(value) else null,
+        .pane_links_json = try dupeOptionalText(allocator, pane_links_json),
+        .updated_at_ms = updated_at_ms orelse 0,
     };
 }
 
@@ -516,4 +575,58 @@ test "save and load preserve archived projects and threads" {
     try testing.expect(loaded.?.value.projects[1].archived);
     try testing.expectEqual(@as(usize, 1), loaded.?.value.projects[1].threads.?.len);
     try testing.expect(loaded.?.value.projects[1].threads.?[0].archived);
+}
+
+test "save and load preserve Herdr workspace links" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(pref_path);
+
+    var client = try Client.init(testing.allocator, pref_path);
+    defer client.deinit();
+
+    const state = PersistedState{
+        .selected_project_index = 0,
+        .projects = &.{.{
+            .id = "project-herdr",
+            .label = "Herdr Workspace",
+            .path = "/tmp/herdr-shadow",
+            .herdr_link = .{
+                .remote_alias = "zod.tailc28f01.ts.net",
+                .session_name = "default",
+                .workspace_id = "w1",
+                .local_dir = "/tmp/herdr-shadow",
+                .remote_cwd = "/home/rtg/project",
+                .last_pane_id = "w1:p1",
+                .attach_dock_id = 7,
+                .attach_pane_id = 3,
+                .pane_links_json = "[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]",
+                .updated_at_ms = 1234,
+            },
+            .threads = &.{.{
+                .title = "New thread",
+                .committed = false,
+                .draft = "",
+            }},
+        }},
+    };
+    try client.save(state);
+
+    const loaded = try client.load(testing.allocator);
+    defer if (loaded) |*value| value.deinit();
+
+    try testing.expect(loaded != null);
+    const link = loaded.?.value.projects[0].herdr_link orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings("zod.tailc28f01.ts.net", link.remote_alias);
+    try testing.expectEqualStrings("default", link.session_name);
+    try testing.expectEqualStrings("w1", link.workspace_id);
+    try testing.expectEqualStrings("/tmp/herdr-shadow", link.local_dir);
+    try testing.expectEqualStrings("/home/rtg/project", link.remote_cwd.?);
+    try testing.expectEqualStrings("w1:p1", link.last_pane_id.?);
+    try testing.expectEqual(@as(?u32, 7), link.attach_dock_id);
+    try testing.expectEqual(@as(?u32, 3), link.attach_pane_id);
+    try testing.expectEqualStrings("[{\"verde_pane_id\":3,\"herdr_pane_id\":\"w1:p1\",\"provider\":\"codex\",\"presentation\":\"gui_chat\"}]", link.pane_links_json.?);
+    try testing.expectEqual(@as(i64, 1234), link.updated_at_ms);
 }

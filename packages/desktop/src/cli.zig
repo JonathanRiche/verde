@@ -4,6 +4,8 @@ const builtin = @import("builtin");
 const args = @import("cli_args.zig");
 const completion = @import("cli_completion.zig");
 const output = @import("cli_output.zig");
+const herdr = @import("herdr.zig");
+const process_env = @import("process_env.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
@@ -12,6 +14,7 @@ const sessionizer = @import("terminal/sessionizer.zig");
 
 const VERSION = "0.0.0";
 const SOCKET_NAME = "verde.sock";
+const LIVE_RESPONSE_TIMEOUT_MS: i64 = 5000;
 const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x40087468)),
     else => @intCast(std.c.T.IOCGWINSZ),
@@ -55,6 +58,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
     }
     if (std.mem.eql(u8, parsed.command, "open")) {
         try handleOpen(allocator, out, io, parsed.rest, parsed.json);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "herdr")) {
+        try handleHerdr(allocator, out, io, argv[0], parsed.rest);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "completion")) {
@@ -106,6 +113,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde version [--json]        Print version metadata
         \\  verde capabilities [--json]   Print CLI capability metadata
         \\  verde open <url>              Open a URL in this Verde workspace's browser pane
+        \\  verde herdr <command>         Open or inspect Herdr-backed Verde workspaces
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
         \\  verde notify [options]        Update the current terminal surface
@@ -120,6 +128,12 @@ fn printHelp(out: output.Output) !void {
         \\  panes --workspace <id|index|current> [--json]
         \\  threads --workspace <id|index|current> [--json]
         \\  transcript --workspace <id|index|current> --thread <index|provider-id> [--json]
+        \\
+        \\Herdr commands:
+        \\  open --herdr-workspace <id> [--session <name>] [--profile <name>|--remote <ssh-alias>] [--cwd <path>] [--remote-cwd <path>] [--local-dir <path>] [--pane <herdr-pane-id>] [--json]
+        \\  handoff [--workspace <id|index|path|current>] [--all] [--session <name>] [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--dry-run] [--json]
+        \\  unlink [--workspace <id|index|path|current>] [--all] [--json]
+        \\  status [--json]
         \\
         \\Integration commands:
         \\  list [--json]
@@ -185,6 +199,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         .protocol_version = 2,
         .cli = .{
             .state = spec.state_commands[0..],
+            .herdr = spec.herdr_commands[0..],
             .integrations = spec.integration_commands[0..],
             .session = spec.session_commands[0..],
             .live = spec.live_capabilities[0..],
@@ -206,6 +221,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\verde CLI capabilities
         \\  protocol: 1
         \\  state: path, workspaces, panes, threads, transcript
+        \\  herdr: open, handoff, unlink, profiles, status
         \\  integrations: list, doctor, install, remove, disable
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
         \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
@@ -300,6 +316,598 @@ fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const [
         try out.stderr("unknown state command: {s}\n", .{command});
         std.process.exit(2);
     }
+}
+
+fn handleHerdr(allocator: std.mem.Allocator, out: output.Output, io: std.Io, exe_path: []const u8, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try printHerdrHelp(out);
+        return;
+    }
+    const command = args.positional(argv, 0) orelse {
+        try out.stderr("missing herdr command\n", .{});
+        std.process.exit(2);
+    };
+    const json = args.hasFlag(argv, "--json");
+    if (std.mem.eql(u8, command, "help")) {
+        try printHerdrHelp(out);
+        return;
+    }
+    if (std.mem.eql(u8, command, "open")) {
+        try handleHerdrOpen(allocator, out, io, exe_path, argv, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "handoff")) {
+        try handleHerdrHandoff(allocator, out, io, argv, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "unlink")) {
+        try handleHerdrUnlink(allocator, out, io, argv, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "profiles")) {
+        try handleHerdrProfiles(allocator, out, io, argv, json);
+        return;
+    }
+    if (std.mem.eql(u8, command, "status")) {
+        try handleHerdrStatus(allocator, out, io, json);
+        return;
+    }
+    try out.stderr("unknown herdr command: {s}\n", .{command});
+    std.process.exit(2);
+}
+
+fn printHerdrHelp(out: output.Output) !void {
+    try out.stdout(
+        \\Usage:
+        \\  verde herdr open --herdr-workspace <id> [--session <name>] [--profile <name>|--remote <ssh-alias>] [--cwd <path>] [--remote-cwd <path>] [--local-dir <path>] [--pane <herdr-pane-id>] [--json]
+        \\  verde herdr handoff [--workspace <id|index|path|current>] [--all] [--session <name>] [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--dry-run] [--json]
+        \\  verde herdr unlink [--workspace <id|index|path|current>] [--all] [--json]
+        \\  verde herdr profiles <list|add|remove|test> [options]
+        \\  verde herdr status [--json]
+        \\
+        \\Open creates or focuses a Verde workspace linked to the Herdr target.
+        \\If Verde is not running, the request is queued and the app is launched.
+        \\Handoff mirrors Verde workspaces into Herdr for terminal/TUI takeover.
+        \\Unlink removes Verde's Herdr runtime mapping without deleting the Herdr workspace.
+        \\Profiles store SSH aliases/session defaults only; credentials stay in SSH config.
+        \\
+    , .{});
+}
+
+fn handleHerdrOpen(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    io: std.Io,
+    exe_path: []const u8,
+    argv: []const []const u8,
+    json: bool,
+) !void {
+    var cwd_owned: ?[]u8 = null;
+    defer if (cwd_owned) |cwd| allocator.free(cwd);
+    var profile_defaults: HerdrProfileDefaults = .{};
+    defer profile_defaults.deinit(allocator);
+    const request = try parseHerdrOpenRequest(allocator, out, io, argv, &cwd_owned, &profile_defaults);
+
+    if (sendLiveRequestAlloc(allocator, io, "herdr.open", request, 1)) |response| {
+        defer allocator.free(response);
+        if (liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
+            // A stale running app can own the socket while the just-built CLI knows
+            // about Herdr. Queue the cold-start request instead of dead-ending.
+        } else {
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
+    } else |_| {}
+
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    try herdr.writePendingOpen(allocator, io, pref_path, request);
+    try launchVerdeAppDetached(allocator, exe_path);
+
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .id = 1,
+            .ok = true,
+            .result = .{
+                .queued = true,
+                .launched = true,
+                .session = request.session,
+                .herdr_workspace = request.herdr_workspace,
+                .remote = herdr.remoteAlias(request),
+                .pane = request.pane,
+            },
+        });
+    } else {
+        try out.stdout("Queued Herdr workspace {s}/{s} and launched Verde.\n", .{ request.session, request.herdr_workspace });
+    }
+}
+
+fn handleHerdrHandoff(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    var profile_defaults: HerdrProfileDefaults = .{};
+    defer profile_defaults.deinit(allocator);
+    const request = try parseHerdrHandoffRequest(allocator, out, io, argv, &profile_defaults);
+    herdr.validateHandoffRequest(request) catch |err| {
+        try out.stderr("invalid herdr handoff request: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    if (sendLiveRequestAlloc(allocator, io, "herdr.handoff", request, 1)) |response| {
+        defer allocator.free(response);
+        if (liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
+            try out.stderr("running Verde app does not support herdr handoff; rebuild/restart Verde\n", .{});
+            std.process.exit(1);
+        }
+        try out.stdout("{s}\n", .{response});
+        _ = json;
+        return;
+    } else |err| {
+        try out.stderr("verde herdr handoff requires the Verde app to be running ({s})\n", .{@errorName(err)});
+        std.process.exit(3);
+    }
+}
+
+fn parseHerdrHandoffRequest(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    io: std.Io,
+    argv: []const []const u8,
+    profile_defaults: *HerdrProfileDefaults,
+) !herdr.HandoffRequest {
+    try resolveHerdrProfileDefaults(allocator, out, io, argv, profile_defaults);
+    return .{
+        .session = args.optionValue(argv, "--session") orelse profile_defaults.session orelse "default",
+        .remote = args.optionValue(argv, "--remote") orelse profile_defaults.remote,
+        .remote_cwd = args.optionValue(argv, "--remote-cwd") orelse profile_defaults.remote_cwd,
+        .workspace = workspaceOption(argv),
+        .all = args.hasFlag(argv, "--all") or workspaceOption(argv) == null,
+        .dry_run = args.hasFlag(argv, "--dry-run"),
+    };
+}
+
+fn handleHerdrUnlink(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const request = parseHerdrUnlinkRequest(argv);
+    herdr.validateUnlinkRequest(request) catch |err| {
+        try out.stderr("invalid herdr unlink request: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    if (sendLiveRequestAlloc(allocator, io, "herdr.unlink", request, 1)) |response| {
+        defer allocator.free(response);
+        if (liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
+            try out.stderr("running Verde app does not support herdr unlink; rebuild/restart Verde\n", .{});
+            std.process.exit(1);
+        }
+        try out.stdout("{s}\n", .{response});
+        _ = json;
+        return;
+    } else |err| {
+        try out.stderr("verde herdr unlink requires the Verde app to be running ({s})\n", .{@errorName(err)});
+        std.process.exit(3);
+    }
+}
+
+fn parseHerdrUnlinkRequest(argv: []const []const u8) herdr.UnlinkRequest {
+    return .{
+        .workspace = workspaceOption(argv),
+        .all = args.hasFlag(argv, "--all"),
+    };
+}
+
+fn handleHerdrProfiles(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const command = args.positional(argv, 1) orelse "list";
+    if (std.mem.eql(u8, command, "help") or args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try printHerdrProfilesHelp(out);
+        return;
+    }
+    if (std.mem.eql(u8, command, "list")) return try handleHerdrProfilesList(allocator, out, io, json);
+    if (std.mem.eql(u8, command, "add")) return try handleHerdrProfilesAdd(allocator, out, io, argv, json);
+    if (std.mem.eql(u8, command, "remove") or std.mem.eql(u8, command, "rm")) return try handleHerdrProfilesRemove(allocator, out, io, argv, json);
+    if (std.mem.eql(u8, command, "test")) return try handleHerdrProfilesTest(allocator, out, io, argv, json);
+    try out.stderr("unknown herdr profiles command: {s}\n", .{command});
+    std.process.exit(2);
+}
+
+fn printHerdrProfilesHelp(out: output.Output) !void {
+    try out.stdout(
+        \\Usage:
+        \\  verde herdr profiles list [--json]
+        \\  verde herdr profiles add --name <name> --ssh-target <alias> [--session <name>] [--remote-cwd <path>] [--local-dir <path>] [--json]
+        \\  verde herdr profiles remove <name> [--json]
+        \\  verde herdr profiles test <name> [--json]
+        \\
+        \\Profiles store SSH aliases and defaults. Configure keys/passwords in SSH, not Verde.
+        \\
+    , .{});
+}
+
+fn handleHerdrProfilesList(allocator: std.mem.Allocator, out: output.Output, io: std.Io, json: bool) !void {
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var loaded = try herdr.loadProfiles(allocator, io, pref_path);
+    defer loaded.deinit();
+    if (json) {
+        try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .profiles = loaded.profiles } });
+        return;
+    }
+    if (loaded.profiles.len == 0) {
+        try out.stdout("No Herdr profiles configured.\n", .{});
+        return;
+    }
+    try out.stdout("NAME  SSH_TARGET  SESSION  REMOTE_CWD\n", .{});
+    for (loaded.profiles) |profile| {
+        try out.stdout("{s}  {s}  {s}  {s}\n", .{
+            profile.name,
+            profile.ssh_target,
+            profile.session,
+            profile.remote_cwd orelse "",
+        });
+    }
+}
+
+fn handleHerdrProfilesAdd(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const name = args.optionValue(argv, "--name") orelse {
+        try out.stderr("verde herdr profiles add requires --name\n", .{});
+        std.process.exit(2);
+    };
+    const ssh_target = args.optionValue(argv, "--ssh-target") orelse args.optionValue(argv, "--remote") orelse {
+        try out.stderr("verde herdr profiles add requires --ssh-target\n", .{});
+        std.process.exit(2);
+    };
+    const profile: herdr.Profile = .{
+        .name = name,
+        .ssh_target = ssh_target,
+        .session = args.optionValue(argv, "--session") orelse "default",
+        .remote_cwd = args.optionValue(argv, "--remote-cwd"),
+        .local_dir = args.optionValue(argv, "--local-dir"),
+        .updated_at_ms = unixTimestampMs(),
+    };
+    herdr.validateProfile(profile) catch |err| {
+        try out.stderr("invalid herdr profile: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var loaded = try herdr.loadProfiles(allocator, io, pref_path);
+    defer loaded.deinit();
+    var next: std.ArrayList(herdr.Profile) = .empty;
+    defer next.deinit(allocator);
+    var updated = false;
+    for (loaded.profiles) |existing| {
+        if (std.mem.eql(u8, existing.name, profile.name)) {
+            try next.append(allocator, profile);
+            updated = true;
+        } else {
+            try next.append(allocator, existing);
+        }
+    }
+    if (!updated) try next.append(allocator, profile);
+    try herdr.saveProfiles(allocator, io, pref_path, next.items);
+
+    if (json) {
+        try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .profile = profile, .updated = updated } });
+    } else {
+        try out.stdout("{s} Herdr profile {s} -> {s}.\n", .{ if (updated) "Updated" else "Added", profile.name, profile.ssh_target });
+    }
+}
+
+fn handleHerdrProfilesRemove(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const name = args.optionValue(argv, "--name") orelse args.positional(argv, 2) orelse {
+        try out.stderr("verde herdr profiles remove requires a profile name\n", .{});
+        std.process.exit(2);
+    };
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var loaded = try herdr.loadProfiles(allocator, io, pref_path);
+    defer loaded.deinit();
+    var next: std.ArrayList(herdr.Profile) = .empty;
+    defer next.deinit(allocator);
+    var removed: ?herdr.Profile = null;
+    for (loaded.profiles) |profile| {
+        if (std.mem.eql(u8, profile.name, name)) {
+            removed = profile;
+        } else {
+            try next.append(allocator, profile);
+        }
+    }
+    const removed_profile = removed orelse {
+        if (json) try out.jsonValue(allocator, .{ .id = 1, .ok = false, .@"error" = .{ .code = "not_found", .message = "Herdr profile not found" } }) else try out.stderr("Herdr profile not found: {s}\n", .{name});
+        std.process.exit(4);
+    };
+    try herdr.saveProfiles(allocator, io, pref_path, next.items);
+    if (json) {
+        try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .removed = removed_profile } });
+    } else {
+        try out.stdout("Removed Herdr profile {s}.\n", .{removed_profile.name});
+    }
+}
+
+fn handleHerdrProfilesTest(allocator: std.mem.Allocator, out: output.Output, io: std.Io, argv: []const []const u8, json: bool) !void {
+    const name = args.optionValue(argv, "--name") orelse args.positional(argv, 2) orelse {
+        try out.stderr("verde herdr profiles test requires a profile name\n", .{});
+        std.process.exit(2);
+    };
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var loaded = try herdr.loadProfiles(allocator, io, pref_path);
+    defer loaded.deinit();
+    const index = herdr.profileIndex(loaded.profiles, name) orelse {
+        if (json) try out.jsonValue(allocator, .{ .id = 1, .ok = false, .@"error" = .{ .code = "not_found", .message = "Herdr profile not found" } }) else try out.stderr("Herdr profile not found: {s}\n", .{name});
+        std.process.exit(4);
+    };
+    const profile = loaded.profiles[index];
+    const result = herdr.runCli(allocator, io, .{ .session = profile.session, .remote = profile.ssh_target }, &.{ "workspace", "list" }, 128 * 1024) catch |err| {
+        if (json) try out.jsonValue(allocator, .{ .id = 1, .ok = false, .@"error" = .{ .code = "rejected", .message = @errorName(err) } }) else try out.stderr("Herdr profile test failed: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    const exit_code = runExitCode(result);
+    const ok = exit_code == 0;
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .id = 1,
+            .ok = ok,
+            .result = .{
+                .profile = profile.name,
+                .ssh_target = profile.ssh_target,
+                .session = profile.session,
+                .exit_code = exit_code,
+                .stdout = result.stdout,
+                .stderr = result.stderr,
+            },
+        });
+    } else if (ok) {
+        try out.stdout("Herdr profile {s} is reachable at {s}.\n", .{ profile.name, profile.ssh_target });
+    } else {
+        try out.stderr("Herdr profile {s} failed with exit code {d}.\n{s}", .{ profile.name, exit_code, result.stderr });
+    }
+    if (!ok) std.process.exit(1);
+}
+
+fn runExitCode(result: std.process.RunResult) i64 {
+    return switch (result.term) {
+        .exited => |code| code,
+        else => -1,
+    };
+}
+
+fn unixTimestampMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
+const HerdrProfileDefaults = struct {
+    session: ?[]u8 = null,
+    remote: ?[]u8 = null,
+    remote_cwd: ?[]u8 = null,
+    local_dir: ?[]u8 = null,
+
+    fn deinit(self: *HerdrProfileDefaults, allocator: std.mem.Allocator) void {
+        if (self.session) |value| allocator.free(value);
+        if (self.remote) |value| allocator.free(value);
+        if (self.remote_cwd) |value| allocator.free(value);
+        if (self.local_dir) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
+fn resolveHerdrProfileDefaults(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    io: std.Io,
+    argv: []const []const u8,
+    defaults: *HerdrProfileDefaults,
+) !void {
+    const profile_name = args.optionValue(argv, "--profile") orelse return;
+    if (args.optionValue(argv, "--remote") != null) {
+        try out.stderr("use either --profile or --remote, not both\n", .{});
+        std.process.exit(2);
+    }
+
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var loaded = try herdr.loadProfiles(allocator, io, pref_path);
+    defer loaded.deinit();
+    const index = herdr.profileIndex(loaded.profiles, profile_name) orelse {
+        try out.stderr("Herdr profile not found: {s}\n", .{profile_name});
+        std.process.exit(4);
+    };
+    const profile = loaded.profiles[index];
+    defaults.* = .{};
+    errdefer defaults.deinit(allocator);
+    defaults.session = try allocator.dupe(u8, profile.session);
+    defaults.remote = try allocator.dupe(u8, profile.ssh_target);
+    defaults.remote_cwd = if (profile.remote_cwd) |value| try allocator.dupe(u8, value) else null;
+    defaults.local_dir = if (profile.local_dir) |value| try allocator.dupe(u8, value) else null;
+}
+
+fn liveResponseErrorCodeEquals(allocator: std.mem.Allocator, response: []const u8, code: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const error_value = parsed.value.object.get("error") orelse return false;
+    if (error_value != .object) return false;
+    const actual = jsonString(error_value.object.get("code") orelse .null) orelse return false;
+    return std.mem.eql(u8, actual, code);
+}
+
+fn parseHerdrOpenRequest(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd_owned: *?[]u8,
+    profile_defaults: *HerdrProfileDefaults,
+) !herdr.OpenRequest {
+    try resolveHerdrProfileDefaults(allocator, out, io, argv, profile_defaults);
+    const session = args.optionValue(argv, "--session") orelse profile_defaults.session orelse {
+        try out.stderr("verde herdr open requires --session\n", .{});
+        std.process.exit(2);
+    };
+    const workspace = args.optionValue(argv, "--herdr-workspace") orelse {
+        try out.stderr("verde herdr open requires --herdr-workspace\n", .{});
+        std.process.exit(2);
+    };
+    const remote = args.optionValue(argv, "--remote") orelse profile_defaults.remote;
+    const local_dir = args.optionValue(argv, "--local-dir") orelse profile_defaults.local_dir;
+    const remote_cwd = args.optionValue(argv, "--remote-cwd") orelse profile_defaults.remote_cwd;
+    const explicit_cwd = args.optionValue(argv, "--cwd");
+    if (remote == null and explicit_cwd == null and local_dir == null) {
+        cwd_owned.* = try currentWorkingDirectoryAlloc(allocator);
+    }
+    const request: herdr.OpenRequest = .{
+        .session = session,
+        .herdr_workspace = workspace,
+        .remote = remote,
+        .cwd = explicit_cwd orelse cwd_owned.*,
+        .remote_cwd = remote_cwd,
+        .local_dir = local_dir,
+        .pane = args.optionValue(argv, "--pane"),
+    };
+    herdr.validateOpenRequest(request) catch |err| {
+        try out.stderr("invalid herdr open request: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    return request;
+}
+
+fn handleHerdrStatus(allocator: std.mem.Allocator, out: output.Output, io: std.Io, json: bool) !void {
+    if (sendLiveRequestAlloc(allocator, io, "herdr.status", .{}, 1)) |response| {
+        defer allocator.free(response);
+        if (!liveResponseErrorCodeEquals(allocator, response, "method_not_found")) {
+            try out.stdout("{s}\n", .{response});
+            return;
+        }
+    } else |_| {}
+    try writeOfflineHerdrStatus(allocator, out, json);
+}
+
+fn writeOfflineHerdrStatus(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    const pref_path = try prefPath(allocator);
+    defer allocator.free(pref_path);
+    var client = try db_client.Client.init(allocator, pref_path);
+    defer client.deinit();
+    var loaded = try client.load(allocator) orelse {
+        if (json) {
+            try out.jsonValue(allocator, .{ .id = 1, .ok = true, .result = .{ .daemon_running = false, .links = &.{} } });
+        } else {
+            try out.stdout("No persisted Verde Herdr links found.\n", .{});
+        }
+        return;
+    };
+    defer loaded.deinit();
+
+    if (json) return try writeOfflineHerdrStatusJson(allocator, out, loaded.value);
+    var count: usize = 0;
+    try out.stdout("WORKSPACE  REMOTE  SESSION  HERDR_WORKSPACE  PATH\n", .{});
+    for (loaded.value.projects) |project| {
+        const link = project.herdr_link orelse continue;
+        count += 1;
+        try out.stdout("{s}  {s}  {s}  {s}  {s}\n", .{
+            project.label,
+            if (link.remote_alias.len > 0) link.remote_alias else "local",
+            link.session_name,
+            link.workspace_id,
+            project.path,
+        });
+    }
+    if (count == 0) try out.stdout("No persisted Verde Herdr links found.\n", .{});
+}
+
+fn writeOfflineHerdrStatusJson(allocator: std.mem.Allocator, out: output.Output, state: db_types.PersistedState) !void {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+    try s.beginObject();
+    try s.objectField("id");
+    try s.write(1);
+    try s.objectField("ok");
+    try s.write(true);
+    try s.objectField("result");
+    try s.beginObject();
+    try s.objectField("daemon_running");
+    try s.write(false);
+    try s.objectField("links");
+    try s.beginArray();
+    for (state.projects, 0..) |project, index| {
+        const link = project.herdr_link orelse continue;
+        try s.beginObject();
+        try s.objectField("workspace_index");
+        try s.write(index);
+        try s.objectField("workspace_id");
+        if (project.id) |id| try s.write(id) else try s.write(project.path);
+        try s.objectField("label");
+        try s.write(project.label);
+        try s.objectField("path");
+        try s.write(project.path);
+        try s.objectField("remote");
+        try s.write(link.remote_alias);
+        try s.objectField("session");
+        try s.write(link.session_name);
+        try s.objectField("herdr_workspace");
+        try s.write(link.workspace_id);
+        try s.objectField("remote_cwd");
+        if (link.remote_cwd) |value| try s.write(value) else try s.write(null);
+        try s.objectField("herdr_pane");
+        if (link.last_pane_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("terminal_dock_id");
+        if (link.attach_dock_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("terminal_pane_id");
+        if (link.attach_pane_id) |value| try s.write(value) else try s.write(null);
+        try s.objectField("pane_links");
+        try writePersistedHerdrPaneLinksJson(allocator, &s, link.pane_links_json);
+        try s.objectField("updated_at_ms");
+        try s.write(link.updated_at_ms);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+    try out.stdout("{s}\n", .{writer.written()});
+}
+
+fn writePersistedHerdrPaneLinksJson(allocator: std.mem.Allocator, s: *std.json.Stringify, pane_links_json: ?[]const u8) !void {
+    const raw = pane_links_json orelse {
+        try s.beginArray();
+        try s.endArray();
+        return;
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        try s.beginArray();
+        try s.endArray();
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) {
+        try s.beginArray();
+        try s.endArray();
+        return;
+    }
+    try s.write(parsed.value);
+}
+
+fn currentWorkingDirectoryAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    return try std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), ".", allocator);
+}
+
+fn launchVerdeAppDetached(allocator: std.mem.Allocator, exe_path: []const u8) !void {
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    const resolved = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, exe_path) catch null;
+    defer if (resolved) |path| allocator.free(path);
+    const argv = [_][]const u8{ resolved orelse exe_path, "app" };
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    _ = try std.process.spawn(threaded.io(), .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .environ_map = &env_map,
+    });
 }
 
 const PersistedSessionRef = struct {
@@ -1475,11 +2083,27 @@ fn sendLiveRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
 
+    return try readLiveResponseLineAlloc(allocator, live_io, stream);
+}
+
+fn readLiveResponseLineAlloc(allocator: std.mem.Allocator, live_io: std.Io, stream: std.Io.net.Stream) ![]u8 {
     var read_buffer: [256 * 1024]u8 = undefined;
-    var reader = stream.reader(live_io, &read_buffer);
-    const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
-    const response = std.mem.trim(u8, line, "\r");
-    return try allocator.dupe(u8, response);
+    var read_len: usize = 0;
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(LIVE_RESPONSE_TIMEOUT_MS),
+        .clock = .awake,
+    } };
+    while (read_len < read_buffer.len) {
+        const message = try stream.socket.receiveTimeout(live_io, read_buffer[read_len..], timeout);
+        if (message.data.len == 0) return error.ConnectionAborted;
+        if (std.mem.indexOfScalar(u8, message.data, '\n')) |relative_end| {
+            const line_end = read_len + relative_end;
+            const response = std.mem.trim(u8, read_buffer[0..line_end], "\r");
+            return try allocator.dupe(u8, response);
+        }
+        read_len += message.data.len;
+    }
+    return error.LiveResponseTooLarge;
 }
 
 fn sendSessionRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const u8, params: anytype, request_id: u64) ![]u8 {
@@ -2233,6 +2857,7 @@ fn trailingFreeArg(argv: []const []const u8, positional_commands: usize) ?[]cons
 
 fn optionConsumesValue(name: []const u8) bool {
     return std.mem.eql(u8, name, "--workspace") or
+        std.mem.eql(u8, name, "--herdr-workspace") or
         std.mem.eql(u8, name, "--project") or
         std.mem.eql(u8, name, "--id") or
         std.mem.eql(u8, name, "--pane") or
@@ -2252,6 +2877,10 @@ fn optionConsumesValue(name: []const u8) bool {
         std.mem.eql(u8, name, "--progress") or
         std.mem.eql(u8, name, "--label") or
         std.mem.eql(u8, name, "--session") or
+        std.mem.eql(u8, name, "--remote") or
+        std.mem.eql(u8, name, "--cwd") or
+        std.mem.eql(u8, name, "--remote-cwd") or
+        std.mem.eql(u8, name, "--local-dir") or
         std.mem.eql(u8, name, "--session-id") or
         std.mem.eql(u8, name, "--dock") or
         std.mem.eql(u8, name, "--script") or

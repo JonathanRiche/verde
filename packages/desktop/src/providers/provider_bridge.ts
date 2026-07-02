@@ -611,10 +611,12 @@ async function handleClaudeReadThread(sdk, request) {
     throw new Error("Claude Agent SDK does not expose getSessionMessages");
   }
   const messages = await sdk.getSessionMessages(request.thread_id, { dir: request.cwd ?? undefined, limit: request.limit ?? 1000 });
+  const model = (messages ?? []).find((message) => typeof message?.message?.model === "string")?.message?.model ?? null;
   write({
     type: "result",
     thread_id: request.thread_id,
     title: request.thread_id,
+    model_id: model,
     messages: (messages ?? []).map((message) => ({
       role: claudeRoleFromSdkMessage(message) ?? "assistant",
       text: textFromContent(message?.message?.content ?? message?.content),

@@ -101,6 +101,10 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
     .{ .id = "workspace.cursor_tui", .title = "Start New Cursor TUI", .keywords = "agent terminal workspace fresh cursor agent", .section = .workspaces, .run = runOpenCursorTui, .enabled = hasProjects },
     .{ .id = "workspace.amp_tui", .title = "Start New Amp TUI", .keywords = "agent terminal workspace fresh amp sourcegraph", .section = .workspaces, .run = runOpenAmpTui, .enabled = hasProjects },
+    .{ .id = "workspace.herdr_handoff", .title = "Handoff Workspace to Herdr", .keywords = "runtime local terminal tui phone", .section = .workspaces, .run = runHerdrHandoffWorkspace, .enabled = hasProjects },
+    .{ .id = "workspace.herdr_handoff_remote", .title = "Handoff Workspace to Remote Herdr", .keywords = "remote profile ssh tailscale runtime terminal tui phone", .section = .workspaces, .run = runHerdrRemoteHandoffWorkspace, .enabled = hasProjects },
+    .{ .id = "workspace.herdr_focus_terminal", .title = "Open/Focus Herdr Terminal", .keywords = "runtime terminal tui", .section = .workspaces, .run = runFocusHerdrTerminal, .enabled = currentWorkspaceHerdrLinked },
+    .{ .id = "workspace.herdr_unlink", .title = "Run Workspace Locally", .keywords = "unlink herdr runtime local", .section = .workspaces, .run = runUnlinkHerdrWorkspace, .enabled = currentWorkspaceHerdrLinked },
     .{ .id = "app.history", .title = "History: This Workspace", .keywords = "saved chats threads search recent", .section = .app, .run = runHistoryThisWorkspace, .enabled = hasProjects, .keeps_open = true },
     .{ .id = "app.settings", .title = "Open Settings", .keywords = "preferences config options", .section = .app, .run = runSettings },
     .{ .id = "app.sidebar", .title = "Toggle Sidebar", .keywords = "rail collapse", .section = .app, .keybind = .toggle_sidebar, .run = runToggleSidebar },
@@ -927,6 +931,17 @@ fn workspaceNotBusy(state: *runtime.AppState) bool {
     return true;
 }
 
+fn currentWorkspaceHerdrLinked(state: *runtime.AppState) bool {
+    return state.selected_project_index < state.projects.items.len and
+        state.projects.items[state.selected_project_index].herdr_link != null;
+}
+
+fn currentWorkspaceHasHerdrAttachTerminal(state: *runtime.AppState) bool {
+    if (!currentWorkspaceHerdrLinked(state)) return false;
+    const link = state.projects.items[state.selected_project_index].herdr_link.?;
+    return link.attach_dock_id != null;
+}
+
 fn currentThreadNotPending(state: *runtime.AppState) bool {
     if (state.selected_project_index >= state.projects.items.len) return false;
     const project = &state.projects.items[state.selected_project_index];
@@ -971,6 +986,8 @@ fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8
         const thread = &project.threads.items[thread_index];
         if (thread.provider_thread_id == null) return "Thread has no provider session id yet.";
     }
+    if (std.mem.eql(u8, id, "workspace.herdr_focus_terminal")) return "Current workspace is not linked to Herdr.";
+    if (std.mem.eql(u8, id, "workspace.herdr_unlink")) return "Current workspace is already running locally.";
     return "Command is unavailable right now.";
 }
 
@@ -1091,6 +1108,22 @@ fn runOpenCursorTui(state: *runtime.AppState) void {
 
 fn runOpenAmpTui(state: *runtime.AppState) void {
     runOpenAgentTui(state, .amp);
+}
+
+fn runHerdrHandoffWorkspace(state: *runtime.AppState) void {
+    state.handoffProjectToLocalHerdrFromUi(state.selected_project_index);
+}
+
+fn runHerdrRemoteHandoffWorkspace(state: *runtime.AppState) void {
+    state.beginHerdrProfilePicker(state.selected_project_index);
+}
+
+fn runFocusHerdrTerminal(state: *runtime.AppState) void {
+    _ = state.focusProjectHerdrAttachTerminal(state.selected_project_index);
+}
+
+fn runUnlinkHerdrWorkspace(state: *runtime.AppState) void {
+    state.unlinkProjectHerdrFromUi(state.selected_project_index);
 }
 
 fn runOpenAgentTui(state: *runtime.AppState, provider: AgentProvider) void {

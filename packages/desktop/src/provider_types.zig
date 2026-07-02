@@ -110,12 +110,14 @@ pub fn freeModelInfos(allocator: anytype, models: []const ModelInfo) void {
 pub const ReadThreadResult = struct {
     thread_id: []const u8,
     title: []const u8,
+    model_id: ?[]const u8 = null,
     updated_at: ?i64 = null,
     messages: []const ChatMessage,
 
     pub fn deinit(self: ReadThreadResult, allocator: anytype) void {
         allocator.free(self.thread_id);
         allocator.free(self.title);
+        if (self.model_id) |model_id| allocator.free(model_id);
         for (self.messages) |message| {
             allocator.free(message.author);
             allocator.free(message.body);

@@ -222,6 +222,7 @@ pub const Client = struct {
         const result = response.result orelse return error.MissingSessionId;
         const id = getOptionalObjectString(result, "thread_id") orelse thread_id;
         const title = getOptionalObjectString(result, "title") orelse id;
+        const model_id = getOptionalObjectString(result, "model_id");
         const messages_value = getObjectField(result, "messages");
 
         var messages: std.ArrayList(provider_types.ChatMessage) = .empty;
@@ -252,6 +253,7 @@ pub const Client = struct {
         return .{
             .thread_id = try allocator.dupe(u8, id),
             .title = try allocator.dupe(u8, title),
+            .model_id = if (model_id) |model| try allocator.dupe(u8, model) else null,
             .messages = owned_messages,
         };
     }
