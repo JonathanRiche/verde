@@ -9,6 +9,7 @@ pub const top_level_commands = [_][]const u8{
     "version",
     "capabilities",
     "open",
+    "herdr",
     "state",
     "notify",
     "integrations",
@@ -24,6 +25,21 @@ pub const state_commands = [_][]const u8{
     "panes",
     "threads",
     "transcript",
+};
+
+pub const herdr_commands = [_][]const u8{
+    "open",
+    "handoff",
+    "unlink",
+    "profiles",
+    "status",
+};
+
+pub const herdr_profile_commands = [_][]const u8{
+    "list",
+    "add",
+    "remove",
+    "test",
 };
 
 pub const integration_commands = [_][]const u8{
@@ -84,6 +100,10 @@ pub const live_capabilities = [_][]const u8{
     "inspect",
     "threads",
     "terminals",
+    "herdr.open",
+    "herdr.handoff",
+    "herdr.unlink",
+    "herdr.status",
     "surfaces",
     "surface.list",
     "surface.inspect",
@@ -250,6 +270,7 @@ pub const all_flags = [_][]const u8{
     "--json",
     "--id",
     "--workspace",
+    "--herdr-workspace",
     "--project",
     "--thread",
     "--pane",
@@ -270,6 +291,14 @@ pub const all_flags = [_][]const u8{
     "--progress",
     "--label",
     "--session",
+    "--ssh-target",
+    "--profile",
+    "--remote",
+    "--cwd",
+    "--remote-cwd",
+    "--local-dir",
+    "--all",
+    "--dry-run",
     "--dock",
     "--clear",
     "--quiet",
@@ -288,6 +317,11 @@ pub const all_flags = [_][]const u8{
 pub const json_flags = [_][]const u8{"--json"};
 pub const workspace_json_flags = [_][]const u8{ "--workspace", "--json" };
 pub const project_json_flags = workspace_json_flags;
+pub const herdr_open_flags = [_][]const u8{ "--session", "--herdr-workspace", "--profile", "--remote", "--cwd", "--remote-cwd", "--local-dir", "--pane", "--json" };
+pub const herdr_handoff_flags = [_][]const u8{ "--workspace", "--project", "--all", "--session", "--profile", "--remote", "--remote-cwd", "--dry-run", "--json" };
+pub const herdr_unlink_flags = [_][]const u8{ "--workspace", "--project", "--all", "--json" };
+pub const herdr_profile_add_flags = [_][]const u8{ "--name", "--ssh-target", "--session", "--remote-cwd", "--local-dir", "--json" };
+pub const herdr_profile_name_flags = [_][]const u8{ "--name", "--json" };
 pub const session_id_json_flags = [_][]const u8{ "--id", "--json" };
 pub const session_new_flags = [_][]const u8{ "--workspace", "--name", "--json" };
 pub const session_attach_flags = [_][]const u8{ "--id", "--workspace", "--pane" };

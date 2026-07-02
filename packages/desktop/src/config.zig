@@ -55,6 +55,11 @@ pub const DefaultOpenAction = union(enum) {
     }
 };
 
+pub const LinkOpenTarget = enum {
+    verde_browser,
+    system_browser,
+};
+
 pub const TerminalLaunchProfileConfig = struct {
     label: []u8,
     command: []const []u8,
@@ -71,6 +76,7 @@ pub const AppConfig = struct {
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
     theme_config: theme.ThemeConfig = .{},
     default_open_action: DefaultOpenAction = .folder,
+    link_open_target: LinkOpenTarget = .verde_browser,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
     // Fire a desktop notification when an agent surface finishes (transitions
     // to `.done`). Defaults on so the feature works without first opening
@@ -135,28 +141,24 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     const config_path = try resolveConfigPath(allocator);
     defer allocator.free(config_path);
 
+    var fallback_arena = std.heap.ArenaAllocator.init(allocator);
+    defer fallback_arena.deinit();
+
     var parsed = try readRootValue(allocator);
     defer if (parsed) |*value| value.deinit();
 
-    var root: std.json.Value = if (parsed) |*value| blk: {
-        const existing = value.value;
-        value.value = .{ .object = .empty };
-        break :blk existing;
-    } else .{ .object = .empty };
-    defer switch (root) {
-        .object => |*map| map.deinit(allocator),
-        else => {},
-    };
+    const tree_allocator = if (parsed) |*value| value.arena.allocator() else fallback_arena.allocator();
+    var root: std.json.Value = if (parsed) |*value| value.value else .{ .object = .empty };
 
     if (root != .object) {
         root = .{ .object = .empty };
     }
 
-    try writeUiSection(allocator, &root.object, config);
-    try writeThemeSection(allocator, &root.object, config);
-    try writeOpenSection(allocator, &root.object, config);
-    try writeTerminalSection(allocator, &root.object, config);
-    try writeNotificationsSection(allocator, &root.object, config);
+    try writeUiSection(tree_allocator, &root.object, config);
+    try writeThemeSection(tree_allocator, &root.object, config);
+    try writeOpenSection(tree_allocator, &root.object, config);
+    try writeTerminalSection(tree_allocator, &root.object, config);
+    try writeNotificationsSection(tree_allocator, &root.object, config);
 
     const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
     defer allocator.free(encoded);
@@ -184,22 +186,27 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try cwd.rename(tmp_path, cwd, config_path, io);
 }
 
+fn objectSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    const entry = try object.getOrPut(allocator, key);
+    if (!entry.found_existing or entry.value_ptr.* != .object) {
+        entry.value_ptr.* = .{ .object = .empty };
+    }
+    return &entry.value_ptr.object;
+}
+
 fn writeUiSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    var ui_object: std.json.Value = object.get("ui") orelse .{ .object = .empty };
-    if (ui_object != .object) ui_object = .{ .object = .empty };
-    try ui_object.object.put(allocator, "font_size", .{ .float = config.font_size });
-    try object.put(allocator, "ui", ui_object);
+    const ui_object = try objectSection(allocator, object, "ui");
+    try ui_object.put(allocator, "font_size", .{ .float = config.font_size });
 }
 
 fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    var theme_object: std.json.Value = object.get("theme") orelse .{ .object = .empty };
-    if (theme_object != .object) theme_object = .{ .object = .empty };
+    const theme_object = try objectSection(allocator, object, "theme");
 
     const source_name = switch (config.theme_config.source) {
         .omarchy => "omarchy",
         .default => "default",
     };
-    try theme_object.object.put(allocator, "theme", .{ .string = source_name });
+    try theme_object.put(allocator, "theme", .{ .string = source_name });
 
     var has_color_override = false;
     inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
@@ -211,19 +218,15 @@ fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, 
         inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
             if (@field(config.theme_config.colors, field.name)) |value| {
                 const hex = try colorToHex(allocator, value);
-                defer allocator.free(hex);
                 try colors_object.put(allocator, field.name, .{ .string = hex });
             }
         }
-        try theme_object.object.put(allocator, "colors", .{ .object = colors_object });
+        try theme_object.put(allocator, "colors", .{ .object = colors_object });
     }
-
-    try object.put(allocator, "theme", theme_object);
 }
 
 fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    var open_object: std.json.Value = object.get("open") orelse .{ .object = .empty };
-    if (open_object != .object) open_object = .{ .object = .empty };
+    const open_object = try objectSection(allocator, object, "open");
 
     const default_value: std.json.Value = switch (config.default_open_action) {
         .folder => .{ .string = "folder" },
@@ -239,15 +242,18 @@ fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, c
         },
     };
 
-    try open_object.object.put(allocator, "default", default_value);
-    try object.put(allocator, "open", open_object);
+    try open_object.put(allocator, "default", default_value);
+    const links_value: std.json.Value = .{ .string = switch (config.link_open_target) {
+        .verde_browser => "verde_browser",
+        .system_browser => "system_browser",
+    } };
+    try open_object.put(allocator, "links", links_value);
 }
 
 fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    var terminal_object: std.json.Value = object.get("terminal") orelse .{ .object = .empty };
-    if (terminal_object != .object) terminal_object = .{ .object = .empty };
+    const terminal_object = try objectSection(allocator, object, "terminal");
 
-    try terminal_object.object.put(allocator, "font_size", .{ .float = config.terminal_font_size });
+    try terminal_object.put(allocator, "font_size", .{ .float = config.terminal_font_size });
 
     var profiles = std.json.Array.init(allocator);
     for (config.terminal_launch_profiles) |profile| {
@@ -261,15 +267,12 @@ fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMa
         try profiles.append(.{ .object = profile_object });
     }
 
-    try terminal_object.object.put(allocator, "profiles", .{ .array = profiles });
-    try object.put(allocator, "terminal", terminal_object);
+    try terminal_object.put(allocator, "profiles", .{ .array = profiles });
 }
 
 fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    var notifications_object: std.json.Value = object.get("notifications") orelse .{ .object = .empty };
-    if (notifications_object != .object) notifications_object = .{ .object = .empty };
-    try notifications_object.object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
-    try object.put(allocator, "notifications", notifications_object);
+    const notifications_object = try objectSection(allocator, object, "notifications");
+    try notifications_object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
 }
 
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
@@ -439,11 +442,35 @@ fn applyOpenOverrides(allocator: std.mem.Allocator, config: *AppConfig, open_val
         return;
     }
 
-    const default_value = open_value.object.get("default") orelse return;
-    const parsed = parseDefaultOpenAction(allocator, default_value) orelse return;
+    if (open_value.object.get("default")) |default_value| {
+        const parsed = parseDefaultOpenAction(allocator, default_value) orelse return;
+        config.default_open_action.deinit(allocator);
+        config.default_open_action = parsed;
+    }
 
-    config.default_open_action.deinit(allocator);
-    config.default_open_action = parsed;
+    if (open_value.object.get("links")) |links_value| {
+        if (parseLinkOpenTarget(links_value)) |target| {
+            config.link_open_target = target;
+        }
+    }
+}
+
+fn parseLinkOpenTarget(value: std.json.Value) ?LinkOpenTarget {
+    if (value != .string) {
+        log.warn("open.links must be a string when provided", .{});
+        return null;
+    }
+    const trimmed = std.mem.trim(u8, value.string, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(trimmed, "verde_browser") or
+        std.ascii.eqlIgnoreCase(trimmed, "verde") or
+        std.ascii.eqlIgnoreCase(trimmed, "browser")) return .verde_browser;
+    if (std.ascii.eqlIgnoreCase(trimmed, "system_browser") or
+        std.ascii.eqlIgnoreCase(trimmed, "system") or
+        std.ascii.eqlIgnoreCase(trimmed, "default_browser") or
+        std.ascii.eqlIgnoreCase(trimmed, "default")) return .system_browser;
+
+    log.warn("ignoring unsupported open.links value: {s}", .{trimmed});
+    return null;
 }
 
 fn parseDefaultOpenAction(allocator: std.mem.Allocator, value: std.json.Value) ?DefaultOpenAction {
@@ -666,6 +693,17 @@ test "app config accepts named open default" {
     applyAppOverrides(std.testing.allocator, &config, root.value);
 
     try std.testing.expect(config.default_open_action == .cursor);
+}
+
+test "app config accepts link open target" {
+    var root = try parseTestRoot("{\"open\":{\"links\":\"system_browser\"}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
 }
 
 test "app config accepts custom open default" {

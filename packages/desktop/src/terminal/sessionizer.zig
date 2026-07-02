@@ -6,7 +6,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const harness = @import("../harness.zig");
 const process_env = @import("../process_env.zig");
+const send_runner = @import("../chat/send_runner.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const log = std.log.scoped(.sessionizer);
@@ -14,7 +16,10 @@ const log = std.log.scoped(.sessionizer);
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
-pub const PROTOCOL_VERSION: u32 = 2;
+// Bump whenever the daemon RPC/state surface changes incompatibly. GUI chat
+// turns are daemon-owned now; accepting an older daemon makes the UI
+// attach to a process that cannot list/tail those turns.
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
@@ -696,9 +701,117 @@ const PtySession = struct {
     }
 };
 
+const ChatTurnStatus = enum { running, waiting_approval, completed, failed, aborted };
+const ApprovalDecision = enum { approve, deny };
+
+const PendingApproval = struct {
+    call_id: []u8,
+    title: []u8,
+    body: []u8,
+
+    fn deinit(self: *PendingApproval, allocator: std.mem.Allocator) void {
+        allocator.free(self.call_id);
+        allocator.free(self.title);
+        allocator.free(self.body);
+    }
+};
+
+const ChatEvent = struct {
+    seq: u64,
+    kind: []u8,
+    payload_json: []u8,
+
+    fn deinit(self: *ChatEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.kind);
+        allocator.free(self.payload_json);
+    }
+};
+
+const ChatTurn = struct {
+    allocator: std.mem.Allocator,
+    turn_id: []u8,
+    workspace_id: []u8,
+    local_thread_id: []u8,
+    request: send_runner.Request,
+    owned_image_paths: []const []const u8,
+    mutex: std.atomic.Mutex = .unlocked,
+    events: std.ArrayList(ChatEvent) = .empty,
+    next_seq: u64 = 1,
+    status: ChatTurnStatus = .running,
+    consumed: bool = false,
+    worker_done: bool = false,
+    cancel_requested: bool = false,
+    provider_thread_id: ?[]u8 = null,
+    active_turn_id: ?[]u8 = null,
+    result_reply_text: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    pending_approval: ?PendingApproval = null,
+    approval_call_id: ?[]u8 = null,
+    approval_decision: ?ApprovalDecision = null,
+
+    fn deinit(self: *ChatTurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.turn_id);
+        allocator.free(self.workspace_id);
+        allocator.free(self.local_thread_id);
+        freeRunnerRequest(allocator, self.request, self.owned_image_paths);
+        for (self.events.items) |*event| event.deinit(allocator);
+        self.events.deinit(allocator);
+        if (self.provider_thread_id) |value| allocator.free(value);
+        if (self.active_turn_id) |value| allocator.free(value);
+        if (self.result_reply_text) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        if (self.pending_approval) |*approval| approval.deinit(allocator);
+        if (self.approval_call_id) |value| allocator.free(value);
+        allocator.destroy(self);
+    }
+
+    fn appendEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, payload_json: []const u8) void {
+        const owned_kind = allocator.dupe(u8, kind) catch return;
+        errdefer allocator.free(owned_kind);
+        const owned_payload = allocator.dupe(u8, payload_json) catch return;
+        errdefer allocator.free(owned_payload);
+        var event: ChatEvent = .{
+            .seq = self.next_seq,
+            .kind = owned_kind,
+            .payload_json = owned_payload,
+        };
+        errdefer event.deinit(allocator);
+        self.events.append(allocator, event) catch return;
+        self.next_seq += 1;
+    }
+
+    fn appendStringEvent(self: *ChatTurn, allocator: std.mem.Allocator, kind: []const u8, field: []const u8, value: []const u8) void {
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        s.beginObject() catch return;
+        s.objectField(field) catch return;
+        s.write(value) catch return;
+        s.endObject() catch return;
+        const payload = writer.toOwnedSlice() catch return;
+        defer allocator.free(payload);
+        self.appendEvent(allocator, kind, payload);
+    }
+};
+
+fn freeRunnerRequest(allocator: std.mem.Allocator, request: send_runner.Request, image_paths: []const []const u8) void {
+    allocator.free(request.project_path);
+    allocator.free(request.prompt);
+    for (image_paths) |path| allocator.free(path);
+    allocator.free(image_paths);
+    if (request.provider_thread_id) |value| allocator.free(value);
+    allocator.free(request.thread_title);
+    if (request.model_ref) |value| allocator.free(value);
+    if (request.opencode_reasoning_variant) |value| allocator.free(value);
+    if (request.cursor_model_params_json) |value| allocator.free(value);
+    if (request.remote_ssh_host) |value| allocator.free(value);
+    if (request.remote_cwd) |value| allocator.free(value);
+}
+
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     sessions: std.ArrayList(*PtySession) = .empty,
+    chat_turns: std.ArrayList(*ChatTurn) = .empty,
     mutex: std.atomic.Mutex = .unlocked,
     idle_since_ms: ?i64 = null,
 
@@ -709,6 +822,8 @@ pub const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         for (self.sessions.items) |session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
+        for (self.chat_turns.items) |turn| turn.deinit(self.allocator);
+        self.chat_turns.deinit(self.allocator);
     }
 
     fn pollSessions(self: *Daemon) void {
@@ -720,8 +835,18 @@ pub const Daemon = struct {
     }
 
     fn shouldExitForIdle(self: *Daemon) bool {
+        self.removeFinishedConsumedChatTurns();
         for (self.sessions.items) |session| {
             if (session.running) {
+                self.idle_since_ms = null;
+                return false;
+            }
+        }
+        for (self.chat_turns.items) |turn| {
+            lockTurn(turn);
+            const keep_alive = turn.status == .running or turn.status == .waiting_approval;
+            turn.mutex.unlock();
+            if (keep_alive) {
                 self.idle_since_ms = null;
                 return false;
             }
@@ -732,6 +857,21 @@ pub const Daemon = struct {
             return false;
         }
         return now - self.idle_since_ms.? >= IDLE_EXIT_MS;
+    }
+
+    fn removeFinishedConsumedChatTurns(self: *Daemon) void {
+        var index: usize = 0;
+        while (index < self.chat_turns.items.len) {
+            const turn = self.chat_turns.items[index];
+            lockTurn(turn);
+            const remove = turn.consumed and turn.worker_done;
+            turn.mutex.unlock();
+            if (remove) {
+                self.chat_turns.orderedRemove(index).deinit(self.allocator);
+                continue;
+            }
+            index += 1;
+        }
     }
 
     fn find(self: *Daemon, session_id: []const u8) ?*PtySession {
@@ -766,6 +906,12 @@ pub const Daemon = struct {
         if (std.mem.eql(u8, method, "session.screen")) return try self.tailResponse(id_value, params, true);
         if (std.mem.eql(u8, method, "session.kill")) return try self.killResponse(id_value, params);
         if (std.mem.eql(u8, method, "session.cleanup")) return try self.cleanupResponse(id_value);
+        if (std.mem.eql(u8, method, "chat.turn.start")) return try self.chatTurnStartResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.list")) return try self.chatTurnListResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.tail")) return try self.chatTurnTailResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.approve")) return try self.chatTurnApproveResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.cancel")) return try self.chatTurnCancelResponse(id_value, params);
+        if (std.mem.eql(u8, method, "chat.turn.consume")) return try self.chatTurnConsumeResponse(id_value, params);
         if (std.mem.eql(u8, method, "status")) return try self.statusResponse(id_value);
         return try errorResponseAlloc(self.allocator, id_value, "method_not_found", method);
     }
@@ -1007,6 +1153,112 @@ pub const Daemon = struct {
         return try okValueResponse(self.allocator, id_value, .{ .removed = removed });
     }
 
+    fn chatTurnStartResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
+        if (self.findChatTurn(turn_id)) |turn| return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = false });
+
+        const turn = try createChatTurnFromParams(self.allocator, params);
+        errdefer turn.deinit(self.allocator);
+        try self.chat_turns.append(self.allocator, turn);
+        errdefer _ = self.chat_turns.pop();
+        const thread = try std.Thread.spawn(.{}, chatTurnThread, .{ self.allocator, turn });
+        thread.detach();
+        return try okValueResponse(self.allocator, id_value, .{ .turn_id = turn.turn_id, .created = true });
+    }
+
+    fn chatTurnListResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        const workspace_filter = if (params == .object) jsonString(params.object.get("workspace_id") orelse .null) else null;
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try s.beginObject();
+        try s.objectField("turns");
+        try s.beginArray();
+        for (self.chat_turns.items) |turn| {
+            if (turn.consumed) continue;
+            if (workspace_filter) |wanted| if (!std.mem.eql(u8, wanted, turn.workspace_id)) continue;
+            {
+                lockTurn(turn);
+                defer turn.mutex.unlock();
+                try writeChatTurnSummary(&s, turn);
+            }
+        }
+        try s.endArray();
+        try s.endObject();
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn chatTurnTailResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        const after_seq = jsonUsize(params.object.get("after_seq") orelse .null) orelse 0;
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        try beginOk(&s, id_value);
+        try s.objectField("result");
+        try writeChatTurnTail(&s, turn, @intCast(after_seq));
+        try s.endObject();
+        return try writer.toOwnedSlice();
+    }
+
+    fn chatTurnApproveResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        const call_id = jsonString(params.object.get("call_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing call_id");
+        const decision_text = jsonString(params.object.get("decision") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing decision");
+        const decision: ApprovalDecision = if (std.mem.eql(u8, decision_text, "approve")) .approve else .deny;
+        lockTurn(turn);
+        defer turn.mutex.unlock();
+        if (turn.pending_approval == null or !std.mem.eql(u8, turn.pending_approval.?.call_id, call_id)) return try errorResponseAlloc(self.allocator, id_value, "not_found", "approval not found");
+        if (turn.approval_call_id) |old| self.allocator.free(old);
+        turn.approval_call_id = try self.allocator.dupe(u8, call_id);
+        turn.approval_decision = decision;
+        return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+    }
+
+    fn chatTurnCancelResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn = self.findChatTurn(jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id")) orelse
+            return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+        lockTurn(turn);
+        turn.cancel_requested = true;
+        if (turn.status == .running or turn.status == .waiting_approval) {
+            turn.status = .aborted;
+            turn.appendEvent(self.allocator, "aborted", "{}");
+        }
+        turn.mutex.unlock();
+        return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+    }
+
+    fn chatTurnConsumeResponse(self: *Daemon, id_value: std.json.Value, params: std.json.Value) ![]u8 {
+        if (params != .object) return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "params must be an object");
+        const turn_id = jsonString(params.object.get("turn_id") orelse .null) orelse return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing turn_id");
+        for (self.chat_turns.items, 0..) |turn, index| {
+            if (!std.mem.eql(u8, turn.turn_id, turn_id)) continue;
+            lockTurn(turn);
+            const can_remove = turn.worker_done;
+            turn.consumed = true;
+            turn.mutex.unlock();
+            if (can_remove) self.chat_turns.orderedRemove(index).deinit(self.allocator);
+            return try okValueResponse(self.allocator, id_value, .{ .accepted = true });
+        }
+        return try errorResponseAlloc(self.allocator, id_value, "not_found", "turn not found");
+    }
+
+    fn findChatTurn(self: *Daemon, turn_id: []const u8) ?*ChatTurn {
+        for (self.chat_turns.items) |turn| if (std.mem.eql(u8, turn.turn_id, turn_id)) return turn;
+        return null;
+    }
+
     fn requiredSession(self: *Daemon, id_value: std.json.Value, params: std.json.Value) !*PtySession {
         _ = id_value;
         if (params != .object) return error.InvalidParams;
@@ -1104,6 +1356,10 @@ fn handleClient(daemon: *Daemon, io: std.Io, stream: std.Io.net.Stream) void {
 
 fn lockDaemon(daemon: *Daemon) void {
     while (!daemon.mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn lockTurn(turn: *ChatTurn) void {
+    while (!turn.mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn sleepMs(milliseconds: i64) void {
@@ -1212,6 +1468,256 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.endObject();
 }
 
+fn writeChatTurnSummary(s: *std.json.Stringify, turn: *const ChatTurn) !void {
+    try s.beginObject();
+    try s.objectField("turn_id");
+    try s.write(turn.turn_id);
+    try s.objectField("workspace_id");
+    try s.write(turn.workspace_id);
+    try s.objectField("local_thread_id");
+    try s.write(turn.local_thread_id);
+    try s.objectField("status");
+    try s.write(@tagName(turn.status));
+    try s.objectField("next_seq");
+    try s.write(turn.next_seq);
+    try s.objectField("provider_thread_id");
+    if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("pending_approval");
+    try writePendingApproval(s, turn.pending_approval);
+    try s.endObject();
+}
+
+fn writeChatTurnTail(s: *std.json.Stringify, turn: *const ChatTurn, after_seq: u64) !void {
+    try s.beginObject();
+    try s.objectField("status");
+    try s.write(@tagName(turn.status));
+    try s.objectField("events");
+    try s.beginArray();
+    for (turn.events.items) |event| {
+        if (event.seq <= after_seq) continue;
+        try s.beginObject();
+        try s.objectField("seq");
+        try s.write(event.seq);
+        try s.objectField("kind");
+        try s.write(event.kind);
+        try s.objectField("payload_json");
+        try s.write(event.payload_json);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.objectField("next_seq");
+    try s.write(turn.next_seq);
+    try s.objectField("provider_thread_id");
+    if (turn.provider_thread_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("active_turn_id");
+    if (turn.active_turn_id) |value| try s.write(value) else try s.write(null);
+    try s.objectField("result_reply_text");
+    if (turn.result_reply_text) |value| try s.write(value) else try s.write(null);
+    try s.objectField("error_message");
+    if (turn.error_message) |value| try s.write(value) else try s.write(null);
+    try s.objectField("pending_approval");
+    try writePendingApproval(s, turn.pending_approval);
+    try s.endObject();
+}
+
+fn writePendingApproval(s: *std.json.Stringify, pending: ?PendingApproval) !void {
+    const approval = pending orelse {
+        try s.write(null);
+        return;
+    };
+    try s.beginObject();
+    try s.objectField("call_id");
+    try s.write(approval.call_id);
+    try s.objectField("title");
+    try s.write(approval.title);
+    try s.objectField("body");
+    try s.write(approval.body);
+    try s.endObject();
+}
+
+fn createChatTurnFromParams(allocator: std.mem.Allocator, params: std.json.Value) !*ChatTurn {
+    const turn = try allocator.create(ChatTurn);
+    errdefer allocator.destroy(turn);
+    const image_paths = try jsonStringArray(allocator, params.object.get("image_paths") orelse .null);
+    errdefer freeStringArray(allocator, image_paths);
+    const provider = parseEnum(harness.Provider, jsonString(params.object.get("provider") orelse .null) orelse return error.InvalidParams) orelse return error.InvalidParams;
+    const harness_kind = parseEnum(harness.HarnessKind, jsonString(params.object.get("harness") orelse .null) orelse "local_cli") orelse return error.InvalidParams;
+    const request: send_runner.Request = .{
+        .provider = provider,
+        .harness_kind = harness_kind,
+        .project_path = try requiredDupe(allocator, params, "project_path"),
+        .prompt = try requiredDupe(allocator, params, "prompt"),
+        .image_paths = image_paths,
+        .provider_thread_id = try optionalDupe(allocator, params, "provider_thread_id"),
+        .thread_title = try requiredDupe(allocator, params, "thread_title"),
+        .model_ref = try optionalDupe(allocator, params, "model_ref"),
+        .reasoning_effort = if (jsonString(params.object.get("reasoning_effort") orelse .null)) |value| parseEnum(harness.ReasoningEffort, value) else null,
+        .opencode_reasoning_variant = try optionalDupe(allocator, params, "opencode_reasoning_variant"),
+        .cursor_model_params_json = try optionalDupe(allocator, params, "cursor_model_params_json"),
+        .fast_mode = if (jsonBool(params.object.get("fast_mode") orelse .null) orelse false) .on else .off,
+        .access_mode = parseAccessMode(jsonString(params.object.get("access_mode") orelse .null)),
+        .remote_ssh_host = try optionalDupe(allocator, params, "remote_ssh_host"),
+        .remote_cwd = try optionalDupe(allocator, params, "remote_cwd"),
+    };
+    turn.* = .{
+        .allocator = allocator,
+        .turn_id = try requiredDupe(allocator, params, "turn_id"),
+        .workspace_id = try requiredDupe(allocator, params, "workspace_id"),
+        .local_thread_id = try requiredDupe(allocator, params, "local_thread_id"),
+        .request = request,
+        .owned_image_paths = image_paths,
+    };
+    return turn;
+}
+
+fn chatTurnThread(allocator: std.mem.Allocator, turn: *ChatTurn) void {
+    const result = send_runner.run(allocator, turn.request, .{
+        .context = turn,
+        .on_thread_id = chatSinkThreadId,
+        .on_turn_id = chatSinkTurnId,
+        .on_stream_delta = chatSinkDelta,
+        .on_stream_event = chatSinkEvent,
+        .on_should_stop = chatSinkShouldStop,
+        .on_approval_request = chatSinkApproval,
+    });
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.cancel_requested or turn.status == .aborted) {
+        turn.worker_done = true;
+        return;
+    }
+    if (result) |value| {
+        turn.status = .completed;
+        if (turn.provider_thread_id) |old| allocator.free(old);
+        turn.provider_thread_id = allocator.dupe(u8, value.provider_thread_id) catch null;
+        turn.result_reply_text = allocator.dupe(u8, value.reply_text) catch null;
+        turn.appendEvent(allocator, "completed", "{}");
+        allocator.free(value.provider_thread_id);
+        allocator.free(value.reply_text);
+    } else |err| {
+        turn.status = if (turn.cancel_requested) .aborted else .failed;
+        turn.error_message = allocator.dupe(u8, @errorName(err)) catch null;
+        turn.appendStringEvent(allocator, if (turn.status == .aborted) "aborted" else "failed", "message", @errorName(err));
+    }
+    turn.worker_done = true;
+}
+
+fn chatSinkThreadId(context: ?*anyopaque, thread_id: []const u8) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.provider_thread_id) |old| allocator.free(old);
+    turn.provider_thread_id = allocator.dupe(u8, thread_id) catch null;
+    turn.appendStringEvent(allocator, "thread_id", "thread_id", thread_id);
+}
+
+fn chatSinkTurnId(context: ?*anyopaque, turn_id: []const u8) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    if (turn.active_turn_id) |old| allocator.free(old);
+    turn.active_turn_id = allocator.dupe(u8, turn_id) catch null;
+    turn.appendStringEvent(allocator, "turn_id", "turn_id", turn_id);
+}
+
+fn chatSinkDelta(context: ?*anyopaque, delta: []const u8) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    turn.appendStringEvent(allocator, "assistant_delta", "text", delta);
+}
+
+fn chatSinkEvent(context: ?*anyopaque, event: harness.StreamEvent) void {
+    const turn = chatTurnFromContext(context) orelse return;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    switch (event) {
+        .message => |message| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            var s: std.json.Stringify = .{ .writer = &writer.writer, .options = .{} };
+            s.beginObject() catch return;
+            s.objectField("title") catch return;
+            s.write(message.title) catch return;
+            s.objectField("body") catch return;
+            s.write(message.body) catch return;
+            s.endObject() catch return;
+            const payload = writer.toOwnedSlice() catch return;
+            defer allocator.free(payload);
+            turn.appendEvent(allocator, "message", payload);
+        },
+        .diff => turn.appendEvent(allocator, "diff", "{}"),
+    }
+}
+
+fn chatSinkShouldStop(context: ?*anyopaque) bool {
+    const turn = chatTurnFromContext(context) orelse return true;
+    lockTurn(turn);
+    defer turn.mutex.unlock();
+    return turn.cancel_requested or turn.status == .aborted;
+}
+
+fn chatSinkApproval(context: ?*anyopaque, request: harness.ApprovalRequest) harness.ApprovalDecision {
+    const turn = chatTurnFromContext(context) orelse return .deny;
+    const allocator = turn.allocator;
+    lockTurn(turn);
+    if (turn.pending_approval) |*old| {
+        old.deinit(allocator);
+        turn.pending_approval = null;
+    }
+    const call_id = allocator.dupe(u8, request.call_id) catch {
+        turn.mutex.unlock();
+        return .deny;
+    };
+    const title = allocator.dupe(u8, request.title) catch {
+        allocator.free(call_id);
+        turn.mutex.unlock();
+        return .deny;
+    };
+    const body = allocator.dupe(u8, request.body) catch {
+        allocator.free(call_id);
+        allocator.free(title);
+        turn.mutex.unlock();
+        return .deny;
+    };
+    turn.pending_approval = .{ .call_id = call_id, .title = title, .body = body };
+    turn.status = .waiting_approval;
+    turn.approval_decision = null;
+    turn.appendStringEvent(allocator, "approval_requested", "call_id", request.call_id);
+    turn.mutex.unlock();
+    while (true) {
+        sleepMs(20);
+        lockTurn(turn);
+        if (turn.cancel_requested) {
+            turn.mutex.unlock();
+            return .deny;
+        }
+        if (turn.approval_decision) |decision| {
+            turn.status = .running;
+            if (turn.pending_approval) |*approval| {
+                approval.deinit(allocator);
+                turn.pending_approval = null;
+            }
+            turn.mutex.unlock();
+            return if (decision == .approve) .approve else .deny;
+        }
+        turn.mutex.unlock();
+    }
+}
+
+fn chatTurnFromContext(context: ?*anyopaque) ?*ChatTurn {
+    const ptr = context orelse return null;
+    if (@intFromPtr(ptr) % @alignOf(ChatTurn) != 0) {
+        log.warn("daemon chat callback received misaligned context ptr=0x{x}", .{@intFromPtr(ptr)});
+        return null;
+    }
+    return @ptrCast(@alignCast(ptr));
+}
+
 fn touchAttachFromParams(session: *PtySession, params: std.json.Value) void {
     if (params != .object) return;
     const attach_id = jsonString(params.object.get("attach_id") orelse .null) orelse return;
@@ -1256,6 +1762,36 @@ fn jsonUsize(value: std.json.Value) ?usize {
 fn jsonU16(value: std.json.Value) ?u16 {
     const value_u32 = jsonU32(value) orelse return null;
     return if (value_u32 <= std.math.maxInt(u16)) @intCast(value_u32) else null;
+}
+
+fn jsonBool(value: std.json.Value) ?bool {
+    return switch (value) {
+        .bool => |v| v,
+        else => null,
+    };
+}
+
+fn parseEnum(comptime T: type, text: []const u8) ?T {
+    inline for (std.meta.fields(T)) |field| {
+        if (std.mem.eql(u8, field.name, text)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parseAccessMode(text: ?[]const u8) send_runner.AccessMode {
+    const value = text orelse return .full_access;
+    if (std.mem.eql(u8, value, "supervised")) return .supervised;
+    return .full_access;
+}
+
+fn requiredDupe(allocator: std.mem.Allocator, params: std.json.Value, field: []const u8) ![]u8 {
+    const text = jsonString(params.object.get(field) orelse .null) orelse return error.InvalidParams;
+    return try allocator.dupe(u8, text);
+}
+
+fn optionalDupe(allocator: std.mem.Allocator, params: std.json.Value, field: []const u8) !?[]u8 {
+    const text = jsonString(params.object.get(field) orelse .null) orelse return null;
+    return try allocator.dupe(u8, text);
 }
 
 fn jsonStringArray(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {

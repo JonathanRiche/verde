@@ -191,10 +191,20 @@ Do not force parity where the provider API does not expose equivalent behavior.
 
 ### Claude
 
-- The current bridge uses the Claude Agent SDK for prompts, sessions, models, and streaming.
-- Claude CLI has interactive slash commands, but the current bridge does not expose a command-dispatch API.
-- `/compact` should only be added if the SDK or stream-json input supports a documented command event.
-- `/usage` can be derived from message usage metadata if available.
+- The current bridge uses the Claude Agent SDK for prompts, sessions, models, and streaming, but it does not yet expose slash-command discovery or command dispatch.
+- The repo has been upgraded from `@anthropic-ai/claude-agent-sdk` `^0.2.132` / installed `0.2.139` to `^0.3.186`.
+- Re-check typings and behavior against the current docs before implementation details are locked in, because the SDK marks some control APIs as experimental.
+- Current Claude Code docs say SDK slash commands are dispatchable by sending the slash command as the prompt text. The `system/init` message lists available commands, and the SDK also exposes `supportedCommands()`.
+- Upgraded typings include `supportedCommands()`, `SlashCommand`, `SDKCommandsChangedMessage`, `SDKCompactBoundaryMessage`, `getContextUsage()`, experimental structured usage, and result usage fields (`total_cost_usd`, `usage`, `modelUsage`), so the bridge should be extended rather than replaced with raw CLI process control.
+- `/compact` can be a real SDK-backed command if it appears in the session's supported commands. Dispatch it by sending `/compact` or `/compact <instructions>` as the prompt and watch for `system/compact_boundary`.
+- `/usage` should use SDK usage/cost fields where possible. The SDK docs state per-query result costs are estimates and each `query()` call reports its own total, so Verde must accumulate per-thread/session totals itself if we want a session-level GUI summary.
+- Custom Claude commands and skills are first-class SDK slash commands. They can come from `.claude/commands/` and the recommended `.claude/skills/<name>/SKILL.md` format, plus bundled skills such as `/code-review`, `/debug`, `/loop`, and `/batch`.
+- Only commands that work without an interactive terminal are dispatchable through the SDK. Do not show terminal-only commands as runnable GUI commands unless they appear in `supportedCommands()`.
+- Sources reviewed:
+  - https://code.claude.com/docs/en/agent-sdk/slash-commands
+  - https://code.claude.com/docs/en/commands
+  - https://code.claude.com/docs/en/agent-sdk/cost-tracking
+  - https://code.claude.com/docs/en/agent-sdk/typescript
 
 ### Cursor
 
@@ -210,11 +220,105 @@ Do not force parity where the provider API does not expose equivalent behavior.
 
 | Command | Codex | OpenCode | Claude | Cursor |
 | --- | --- | --- | --- | --- |
-| `/compact` | `thread/compact/start` | Investigate | Investigate SDK support | Investigate |
-| `/goal` | `thread/goal/*` | Unsupported initially | Unsupported initially | Unsupported initially |
-| `/usage` | `account/usage/read` + token updates | Investigate stats | Derive from usage metadata | Derive if available |
-| `/review` | `review/start` | Unsupported initially | Maybe provider-specific later | Maybe provider-specific later |
+| `/compact` | `thread/compact/start` | Investigate | SDK prompt dispatch when `supportedCommands()` includes `compact`; watch `compact_boundary` | Investigate |
+| `/goal` | `thread/goal/*` | Unsupported initially | SDK command if `supportedCommands()` includes `goal`; otherwise unsupported | Unsupported initially |
+| `/usage` | `account/usage/read` + token updates | Investigate stats | SDK result usage/cost; optionally dispatch `/usage` when supported for provider-formatted summary | Derive if available |
+| `/review` | `review/start` | Unsupported initially | Prefer `/code-review` skill when supported; `/review` is PR review only | Maybe provider-specific later |
+| `/loop` | Unsupported initially | Unsupported initially | Bundled skill when supported; likely Claude-specific | Unsupported initially |
 | `/shell` | Defer pending confirmation UX | Unsupported initially | Unsupported initially | Existing skill/template only |
+
+## Claude Phase 1
+
+Implement Claude after the Codex path. The SDK dependency has already been bumped to the current npm release during planning, so the next implementation step is to adapt the bridge to the upgraded API surface.
+
+### SDK Upgrade Baseline
+
+- `@anthropic-ai/claude-agent-sdk` is now `^0.3.186` in `package.json`.
+- `bun.lock` has been refreshed for the upgraded SDK.
+- Bun reported peer warnings for the existing `zod` and `@anthropic-ai/sdk` versions during the upgrade; validate whether those warnings matter before shipping Claude slash-command work.
+- Re-run TypeScript bridge checks/builds that cover `provider_bridge.ts`.
+- Re-check these SDK APIs before implementation:
+  - `query({ prompt, options })`
+  - `query.supportedCommands()`
+  - `system/init.slash_commands`
+  - `system/commands_changed`
+  - `system/compact_boundary`
+  - `query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()`
+  - result fields `total_cost_usd`, `usage`, and `modelUsage`
+  - assistant-message nested `message.usage`
+
+If any of these SDK shapes shift again, adapt the bridge to the current SDK rather than preserving old `0.2.x` assumptions.
+
+### Bridge Additions
+
+- Add a Claude bridge command for slash discovery, for example `claude_slash_commands`.
+  - Build normal Claude options from the active project/thread context.
+  - Prefer `supportedCommands()` when available.
+  - Fall back to reading `system/init.slash_commands` from a low-turn query only if needed.
+  - Listen for `system/commands_changed` during normal sends and slash execution, and replace the cached command list for that session when it appears.
+  - Return command name, description, argument hint, aliases, and whether the command is built-in or custom if the SDK exposes that.
+- Add a Claude bridge command for slash execution, for example `claude_run_slash_command`.
+  - Validate the requested command is present in the discovered command list.
+  - Dispatch by calling `query({ prompt: "/name args", options })`.
+  - Pass `resume: thread_id` so command effects apply to the current Claude session.
+  - Stream assistant/tool/system events through the same handlers as normal sends.
+  - Convert command-only output into `RunSlashCommandResult` notices/transcript rows.
+- Add Claude-specific parsing/formatting for:
+  - `compact_boundary` metadata,
+  - result cost/usage,
+  - provider-formatted `/usage` output if emitted as local command output,
+  - command-not-found or non-dispatchable command errors.
+
+### `/usage`
+
+Ship `/usage` first.
+
+- Capture each Claude `result` message during normal sends and slash command runs.
+- Evaluate `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET()` as an optional structured source for `/usage`; gate it defensively because the SDK says it is unstable.
+- Store enough per-thread usage state to show:
+  - last turn cost estimate,
+  - accumulated GUI-session estimate,
+  - input/output/cache token totals when available,
+  - per-model breakdown from `modelUsage`.
+- Make the UI copy clear that SDK costs are estimates, not authoritative billing.
+- If `supportedCommands()` includes `usage`, optionally dispatch `/usage` for Claude's own formatted summary and append it as a transcript row. Keep Verde's structured summary available so the GUI is consistent across providers.
+
+### `/compact`
+
+Ship `/compact` after `/usage`.
+
+- Require an existing Claude thread/session.
+- Only enable when discovery says `compact` is supported.
+- Dispatch `/compact` plus optional instructions through `query()`.
+- Treat `system/compact_boundary` as successful completion and display pre/post token metadata when present.
+- Refresh/read the session afterward so the GUI transcript reflects the compacted state.
+
+### Custom Commands And Skills
+
+Treat Claude custom commands as provider-discovered commands, not as Verde-authored prompt templates.
+
+- Include commands returned by `supportedCommands()` in the slash picker.
+- Show aliases like `/cost` and `/stats` for `/usage` only if the SDK returns them.
+- Support argument hints from the SDK.
+- Do not scan `~/.claude` or `.claude` directly for the first version unless SDK discovery misses commands we need; direct filesystem scanning risks diverging from Claude's real command visibility rules.
+- Respect non-interactive dispatchability: commands absent from `supportedCommands()` should not be runnable from the GUI.
+
+### Claude Command Candidates
+
+- Common first:
+  - `/usage`
+  - `/compact`
+- Claude-specific next:
+  - `/code-review`
+  - `/debug`
+  - `/loop`
+  - `/batch`
+  - `/skills`
+- Likely not first-pass GUI commands:
+  - `/clear`, because Verde already owns thread/session creation and reset semantics.
+  - `/model` and `/effort`, because Verde already has provider/model controls and should update those controls directly.
+  - `/permissions`, `/config`, `/theme`, `/vim`, `/terminal-setup`, because they are interactive terminal/config UI commands.
+  - `/review`, unless the user specifically wants GitHub PR review; Claude's local diff review command is `/code-review`.
 
 ## Testing Plan
 

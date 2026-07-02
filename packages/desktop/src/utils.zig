@@ -135,6 +135,28 @@ pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const 
     };
 }
 
+pub fn openUrlInDefaultBrowser(allocator: std.mem.Allocator, url: []const u8) OpenProjectError!void {
+    return switch (@import("builtin").os.tag) {
+        .macos => {
+            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=open url={s}", .{url});
+            return spawnDetached(allocator, &.{ "open", url }, null);
+        },
+        .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            if (commandExists("xdg-open")) {
+                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=xdg-open url={s}", .{url});
+                return spawnDetached(allocator, &.{ "xdg-open", url }, null);
+            }
+            if (commandExists("gio")) {
+                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=gio open url={s}", .{url});
+                return spawnDetached(allocator, &.{ "gio", "open", url }, null);
+            }
+            runtime_log.diagnostic("openUrlInDefaultBrowser launcher unavailable url={s}", .{url});
+            return error.LauncherUnavailable;
+        },
+        else => error.UnsupportedOperatingSystem,
+    };
+}
+
 pub fn canOpenProjectEditor(target: app_state.ProjectEditorTarget) bool {
     return switch (target) {
         .configured => canOpenConfiguredEditor(),
@@ -422,6 +444,7 @@ fn runDirectoryPickerCommand(
 
 pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void {
     const page_alloc = std.heap.page_allocator;
+    const request_cwd = request.remote_cwd orelse request.project_path;
     defer {
         page_alloc.free(request.project_path);
         page_alloc.free(request.prompt);
@@ -433,6 +456,8 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         if (request.model_ref) |model_ref| page_alloc.free(model_ref);
         if (request.opencode_reasoning_variant) |variant| page_alloc.free(variant);
         if (request.cursor_model_params_json) |params| page_alloc.free(params);
+        if (request.remote_ssh_host) |host| page_alloc.free(host);
+        if (request.remote_cwd) |cwd| page_alloc.free(cwd);
         page_alloc.destroy(request);
     }
 
@@ -440,7 +465,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         "[codex-debug] sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}\n",
         .{
             @tagName(request.provider),
-            request.project_path,
+            request_cwd,
             request.model_ref orelse "(default)",
             request.provider_thread_id orelse "(new)",
             request.prompt.len,
@@ -450,7 +475,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         "sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
         .{
             @tagName(request.provider),
-            request.project_path,
+            request_cwd,
             request.model_ref orelse "(default)",
             request.provider_thread_id orelse "(new)",
             request.prompt.len,
@@ -482,7 +507,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
             "[codex-debug] sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}\n",
             .{
                 @tagName(request.provider),
-                request.project_path,
+                request_cwd,
                 request.model_ref orelse "(default)",
                 request.provider_thread_id orelse "(new)",
                 @errorName(err),
@@ -492,7 +517,7 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
             "sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}",
             .{
                 @tagName(request.provider),
-                request.project_path,
+                request_cwd,
                 request.model_ref orelse "(default)",
                 request.provider_thread_id orelse "(new)",
                 @errorName(err),
@@ -527,6 +552,8 @@ pub const SendWorkerRequest = struct {
     cursor_model_params_json: ?[]u8,
     fast_mode: app_state.FastMode,
     access_mode: app_state.AccessMode,
+    remote_ssh_host: ?[]u8 = null,
+    remote_cwd: ?[]u8 = null,
 };
 pub fn runSendWorker(
     allocator: std.mem.Allocator,
@@ -536,28 +563,37 @@ pub fn runSendWorker(
         return error.UnsupportedHarnessMode;
     }
 
+    if (request.remote_ssh_host != null and request.provider != .codex) {
+        return error.UnsupportedRemoteProvider;
+    }
+    const request_cwd = request.remote_cwd orelse request.project_path;
+
     const provider_config = switch (request.provider) {
         .opencode => ai_harness.ProviderConfig{
             .opencode = .{
                 .allocator = allocator,
-                .working_directory = request.project_path,
+                .working_directory = request_cwd,
                 .launch_if_missing = true,
             },
         },
         .codex => ai_harness.ProviderConfig{
             .codex = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
                 .launch_on_connect = true,
+                .remote_ssh = if (request.remote_ssh_host) |host| .{
+                    .host = host,
+                    .cwd = request_cwd,
+                } else null,
             },
         },
         .claude => ai_harness.ProviderConfig{
             .claude = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
             },
         },
         .cursor => ai_harness.ProviderConfig{
             .cursor = .{
-                .cwd = request.project_path,
+                .cwd = request_cwd,
                 .model = request.model_ref,
             },
         },
@@ -567,7 +603,7 @@ pub fn runSendWorker(
         "send worker starting provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
         .{
             @tagName(request.provider),
-            request.project_path,
+            request_cwd,
             request.model_ref orelse "(default)",
             request.provider_thread_id orelse "(new)",
             request.prompt.len,
@@ -591,7 +627,7 @@ pub fn runSendWorker(
         .prompt = request.prompt,
         .image = if (request.image_path) |image_path| .{ .path = image_path } else null,
         .images = image_attachments,
-        .cwd = request.project_path,
+        .cwd = request_cwd,
         .model = request.model_ref,
         .opencode_variant = if (request.provider == .opencode) request.opencode_reasoning_variant else null,
         .cursor_model_params_json = if (request.provider == .cursor) request.cursor_model_params_json else null,
@@ -611,7 +647,7 @@ pub fn runSendWorker(
             "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}\n",
             .{
                 @tagName(request.provider),
-                request.project_path,
+                request_cwd,
                 request.model_ref orelse "(default)",
                 request.provider_thread_id orelse "(new)",
                 @errorName(err),
@@ -621,7 +657,7 @@ pub fn runSendWorker(
             "client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
             .{
                 @tagName(request.provider),
-                request.project_path,
+                request_cwd,
                 request.model_ref orelse "(default)",
                 request.provider_thread_id orelse "(new)",
                 @errorName(err),
@@ -631,7 +667,7 @@ pub fn runSendWorker(
             "send worker failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
             .{
                 @tagName(request.provider),
-                request.project_path,
+                request_cwd,
                 request.model_ref orelse "(default)",
                 request.provider_thread_id orelse "(new)",
                 @errorName(err),
@@ -1233,6 +1269,10 @@ fn formatSendWorkerError(
         error.CursorAcpFailed => allocator.dupe(
             u8,
             "Cursor ACP request failed. Check that the Cursor CLI works with `agent status` and `agent acp`.",
+        ),
+        error.UnsupportedRemoteProvider => allocator.dupe(
+            u8,
+            "Remote Herdr GUI sends currently support Codex only. Use the Herdr terminal/TUI pane for this provider.",
         ),
         else => std.fmt.allocPrint(allocator, "Provider request failed: {s}", .{@errorName(err)}),
     };

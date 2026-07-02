@@ -22,6 +22,7 @@ const TERMINAL_SCROLLBAR_MIN_THUMB_CSS: f32 = 28.0;
 const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
 const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
 const TERMINAL_SCROLLBAR_VERTICAL_PAD_CSS: f32 = 4.0;
+const MAX_TERMINAL_LINK_BYTES: usize = 2048;
 
 const TerminalContextMenuKind = enum {
     pane,
@@ -192,6 +193,39 @@ const TerminalSelection = struct {
     focus: TerminalCellCoord = .{},
 };
 
+const PendingLinkClick = struct {
+    active: bool = false,
+    dock_id: u32 = 0,
+    pane_id: u32 = 0,
+    start_x: f32 = 0.0,
+    start_y: f32 = 0.0,
+    coord: TerminalCellCoord = .{},
+    href_len: usize = 0,
+    href: [MAX_TERMINAL_LINK_BYTES]u8 = undefined,
+
+    fn value(self: *const PendingLinkClick) []const u8 {
+        return self.href[0..self.href_len];
+    }
+};
+
+const TerminalUrlCellRanges = struct {
+    count: usize = 0,
+    ranges: [32]struct { start: usize, end: usize } = undefined,
+
+    fn add(self: *TerminalUrlCellRanges, start: usize, end: usize) void {
+        if (self.count >= self.ranges.len or end < start) return;
+        self.ranges[self.count] = .{ .start = start, .end = end };
+        self.count += 1;
+    }
+
+    fn covers(self: *const TerminalUrlCellRanges, column: usize) bool {
+        for (self.ranges[0..self.count]) |range| {
+            if (column >= range.start and column <= range.end) return true;
+        }
+        return false;
+    }
+};
+
 const TabHit = struct {
     dock_id: u32 = 0,
     index: usize = 0,
@@ -234,6 +268,7 @@ const TerminalHitCache = struct {
 
 var hit_cache: TerminalHitCache = .{};
 var selection_state: TerminalSelection = .{};
+var pending_link_click: PendingLinkClick = .{};
 var draw_cache: TerminalDrawCache = .{};
 var active_capture: ?*TerminalPaneDrawCache = null;
 var terminal_layout_log_enabled: ?bool = null;
@@ -290,6 +325,9 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
 }
 
 pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool {
+    if (pending_link_click.active and selectionDragDistanceExceededFrom(pending_link_click.start_x, pending_link_click.start_y, x, y)) {
+        pending_link_click = .{};
+    }
     if (!selection_state.dragging) return false;
     updateSelectionFocus(state, x, y) orelse return true;
     selection_state.moved = true;
@@ -302,6 +340,7 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {
     if (state.projects.items.len == 0) return false;
+    if (button == 1 and !down and pending_link_click.active) return finishPendingLinkClick(state, x, y);
     if (button == 1 and hit_cache.menu_open) {
         if (!down) return true;
         const dock = state.currentProjectTerminalDockMutable(hit_cache.menu_dock_id) orelse return false;
@@ -344,6 +383,7 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, butt
             hit_cache.menu_open = false;
             return true;
         }
+        if (beginPendingLinkClick(state, x, y)) return true;
         // Try to begin a selection candidate first — it requires both a pane
         // hit AND a valid cell at the click, so clicks in the inset/padding
         // zone fall through to the focus-only branch below.
@@ -556,6 +596,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
         const row_graphemes = cells_slice.items(.grapheme);
         const row_y = grid_rect.y + @as(f32, @floatFromInt(visual_y)) * cell_h;
         if (row_y >= rect.y + rect.h) break;
+        const url_ranges = terminalUrlCellRanges(state.allocator, cells) catch TerminalUrlCellRanges{};
 
         const row_visible_cols = @min(raw_cells.len, visible_cols);
         for (raw_cells[0..row_visible_cols], 0..) |raw_cell, x| {
@@ -625,6 +666,9 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
                 .w = text_rect.w,
                 .h = text_rect.h,
             }, text, rgbPaletteColor(fg, foregroundAlpha(cell_style)), draw_font_size, intersectRect(if (glyph_kind != .text or glyphNeedsRelaxedClip(raw_cell.codepoint())) rect else cell_rect, rect), glyph_kind);
+            if (url_ranges.covers(x)) {
+                drawTerminalLinkUnderline(state, cell_rect, rgbPaletteColor(fg, foregroundAlpha(cell_style)), rect);
+            }
         }
     }
 }
@@ -816,13 +860,13 @@ fn performContextMenuAction(state: *app_state.AppState, dock: anytype, action: T
     };
     switch (action) {
         .copy_selection => _ = copySelectionToClipboard(state),
-        .new_tab => dock.createTab(state.allocator) catch |err| app_state.log.warn("failed to create terminal tab: {s}", .{@errorName(err)}),
-        .new_claude_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .claude, .label = "Claude" }) catch |err| app_state.log.warn("failed to create Claude terminal tab: {s}", .{@errorName(err)}),
-        .new_opencode_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .opencode, .label = "OpenCode" }) catch |err| app_state.log.warn("failed to create OpenCode terminal tab: {s}", .{@errorName(err)}),
-        .new_codex_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .codex, .label = "Codex" }) catch |err| app_state.log.warn("failed to create Codex terminal tab: {s}", .{@errorName(err)}),
-        .new_cursor_tab => dock.createTabWithProfile(state.allocator, .{ .kind = .cursor, .label = "Cursor" }) catch |err| app_state.log.warn("failed to create Cursor terminal tab: {s}", .{@errorName(err)}),
+        .new_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{}),
+        .new_claude_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .claude, .label = "Claude" }),
+        .new_opencode_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .opencode, .label = "OpenCode" }),
+        .new_codex_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .codex, .label = "Codex" }),
+        .new_cursor_tab => _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, .{ .kind = .cursor, .label = "Cursor" }),
         .new_custom_tab => if (state.firstCustomTerminalLaunchProfile()) |profile| {
-            dock.createTabWithProfile(state.allocator, profile) catch |err| app_state.log.warn("failed to create custom terminal tab: {s}", .{@errorName(err)});
+            _ = state.createCurrentProjectTerminalTab(hit_cache.menu_dock_id, profile);
         },
         .rename_tab => if (dock.activeTab()) |tab| dock.beginRenameTab(tab.id),
         .close_tab => dock.closeTab(state.allocator, hit_cache.menu_tab_index) catch |err| app_state.log.warn("failed to close terminal tab: {s}", .{@errorName(err)}),
@@ -866,6 +910,180 @@ fn focusTerminal(state: *app_state.AppState) void {
     state.requestTerminalDockFocus(if (hit_cache.menu_open) hit_cache.menu_dock_id else hit_cache.dock_id);
 }
 
+fn beginPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    hit_cache.dock_id = target.dock_id;
+    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return false;
+    // Full-screen TUIs that requested mouse input own plain clicks; do not
+    // steal those events for link opening.
+    if (dock.paneWantsMouseInput(target.pane_id)) return false;
+    const coord = cellAtPoint(state, target, x, y) orelse return false;
+    const href = linkAtCell(state.allocator, dock, target.pane_id, coord) catch |err| {
+        log.warn("failed to hit-test terminal link: {s}", .{@errorName(err)});
+        return false;
+    } orelse return false;
+    defer state.allocator.free(href);
+    if (href.len == 0 or href.len > pending_link_click.href.len) return false;
+
+    var mutable_dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    mutable_dock.focusPane(target.pane_id);
+    if (workspacePaneIdForDock(state, target.dock_id)) |workspace_pane_id| {
+        _ = state.focusCurrentProjectWorkspacePane(workspace_pane_id);
+    }
+    focusTerminal(state);
+    clearSelection();
+    pending_link_click = .{
+        .active = true,
+        .dock_id = target.dock_id,
+        .pane_id = target.pane_id,
+        .start_x = x,
+        .start_y = y,
+        .coord = coord,
+        .href_len = href.len,
+    };
+    @memcpy(pending_link_click.href[0..href.len], href);
+    hit_cache.menu_open = false;
+    if (mutable_dock.consumeWorkspaceChange()) state.markDirty();
+    state.markDirty();
+    return true;
+}
+
+fn finishPendingLinkClick(state: *app_state.AppState, x: f32, y: f32) bool {
+    const click = pending_link_click;
+    pending_link_click = .{};
+    if (selectionDragDistanceExceededFrom(click.start_x, click.start_y, x, y)) return true;
+    const target = paneAtPoint(x, y) orelse return true;
+    if (target.dock_id != click.dock_id or target.pane_id != click.pane_id) return true;
+    const coord = cellAtPoint(state, target, x, y) orelse return true;
+    if (coord.x != click.coord.x or coord.y != click.coord.y) return true;
+
+    state.openConfiguredWebLink(click.value());
+    state.markDirty();
+    return true;
+}
+
+fn linkAtCell(allocator: std.mem.Allocator, dock: *const terminal.Dock, pane_id: u32, coord: TerminalCellCoord) !?[]u8 {
+    const render_state = dock.renderStateForPane(pane_id) orelse return null;
+    const row_data = render_state.row_data.slice();
+    const row_cells = row_data.items(.cells);
+    if (coord.y >= row_cells.len) return null;
+
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(allocator);
+    var byte_cols: std.ArrayList(usize) = .empty;
+    defer byte_cols.deinit(allocator);
+    try appendTerminalRowText(allocator, row_cells[coord.y], &row_text, &byte_cols);
+    return urlAtRowColumn(allocator, row_text.items, byte_cols.items, coord.x);
+}
+
+fn appendTerminalRowText(
+    allocator: std.mem.Allocator,
+    row: anytype,
+    output: *std.ArrayList(u8),
+    byte_cols: *std.ArrayList(usize),
+) !void {
+    const cells_slice = row.slice();
+    const raw_cells = cells_slice.items(.raw);
+    const row_graphemes = cells_slice.items(.grapheme);
+    for (raw_cells, 0..) |raw_cell, x| {
+        if (raw_cell.wide == .spacer_tail) continue;
+        var text_buf: [128]u8 = undefined;
+        const text = if (raw_cell.hasText())
+            cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse " "
+        else
+            " ";
+        try output.appendSlice(allocator, text);
+        for (0..text.len) |_| try byte_cols.append(allocator, x);
+    }
+}
+
+fn terminalUrlCellRanges(allocator: std.mem.Allocator, row: anytype) !TerminalUrlCellRanges {
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(allocator);
+    var byte_cols: std.ArrayList(usize) = .empty;
+    defer byte_cols.deinit(allocator);
+    try appendTerminalRowText(allocator, row, &row_text, &byte_cols);
+
+    var result: TerminalUrlCellRanges = .{};
+    var index: usize = 0;
+    while (index < row_text.items.len) {
+        const start = nextUrlStart(row_text.items, index) orelse break;
+        var end = start;
+        while (end < row_text.items.len and isUrlBodyByte(row_text.items[end])) : (end += 1) {}
+        end = trimUrlEnd(row_text.items, start, end);
+        if (urlByteRangeColumns(byte_cols.items, start, end)) |cols| {
+            result.add(cols.start, cols.end);
+        }
+        index = @max(end, start + 1);
+    }
+    return result;
+}
+
+fn urlAtRowColumn(allocator: std.mem.Allocator, row_text: []const u8, byte_cols: []const usize, column: usize) !?[]u8 {
+    if (row_text.len == 0 or row_text.len != byte_cols.len) return null;
+    var index: usize = 0;
+    while (index < row_text.len) {
+        const start = nextUrlStart(row_text, index) orelse return null;
+        var end = start;
+        while (end < row_text.len and isUrlBodyByte(row_text[end])) : (end += 1) {}
+        end = trimUrlEnd(row_text, start, end);
+        if (end > start and columnWithinByteRange(byte_cols, start, end, column)) {
+            return try allocator.dupe(u8, row_text[start..end]);
+        }
+        index = @max(end, start + 1);
+    }
+    return null;
+}
+
+fn nextUrlStart(text: []const u8, start: usize) ?usize {
+    const schemes = [_][]const u8{ "https://", "http://", "file://" };
+    var best: ?usize = null;
+    for (schemes) |scheme| {
+        if (std.mem.indexOfPos(u8, text, start, scheme)) |found| {
+            if (best == null or found < best.?) best = found;
+        }
+    }
+    return best;
+}
+
+fn isUrlBodyByte(byte: u8) bool {
+    return switch (byte) {
+        0...32, '"', '\'', '<', '>', '`' => false,
+        else => true,
+    };
+}
+
+fn trimUrlEnd(text: []const u8, start: usize, end: usize) usize {
+    var result = end;
+    while (result > start) {
+        switch (text[result - 1]) {
+            '.', ',', ';', ':', '!', '?', ')', ']', '}' => result -= 1,
+            else => break,
+        }
+    }
+    return result;
+}
+
+fn columnWithinByteRange(byte_cols: []const usize, start: usize, end: usize, column: usize) bool {
+    if (start >= end or end > byte_cols.len) return false;
+    for (byte_cols[start..end]) |byte_col| {
+        if (byte_col == column) return true;
+    }
+    return false;
+}
+
+fn urlByteRangeColumns(byte_cols: []const usize, start: usize, end: usize) ?struct { start: usize, end: usize } {
+    if (start >= end or end > byte_cols.len) return null;
+    var min_col: usize = std.math.maxInt(usize);
+    var max_col: usize = 0;
+    for (byte_cols[start..end]) |byte_col| {
+        min_col = @min(min_col, byte_col);
+        max_col = @max(max_col, byte_col);
+    }
+    if (min_col == std.math.maxInt(usize)) return null;
+    return .{ .start = min_col, .end = max_col };
+}
+
 fn beginSelectionCandidate(state: *app_state.AppState, x: f32, y: f32) bool {
     const target = paneAtPoint(x, y) orelse return false;
     const coord = cellAtPoint(state, target, x, y) orelse return false;
@@ -891,8 +1109,12 @@ fn beginSelectionCandidate(state: *app_state.AppState, x: f32, y: f32) bool {
 }
 
 fn selectionDragDistanceExceeded(x: f32, y: f32) bool {
-    const dx = x - selection_state.start_x;
-    const dy = y - selection_state.start_y;
+    return selectionDragDistanceExceededFrom(selection_state.start_x, selection_state.start_y, x, y);
+}
+
+fn selectionDragDistanceExceededFrom(start_x: f32, start_y: f32, x: f32, y: f32) bool {
+    const dx = x - start_x;
+    const dy = y - start_y;
     return dx * dx + dy * dy >= 16.0;
 }
 
@@ -1087,6 +1309,16 @@ fn drawCursor(state: *app_state.AppState, render_state: *const ghostty_vt.Render
         .bar => queueClippedRect(state, .{ .x = rect.x, .y = rect.y, .w = @max(rect.w * 0.12, theme.scaledUi(2.0)), .h = rect.h }, color, clip),
         .underline => queueClippedRect(state, .{ .x = rect.x, .y = rect.y + rect.h - @max(rect.h * 0.1, theme.scaledUi(2.0)), .w = rect.w, .h = @max(rect.h * 0.1, theme.scaledUi(2.0)) }, color, clip),
     }
+}
+
+fn drawTerminalLinkUnderline(state: *app_state.AppState, rect: palette.Rect, color: palette.Color, clip: palette.Rect) void {
+    const line_h = @max(theme.scaledUi(1.0), 1.0);
+    queueClippedRect(state, .{
+        .x = rect.x,
+        .y = rect.y + rect.h - line_h - @max(theme.scaledUi(1.0), 1.0),
+        .w = rect.w,
+        .h = line_h,
+    }, color, clip);
 }
 
 fn rawCellNeedsFill(cell: ghostty_vt.Cell) bool {

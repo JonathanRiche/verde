@@ -18,6 +18,8 @@ pub const Control = enum(u8) {
     open_cursor,
     open_vscode,
     open_zed,
+    links_verde_browser,
+    links_system_browser,
     hooks_claude,
     hooks_codex,
     hooks_amp,
@@ -97,6 +99,8 @@ const SettingsLayout = struct {
     terminal_font_dec: palette.Rect,
     terminal_font_inc: palette.Rect,
     terminal_hint_y: f32,
+    links_verde_browser: palette.Rect,
+    links_system_browser: palette.Rect,
     workspace_card: palette.Rect,
     open_cells: [OPEN_CHOICES.len]palette.Rect,
     custom_open: ?palette.Rect = null,
@@ -172,7 +176,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const custom_extra: f32 = if (state.settings_draft.open_action == .custom) m.row_h + m.inner_gap else 0.0;
 
     const appearance_h = m.labeledBlockH(2);
-    const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h;
+    const terminal_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.row_h + m.inner_gap + m.label_h + m.row_gap + m.label_h + m.inner_gap + m.row_h;
     const workspace_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + open_grid_h + custom_extra;
     // Title, field label, three toggle rows (Claude + Codex + Amp), hint.
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
@@ -240,6 +244,11 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const terminal_font_y = terminal_card.y + m.card_pad + m.title_h + m.row_gap;
     const terminal_stepper = stepperRects(terminal_card, m.card_pad, terminal_font_y, m);
     const terminal_hint_y = terminal_font_y + m.row_h + m.inner_gap;
+    const link_label_y = terminal_hint_y + m.label_h + m.row_gap;
+    const link_row_y = link_label_y + m.label_h + m.inner_gap;
+    const link_cell_w = (content_w - m.card_pad * 2.0 - m.inner_gap) * 0.5;
+    const links_verde_browser: palette.Rect = .{ .x = terminal_card.x + m.card_pad, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
+    const links_system_browser: palette.Rect = .{ .x = links_verde_browser.x + link_cell_w + m.inner_gap, .y = link_row_y, .w = link_cell_w, .h = m.row_h };
 
     y += terminal_h + m.card_gap;
 
@@ -305,6 +314,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .terminal_font_dec = terminal_stepper.dec,
         .terminal_font_inc = terminal_stepper.inc,
         .terminal_hint_y = terminal_hint_y,
+        .links_verde_browser = links_verde_browser,
+        .links_system_browser = links_system_browser,
         .workspace_card = workspace_card,
         .open_cells = open_cells,
         .custom_open = custom_open,
@@ -362,6 +373,8 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
     queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
     queueControlHit(state, layout.terminal_font_inc, layout.body_clip, .terminal_font_inc, queue_hit);
+    queueControlHit(state, layout.links_verde_browser, layout.body_clip, .links_verde_browser, queue_hit);
+    queueControlHit(state, layout.links_system_browser, layout.body_clip, .links_system_browser, queue_hit);
     for (OPEN_CHOICES, 0..) |choice, index| {
         queueControlHit(state, layout.open_cells[index], layout.body_clip, choice.control, queue_hit);
     }
@@ -406,6 +419,14 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.terminal_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, profile_line, paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
+    queueText(state, .{
+        .x = layout.terminal_card.x + m.card_pad,
+        .y = layout.links_verde_browser.y - m.inner_gap - m.label_h,
+        .w = layout.terminal_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, "Terminal link clicks", paletteColor(textLabel()), theme.scaledUi(11.5), layout.body_clip);
+    drawToggleCell(state, layout.links_verde_browser, "Verde browser", state.settings_draft.link_open_target == .verde_browser, isControlHovered(state, .links_verde_browser), layout.body_clip);
+    drawToggleCell(state, layout.links_system_browser, "Default browser", state.settings_draft.link_open_target == .system_browser, isControlHovered(state, .links_system_browser), layout.body_clip);
 
     // Workspace
     drawCardTitle(state, layout.workspace_card, "Workspace", layout.body_clip);
@@ -521,6 +542,8 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .open_cursor => state.settings_draft.open_action = .cursor,
         .open_vscode => state.settings_draft.open_action = .vscode,
         .open_zed => state.settings_draft.open_action = .zed,
+        .links_verde_browser => state.settings_draft.link_open_target = .verde_browser,
+        .links_system_browser => state.settings_draft.link_open_target = .system_browser,
         // Acts immediately (filesystem side effect), independent of Save/Cancel.
         .hooks_claude => {
             state.toggleClaudeGlobalHooks();
