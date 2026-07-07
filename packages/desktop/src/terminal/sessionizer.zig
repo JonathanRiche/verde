@@ -395,20 +395,6 @@ const PtySession = struct {
         _ = self.captureExitStatus();
     }
 
-    fn pollSettle(self: *PtySession, allocator: std.mem.Allocator) !usize {
-        const before = self.output_ring.items.len;
-        try self.poll(allocator);
-        var previous_len = self.output_ring.items.len;
-        var index: usize = 0;
-        while (index < 3) : (index += 1) {
-            sleepMs(5);
-            try self.poll(allocator);
-            if (self.output_ring.items.len == previous_len) break;
-            previous_len = self.output_ring.items.len;
-        }
-        return self.output_ring.items.len -| before;
-    }
-
     fn writeInput(self: *PtySession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
         try writeAll(self.master_fd, bytes);
@@ -1042,27 +1028,24 @@ pub const Daemon = struct {
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
-        const start_total = session.output_total;
         const wrote = try session.writeInput(text);
-        const output_bytes = if (wrote) try session.pollSettle(self.allocator) else 0;
-        const new_count = session.output_total - start_total;
-        const ring = session.output_ring.items;
-        const slice_start = if (new_count >= ring.len) 0 else ring.len - @as(usize, @intCast(new_count));
-        const output_text = try self.allocator.dupe(u8, ring[slice_start..]);
-        defer self.allocator.free(output_text);
         log.info(
-            "write id={s} pid={d} pgrp={?d} input_bytes={d} output_bytes={d}",
-            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), text.len, output_bytes },
+            "write id={s} pid={d} pgrp={?d} input_bytes={d}",
+            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), text.len },
         );
+        // Respond immediately with process metadata only (mirrors
+        // resizeResponse). This used to pollSettle (~15ms) and return the
+        // echo/output bytes, but shipping ring output in a write response
+        // breaks the tail-cursor ordering contract: the client must consume
+        // ring bytes exclusively via `session.tail`, or an out-of-band
+        // next_offset skips un-tailed bytes (the frozen-pane-after-unzoom
+        // bug). Dropping the settle also removes per-keystroke IPC latency.
         return try okValueResponse(self.allocator, id_value, .{
             .accepted = wrote,
             .bytes = text.len,
             .running = session.running,
             .pid = session.child_pid,
             .foreground_process_group = session.foregroundProcessGroup(),
-            .text = output_text,
-            .offset = start_total,
-            .next_offset = session.output_total,
         });
     }
 
@@ -1070,30 +1053,24 @@ pub const Daemon = struct {
         const session = try self.requiredSession(id_value, params);
         if (params != .object) unreachable;
         touchAttachFromParams(session, params);
-        const start_total = session.output_total;
         session.resize(
             jsonU16(params.object.get("cols") orelse .null) orelse session.cols,
             jsonU16(params.object.get("rows") orelse .null) orelse session.rows,
         );
-        const output_bytes = try session.pollSettle(self.allocator);
-        const new_count = session.output_total - start_total;
-        const ring = session.output_ring.items;
-        const slice_start = if (new_count >= ring.len) 0 else ring.len - @as(usize, @intCast(new_count));
-        const output_text = try self.allocator.dupe(u8, ring[slice_start..]);
-        defer self.allocator.free(output_text);
-        log.info(
-            "resize-poll id={s} pid={d} pgrp={?d} output_bytes={d}",
-            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), output_bytes },
-        );
+        // Respond immediately with process metadata only. This used to
+        // pollSettle (~15ms) and return the program's SIGWINCH redraw bytes,
+        // but the client must not apply output from a resize response anyway
+        // (its terminal model still has the old grid at that point — the nvim
+        // unzoom bug), and it tails the redraw via `session.tail` right after.
+        // Blocking here only added latency to every interactive pane resize.
+        // Clients tolerate the missing `text`/`next_offset` fields: absent
+        // `text` reads as empty and the tail cursor stays untouched.
         return try okValueResponse(self.allocator, id_value, .{
             .accepted = true,
             .running = session.running,
             .pid = session.child_pid,
             .foreground_process_group = session.foregroundProcessGroup(),
             .child_process_count = childProcessCount(session.child_pid),
-            .text = output_text,
-            .offset = start_total,
-            .next_offset = session.output_total,
         });
     }
 

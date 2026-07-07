@@ -529,7 +529,13 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         .h = rect.h,
     };
     appendPaneHit(pane_id, grid_rect);
-    dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch {};
+    // A failed resize must be visible in diagnostics: the session's cell
+    // counts are updated before the fallible daemon/model steps, so a single
+    // failure makes later frames see "no size change" and never retry,
+    // leaving the PTY/model at the wrong size.
+    dock.resizePaneToFit(state.allocator, pane_id, grid_rect.w, grid_rect.h) catch |err| {
+        runtime_log.diagnostic("terminal resizePaneToFit failed pane={d} err={s}", .{ pane_id, @errorName(err) });
+    };
     const focused = if (dock.activePaneConst()) |active| active.id == pane_id and state.terminal_focused else false;
     const render_state = dock.renderStateForPane(pane_id) orelse {
         var status_buf: [192]u8 = undefined;
