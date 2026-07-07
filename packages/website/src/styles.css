@@ -744,7 +744,7 @@ pre code {
 
 .provider-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 1rem;
 }
 
@@ -794,6 +794,35 @@ pre code {
   color: var(--muted);
   font-size: 0.88rem;
   line-height: 1.55;
+}
+
+/* GUI chat / Terminal TUI mode badges on each provider card */
+.provider-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.provider-mode {
+  padding: 0.14rem 0.5rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--subtle);
+}
+
+.provider-mode--gui {
+  border-color: rgba(80, 200, 120, 0.35);
+  color: var(--accent);
+}
+
+.provider-mode--tui {
+  border-color: rgba(232, 164, 74, 0.35);
+  color: var(--warm-strong);
 }
 
 .providers-note {
@@ -1693,7 +1722,8 @@ thead .comp-rowhead { background: transparent; }
 }
 
 @media (max-width: 1080px) {
-  .provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 3 columns keeps the 5 provider cards from leaving a lone orphan row */
+  .provider-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .feature-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 

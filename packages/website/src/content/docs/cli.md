@@ -22,6 +22,8 @@ verde open <url> [--json]     # Open a URL in this Verde workspace's browser pan
 verde completion <shell>      # Print shell completion script
 verde state <command>         # Read persisted state while the app is closed
 verde notify [options]        # Update the current terminal surface
+verde integrations <command>  # Inspect and install optional provider hooks
+verde herdr <command>         # Open or inspect Herdr-backed remote workspaces
 verde live <command>          # Control or inspect the running app
 ```
 
@@ -154,6 +156,42 @@ verde live pane move --pane <pane-id> --direction left|right|up|down [--json]
 verde live pane close --pane <pane-id> [--json]
 verde live palette list [--json]
 verde live palette run --command pane.split_terminal_down [--json]
+```
+
+## Provider integrations
+
+Provider hooks are optional add-ons that let agent CLIs drive Verde's sidebar
+status pips. They never overwrite provider config or change provider
+login/auth behavior.
+
+```bash
+verde integrations list [--json]
+verde integrations doctor [--json]
+verde integrations install <claude|codex|amp|opencode|cursor> [--global]
+verde integrations remove <claude|codex|amp|opencode|cursor> [--global]
+verde integrations disable <claude|codex|amp|opencode|cursor>
+```
+
+- **Claude / Codex** hooks are project-local (`.claude/settings.local.json` / `.codex/hooks.json`); `--global` installs them in `~/.claude/settings.json` / `~/.codex/hooks.json` instead.
+- **Amp** uses a global lifecycle plugin at `~/.config/amp/plugins/verde-notify.ts` (install with `--global`). The plugin is a no-op outside Verde panes.
+- **OpenCode / Cursor** have no stable hook installer yet; `list` and `doctor` report them as unsupported.
+
+## Remote workspaces (Herdr)
+
+Herdr opens or attaches Verde workspaces on a remote host over SSH and syncs
+pane state, with handoff to move a local workspace to a remote (and unlink to
+bring it back) and reusable connection profiles. `handoff` and `unlink`
+require the app to be running.
+
+```bash
+verde herdr status [--json]
+verde herdr open --herdr-workspace <id> --session <name> [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--local-dir <path>] [--json]
+verde herdr handoff [--workspace <id|index|path|current>] [--all] [--session <name>] [--profile <name>|--remote <ssh-alias>] [--remote-cwd <path>] [--dry-run] [--json]
+verde herdr unlink [--workspace <id|index|path|current>] [--all] [--json]
+verde herdr profiles list [--json]
+verde herdr profiles add --name <name> --ssh-target <alias> [--session <name>] [--remote-cwd <path>] [--local-dir <path>] [--json]
+verde herdr profiles remove <name> [--json]
+verde herdr profiles test <name> [--json]
 ```
 
 ## Terminal surface notifications

@@ -32,15 +32,19 @@ below.
 | `Ctrl+B`                    | Toggle the embedded browser pane      |
 | `Tab`                       | Inside a chat pane, focus the prompt box |
 | `Alt+1 … Alt+9, Alt+0`     | Jump between workspaces by sidebar order |
+| `Alt+↑` / `Alt+↓`          | Cycle to the previous / next workspace |
 
 ### Focus (vim-style)
 
-| Combo          | Action                          |
-| -------------- | ------------------------------- |
-| `Ctrl+H` / `Alt+←` | Focus the pane to the left  |
-| `Ctrl+L` / `Alt+→` | Focus the pane to the right |
-| `Ctrl+K` / `Alt+↑` | Focus the pane above        |
-| `Ctrl+J` / `Alt+↓` | Focus the pane below        |
+| Combo    | Action                          |
+| -------- | ------------------------------- |
+| `Ctrl+H` | Focus the pane to the left  |
+| `Ctrl+L` | Focus the pane to the right |
+| `Ctrl+K` | Focus the pane above        |
+| `Ctrl+J` | Focus the pane below        |
+
+`Alt+arrow` combos are no longer focus aliases — `Alt+↑` / `Alt+↓` now cycle
+between workspaces (see the sidebar table above).
 
 ### Swap (rearrange the tiling)
 
@@ -117,10 +121,12 @@ for multiple shortcuts on the same action:
     "new_thread": "CommandOrControl+T",
     "browser": "Ctrl+B",
     "workspace": {
-      "focus_up": ["Alt+Up", "Ctrl+K"],
-      "focus_down": ["Alt+Down", "Ctrl+J"],
-      "focus_left": ["Alt+Left", "Ctrl+H"],
-      "focus_right": ["Alt+Right", "Ctrl+L"],
+      "focus_up": "Ctrl+K",
+      "focus_down": "Ctrl+J",
+      "focus_left": "Ctrl+H",
+      "focus_right": "Ctrl+L",
+      "previous": "Alt+Up",
+      "next": "Alt+Down",
       "move_left": "Ctrl+Shift+H",
       "move_right": "Ctrl+Shift+L",
       "move_up": "Ctrl+Shift+K",
@@ -172,7 +178,7 @@ or an array of shortcuts.
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | top         | `refresh`, `open_default`, `open_editor`, `new_thread`, `command_palette`, `toggle_sidebar`, `toggle_sidebar_hidden`, `toggle_browser`, `toggle_terminal`                                                                       |
 | chat        | `chat_up`, `chat_down`, `chat_page_up`, `chat_page_down`                                                                                                                                                                          |
-| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select` |
+| `workspace` | `split_chat_vertical`, `split_chat_horizontal`, `split_terminal_vertical`, `split_terminal_horizontal`, `toggle_maximize`, `minimize`, `close`, `focus_left`, `focus_right`, `focus_up`, `focus_down`, `focus_prompt`, `move_*`, `grow_*`, `select`, `previous`, `next` |
 | `terminal`  | `new_tab`, `close`, `rename_tab`, `tab_previous`, `tab_next`, `split_up`, `split_down`, `split_left`, `split_right`, `focus_up`, `focus_down`, `focus_left`, `focus_right`                                                       |
 
 Keybinds are loaded on startup and on app refresh. See [Configuration &
