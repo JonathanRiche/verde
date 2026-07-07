@@ -13,8 +13,9 @@ function About() {
         <p class="band-body">
           Verde is the native desktop app in this repo. It keeps coding-agent
           threads, an embedded browser pane, and a project-scoped terminal in
-          the same workspace while talking to local provider CLIs such as Codex
-          and OpenCode.
+          the same workspace while talking to local provider CLIs — Codex,
+          Claude Code, OpenCode, and Cursor as native chat panes, plus any of
+          them (and Amp) as a TUI in an embedded terminal.
         </p>
       </section>
     </main>

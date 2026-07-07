@@ -36,6 +36,7 @@ the app:
 | Claude Code | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in.  |
 | OpenCode    | Install [OpenCode](https://github.com/anomalyco/opencode); ensure `opencode` is on `PATH`. |
 | Cursor      | Install the [Cursor CLI](https://cursor.com/docs/cli/installation), ensure `agent` is on `PATH`, run `agent login`. `CURSOR_API_KEY` is also supported for headless environments. |
+| Amp         | Install [Amp](https://ampcode.com); ensure `amp` is on `PATH`. Amp runs as a terminal TUI rather than a chat pane — launch it from the command palette. |
 
 See [Provider setup](/docs/providers) for the full per-provider notes.
 
@@ -85,8 +86,8 @@ verde live browser eval --script "document.title"
 
 Press `Ctrl+Shift+T` to split a terminal pane next to the focused workspace pane.
 Right-click inside a terminal to spawn shell tabs or agent launch-profile tabs
-(Claude, OpenCode, Codex, Cursor). Per-terminal zoom (`Ctrl+-` / `Ctrl+=`) and
-the full layout persist across launches.
+(Claude, OpenCode, Codex, Cursor, Amp). Per-terminal zoom (`Ctrl+-` / `Ctrl+=`)
+and the full layout persist across launches.
 
 ## Move around
 
@@ -95,6 +96,7 @@ the full layout persist across launches.
 - `Alt+Shift+← ↑ ↓ →` — resize the focused pane
 - `Alt+Z` — zoom the focused pane to fill the workspace; press again to restore
 - `Alt+1 … Alt+9, Alt+0` — jump between workspaces by sidebar order
+- `Alt+↑ / Alt+↓` — cycle to the previous / next workspace
 
 The full set of defaults and how to remap them is in [Keybinds](/docs/keybinds).
 

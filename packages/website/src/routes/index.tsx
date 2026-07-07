@@ -5,6 +5,7 @@ import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png
 import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
 import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
+import ampLogo from '../../../desktop/src/assets/amp-logo.png'
 import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
 import appScreenshot from '../../../../assets/green_verde.png'
 import CopyButton from '../components/CopyButton'
@@ -42,28 +43,47 @@ function FeatureIcon(props: { name: string }) {
 
 /* ───────────────────────── Data ───────────────────────── */
 
+// Two integration modes: 'gui' = native Verde chat pane over the provider's
+// protocol; 'tui' = the agent's own TUI launched in an embedded Ghostty
+// terminal pane. Source of truth: provider_types.zig (GUI) and stack.zig's
+// AgentProvider (TUI).
 const providers = [
   {
     name: 'Codex',
     logo: openAiLogo,
+    modes: ['gui', 'tui'],
     blurb: 'Runs the local codex CLI and boots codex app-server when a thread starts.',
   },
   {
     name: 'Claude Code',
     logo: claudeLogo,
+    modes: ['gui', 'tui'],
     blurb: 'Talks to your installed Claude Code through the Claude Agent SDK.',
   },
   {
     name: 'OpenCode',
     logo: opencodeLogo,
+    modes: ['gui', 'tui'],
     blurb: 'Drives the opencode CLI and starts opencode serve on demand.',
   },
   {
     name: 'Cursor',
     logo: cursorLogo,
+    modes: ['gui', 'tui'],
     blurb: 'Speaks to the Cursor CLI ACP server (agent acp) on your machine.',
   },
+  {
+    name: 'Amp',
+    logo: ampLogo,
+    modes: ['tui'],
+    blurb: 'Launches the amp CLI in an embedded terminal, with hooks that drive live status pips.',
+  },
 ]
+
+const MODE_LABELS: Record<string, string> = {
+  gui: 'GUI chat',
+  tui: 'Terminal TUI',
+}
 
 const featureCards = [
   {
@@ -84,7 +104,7 @@ const featureCards = [
   {
     icon: 'sidebar',
     title: 'Live-state sidebar',
-    body: 'Projects, threads, and running agents in one rail — each pane shows its provider glyph and a live title, so you always know what is working.',
+    body: 'Projects, threads, and running agents in one rail — each pane shows its provider glyph and a live title. Collapse it to a pip rail and watch every agent\'s working / waiting / done status at a glance.',
   },
   {
     icon: 'shield',
@@ -116,6 +136,7 @@ const keybinds = [
   { combo: 'Alt+Shift+←↑↓→', desc: 'Resize the focused pane' },
   { combo: 'Alt+Z', desc: 'Zoom the focused pane to fill the workspace' },
   { combo: 'Alt+1 … Alt+9', desc: 'Jump between workspaces by sidebar order' },
+  { combo: 'Alt+↑ / Alt+↓', desc: 'Cycle to the previous / next workspace' },
 ]
 
 const scriptingExamples = [
@@ -197,10 +218,11 @@ function App() {
               <span class="display-accent">One tiling window.</span>
             </h1>
             <p class="lead">
-              Verde runs Codex, Claude Code, OpenCode, and Cursor side by side in
-              one native desktop app. Tile chat, terminal, and browser panes with
-              vim keybinds. No hosted relay — Verde just talks to the CLIs already
-              on your machine.
+              Verde runs Codex, Claude Code, OpenCode, Cursor, and Amp side by
+              side in one native desktop app — as native chat panes or as each
+              agent's own TUI in an embedded terminal. Tile chat, terminal, and
+              browser panes with vim keybinds. No hosted relay — Verde just
+              talks to the CLIs already on your machine.
             </p>
 
             <div class="hero-actions">
@@ -245,7 +267,7 @@ function App() {
       {/* ── Provider strip ── */}
       <section id="providers" class="providers-band">
         <div class="wrap">
-          <p class="strip-eyebrow">Four agent runtimes, one workspace</p>
+          <p class="strip-eyebrow">Five agents, one workspace — GUI chat or native TUI</p>
           <div class="provider-grid stagger">
             <For each={providers}>
               {(p) => (
@@ -254,15 +276,26 @@ function App() {
                     <img src={p.logo} alt="" class="provider-card-logo" />
                     <h3>{p.name}</h3>
                   </div>
+                  <div class="provider-modes">
+                    <For each={p.modes}>
+                      {(m) => (
+                        <span class={`provider-mode provider-mode--${m}`}>
+                          {MODE_LABELS[m]}
+                        </span>
+                      )}
+                    </For>
+                  </div>
                   <p>{p.blurb}</p>
                 </article>
               )}
             </For>
           </div>
           <p class="providers-note">
-            Verde doesn't host a model or run inference. It drives the provider
-            CLIs already installed on your machine, so your tokens, transcripts,
-            and project files never leave it.
+            Every agent can run as its own TUI inside an embedded Ghostty
+            terminal pane; four of them also drive Verde's native chat panes.
+            Either way, Verde doesn't host a model or run inference — it drives
+            the provider CLIs already installed on your machine, so your tokens,
+            transcripts, and project files never leave it.
           </p>
         </div>
       </section>
@@ -586,8 +619,8 @@ function App() {
             </div>
             <p class="install-primary-note">
               Then install and authenticate at least one provider CLI —{' '}
-              <code>codex login</code>, Claude Code, <code>opencode</code>, or{' '}
-              <code>agent login</code> for Cursor.
+              <code>codex login</code>, Claude Code, <code>opencode</code>,{' '}
+              <code>agent login</code> for Cursor, or <code>amp</code>.
             </p>
           </article>
 

@@ -28,8 +28,9 @@ pane header buttons for everything else.
 For chat-vs-chat splits and terminal-vertical splits, use the pane header
 buttons: `C|` and `C-` split a chat pane vertically or horizontally; `T|` and
 `T-` do the same for terminals. Right-click inside a terminal pane to spawn
-shell tabs or agent launch-profile tabs (Claude, OpenCode, Codex, Cursor), or
-to add a new workspace terminal pane around the focused one.
+shell tabs or agent launch-profile tabs (Claude, OpenCode, Codex, Cursor, Amp),
+or to add a new workspace terminal pane around the focused one. Context menus
+also offer **Close pane** directly.
 
 Terminal-internal tabs live inside the focused terminal pane. Workspace split
 actions create new workspace panes in the tiling tree, not new tabs inside a
@@ -38,9 +39,9 @@ terminal.
 ## Moving focus
 
 - `Ctrl+H / J / K / L` — focus the pane to the left / down / up / right (vim-style).
-- `Alt+← ↑ ↓ →` — same idea, arrow keys instead.
 - `Tab` — while focused inside a chat thread pane, return focus to the prompt box.
 - `Alt+1 … Alt+9, Alt+0` — jump between workspaces by sidebar order.
+- `Alt+↑ / Alt+↓` — cycle to the previous / next workspace.
 
 ## Resizing
 
@@ -49,12 +50,13 @@ terminal.
 
 Resizes are committed to the layout immediately and persist with the workspace.
 
-## Swapping panes
+## Rearranging panes
 
-- `Ctrl+Shift+H / J / K / L` — swap the focused pane with its neighbor in that direction.
+- `Ctrl+Shift+H / J / K / L` — move the focused pane past its neighbor in that direction.
+- `Ctrl`-drag a pane — pick it up with the mouse and drop it where it should go.
 
-Use swap when the layout is right but the wrong pane is in the wrong place.
-Swap is non-destructive — both panes keep their content and provider.
+Use these when the layout is right but a pane is in the wrong place. Moves are
+non-destructive — every pane keeps its content and provider.
 
 ## Zooming and minimizing
 
@@ -71,6 +73,13 @@ so you always know what is working without switching to it.
 - `Ctrl+S` — toggle the sidebar (visible ↔ icon rail).
 - `Ctrl+Shift+S` — toggle the sidebar's hidden mode (no rail at all).
 
+When collapsed to the icon rail, each workspace avatar carries a row of small
+**status pips** — one dot per open pane, in layout order. Pips pulse green
+while an agent is working, yellow while it waits for input, and settle when
+it's done or errors, so you can watch several agents from a rail a few pixels
+wide. Context menus (new thread, close, expand) still work from the collapsed
+rail.
+
 Right-click the sidebar for project import, rename, archive, and the new-thread
 / pencil button for opening a Codex TUI directly.
 
@@ -78,7 +87,7 @@ Right-click the sidebar for project import, rename, archive, and the new-thread
 
 Verde's embedded terminals are powered by Ghostty's `libghostty-vt` terminal
 engine. Each terminal pane is a full terminal with tabs, splits, OSC titles,
-and per-terminal zoom.
+scrollback with a scrollbar, and per-terminal zoom.
 
 - `Ctrl+Alt+T` — new terminal tab inside the focused terminal pane.
 - `Ctrl+Shift+W` — close the active terminal tab.
@@ -129,10 +138,22 @@ verde live panes --project current --json
 
 `Ctrl+Shift+P` opens the command palette — a single ranked list of threads, panes,
 workspaces, and app commands. `Ctrl+Enter` on any result opens it in a fresh
-pane. Slash commands run from the composer:
+pane. The palette also carries **Start New … TUI** entries for Codex, Claude,
+OpenCode, Cursor, and Amp, and **Open Current Thread in TUI** entries that
+promote a GUI chat thread into that provider's terminal TUI.
 
-- `/stack` — start / stop / restart every process and agent declared in the workspace's `verde.yml`.
-- `/process` — control a single declared process by name.
+Typing `/` in the composer opens a slash-command picker. Running a command
+shows a pending row in the transcript while it executes, then a result card
+(`/usage` renders a structured card with limit bars and recent daily usage).
 
-Each provider also exposes its own slash commands inside the composer
-alongside `/stack` and `/process`.
+Workspace commands, available with every provider:
+
+- `/stack` — start / stop / restart / status for every process and agent declared in the workspace's `verde.yml`.
+- `/process` — start / stop / restart / focus a single declared process by name.
+- `//text` — escape hatch: send a literal prompt that begins with a slash.
+
+Provider-native commands surface in the same picker:
+
+- **Claude Code** — `/usage`, `/compact [instructions]`, plus skill commands such as `/code-review`, `/debug`, `/loop`, `/batch`, and `/skills`.
+- **Codex** — `/usage`, `/compact`, `/goal [status|clear|…]`, `/review [changes|base <branch>|commit <sha>|custom …]`, and `/shell confirm <command>` (requires typed confirmation).
+- **OpenCode / Cursor** — no native slash commands yet; `/stack`, `/process`, and `//` still work.

@@ -36,10 +36,12 @@ User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or
     "new_thread": "CommandOrControl+T",
     "browser": "Ctrl+B",
     "workspace": {
-      "focus_up": ["Alt+Up", "Ctrl+K"],
-      "focus_down": ["Alt+Down", "Ctrl+J"],
-      "focus_left": ["Alt+Left", "Ctrl+H"],
-      "focus_right": ["Alt+Right", "Ctrl+L"]
+      "focus_up": "Ctrl+K",
+      "focus_down": "Ctrl+J",
+      "focus_left": "Ctrl+H",
+      "focus_right": "Ctrl+L",
+      "previous": "Alt+Up",
+      "next": "Alt+Down"
     }
   }
 }
@@ -54,8 +56,9 @@ full keybinds reference.
 
 Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace
 root. `processes:` and `agents:` entries both run in terminal docks; agent
-entries may also declare `provider`, `revive`, `notify`, `mcp`, and `hooks`
-metadata. New agent metadata defaults to disabled unless explicitly set.
+entries may also declare `provider` (`codex`, `claude`, `opencode`, `cursor`,
+`amp`, or `other`), `revive`, `notify`, `mcp`, and `hooks` metadata. New agent
+metadata defaults to disabled unless explicitly set.
 
 ```yaml
 processes:

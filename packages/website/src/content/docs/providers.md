@@ -1,6 +1,6 @@
 ---
 title: Provider setup
-description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, and Cursor.
+description: How Verde talks to local coding-agent CLIs, plus per-provider setup and troubleshooting notes for Codex, Claude Code, OpenCode, Cursor, and Amp.
 section: Get started
 order: 2
 slug: providers
@@ -10,15 +10,22 @@ slug: providers
 
 Verde does not host a model and does not relay your prompts through a hosted
 backend. It spawns and talks to the coding-agent CLIs you already have on your
-machine — Codex, Claude Code, OpenCode, and Cursor — over each provider's
-native protocol:
+machine, and supports each agent in one or both of two modes:
 
-- **Codex** runs the local `codex` CLI and boots `codex app-server` automatically when a thread starts.
-- **Claude Code** uses Anthropic's Claude Agent SDK against the local Claude Code runtime.
-- **OpenCode** drives the `opencode` CLI and starts `opencode serve` on demand.
-- **Cursor** speaks to the local Cursor CLI ACP server (`agent acp`).
+- **GUI chat** — the provider drives Verde's native chat panes over its own
+  protocol: streaming transcript, composer, slash commands, approvals.
+- **Terminal TUI** — Verde launches the agent's own TUI inside an embedded
+  Ghostty terminal pane, wired into the sidebar's live status pips.
 
-All four run against the project directory you imported into Verde. Tokens,
+| Provider    | GUI chat | Terminal TUI | How the GUI integration talks                                  |
+| ----------- | -------- | ------------ | -------------------------------------------------------------- |
+| Codex       | ✓        | ✓            | Runs the local `codex` CLI; boots `codex app-server` per thread |
+| Claude Code | ✓        | ✓            | Anthropic's Claude Agent SDK against the local runtime          |
+| OpenCode    | ✓        | ✓            | Drives the `opencode` CLI; starts `opencode serve` on demand    |
+| Cursor      | ✓        | ✓            | Speaks to the Cursor CLI ACP server (`agent acp`)               |
+| Amp         | –        | ✓            | TUI-only — launches the `amp` CLI in a terminal pane            |
+
+All of them run against the project directory you imported into Verde. Tokens,
 transcripts, and project files stay on your machine.
 
 ## Codex
@@ -66,12 +73,33 @@ agent login
 login is not possible. Verde talks to the Cursor ACP server (`agent acp`) over
 its native protocol.
 
+## Amp
+
+Install [Amp](https://ampcode.com) and make sure `amp` is on your `PATH`. Amp
+is **TUI-only**: it does not appear in the chat composer's provider switcher.
+Instead, launch it from the command palette (`Ctrl+Shift+P` → **Start New Amp
+TUI**) and Verde opens the `amp` CLI in a new embedded terminal pane in the
+current workspace.
+
+To wire Amp into the sidebar's live status pips, install Verde's Amp plugin:
+
+```bash
+verde integrations install amp --global
+```
+
+That writes a small lifecycle plugin to `~/.config/amp/plugins/verde-notify.ts`
+which reports `working` / `done` / `error` to the pane's status pip as the
+agent runs (only when Amp is running inside a Verde pane). You can also toggle
+it from the settings modal under **Status pip hooks**, and remove it with
+`verde integrations remove amp --global`.
+
 ## Switching providers
 
 Each chat thread is bound to one provider. The composer's provider switcher
-shows the four providers and indicates which are detected and authenticated on
-your machine. Picking a provider that is not installed or signed in produces an
-explicit failure with a hint — Verde will not silently drop the prompt.
+shows the four GUI chat providers and indicates which are detected and
+authenticated on your machine. Picking a provider that is not installed or
+signed in produces an explicit failure with a hint — Verde will not silently
+drop the prompt.
 
 To run several providers side by side, create additional chat threads (one per
 provider) and tile them in the same workspace. Each thread keeps its own
@@ -79,8 +107,14 @@ provider, model, and transcript; the layout is shared.
 
 ## Driving provider CLIs from terminal docks
 
-You can also launch a provider's TUI directly inside a terminal dock — useful
-when you want the agent's native UI rather than Verde's chat surface:
+You can also launch any provider's TUI directly inside a terminal pane — useful
+when you want the agent's native UI rather than Verde's chat surface. The
+command palette (`Ctrl+Shift+P`) has a **Start New … TUI** entry for each of
+Codex, Claude, OpenCode, Cursor, and Amp, plus **Open Current Thread in TUI**
+entries that promote a running GUI chat thread into that provider's terminal
+TUI. Right-clicking inside a terminal offers the same launch profiles as tabs.
+
+From the CLI:
 
 ```bash
 verde live agent open --provider codex

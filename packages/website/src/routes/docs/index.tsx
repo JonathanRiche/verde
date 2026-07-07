@@ -57,9 +57,10 @@ function DocsIndex() {
           <h1 class="heading">Everything you need to run Verde.</h1>
           <p class="band-body docs-hero-lead">
             Verde is a native desktop workspace for coding agents — Codex, Claude
-            Code, OpenCode, and Cursor side by side in one tiling window. These
-            docs cover installation, provider setup, the tiled workspace,
-            keybinds, the scriptable CLI, configuration, and troubleshooting.
+            Code, OpenCode, Cursor, and Amp side by side in one tiling window,
+            as native chat panes or each agent's own TUI. These docs cover
+            installation, provider setup, the tiled workspace, keybinds, the
+            scriptable CLI, configuration, and troubleshooting.
           </p>
         </section>
 
