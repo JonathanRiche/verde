@@ -5470,22 +5470,19 @@ pub const AppState = struct {
         const session_name = if (existing_link) |link| link.session_name else request.session;
         var default_remote_cwd: ?[]u8 = null;
         defer if (default_remote_cwd) |cwd| self.allocator.free(cwd);
-        const remote_cwd = if (remote_alias.len > 0)
-            blk: {
-                if (request.remote_cwd) |cwd| break :blk cwd;
-                if (existing_link) |link| {
-                    if (link.remote_cwd) |cwd| {
-                        // Earlier builds used the local project path as the
-                        // implicit remote cwd. Treat that as unset so existing
-                        // links migrate to Verde's remote workspace area.
-                        if (!std.mem.eql(u8, cwd, project.path)) break :blk cwd;
-                    }
+        const remote_cwd = if (remote_alias.len > 0) blk: {
+            if (request.remote_cwd) |cwd| break :blk cwd;
+            if (existing_link) |link| {
+                if (link.remote_cwd) |cwd| {
+                    // Earlier builds used the local project path as the
+                    // implicit remote cwd. Treat that as unset so existing
+                    // links migrate to Verde's remote workspace area.
+                    if (!std.mem.eql(u8, cwd, project.path)) break :blk cwd;
                 }
-                default_remote_cwd = try herdr.defaultRemoteCwd(self.allocator, project.label, project.id);
-                break :blk default_remote_cwd.?;
             }
-        else
-            null;
+            default_remote_cwd = try herdr.defaultRemoteCwd(self.allocator, project.label, project.id);
+            break :blk default_remote_cwd.?;
+        } else null;
         const herdr_cwd = remote_cwd orelse project.path;
 
         if (request.dry_run) {
@@ -5784,7 +5781,6 @@ pub const AppState = struct {
         if (link.remote_alias.len == 0) return error.WorkspaceNotRemote;
         const remote_cwd = try self.remoteCwdForWorkspaceCwd(project, cwd);
         defer self.allocator.free(remote_cwd);
-        try self.ensureHerdrRemoteCwd(.{ .session = link.session_name, .remote = link.remote_alias }, remote_cwd);
         if (commandArgsForTerminalProfile(profile)) |args| {
             return try herdr.remoteExecCommandLineAlloc(self.allocator, remote_cwd, args);
         }
@@ -11938,7 +11934,8 @@ pub const AppState = struct {
             .terminal => |ref| ref.dock_id,
             else => return null,
         };
-        const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return null;
+        try self.pollTerminalDockBeforeRead(project_index, dock_id, dock);
         return try dock.activeOutputTailAlloc(self.allocator, max_bytes);
     }
 
@@ -11955,8 +11952,21 @@ pub const AppState = struct {
             .terminal => |ref| ref.dock_id,
             else => return null,
         };
-        const dock = self.projectTerminalDock(project_index, dock_id) orelse return null;
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return null;
+        try self.pollTerminalDockBeforeRead(project_index, dock_id, dock);
         return try dock.activeScreenTextAlloc(self.allocator);
+    }
+
+    fn pollTerminalDockBeforeRead(self: *AppState, project_index: usize, dock_id: u32, dock: *terminal.Dock) !void {
+        const changed = try dock.poll(self.allocator);
+        try self.drainTerminalDockNotifications(project_index, dock_id, dock);
+        if (changed and project_index == self.selected_project_index) {
+            const project = &self.projects.items[project_index];
+            if (dock.visible or project.workspace_layout.hasTerminalDockPane(dock_id)) {
+                self.last_terminal_output_ms = monotonicMs();
+                self.markDirty();
+            }
+        }
     }
 
     pub fn terminalPaneScreenText(self: *AppState, pane_id: WorkspacePaneId) !?[]u8 {
