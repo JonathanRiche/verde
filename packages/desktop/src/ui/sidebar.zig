@@ -807,8 +807,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
     queuePaletteText(state, .{ .x = x + theme.scaledUi(54.0), .y = header_top + theme.scaledUi(4.0), .w = theme.scaledUi(130.0), .h = theme.scaledUi(38.0) }, "verde", paletteColor(theme.COLOR_WHITE), theme.heading_font_size, rect);
 
     const toggle_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = header_top + theme.scaledUi(6.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
-    queuePaletteButton(state, toggle_rect, "<", false);
-    addPaletteHit(toggle_rect, .collapse, 0, 0);
+    renderPaletteSidebarToggle(state, toggle_rect, true);
 
     queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(150.0), .h = theme.scaledUi(24.0) }, "WORKSPACES", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
     const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
@@ -843,8 +842,7 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     queuePaletteLogoMark(state, .{ .x = x + theme.scaledUi(2.0), .y = y, .w = theme.scaledUi(32.0), .h = theme.scaledUi(32.0) });
     y += theme.scaledUi(58.0);
     const expand_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    queuePaletteButton(state, expand_rect, ">", false);
-    addPaletteHit(expand_rect, .expand, 0, 0);
+    renderPaletteSidebarToggle(state, expand_rect, false);
     y += theme.scaledUi(38.0);
     const add_top_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
     queuePaletteButton(state, add_top_rect, "+", true);
@@ -936,6 +934,26 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
 
     const settings_rect: palette.Rect = .{ .x = x, .y = rect.y + rect.h - theme.scaledUi(42.0), .w = button, .h = theme.scaledUi(30.0) };
     renderPaletteSettingsButton(state, settings_rect, rect);
+}
+
+/// Renders the sidebar collapse/expand toggle used by both rails: a modern
+/// panel-left codicon (filled while expanded, hollow while collapsed) with the
+/// same hover treatment as the settings button, replacing the old "<"/">" text.
+fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expanded: bool) void {
+    const hovered = state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y);
+    if (hovered) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+    }
+    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_font = theme.scaledUi(17.0);
+    const glyph = if (expanded) NF_COD_LAYOUT_SIDEBAR_LEFT else NF_COD_LAYOUT_SIDEBAR_LEFT_OFF;
+    queuePaletteIcon(state, .{
+        .x = rect.x + (rect.w - icon_font) * 0.5,
+        .y = rect.y + (rect.h - icon_font) * 0.5,
+        .w = icon_font,
+        .h = icon_font,
+    }, glyph, icon_font, paletteColor(fg), null);
+    addPaletteHit(rect, if (expanded) .collapse else .expand, 0, 0);
 }
 
 /// Renders the sidebar settings gear button used by both expanded and collapsed rails.
@@ -1511,6 +1529,10 @@ const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
 const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
+// Panel-style sidebar toggle (VS Code's layout-sidebar-left): filled left pane
+// while the rail is expanded, hollow "off" variant while collapsed.
+const NF_COD_LAYOUT_SIDEBAR_LEFT = "\u{EBF3}";
+const NF_COD_LAYOUT_SIDEBAR_LEFT_OFF = "\u{EC02}";
 
 /// Renders a centered codicon glyph through the icon font. Replaces the
 /// hand-drawn shapes / PNGs we used before.
