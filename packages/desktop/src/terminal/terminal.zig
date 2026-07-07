@@ -32,6 +32,10 @@ const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
+// Consecutive tail failures tolerated before declaring the daemon gone.
+// ~2 seconds at display rate; see daemon_poll_failures for why one miss
+// must not trigger a revive.
+const DAEMON_POLL_FAILURE_LIMIT: u32 = 120;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 const LOCAL_TERMINAL_SCREEN_CLEAR = "\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
@@ -1784,6 +1788,17 @@ const UnixSession = struct {
     suppress_next_daemon_replay: bool = false,
     suppress_pty_responses: bool = false,
     defer_daemon_replay_until_resize: bool = false,
+    /// Consecutive daemon tail IPC failures. A single failed request must not
+    /// flip the session to not-running: pollTerminals treats a dead session as
+    /// restorable and silently revives it, and the revive's bounded attach
+    /// replay cannot reconstruct a full TUI frame — the pane comes back as a
+    /// garbled mix of partial frames. Only give up after a sustained outage.
+    daemon_poll_failures: u32 = 0,
+    /// Set when this session attached to an already-running daemon PTY (app
+    /// restart or revive). Cleared after the first sized resize kicks the
+    /// foreground TUI to repaint, since the bounded replay alone cannot
+    /// restore a coherent alt-screen frame.
+    needs_attach_repaint_kick: bool = false,
     output_ring: std.ArrayList(u8) = .empty,
     /// Opt-in parser-boundary diagnostics, toggled by VERDE_TERMINAL_PARSER_LOG=1.
     /// When set, drainOutput logs the moments a chunk ends with an ESC near the
@@ -1962,7 +1977,6 @@ const UnixSession = struct {
         const next_rows = sanitizeCellCount(rows, MIN_ROWS);
         const next_cell_width = @max(cell_width, 1);
         const next_cell_height = @max(cell_height, 1);
-        const growing_rows = next_rows > self.rows;
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
         if (!size_changed and !metrics_changed) {
@@ -1970,6 +1984,7 @@ const UnixSession = struct {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
                 _ = try self.drainDaemonOutput(allocator);
+                self.kickAttachedTuiRepaint(allocator);
                 try self.refreshRenderState(allocator);
                 self.render_state.dirty = .full;
             }
@@ -1977,10 +1992,22 @@ const UnixSession = struct {
         }
         const prev_cols = self.cols;
         const prev_rows = self.rows;
+        const prev_cell_width = self.cell_width;
+        const prev_cell_height = self.cell_height;
         self.cols = next_cols;
         self.rows = next_rows;
         self.cell_width = next_cell_width;
         self.cell_height = next_cell_height;
+        // Roll back on any failure below: the new cell counts are only real
+        // once the backend and the terminal model both accepted them. Without
+        // this, one failed resize makes every later frame see "no size
+        // change" and never retry, stranding the PTY/model at the old size.
+        errdefer {
+            self.cols = prev_cols;
+            self.rows = prev_rows;
+            self.cell_width = prev_cell_width;
+            self.cell_height = prev_cell_height;
+        }
         const needs_initial_replay = self.backend == .daemon and self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         switch (self.backend) {
             .local => {
@@ -2018,20 +2045,27 @@ const UnixSession = struct {
                 );
             }
         }
+        // Mode-2048 clients (nvim 0.10+) take their size exclusively from
+        // in-band reports and ignore SIGWINCH/TIOCGWINSZ, so the report must
+        // go out on EVERY change — cols-only and shrinks included. The old
+        // growing-rows-only gate left nvim on the stale size for width-only
+        // zooms and any shrink (the frozen/garbled pane-resize bug); the
+        // synthetic Ctrl-L injection removed in 02a1933 had been masking it.
         switch (self.backend) {
             .local => {
-                if (size_changed) {
-                    if (growing_rows) self.sendInBandSizeReportAfterResize();
-                }
+                if (size_changed or metrics_changed) self.sendInBandSizeReportAfterResize();
             },
             .daemon => {
                 if (needs_initial_replay) {
                     _ = try self.drainDaemonOutput(allocator);
                 }
-                if (size_changed) {
-                    if (growing_rows) self.sendInBandSizeReportAfterResize();
-                }
+                if (size_changed or metrics_changed) self.sendInBandSizeReportAfterResize();
                 _ = try self.drainDaemonOutput(allocator);
+                // Even when this resize changed the client's size, the daemon
+                // PTY may already have been at the target size (attach to a
+                // surviving session), making the ioctl a no-op with no
+                // SIGWINCH — so the kick must not be skipped on size_changed.
+                self.kickAttachedTuiRepaint(allocator);
             },
         }
         try self.refreshRenderState(allocator);
@@ -2542,6 +2576,11 @@ const UnixSession = struct {
         }
         self.suppress_next_daemon_replay = attached_existing_session;
         self.defer_daemon_replay_until_resize = attached_existing_session;
+        self.needs_attach_repaint_kick = attached_existing_session;
+        runtime_log.diagnostic(
+            "terminal daemon attach session={s} existing={} revive_policy={s}",
+            .{ session_id, attached_existing_session, @tagName(options.revive_policy) },
+        );
 
         const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
@@ -2576,17 +2615,38 @@ const UnixSession = struct {
             .offset = self.remote_output_offset,
             .max_bytes = max_replay_bytes,
         }, 1) catch |err| {
-            log.debug("failed to poll daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
+            // Tolerate transient IPC failures: flipping running=false makes
+            // pollTerminals revive the session, and the revive's bounded
+            // replay garbles TUI panes. ~120 consecutive misses ≈ a couple of
+            // seconds of sustained daemon outage before giving up.
+            self.daemon_poll_failures += 1;
+            if (self.daemon_poll_failures == 1 or self.daemon_poll_failures == DAEMON_POLL_FAILURE_LIMIT) {
+                runtime_log.diagnostic(
+                    "terminal daemon tail failure session={s} count={d} err={s}",
+                    .{ session_id, self.daemon_poll_failures, @errorName(err) },
+                );
+            }
+            if (self.daemon_poll_failures < DAEMON_POLL_FAILURE_LIMIT) return false;
             self.daemon_state = .unavailable;
             self.running = false;
             return false;
         };
         defer allocator.free(response);
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err| {
+            // A malformed response (e.g. a ring slice that cuts a UTF-8
+            // sequence) would otherwise recur identically every frame and
+            // freeze the pane; surface it instead of erroring the poll loop.
+            runtime_log.diagnostic(
+                "terminal daemon tail parse failure session={s} err={s} response_len={d}",
+                .{ session_id, @errorName(err), response.len },
+            );
+            return err;
+        };
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSessionResponse;
         if (parsed.value.object.get("error")) |_| {
+            runtime_log.diagnostic("terminal daemon tail rejected session={s} marking missing", .{session_id});
             self.daemon_state = .missing;
             self.running = false;
             return false;
@@ -2624,6 +2684,7 @@ const UnixSession = struct {
         self.suppress_next_daemon_replay = false;
         self.running = jsonBool(result.object.get("running") orelse .null) orelse self.running;
         self.daemon_state = .attached;
+        self.daemon_poll_failures = 0;
         if (stale_alt_screen_replay) {
             self.resetLocalTerminalView(allocator) catch |err| {
                 log.warn("failed to reset stale daemon terminal replay for {s}: {s}", .{ session_id, @errorName(err) });
@@ -2670,10 +2731,42 @@ const UnixSession = struct {
         }
     }
 
+    /// After attaching to an already-running daemon PTY, the bounded replay
+    /// cannot reconstruct a full-screen TUI frame, and the PTY size usually
+    /// has not changed — so the program has no reason to repaint and the pane
+    /// would stay a garbled mix of partial frames. Nudge it with a one-column
+    /// winsize jiggle: two real TIOCSWINSZ transitions guarantee a SIGWINCH
+    /// and a full repaint at the correct size (the same trick tmux uses on
+    /// client attach). Skipped at a bare shell prompt, where the replay
+    /// heuristics already produce a sane view.
+    fn kickAttachedTuiRepaint(self: *UnixSession, allocator: std.mem.Allocator) void {
+        if (!self.needs_attach_repaint_kick) return;
+        self.needs_attach_repaint_kick = false;
+        if (self.foregroundProcessGroup() == null) return;
+        const cols = self.cols;
+        if (cols <= MIN_COLS) return;
+        self.cols = cols - 1;
+        self.resizeDaemon(allocator) catch {};
+        self.cols = cols;
+        self.resizeDaemon(allocator) catch |err| {
+            runtime_log.diagnostic(
+                "terminal attach repaint kick failed session={?s} err={s}",
+                .{ self.session_id, @errorName(err) },
+            );
+            return;
+        };
+        // Mode-2048 clients ignore the SIGWINCH from the jiggle; tell them
+        // in-band too (no-op unless the replayed model saw the mode set).
+        self.sendInBandSizeReportAfterResize();
+        runtime_log.diagnostic(
+            "terminal attach repaint kick session={?s} cells={d}x{d}",
+            .{ self.session_id, cols, self.rows },
+        );
+    }
+
     fn resizeDaemon(self: *UnixSession, allocator: std.mem.Allocator) !void {
         const pref_path = self.pref_path orelse return;
         const session_id = self.session_id orelse return;
-        const initial_attach_replay = self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         const response = try sessionizer.requestAlloc(allocator, pref_path, "session.resize", .{
             .id = session_id,
             .attach_id = self.attach_id orelse "",
@@ -2710,25 +2803,18 @@ const UnixSession = struct {
             },
         );
 
-        // When reattaching to a daemon-owned PTY after a Verde restart, the
-        // first UI-driven resize happens before the local terminal model has
-        // replayed the daemon's buffered output. The daemon's resize response is
-        // anchored at the daemon's current tail, so advancing remote_output_offset
-        // here makes the following tail request start at EOF and the pane opens
-        // with only later redraw bytes (often visible as repeated ^L). Keep the
-        // cursor at zero and let drainDaemonOutput replay the bounded tail once,
-        // in chronological order, after the real pane size is known.
-        if (initial_attach_replay) return;
-
-        if (next_offset) |offset| {
-            if (offset > self.remote_output_offset) self.remote_output_offset = offset;
-        }
-        if (text.len > 0) {
-            try self.appendOutput(allocator, text);
-            self.stream.nextSlice(text);
-            try self.repairTerminalState(allocator);
-            self.resetAlternateViewport();
-        }
+        // Deliberately ignore the response's `text`/`next_offset`. The daemon
+        // answers a resize with any redraw bytes the program emitted while the
+        // request settled — for a TUI that is exactly its SIGWINCH repaint for
+        // the NEW size. At this point the local terminal model still has the
+        // OLD grid (resize() notifies the backend before resizing the model,
+        // matching Ghostty), so applying that repaint here paints the top of
+        // the old grid and the following shrink discards it (libghostty keeps
+        // the BOTTOM rows on an alt-screen row shrink), leaving stale zoomed
+        // content on screen (nvim unzoom bug). Leaving remote_output_offset
+        // untouched lets the drainDaemonOutput call that every resizeDaemon
+        // call site performs after the model resize replay those same bytes
+        // into the correctly-sized grid instead.
     }
 
     fn killDaemon(self: *UnixSession) !void {
@@ -2767,22 +2853,16 @@ const UnixSession = struct {
         if (jsonUsize(result.object.get("foreground_process_group") orelse .null)) |pgrp| {
             self.daemon_foreground_process_group = pgrp;
         }
-        const text = jsonString(result.object.get("text") orelse .null) orelse "";
-        const next_offset = jsonUsize(result.object.get("next_offset") orelse .null);
-        if (next_offset) |offset| {
-            if (offset > self.remote_output_offset) self.remote_output_offset = offset;
-        }
-        if (text.len == 0) return;
-        log.info(
-            "daemon-write-apply session={?s} text_len={d} next_offset={?d} active_screen={s}",
-            .{ self.session_id, text.len, next_offset, @tagName(self.terminal.screens.active_key) },
-        );
-        try self.appendOutput(std.heap.smp_allocator, text);
-        self.stream.nextSlice(text);
-        try self.repairTerminalState(std.heap.smp_allocator);
-        self.resetAlternateViewport();
-        try self.refreshRenderState(std.heap.smp_allocator);
-        self.render_state.dirty = .full;
+        // Deliberately ignore the response's `text`/`next_offset` (mirrors
+        // resizeDaemon). The daemon's write response only carries bytes
+        // produced during that request's settle window, but its next_offset is
+        // the ring's total. Jumping remote_output_offset to that total skips
+        // any un-tailed bytes that landed between the last tail and this write
+        // — e.g. nvim's SIGWINCH repaint right after an unzoom, where the
+        // terminal model's own auto-response (DSR/color-query reply) triggers
+        // a write and permanently swallows the repaint, freezing the pane on
+        // the stale frame. All ring output must flow through session.tail in
+        // drainDaemonOutput, strictly ordered by the tail cursor.
     }
 
     fn detachDaemon(self: *UnixSession, allocator: std.mem.Allocator) void {
