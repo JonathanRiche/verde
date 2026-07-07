@@ -42,6 +42,7 @@ pub const LiveServer = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     thread: ?std.Thread = null,
+    owns_socket: std.atomic.Value(bool) = .init(false),
     mutex: Mutex = .{},
     condition: Condition = .{},
     pending: std.ArrayList(*Command) = .empty,
@@ -75,7 +76,7 @@ pub const LiveServer = struct {
             self.allocator.destroy(command);
         }
         self.pending.deinit(self.allocator);
-        deleteSocketPath(self.path);
+        if (self.owns_socket.load(.seq_cst)) deleteSocketPath(self.path);
         self.allocator.free(self.path);
         self.* = undefined;
     }
@@ -133,12 +134,20 @@ pub const LiveServer = struct {
 
 fn serverThreadMain(server: *LiveServer) void {
     var threaded = std.Io.Threaded.init_single_threaded;
+    // A second Verde instance can start while the first app is still running.
+    // Do not unlink an active app socket: existing terminal hooks have this
+    // pathname in VERDE_LIVE_SOCKET, and unlinking it leaves the first server
+    // listening on an anonymous fd that no hook/CLI process can reach.
+    if (socketAcceptsConnections(threaded.io(), server.path)) return;
     deleteSocketPath(server.path);
 
     const address = std.Io.net.UnixAddress.init(server.path) catch return;
     var listener = address.listen(threaded.io(), .{}) catch return;
+    server.owns_socket.store(true, .seq_cst);
     defer listener.deinit(threaded.io());
-    defer deleteSocketPath(server.path);
+    defer {
+        if (server.owns_socket.load(.seq_cst)) deleteSocketPath(server.path);
+    }
 
     while (true) {
         server.mutex.lock();
@@ -1980,6 +1989,13 @@ fn parseApprovalDecision(value: []const u8) ?provider_types.ApprovalDecision {
 fn deleteSocketPath(path: []const u8) void {
     var threaded = std.Io.Threaded.init_single_threaded;
     std.Io.Dir.deleteFileAbsolute(threaded.io(), path) catch {};
+}
+
+fn socketAcceptsConnections(io: std.Io, path: []const u8) bool {
+    const address = std.Io.net.UnixAddress.init(path) catch return false;
+    const stream = address.connect(io) catch return false;
+    stream.close(io);
+    return true;
 }
 
 fn wakeServer(path: []const u8) void {
