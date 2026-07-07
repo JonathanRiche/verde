@@ -239,9 +239,8 @@ pub fn remoteMkdirCommandLineAlloc(allocator: std.mem.Allocator, path: []const u
 pub fn remoteLoginShellCommandLineAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
     var script_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer script_writer.deinit();
-    try script_writer.writer.writeAll("cd -- ");
-    try shellQuote(&script_writer.writer, cwd);
-    try script_writer.writer.writeAll(" && exec \"${SHELL:-/bin/bash}\" -l");
+    try appendRemoteEnsureCwd(&script_writer.writer, cwd);
+    try script_writer.writer.writeAll(" && exec \"${SHELL:-/bin/bash}\" -il");
     const script = try script_writer.toOwnedSlice();
     defer allocator.free(script);
 
@@ -259,8 +258,7 @@ pub fn remoteExecCommandLineAlloc(allocator: std.mem.Allocator, cwd: []const u8,
     if (args.len == 0) return error.EmptyRemoteCommand;
     var script_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer script_writer.deinit();
-    try script_writer.writer.writeAll("cd -- ");
-    try shellQuote(&script_writer.writer, cwd);
+    try appendRemoteEnsureCwd(&script_writer.writer, cwd);
     try script_writer.writer.writeAll(" && exec ");
     for (args, 0..) |arg, index| {
         if (index > 0) try script_writer.writer.writeByte(' ');
@@ -274,6 +272,16 @@ pub fn remoteExecCommandLineAlloc(allocator: std.mem.Allocator, cwd: []const u8,
     try writer.writer.writeAll("bash -lc ");
     try shellQuote(&writer.writer, script);
     return try writer.toOwnedSlice();
+}
+
+fn appendRemoteEnsureCwd(writer: *std.Io.Writer, cwd: []const u8) !void {
+    // Keep terminal startup to one interactive SSH command. A separate preflight
+    // SSH freezes Verde's UI when Tailscale/SSH needs approval; this lets the
+    // terminal pane show that prompt instead.
+    try writer.writeAll("mkdir -p -- ");
+    try shellQuote(writer, cwd);
+    try writer.writeAll(" && cd -- ");
+    try shellQuote(writer, cwd);
 }
 
 fn localHerdrExecutableAlloc(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
@@ -513,7 +521,7 @@ test "remote login shell command line starts in cwd" {
     const command = try remoteLoginShellCommandLineAlloc(std.testing.allocator, ".local/share/verde/herdr-workspaces/has space");
     defer std.testing.allocator.free(command);
     const expected =
-        \\bash -lc 'cd -- '\''.local/share/verde/herdr-workspaces/has space'\'' && exec "${SHELL:-/bin/bash}" -l'
+        \\bash -lc 'mkdir -p -- '\''.local/share/verde/herdr-workspaces/has space'\'' && cd -- '\''.local/share/verde/herdr-workspaces/has space'\'' && exec "${SHELL:-/bin/bash}" -il'
     ;
     try std.testing.expectEqualStrings(expected, command);
 }
@@ -522,7 +530,7 @@ test "remote exec command line quotes cwd and argv" {
     const command = try remoteExecCommandLineAlloc(std.testing.allocator, ".local/share/verde/herdr-workspaces/has space", &.{ "/bin/sh", "-lc", "printf 'hi there'" });
     defer std.testing.allocator.free(command);
     const expected =
-        \\bash -lc 'cd -- '\''.local/share/verde/herdr-workspaces/has space'\'' && exec /bin/sh -lc '\''printf '\''\'\'''\''hi there'\''\'\'''\'''\'''
+        \\bash -lc 'mkdir -p -- '\''.local/share/verde/herdr-workspaces/has space'\'' && cd -- '\''.local/share/verde/herdr-workspaces/has space'\'' && exec /bin/sh -lc '\''printf '\''\'\'''\''hi there'\''\'\'''\'''\'''
     ;
     try std.testing.expectEqualStrings(expected, command);
 }
