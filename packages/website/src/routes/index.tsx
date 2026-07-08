@@ -1,5 +1,7 @@
 import { createFileRoute } from '@tanstack/solid-router'
-import { For, Show, createSignal } from 'solid-js'
+import { For, Show, createSignal, onMount } from 'solid-js'
+
+import { activeTheme, activeThemeSlug, availableThemes, setActiveThemeSlug } from '../lib/site-theme'
 
 import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png'
 import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
@@ -199,6 +201,17 @@ function CompCell(props: { value: Cell }) {
 
 function App() {
   const [showMoreInstall, setShowMoreInstall] = createSignal(false)
+
+  // Fetch every theme capture once the page is interactive so switching
+  // themes is instant instead of flashing a network load. Theme state itself
+  // lives in lib/site-theme.ts, shared with the nav dropdown; the Header owns
+  // the effect that applies the tokens site-wide.
+  onMount(() => {
+    for (const t of availableThemes) {
+      const img = new Image()
+      img.src = t.shot
+    }
+  })
 
   return (
     <main>
@@ -400,6 +413,59 @@ function App() {
           </div>
         </div>
       </section>
+
+      {/* ── Omarchy theme showcase ── */}
+      <Show when={availableThemes.length > 0}>
+        <section id="themes" class="themes-band">
+          <div class="wrap">
+            <div class="band-header band-header--center">
+              <p class="tag tag-static">Omarchy themes</p>
+              <h2 class="heading">It dresses like your desktop.</h2>
+              <p class="band-body">
+                On Omarchy, Verde auto-detects the active theme's{' '}
+                <code>colors.toml</code> and restyles itself to match — no Verde
+                config needed. Pick one: every shot is the real app recaptured
+                under that theme, and this whole page re-skins itself from the
+                same palette, exactly like the app does.
+              </p>
+            </div>
+
+            <div class="theme-picker" role="tablist" aria-label="Preview Verde under an Omarchy theme">
+              <For each={availableThemes}>
+                {(t) => (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeThemeSlug() === t.slug}
+                    class={`theme-chip${activeThemeSlug() === t.slug ? ' theme-chip--active' : ''}`}
+                    onClick={() => setActiveThemeSlug(t.slug)}
+                  >
+                    <span class="theme-swatch" style={{ background: t.bg }}>
+                      <span class="theme-swatch-dot" style={{ background: t.accent }} />
+                    </span>
+                    {t.name}
+                  </button>
+                )}
+              </For>
+            </div>
+
+            <div class="app-frame theme-frame">
+              <img
+                src={activeTheme().shot}
+                alt={`Verde desktop app themed by the Omarchy ${activeTheme().name} theme.`}
+                class="theme-screenshot"
+              />
+            </div>
+
+            <p class="themes-note">
+              Works with any Omarchy theme, not just these — Verde follows{' '}
+              <code>~/.config/omarchy/current/theme/colors.toml</code>. See{' '}
+              <a href="/docs/config" class="text-link">Configuration &amp; state</a>{' '}
+              for the detection order and manual overrides.
+            </p>
+          </div>
+        </section>
+      </Show>
 
       {/* ── Feature grid ── */}
       <section id="features" class="band">

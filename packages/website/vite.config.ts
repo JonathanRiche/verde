@@ -22,6 +22,11 @@ const alchemyPlugins = process.env.NODE_ENV !== 'production' &&
   : []
 
 const ASSET_EXT_MIME: Record<string, string> = {
+  // JS is served only on an exact content-hash match (no fallback below), so
+  // a hit is by construction the bundle the SSR manifest asked for. Without
+  // this, dev pages never hydrate: the manifest references hashed /assets/*.js
+  // that vite dev doesn't emit, every chunk 404s, and the page is static HTML.
+  '.js': 'text/javascript',
   '.css': 'text/css',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -50,7 +55,9 @@ function mimeForAssetPath(pathname: string): string | undefined {
  * TanStack Start's SSR manifest references `/assets/*` from the last client
  * build. Vite dev does not emit those files, so they 404 unless `dist/client`
  * already exists. Serve matching files from `dist/client` when present.
- * (JS is excluded so we never serve a stale client bundle from disk.)
+ * JS is served only on an exact hashed-filename match — content hashing makes
+ * an exact hit the right bundle, and it's what lets dev pages hydrate at all.
+ * The trade-off stands: rebuild (`bun run build`) to see client-code changes.
  */
 function serveStaleClientAssetsFromDist(): Plugin {
   return {
