@@ -1,26 +1,34 @@
-import { Link } from '@tanstack/solid-router'
+import { Link, getRouteApi } from '@tanstack/solid-router'
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 
 import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
 import {
-  activeTheme,
   activeThemeSlug,
-  applySiteTheme,
   availableThemes,
+  displayedTheme,
+  persistThemeCookie,
   setActiveThemeSlug,
+  themeCssText,
 } from '../lib/site-theme'
+
+const rootRoute = getRouteApi('__root__')
 
 /* Custom dropdown mirroring the homepage theme chips — same shared signal, so
    picking a theme here or there stays in sync. The Header is mounted on every
-   route, so it owns the effect that applies the theme tokens site-wide. */
+   route, so it owns the site-wide theming: a reactive <style> tag whose token
+   overrides follow the current theme. During SSR the current theme comes from
+   the visitor's cookie (read by the root loader), so returning visitors get
+   already-themed HTML with no flash. */
 function ThemeDropdown() {
   const [open, setOpen] = createSignal(false)
   let rootEl: HTMLDivElement | undefined
 
-  // Re-skin the page whenever the shared theme changes. Effects only run
-  // client-side, so SSR always emits the stock Verde tokens.
+  const savedSlug = rootRoute.useLoaderData() as () => string | null
+  const theme = () => displayedTheme(savedSlug())
+
+  // Persist picks for the next visit's SSR. Effects never run server-side.
   createEffect(() => {
-    applySiteTheme(activeTheme())
+    persistThemeCookie(activeThemeSlug())
   })
 
   onMount(() => {
@@ -40,6 +48,10 @@ function ThemeDropdown() {
 
   return (
     <Show when={availableThemes.length > 1}>
+      {/* Site-wide token overrides; sits after the main stylesheet so its
+          equal-specificity :root block wins by source order. */}
+      <style innerHTML={themeCssText(theme())} />
+
       <div class="theme-dd" ref={rootEl}>
         <button
           type="button"
@@ -49,10 +61,10 @@ function ThemeDropdown() {
           aria-label="Preview an Omarchy theme"
           onClick={() => setOpen(!open())}
         >
-          <span class="theme-swatch" style={{ background: activeTheme().bg }}>
-            <span class="theme-swatch-dot" style={{ background: activeTheme().accent }} />
+          <span class="theme-swatch" style={{ background: theme().bg }}>
+            <span class="theme-swatch-dot" style={{ background: theme().accent }} />
           </span>
-          <span class="theme-dd-label">{activeTheme().name}</span>
+          <span class="theme-dd-label">{theme().name}</span>
           <svg class="theme-dd-chevron" viewBox="0 0 24 24" aria-hidden="true">
             <path
               d="M6 9l6 6 6-6"
