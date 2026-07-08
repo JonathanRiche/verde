@@ -10,7 +10,7 @@ import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
 import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
 import ampLogo from '../../../desktop/src/assets/amp-logo.png'
-import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
+import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
 import CopyButton from '../components/CopyButton'
 
 export const Route = createFileRoute('/')({ component: App })
@@ -743,7 +743,14 @@ bash ./scripts/release/install-linux-local.sh
       <footer class="site-footer">
         <div class="wrap footer-grid">
           <div class="footer-brand">
-            <img src={verdeLogo} alt="" />
+            <span
+              class="footer-logo logo-mask"
+              aria-hidden="true"
+              style={{
+                'mask-image': `url(${verdeLogoMask})`,
+                '-webkit-mask-image': `url(${verdeLogoMask})`,
+              }}
+            />
             <div>
               <strong>verde</strong>
               <span>A tiling desktop for AI coding agents.</span>
