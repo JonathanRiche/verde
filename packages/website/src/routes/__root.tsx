@@ -5,11 +5,21 @@ import {
   createRootRouteWithContext,
 } from '@tanstack/solid-router'
 import { TanStackRouterDevtools } from '@tanstack/solid-router-devtools'
+import { createServerFn } from '@tanstack/solid-start'
+import { getCookie } from '@tanstack/solid-start/server'
 
 import { HydrationScript } from 'solid-js/web'
 import { Suspense } from 'solid-js'
 
 import Header from '../components/Header'
+import { THEME_COOKIE } from '../lib/site-theme'
+
+/* Read the visitor's saved Omarchy theme pick during SSR so the page paints
+   already themed (see lib/site-theme.ts). Runs on the server only; the
+   client re-derives the same value from document.cookie. */
+const getSavedThemeSlug = createServerFn({ method: 'GET' }).handler(() => {
+  return getCookie(THEME_COOKIE) ?? null
+})
 
 // Side-effect import (not `?url`): TanStack Start dev SSR skips `?url` CSS when
 // building `/@tanstack-start/styles.css`, and `?url` hrefs point at prod asset
@@ -53,6 +63,7 @@ export const Route = createRootRouteWithContext()({
       { rel: 'manifest', href: '/manifest.json' },
     ],
   }),
+  loader: () => getSavedThemeSlug(),
   shellComponent: RootComponent,
 })
 

@@ -1,15 +1,22 @@
 //! Shared Omarchy theme state for the marketing site.
 //!
 //! One module-level signal drives both the homepage showcase chips and the
-//! nav dropdown, and `applySiteTheme` re-skins the whole page by overriding
+//! nav dropdown, and `themeCssText` re-skins the whole page by overriding
 //! the design tokens in styles.css with values derived from the theme's four
 //! palette colors — the same way the desktop app derives its UI from an
-//! Omarchy colors.toml. The signal is only ever written from user interaction
-//! (client-side), so SSR always renders the stock Verde look.
+//! Omarchy colors.toml. The pick persists in a plain cookie that the root
+//! loader reads server-side, so a returning visitor's SSR HTML is already
+//! themed — no client-side restore, no flash.
 
 import { createSignal } from 'solid-js'
+import { isServer } from 'solid-js/web'
 
 import appScreenshot from '../../../../assets/green_verde.png'
+
+/** Cookie persisting the visitor's picked theme; read server-side by the root
+    loader so SSR paints the saved theme with no flash. Value is the plain
+    theme slug — validated against the manifest on every read. */
+export const THEME_COOKIE = 'verde_theme'
 
 /* Screenshots live in src/assets/theme_shots/<slug>.png. The glob picks them
    up at build time, so dropping a new capture into that folder is all it
@@ -67,12 +74,38 @@ export const availableThemes = OMARCHY_THEMES.map((t) => ({
   shot: themeShot(t.slug) ?? t.fallbackShot,
 })).filter((t): t is OmarchyTheme & { shot: string } => t.shot !== undefined)
 
+export function themeBySlug(slug: string | null | undefined) {
+  return availableThemes.find((t) => t.slug === slug)
+}
+
+/* On the client the signal initializes straight from the cookie, so hydration
+   agrees with the cookie-driven SSR output. On the server the signal is never
+   read for theming (see displayedTheme) and never written, so concurrent
+   requests can't leak state into each other. */
+function clientCookieSlug(): string | null {
+  if (isServer) return null
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${THEME_COOKIE}=([^;]+)`))
+  return match ? decodeURIComponent(match[1]!) : null
+}
+
 export const [activeThemeSlug, setActiveThemeSlug] = createSignal(
-  availableThemes[0]?.slug ?? 'verde',
+  themeBySlug(clientCookieSlug())?.slug ?? availableThemes[0]?.slug ?? 'verde',
 )
 
 export function activeTheme() {
-  return availableThemes.find((t) => t.slug === activeThemeSlug()) ?? availableThemes[0]!
+  return themeBySlug(activeThemeSlug()) ?? availableThemes[0]!
+}
+
+/** Theme to render right now: on the server, the cookie slug the root loader
+    read; on the client, the shared signal (itself cookie-initialized). */
+export function displayedTheme(ssrSlug: string | null | undefined) {
+  if (isServer) return themeBySlug(ssrSlug) ?? availableThemes[0]!
+  return activeTheme()
+}
+
+export function persistThemeCookie(slug: string) {
+  if (isServer) return
+  document.cookie = `${THEME_COOKIE}=${encodeURIComponent(slug)}; path=/; max-age=31536000; samesite=lax`
 }
 
 /* ── Token derivation ── */
@@ -137,14 +170,15 @@ function siteTokensFor(t: OmarchyTheme): Record<string, string> {
   }
 }
 
-export function applySiteTheme(t: OmarchyTheme) {
-  const root = document.documentElement
-  if (t.slug === 'verde') {
-    // Default theme = the stock stylesheet tokens; clear every override.
-    for (const key of Object.keys(siteTokensFor(t))) root.style.removeProperty(key)
-    return
-  }
-  for (const [key, value] of Object.entries(siteTokensFor(t))) {
-    root.style.setProperty(key, value)
-  }
+/** CSS text for the theme's token overrides, rendered into a `<style>` tag
+    (in the Header) that follows the shared signal. Empty for the default
+    theme so the stock stylesheet tokens win. The tag lives in `<body>`,
+    after the main stylesheet, so its equal-specificity `:root` block takes
+    precedence by source order. */
+export function themeCssText(t: OmarchyTheme): string {
+  if (t.slug === 'verde') return ''
+  const decls = Object.entries(siteTokensFor(t))
+    .map(([key, value]) => `${key}:${value}`)
+    .join(';')
+  return `:root{${decls}}`
 }

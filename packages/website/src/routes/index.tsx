@@ -1,7 +1,9 @@
-import { createFileRoute } from '@tanstack/solid-router'
+import { createFileRoute, getRouteApi } from '@tanstack/solid-router'
 import { For, Show, createSignal, onMount } from 'solid-js'
 
-import { activeTheme, activeThemeSlug, availableThemes, setActiveThemeSlug } from '../lib/site-theme'
+import { availableThemes, displayedTheme, setActiveThemeSlug } from '../lib/site-theme'
+
+const rootRoute = getRouteApi('__root__')
 
 import openAiLogo from '../../../desktop/src/assets/OpenAI-white-monoblossom.png'
 import claudeLogo from '../../../desktop/src/assets/claude-logo.png'
@@ -9,7 +11,6 @@ import opencodeLogo from '../../../desktop/src/assets/opencode-logo-dark.png'
 import cursorLogo from '../../../desktop/src/assets/editor_logos/cursor.png'
 import ampLogo from '../../../desktop/src/assets/amp-logo.png'
 import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
-import appScreenshot from '../../../../assets/green_verde.png'
 import CopyButton from '../components/CopyButton'
 
 export const Route = createFileRoute('/')({ component: App })
@@ -202,10 +203,14 @@ function CompCell(props: { value: Cell }) {
 function App() {
   const [showMoreInstall, setShowMoreInstall] = createSignal(false)
 
+  // Theme state lives in lib/site-theme.ts, shared with the nav dropdown; the
+  // Header owns the site-wide <style> overrides. During SSR the theme comes
+  // from the visitor's cookie via the root loader.
+  const savedSlug = rootRoute.useLoaderData() as () => string | null
+  const theme = () => displayedTheme(savedSlug())
+
   // Fetch every theme capture once the page is interactive so switching
-  // themes is instant instead of flashing a network load. Theme state itself
-  // lives in lib/site-theme.ts, shared with the nav dropdown; the Header owns
-  // the effect that applies the tokens site-wide.
+  // themes is instant instead of flashing a network load.
   onMount(() => {
     for (const t of availableThemes) {
       const img = new Image()
@@ -268,9 +273,10 @@ function App() {
 
         <div class="stage-wrap">
           <div class="app-frame rise" style={{ 'animation-delay': '180ms' }}>
+            {/* Follows the Omarchy theme picker (nav dropdown / #themes chips) */}
             <img
-              src={appScreenshot}
-              alt="Verde desktop app with a sidebar of projects and threads, a chat pane, a browser pane, and an embedded terminal dock."
+              src={theme().shot}
+              alt="Verde desktop app with a sidebar of projects and threads, a chat pane, a terminal pane, and an Amp TUI, themed to match the selected Omarchy theme."
               class="app-screenshot"
             />
           </div>
@@ -436,8 +442,8 @@ function App() {
                   <button
                     type="button"
                     role="tab"
-                    aria-selected={activeThemeSlug() === t.slug}
-                    class={`theme-chip${activeThemeSlug() === t.slug ? ' theme-chip--active' : ''}`}
+                    aria-selected={theme().slug === t.slug}
+                    class={`theme-chip${theme().slug === t.slug ? ' theme-chip--active' : ''}`}
                     onClick={() => setActiveThemeSlug(t.slug)}
                   >
                     <span class="theme-swatch" style={{ background: t.bg }}>
@@ -451,8 +457,8 @@ function App() {
 
             <div class="app-frame theme-frame">
               <img
-                src={activeTheme().shot}
-                alt={`Verde desktop app themed by the Omarchy ${activeTheme().name} theme.`}
+                src={theme().shot}
+                alt={`Verde desktop app themed by the Omarchy ${theme().name} theme.`}
                 class="theme-screenshot"
               />
             </div>
