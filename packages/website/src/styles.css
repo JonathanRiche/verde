@@ -211,6 +211,21 @@ pre code {
   height: 1.55rem;
 }
 
+/* Accent-tinted logo, mirroring the desktop sidebar mark: a solid
+   var(--accent) fill shaped by the logo's alpha mask (mask-image is set
+   inline where used, since the hashed asset URL lives in JS). */
+.logo-mask {
+  display: inline-block;
+  background: var(--accent);
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  flex-shrink: 0;
+}
+
 .nav-links {
   display: flex;
   align-items: center;
@@ -1784,11 +1799,10 @@ thead .comp-rowhead { background: transparent; }
   gap: 0.85rem;
 }
 
-.footer-brand img {
+.footer-logo {
   width: 1.6rem;
   height: 1.8rem;
   opacity: 0.7;
-  flex-shrink: 0;
 }
 
 .footer-brand strong {

@@ -1,7 +1,7 @@
 import { Link, getRouteApi } from '@tanstack/solid-router'
 import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 
-import verdeLogo from '../../../desktop/src/assets/verde_logo.png'
+import verdeLogoMask from '../../../desktop/src/assets/verde_logo_mask.png'
 import {
   activeThemeSlug,
   availableThemes,
@@ -110,7 +110,17 @@ export default function Header() {
     <header class="site-header">
       <nav class="wrap header-inner" aria-label="Primary">
         <Link to="/" class="brand">
-          <img src={verdeLogo} alt="Verde" class="brand-logo" />
+          {/* Accent-tinted logo mask, mirroring the desktop sidebar mark —
+              the fill is var(--accent), so it recolors with the theme. */}
+          <span
+            class="brand-logo logo-mask"
+            role="img"
+            aria-label="Verde"
+            style={{
+              'mask-image': `url(${verdeLogoMask})`,
+              '-webkit-mask-image': `url(${verdeLogoMask})`,
+            }}
+          />
           <span>verde</span>
         </Link>
 
