@@ -9,4 +9,5 @@ node_modules/
 .env.agent-ci
 .claude/
 .tmp_video_review/
+tmp/
 notes/mac-webview-smoke/manual-evidence/

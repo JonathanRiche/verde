@@ -82,6 +82,10 @@ const SLASH_COMMAND_ANIMATION_WAIT_TIMEOUT_MS: c_int = 33;
 const BACKGROUND_TASK_WAIT_TIMEOUT_MS: c_int = 1000;
 const MOUSE_MOTION_RENDER_INTERVAL_MS: i64 = 33;
 const MACOS_CMD_W_CLOSE_SUPPRESS_MS: i64 = 750;
+// Some Wayland compositors can emit a burst of SDL close requests while a
+// screenshot/portal overlay is being dismissed. Most of the burst lacks focus,
+// but the final event may briefly report focus again; suppress that tail too.
+const LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS: i64 = 3500;
 var linux_wayland_browser_host: browser_runtime.LinuxWaylandHost = .{};
 const PALETTE_GPU_UI_FONT_PATHS = [_][:0]const u8{
     "src/assets/fonts/CalSans-Regular.ttf",
@@ -141,6 +145,7 @@ var macos_launch_close_suppress_until_ms: i64 = 0;
 var macos_last_text_input_timestamp_ns: u64 = 0;
 var macos_last_text_input_len: usize = 0;
 var macos_last_text_input: [64]u8 = std.mem.zeroes([64]u8);
+var linux_last_suspicious_close_ms: i64 = 0;
 const MACOS_DUPLICATE_TEXT_INPUT_SUPPRESS_NS: u64 = 30 * std.time.ns_per_ms;
 const MACOS_LAUNCH_CLOSE_SUPPRESS_MS: i64 = 650;
 
@@ -2113,14 +2118,29 @@ fn handleWindowCloseRequested(window: *sdl.Window, state: *AppState) bool {
             window_flags.minimized or
             window_flags.occluded;
         if (suspicious_close) {
+            linux_last_suspicious_close_ms = now_ms;
             runtime_log.diagnostic(
                 "ignoring suspicious linux window close request focus={} mouse_focus={} hidden={} minimized={} occluded={}",
                 .{ window_flags.input_focus, window_flags.mouse_focus, window_flags.hidden, window_flags.minimized, window_flags.occluded },
             );
             return true;
         }
+        if (linuxCloseRequestFollowsSuspiciousBurst(now_ms)) {
+            runtime_log.diagnostic("ignoring linux window close request after suspicious close burst", .{});
+            return true;
+        }
     }
     return false;
+}
+
+fn linuxCloseRequestFollowsSuspiciousBurst(now_ms: i64) bool {
+    if (linux_last_suspicious_close_ms == 0) return false;
+    if (now_ms < linux_last_suspicious_close_ms) {
+        linux_last_suspicious_close_ms = 0;
+        return false;
+    }
+    if (now_ms - linux_last_suspicious_close_ms > LINUX_SUSPICIOUS_CLOSE_BURST_SUPPRESS_MS) return false;
+    return true;
 }
 
 fn macosHostWindowRequestedClose(window: *sdl.Window, state: *AppState) bool {

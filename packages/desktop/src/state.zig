@@ -140,6 +140,7 @@ pub const PaletteModalAction = enum {
     herdr_profile_select,
     project_import_browse,
     project_import_submit,
+    project_import_create_dir,
     project_import_cancel,
     modal_dismiss,
     modal_block,
@@ -4164,6 +4165,7 @@ pub const AppState = struct {
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
+    project_directory_picker_create_parent: bool,
     picker_state: PickerState,
     slash_command_state: SlashCommandState,
     opencode_model_cache_state: OpencodeModelCacheState,
@@ -4402,6 +4404,7 @@ pub const AppState = struct {
             .app_config_file_mtime = -1,
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
+            .project_directory_picker_create_parent = false,
             .picker_state = .{},
             .slash_command_state = .{},
             .opencode_model_cache_state = .{},
@@ -5197,6 +5200,38 @@ pub const AppState = struct {
             .index = index,
             .restored = add_result == .restored,
         };
+    }
+
+    pub fn createProjectDirectoryFromInput(self: *AppState) !void {
+        const trimmed = std.mem.trim(u8, self.importDirectoryDraft(), &std.ascii.whitespace);
+        if (trimmed.len == 0) {
+            self.browseForProjectDirectoryCreateParent();
+            return;
+        }
+
+        if (self.resolveProjectPath(trimmed)) |existing| {
+            defer self.allocator.free(existing);
+            try self.setImportPathWithTrailingSeparator(existing);
+            self.project_import_cursor = self.importDirectoryDraft().len;
+            self.palette_modal_text_focus = .project_import;
+            self.setSidebarNotice("Type the new folder name, then Create directory.");
+            self.markDirty();
+            return;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        const created = self.ensureDirectoryPath(trimmed) catch |err| switch (err) {
+            error.EmptyProjectPath => {
+                self.setSidebarNotice("Enter a workspace directory path first.");
+                return;
+            },
+            else => return err,
+        };
+        defer self.allocator.free(created);
+        self.setSidebarNotice("Directory created. Adding workspace...");
+        try self.importProjectFromInput();
     }
 
     pub fn consumePendingHerdrOpenRequest(self: *AppState) !bool {
@@ -6108,6 +6143,11 @@ pub const AppState = struct {
                 self.setSidebarNotice("Enter a workspace directory path first.");
                 return;
             },
+            error.FileNotFound => {
+                self.setSidebarNotice("Directory not found. Use New folder..., then type a folder name.");
+                self.markDirty();
+                return;
+            },
             error.ProjectAlreadyExists => {
                 self.setSidebarNotice("That directory is already in the workspace rail.");
                 return;
@@ -6129,12 +6169,18 @@ pub const AppState = struct {
         self.markDirty();
     }
 
+    pub fn browseForProjectDirectoryCreateParent(self: *AppState) void {
+        self.project_directory_picker_create_parent = true;
+        self.browseForProjectDirectory();
+    }
+
     pub fn browseForProjectDirectory(self: *AppState) void {
         runtime_log.diagnostic("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         log.info("browseForWorkspaceDirectory entry show_project_creator={} draft_len={d}", .{ self.show_project_creator, self.importDirectoryDraft().len });
         const target_path = self.defaultExplorerPath() catch |err| {
             runtime_log.diagnostic("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
             log.warn("browseForWorkspaceDirectory defaultExplorerPath failed: {s}", .{@errorName(err)});
+            self.project_directory_picker_create_parent = false;
             self.setSidebarNotice(@errorName(err));
             return;
         };
@@ -6155,6 +6201,7 @@ pub const AppState = struct {
             runtime_log.diagnostic("browseForWorkspaceDirectory ignored: picker already pending", .{});
             log.info("browseForWorkspaceDirectory ignored: picker already pending", .{});
             page_alloc.free(owned_target);
+            self.project_directory_picker_create_parent = false;
             self.setSidebarNotice("Folder picker already open.");
             return;
         }
@@ -6164,6 +6211,7 @@ pub const AppState = struct {
         self.picker_state.worker = std.Thread.spawn(.{}, pickerWorker, .{ &self.picker_state, owned_target }) catch {
             page_alloc.free(owned_target);
             self.picker_state.status = .failed;
+            self.project_directory_picker_create_parent = false;
             runtime_log.diagnostic("browseForWorkspaceDirectory failed to spawn picker worker", .{});
             log.warn("browseForWorkspaceDirectory failed to spawn picker worker", .{});
             self.setSidebarNotice("Failed to start folder picker.");
@@ -6177,6 +6225,7 @@ pub const AppState = struct {
     pub fn requestBrowseForProjectDirectory(self: *AppState) void {
         runtime_log.diagnostic("requestBrowseForWorkspaceDirectory queued", .{});
         log.info("requestBrowseForWorkspaceDirectory queued", .{});
+        self.project_directory_picker_create_parent = false;
         self.project_directory_browse_requested = true;
         self.markDirty();
     }
@@ -14958,6 +15007,16 @@ pub const AppState = struct {
         @memcpy(self.import_path_storage[0..len], value[0..len]);
     }
 
+    fn setImportPathWithTrailingSeparator(self: *AppState, value: []const u8) !void {
+        if (value.len > 0 and value[value.len - 1] == std.fs.path.sep) {
+            self.setImportPath(value);
+            return;
+        }
+        const with_sep = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ value, std.fs.path.sep_str });
+        defer self.allocator.free(with_sep);
+        self.setImportPath(with_sep);
+    }
+
     fn renameInput(self: *const AppState) []const u8 {
         return std.mem.sliceTo(self.rename_storage[0..], 0);
     }
@@ -15213,14 +15272,26 @@ pub const AppState = struct {
             self.finishPickerThread();
         }
 
+        const create_parent = self.project_directory_picker_create_parent;
+        if (next_status != .idle) self.project_directory_picker_create_parent = false;
+
         switch (next_status) {
             .selected => {
                 if (picked_path) |path| {
                     defer std.heap.page_allocator.free(path);
                     if (self.show_project_creator) {
-                        self.setImportPath(path);
+                        if (create_parent) {
+                            self.setImportPathWithTrailingSeparator(path) catch |err| {
+                                log.warn("failed to stage selected parent folder: {s}", .{@errorName(err)});
+                                self.setSidebarNotice("Folder selected, but path setup failed.");
+                                return;
+                            };
+                        } else {
+                            self.setImportPath(path);
+                        }
                         self.project_import_cursor = self.importDirectoryDraft().len;
-                        self.setSidebarNotice("Folder selected.");
+                        self.palette_modal_text_focus = .project_import;
+                        self.setSidebarNotice(if (create_parent) "Type the new folder name, then Create directory." else "Folder selected.");
                         self.markDirty();
                     } else {
                         self.setImportPath(path);
