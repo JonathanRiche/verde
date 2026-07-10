@@ -239,6 +239,8 @@ fn mainInner(init: std.process.Init) !void {
         },
     );
     defer window.destroy();
+    const terminal_pointer_cursor = try sdl.createSystemCursor(.pointer);
+    defer terminal_pointer_cursor.destroy();
     window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
@@ -518,6 +520,7 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
+        syncTerminalMouseCursor(&state, terminal_pointer_cursor);
         pollAppConfigFileChanges(&state);
         if (state.app_config_runtime_sync_pending) {
             state.app_config_runtime_sync_pending = false;
@@ -621,6 +624,14 @@ fn mainInner(init: std.process.Init) !void {
         profiler.recordFrame(frame_sample);
         maybeLogFrameProfile(frame_profile_logging, &last_frame_profile_log_ms, &palette_renderer);
     }
+}
+
+fn syncTerminalMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
+    const shape = terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y) orelse {
+        sdl.setCursor(sdl.getDefaultCursor()) catch {};
+        return;
+    };
+    sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
 }
 
 fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
@@ -1405,7 +1416,7 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             if (workspace_panes_ui.hasActivePaneDrag() and workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {
                 return true;
             }
-            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y)) {
+            if (terminal_panel_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, event.motion.state)) {
                 return true;
             }
             if (workspace_panes_ui.handlePaletteMouseMotion(state, event.motion.x, event.motion.y, ctrl_down)) {

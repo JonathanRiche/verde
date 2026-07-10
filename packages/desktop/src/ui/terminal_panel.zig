@@ -324,10 +324,11 @@ pub fn handlePaletteKeyDown(state: *app_state.AppState, event: *const sdl.Keyboa
     return copySelectionToClipboard(state);
 }
 
-pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool {
+pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
     if (pending_link_click.active and selectionDragDistanceExceededFrom(pending_link_click.start_x, pending_link_click.start_y, x, y)) {
         pending_link_click = .{};
     }
+    if (routeTerminalMouseMotion(state, x, y, buttons)) return true;
     if (!selection_state.dragging) return false;
     updateSelectionFocus(state, x, y) orelse return true;
     selection_state.moved = true;
@@ -336,6 +337,34 @@ pub fn handlePaletteMouseMotion(state: *app_state.AppState, x: f32, y: f32) bool
     }
     state.markDirty();
     return true;
+}
+
+pub fn mouseShapeAtPoint(state: *const app_state.AppState, x: f32, y: f32) ?ghostty_vt.MouseShape {
+    const target = paneAtPoint(x, y) orelse return null;
+    const dock = state.currentProjectTerminalDock(target.dock_id) orelse return null;
+    return dock.mouseShapeForPane(target.pane_id);
+}
+
+fn routeTerminalMouseMotion(state: *app_state.AppState, x: f32, y: f32, buttons: sdl.MouseButtonFlags) bool {
+    const target = paneAtPoint(x, y) orelse return false;
+    var dock = state.currentProjectTerminalDockMutable(target.dock_id) orelse return false;
+    return dock.handleMouseMotion(
+        target.pane_id,
+        terminalPressedMouseButton(buttons),
+        x - target.rect.x,
+        y - target.rect.y,
+        target.rect.w,
+        target.rect.h,
+    );
+}
+
+fn terminalPressedMouseButton(buttons: sdl.MouseButtonFlags) ?u8 {
+    if (buttons.left != 0) return 1;
+    if (buttons.middle != 0) return 2;
+    if (buttons.right != 0) return 3;
+    if (buttons.x1 != 0) return 4;
+    if (buttons.x2 != 0) return 5;
+    return null;
 }
 
 pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, button: u8, down: bool) bool {

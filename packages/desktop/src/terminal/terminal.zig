@@ -512,6 +512,12 @@ pub const Dock = struct {
         return false;
     }
 
+    pub fn mouseShapeForPane(self: *const Dock, pane_id: u32) ?ghostty_vt.MouseShape {
+        const pane = self.findPaneByIdConst(pane_id) orelse return null;
+        if (pane.session) |session| return session.terminal.mouse_shape;
+        return null;
+    }
+
     pub fn scrollbarForPane(self: *Dock, pane_id: u32) ?TerminalScrollbar {
         const pane = self.findPaneById(pane_id) orelse return null;
         if (pane.session) |session| return session.scrollbar();
@@ -670,6 +676,17 @@ pub const Dock = struct {
         if (pane.session) |session| {
             return session.handleMouseButton(button, down, local_x, local_y, width, height) catch |err| {
                 log.warn("terminal mouse button failed: {s}", .{@errorName(err)});
+                return false;
+            };
+        }
+        return false;
+    }
+
+    pub fn handleMouseMotion(self: *Dock, pane_id: u32, button: ?u8, local_x: f32, local_y: f32, width: f32, height: f32) bool {
+        const pane = self.findPaneById(pane_id) orelse return false;
+        if (pane.session) |session| {
+            return session.handleMouseMotion(button, local_x, local_y, width, height) catch |err| {
+                log.warn("terminal mouse motion failed: {s}", .{@errorName(err)});
                 return false;
             };
         }
@@ -1738,6 +1755,10 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn handleMouseMotion(_: *UnsupportedSession, _: ?u8, _: f32, _: f32, _: f32, _: f32) !bool {
+        return false;
+    }
+
     pub fn scrollViewport(_: *UnsupportedSession, _: std.mem.Allocator, _: TerminalScroll) !void {}
 
     pub fn scrollbar(_: *UnsupportedSession) TerminalScrollbar {
@@ -2243,6 +2264,13 @@ const UnixSession = struct {
         return false;
     }
 
+    pub fn handleMouseMotion(self: *UnixSession, button: ?u8, local_x: f32, local_y: f32, width: f32, height: f32) !bool {
+        if (self.terminal.flags.mouse_event == .none) return false;
+        const mouse_button = if (button) |value| terminalMouseButton(value) else null;
+        try self.writeMouseInput(mouse_button, .motion, local_x, local_y, width, height);
+        return true;
+    }
+
     fn sendInBandSizeReportAfterResize(self: *UnixSession) void {
         if (!self.terminal.modes.get(.in_band_size_reports)) return;
         var buffer: [128]u8 = undefined;
@@ -2329,7 +2357,7 @@ const UnixSession = struct {
         }
     }
 
-    fn writeMouseInput(self: *UnixSession, button: ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32) !void {
+    fn writeMouseInput(self: *UnixSession, button: ?ghostty_vt.input.MouseButton, action: ghostty_vt.input.MouseAction, local_x: f32, local_y: f32, width: f32, height: f32) !void {
         const logical_cell_width = @max(self.cell_width, 1);
         const logical_cell_height = @max(self.cell_height, 1);
         const visible_rows = @min(
@@ -2345,19 +2373,17 @@ const UnixSession = struct {
             @as(u32, @max(self.rows, 1)) * logical_cell_height
         else
             @intFromFloat(@max(@round(height), 1.0));
-        const cell_width: u32 = if (clipped_alt)
-            logical_cell_width
-        else
-            @intFromFloat(@max(@round(width / @as(f32, @floatFromInt(@max(self.cols, 1)))), 1.0));
-        const cell_height: u32 = if (clipped_alt)
-            logical_cell_height
-        else
-            @intFromFloat(@max(@round(height / @as(f32, @floatFromInt(@max(self.rows, 1)))), 1.0));
-        const options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
+        // Rendering keeps cells at these fixed scaled dimensions and leaves
+        // any remainder at the pane edge. Redistributing that remainder over
+        // all rows/columns makes mouse targets drift away from drawn cells.
+        const cell_width = logical_cell_width;
+        const cell_height = logical_cell_height;
+        var options = ghostty_vt.input.MouseEncodeOptions.fromTerminal(&self.terminal, .{
             .screen = .{ .width = screen_width, .height = screen_height },
             .cell = .{ .width = cell_width, .height = cell_height },
             .padding = .{},
         });
+        options.any_button_pressed = button != null;
         const row_offset = if (clipped_alt)
             @as(usize, self.rows) - visible_rows
         else
