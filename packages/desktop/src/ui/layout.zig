@@ -497,6 +497,12 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                     state.setSidebarNotice("Could not add that directory path.");
                 };
             },
+            .project_import_create_dir => {
+                state.createProjectDirectoryFromInput() catch |err| {
+                    runtime.log.warn("workspace directory creation failed: {s}", .{@errorName(err)});
+                    state.setSidebarNotice("Could not create that directory path.");
+                };
+            },
             .project_import_cancel => state.cancelProjectImport(),
             .settings_cancel => state.cancelSettingsModal(),
             .settings_close => state.cancelSettingsModal(),
@@ -834,8 +840,12 @@ fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f
     var y = modal.y + pad;
     y += theme.scaledUi(30.0);
     y += theme.scaledUi(48.0);
-    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(36.0) };
+    const button_gap = theme.scaledUi(10.0);
+    const browse_w = (modal.w - pad * 2.0 - button_gap) * 0.5;
+    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = browse_w, .h = theme.scaledUi(36.0) };
+    const create_rect: palette.Rect = .{ .x = browse_rect.x + browse_rect.w + button_gap, .y = y, .w = browse_w, .h = browse_rect.h };
     queueModalHit(state, browse_rect, .project_import_browse, 0);
+    queueModalHit(state, create_rect, .project_import_create_dir, 0);
     y += theme.scaledUi(44.0);
     const add_w = theme.scaledUi(76.0);
     const row_gap = theme.scaledUi(10.0);
@@ -1024,10 +1034,14 @@ fn renderWorkspaceAddModal(state: *runtime.AppState, width: f32, height: f32) vo
     var y = modal.y + pad;
     queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(24.0) }, "Add workspace", paletteColor(theme.COLOR_WHITE), theme.scaledUi(17.0), modal);
     y += theme.scaledUi(30.0);
-    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Choose a directory for a new workspace, or paste a path below.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(40.0) }, "Open an existing folder, or pick a parent and type a new folder name.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.0), modal);
     y += theme.scaledUi(48.0);
-    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(36.0) };
-    drawActionButton(state, browse_rect, "Browse for folder", theme.COLOR_PANEL_ALT);
+    const button_gap = theme.scaledUi(10.0);
+    const browse_w = (modal.w - pad * 2.0 - button_gap) * 0.5;
+    const browse_rect: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = browse_w, .h = theme.scaledUi(36.0) };
+    const create_rect: palette.Rect = .{ .x = browse_rect.x + browse_rect.w + button_gap, .y = y, .w = browse_w, .h = browse_rect.h };
+    drawActionButton(state, browse_rect, "Open existing folder", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, create_rect, "New folder...", theme.COLOR_GREEN);
     y += theme.scaledUi(44.0);
     const add_w = theme.scaledUi(76.0);
     const row_gap = theme.scaledUi(10.0);

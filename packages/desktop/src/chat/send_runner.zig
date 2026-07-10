@@ -103,15 +103,24 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
 }
 
 fn approvalPolicyForMode(mode: AccessMode) ?harness.ApprovalPolicy {
-    return switch (mode) { .full_access => .never, .supervised => .on_request };
+    return switch (mode) {
+        .full_access => .never,
+        .supervised => .on_request,
+    };
 }
 
 fn serviceTierForMode(provider: harness.Provider, fast_mode: FastMode) ?harness.ServiceTier {
     if (provider != .codex) return null;
-    return switch (fast_mode) { .on => .fast, .off => null };
+    return switch (fast_mode) {
+        .on => .fast,
+        .off => null,
+    };
 }
 
 fn sandboxModeForMode(provider: harness.Provider, mode: AccessMode) ?harness.SandboxMode {
     if (provider != .codex and provider != .claude) return null;
-    return switch (mode) { .full_access => .danger_full_access, .supervised => .workspace_write };
+    return switch (mode) {
+        .full_access => .danger_full_access,
+        .supervised => .workspace_write,
+    };
 }
