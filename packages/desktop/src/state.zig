@@ -10002,6 +10002,7 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                if (project.terminal_dock.consumeWorkspaceChange()) self.markDirty();
                 self.drainTerminalDockNotifications(project_index, 0, &project.terminal_dock) catch |err| {
                     log.warn("failed to apply terminal notification: {s}", .{@errorName(err)});
                 };
@@ -10035,6 +10036,7 @@ pub const AppState = struct {
                     }
                     break :blk false;
                 };
+                if (entry.dock.consumeWorkspaceChange()) self.markDirty();
                 self.drainTerminalDockNotifications(project_index, entry.id, &entry.dock) catch |err| {
                     log.warn("failed to apply terminal dock notification: {s}", .{@errorName(err)});
                 };

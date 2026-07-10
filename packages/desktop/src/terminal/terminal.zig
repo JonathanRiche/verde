@@ -116,6 +116,7 @@ const SessionCreateOptions = struct {
     cols: u16,
     rows: u16,
     profile: TerminalLaunchProfile = .{},
+    restored_modes: ?PersistedTerminalModes = null,
     session_id: ?[]const u8 = null,
     pref_path: ?[]const u8 = null,
     project_id: []const u8 = "",
@@ -146,6 +147,28 @@ pub const PersistedNodeKind = enum(u8) {
     split,
 };
 
+pub const PersistedMouseEvent = enum(u8) {
+    none,
+    x10,
+    normal,
+    button,
+    any,
+};
+
+pub const PersistedMouseFormat = enum(u8) {
+    x10,
+    utf8,
+    sgr,
+    urxvt,
+    sgr_pixels,
+};
+
+pub const PersistedTerminalModes = struct {
+    alternate_screen: bool = false,
+    mouse_event: PersistedMouseEvent = .none,
+    mouse_format: PersistedMouseFormat = .x10,
+};
+
 pub const PersistedNode = struct {
     node_id: u32,
     kind: PersistedNodeKind,
@@ -155,6 +178,7 @@ pub const PersistedNode = struct {
     launch_label: ?[]const u8 = null,
     launch_command: []const []const u8 = &.{},
     revive_policy: ?TerminalRevivePolicy = null,
+    terminal_modes: ?PersistedTerminalModes = null,
     axis: ?SplitAxis = null,
     ratio: ?f32 = null,
     first_node_id: ?u32 = null,
@@ -169,6 +193,7 @@ pub const PaneLeaf = struct {
     launch_label: ?[]u8 = null,
     launch_command: []const []const u8 = &.{},
     revive_policy: TerminalRevivePolicy = .attach_or_create,
+    restored_modes: ?PersistedTerminalModes = null,
 };
 
 pub const PaneSplit = struct {
@@ -398,10 +423,12 @@ pub const Dock = struct {
 
     pub fn poll(self: *Dock, allocator: std.mem.Allocator) !bool {
         var changed = false;
+        var terminal_modes_changed = false;
         for (self.tabs.items) |*tab| {
-            changed = (try pollPaneNode(tab.root, allocator)) or changed;
+            changed = (try pollPaneNode(tab.root, allocator, &terminal_modes_changed)) or changed;
             if (self.captureTabObservedTitle(allocator, tab)) changed = true;
         }
+        if (terminal_modes_changed) self.workspace_changed = true;
         return changed;
     }
 
@@ -1125,6 +1152,7 @@ pub const Dock = struct {
             .cols = INITIAL_COLS,
             .rows = INITIAL_ROWS,
             .profile = profile,
+            .restored_modes = leaf.restored_modes,
             .session_id = leaf.session_id,
             .pref_path = self.pref_path,
             .project_id = cwd,
@@ -1133,6 +1161,7 @@ pub const Dock = struct {
             .pane_id = leaf.id,
             .revive_policy = leaf.revive_policy,
         });
+        leaf.restored_modes = null;
         // Restart is a one-shot user action. Once the fresh daemon session is
         // created, future app launches should reattach like normal terminals.
         if (leaf.revive_policy == .restart) leaf.revive_policy = .attach_or_create;
@@ -1311,14 +1340,20 @@ fn deinitPaneLeaf(leaf: *PaneLeaf, allocator: std.mem.Allocator) void {
     leaf.launch_command = &.{};
 }
 
-fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator) !bool {
+fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator, terminal_modes_changed: *bool) !bool {
     switch (node.*) {
         .leaf => |*leaf| {
-            return if (leaf.session) |session| try session.poll(allocator) else false;
+            if (leaf.session) |session| {
+                const modes_before = session.persistedTerminalModes();
+                const changed = try session.poll(allocator);
+                if (!std.meta.eql(modes_before, session.persistedTerminalModes())) terminal_modes_changed.* = true;
+                return changed;
+            }
+            return false;
         },
         .split => |*split| {
-            const first_changed = try pollPaneNode(split.first, allocator);
-            const second_changed = try pollPaneNode(split.second, allocator);
+            const first_changed = try pollPaneNode(split.first, allocator, terminal_modes_changed);
+            const second_changed = try pollPaneNode(split.second, allocator, terminal_modes_changed);
             return first_changed or second_changed;
         },
     }
@@ -1592,6 +1627,7 @@ fn serializePaneNode(
                 .launch_label = launch_label,
                 .launch_command = try dupeStringSlice(allocator, leaf.launch_command),
                 .revive_policy = persistedRevivePolicy(leaf.revive_policy),
+                .terminal_modes = if (leaf.session) |session| session.persistedTerminalModes() else leaf.restored_modes,
             });
         },
         .split => |split| {
@@ -1641,6 +1677,7 @@ fn buildPaneNodeFromPersisted(
                     .launch_label = if (persisted.launch_label) |label| try allocator.dupe(u8, label) else null,
                     .launch_command = try dupeStringSlice(allocator, persisted.launch_command),
                     .revive_policy = persistedRevivePolicy(persisted.revive_policy orelse .attach_or_create),
+                    .restored_modes = persisted.terminal_modes,
                 } };
             },
             .split => {
@@ -1681,6 +1718,10 @@ const UnsupportedSession = struct {
 
     pub fn poll(_: *UnsupportedSession, _: std.mem.Allocator) !bool {
         return false;
+    }
+
+    pub fn persistedTerminalModes(_: *const UnsupportedSession) PersistedTerminalModes {
+        return .{};
     }
 
     pub fn resize(_: *UnsupportedSession, _: std.mem.Allocator, _: u16, _: u16, _: u32, _: u32) !void {}
@@ -1991,6 +2032,46 @@ const UnixSession = struct {
             try self.refreshRenderState(allocator);
         }
         return changed or exited;
+    }
+
+    pub fn persistedTerminalModes(self: *const UnixSession) PersistedTerminalModes {
+        return .{
+            .alternate_screen = self.terminal.screens.active_key == .alternate,
+            .mouse_event = switch (self.terminal.flags.mouse_event) {
+                .none => .none,
+                .x10 => .x10,
+                .normal => .normal,
+                .button => .button,
+                .any => .any,
+            },
+            .mouse_format = switch (self.terminal.flags.mouse_format) {
+                .x10 => .x10,
+                .utf8 => .utf8,
+                .sgr => .sgr,
+                .urxvt => .urxvt,
+                .sgr_pixels => .sgr_pixels,
+            },
+        };
+    }
+
+    /// Rebuilds protocol state that belongs to the surviving PTY but is older
+    /// than the bounded output replay available to a newly-started UI client.
+    fn applyRestoredTerminalModes(self: *UnixSession, modes: PersistedTerminalModes) void {
+        if (modes.alternate_screen) self.stream.nextSlice("\x1b[?1049h");
+        self.stream.nextSlice(switch (modes.mouse_event) {
+            .none => "",
+            .x10 => "\x1b[?9h",
+            .normal => "\x1b[?1000h",
+            .button => "\x1b[?1002h",
+            .any => "\x1b[?1003h",
+        });
+        self.stream.nextSlice(switch (modes.mouse_format) {
+            .x10 => "",
+            .utf8 => "\x1b[?1005h",
+            .sgr => "\x1b[?1006h",
+            .urxvt => "\x1b[?1015h",
+            .sgr_pixels => "\x1b[?1016h",
+        });
     }
 
     pub fn resize(self: *UnixSession, allocator: std.mem.Allocator, cols: u16, rows: u16, cell_width: u32, cell_height: u32) !void {
@@ -2599,6 +2680,9 @@ const UnixSession = struct {
             defer allocator.free(create_response);
             try ensureSessionResponseOk(allocator, create_response);
             attached_existing_session = !(sessionResultBool(allocator, create_response, "created") catch true);
+        }
+        if (attached_existing_session) {
+            if (options.restored_modes) |modes| self.applyRestoredTerminalModes(modes);
         }
         self.suppress_next_daemon_replay = attached_existing_session;
         self.defer_daemon_replay_until_resize = attached_existing_session;
@@ -4235,7 +4319,12 @@ test "persisted layout accepts leaves without session metadata" {
         \\    "nodes": [{
         \\      "node_id": 1,
         \\      "kind": "leaf",
-        \\      "pane_id": 7
+        \\      "pane_id": 7,
+        \\      "terminal_modes": {
+        \\        "alternate_screen": true,
+        \\        "mouse_event": "any",
+        \\        "mouse_format": "sgr"
+        \\      }
         \\    }]
         \\  }]
         \\}
@@ -4247,6 +4336,17 @@ test "persisted layout accepts leaves without session metadata" {
     try std.testing.expectEqual(@as(?[]u8, null), pane.session_id);
     try std.testing.expectEqual(@as(?TerminalLaunchKind, null), pane.launch_kind);
     try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, pane.revive_policy);
+    try std.testing.expectEqual(PersistedTerminalModes{
+        .alternate_screen = true,
+        .mouse_event = .any,
+        .mouse_format = .sgr,
+    }, pane.restored_modes.?);
+
+    const round_trip_json = (try dock.persistedLayoutJson(allocator)).?;
+    defer allocator.free(round_trip_json);
+    var round_trip = try std.json.parseFromSlice(PersistedWorkspace, allocator, round_trip_json, .{});
+    defer round_trip.deinit();
+    try std.testing.expectEqual(pane.restored_modes.?, round_trip.value.tabs[0].nodes[0].terminal_modes.?);
 }
 
 test "persisted restart revive policy reloads as attach" {
@@ -4398,6 +4498,36 @@ test "unix session alternate-screen resize follows terminal model without cleari
     try testing.expectEqual(@as(u16, 80), session.terminal.cols);
     try testing.expectEqual(@as(u16, 12), session.rows);
     try testing.expectEqual(@as(u16, 12), session.terminal.rows);
+}
+
+test "unix session restores alternate screen and mouse modes before daemon replay" {
+    if (!SESSION_SUPPORTED) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const session = try UnixSession.create(allocator, .{
+        .cwd = cwd,
+        .cols = 80,
+        .rows = 24,
+    });
+    defer {
+        session.deinit(allocator);
+        allocator.destroy(session);
+    }
+
+    session.applyRestoredTerminalModes(.{
+        .alternate_screen = true,
+        .mouse_event = .any,
+        .mouse_format = .sgr,
+    });
+    try testing.expectEqual(PersistedTerminalModes{
+        .alternate_screen = true,
+        .mouse_event = .any,
+        .mouse_format = .sgr,
+    }, session.persistedTerminalModes());
 }
 
 test "terminal geometry sanitization never returns zero cells" {
