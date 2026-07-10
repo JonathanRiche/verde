@@ -368,8 +368,9 @@ fn capabilitiesResponse(allocator: std.mem.Allocator, id_value: std.json.Value) 
             "surfaces",                            "surface.list",                         "surface.inspect",                    "surface.focus",
             "surface.clearAttention",              "notification.create",                  "notification.update",                "notification.clear",
             "processes",                           "workspace.select",                     "workspace.create",                   "workspace.rename",
-            "workspace.archive",                   "pane.focus",                           "pane.split",                         "pane.resize",
-            "pane.move",                           "pane.minimize",                        "pane.maximize",                      "pane.restore",
+            "workspace.close",                     "workspace.reopen",                     "workspace.archive",                  "pane.focus",
+            "pane.split",                          "pane.resize",                          "pane.move",                          "pane.minimize",
+            "pane.maximize",                       "pane.restore",
             "pane.close",                          "chat.status",                          "chat.transcript",                    "chat.draft.set",
             "chat.draft.append",                   "chat.send",                            "chat.followup",                      "chat.stop",
             "chat.approve",                        "browser.open",                         "browser.navigate",                   "browser.status",
@@ -418,6 +419,27 @@ fn workspacesResponse(allocator: std.mem.Allocator, id_value: std.json.Value, st
         try s.write(project.path);
         try s.objectField("archived");
         try s.write(project.archived);
+        try s.objectField("thread_count");
+        try s.write(project.threads.items.len);
+        try s.objectField("pane_count");
+        try s.write(project.workspace_layout.panes.items.len);
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.objectField("closed_workspaces");
+    try s.beginArray();
+    for (state.archived_projects.items, 0..) |project, index| {
+        try s.beginObject();
+        try s.objectField("index");
+        try s.write(index);
+        try s.objectField("id");
+        try s.write(project.id);
+        try s.objectField("label");
+        try s.write(project.label);
+        try s.objectField("path");
+        try s.write(project.path);
+        try s.objectField("closed");
+        try s.write(true);
         try s.objectField("thread_count");
         try s.write(project.threads.items.len);
         try s.objectField("pane_count");
@@ -783,11 +805,20 @@ fn workspaceCommandResponse(allocator: std.mem.Allocator, id_value: std.json.Val
         return try workspacesResponse(allocator, id_value, state);
     }
 
-    if (std.mem.eql(u8, command, "archive")) {
+    if (std.mem.eql(u8, command, "close") or std.mem.eql(u8, command, "archive")) {
         const project_index = resolveProjectIndex(state, params) orelse
             return try errorResponseAlloc(allocator, id_value, "not_found", "workspace not found");
-        if (!state.archiveProjectAtIndexResult(project_index)) {
-            return try errorResponseAlloc(allocator, id_value, "rejected", "workspace archive did not apply");
+        if (!state.closeProjectAtIndexResult(project_index)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "workspace close did not apply");
+        }
+        return try workspacesResponse(allocator, id_value, state);
+    }
+
+    if (std.mem.eql(u8, command, "reopen")) {
+        const archived_index = resolveClosedProjectIndex(state, params) orelse
+            return try errorResponseAlloc(allocator, id_value, "not_found", "closed workspace not found");
+        if (!state.reopenClosedProjectAtIndex(archived_index)) {
+            return try errorResponseAlloc(allocator, id_value, "rejected", "workspace reopen did not apply");
         }
         return try workspacesResponse(allocator, id_value, state);
     }
@@ -1290,6 +1321,23 @@ fn resolveProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usiz
         }
     }
     return state.selected_project_index;
+}
+
+fn resolveClosedProjectIndex(state: *app_state.AppState, params: std.json.Value) ?usize {
+    if (state.archived_projects.items.len == 0) return null;
+    if (params == .object) {
+        if (jsonString(params.object.get("workspace") orelse params.object.get("project") orelse .null)) |project_ref| {
+            if (std.mem.eql(u8, project_ref, "last") or std.mem.eql(u8, project_ref, "current")) return state.archived_projects.items.len - 1;
+            if (std.fmt.parseInt(usize, project_ref, 10)) |index| {
+                if (index < state.archived_projects.items.len) return index;
+            } else |_| {}
+            for (state.archived_projects.items, 0..) |project, index| {
+                if (std.mem.eql(u8, project.id, project_ref) or std.mem.eql(u8, project.path, project_ref) or std.mem.eql(u8, project.label, project_ref)) return index;
+            }
+            return null;
+        }
+    }
+    return state.archived_projects.items.len - 1;
 }
 
 fn resolveProjectIndexNullable(state: *app_state.AppState, params: std.json.Value) ?usize {

@@ -1990,6 +1990,7 @@ fn handleKeyboardAction(
         .workspace_toggle_maximize => _ = state.toggleFocusedWorkspacePaneMaximized(),
         .workspace_minimize => _ = state.minimizeFocusedWorkspacePane(),
         .workspace_close => _ = state.closeFocusedWorkspacePane(),
+        .workspace_close_current => if (state.selected_project_index < state.projects.items.len) state.closeProjectAtIndex(state.selected_project_index),
         .workspace_focus_left => _ = workspace_panes_ui.focusPaneInDirection(state, .left),
         .workspace_focus_right => _ = workspace_panes_ui.focusPaneInDirection(state, .right),
         .workspace_focus_up => _ = workspace_panes_ui.focusPaneInDirection(state, .up),
@@ -2026,6 +2027,7 @@ fn isWorkspacePaneAction(action: keybinds.NativeKeyboardAction) bool {
         .workspace_toggle_maximize,
         .workspace_minimize,
         .workspace_close,
+        .workspace_close_current,
         => true,
         else => false,
     };

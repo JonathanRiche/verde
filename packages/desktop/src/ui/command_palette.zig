@@ -95,7 +95,8 @@ const STATIC_COMMANDS = [_]Command{
     .{ .id = "pane.minimize", .title = "Minimize Pane", .keywords = "hide", .section = .panes, .keybind = .workspace_minimize, .run = runMinimizePane, .enabled = hasProjects },
     .{ .id = "workspace.add", .title = "Add Workspace", .keywords = "new project folder directory", .section = .workspaces, .run = runAddWorkspace },
     .{ .id = "workspace.rename", .title = "Rename Workspace", .keywords = "label", .section = .workspaces, .run = runRenameWorkspace, .enabled = hasProjects },
-    .{ .id = "workspace.archive", .title = "Archive Workspace", .keywords = "remove project", .section = .workspaces, .run = runArchiveWorkspace, .enabled = workspaceNotBusy },
+    .{ .id = "workspace.close", .title = "Close Workspace", .keywords = "archive remove project save state", .section = .workspaces, .run = runCloseWorkspace, .enabled = workspaceNotBusy },
+    .{ .id = "workspace.reopen", .title = "Reopen Last Closed Workspace", .keywords = "restore archived project", .section = .workspaces, .run = runReopenWorkspace, .enabled = hasClosedWorkspaces },
     .{ .id = "workspace.codex_tui", .title = "Start New Codex TUI", .keywords = "agent terminal workspace fresh openai", .section = .workspaces, .run = runOpenCodexTui, .enabled = hasProjects },
     .{ .id = "workspace.claude_tui", .title = "Start New Claude TUI", .keywords = "agent terminal workspace fresh anthropic claude code", .section = .workspaces, .run = runOpenClaudeTui, .enabled = hasProjects },
     .{ .id = "workspace.opencode_tui", .title = "Start New OpenCode TUI", .keywords = "agent terminal workspace fresh opencode", .section = .workspaces, .run = runOpenOpencodeTui, .enabled = hasProjects },
@@ -120,6 +121,8 @@ const ResultRef = union(enum) {
     thread: ThreadRef,
     /// Project index for a "Switch to <workspace>" row.
     workspace: usize,
+    /// Archived-project index for a "Reopen <workspace>" row.
+    closed_workspace: usize,
 };
 
 const Result = struct {
@@ -195,8 +198,9 @@ pub fn staticCommandInfo(state: *runtime.AppState, index: usize) ?StaticCommandI
 
 /// Runs one static command-palette entry by stable id, mirroring UI activation.
 pub fn runStaticCommandById(state: *runtime.AppState, id: []const u8) RunStaticCommandResult {
+    const command_id = if (std.mem.eql(u8, id, "workspace.archive")) "workspace.close" else id;
     for (STATIC_COMMANDS) |command| {
-        if (!std.mem.eql(u8, command.id, id)) continue;
+        if (!std.mem.eql(u8, command.id, command_id)) continue;
         if (!command.enabled(state)) {
             state.setSidebarNotice(disabledNoticeForCommand(state, command.id));
             return .disabled;
@@ -364,6 +368,10 @@ pub fn activateRow(state: *runtime.AppState, row_index: usize, split: bool) void
                 state.syncRenameBuffer();
                 state.markDirty();
             }
+        },
+        .closed_workspace => |ai| {
+            state.closeCommandPalette();
+            _ = state.reopenClosedProjectAtIndex(ai);
         },
     }
 }
@@ -571,6 +579,14 @@ fn buildSuggestions(state: *runtime.AppState) void {
             appendResult(.{ .workspace = pi });
         }
     }
+    if (state.archived_projects.items.len > 0) {
+        appendResult(.{ .header = "CLOSED WORKSPACES" });
+        var remaining = state.archived_projects.items.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            appendResult(.{ .closed_workspace = remaining });
+        }
+    }
 }
 
 /// Sidebar "History" scope: one workspace's committed threads, recency
@@ -636,6 +652,21 @@ fn buildRanked(state: *runtime.AppState, query: []const u8) void {
                     .score = score + (30 - age_days),
                 });
             }
+        }
+    }
+    for (state.archived_projects.items, 0..) |*project, ai| {
+        const label_score = fuzzyScore(project.label, query);
+        const path_score = fuzzyScore(project.path, query);
+        const action_score = maxOptional(
+            fuzzyScore("reopen workspace", query),
+            fuzzyScore("closed workspace", query),
+        );
+        const best = maxOptional(
+            maxOptional(label_score, if (path_score) |s| s - 50 else null),
+            if (action_score) |s| s - @as(i32, @intCast(@min(ai, 40))) else null,
+        );
+        if (best) |score| {
+            appendCandidate(&candidates, &candidate_count, .{ .ref = .{ .closed_workspace = ai }, .score = score + 20 });
         }
     }
 
@@ -931,6 +962,10 @@ fn workspaceNotBusy(state: *runtime.AppState) bool {
     return true;
 }
 
+fn hasClosedWorkspaces(state: *runtime.AppState) bool {
+    return state.archived_projects.items.len > 0;
+}
+
 fn currentWorkspaceHerdrLinked(state: *runtime.AppState) bool {
     return state.selected_project_index < state.projects.items.len and
         state.projects.items[state.selected_project_index].herdr_link != null;
@@ -986,6 +1021,7 @@ fn disabledNoticeForCommand(state: *runtime.AppState, id: []const u8) []const u8
         const thread = &project.threads.items[thread_index];
         if (thread.provider_thread_id == null) return "Thread has no provider session id yet.";
     }
+    if (std.mem.eql(u8, id, "workspace.reopen")) return "No closed workspaces to reopen.";
     if (std.mem.eql(u8, id, "workspace.herdr_focus_terminal")) return "Current workspace is not linked to Herdr.";
     if (std.mem.eql(u8, id, "workspace.herdr_unlink")) return "Current workspace is already running locally.";
     return "Command is unavailable right now.";
@@ -1086,8 +1122,12 @@ fn runRenameWorkspace(state: *runtime.AppState) void {
     state.beginProjectRename(state.selected_project_index);
 }
 
-fn runArchiveWorkspace(state: *runtime.AppState) void {
-    state.archiveProjectAtIndex(state.selected_project_index);
+fn runCloseWorkspace(state: *runtime.AppState) void {
+    state.closeProjectAtIndex(state.selected_project_index);
+}
+
+fn runReopenWorkspace(state: *runtime.AppState) void {
+    _ = state.reopenLastClosedProject();
 }
 
 fn runOpenCodexTui(state: *runtime.AppState) void {
@@ -1254,6 +1294,7 @@ fn renderRows(state: *runtime.AppState) void {
             .command => |ci| renderCommandRow(state, i, ci, rect, row_clip),
             .thread => |tr| renderThreadRow(state, i, tr, rect, row_clip),
             .workspace => |pi| renderWorkspaceRow(state, i, pi, rect, row_clip),
+            .closed_workspace => |ai| renderClosedWorkspaceRow(state, i, ai, rect, row_clip),
         }
     }
 }
@@ -1375,6 +1416,29 @@ fn renderWorkspaceRow(state: *runtime.AppState, row_index: usize, project_index:
             .h = font_size * 1.3,
         }, hint, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
     }
+}
+
+fn renderClosedWorkspaceRow(state: *runtime.AppState, row_index: usize, archived_index: usize, rect: palette.Rect, row_clip: palette.Rect) void {
+    renderRowBackground(state, row_index, rect, row_clip);
+    if (archived_index >= state.archived_projects.items.len) return;
+    const emphasis = state.command_palette_selected == row_index;
+    const font_size = theme.scaledUi(13.5);
+    const text_y = rect.y + (rect.h - font_size * 1.3) * 0.5;
+    var buf: [96]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, "Reopen {s}", .{state.archived_projects.items[archived_index].label}) catch "Reopen workspace";
+    queueText(state, .{ .x = rect.x + theme.scaledUi(12.0), .y = text_y, .w = theme.scaledUi(16.0), .h = font_size * 1.3 }, ">", paletteColor(theme.COLOR_GREEN), font_size, row_clip);
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(34.0),
+        .y = text_y,
+        .w = rect.w - theme.scaledUi(34.0) - theme.scaledUi(96.0),
+        .h = font_size * 1.3,
+    }, label, paletteColor(if (emphasis) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED), font_size, row_clip);
+    queueText(state, .{
+        .x = rect.x + rect.w - theme.scaledUi(88.0),
+        .y = text_y,
+        .w = theme.scaledUi(78.0),
+        .h = font_size * 1.3,
+    }, "closed", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), row_clip);
 }
 
 fn renderActionMenu(state: *runtime.AppState) void {

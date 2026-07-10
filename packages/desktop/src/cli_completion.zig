@@ -110,6 +110,10 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_create_flags);
     try w.writeAll("\"\n  local workspace_rename_flags=\"");
     try writeWords(w, &spec.workspace_rename_flags);
+    try w.writeAll("\"\n  local workspace_close_flags=\"");
+    try writeWords(w, &spec.workspace_close_flags);
+    try w.writeAll("\"\n  local workspace_reopen_flags=\"");
+    try writeWords(w, &spec.workspace_reopen_flags);
     try w.writeAll("\"\n  local workspace_archive_flags=\"");
     try writeWords(w, &spec.workspace_archive_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
@@ -223,6 +227,8 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\              select) COMPREPLY=( $(compgen -W "$workspace_select_flags" -- "$cur") ) ;;
         \\              create) COMPREPLY=( $(compgen -W "$workspace_create_flags" -- "$cur") ) ;;
         \\              rename) COMPREPLY=( $(compgen -W "$workspace_rename_flags" -- "$cur") ) ;;
+        \\              close) COMPREPLY=( $(compgen -W "$workspace_close_flags" -- "$cur") ) ;;
+        \\              reopen) COMPREPLY=( $(compgen -W "$workspace_reopen_flags" -- "$cur") ) ;;
         \\              archive) COMPREPLY=( $(compgen -W "$workspace_archive_flags" -- "$cur") ) ;;
         \\              *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\            esac
@@ -386,6 +392,10 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.workspace_create_flags);
     try w.writeAll("\"\n  local workspace_rename_flags=\"");
     try writeWords(w, &spec.workspace_rename_flags);
+    try w.writeAll("\"\n  local workspace_close_flags=\"");
+    try writeWords(w, &spec.workspace_close_flags);
+    try w.writeAll("\"\n  local workspace_reopen_flags=\"");
+    try writeWords(w, &spec.workspace_reopen_flags);
     try w.writeAll("\"\n  local workspace_archive_flags=\"");
     try writeWords(w, &spec.workspace_archive_flags);
     try w.writeAll("\"\n  local chat_draft_flags=\"");
@@ -499,6 +509,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\              select) compadd -- ${(s: :)workspace_select_flags} ;;
         \\              create) compadd -- ${(s: :)workspace_create_flags} ;;
         \\              rename) compadd -- ${(s: :)workspace_rename_flags} ;;
+        \\              close) compadd -- ${(s: :)workspace_close_flags} ;;
+        \\              reopen) compadd -- ${(s: :)workspace_reopen_flags} ;;
         \\              archive) compadd -- ${(s: :)workspace_archive_flags} ;;
         \\              *) compadd -- ${(s: :)json_flags} ;;
         \\            esac

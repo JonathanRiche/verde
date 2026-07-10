@@ -30,6 +30,7 @@ pub const NativeKeyboardAction = enum {
     workspace_toggle_maximize,
     workspace_minimize,
     workspace_close,
+    workspace_close_current,
     workspace_focus_left,
     workspace_focus_right,
     workspace_focus_up,
@@ -145,6 +146,7 @@ pub const NativeKeyboardConfig = struct {
     workspace_toggle_maximize: []Keybind,
     workspace_minimize: []Keybind,
     workspace_close: []Keybind,
+    workspace_close_current: []Keybind,
     workspace_focus_left: []Keybind,
     workspace_focus_right: []Keybind,
     workspace_focus_up: []Keybind,
@@ -198,6 +200,7 @@ pub const NativeKeyboardConfig = struct {
             .workspace_toggle_maximize = try cloneDefaultWorkspaceToggleMaximizeKeybinds(allocator),
             .workspace_minimize = try cloneEmptyKeybinds(allocator),
             .workspace_close = try cloneDefaultWorkspaceCloseKeybinds(allocator),
+            .workspace_close_current = try cloneDefaultWorkspaceCloseCurrentKeybinds(allocator),
             .workspace_focus_left = try cloneDefaultWorkspaceFocusLeftKeybinds(allocator),
             .workspace_focus_right = try cloneDefaultWorkspaceFocusRightKeybinds(allocator),
             .workspace_focus_up = try cloneDefaultWorkspaceFocusUpKeybinds(allocator),
@@ -262,6 +265,7 @@ pub const NativeKeyboardConfig = struct {
         self.allocator.free(self.workspace_toggle_maximize);
         self.allocator.free(self.workspace_minimize);
         self.allocator.free(self.workspace_close);
+        self.allocator.free(self.workspace_close_current);
         self.allocator.free(self.workspace_focus_left);
         self.allocator.free(self.workspace_focus_right);
         self.allocator.free(self.workspace_focus_up);
@@ -344,6 +348,9 @@ pub const NativeKeyboardConfig = struct {
         }
         if (matchesAny(self.workspace_close, event)) {
             return .workspace_close;
+        }
+        if (matchesAny(self.workspace_close_current, event)) {
+            return .workspace_close_current;
         }
         if (matchesAny(self.workspace_focus_left, event)) {
             return .workspace_focus_left;
@@ -695,6 +702,12 @@ pub const NativeKeyboardConfig = struct {
                 self.workspace_close = bindings;
             }
         }
+        if (workspace_value.object.get("close_current")) |value| {
+            if (self.parseOverrideValue(value, "workspace.close_current")) |bindings| {
+                self.allocator.free(self.workspace_close_current);
+                self.workspace_close_current = bindings;
+            }
+        }
         if (workspace_value.object.get("focus_left")) |value| {
             if (self.parseOverrideValue(value, "workspace.focus_left")) |bindings| {
                 self.allocator.free(self.workspace_focus_left);
@@ -895,6 +908,12 @@ fn cloneDefaultWorkspaceCloseKeybinds(allocator: std.mem.Allocator) ![]Keybind {
     return allocator.dupe(Keybind, &.{
         try parseDefaultAccelerator("CommandOrControl+W"),
         try parseDefaultAccelerator("Alt+X"),
+    });
+}
+
+fn cloneDefaultWorkspaceCloseCurrentKeybinds(allocator: std.mem.Allocator) ![]Keybind {
+    return allocator.dupe(Keybind, &.{
+        try parseDefaultAccelerator("Ctrl+Shift+W"),
     });
 }
 
@@ -1558,6 +1577,16 @@ test "default workspace close supports primary w and alt x" {
     try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close[0].key);
     try std.testing.expect(config.workspace_close[1].alt);
     try std.testing.expectEqual(sdl.Keycode.x, config.workspace_close[1].key);
+}
+
+test "default workspace close current uses ctrl shift w" {
+    var config = try NativeKeyboardConfig.load(std.testing.allocator);
+    defer config.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), config.workspace_close_current.len);
+    try std.testing.expect(config.workspace_close_current[0].ctrl);
+    try std.testing.expect(config.workspace_close_current[0].shift);
+    try std.testing.expectEqual(sdl.Keycode.w, config.workspace_close_current[0].key);
 }
 
 test "default workspace focus supports ctrl hjkl without alt arrows" {
