@@ -9,5 +9,7 @@ pub const MouseShape = root.MouseShape;
 pub const RGB = root.color.RGB;
 pub const color = root.color;
 pub const input = root.input;
+pub const kitty = root.kitty;
 pub const PageList = root.PageList;
 pub const size_report = root.size_report;
+pub const sys = root.sys;

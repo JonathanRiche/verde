@@ -4071,6 +4071,7 @@ pub const AppState = struct {
     browser_textures_enabled: bool,
     texture_upload_context: ?*anyopaque,
     texture_upload_fn: ?TextureUploadFn,
+    texture_release_fn: ?TextureReleaseFn,
     project_rename_cursor: usize,
     project_import_cursor: usize,
     thread_import_cursor: usize,
@@ -4263,11 +4264,14 @@ pub const AppState = struct {
         browser_textures_enabled: bool = true,
         texture_upload_context: ?*anyopaque = null,
         texture_upload_fn: ?TextureUploadFn = null,
+        texture_release_fn: ?TextureReleaseFn = null,
     };
 
     pub const TextureUploadFn = *const fn (context: ?*anyopaque, loaded: stb_image.LoadedImage) ?CachedImageTexture;
+    pub const TextureReleaseFn = *const fn (context: ?*anyopaque, texture_id: c_uint) void;
 
     pub fn init(allocator: std.mem.Allocator, storage: *const Storage, initial_config: app_config.AppConfig, options: InitOptions) !AppState {
+        terminal.configureGhosttySystem();
         var browser_state = try browser_runtime.State.init(allocator);
         errdefer browser_state.deinit();
 
@@ -4332,6 +4336,7 @@ pub const AppState = struct {
             .browser_textures_enabled = options.browser_textures_enabled,
             .texture_upload_context = options.texture_upload_context,
             .texture_upload_fn = options.texture_upload_fn,
+            .texture_release_fn = options.texture_release_fn,
             .project_rename_cursor = 0,
             .project_import_cursor = 0,
             .thread_import_cursor = 0,
@@ -4523,6 +4528,26 @@ pub const AppState = struct {
         }
         if (!self.gl_texture_uploads_enabled) return null;
         return uploadTexture(loaded);
+    }
+
+    pub fn uploadRgbaTexture(self: *AppState, width: u32, height: u32, pixels: []const u8) ?CachedImageTexture {
+        const expected_len = std.math.mul(usize, width, height) catch return null;
+        const rgba_len = std.math.mul(usize, expected_len, 4) catch return null;
+        if (width == 0 or height == 0 or pixels.len != rgba_len) return null;
+        const loaded: stb_image.LoadedImage = .{
+            .pixels = @ptrCast(@constCast(pixels.ptr)),
+            .width = @intCast(width),
+            .height = @intCast(height),
+            .channels = 4,
+        };
+        return self.uploadLoadedTexture(loaded);
+    }
+
+    pub fn releaseTexture(self: *AppState, texture_id: c_uint) void {
+        if (texture_id == 0) return;
+        if (self.texture_release_fn) |release_fn| {
+            release_fn(self.texture_upload_context, texture_id);
+        }
     }
 
     pub fn opencodeModelOptionsSnapshot(self: *const AppState) []const ModelOption {

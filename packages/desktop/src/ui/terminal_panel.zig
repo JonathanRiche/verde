@@ -23,6 +23,7 @@ const TERMINAL_SCROLLBAR_TRACK_WIDTH_CSS: f32 = 3.0;
 const TERMINAL_SCROLLBAR_EDGE_PAD_CSS: f32 = 2.0;
 const TERMINAL_SCROLLBAR_VERTICAL_PAD_CSS: f32 = 4.0;
 const MAX_TERMINAL_LINK_BYTES: usize = 2048;
+const MAX_TERMINAL_IMAGE_TEXTURES: usize = 128;
 
 const TerminalContextMenuKind = enum {
     pane,
@@ -170,6 +171,48 @@ const TerminalDrawCache = struct {
     }
 };
 
+const TerminalImageTexture = struct {
+    active: bool = false,
+    terminal_id: usize = 0,
+    image_id: u32 = 0,
+    texture_id: u32 = 0,
+};
+
+const TerminalImageTextureCache = struct {
+    entries: [MAX_TERMINAL_IMAGE_TEXTURES]TerminalImageTexture = [_]TerminalImageTexture{.{}} ** MAX_TERMINAL_IMAGE_TEXTURES,
+    next_recycle: usize = 0,
+
+    fn find(self: *TerminalImageTextureCache, terminal_id: usize, image_id: u32) ?u32 {
+        for (&self.entries) |*entry| {
+            if (entry.active and entry.terminal_id == terminal_id and entry.image_id == image_id) {
+                return entry.texture_id;
+            }
+        }
+        return null;
+    }
+
+    fn invalidateTerminal(self: *TerminalImageTextureCache, state: *app_state.AppState, terminal_id: usize) void {
+        for (&self.entries) |*entry| {
+            if (!entry.active or entry.terminal_id != terminal_id) continue;
+            state.releaseTexture(entry.texture_id);
+            entry.* = .{};
+        }
+    }
+
+    fn store(self: *TerminalImageTextureCache, state: *app_state.AppState, entry: TerminalImageTexture) void {
+        for (&self.entries) |*candidate| {
+            if (!candidate.active) {
+                candidate.* = entry;
+                return;
+            }
+        }
+        const candidate = &self.entries[self.next_recycle];
+        self.next_recycle = (self.next_recycle + 1) % self.entries.len;
+        state.releaseTexture(candidate.texture_id);
+        candidate.* = entry;
+    }
+};
+
 const PaneHit = struct {
     dock_id: u32 = 0,
     pane_id: u32 = 0,
@@ -270,6 +313,7 @@ var hit_cache: TerminalHitCache = .{};
 var selection_state: TerminalSelection = .{};
 var pending_link_click: PendingLinkClick = .{};
 var draw_cache: TerminalDrawCache = .{};
+var image_texture_cache: TerminalImageTextureCache = .{};
 var active_capture: ?*TerminalPaneDrawCache = null;
 var terminal_layout_log_enabled: ?bool = null;
 
@@ -572,7 +616,7 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
         renderStatus(state, rect, dock.statusText(&status_buf));
         return;
     };
-    renderViewport(state, pane_id, render_state, grid_rect, dock.font_scale);
+    renderViewport(state, pane_id, render_state, dock.terminalForPane(pane_id), grid_rect, dock.font_scale);
     if (dock.scrollbarForPane(pane_id)) |scrollbar| {
         renderTerminalScrollbar(state, rect, grid_rect, scrollbar);
     }
@@ -580,8 +624,13 @@ fn renderPane(state: *app_state.AppState, dock: anytype, pane_id: u32, rect: pal
     if (focused) queueBorder(state, rect, paletteColor(theme.COLOR_SECONDARY_GREEN), 0.0, theme.scaledUi(1.0));
 }
 
-fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, rect: palette.Rect, font_scale: f32) void {
+fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const ghostty_vt.RenderState, terminal_model: ?*ghostty_vt.Terminal, rect: palette.Rect, font_scale: f32) void {
     if (render_state.rows == 0 or render_state.cols == 0) return;
+    if (terminal_model) |model| {
+        if (model.screens.active.kitty_images.dirty) {
+            image_texture_cache.invalidateTerminal(state, @intFromPtr(model));
+        }
+    }
     const dock_id = hit_cache.dock_id;
     const cache = draw_cache.entryFor(dock_id, pane_id);
     const selection_dynamic = selectionAffectsPane(dock_id, pane_id);
@@ -592,6 +641,10 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
     // the cache key is missing something it should depend on.
     if (!selection_dynamic and !drawCacheBypassEnabled() and cache.validFor(render_state, rect, font_scale)) {
         replayCachedViewport(state, cache);
+        if (terminal_model) |model| {
+            renderTerminalImages(state, model, rect, rect, terminalRenderCellSize(terminal.CELL_PIXEL_WIDTH, font_scale), terminalRenderCellSize(terminal.CELL_PIXEL_HEIGHT, font_scale));
+            model.screens.active.kitty_images.dirty = false;
+        }
         return;
     }
 
@@ -677,6 +730,7 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
                 queueClippedRect(state, cell_rect, rgbPaletteColor(bg, 1.0), rect);
             }
             if (!raw_cell.hasText() or raw_cell.wide == .spacer_tail) continue;
+            if (raw_cell.codepoint() == ghostty_vt.kitty.graphics.unicode.placeholder) continue;
             var text_buf: [128]u8 = undefined;
             const text = cellText(raw_cell, graphemesForCell(raw_cell, row_graphemes, x), &text_buf) orelse continue;
             const glyph_kind = terminalGlyphKind(raw_cell.codepoint());
@@ -706,6 +760,10 @@ fn renderViewport(state: *app_state.AppState, pane_id: u32, render_state: *const
             }
         }
     }
+    if (terminal_model) |model| {
+        renderTerminalImages(state, model, grid_rect, rect, cell_w, cell_h);
+        model.screens.active.kitty_images.dirty = false;
+    }
 }
 
 fn renderStatus(state: *app_state.AppState, rect: palette.Rect, label: []const u8) void {
@@ -726,6 +784,140 @@ fn replayCachedViewport(state: *app_state.AppState, cache: *const TerminalPaneDr
             .terminal_text => |cmd| queueTerminalText(state, cmd.rect, cmd.value, cmd.color, cmd.font_size, cmd.clip, cmd.glyph_kind),
         }
     }
+}
+
+/// Renders Kitty image placements stored by Ghostty VT into the terminal grid.
+fn renderTerminalImages(state: *app_state.AppState, model: *const ghostty_vt.Terminal, grid_rect: palette.Rect, clip: palette.Rect, cell_w: f32, cell_h: f32) void {
+    const storage = &model.screens.active.kitty_images;
+    if (storage.images.count() == 0 or storage.placements.count() == 0) return;
+    const model_cell_w = model.width_px / @max(model.cols, 1);
+    const model_cell_h = model.height_px / @max(model.rows, 1);
+    if (model_cell_w == 0 or model_cell_h == 0) return;
+    const scale_x = cell_w / @as(f32, @floatFromInt(model_cell_w));
+    const scale_y = cell_h / @as(f32, @floatFromInt(model_cell_h));
+
+    renderPinnedTerminalImages(state, model, storage, grid_rect, clip, scale_x, scale_y);
+
+    const top = model.screens.active.pages.getTopLeft(.viewport);
+    const bottom = model.screens.active.pages.getBottomRight(.viewport) orelse return;
+    var iterator = ghostty_vt.kitty.graphics.unicode.placementIterator(top, bottom);
+    while (iterator.next()) |virtual_placement| {
+        var image = storage.imageById(virtual_placement.image_id) orelse continue;
+        const placement = virtual_placement.renderPlacement(storage, &image, model_cell_w, model_cell_h) catch continue;
+        if (placement.dest_width == 0 or placement.dest_height == 0) continue;
+        const viewport = model.screens.active.pages.pointFromPin(.viewport, placement.top_left) orelse continue;
+        const texture_id = ensureTerminalImageTexture(state, model, &image) orelse continue;
+        const dest: palette.Rect = .{
+            .x = grid_rect.x + @as(f32, @floatFromInt(viewport.viewport.x)) * cell_w + @as(f32, @floatFromInt(placement.offset_x)) * scale_x,
+            .y = grid_rect.y + @as(f32, @floatFromInt(viewport.viewport.y)) * cell_h + @as(f32, @floatFromInt(placement.offset_y)) * scale_y,
+            .w = @as(f32, @floatFromInt(placement.dest_width)) * scale_x,
+            .h = @as(f32, @floatFromInt(placement.dest_height)) * scale_y,
+        };
+        queueTerminalImage(state, dest, texture_id, terminalImageUv(&image, placement.source_x, placement.source_y, placement.source_width, placement.source_height), clip);
+    }
+}
+
+/// Renders non-virtual Kitty placements anchored directly to terminal pins.
+fn renderPinnedTerminalImages(state: *app_state.AppState, model: *const ghostty_vt.Terminal, storage: *const ghostty_vt.kitty.graphics.ImageStorage, grid_rect: palette.Rect, clip: palette.Rect, scale_x: f32, scale_y: f32) void {
+    var iterator = storage.placements.iterator();
+    while (iterator.next()) |entry| {
+        const placement = entry.value_ptr;
+        const pin = switch (placement.location) {
+            .pin => |value| value,
+            .virtual => continue,
+        };
+        var image = storage.imageById(entry.key_ptr.image_id) orelse continue;
+        const viewport = model.screens.active.pages.pointFromPin(.viewport, pin.*) orelse continue;
+        const size = placement.pixelSize(image, model);
+        if (size.width == 0 or size.height == 0) continue;
+        const texture_id = ensureTerminalImageTexture(state, model, &image) orelse continue;
+        const source_x = @min(placement.source_x, image.width);
+        const source_y = @min(placement.source_y, image.height);
+        const source_width = @min(if (placement.source_width > 0) placement.source_width else image.width, image.width - source_x);
+        const source_height = @min(if (placement.source_height > 0) placement.source_height else image.height, image.height - source_y);
+        const dest: palette.Rect = .{
+            .x = grid_rect.x + @as(f32, @floatFromInt(viewport.viewport.x)) * (scale_x * @as(f32, @floatFromInt(model.width_px / @max(model.cols, 1)))) + @as(f32, @floatFromInt(placement.x_offset)) * scale_x,
+            .y = grid_rect.y + @as(f32, @floatFromInt(viewport.viewport.y)) * (scale_y * @as(f32, @floatFromInt(model.height_px / @max(model.rows, 1)))) + @as(f32, @floatFromInt(placement.y_offset)) * scale_y,
+            .w = @as(f32, @floatFromInt(size.width)) * scale_x,
+            .h = @as(f32, @floatFromInt(size.height)) * scale_y,
+        };
+        queueTerminalImage(state, dest, texture_id, terminalImageUv(&image, source_x, source_y, source_width, source_height), clip);
+    }
+}
+
+fn terminalImageUv(image: *const ghostty_vt.kitty.graphics.Image, x: u32, y: u32, width: u32, height: u32) palette.Rect {
+    const image_w: f32 = @floatFromInt(@max(image.width, 1));
+    const image_h: f32 = @floatFromInt(@max(image.height, 1));
+    return .{
+        .x = @as(f32, @floatFromInt(x)) / image_w,
+        .y = @as(f32, @floatFromInt(y)) / image_h,
+        .w = @as(f32, @floatFromInt(width)) / image_w,
+        .h = @as(f32, @floatFromInt(height)) / image_h,
+    };
+}
+
+fn ensureTerminalImageTexture(state: *app_state.AppState, model: *const ghostty_vt.Terminal, image: *const ghostty_vt.kitty.graphics.Image) ?u32 {
+    const terminal_id = @intFromPtr(model);
+    if (image_texture_cache.find(terminal_id, image.id)) |texture_id| return texture_id;
+    const rgba = terminalImageRgba(state.allocator, image) orelse return null;
+    defer if (rgba.owned) state.allocator.free(rgba.pixels);
+    const texture = state.uploadRgbaTexture(image.width, image.height, rgba.pixels) orelse {
+        runtime_log.diagnostic("terminal image texture upload failed image={d} format={s} size={d}x{d} bytes={d}", .{ image.id, @tagName(image.format), image.width, image.height, rgba.pixels.len });
+        return null;
+    };
+    image_texture_cache.store(state, .{
+        .active = true,
+        .terminal_id = terminal_id,
+        .image_id = image.id,
+        .texture_id = texture.texture_id,
+    });
+    return texture.texture_id;
+}
+
+const TerminalRgbaPixels = struct {
+    pixels: []const u8,
+    owned: bool,
+};
+
+fn terminalImageRgba(allocator: std.mem.Allocator, image: *const ghostty_vt.kitty.graphics.Image) ?TerminalRgbaPixels {
+    const pixel_count = std.math.mul(usize, image.width, image.height) catch return null;
+    const rgba_len = std.math.mul(usize, pixel_count, 4) catch return null;
+    if (image.format == .rgba) {
+        if (image.data.len != rgba_len) return null;
+        return .{ .pixels = image.data, .owned = false };
+    }
+    const source_bpp: usize = switch (image.format) {
+        .rgb => 3,
+        .gray_alpha => 2,
+        .gray => 1,
+        .rgba => unreachable,
+        .png => return null,
+    };
+    const source_len = std.math.mul(usize, pixel_count, source_bpp) catch return null;
+    if (image.data.len != source_len) return null;
+    const pixels = allocator.alloc(u8, rgba_len) catch return null;
+    for (0..pixel_count) |index| {
+        const src = index * source_bpp;
+        const dst = index * 4;
+        switch (image.format) {
+            .rgb => {
+                pixels[dst] = image.data[src];
+                pixels[dst + 1] = image.data[src + 1];
+                pixels[dst + 2] = image.data[src + 2];
+                pixels[dst + 3] = 255;
+            },
+            .gray_alpha => {
+                @memset(pixels[dst .. dst + 3], image.data[src]);
+                pixels[dst + 3] = image.data[src + 1];
+            },
+            .gray => {
+                @memset(pixels[dst .. dst + 3], image.data[src]);
+                pixels[dst + 3] = 255;
+            },
+            .rgba, .png => unreachable,
+        }
+    }
+    return .{ .pixels = pixels, .owned = true };
 }
 
 fn selectionAffectsPane(dock_id: u32, pane_id: u32) bool {
@@ -1684,6 +1876,17 @@ fn queueTerminalText(state: *app_state.AppState, rect: palette.Rect, value: []co
         return;
     }
     state.palette_overlay_batch.roleText(state.allocator, rect, stableText(state, value), color, font_size, font_role, null, clip) catch {};
+}
+
+fn queueTerminalImage(state: *app_state.AppState, rect: palette.Rect, texture_id: u32, uv: palette.Rect, clip: ?palette.Rect) void {
+    state.palette_overlay_batch.image(
+        state.allocator,
+        rect,
+        palette.TextureId.init(texture_id),
+        uv,
+        palette.Color.white,
+        clip,
+    ) catch {};
 }
 
 fn queuePowerlineGlyph(state: *app_state.AppState, rect: palette.Rect, cp: u21, color: palette.Color, clip: ?palette.Rect) void {

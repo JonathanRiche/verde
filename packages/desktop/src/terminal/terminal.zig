@@ -5,6 +5,7 @@ const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
 const process_env = @import("../process_env.zig");
 pub const sessionizer = @import("sessionizer.zig");
+const stb_image = @import("../stb_image.zig");
 const theme = @import("../ui/theme.zig");
 const runtime_log = @import("../runtime_log.zig");
 
@@ -32,6 +33,30 @@ const KEY_SCROLL_LINES: isize = 3;
 const OUTPUT_RING_CAPACITY: usize = 256 * 1024;
 const DAEMON_REPLAY_MAX_BYTES: usize = 512 * 1024;
 const DAEMON_ATTACH_REPLAY_MAX_BYTES: usize = 8 * 1024;
+// Match Ghostty's app default so normal high-resolution PNGs do not exceed
+// libghostty-vt's intentionally conservative 10 MB embedder default.
+const KITTY_IMAGE_STORAGE_LIMIT: usize = 320 * 1000 * 1000;
+
+pub fn configureGhosttySystem() void {
+    // The Zig consumer build intentionally leaves host-dependent services
+    // unset. Kitty PNG transmission needs an embedder-provided decoder.
+    ghostty_vt.sys.decode_png = decodeTerminalPng;
+}
+
+fn decodeTerminalPng(allocator: std.mem.Allocator, bytes: []const u8) ghostty_vt.sys.DecodeError!ghostty_vt.sys.Image {
+    const loaded = stb_image.loadFromMemory(bytes) catch return error.InvalidData;
+    defer loaded.deinit();
+    if (loaded.width <= 0 or loaded.height <= 0) return error.InvalidData;
+    const width: u32 = @intCast(loaded.width);
+    const height: u32 = @intCast(loaded.height);
+    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidData;
+    const byte_len = std.math.mul(usize, pixel_count, 4) catch return error.InvalidData;
+    return .{
+        .width = width,
+        .height = height,
+        .data = try allocator.dupe(u8, loaded.pixels[0..byte_len]),
+    };
+}
 // Consecutive tail failures tolerated before declaring the daemon gone.
 // ~2 seconds at display rate; see daemon_poll_failures for why one miss
 // must not trigger a revive.
@@ -530,6 +555,12 @@ pub const Dock = struct {
     pub fn renderStateForPane(self: *const Dock, pane_id: u32) ?*const ghostty_vt.RenderState {
         const pane = self.findPaneByIdConst(pane_id) orelse return null;
         if (pane.session) |session| return session.renderState();
+        return null;
+    }
+
+    pub fn terminalForPane(self: *Dock, pane_id: u32) ?*ghostty_vt.Terminal {
+        const pane = self.findPaneById(pane_id) orelse return null;
+        if (pane.session) |session| return &session.terminal;
         return null;
     }
 
@@ -1908,6 +1939,7 @@ const UnixSession = struct {
             // caps scrollback at a few screenfuls. Match Ghostty's main-app
             // default of 10 MB so long sessions retain meaningful history.
             .max_scrollback = 10_000_000,
+            .kitty_image_storage_limit = KITTY_IMAGE_STORAGE_LIMIT,
         });
         errdefer terminal.deinit(allocator);
         configureTerminalTheme(allocator, &terminal);
@@ -2079,9 +2111,16 @@ const UnixSession = struct {
         const next_rows = sanitizeCellCount(rows, MIN_ROWS);
         const next_cell_width = @max(cell_width, 1);
         const next_cell_height = @max(cell_height, 1);
+        const next_width_px = std.math.mul(u32, next_cols, next_cell_width) catch std.math.maxInt(u32);
+        const next_height_px = std.math.mul(u32, next_rows, next_cell_height) catch std.math.maxInt(u32);
         const size_changed = self.cols != next_cols or self.rows != next_rows;
         const metrics_changed = self.cell_width != next_cell_width or self.cell_height != next_cell_height;
         if (!size_changed and !metrics_changed) {
+            // The direct Zig Terminal.resize API only updates rows and columns;
+            // Kitty placement sizing also requires the pixel dimensions that
+            // Ghostty's C wrapper normally maintains for callers.
+            self.terminal.width_px = next_width_px;
+            self.terminal.height_px = next_height_px;
             if (self.backend == .daemon and self.defer_daemon_replay_until_resize) {
                 try self.resizeDaemon(allocator);
                 self.defer_daemon_replay_until_resize = false;
@@ -2147,6 +2186,8 @@ const UnixSession = struct {
                 );
             }
         }
+        self.terminal.width_px = next_width_px;
+        self.terminal.height_px = next_height_px;
         // Mode-2048 clients (nvim 0.10+) take their size exclusively from
         // in-band reports and ignore SIGWINCH/TIOCGWINSZ, so the report must
         // go out on EVERY change — cols-only and shrinks included. The old
