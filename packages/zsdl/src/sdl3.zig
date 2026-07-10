@@ -3009,9 +3009,11 @@ extern fn SDL_StopTextInput(window: *Window) bool;
 //--------------------------------------------------------------------------------------------------
 pub const MouseId = enum(u32) { invalid = 0, _ };
 
-pub const Cursor = opaque {};
+pub const Cursor = opaque {
+    pub const destroy = destroyCursor;
+};
 
-pub const SystemCursor = enum {
+pub const SystemCursor = enum(c_int) {
     default,
     text,
     wait,
@@ -3071,11 +3073,24 @@ extern fn SDL_GetMouseState(x: ?*f32, y: ?*f32) u32;
 // - SDL_GetWindowRelativeMouseMode
 // - SDL_CreateCursor
 // - SDL_CreateColorCursor
-// - SDL_CreateSystemCursor
-// - SDL_SetCursor
-// - SDL_GetCursor
-// - SDL_GetDefaultCursor
-// - SDL_DestroyCursor
+pub fn createSystemCursor(id: SystemCursor) Error!*Cursor {
+    return SDL_CreateSystemCursor(id) orelse makeError();
+}
+extern fn SDL_CreateSystemCursor(id: SystemCursor) ?*Cursor;
+
+pub fn setCursor(cursor: ?*Cursor) Error!void {
+    if (!SDL_SetCursor(cursor)) return makeError();
+}
+extern fn SDL_SetCursor(cursor: ?*Cursor) bool;
+
+pub const getCursor = SDL_GetCursor;
+extern fn SDL_GetCursor() ?*Cursor;
+
+pub const getDefaultCursor = SDL_GetDefaultCursor;
+extern fn SDL_GetDefaultCursor() ?*Cursor;
+
+pub const destroyCursor = SDL_DestroyCursor;
+extern fn SDL_DestroyCursor(cursor: ?*Cursor) void;
 
 /// Capture mouse events outside the focused window while dragging.
 pub const captureMouse = SDL_CaptureMouse;

@@ -5,6 +5,7 @@ pub const RenderState = root.RenderState;
 pub const Style = root.Style;
 pub const Stream = root.Stream;
 pub const Terminal = root.Terminal;
+pub const MouseShape = root.MouseShape;
 pub const RGB = root.color.RGB;
 pub const color = root.color;
 pub const input = root.input;
