@@ -1,9 +1,6 @@
-name: AUR Sync
+name: AUR Sync (manual)
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:
@@ -17,7 +14,6 @@ permissions:
 jobs:
   sync-verde-bin:
     runs-on: ubuntu-24.04
-    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name != ''
 
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +22,7 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AUR SSH key
         shell: bash
