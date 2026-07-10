@@ -55,6 +55,7 @@ const SidebarHitKind = enum {
     expand,
     add_workspace,
     new_thread,
+    new_terminal,
     workspace_row,
     workspace_avatar,
     open_pane,
@@ -104,6 +105,7 @@ var sidebar_menu_row_labels: [16][]const u8 = undefined;
 var sidebar_menu_row_count: usize = 0;
 
 var settings_hovered: bool = false;
+var terminal_action_hovered: ?usize = null;
 
 const WorkspaceDragState = struct {
     pending: bool = false,
@@ -160,6 +162,7 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 
     var new_project_hover: ?usize = null;
     var new_new_thread_hover: ?usize = null;
+    var new_terminal_hover: ?usize = null;
     var new_settings_hover = false;
     if (rectContainsPoint(palette_sidebar_rect, x, y)) {
         // Walk hits in reverse so later (visually-topmost) rows win when
@@ -176,6 +179,9 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
                 .new_thread => {
                     if (!state.isSidebarCollapsed() and new_new_thread_hover == null) new_new_thread_hover = hit.project_index;
                 },
+                .new_terminal => {
+                    if (!state.isSidebarCollapsed() and new_terminal_hover == null) new_terminal_hover = hit.project_index;
+                },
                 .settings => new_settings_hover = true,
                 else => {},
             }
@@ -184,9 +190,11 @@ pub fn handlePaletteMouseMotion(state: *runtime.AppState, x: f32, y: f32) void {
 
     const project_changed = state.sidebar_project_hover != new_project_hover;
     const new_thread_changed = state.sidebar_new_thread_hover != new_new_thread_hover;
+    const terminal_changed = terminal_action_hovered != new_terminal_hover;
     const settings_changed = settings_hovered != new_settings_hover;
+    terminal_action_hovered = new_terminal_hover;
     settings_hovered = new_settings_hover;
-    if (!project_changed and !new_thread_changed and !settings_changed) return;
+    if (!project_changed and !new_thread_changed and !terminal_changed and !settings_changed) return;
 
     state.sidebar_project_hover = new_project_hover;
     state.sidebar_new_thread_hover = new_new_thread_hover;
@@ -225,6 +233,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
             },
             .new_thread => {
                 if (state.projects.items.len > 0) state.createThreadForProject(@min(hit.project_index, state.projects.items.len - 1));
+            },
+            .new_terminal => {
+                if (hit.project_index < state.projects.items.len) _ = state.openTerminalPaneForProjectIndex(hit.project_index);
             },
             .workspace_row => {
                 startWorkspaceDrag(state, hit.project_index, x, y, true);
@@ -694,7 +705,9 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
         const collapsed = project.collapsed;
         const row_h = theme.scaledUi(28.0);
         const action_w = theme.scaledUi(32.0);
-        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w - action_w - theme.scaledUi(6.0), .h = row_h };
+        const action_gap = theme.scaledUi(2.0);
+        const action_cluster_w = action_w * 2.0 + action_gap;
+        const row_rect: palette.Rect = .{ .x = x, .y = y, .w = rail_w - action_cluster_w - theme.scaledUi(6.0), .h = row_h };
         const project_visible = rowVisible(row_rect, list_clip);
         const project_hovered = state.sidebar_project_hover == project_index;
         if (project_visible) {
@@ -737,14 +750,18 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
                 renderHerdrRuntimeBadge(state, .{ .x = row_rect.x + row_rect.w - badge_w, .y = y + theme.scaledUi(5.0), .w = badge_w, .h = row_h - theme.scaledUi(10.0) }, label, selected or project_hovered, row_rect);
             }
         }
-        const new_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - action_w, .y = y, .w = action_w, .h = row_h };
+        // Adjacent, independently-hovered actions make chat and terminal pane
+        // creation equally discoverable without turning them into one control.
+        const action_x = rect.x + rect.w - pad_x - action_cluster_w;
+        const new_rect: palette.Rect = .{ .x = action_x, .y = y, .w = action_w, .h = row_h };
+        const terminal_rect: palette.Rect = .{ .x = action_x + action_w + action_gap, .y = y, .w = action_w, .h = row_h };
         const new_hovered = state.sidebar_new_thread_hover == project_index;
+        const terminal_hovered = terminal_action_hovered == project_index;
         if (project_visible) {
-            if (new_hovered) {
-                queuePaletteRoundedRect(state, new_rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 200)), theme.scaledUi(6.0));
-            }
-            queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, if (new_hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED);
+            renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, new_hovered, list_clip);
             addPaletteHit(new_rect, .new_thread, project_index, 0);
+            renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, terminal_hovered, list_clip);
+            addPaletteHit(terminal_rect, .new_terminal, project_index, 0);
         }
         y += row_h + theme.scaledUi(4.0);
 
@@ -811,7 +828,7 @@ fn renderPaletteExpandedSidebar(state: *runtime.AppState, rect: palette.Rect) vo
 
     queuePaletteText(state, .{ .x = x, .y = projects_label_y, .w = theme.scaledUi(150.0), .h = theme.scaledUi(24.0) }, "WORKSPACES", paletteColor(theme.COLOR_TEXT_MUTED), theme.scaledUi(16.0), rect);
     const add_rect: palette.Rect = .{ .x = rect.x + rect.w - pad_x - theme.scaledUi(28.0), .y = projects_label_y - theme.scaledUi(2.0), .w = theme.scaledUi(28.0), .h = theme.scaledUi(28.0) };
-    queuePaletteButton(state, add_rect, "+", true);
+    renderPaletteSidebarActionIcon(state, add_rect, NF_COD_ADD, null, rect);
     addPaletteHit(add_rect, .add_workspace, 0, 0);
 }
 
@@ -845,12 +862,16 @@ fn renderPaletteCollapsedSidebar(state: *runtime.AppState, rect: palette.Rect) v
     renderPaletteSidebarToggle(state, expand_rect, false);
     y += theme.scaledUi(38.0);
     const add_top_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    queuePaletteButton(state, add_top_rect, "+", true);
+    renderPaletteSidebarActionIcon(state, add_top_rect, NF_COD_ADD, null, rect);
     addPaletteHit(add_top_rect, .add_workspace, 0, 0);
     y += theme.scaledUi(34.0);
     const new_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
-    queuePaletteEditGlyph(state, .{ new_rect.x, new_rect.y }, new_rect.w, new_rect.h, theme.COLOR_TEXT_MUTED);
+    renderPaletteSidebarActionIcon(state, new_rect, NF_COD_EDIT, null, rect);
     addPaletteHit(new_rect, .new_thread, state.selected_project_index, 0);
+    y += theme.scaledUi(34.0);
+    const terminal_rect: palette.Rect = .{ .x = x, .y = y, .w = button, .h = theme.scaledUi(30.0) };
+    renderPaletteSidebarActionIcon(state, terminal_rect, NF_COD_TERMINAL, null, rect);
+    addPaletteHit(terminal_rect, .new_terminal, state.selected_project_index, 0);
     y += theme.scaledUi(34.0);
 
     // Hairline divider, then a vertical "activity dock" of workspace avatars so
@@ -954,6 +975,22 @@ fn renderPaletteSidebarToggle(state: *runtime.AppState, rect: palette.Rect, expa
         .h = icon_font,
     }, glyph, icon_font, paletteColor(fg), null);
     addPaletteHit(rect, if (expanded) .collapse else .expand, 0, 0);
+}
+
+/// Renders add/edit actions with the same themed geometry as the sidebar toggle.
+fn renderPaletteSidebarActionIcon(state: *runtime.AppState, rect: palette.Rect, glyph: []const u8, hover_override: ?bool, clip: ?palette.Rect) void {
+    const hovered = hover_override orelse (state.palette_mouse_in_workspace and rectContainsPoint(rect, state.palette_mouse_x, state.palette_mouse_y));
+    if (hovered) {
+        queuePaletteRoundedRect(state, rect, paletteColor(theme.withAlpha(theme.COLOR_SECONDARY_GREEN, 180)), theme.scaledUi(8.0));
+    }
+    const fg = if (hovered) theme.COLOR_WHITE else theme.COLOR_TEXT_MUTED;
+    const icon_font = theme.scaledUi(17.0);
+    queuePaletteIcon(state, .{
+        .x = rect.x + (rect.w - icon_font) * 0.5,
+        .y = rect.y + (rect.h - icon_font) * 0.5,
+        .w = icon_font,
+        .h = icon_font,
+    }, glyph, icon_font, paletteColor(fg), clip);
 }
 
 /// Renders the sidebar settings gear button used by both expanded and collapsed rails.
@@ -1141,18 +1178,6 @@ fn queuePaletteRect(state: *runtime.AppState, rect: palette.Rect, color: palette
     state.palette_overlay_batch.rect(state.allocator, rect, color) catch |err| {
         log.warn("failed to queue sidebar palette rect: {s}", .{@errorName(err)});
     };
-}
-
-fn queuePaletteButton(state: *runtime.AppState, rect: palette.Rect, label: []const u8, green: bool) void {
-    queuePaletteRoundedRect(state, rect, paletteColor(if (green) theme.COLOR_SECONDARY_GREEN else theme.COLOR_PANEL_ALT), theme.scaledUi(8.0));
-    const font_size = theme.scaledUi(16.0);
-    const text_width = @as(f32, @floatFromInt(label.len)) * font_size * 0.55;
-    queuePaletteText(state, .{
-        .x = rect.x + (rect.w - text_width) * 0.5,
-        .y = rect.y + (rect.h - font_size * 1.25) * 0.5,
-        .w = @max(text_width, theme.scaledUi(4.0)),
-        .h = font_size * 1.25,
-    }, label, paletteColor(theme.COLOR_WHITE), font_size, rect);
 }
 
 /// Renders the live "OPEN" list of a workspace's layout panes (chat / terminal
@@ -1526,6 +1551,7 @@ fn queuePaletteFolderIcon(state: *runtime.AppState, x: f32, center_y: f32, width
 // confirmed against SymbolsNerdFontMono-Regular.ttf's cmap.
 const NF_COD_CHEVRON_RIGHT = "\u{EAB6}";
 const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_ADD = "\u{EA60}";
 const NF_COD_EDIT = "\u{EA73}";
 const NF_COD_GEAR = "\u{EB51}";
 const NF_COD_TERMINAL = "\u{EA85}";
@@ -1564,16 +1590,6 @@ fn queuePaletteChevron(state: *runtime.AppState, x: f32, center_y: f32, color: [
         .w = theme.scaledUi(14.0),
         .h = font_size,
     }, glyph, font_size, paletteColor(color), null);
-}
-
-fn queuePaletteEditGlyph(state: *runtime.AppState, start: [2]f32, width: f32, height: f32, color: [4]f32) void {
-    const font_size = @min(width, height) * 0.5;
-    queuePaletteIcon(state, .{
-        .x = start[0] + (width - font_size) * 0.5,
-        .y = start[1] + (height - font_size) * 0.5,
-        .w = font_size,
-        .h = font_size,
-    }, NF_COD_EDIT, font_size, paletteColor(color), null);
 }
 
 fn queuePaletteLogoMark(state: *runtime.AppState, rect: palette.Rect) void {
