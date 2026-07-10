@@ -424,6 +424,7 @@ fn mainInner(init: std.process.Init) !void {
         .browser_textures_enabled = palette_renderer.activeBackend() == .sdl_gpu,
         .texture_upload_context = if (palette_renderer.activeBackend() == .sdl_gpu) &palette_renderer else null,
         .texture_upload_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.uploadLoadedTextureCallback else null,
+        .texture_release_fn = if (palette_renderer.activeBackend() == .sdl_gpu) palette_frame_renderer.Renderer.releaseTextureCallback else null,
     });
     defer state.deinit();
     state.app_config_file_mtime = app_config.configFileMtime(allocator) catch -1;

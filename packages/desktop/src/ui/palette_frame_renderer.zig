@@ -212,6 +212,10 @@ pub const Renderer = struct {
         renderer.gpu.?.releaseTexture(texture_id);
     }
 
+    pub fn releaseTextureCallback(context: ?*anyopaque, texture_id: c_uint) void {
+        releasePaneTextureCallback(context, texture_id);
+    }
+
     fn nextTextureId(self: *Renderer) u32 {
         const id = self.next_texture_id;
         self.next_texture_id +%= 1;
