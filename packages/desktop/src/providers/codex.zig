@@ -1,6 +1,7 @@
 //! Codex provider harness backed by `codex app-server`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -830,6 +831,7 @@ pub const Client = struct {
             .stdout = .inherit,
             .stderr = .inherit,
             .environ_map = &env_map,
+            .pgid = if (builtin.os.tag == .windows) null else 0,
         }) catch |err| {
             runtime_log.diagnostic("codex.spawnRemoteWebSocketServer process.spawn failed host={s}: {s}", .{ remote.host, @errorName(err) });
             return err;
@@ -875,6 +877,7 @@ pub const Client = struct {
             .stderr = .inherit,
             .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
+            .pgid = if (builtin.os.tag == .windows) null else 0,
         }) catch |err| {
             runtime_log.diagnostic("codex.spawnWebSocketServer process.spawn failed: {s}", .{@errorName(err)});
             return err;
@@ -1697,8 +1700,7 @@ fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
             runtime_log.diagnostic("codex.stopOwnedServer stopping pid={d}", .{child.id orelse -1});
-            var threaded = std.Io.Threaded.init_single_threaded;
-            child.kill(threaded.io());
+            stopSpawnedProcessGroup(child);
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1708,14 +1710,26 @@ fn stopOwnedServerLocked() void {
 fn stopRemoteServerLocked() void {
     if (remote_server_state.child) |*child| {
         runtime_log.diagnostic("codex.stopRemoteServer stopping pid={d}", .{child.id orelse -1});
-        var threaded = std.Io.Threaded.init_single_threaded;
-        child.kill(threaded.io());
+        stopSpawnedProcessGroup(child);
         remote_server_state.child = null;
     }
     if (remote_server_state.key) |key| {
         std.heap.page_allocator.free(key);
         remote_server_state.key = null;
     }
+}
+
+fn stopSpawnedProcessGroup(child: *std.process.Child) void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => {},
+        else => if (child.id) |pid| {
+            // The Codex launcher may spawn a native child, so stopping only the
+            // launcher leaves an outdated app-server holding Verde's fixed port.
+            std.posix.kill(-pid, .TERM) catch {};
+        },
+    }
+    var threaded = std.Io.Threaded.init_single_threaded;
+    child.kill(threaded.io());
 }
 
 fn remoteServerKeyAlloc(allocator: std.mem.Allocator, remote: RemoteSshConfig) ![]u8 {

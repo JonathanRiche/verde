@@ -826,7 +826,8 @@ pub const ORG_NAME: [:0]const u8 = "verde";
 pub const APP_NAME: [:0]const u8 = "Native";
 pub const LEGACY_STATE_FILE_NAME = "state.json";
 const CURSOR_MODEL_CACHE_FILE_NAME = "cursor-models.json";
-pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.5";
+pub const DEFAULT_CODEX_MODEL: [:0]const u8 = "gpt-5.6-sol";
+pub const DEFAULT_CODEX_REASONING_EFFORT: ReasoningEffort = .low;
 pub const DEFAULT_OPENCODE_MODEL: [:0]const u8 = "opencode/gpt-5.4";
 pub const DEFAULT_CLAUDE_MODEL: [:0]const u8 = "default";
 pub const DEFAULT_CURSOR_MODEL: [:0]const u8 = "composer-2";
@@ -1040,7 +1041,10 @@ pub const OPENCODE_MODEL_OPTIONS = [_]ModelOption{
 };
 
 pub const CODEX_MODEL_OPTIONS = [_]ModelOption{
+    .{ .label = "GPT-5.6 Sol", .value = "gpt-5.6-sol" },
     .{ .label = "GPT-5.5", .value = "gpt-5.5" },
+    .{ .label = "GPT-5.6 Terra", .value = "gpt-5.6-terra" },
+    .{ .label = "GPT-5.6 Luna", .value = "gpt-5.6-luna" },
     .{ .label = "GPT-5.4", .value = "gpt-5.4" },
     .{ .label = "GPT-5.4 Mini", .value = "gpt-5.4-mini" },
     .{ .label = "GPT-5.3 Codex", .value = "gpt-5.3-codex" },
@@ -1192,7 +1196,7 @@ pub const ChatThread = struct {
             .committed = false,
             .last_activity_at = 0,
             .model_ref = try allocator.dupeZ(u8, DEFAULT_CODEX_MODEL),
-            .reasoning_effort = .medium,
+            .reasoning_effort = DEFAULT_CODEX_REASONING_EFFORT,
             .fast_mode = .off,
             .access_mode = .full_access,
             .provider = .codex,
@@ -14424,7 +14428,7 @@ pub const AppState = struct {
         thread.provider_thread_id = null;
         if (thread.model_ref) |model_ref| self.allocator.free(model_ref);
         thread.model_ref = self.allocator.dupeZ(u8, composerDefaultModelRef(self, provider)) catch null;
-        thread.reasoning_effort = null;
+        thread.reasoning_effort = if (provider == .codex) DEFAULT_CODEX_REASONING_EFFORT else null;
         if (thread.opencode_reasoning_variant) |v| {
             self.allocator.free(v);
             thread.opencode_reasoning_variant = null;
@@ -17207,6 +17211,17 @@ fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
         .query_start = token_start + 1,
         .end = draft.len,
     };
+}
+
+test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
+    try std.testing.expectEqualStrings("gpt-5.6-sol", DEFAULT_CODEX_MODEL);
+    try std.testing.expectEqual(ReasoningEffort.low, DEFAULT_CODEX_REASONING_EFFORT);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, CODEX_MODEL_OPTIONS[0].value.?);
+
+    var thread = try ChatThread.init(std.testing.allocator, "New thread");
+    defer thread.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
+    try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
 }
 
 test "workspace layout prunes stale root leaves" {
