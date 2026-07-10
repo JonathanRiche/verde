@@ -164,7 +164,7 @@ fn printHelp(out: output.Output) !void {
         \\  terminals [--workspace <id|index|current>] [--json]
         \\  surfaces [--json]
         \\  inspect --pane <id> [--workspace <id|index|current>] [--json]
-        \\  workspace select|create|rename|archive ...
+        \\  workspace select|create|rename|close|reopen ...
         \\  pane focus|split|resize|move|minimize|maximize|restore|close ...
         \\  chat status|transcript|send|followup|stop|approve|draft ...
         \\  browser open|navigate|status|close|toggle|back|forward|reload|eval|post-json|inspector-* ...
@@ -1649,9 +1649,15 @@ fn handleLiveWorkspace(allocator: std.mem.Allocator, out: output.Output, io: std
         }, json);
         return;
     }
-    if (std.mem.eql(u8, subcommand, "archive")) {
-        try sendLiveRequest(allocator, out, io, "workspace.archive", .{
+    if (std.mem.eql(u8, subcommand, "close") or std.mem.eql(u8, subcommand, "archive")) {
+        try sendLiveRequest(allocator, out, io, "workspace.close", .{
             .workspace = workspaceOption(argv) orelse trailingFreeArg(argv, 2) orelse "current",
+        }, json);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "reopen")) {
+        try sendLiveRequest(allocator, out, io, "workspace.reopen", .{
+            .workspace = workspaceOption(argv) orelse trailingFreeArg(argv, 2) orelse "last",
         }, json);
         return;
     }

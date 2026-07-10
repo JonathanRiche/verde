@@ -499,7 +499,7 @@ fn handleSidebarContextMenuPrimary(state: *runtime.AppState, x: f32, y: f32) boo
                 .workspace_import_codex => state.beginThreadImport(pi, .codex),
                 .workspace_import_opencode => state.beginThreadImport(pi, .opencode),
                 .workspace_import_claude => state.beginThreadImport(pi, .claude),
-                .workspace_archive => state.archiveProjectAtIndex(pi),
+                .workspace_archive => state.closeProjectAtIndex(pi),
                 .thread_open_tui => state.openThreadInTui(pi, ti),
                 .thread_open_chat => state.openThreadInChat(pi, ti),
                 .thread_sync => state.syncThreadFromProvider(pi, ti),
@@ -574,7 +574,7 @@ fn renderSidebarContextMenu(state: *runtime.AppState, sidebar_rect: palette.Rect
                     }
                 }
             }
-            appendSidebarContextMenuRow(.workspace_archive, !busy, "Archive workspace");
+            appendSidebarContextMenuRow(.workspace_archive, !busy, "Close workspace");
         },
         .project_new_thread => {
             const pi = state.sidebar_context_menu_project_index;

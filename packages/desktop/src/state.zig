@@ -3764,14 +3764,15 @@ pub const Project = struct {
         self.sidebar_thread_indices.deinit(allocator);
     }
 
-    fn archiveAllThreads(self: *Project, allocator: std.mem.Allocator) !void {
-        while (self.threads.items.len > 0) {
-            var thread = self.threads.orderedRemove(self.threads.items.len - 1);
-            thread.archived = true;
-            try self.archived_threads.append(allocator, thread);
+    fn terminateWorkspaceSessions(self: *Project) void {
+        self.terminal_dock.terminateAllSessions();
+        for (self.terminal_docks.items) |*entry| entry.dock.terminateAllSessions();
+        for (self.managed_processes.items) |*process| {
+            process.status = .stopped;
+            process.explicit_stop = true;
+            process.next_restart_ms = 0;
+            process.pending_watch_restart_ms = 0;
         }
-        self.selected_thread_index = 0;
-        self.invalidateSidebarThreadCache();
     }
 
     fn ensureSidebarThreadCache(self: *Project, allocator: std.mem.Allocator) void {
@@ -5160,15 +5161,7 @@ pub const AppState = struct {
         const id = try self.deriveProjectId(path);
         defer self.allocator.free(id);
         if (self.findArchivedProjectIndexByPath(path)) |archived_index| {
-            var restored = self.archived_projects.orderedRemove(archived_index);
-            restored.archived = false;
-            restored.unread_count = unread_count;
-            if (restored.threads.items.len == 0) {
-                _ = try restored.addThread(self.allocator);
-            }
-            try restored.normalize(self.allocator, self.app_config.terminal_font_size);
-            try self.projects.append(self.allocator, restored);
-            self.markDirty();
+            try self.restoreClosedProject(archived_index, unread_count);
             return .restored;
         }
         var project = try Project.init(self.allocator, id, label, path, unread_count);
@@ -5194,7 +5187,7 @@ pub const AppState = struct {
         self.syncRenameBuffer();
         self.show_project_creator = false;
         self.palette_modal_text_focus = .none;
-        self.setSidebarNotice(if (add_result == .restored) "Workspace restored from archive." else "Workspace imported.");
+        self.setSidebarNotice(if (add_result == .restored) "Workspace reopened." else "Workspace imported.");
         self.markDirty();
         return .{
             .index = index,
@@ -6847,14 +6840,50 @@ pub const AppState = struct {
         self.markDirty();
     }
 
-    pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
-        _ = self.archiveProjectAtIndexResult(index);
+    fn restoreClosedProject(self: *AppState, archived_index: usize, unread_count: u8) !void {
+        if (archived_index >= self.archived_projects.items.len) return error.ProjectNotFound;
+        var restored = self.archived_projects.orderedRemove(archived_index);
+        var restored_appended = false;
+        errdefer if (!restored_appended) restored.deinit(self.allocator);
+        restored.archived = false;
+        restored.unread_count = unread_count;
+        if (restored.threads.items.len == 0) {
+            _ = try restored.addThread(self.allocator);
+        }
+        try restored.normalize(self.allocator, self.app_config.terminal_font_size);
+        try self.projects.append(self.allocator, restored);
+        restored_appended = true;
+        self.selected_project_index = self.projects.items.len - 1;
+        self.ensureCurrentProjectWorkspace();
+        self.syncRenameBuffer();
+        self.markDirty();
     }
 
-    pub fn archiveProjectAtIndexResult(self: *AppState, index: usize) bool {
+    pub fn reopenClosedProjectAtIndex(self: *AppState, archived_index: usize) bool {
+        self.restoreClosedProject(archived_index, 0) catch |err| {
+            self.setSidebarNotice(@errorName(err));
+            return false;
+        };
+        self.setSidebarNotice("Workspace reopened.");
+        return true;
+    }
+
+    pub fn reopenLastClosedProject(self: *AppState) bool {
+        if (self.archived_projects.items.len == 0) {
+            self.setSidebarNotice("No closed workspaces to reopen.");
+            return false;
+        }
+        return self.reopenClosedProjectAtIndex(self.archived_projects.items.len - 1);
+    }
+
+    pub fn closeProjectAtIndex(self: *AppState, index: usize) void {
+        _ = self.closeProjectAtIndexResult(index);
+    }
+
+    pub fn closeProjectAtIndexResult(self: *AppState, index: usize) bool {
         if (index >= self.projects.items.len) return false;
         if (self.projectHasPendingSend(index)) {
-            self.setSidebarNotice("Finish this workspace's running provider requests before archiving it.");
+            self.setSidebarNotice("Finish this workspace's running provider requests before closing it.");
             return false;
         }
 
@@ -6862,11 +6891,7 @@ pub const AppState = struct {
         var removed = self.projects.orderedRemove(index);
         removed.archived = true;
         removed.terminal_dock.visible = false;
-        removed.archiveAllThreads(self.allocator) catch {
-            removed.deinit(self.allocator);
-            self.setSidebarNotice("Failed to archive the workspace.");
-            return false;
-        };
+        removed.terminateWorkspaceSessions();
         self.archived_projects.append(self.allocator, removed) catch |err| {
             var failed = removed;
             failed.deinit(self.allocator);
@@ -6884,14 +6909,22 @@ pub const AppState = struct {
 
         self.rename_project_index = null;
         self.syncRenameBuffer();
-        self.setSidebarNotice("Workspace archived.");
+        self.setSidebarNotice("Workspace closed.");
         self.markDirty();
         return true;
     }
 
+    pub fn archiveProjectAtIndex(self: *AppState, index: usize) void {
+        self.closeProjectAtIndex(index);
+    }
+
+    pub fn archiveProjectAtIndexResult(self: *AppState, index: usize) bool {
+        return self.closeProjectAtIndexResult(index);
+    }
+
     fn archiveSelectedProject(self: *AppState) void {
         if (self.projects.items.len == 0) return;
-        _ = self.archiveProjectAtIndexResult(self.selected_project_index);
+        _ = self.closeProjectAtIndexResult(self.selected_project_index);
     }
 
     fn projectHasPendingSend(self: *const AppState, index: usize) bool {
@@ -7568,7 +7601,7 @@ pub const AppState = struct {
             if (project.threads) |threads| {
                 for (threads) |persisted_thread| {
                     var thread = try ChatThread.init(self.allocator, persisted_thread.title);
-                    thread.archived = project.archived or persisted_thread.archived;
+                    thread.archived = persisted_thread.archived;
                     thread.committed = persisted_thread.committed;
                     if (persisted_thread.local_thread_id) |local_thread_id| {
                         self.allocator.free(thread.local_thread_id);
@@ -7754,7 +7787,7 @@ pub const AppState = struct {
             .terminal_layout_json = terminal_layout_json,
             .terminal_docks_json = terminal_docks_json,
             .workspace_layout_json = workspace_layout_json,
-            .selected_thread_index = if (project.archived or project.threads.items.len == 0) 0 else chat_threads.selectedCommittedThreadIndex(project),
+            .selected_thread_index = if (project.threads.items.len == 0) 0 else @min(project.selected_thread_index, project.threads.items.len - 1),
             .herdr_link = if (project.herdr_link) |*link| try link.toPersisted(allocator) else null,
             .threads = try threads.toOwnedSlice(allocator),
         };

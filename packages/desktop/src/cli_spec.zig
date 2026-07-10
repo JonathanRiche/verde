@@ -116,6 +116,8 @@ pub const live_capabilities = [_][]const u8{
     "workspace.select",
     "workspace.create",
     "workspace.rename",
+    "workspace.close",
+    "workspace.reopen",
     "workspace.archive",
     "pane.focus",
     "pane.split",
@@ -203,6 +205,8 @@ pub const workspace_commands = [_][]const u8{
     "select",
     "create",
     "rename",
+    "close",
+    "reopen",
     "archive",
 };
 
@@ -334,7 +338,9 @@ pub const pane_move_flags = [_][]const u8{ "--workspace", "--pane", "--focused",
 pub const workspace_select_flags = [_][]const u8{ "--workspace", "--project", "--json" };
 pub const workspace_create_flags = [_][]const u8{ "--path", "--json" };
 pub const workspace_rename_flags = [_][]const u8{ "--workspace", "--project", "--label", "--json" };
-pub const workspace_archive_flags = [_][]const u8{ "--workspace", "--project", "--json" };
+pub const workspace_close_flags = [_][]const u8{ "--workspace", "--project", "--json" };
+pub const workspace_reopen_flags = [_][]const u8{ "--workspace", "--project", "--json" };
+pub const workspace_archive_flags = workspace_close_flags;
 pub const chat_draft_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--text", "--json" };
 pub const chat_send_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--prompt", "--text", "--json" };
 pub const chat_approve_flags = [_][]const u8{ "--workspace", "--pane", "--focused", "--call", "--decision", "--json" };
