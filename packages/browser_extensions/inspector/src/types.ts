@@ -58,6 +58,20 @@ export interface RegionSelection {
 
 export type InspectorSelection = PointSelection | RegionSelection;
 
+/** Viewport metrics captured at submit time so the host can map CSS
+ * selection coordinates onto browser frame pixels for screenshot crops. */
+export interface InspectorViewportInfo {
+  width: number;
+  height: number;
+  devicePixelRatio: number;
+  scrollX: number;
+  scrollY: number;
+}
+
+/** Host verdict for a submitted prompt: "sent"/"drafted" close the bubble,
+ * "failed" re-enables it with an optional message. */
+export type InspectorPromptResult = "sent" | "drafted" | "failed";
+
 export interface InspectorEventPayloadMap {
   "inspector:enabled": null;
   "inspector:disabled": null;
@@ -74,6 +88,7 @@ export interface InspectorEventPayloadMap {
   "prompt:submitted": {
     selection: InspectorSelection;
     prompt: string;
+    viewport: InspectorViewportInfo;
   };
 }
 
@@ -108,4 +123,6 @@ export interface InspectorHandle {
   getSelection(): InspectorSelection | null;
   getSelectedElements(): ElementSnapshot[];
   getSelectedElement(): ElementSnapshot | null;
+  /** Host callback resolving the pending state after a prompt:submitted. */
+  notifyPromptResult(result: InspectorPromptResult, message?: string | null): void;
 }

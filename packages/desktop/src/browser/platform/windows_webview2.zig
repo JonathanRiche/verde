@@ -97,6 +97,13 @@ pub const Controller = struct {
         return null;
     }
 
+    /// WebView2 renders in-window; no CPU frame is available to copy yet.
+    pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        _ = self;
+        _ = allocator;
+        return null;
+    }
+
     pub fn setHostWindow(self: *Controller, handle: ?*anyopaque) !void {
         self.host_window = handle;
     }

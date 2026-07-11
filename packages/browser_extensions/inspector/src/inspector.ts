@@ -10,6 +10,7 @@ import type {
   InspectorMode,
   InspectorModeInput,
   InspectorOptions,
+  InspectorPromptResult,
   InspectorSelection,
   RegionSelection,
 } from "./types";
@@ -32,6 +33,13 @@ const FREEFORM_BRUSH_RADIUS = 14;
 const FREEFORM_POINT_STEP = 4;
 const FREEFORM_CLOSE_SNAP_DISTANCE = 120;
 const FREEFORM_CLOSE_SNAP_DISTANCE_MAX = 224;
+// Gap between the selection rect and the anchored prompt panel, and the
+// minimum inset that keeps the panel inside the viewport.
+const PROMPT_ANCHOR_GAP = 12;
+const PROMPT_VIEWPORT_INSET = 12;
+// Host must resolve a submitted prompt within this window or the bubble
+// re-enables with a timeout notice (protects against a dead bridge).
+const PROMPT_PENDING_TIMEOUT_MS = 30000;
 
 type OverlayParts = {
   root: HTMLDivElement;
@@ -49,6 +57,8 @@ type OverlayParts = {
   promptTextarea: HTMLTextAreaElement;
   promptActions: HTMLDivElement;
   promptButton: HTMLButtonElement;
+  promptSpinner: HTMLSpanElement;
+  promptButtonLabel: HTMLSpanElement;
 };
 
 type PointerPosition = {
@@ -72,6 +82,8 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   let boxStart: PointerPosition | null = null;
   let freeformPoints: PointerPosition[] = [];
   let suppressNextClick = false;
+  let promptPending = false;
+  let promptPendingTimer: ReturnType<typeof setTimeout> | null = null;
 
   const overlay = createOverlay(doc);
 
@@ -153,10 +165,57 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     overlay.promptTextarea.select();
   };
 
+  // Anchors the prompt panel directly below the selection (above it when the
+  // selection hugs the bottom edge), clamped inside the viewport so the
+  // bubble never renders offscreen.
+  const positionPromptPanel = (rect: ElementBoxRect): void => {
+    const panel = overlay.promptPanel;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    const panelWidth = panel.offsetWidth || 420;
+    const panelHeight = panel.offsetHeight || 220;
+    const maxLeft = Math.max(win.innerWidth - panelWidth - PROMPT_VIEWPORT_INSET, PROMPT_VIEWPORT_INSET);
+    const left = Math.min(Math.max(rect.x, PROMPT_VIEWPORT_INSET), maxLeft);
+    let top = rect.y + rect.height + PROMPT_ANCHOR_GAP;
+    if (top + panelHeight > win.innerHeight - PROMPT_VIEWPORT_INSET) {
+      top = rect.y - panelHeight - PROMPT_ANCHOR_GAP;
+    }
+    top = Math.min(
+      Math.max(top, PROMPT_VIEWPORT_INSET),
+      Math.max(win.innerHeight - panelHeight - PROMPT_VIEWPORT_INSET, PROMPT_VIEWPORT_INSET),
+    );
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(top)}px`;
+  };
+
+  const setPromptMetaText = (text: string, isError: boolean): void => {
+    overlay.promptMeta.textContent = text;
+    overlay.promptMeta.style.color = isError ? "#f2a4a4" : "#b9bbc3";
+  };
+
+  const setPromptPendingUi = (pending: boolean): void => {
+    overlay.promptTextarea.disabled = pending;
+    overlay.promptButton.disabled = pending;
+    overlay.promptButton.style.cursor = pending ? "default" : "pointer";
+    overlay.promptPanel.style.opacity = pending ? "0.72" : "1";
+    overlay.promptSpinner.style.display = pending ? "inline-block" : "none";
+    overlay.promptButtonLabel.textContent = pending ? "Sending..." : "Send";
+  };
+
+  const clearPromptPendingTimer = (): void => {
+    if (promptPendingTimer != null) {
+      clearTimeout(promptPendingTimer);
+      promptPendingTimer = null;
+    }
+  };
+
   const syncPrompt = (nextSelection: InspectorSelection | null): void => {
     if (!nextSelection) {
       overlay.promptPanel.hidden = true;
       overlay.promptTextarea.value = "";
+      promptPending = false;
+      clearPromptPendingTimer();
+      setPromptPendingUi(false);
       return;
     }
 
@@ -164,8 +223,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     if (nextSelection.mode === "point") {
       const snapshot = nextSelection.element;
       overlay.promptTitle.textContent = `Selected: ${snapshot.selector}`;
-      overlay.promptMeta.textContent =
-        `${snapshot.rect.width} x ${snapshot.rect.height} at (${snapshot.rect.x}, ${snapshot.rect.y})`;
+      setPromptMetaText(
+        `${snapshot.rect.width} x ${snapshot.rect.height} at (${snapshot.rect.x}, ${snapshot.rect.y})`,
+        false,
+      );
+      positionPromptPanel(snapshot.rect);
       return;
     }
 
@@ -173,8 +235,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       nextSelection.mode === "draw-box" ? "Selected box region" : "Selected freeform region";
     overlay.promptTitle.textContent =
       `${selectionLabel}: ${nextSelection.elements.length} element${nextSelection.elements.length === 1 ? "" : "s"}`;
-    overlay.promptMeta.textContent =
-      `${nextSelection.rect.width} x ${nextSelection.rect.height} at (${nextSelection.rect.x}, ${nextSelection.rect.y})`;
+    setPromptMetaText(
+      `${nextSelection.rect.width} x ${nextSelection.rect.height} at (${nextSelection.rect.x}, ${nextSelection.rect.y})`,
+      false,
+    );
+    positionPromptPanel(nextSelection.rect);
   };
 
   const renderPointSnapshot = (
@@ -382,7 +447,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handlePointerMove = (event: MouseEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
 
     if (boxStart) {
       const rect = rectFromPoints(boxStart, {
@@ -446,7 +511,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleMouseDown = (event: MouseEvent): void => {
-    if (!enabled || destroyed || mode === "point") return;
+    if (!enabled || destroyed || promptPending || mode === "point") return;
     if (event.button !== 0 || isInsideIgnoredSurface(event.target)) return;
 
     event.preventDefault();
@@ -510,7 +575,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleClick = (event: MouseEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
     if (isInsideIgnoredSurface(event.target)) return;
 
     if (suppressNextClick) {
@@ -541,7 +606,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleKeyDown = (event: KeyboardEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
 
     if (event.key === "Escape") {
       event.preventDefault();
@@ -560,6 +625,60 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     }
   };
 
+  // Submits the current prompt: hides the overlay for two frames so the host
+  // can capture a clean screenshot crop of the selection, emits the event,
+  // then parks the bubble in a pending state until the host acknowledges via
+  // notifyPromptResult (or the timeout fires).
+  const submitPrompt = (): void => {
+    if (!selection || promptPending) return;
+    const prompt = overlay.promptTextarea.value.trim();
+    if (prompt.length === 0) {
+      focusPrompt();
+      return;
+    }
+
+    const submittedSelection = selection;
+    promptPending = true;
+    setPromptPendingUi(true);
+    overlay.root.style.visibility = "hidden";
+    win.requestAnimationFrame(() => {
+      win.requestAnimationFrame(() => {
+        emit("prompt:submitted", {
+          selection: submittedSelection,
+          prompt,
+          viewport: {
+            width: win.innerWidth,
+            height: win.innerHeight,
+            devicePixelRatio: win.devicePixelRatio || 1,
+            scrollX: win.scrollX,
+            scrollY: win.scrollY,
+          },
+        });
+        overlay.root.style.visibility = "visible";
+      });
+    });
+
+    clearPromptPendingTimer();
+    promptPendingTimer = setTimeout(() => {
+      notifyPromptResult("failed", "No response from Verde. Try again.");
+    }, PROMPT_PENDING_TIMEOUT_MS);
+  };
+
+  const notifyPromptResult = (result: InspectorPromptResult, message?: string | null): void => {
+    if (destroyed || !promptPending) return;
+    promptPending = false;
+    clearPromptPendingTimer();
+    setPromptPendingUi(false);
+
+    if (result === "failed") {
+      setPromptMetaText(message ?? "Verde could not send this prompt.", true);
+      focusPrompt();
+      return;
+    }
+
+    clearSelection();
+  };
+
   overlay.promptTextarea.addEventListener("input", () => {
     if (!selection) return;
     emit("prompt:changed", {
@@ -572,14 +691,19 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       event.stopPropagation();
     });
   }
+  // Enter submits (Shift+Enter keeps inserting a newline). Escape is handled
+  // by the document-level capture listener so it is intentionally not wired
+  // here.
+  overlay.promptTextarea.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      submitPrompt();
+    }
+  });
 
   overlay.promptButton.addEventListener("click", () => {
-    if (!selection) return;
-    emit("prompt:submitted", {
-      selection,
-      prompt: overlay.promptTextarea.value.trim(),
-    });
-    clearSelection();
+    submitPrompt();
   });
 
   const enable = (): void => {
@@ -647,6 +771,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       if (selection == null || selection.mode !== "point") return null;
       return selection.element;
     },
+    notifyPromptResult,
   };
 }
 
@@ -722,13 +847,20 @@ function createOverlay(doc: Document): OverlayParts {
     "opacity:0",
   ].join(";");
 
+  // Spin keyframes for the submit spinner; scoped to an inspector-prefixed
+  // name so it cannot collide with page styles.
+  const spinnerStyle = doc.createElement("style");
+  spinnerStyle.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  spinnerStyle.textContent =
+    "@keyframes verde-inspector-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
+
   const promptPanel = doc.createElement("div");
   promptPanel.hidden = true;
   promptPanel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptPanel.style.cssText = [
     "position:fixed",
-    "right:20px",
-    "bottom:20px",
+    "left:20px",
+    "top:20px",
     "width:min(420px, calc(100vw - 40px))",
     "padding:12px",
     "border:1px solid rgba(80, 200, 120, 0.22)",
@@ -750,7 +882,7 @@ function createOverlay(doc: Document): OverlayParts {
 
   const promptTextarea = doc.createElement("textarea");
   promptTextarea.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTextarea.placeholder = "Describe what you want to do with this selection...";
+  promptTextarea.placeholder = "What should the agent do with this?";
   promptTextarea.style.cssText = [
     "display:block",
     "width:100%",
@@ -777,10 +909,12 @@ function createOverlay(doc: Document): OverlayParts {
 
   const promptButton = doc.createElement("button");
   promptButton.type = "button";
-  promptButton.textContent = "Send prompt";
   promptButton.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptButton.style.cssText = [
     "pointer-events:auto",
+    "display:inline-flex",
+    "align-items:center",
+    "gap:8px",
     "padding:9px 14px",
     "border:0",
     "border-radius:8px",
@@ -791,9 +925,27 @@ function createOverlay(doc: Document): OverlayParts {
     "cursor:pointer",
   ].join(";");
 
+  const promptSpinner = doc.createElement("span");
+  promptSpinner.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptSpinner.style.cssText = [
+    "display:none",
+    "width:12px",
+    "height:12px",
+    "box-sizing:border-box",
+    "border:2px solid rgba(240, 253, 244, 0.35)",
+    "border-top-color:#f0fdf4",
+    "border-radius:50%",
+    "animation:verde-inspector-spin 0.8s linear infinite",
+  ].join(";");
+
+  const promptButtonLabel = doc.createElement("span");
+  promptButtonLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptButtonLabel.textContent = "Send";
+
+  promptButton.append(promptSpinner, promptButtonLabel);
   promptActions.appendChild(promptButton);
   promptPanel.append(promptTitle, promptMeta, promptTextarea, promptActions);
-  root.append(margin, border, padding, content, region, freeformSvg, tooltip, promptPanel);
+  root.append(spinnerStyle, margin, border, padding, content, region, freeformSvg, tooltip, promptPanel);
 
   return {
     root,
@@ -811,6 +963,8 @@ function createOverlay(doc: Document): OverlayParts {
     promptTextarea,
     promptActions,
     promptButton,
+    promptSpinner,
+    promptButtonLabel,
   };
 }
 
