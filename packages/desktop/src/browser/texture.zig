@@ -9,6 +9,20 @@ pub const PixelFormat = enum {
     bgra,
 };
 
+/// One caller-owned CPU copy of the most recent browser frame, used for
+/// screenshot crops (e.g. inspector design-mode selections).
+pub const CopiedFrame = struct {
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    /// Tightly packed `width * height * 4` bytes owned by the caller.
+    pixels: []u8,
+
+    pub fn deinit(self: *const CopiedFrame, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+    }
+};
+
 pub const ExternalUploadFn = *const fn (context: ?*anyopaque, texture: *PaneTexture, width: u32, height: u32, format: PixelFormat, pixels: []const u8) anyerror!void;
 pub const ExternalReleaseFn = *const fn (context: ?*anyopaque, texture_id: c_uint) void;
 

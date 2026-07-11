@@ -2318,4 +2318,5 @@ test {
     _ = @import("providers/claude.zig");
     _ = @import("slash_commands.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("browser/screenshot.zig");
 }
