@@ -3,33 +3,24 @@ name: Windows native smoke
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/windows-smoke.yml"
-      - "build.zig"
-      - "mise.toml"
-      - "bun.lock"
-      - "package.json"
-      - "packages/desktop/**"
-      - "packages/palette/**"
-      - "packages/zsdl/**"
-      - "scripts/dev/*windows*"
-      - "scripts/release/*windows*"
-      - "scripts/release/create_deterministic_zip.py"
-      - "scripts/windows-dependencies.json"
-      - "notes/windows*"
-      - "packages/npm/verde-windows-x64/**"
-      - "vendor/fff/**"
+  merge_group:
+    types:
+      - checks_requested
+  push:
+    branches:
+      - master
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-smoke-${{ github.ref }}
+  group: windows-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    name: Windows build and smoke
+    runs-on: windows-2022
     timeout-minutes: 120
     env:
       ZIG_VERSION: 0.16.0
@@ -38,21 +29,27 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.cache\zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13.5"
 
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -64,13 +61,13 @@ jobs:
           cargo --version
           rustc --version
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .cache/zig-global
             .zig-cache/windows-deps
             vendor/fff/target
-          key: windows-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('scripts/windows-dependencies.json', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock') }}
+          key: windows-smoke-${{ github.event_name }}-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('bun.lock', 'package.json', 'scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/bootstrap-windows-deps.ps1', 'scripts/dev/build-windows.ps1', 'scripts/dev/smoke-windows*.ps1', 'scripts/dev/verify-windows-package.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/package-windows.py', 'scripts/release/create_deterministic_zip.py', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'packages/ghostty/build.zig', 'packages/ghostty/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
 
       - name: Record native toolchain
         shell: pwsh
@@ -87,6 +84,12 @@ jobs:
         shell: pwsh
         run: bun install --frozen-lockfile --production
 
+      - name: Test Windows packaging and launcher contracts
+        shell: pwsh
+        run: |
+          node --test scripts/release/package-npm.test.mjs scripts/release/windows-npm-integrity.test.mjs packages/npm/verde/test/windows-launcher.test.js
+          python -m unittest scripts.release.test_package_windows_integrity scripts.release.test_package_windows_version
+
       - name: Bootstrap pinned Windows dependencies
         shell: pwsh
         run: .\scripts\dev\bootstrap-windows-deps.ps1 -Toolchain msvc
@@ -101,17 +104,20 @@ jobs:
 
       - name: Upload Windows readiness evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verde-windows-ci-smoke-evidence
           if-no-files-found: warn
+          retention-days: 7
           path: .zig-cache/windows-smoke/evidence/*
 
       - name: Upload Windows package
-        uses: actions/upload-artifact@v4
+        if: success() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verde-windows-ci-package
+          name: verde-windows-ci-package-unsigned
           if-no-files-found: error
+          retention-days: 7
           path: |
             dist/*
             .zig-cache/windows-package/*verification.json

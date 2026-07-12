@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.workflow }}
-  cancel-in-progress: true
+  group: release-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-linux:
@@ -24,9 +24,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -171,7 +171,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
@@ -194,7 +194,7 @@ jobs:
             sleep 15
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-linux-x86_64
           path: dist/*
@@ -214,9 +214,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -302,7 +302,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
             echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
@@ -335,14 +335,15 @@ jobs:
             sleep 15
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*
 
   build-windows:
+    name: Windows x86-64
     timeout-minutes: 180
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       ZIG_VERSION: 0.16.0
       RUST_VERSION: 1.95.0
@@ -350,21 +351,27 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.cache\zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13.5"
 
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -376,23 +383,29 @@ jobs:
           cargo --version
           rustc --version
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .cache/zig-global
             .zig-cache/windows-deps
             vendor/fff/target
-          key: windows-release-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/build-windows.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock') }}
+          key: windows-release-${{ github.event_name }}-${{ github.sha }}-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('bun.lock', 'package.json', 'scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/bootstrap-windows-deps.ps1', 'scripts/dev/build-windows.ps1', 'scripts/dev/verify-windows-package.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/package-windows.py', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'packages/ghostty/build.zig', 'packages/ghostty/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
 
       - name: Install JavaScript dependencies
         shell: pwsh
         run: bun install --frozen-lockfile --production
 
+      - name: Test Windows packaging and launcher contracts
+        shell: pwsh
+        run: |
+          node --test scripts/release/package-npm.test.mjs scripts/release/windows-npm-integrity.test.mjs packages/npm/verde/test/windows-launcher.test.js
+          python -m unittest scripts.release.test_package_windows_integrity scripts.release.test_package_windows_version
+
       - name: Compute release version
         id: version
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -eq "tag" -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
+          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME.StartsWith("v")) {
             $Version = $env:GITHUB_REF_NAME
           } else {
             $Version = "manual-$env:GITHUB_RUN_NUMBER-$($env:GITHUB_SHA.Substring(0, 7))"
@@ -403,46 +416,58 @@ jobs:
         shell: pwsh
         run: .\scripts\dev\build-windows.ps1 -CompileTests
 
+      - name: Build and verify unsigned Windows package
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: .\scripts\release\package-windows.ps1 -Version "${{ steps.version.outputs.value }}" -OutputDir dist
+
       - name: Build, sign, and verify Windows package
+        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         shell: pwsh
         env:
           VERDE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
           VERDE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
         run: |
-          $IsTagRelease = $env:GITHUB_REF_TYPE -eq "tag"
-          $PackageArguments = @{
-            Version = "${{ steps.version.outputs.value }}"
-            OutputDir = "dist"
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)) {
-            $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
-            [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
-            $PackageArguments.CertificatePath = $CertificatePath
-            $PackageArguments.CertificatePassword = $env:VERDE_SIGNING_PFX_PASSWORD
-            $PackageArguments.RequireSignature = $true
-          } elseif ($IsTagRelease) {
+          if ([string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)) {
             throw "Tag releases require WINDOWS_SIGNING_CERTIFICATE_BASE64."
           }
-          .\scripts\release\package-windows.ps1 @PackageArguments
+          if ([string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_PASSWORD)) {
+            throw "Tag releases require WINDOWS_SIGNING_CERTIFICATE_PASSWORD."
+          }
 
-      - uses: actions/upload-artifact@v4
+          $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
+            .\scripts\release\package-windows.ps1 `
+              -Version "${{ steps.version.outputs.value }}" `
+              -OutputDir dist `
+              -CertificatePath $CertificatePath `
+              -CertificatePassword $env:VERDE_SIGNING_PFX_PASSWORD `
+              -RequireSignature
+          } finally {
+            Remove-Item -LiteralPath $CertificatePath -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-windows-x86_64
           if-no-files-found: error
           path: dist/*
 
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs:
       - build-linux
       - build-macos
       - build-windows
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           merge-multiple: true
@@ -454,18 +479,18 @@ jobs:
           cd release-assets
           sha256sum * > SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-assets/*
           generate_release_notes: true
 
   sync-aur:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: publish
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Configure AUR SSH key
         shell: bash

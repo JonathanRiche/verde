@@ -60,3 +60,31 @@ SHA-256 file through a trusted channel. Tag releases require an Authenticode
 certificate and RFC 3161 timestamping in the release workflow. A stable
 installer is deferred until certificate ownership, upgrade/downgrade behavior,
 uninstall cleanup, shortcut migration, and toast activation are validated.
+
+## GitHub Actions setup
+
+The `Windows native smoke` workflow runs its `Windows build and smoke` job on
+every pull request, merge-queue check, push to `master`, and manual dispatch.
+It uses the native MSVC toolchain on `windows-2022`, compiles the Windows test
+targets, exercises WebView2 and ConPTY at runtime, and validates an extracted
+deterministic ZIP.
+PR packages are unsigned and retained for seven days; executable ZIPs are not
+uploaded from untrusted fork pull requests.
+
+After the workflow has completed once on the default branch, configure the
+repository's `master` branch protection or ruleset to require the `Windows
+build and smoke` check, shown under the `Windows native smoke` workflow. The
+workflow intentionally has no path filter so a required check cannot remain
+pending when an unrelated-looking change affects shared build or provider code.
+
+The `Release` workflow builds Linux, both macOS architectures, and Windows. A
+manual dispatch is an unsigned rehearsal with a `manual-*` version. Only a
+GitHub `push` event for a `v*` tag can receive the Windows signing material or
+publish a release. Configure these Actions repository secrets before creating
+the first release tag:
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`: base64-encoded Authenticode PFX.
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: password for that PFX.
+
+Protect `v*` tags so only release maintainers can create them. The release is
+published only after every Linux, macOS, and Windows artifact job succeeds.
