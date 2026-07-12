@@ -71,11 +71,11 @@ deterministic ZIP.
 PR packages are unsigned and retained for seven days; executable ZIPs are not
 uploaded from untrusted fork pull requests.
 
-After the workflow has completed once on the default branch, configure the
-repository's `master` branch protection or ruleset to require the `Windows
-build and smoke` check, shown under the `Windows native smoke` workflow. The
-workflow intentionally has no path filter so a required check cannot remain
-pending when an unrelated-looking change affects shared build or provider code.
+After the workflow has completed once on the pull request, configure the
+repository's `master` branch protection or ruleset to require the `Windows build
+and smoke` check, shown under the `Windows native smoke` workflow. The workflow
+intentionally has no path filter so a required check cannot remain pending when
+an unrelated-looking change affects shared build or provider code.
 
 The `Release` workflow builds Linux, both macOS architectures, and Windows. A
 manual dispatch is an unsigned rehearsal with a `manual-*` version. Only a
