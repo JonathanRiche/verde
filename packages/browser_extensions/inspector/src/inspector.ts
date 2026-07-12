@@ -11,6 +11,7 @@ import type {
   InspectorModeInput,
   InspectorOptions,
   InspectorPromptResult,
+  InspectorPromptTarget,
   InspectorSelection,
   RegionSelection,
 } from "./types";
@@ -59,6 +60,8 @@ type OverlayParts = {
   promptButton: HTMLButtonElement;
   promptSpinner: HTMLSpanElement;
   promptButtonLabel: HTMLSpanElement;
+  promptTargetRow: HTMLDivElement;
+  promptTargetSelect: HTMLSelectElement;
 };
 
 type PointerPosition = {
@@ -84,6 +87,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   let suppressNextClick = false;
   let promptPending = false;
   let promptPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  let promptTargets: InspectorPromptTarget[] = [];
 
   const overlay = createOverlay(doc);
 
@@ -196,10 +200,46 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   const setPromptPendingUi = (pending: boolean): void => {
     overlay.promptTextarea.disabled = pending;
     overlay.promptButton.disabled = pending;
+    overlay.promptTargetSelect.disabled = pending;
     overlay.promptButton.style.cursor = pending ? "default" : "pointer";
     overlay.promptPanel.style.opacity = pending ? "0.72" : "1";
     overlay.promptSpinner.style.display = pending ? "inline-block" : "none";
     overlay.promptButtonLabel.textContent = pending ? "Sending..." : "Send";
+  };
+
+  // Rebuilds the "Send to" selector. The row only shows when the choice is
+  // ambiguous (2+ chat destinations); a single destination stays implicit.
+  const syncPromptTargetsUi = (selectedId?: string | null): void => {
+    const select = overlay.promptTargetSelect;
+    const previous = selectedId ?? select.value;
+    select.textContent = "";
+    for (const target of promptTargets) {
+      const option = overlay.promptPanel.ownerDocument.createElement("option");
+      option.value = target.id;
+      option.textContent = target.label;
+      select.appendChild(option);
+    }
+    if (previous && promptTargets.some((target) => target.id === previous)) {
+      select.value = previous;
+    }
+    overlay.promptTargetRow.style.display = promptTargets.length > 1 ? "flex" : "none";
+  };
+
+  const setPromptTargets = (
+    targets: InspectorPromptTarget[],
+    selectedId?: string | null,
+  ): void => {
+    promptTargets = Array.isArray(targets)
+      ? targets.filter((target) => target && typeof target.id === "string")
+      : [];
+    syncPromptTargetsUi(selectedId);
+  };
+
+  const selectedPromptTarget = (): string | null => {
+    if (promptTargets.length === 0) return null;
+    const value = overlay.promptTargetSelect.value;
+    if (value && promptTargets.some((target) => target.id === value)) return value;
+    return promptTargets[0]!.id;
   };
 
   const clearPromptPendingTimer = (): void => {
@@ -653,6 +693,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
             scrollX: win.scrollX,
             scrollY: win.scrollY,
           },
+          target: selectedPromptTarget(),
         });
         overlay.root.style.visibility = "visible";
       });
@@ -688,6 +729,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   });
   for (const eventName of ["mousedown", "mouseup", "click", "dblclick", "select", "copy", "cut", "paste"] as const) {
     overlay.promptTextarea.addEventListener(eventName, (event) => {
+      event.stopPropagation();
+    });
+  }
+  for (const eventName of ["mousedown", "mouseup", "click", "change"] as const) {
+    overlay.promptTargetSelect.addEventListener(eventName, (event) => {
       event.stopPropagation();
     });
   }
@@ -772,6 +818,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       return selection.element;
     },
     notifyPromptResult,
+    setPromptTargets,
   };
 }
 
@@ -880,6 +927,40 @@ function createOverlay(doc: Document): OverlayParts {
   promptMeta.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptMeta.style.cssText = "font-size:11px;color:#b9bbc3;margin-bottom:10px;";
 
+  // "Send to" destination row; hidden unless the host reports 2+ chat panes.
+  const promptTargetRow = doc.createElement("div");
+  promptTargetRow.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetRow.style.cssText = [
+    "display:none",
+    "align-items:center",
+    "gap:8px",
+    "margin-bottom:10px",
+  ].join(";");
+
+  const promptTargetLabel = doc.createElement("span");
+  promptTargetLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetLabel.textContent = "Send to";
+  promptTargetLabel.style.cssText = "font-size:11px;color:#b9bbc3;flex:0 0 auto;";
+
+  const promptTargetSelect = doc.createElement("select");
+  promptTargetSelect.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetSelect.style.cssText = [
+    "pointer-events:auto",
+    "flex:1 1 auto",
+    "min-width:0",
+    "padding:6px 8px",
+    "border-radius:6px",
+    "border:1px solid rgba(80, 200, 120, 0.2)",
+    "background:rgba(29, 38, 43, 0.95)",
+    "color:#f0f0f5",
+    "font:inherit",
+    "font-size:12px",
+    "outline:none",
+    "text-overflow:ellipsis",
+  ].join(";");
+
+  promptTargetRow.append(promptTargetLabel, promptTargetSelect);
+
   const promptTextarea = doc.createElement("textarea");
   promptTextarea.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptTextarea.placeholder = "What should the agent do with this?";
@@ -944,7 +1025,7 @@ function createOverlay(doc: Document): OverlayParts {
 
   promptButton.append(promptSpinner, promptButtonLabel);
   promptActions.appendChild(promptButton);
-  promptPanel.append(promptTitle, promptMeta, promptTextarea, promptActions);
+  promptPanel.append(promptTitle, promptMeta, promptTargetRow, promptTextarea, promptActions);
   root.append(spinnerStyle, margin, border, padding, content, region, freeformSvg, tooltip, promptPanel);
 
   return {
@@ -965,6 +1046,8 @@ function createOverlay(doc: Document): OverlayParts {
     promptButton,
     promptSpinner,
     promptButtonLabel,
+    promptTargetRow,
+    promptTargetSelect,
   };
 }
 

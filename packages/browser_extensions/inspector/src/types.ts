@@ -72,6 +72,13 @@ export interface InspectorViewportInfo {
  * "failed" re-enables it with an optional message. */
 export type InspectorPromptResult = "sent" | "drafted" | "failed";
 
+/** One chat destination the host can route a design-mode prompt to. The id is
+ * opaque to the page (Verde uses the workspace pane id). */
+export interface InspectorPromptTarget {
+  id: string;
+  label: string;
+}
+
 export interface InspectorEventPayloadMap {
   "inspector:enabled": null;
   "inspector:disabled": null;
@@ -89,6 +96,9 @@ export interface InspectorEventPayloadMap {
     selection: InspectorSelection;
     prompt: string;
     viewport: InspectorViewportInfo;
+    /** Selected target id from the host-provided list, or null when the host
+     * never pushed targets (host falls back to its active thread). */
+    target: string | null;
   };
 }
 
@@ -125,4 +135,7 @@ export interface InspectorHandle {
   getSelectedElement(): ElementSnapshot | null;
   /** Host callback resolving the pending state after a prompt:submitted. */
   notifyPromptResult(result: InspectorPromptResult, message?: string | null): void;
+  /** Host push of available chat destinations; the bubble shows a selector
+   * only when more than one target exists. */
+  setPromptTargets(targets: InspectorPromptTarget[], selectedId?: string | null): void;
 }
