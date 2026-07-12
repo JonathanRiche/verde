@@ -4,6 +4,9 @@ imgui.ini
 vendor/imgui.ini
 .codex
 node_modules/
+dist/
+__pycache__/
+*.pyc
 .agent-ci/
 .env
 .env.agent-ci

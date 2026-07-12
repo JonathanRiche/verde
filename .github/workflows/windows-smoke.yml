@@ -1,0 +1,118 @@
+name: Windows native smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-smoke.yml"
+      - "build.zig"
+      - "mise.toml"
+      - "bun.lock"
+      - "package.json"
+      - "packages/desktop/**"
+      - "packages/palette/**"
+      - "packages/zsdl/**"
+      - "scripts/dev/*windows*"
+      - "scripts/release/*windows*"
+      - "scripts/release/create_deterministic_zip.py"
+      - "scripts/windows-dependencies.json"
+      - "notes/windows*"
+      - "packages/npm/verde-windows-x64/**"
+      - "vendor/fff/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      ZIG_VERSION: 0.16.0
+      RUST_VERSION: 1.95.0
+      BUN_VERSION: 1.3.14
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.cache\zig-global
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.5"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install pinned Rust MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_VERSION
+          cargo --version
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/zig-global
+            .zig-cache/windows-deps
+            vendor/fff/target
+          key: windows-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('scripts/windows-dependencies.json', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock') }}
+
+      - name: Record native toolchain
+        shell: pwsh
+        run: |
+          zig version
+          bun --version
+          python --version
+          cmake --version
+          ninja --version
+          Write-Host "MSVC developer environment: $env:VSCMD_VER"
+          Write-Host "Windows SDK: $env:WindowsSdkDir $env:WindowsSDKVersion"
+
+      - name: Install JavaScript dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --production
+
+      - name: Bootstrap pinned Windows dependencies
+        shell: pwsh
+        run: .\scripts\dev\bootstrap-windows-deps.ps1 -Toolchain msvc
+
+      - name: Compile tests and build native package tree
+        shell: pwsh
+        run: .\scripts\dev\smoke-windows.ps1 -Version "ci-$env:GITHUB_RUN_NUMBER"
+
+      - name: Package and extraction-check ZIP
+        shell: pwsh
+        run: .\scripts\release\package-windows.ps1 -Version "ci-$env:GITHUB_RUN_NUMBER" -OutputDir dist -PrefixDir .zig-cache\windows-smoke\prefix -SkipBuild
+
+      - name: Upload Windows readiness evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verde-windows-ci-smoke-evidence
+          if-no-files-found: warn
+          path: .zig-cache/windows-smoke/evidence/*
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: verde-windows-ci-package
+          if-no-files-found: error
+          path: |
+            dist/*
+            .zig-cache/windows-package/*verification.json
+            .zig-cache/windows-deps/msvc/manifest.json

@@ -1,7 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const platform_paths = @import("platform_paths");
 
 const CODEX_HOOK_MARKER = "verde-codex-notify-hook";
+const CODEX_PROJECT_HOOK_NEEDLE = "codex-notify-hook.";
 const CODEX_HOOK_REL_PATH = ".verde/hooks/codex-notify-hook.sh";
+const CODEX_WINDOWS_HOOK_REL_PATH = ".verde/hooks/codex-notify-hook.ps1";
 const CODEX_HOOKS_JSON_REL_PATH = ".codex/hooks.json";
 
 // Global (all-projects) Codex hooks live in ~/.codex/hooks.json with the hook
@@ -9,6 +13,7 @@ const CODEX_HOOKS_JSON_REL_PATH = ".codex/hooks.json";
 // merges global and project hooks, so we merge our entries in while preserving
 // any hooks the user already runs (e.g. their own notify-stop.sh).
 const CODEX_GLOBAL_HOOK_REL = ".codex/verde-codex-notify-hook.sh";
+const CODEX_WINDOWS_GLOBAL_HOOK_REL = ".codex/verde-codex-notify-hook.ps1";
 const CODEX_GLOBAL_HOOKS_JSON_REL = ".codex/hooks.json";
 const CODEX_GLOBAL_HOOK_NEEDLE = "verde-codex-notify-hook";
 const CodexHookEvent = struct { name: []const u8, status_message: []const u8 };
@@ -23,7 +28,8 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ project_path, CODEX_HOOK_REL_PATH });
+    const hook_rel_path = codexProjectHookRelPathForOs(builtin.os.tag);
+    const hook_path = try std.fs.path.join(allocator, &.{ project_path, hook_rel_path });
     defer allocator.free(hook_path);
     const hooks_json_path = try std.fs.path.join(allocator, &.{ project_path, CODEX_HOOKS_JSON_REL_PATH });
     defer allocator.free(hooks_json_path);
@@ -43,18 +49,20 @@ pub fn ensureCodexProjectHooks(allocator: std.mem.Allocator, project_path: []con
     }
 
     try ensureParentDir(io, hooks_json_path);
-    const hooks_json = try codexHooksJsonAlloc(allocator, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const hooks_json = try codexHooksJsonAlloc(allocator, hook_command);
     defer allocator.free(hooks_json);
     try writeFileAtomic(allocator, io, hooks_json_path, hooks_json, .default_file);
 }
 
 fn codexHooksJsonIsManaged(content: []const u8) bool {
     return std.mem.indexOf(u8, content, CODEX_HOOK_MARKER) != null or
-        std.mem.indexOf(u8, content, CODEX_HOOK_REL_PATH) != null;
+        std.mem.indexOf(u8, content, CODEX_PROJECT_HOOK_NEEDLE) != null;
 }
 
 fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const script =
+    const script = if (builtin.os.tag == .windows) codexPowerShellHookScript() else
         \\#!/bin/sh
         \\# verde-codex-notify-hook
         \\[ "${VERDE:-}" = "1" ] || exit 0
@@ -108,7 +116,7 @@ fn writeCodexHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const 
         \\exit 0
         \\
     ;
-    try writeFileAtomic(allocator, io, path, script, .executable_file);
+    try writeFileAtomic(allocator, io, path, script, hookPermissionsForOs(builtin.os.tag));
 }
 
 fn codexHooksJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) ![]u8 {
@@ -151,7 +159,9 @@ fn writeCodexHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []c
 }
 
 const CLAUDE_HOOK_MARKER = "verde-claude-notify-hook";
+const CLAUDE_PROJECT_HOOK_NEEDLE = "claude-notify-hook.";
 const CLAUDE_HOOK_REL_PATH = ".verde/hooks/claude-notify-hook.sh";
+const CLAUDE_WINDOWS_HOOK_REL_PATH = ".verde/hooks/claude-notify-hook.ps1";
 // Claude Code merges hooks across settings files, so we target the personal,
 // usually-gitignored settings.local.json to avoid touching shared settings.json.
 const CLAUDE_SETTINGS_REL_PATH = ".claude/settings.local.json";
@@ -160,7 +170,8 @@ pub fn ensureClaudeProjectHooks(allocator: std.mem.Allocator, project_path: []co
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ project_path, CLAUDE_HOOK_REL_PATH });
+    const hook_rel_path = claudeProjectHookRelPathForOs(builtin.os.tag);
+    const hook_path = try std.fs.path.join(allocator, &.{ project_path, hook_rel_path });
     defer allocator.free(hook_path);
     const settings_path = try std.fs.path.join(allocator, &.{ project_path, CLAUDE_SETTINGS_REL_PATH });
     defer allocator.free(settings_path);
@@ -180,20 +191,22 @@ pub fn ensureClaudeProjectHooks(allocator: std.mem.Allocator, project_path: []co
     }
 
     try ensureParentDir(io, settings_path);
-    const settings_json = try claudeSettingsJsonAlloc(allocator, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const settings_json = try claudeSettingsJsonAlloc(allocator, hook_command);
     defer allocator.free(settings_json);
     try writeFileAtomic(allocator, io, settings_path, settings_json, .default_file);
 }
 
 fn claudeSettingsIsManaged(content: []const u8) bool {
     return std.mem.indexOf(u8, content, CLAUDE_HOOK_MARKER) != null or
-        std.mem.indexOf(u8, content, CLAUDE_HOOK_REL_PATH) != null;
+        std.mem.indexOf(u8, content, CLAUDE_PROJECT_HOOK_NEEDLE) != null;
 }
 
 fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     // Drives Verde surface status (working/waiting/done) for the pips. It does
     // not set a title, so the live OSC session summary remains the pane label.
-    const script =
+    const script = if (builtin.os.tag == .windows) claudePowerShellHookScript() else
         \\#!/bin/sh
         \\# verde-claude-notify-hook
         \\[ "${VERDE:-}" = "1" ] || exit 0
@@ -239,7 +252,7 @@ fn writeClaudeHookScript(allocator: std.mem.Allocator, io: std.Io, path: []const
         \\exit 0
         \\
     ;
-    try writeFileAtomic(allocator, io, path, script, .executable_file);
+    try writeFileAtomic(allocator, io, path, script, hookPermissionsForOs(builtin.os.tag));
 }
 
 fn claudeSettingsJsonAlloc(allocator: std.mem.Allocator, hook_path: []const u8) ![]u8 {
@@ -277,9 +290,114 @@ fn writeClaudeHookEvent(s: *std.json.Stringify, event: []const u8, hook_path: []
     try s.endArray();
 }
 
+fn codexProjectHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CODEX_WINDOWS_HOOK_REL_PATH else CODEX_HOOK_REL_PATH;
+}
+
+fn claudeProjectHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CLAUDE_WINDOWS_HOOK_REL_PATH else CLAUDE_HOOK_REL_PATH;
+}
+
+fn codexGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CODEX_WINDOWS_GLOBAL_HOOK_REL else CODEX_GLOBAL_HOOK_REL;
+}
+
+fn claudeGlobalHookRelPathForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .windows) CLAUDE_WINDOWS_GLOBAL_HOOK_REL else CLAUDE_GLOBAL_HOOK_REL;
+}
+
+fn hookPermissionsForOs(comptime os_tag: std.Target.Os.Tag) std.Io.File.Permissions {
+    return if (os_tag == .windows) .default_file else .executable_file;
+}
+
+fn hookCommandAllocForOs(
+    allocator: std.mem.Allocator,
+    comptime os_tag: std.Target.Os.Tag,
+    hook_path: []const u8,
+) ![]u8 {
+    if (os_tag != .windows) return allocator.dupe(u8, hook_path);
+    // Windows filenames cannot contain a quote. Rejecting one here also keeps
+    // the provider's string command unambiguous if a non-filesystem test path
+    // reaches this boundary.
+    if (std.mem.indexOfScalar(u8, hook_path, '"') != null) return error.InvalidWindowsHookPath;
+    return std.fmt.allocPrint(
+        allocator,
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{s}\"",
+        .{hook_path},
+    );
+}
+
+fn codexPowerShellHookScript() []const u8 {
+    return
+    \\# verde-codex-notify-hook
+    \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$payload = $null
+    \\try {
+    \\  $payloadText = [Console]::In.ReadToEnd()
+    \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
+    \\} catch {}
+    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($null -ne $payload -and $null -ne $payload.event) { [string]$payload.event } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+    \\$status = ''
+    \\$title = ''
+    \\switch ($eventName) {
+    \\  'SessionStart' { $status = 'working' }
+    \\  'UserPromptSubmit' {
+    \\    $status = 'working'
+    \\    if ($null -ne $payload -and $null -ne $payload.prompt) {
+    \\      $title = [regex]::Replace([string]$payload.prompt, '\s+', ' ').Trim()
+    \\      if ($title.Length -gt 72) { $title = $title.Substring(0, 72) }
+    \\    }
+    \\  }
+    \\  'PermissionRequest' { $status = 'waiting' }
+    \\  'Stop' { $status = 'done' }
+    \\  default { exit 0 }
+    \\}
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\$notifyArgs = @('notify', '--quiet', '--status', $status, '--provider', 'codex')
+    \\if (-not [string]::IsNullOrWhiteSpace($title)) { $notifyArgs += @('--title', $title) }
+    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
+    \\try { & $cli @notifyArgs *> $null } catch {}
+    \\exit 0
+    \\
+    ;
+}
+
+fn claudePowerShellHookScript() []const u8 {
+    return
+    \\# verde-claude-notify-hook
+    \\if ($env:VERDE -ne '1' -or [string]::IsNullOrWhiteSpace($env:VERDE_SESSION_ID)) { exit 0 }
+    \\$payload = $null
+    \\try {
+    \\  $payloadText = [Console]::In.ReadToEnd()
+    \\  if (-not [string]::IsNullOrWhiteSpace($payloadText)) { $payload = ConvertFrom-Json -InputObject $payloadText }
+    \\} catch {}
+    \\$eventName = if ($null -ne $payload -and $null -ne $payload.hook_event_name) { [string]$payload.hook_event_name } elseif ($args.Count -gt 0) { [string]$args[0] } else { '' }
+    \\$status = ''
+    \\switch ($eventName) {
+    \\  'SessionStart' { $status = 'idle' }
+    \\  'UserPromptSubmit' { $status = 'working' }
+    \\  'Notification' {
+    \\    $message = if ($null -ne $payload -and $null -ne $payload.message) { [string]$payload.message } else { '' }
+    \\    if ($message -match 'waiting for your input|is idle') { exit 0 }
+    \\    $status = 'waiting'
+    \\  }
+    \\  'Stop' { $status = 'done' }
+    \\  default { exit 0 }
+    \\}
+    \\$cli = if ([string]::IsNullOrWhiteSpace($env:VERDE_CLI)) { 'verde.exe' } else { $env:VERDE_CLI }
+    \\if ($cli.EndsWith(' (deleted)')) { $cli = $cli.Substring(0, $cli.Length - 10) }
+    \\# $env:VERDE_LIVE_ENDPOINT is inherited, so the CLI targets the exact named pipe advertised by Verde.
+    \\try { & $cli notify --quiet --status $status --provider claude *> $null } catch {}
+    \\exit 0
+    \\
+    ;
+}
+
 // Global (all-projects) Claude hooks live in ~/.claude/settings.json with the
 // hook script at an absolute path so it resolves from any working directory.
 const CLAUDE_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.sh";
+const CLAUDE_WINDOWS_GLOBAL_HOOK_REL = ".claude/verde-claude-notify-hook.ps1";
 const CLAUDE_GLOBAL_SETTINGS_REL = ".claude/settings.json";
 const CLAUDE_GLOBAL_HOOK_NEEDLE = "verde-claude-notify-hook";
 const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "Notification", "Stop" };
@@ -287,14 +405,14 @@ const CLAUDE_HOOK_EVENTS = [_][]const u8{ "SessionStart", "UserPromptSubmit", "N
 const AMP_GLOBAL_PLUGIN_REL = ".config/amp/plugins/verde-notify.ts";
 const AMP_GLOBAL_PLUGIN_NEEDLE = "verde-amp-notify-plugin";
 
-fn homeDir() ?[]const u8 {
-    const ptr = std.c.getenv("HOME") orelse return null;
-    return std.mem.span(ptr);
+fn homeDirAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return platform_paths.userHome(allocator);
 }
 
 /// True when our managed hook is present in the global Claude settings.
 pub fn claudeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
-    const home = homeDir() orelse return false;
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
     const settings_path = std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL }) catch return false;
     defer allocator.free(settings_path);
     var threaded: std.Io.Threaded = .init(allocator, .{});
@@ -307,12 +425,13 @@ pub fn claudeGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
 /// Installs the Claude notify hook globally by merging our events into the
 /// existing ~/.claude/settings.json (preserving all other settings and hooks).
 pub fn ensureClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_HOOK_REL });
+    const hook_path = try std.fs.path.join(allocator, &.{ home, claudeGlobalHookRelPathForOs(builtin.os.tag) });
     defer allocator.free(hook_path);
     const settings_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL });
     defer allocator.free(settings_path);
@@ -326,7 +445,9 @@ pub fn ensureClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(existing);
 
-    const merged = try mergeClaudeHooks(allocator, existing, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const merged = try mergeClaudeHooks(allocator, existing, hook_command);
     defer if (merged) |m| allocator.free(m);
     if (merged) |m| {
         try ensureParentDir(io, settings_path);
@@ -337,12 +458,13 @@ pub fn ensureClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
 /// Removes our managed hook entries from the global Claude settings and deletes
 /// the hook script. Idempotent.
 pub fn removeClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_HOOK_REL });
+    const hook_path = try std.fs.path.join(allocator, &.{ home, claudeGlobalHookRelPathForOs(builtin.os.tag) });
     defer allocator.free(hook_path);
     const settings_path = try std.fs.path.join(allocator, &.{ home, CLAUDE_GLOBAL_SETTINGS_REL });
     defer allocator.free(settings_path);
@@ -356,7 +478,9 @@ pub fn removeClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(existing);
 
-    const updated = try removeClaudeHooksFromJson(allocator, existing, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const updated = try removeClaudeHooksFromJson(allocator, existing, hook_command);
     defer if (updated) |u| allocator.free(u);
     if (updated) |u| try writeFileAtomic(allocator, io, settings_path, u, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
@@ -364,7 +488,8 @@ pub fn removeClaudeGlobalHooks(allocator: std.mem.Allocator) !void {
 
 /// True when our managed hook is present in the global Codex hooks file.
 pub fn codexGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
-    const home = homeDir() orelse return false;
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
     const hooks_path = std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL }) catch return false;
     defer allocator.free(hooks_path);
     var threaded: std.Io.Threaded = .init(allocator, .{});
@@ -377,12 +502,13 @@ pub fn codexGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
 /// Installs the Codex notify hook globally by merging our events into the
 /// existing ~/.codex/hooks.json (preserving any hooks the user already runs).
 pub fn ensureCodexGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOK_REL });
+    const hook_path = try std.fs.path.join(allocator, &.{ home, codexGlobalHookRelPathForOs(builtin.os.tag) });
     defer allocator.free(hook_path);
     const hooks_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL });
     defer allocator.free(hooks_path);
@@ -396,7 +522,9 @@ pub fn ensureCodexGlobalHooks(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(existing);
 
-    const merged = try mergeCodexHooks(allocator, existing, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const merged = try mergeCodexHooks(allocator, existing, hook_command);
     defer if (merged) |m| allocator.free(m);
     if (merged) |m| {
         try ensureParentDir(io, hooks_path);
@@ -407,12 +535,13 @@ pub fn ensureCodexGlobalHooks(allocator: std.mem.Allocator) !void {
 /// Removes our managed hook entries from the global Codex hooks file and deletes
 /// the hook script, leaving any user-owned hooks intact. Idempotent.
 pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const hook_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOK_REL });
+    const hook_path = try std.fs.path.join(allocator, &.{ home, codexGlobalHookRelPathForOs(builtin.os.tag) });
     defer allocator.free(hook_path);
     const hooks_path = try std.fs.path.join(allocator, &.{ home, CODEX_GLOBAL_HOOKS_JSON_REL });
     defer allocator.free(hooks_path);
@@ -426,7 +555,9 @@ pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(existing);
 
-    const updated = try removeCodexHooksFromJson(allocator, existing, hook_path);
+    const hook_command = try hookCommandAllocForOs(allocator, builtin.os.tag, hook_path);
+    defer allocator.free(hook_command);
+    const updated = try removeCodexHooksFromJson(allocator, existing, hook_command);
     defer if (updated) |u| allocator.free(u);
     if (updated) |u| try writeFileAtomic(allocator, io, hooks_path, u, .default_file);
     std.Io.Dir.cwd().deleteFile(io, hook_path) catch {};
@@ -434,7 +565,8 @@ pub fn removeCodexGlobalHooks(allocator: std.mem.Allocator) !void {
 
 /// True when our managed Amp plugin is present in the global Amp plugin dir.
 pub fn ampGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
-    const home = homeDir() orelse return false;
+    const home = homeDirAlloc(allocator) catch return false;
+    defer allocator.free(home);
     const plugin_path = std.fs.path.join(allocator, &.{ home, AMP_GLOBAL_PLUGIN_REL }) catch return false;
     defer allocator.free(plugin_path);
     var threaded: std.Io.Threaded = .init(allocator, .{});
@@ -448,7 +580,8 @@ pub fn ampGlobalHooksInstalled(allocator: std.mem.Allocator) bool {
 /// TypeScript plugins rather than Claude/Codex-style JSON hook settings, so this
 /// writes one managed plugin under ~/.config/amp/plugins.
 pub fn ensureAmpGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -462,7 +595,8 @@ pub fn ensureAmpGlobalHooks(allocator: std.mem.Allocator) !void {
 
 /// Removes the managed Amp notify plugin. Idempotent.
 pub fn removeAmpGlobalHooks(allocator: std.mem.Allocator) !void {
-    const home = homeDir() orelse return error.NoHomeDir;
+    const home = homeDirAlloc(allocator) catch return error.NoHomeDir;
+    defer allocator.free(home);
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
 
@@ -764,4 +898,36 @@ test "ensureCodexProjectHooks refuses unmanaged hooks json" {
     }
 
     try std.testing.expectError(error.CodexHooksJsonExists, ensureCodexProjectHooks(std.testing.allocator, project_path));
+}
+
+test "Windows hook commands quote Unicode paths and select PowerShell scripts" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqualStrings(CODEX_WINDOWS_HOOK_REL_PATH, codexProjectHookRelPathForOs(.windows));
+    try std.testing.expectEqualStrings(CLAUDE_WINDOWS_HOOK_REL_PATH, claudeProjectHookRelPathForOs(.windows));
+
+    const hook_path = "C:\\Users\\Zoë Tester\\Client Repo\\.verde\\hooks\\codex-notify-hook.ps1";
+    const command = try hookCommandAllocForOs(allocator, .windows, hook_path);
+    defer allocator.free(command);
+    try std.testing.expectEqualStrings(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\Zoë Tester\\Client Repo\\.verde\\hooks\\codex-notify-hook.ps1\"",
+        command,
+    );
+
+    const json = try codexHooksJsonAlloc(allocator, command);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "powershell.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Zoë Tester") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, CODEX_PROJECT_HOOK_NEEDLE) != null);
+}
+
+test "PowerShell hooks use inherited transport-neutral endpoint and safe invocation" {
+    const codex_script = codexPowerShellHookScript();
+    try std.testing.expect(std.mem.indexOf(u8, codex_script, "$env:VERDE_LIVE_ENDPOINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, codex_script, "& $cli @notifyArgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, codex_script, "/bin/sh") == null);
+
+    const claude_script = claudePowerShellHookScript();
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "$env:VERDE_LIVE_ENDPOINT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "ConvertFrom-Json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_script, "& $cli notify") != null);
 }

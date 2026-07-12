@@ -2,26 +2,37 @@
 
 const Self = @This();
 const std = @import("std");
+const builtin = @import("builtin");
 
+const clock = @import("clock.zig");
 const draw = @import("draw.zig");
 const sdl = @import("sdl.zig");
 
 pub const c = @cImport({
+    // Zig's C translator rejects MinGW's optimized wide-string fortify
+    // wrappers because they leave generated extern helpers unused. The native
+    // C compilation paths retain their normal hardening; this only keeps the
+    // SDL header translation deterministic for Windows cross-builds.
+    if (builtin.os.tag == .windows) @cDefine("_FORTIFY_SOURCE", "0");
     @cInclude("SDL3/SDL_gpu.h");
     @cInclude("SDL3_ttf/SDL_ttf.h");
 });
 
 pub const ShaderFormat = struct {
     pub const spirv: u32 = c.SDL_GPU_SHADERFORMAT_SPIRV;
+    pub const dxbc: u32 = c.SDL_GPU_SHADERFORMAT_DXBC;
+    pub const dxil: u32 = c.SDL_GPU_SHADERFORMAT_DXIL;
     pub const msl: u32 = c.SDL_GPU_SHADERFORMAT_MSL;
     pub const metallib: u32 = c.SDL_GPU_SHADERFORMAT_METALLIB;
     pub const vulkan: u32 = spirv;
+    pub const d3d12: u32 = dxil | dxbc;
     pub const metal: u32 = msl | metallib;
-    pub const portable: u32 = vulkan | metal;
+    pub const portable: u32 = vulkan | d3d12 | metal;
 
     pub fn defaultForTarget(os_tag: std.Target.Os.Tag) u32 {
         return switch (os_tag) {
             .macos, .ios, .tvos, .watchos => metal,
+            .windows => dxil,
             .linux, .freebsd, .openbsd, .netbsd, .dragonfly => vulkan,
             else => portable,
         };
@@ -2217,10 +2228,7 @@ fn alphaBlendState() c.SDL_GPUColorTargetBlendState {
 }
 
 fn nowNs() i128 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
-        @as(i128, @intCast(ts.nsec));
+    return clock.monotonicTimestampNs();
 }
 
 fn elapsedNs(start: i128) u64 {
@@ -2230,8 +2238,6 @@ fn elapsedNs(start: i128) u64 {
 }
 
 pub const ShaderSource = struct {
-    pub const vertex_hlsl = @embedFile("shaders/ui.vert.hlsl");
-    pub const fragment_hlsl = @embedFile("shaders/ui.frag.hlsl");
     pub const vertex_spirv = @embedFile("shaders/ui.vert.spv");
     pub const solid_fragment_spirv = @embedFile("shaders/ui.solid.frag.spv");
     pub const text_fragment_spirv = @embedFile("shaders/ui.text.frag.spv");
@@ -2244,6 +2250,10 @@ pub const ShaderSource = struct {
     pub const solid_fragment_metallib = @embedFile("shaders/ui.solid.frag.metallib");
     pub const text_fragment_metallib = @embedFile("shaders/ui.text.frag.metallib");
     pub const image_fragment_metallib = @embedFile("shaders/ui.image.frag.metallib");
+    pub const vertex_dxil = @embedFile("shaders/ui.vert.dxil");
+    pub const solid_fragment_dxil = @embedFile("shaders/ui.solid.frag.dxil");
+    pub const text_fragment_dxil = @embedFile("shaders/ui.text.frag.dxil");
+    pub const image_fragment_dxil = @embedFile("shaders/ui.image.frag.dxil");
 
     pub fn vulkanPackages() PipelineShaderPackages {
         return .{
@@ -2279,9 +2289,27 @@ pub const ShaderSource = struct {
         };
     }
 
+    pub fn d3d12Packages() PipelineShaderPackages {
+        return .{
+            .solid = .{
+                .vertex = .{ .format = ShaderFormat.dxil, .code = vertex_dxil },
+                .fragment = .{ .format = ShaderFormat.dxil, .code = solid_fragment_dxil },
+            },
+            .text = .{
+                .vertex = .{ .format = ShaderFormat.dxil, .code = vertex_dxil },
+                .fragment = .{ .format = ShaderFormat.dxil, .code = text_fragment_dxil },
+            },
+            .image = .{
+                .vertex = .{ .format = ShaderFormat.dxil, .code = vertex_dxil },
+                .fragment = .{ .format = ShaderFormat.dxil, .code = image_fragment_dxil },
+            },
+        };
+    }
+
     pub fn packagesForTarget(os_tag: std.Target.Os.Tag) PipelineShaderPackages {
         return switch (os_tag) {
             .macos, .ios, .tvos, .watchos => metalPackages(),
+            .windows => d3d12Packages(),
             else => vulkanPackages(),
         };
     }
@@ -2325,10 +2353,12 @@ test "gpu renderer renderBatch consumes command kinds" {
     try std.testing.expectEqual(@as(usize, 24), renderer.command_counts.drawableIndexCount());
 }
 
-test "shader format defaults target Vulkan and Metal backends" {
+test "shader format defaults target native GPU backends" {
     try std.testing.expectEqual(ShaderFormat.vulkan, ShaderFormat.defaultForTarget(.linux));
     try std.testing.expectEqual(ShaderFormat.metal, ShaderFormat.defaultForTarget(.macos));
+    try std.testing.expectEqual(ShaderFormat.dxil, ShaderFormat.defaultForTarget(.windows));
     try std.testing.expect(ShaderFormat.portable & ShaderFormat.vulkan != 0);
+    try std.testing.expect(ShaderFormat.portable & ShaderFormat.d3d12 != 0);
     try std.testing.expect(ShaderFormat.portable & ShaderFormat.metal != 0);
 }
 
@@ -2352,7 +2382,7 @@ test "gpu text support is explicit until atlas path is configured" {
     try std.testing.expect(!renderer.supportsGpuText());
 }
 
-test "embedded Vulkan and Metal shader packages validate" {
+test "embedded native shader packages validate" {
     const vulkan = ShaderSource.vulkanPackages();
     try vulkan.solid.validate(ShaderFormat.vulkan);
     try vulkan.text.validate(ShaderFormat.vulkan);
@@ -2364,4 +2394,11 @@ test "embedded Vulkan and Metal shader packages validate" {
     try metal.text.validate(ShaderFormat.metal);
     try std.testing.expect(ShaderSource.vertex_metallib.len > 0);
     try std.testing.expect(ShaderSource.text_fragment_metallib.len > 0);
+
+    const d3d12 = ShaderSource.d3d12Packages();
+    try d3d12.solid.validate(ShaderFormat.dxil);
+    try d3d12.text.validate(ShaderFormat.dxil);
+    try d3d12.image.validate(ShaderFormat.dxil);
+    try std.testing.expectEqualStrings("DXBC", ShaderSource.vertex_dxil[0..4]);
+    try std.testing.expectEqualStrings("DXBC", ShaderSource.text_fragment_dxil[0..4]);
 }

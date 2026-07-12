@@ -13,6 +13,8 @@ pub fn print(allocator: std.mem.Allocator, out: output.Output, shell: []const u8
         try writeZsh(&writer.writer);
     } else if (std.mem.eql(u8, shell, "fish")) {
         try writeFish(&writer.writer);
+    } else if (std.mem.eql(u8, shell, "powershell") or std.mem.eql(u8, shell, "pwsh")) {
+        try writePowerShell(&writer.writer);
     } else {
         return false;
     }
@@ -26,6 +28,94 @@ fn writeWords(w: *std.Io.Writer, words: []const []const u8) !void {
         if (index > 0) try w.writeByte(' ');
         try w.writeAll(word);
     }
+}
+
+fn writePowerShellArray(w: *std.Io.Writer, words: []const []const u8) !void {
+    try w.writeAll("@(");
+    for (words, 0..) |word, index| {
+        if (index > 0) try w.writeAll(", ");
+        try w.print("'{s}'", .{word});
+    }
+    try w.writeByte(')');
+}
+
+fn writePowerShellRoute(w: *std.Io.Writer, route: []const u8, words: []const []const u8) !void {
+    try w.print("    '{s}' = ", .{route});
+    try writePowerShellArray(w, words);
+    try w.writeByte('\n');
+}
+
+fn writePowerShell(w: *std.Io.Writer) !void {
+    try w.writeAll(
+        \\# PowerShell native argument completion for verde.
+        \\Register-ArgumentCompleter -Native -CommandName verde -ScriptBlock {
+        \\  param($wordToComplete, $commandAst, $cursorPosition)
+        \\  $routes = @{
+        \\
+    );
+    try writePowerShellRoute(w, "", &spec.top_level_commands);
+    try writePowerShellRoute(w, "completion", &spec.shells);
+    try writePowerShellRoute(w, "state", &spec.state_commands);
+    try writePowerShellRoute(w, "herdr", &spec.herdr_commands);
+    try writePowerShellRoute(w, "herdr profiles", &spec.herdr_profile_commands);
+    try writePowerShellRoute(w, "integrations", &spec.integration_commands);
+    try writePowerShellRoute(w, "integrations install", &spec.integration_providers);
+    try writePowerShellRoute(w, "integrations remove", &spec.integration_providers);
+    try writePowerShellRoute(w, "integrations disable", &spec.integration_providers);
+    try writePowerShellRoute(w, "session", &spec.session_commands);
+    try writePowerShellRoute(w, "live", &spec.live_commands);
+    try writePowerShellRoute(w, "live workspace", &spec.workspace_commands);
+    try writePowerShellRoute(w, "live pane", &spec.pane_commands);
+    try writePowerShellRoute(w, "live chat", &spec.chat_commands);
+    try writePowerShellRoute(w, "live chat draft", &spec.chat_draft_commands);
+    try writePowerShellRoute(w, "live browser", &spec.browser_commands);
+    try writePowerShellRoute(w, "live palette", &spec.palette_commands);
+    try writePowerShellRoute(w, "live terminal", &spec.terminal_commands);
+    try writePowerShellRoute(w, "live process", &spec.process_commands);
+    try writePowerShellRoute(w, "live agent", &spec.agent_commands);
+    try writePowerShellRoute(w, "live stack", &spec.stack_commands);
+    try w.writeAll(
+        \\  }
+        \\  $fixedValues = @{
+        \\
+    );
+    try writePowerShellRoute(w, "--kind", &spec.kind_values);
+    try writePowerShellRoute(w, "--axis", &spec.axis_values);
+    try writePowerShellRoute(w, "--direction", &spec.direction_values);
+    try writePowerShellRoute(w, "--decision", &spec.decision_values);
+    try writePowerShellRoute(w, "--provider", &spec.provider_values);
+    try writePowerShellRoute(w, "--mode", &spec.inspector_mode_values);
+    try w.writeAll(
+        \\  }
+        \\  $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+        \\  $previous = if ($elements.Count -ge 2) { $elements[-2] } else { '' }
+        \\  if ($fixedValues.ContainsKey($previous)) {
+        \\    $candidates = $fixedValues[$previous]
+        \\  } else {
+        \\    $afterCommand = if ($elements.Count -gt 1) { @($elements[1..($elements.Count - 1)]) } else { @() }
+        \\    if ($afterCommand.Count -gt 0 -and $afterCommand[-1] -eq $wordToComplete) {
+        \\      $afterCommand = if ($afterCommand.Count -gt 1) { @($afterCommand[0..($afterCommand.Count - 2)]) } else { @() }
+        \\    }
+        \\    $route = $afterCommand -join ' '
+        \\    $candidates = if ($routes.ContainsKey($route)) { @($routes[$route]) } else { @() }
+        \\  }
+        \\  $candidates += @(
+        \\
+    );
+    for (spec.all_flags, 0..) |flag, index| {
+        if (index > 0) try w.writeAll(",\n");
+        try w.print("    '{s}'", .{flag});
+    }
+    try w.writeAll(
+        \\
+        \\  )
+        \\  $pattern = [WildcardPattern]::Escape($wordToComplete) + '*'
+        \\  $candidates | Sort-Object -Unique | Where-Object { $_ -like $pattern } | ForEach-Object {
+        \\    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+        \\  }
+        \\}
+        \\
+    );
 }
 
 fn writeBash(w: *std.Io.Writer) !void {

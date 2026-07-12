@@ -5,6 +5,7 @@ const palette = @import("palette");
 
 const app_state = @import("../state.zig");
 const profiler = @import("../profiler.zig");
+const platform_runtime = @import("platform_runtime");
 const utils = @import("../utils.zig");
 const browser_panel = @import("browser.zig");
 const chat_markdown = @import("chat_markdown.zig");
@@ -2005,10 +2006,7 @@ fn renderPendingTranscriptStream(state: *app_state.AppState, thread: *const app_
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 fn formatPendingWorkingLabel(buf: []u8, started_at_ms: i64) []const u8 {

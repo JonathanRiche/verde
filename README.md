@@ -16,7 +16,9 @@ The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is 
 - **Project-scoped terminal dock.** Ghostty-powered terminals with shell tabs and agent launch-profile tabs that persist with the layout.
 - **Managed workspace processes.** Declare dev servers or workers in `verde.yml` and control them from chat with the `/stack` and `/process` slash commands.
 - **Local-first.** No hosted inference and no relay; Verde drives the provider CLIs already on your machine.
-- **Scriptable.** Every running instance exposes a Unix-socket IPC through `verde live` and `verde state`.
+- **Scriptable.** Every running instance exposes per-user local control through
+  `verde live` (Windows named pipes or Unix sockets); `verde state` inspects the
+  persisted state without launching the app.
 - **Native, not Electron.** A single Zig + SDL3 binary built on Verde's own Palette UI framework.
 
 ## Getting Started
@@ -40,11 +42,25 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 
 - Linux: download `verde-v<version>-linux-x86_64.tar.gz`, extract it, then run `./install-local.sh`.
 - macOS: download the `.dmg` or `.zip` for your architecture, then move `Verde.app` into `Applications`.
+- Windows x64 preview: verify and extract the ZIP, then run `install.ps1` to
+  install for the current user and create the `Verde.Desktop` Start Menu
+  identity. `app\Verde.exe` is the desktop entry point and `bin\verde.exe` is
+  the console CLI.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
 
 ```bash
 yay -S verde-bin
 ```
+
+The Windows preview requires the Microsoft Edge WebView2 Evergreen Runtime;
+the packaged `WebView2Loader.dll` is only its application loader. Verde live
+control and persistent-terminal control use current-logon Windows named pipes,
+not TCP, and do not need a firewall exception. Codex app-server and OpenCode do
+open provider-local listeners, bound by default to `127.0.0.1` (`4500` and
+`4096` respectively). Do not expose those listeners on `0.0.0.0` or add a
+public/LAN inbound rule. If Windows Defender Firewall, a third-party firewall,
+or enterprise policy blocks loopback traffic, allow only the relevant provider
+executable's local-loopback traffic as policy permits, or ask the administrator.
 
 Linux browser support uses the system WPE WebKit runtime. AUR installs it as a
 package dependency; tarball installs will warn if required WPE libraries are
@@ -60,6 +76,12 @@ Chromium. Linux builds also require WPE WebKit development
 packages. Windows native-webview builds require the Microsoft WebView2 SDK
 headers at compile time and `WebView2Loader.dll` next to `verde.exe` or on the
 DLL search path.
+
+From Arch/Linux, `mise run build-windows` cross-builds the pinned
+`x86_64-windows-gnu` lane after validating the Rust target and
+`cargo-zigbuild`. On Windows, `scripts\dev\build-windows.ps1` builds the native
+MSVC lane. Both use `scripts/windows-dependencies.json` and the deterministic
+bootstrap cache instead of discovering arbitrary system SDK copies.
 
 For release-style local installs, use the packaged install scripts:
 
@@ -240,7 +262,10 @@ verde live workspace archive --project <id|index|path|current> [--json]
 Verde terminal children receive identity variables such as `VERDE=1`,
 `VERDE_SESSION_ID`, `VERDE_WORKSPACE_ID`, `VERDE_WORKSPACE_PATH`,
 `VERDE_DOCK_ID`, `VERDE_PANE_ID`, `VERDE_SOCKET`,
-`VERDE_LIVE_SOCKET`, `VERDE_SESSIONIZER_SOCKET`, and `VERDE_CLI`.
+`VERDE_LIVE_ENDPOINT`, `VERDE_LIVE_SOCKET`, `VERDE_SESSIONIZER_SOCKET`, and
+`VERDE_CLI`. `VERDE_LIVE_ENDPOINT` is the transport-neutral live-control
+address: a named-pipe name on Windows and a Unix-socket path elsewhere.
+`VERDE_LIVE_SOCKET` remains a Unix compatibility alias.
 Terminal tools can use those variables to update their pane surface:
 
 ```bash
@@ -265,12 +290,21 @@ verde integrations install claude
 ```
 
 `verde integrations` reports hook support without touching provider auth.
-Codex uses project-local hooks: `verde integrations install codex` writes
-`.codex/hooks.json` and `.verde/hooks/codex-notify-hook.sh` in the current
-workspace, and refuses to overwrite an existing unmanaged `.codex/hooks.json`.
-Other providers currently return an unsupported status; the generic
-`verde notify`, OSC notification, and MCP surface paths remain available for
-all terminal tools.
+Codex and Claude support project-local and `--global` hook installers. On
+Windows their generated scripts are `.verde/hooks/codex-notify-hook.ps1` and
+`.verde/hooks/claude-notify-hook.ps1`; Unix hosts use `.sh` scripts. Verde
+refuses to replace unmanaged provider settings. Amp supports its global plugin;
+OpenCode and Cursor remain usable chat providers but do not currently have a
+managed hook installer. The generic `verde notify`, OSC notification, and MCP
+surface paths remain available for terminal tools.
+
+Windows hook commands invoke the generated script with Windows PowerShell using
+`-NoProfile -NonInteractive -ExecutionPolicy Bypass -File`. `Bypass` applies
+only to that child PowerShell process; Verde does not change the user's or
+machine's saved execution policy. Domain Group Policy, AppLocker, WDAC, or
+endpoint security can still block the unsigned generated script. Inspect the
+script before enabling hooks, and if policy blocks it, leave the optional hook
+disabled or ask the administrator rather than weakening machine policy.
 
 - `panes`, `threads`, and `terminals` inspect one project.
 - `processes` returns the terminal-pane process graph currently available to
@@ -476,7 +510,7 @@ Verde includes embedded terminal panes powered by Ghostty's `libghostty-vt` term
 ## Config And State
 
 - App state is saved through SDL's pref path in `state.sqlite`.
-- User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json`.
+- User config is loaded from `$XDG_CONFIG_HOME/verde/verde.json` or `~/.config/verde/verde.json` on Unix, and `%APPDATA%\Verde\verde.json` on Windows. `VERDE_CONFIG` overrides either location.
 - Project stack config is loaded from `verde.yml` or `verde.yaml` in the workspace root. `processes:` and `agents:` entries both run in terminal docks; agent entries may also declare `provider`, `revive`, `notify`, `mcp`, and `hooks` metadata. New agent metadata defaults to disabled unless explicitly set.
 - On Omarchy systems, UI colors are loaded from an Omarchy-compatible `colors.toml`. Verde first honors `VERDE_OMARCHY_COLORS=/path/to/colors.toml`, then `$XDG_CONFIG_HOME/omarchy/current/theme/colors.toml`, then named Omarchy themes such as `$XDG_CONFIG_HOME/omarchy/themes/verde/colors.toml` or `~/.config/omarchy/themes/verde/colors.toml`. Missing values fall back to Verde defaults. See [`examples/omarchy/verde/colors.toml`](examples/omarchy/verde/colors.toml).
 - `theme.colors` in `verde.json` can override Verde theme tokens. Omit `theme.theme` to keep Omarchy auto-detection, or set it to `"default"` to start from Verde's built-in colors.
@@ -487,8 +521,16 @@ Example project stack config:
 processes:
   web:
     command: "npm run dev"
+    command_windows: "npm.cmd run dev"
     cwd: "."
     restart: on_crash
+
+  worker:
+    # Structured argv bypasses the local shell and preserves spaces exactly.
+    argv:
+      - "node"
+      - "scripts/worker task.mjs"
+      - "--label=client repo"
 
 agents:
   codex:
@@ -508,6 +550,16 @@ for the agent and wires Codex hook events into pane/workspace attention. Plain
 `codex` managed commands are launched with `features.codex_hooks=true` when
 `hooks: true` is set, so `PermissionRequest` can mark the surface `waiting` and
 `Stop` can mark it `done`.
+
+For portable stacks, prefer `argv:` when the executable and arguments are the
+same on every platform. Use `command_windows:` and `command_unix:` only when a
+shell command genuinely differs; these override `command:` on their platform.
+`argv_windows:` and `argv_unix:` provide the same override for structured
+arguments. A legacy `command:` keeps its existing `/bin/sh -lc` behavior on
+Unix. On Windows it runs in PowerShell 7 when available, then Windows
+PowerShell; Bash syntax is never silently sent to `cmd.exe`. Managed terminal
+processes are owned as a process tree (a Job Object on Windows), so stop,
+restart, or closing the managed pane also cleans up descendants.
 
 Start or restart a configured Codex agent with:
 
@@ -620,7 +672,13 @@ On Linux, Verde writes runtime logs under SDL's pref path:
 - `~/.local/share/verde/Native/logs/verde.stderr.log`
 - `~/.local/share/verde/Native/logs/last-crash.log`
 
-Those files capture Zig panic output, provider helper stderr, and the last panic marker written before the app aborted.
+On Windows, run `bin\verde.exe state path --json` to locate the authoritative
+per-user state directory; the same `logs\verde.stderr.log` and
+`logs\last-crash.log` files are below it. Windows user configuration defaults
+to `%APPDATA%\Verde\verde.json` and can be overridden with `VERDE_CONFIG`.
+
+Those log files capture Zig panic output, provider helper stderr, and the last
+panic marker written before the app aborted.
 
 ## Third-Party Components
 

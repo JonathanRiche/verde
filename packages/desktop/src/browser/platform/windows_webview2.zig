@@ -1,9 +1,11 @@
 //! Windows WebView2 browser backend.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const browser_input = @import("../input.zig");
 const browser_texture = @import("../texture.zig");
 const browser_types = @import("../types.zig");
+const platform_paths = @import("platform_paths");
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -19,7 +21,7 @@ const EventKind = enum(c_int) {
     failed = 8,
 };
 
-extern fn verde_windows_webview2_create(hwnd: ?*anyopaque) ?*anyopaque;
+extern fn verde_windows_webview2_create(hwnd: ?*anyopaque, user_data_dir: [*:0]const u8) ?*anyopaque;
 extern fn verde_windows_webview2_destroy(handle: ?*anyopaque) void;
 extern fn verde_windows_webview2_show(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_hide(handle: ?*anyopaque) c_int;
@@ -32,9 +34,11 @@ extern fn verde_windows_webview2_go_forward(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_reload(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_focus(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_blur(handle: ?*anyopaque) c_int;
+extern fn verde_windows_webview2_has_focus(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_is_ready(handle: ?*anyopaque) c_int;
 extern fn verde_windows_webview2_pop_event(handle: ?*anyopaque, kind: *c_int, payload: *?[*:0]u8) c_int;
 extern fn verde_windows_webview2_free_string(value: ?[*:0]u8) void;
+extern fn verde_windows_webview2_test_utf8_roundtrip(value: [*:0]const u8) c_int;
 
 /// Owns a WebView2 controller hosted as a child HWND under the SDL-created window.
 pub const Controller = struct {
@@ -179,6 +183,11 @@ pub const Controller = struct {
         }
     }
 
+    pub fn hasFocus(self: *const Controller) bool {
+        const handle = self.handle orelse return false;
+        return verde_windows_webview2_has_focus(handle) != 0;
+    }
+
     pub fn presentationKind(self: *const Controller) browser_types.PresentationKind {
         _ = self;
         return .native_child_view;
@@ -238,7 +247,15 @@ pub const Controller = struct {
     fn ensureWebView(self: *Controller) !*anyopaque {
         if (self.handle) |handle| return handle;
         const host_window = self.host_window orelse return error.BrowserUnavailable;
-        const handle = verde_windows_webview2_create(host_window) orelse return error.BrowserUnavailable;
+        const local_data = try platform_paths.localDataDir(self.allocator, "Verde", "Native");
+        defer self.allocator.free(local_data);
+        const user_data = try std.fs.path.join(self.allocator, &.{ local_data, "WebView2" });
+        defer self.allocator.free(user_data);
+        var threaded = std.Io.Threaded.init_single_threaded;
+        try std.Io.Dir.cwd().createDirPath(threaded.io(), user_data);
+        const user_data_z = try self.allocator.dupeZ(u8, user_data);
+        defer self.allocator.free(user_data_z);
+        const handle = verde_windows_webview2_create(host_window, user_data_z.ptr) orelse return error.BrowserUnavailable;
         self.handle = handle;
         try self.applyBounds(handle);
         return handle;
@@ -254,3 +271,21 @@ pub const Controller = struct {
         ) == 0) return error.BrowserUnavailable;
     }
 };
+
+test "WebView2 string conversion preserves non-ASCII UTF-8" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const values = [_][:0]const u8{
+        "https://example.test/naïve/東京",
+        "Verde browser — emoji 🟢",
+        "消息：已加载",
+    };
+    for (values) |value| {
+        try std.testing.expectEqual(@as(c_int, 1), verde_windows_webview2_test_utf8_roundtrip(value.ptr));
+    }
+}
+
+test "WebView2 string conversion rejects invalid UTF-8" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const invalid: [:0]const u8 = "\xff";
+    try std.testing.expectEqual(@as(c_int, 0), verde_windows_webview2_test_utf8_roundtrip(invalid.ptr));
+}

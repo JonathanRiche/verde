@@ -1,0 +1,38 @@
+#!/usr/bin/env sh
+set -u
+
+if [ -z "${VERDE_REAL_ZIG:-}" ]; then
+  echo "error: VERDE_REAL_ZIG must name the pinned Zig executable" >&2
+  exit 1
+fi
+
+"$VERDE_REAL_ZIG" "$@"
+status=$?
+if [ "$status" -ne 0 ]; then
+  exit "$status"
+fi
+
+# zlob 1.3.3 asks Zig for a static Windows-GNU library, then asks rustc for
+# GNU's libzlob.a spelling. Zig 0.16 correctly emits the COFF archive as
+# zlob.lib for all Windows ABIs. Mirror those identical bytes under the name
+# rustc expects until the pinned crate handles Zig 0.16's spelling itself.
+static_only=false
+prefix=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -Dstatic-only=true)
+      static_only=true
+      ;;
+    -p)
+      shift
+      if [ "$#" -gt 0 ]; then
+        prefix=$1
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [ "$static_only" = true ] && [ -n "$prefix" ] && [ -f "$prefix/lib/zlob.lib" ]; then
+  cp "$prefix/lib/zlob.lib" "$prefix/lib/libzlob.a"
+fi

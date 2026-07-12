@@ -1,7 +1,9 @@
 //! Shared Herdr integration helpers used by the CLI and desktop app.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
+const platform_paths = @import("platform_paths");
 const process_env = @import("process_env.zig");
 
 pub const PENDING_DIR_NAME = "herdr";
@@ -12,6 +14,13 @@ pub const SHADOW_WORKSPACES_DIR_NAME = "herdr-workspaces";
 /// Herdr normalizes the relative cwd into an absolute pane cwd on the remote.
 pub const REMOTE_WORKSPACES_DIR_NAME = ".local/share/verde/herdr-workspaces";
 const REMOTE_CONTROL_TIMEOUT = "20s";
+const REMOTE_CONTROL_TIMEOUT_SECONDS = "20";
+
+/// A command line interpreted by the remote account's POSIX shell. Local
+/// Windows commands are always represented as argv and never use this type.
+pub const RemotePosixCommand = struct {
+    bytes: []const u8,
+};
 
 pub const OpenRequest = struct {
     session: []const u8 = "",
@@ -158,6 +167,8 @@ pub fn runCli(
     defer if (remote_command) |command| allocator.free(command);
     var local_executable: ?[]u8 = null;
     defer if (local_executable) |path| allocator.free(path);
+    var ssh_executable: ?[]u8 = null;
+    defer if (ssh_executable) |path| allocator.free(path);
     var env_map = try process_env.buildAugmentedEnvMap(allocator);
     defer env_map.deinit();
 
@@ -170,19 +181,8 @@ pub fn runCli(
         // `timeout` prevents live IPC calls from hanging forever when SSH or
         // Tailscale needs a fresh interactive approval. Terminal attach remains
         // interactive; this guard is only for request/response control calls.
-        try argv.appendSlice(allocator, &.{
-            "timeout",
-            REMOTE_CONTROL_TIMEOUT,
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "NumberOfPasswordPrompts=0",
-            "-o",
-            "KbdInteractiveAuthentication=no",
-            remote,
-            remote_command.?,
-        });
+        ssh_executable = try localSshExecutableAlloc(allocator, &env_map);
+        try appendRemoteControlArgv(allocator, &argv, builtin.os.tag, ssh_executable.?, remote, remote_command.?);
     } else {
         local_executable = try localHerdrExecutableAlloc(allocator, io);
         try argv.appendSlice(allocator, &.{ local_executable orelse "herdr", "--session", target.session });
@@ -201,30 +201,64 @@ pub fn runRemoteShell(
     allocator: std.mem.Allocator,
     io: std.Io,
     remote: []const u8,
-    command: []const u8,
+    command: RemotePosixCommand,
     max_output_bytes: usize,
 ) !std.process.RunResult {
     if (std.mem.trim(u8, remote, &std.ascii.whitespace).len == 0) return error.MissingHerdrProfileSshTarget;
     var env_map = try process_env.buildAugmentedEnvMap(allocator);
     defer env_map.deinit();
-    const argv = [_][]const u8{
-        "timeout",
-        REMOTE_CONTROL_TIMEOUT,
-        "ssh",
+    const ssh_executable = try localSshExecutableAlloc(allocator, &env_map);
+    defer allocator.free(ssh_executable);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try appendRemoteControlArgv(allocator, &argv, builtin.os.tag, ssh_executable, remote, command.bytes);
+    return std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+        .environ_map = &env_map,
+    });
+}
+
+fn localSshExecutableAlloc(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
+    const executable_name = if (builtin.os.tag == .windows) "ssh.exe" else "ssh";
+    return process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, executable_name) catch |err| switch (err) {
+        // Unix historically delegated resolution to execvp. Preserve that
+        // behavior while requiring the native OpenSSH client on Windows.
+        error.FileNotFound => if (builtin.os.tag == .windows) blk: {
+            const system_root = env_map.get("SYSTEMROOT") orelse return error.WindowsOpenSshNotFound;
+            const candidate = try std.fs.path.join(allocator, &.{ system_root, "System32", "OpenSSH", "ssh.exe" });
+            defer allocator.free(candidate);
+            break :blk process_env.resolveExecutableInEnvMapAlloc(allocator, env_map, candidate) catch
+                return error.WindowsOpenSshNotFound;
+        } else allocator.dupe(u8, "ssh"),
+        else => return err,
+    };
+}
+
+fn appendRemoteControlArgv(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    comptime os_tag: std.Target.Os.Tag,
+    ssh_executable: []const u8,
+    remote: []const u8,
+    command: []const u8,
+) !void {
+    if (os_tag != .windows) try argv.appendSlice(allocator, &.{ "timeout", REMOTE_CONTROL_TIMEOUT });
+    try argv.appendSlice(allocator, &.{
+        ssh_executable,
         "-o",
         "BatchMode=yes",
         "-o",
         "NumberOfPasswordPrompts=0",
         "-o",
         "KbdInteractiveAuthentication=no",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ConnectTimeout=" ++ REMOTE_CONTROL_TIMEOUT_SECONDS,
         remote,
         command,
-    };
-    return std.process.run(allocator, io, .{
-        .argv = &argv,
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(max_output_bytes),
-        .environ_map = &env_map,
     });
 }
 
@@ -232,7 +266,7 @@ pub fn remoteMkdirCommandLineAlloc(allocator: std.mem.Allocator, path: []const u
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     try writer.writer.writeAll("mkdir -p -- ");
-    try shellQuote(&writer.writer, path);
+    try appendRemotePosixShellArg(&writer.writer, path);
     return try writer.toOwnedSlice();
 }
 
@@ -250,7 +284,7 @@ pub fn remoteLoginShellCommandLineAlloc(allocator: std.mem.Allocator, cwd: []con
     // use fish or another non-POSIX login shell. The launched shell is still the
     // user's remote `$SHELL`.
     try writer.writer.writeAll("bash -lc ");
-    try shellQuote(&writer.writer, script);
+    try appendRemotePosixShellArg(&writer.writer, script);
     return try writer.toOwnedSlice();
 }
 
@@ -262,7 +296,7 @@ pub fn remoteExecCommandLineAlloc(allocator: std.mem.Allocator, cwd: []const u8,
     try script_writer.writer.writeAll(" && exec ");
     for (args, 0..) |arg, index| {
         if (index > 0) try script_writer.writer.writeByte(' ');
-        try shellQuote(&script_writer.writer, arg);
+        try appendRemotePosixShellArg(&script_writer.writer, arg);
     }
     const script = try script_writer.toOwnedSlice();
     defer allocator.free(script);
@@ -270,7 +304,7 @@ pub fn remoteExecCommandLineAlloc(allocator: std.mem.Allocator, cwd: []const u8,
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     try writer.writer.writeAll("bash -lc ");
-    try shellQuote(&writer.writer, script);
+    try appendRemotePosixShellArg(&writer.writer, script);
     return try writer.toOwnedSlice();
 }
 
@@ -279,36 +313,37 @@ fn appendRemoteEnsureCwd(writer: *std.Io.Writer, cwd: []const u8) !void {
     // SSH freezes Verde's UI when Tailscale/SSH needs approval; this lets the
     // terminal pane show that prompt instead.
     try writer.writeAll("mkdir -p -- ");
-    try shellQuote(writer, cwd);
+    try appendRemotePosixShellArg(writer, cwd);
     try writer.writeAll(" && cd -- ");
-    try shellQuote(writer, cwd);
+    try appendRemotePosixShellArg(writer, cwd);
 }
 
 fn localHerdrExecutableAlloc(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
-    if (std.c.getenv("HERDR_BIN")) |value| {
-        return try allocator.dupe(u8, std.mem.sliceTo(value, 0));
+    _ = io;
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    if (env_map.get("HERDR_BIN")) |value| {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (trimmed.len > 0) {
+            const expanded = try platform_paths.expandUserPath(allocator, trimmed);
+            defer allocator.free(expanded);
+            // Resolve overrides through the same PATH/PATHEXT rules as defaults;
+            // this keeps `HERDR_BIN=herdr` and `.cmd` shims working on Windows.
+            return try process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, expanded);
+        }
     }
-    const home = std.c.getenv("HOME") orelse return null;
-    const local_path = try std.fs.path.join(allocator, &.{ std.mem.sliceTo(home, 0), ".local", "bin", "herdr" });
-    errdefer allocator.free(local_path);
-    std.Io.Dir.accessAbsolute(io, local_path, .{ .follow_symlinks = true, .read = true, .write = false, .execute = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            allocator.free(local_path);
-            return null;
-        },
-        else => return err,
-    };
-    return local_path;
+    const executable_name = if (builtin.os.tag == .windows) "herdr.exe" else "herdr";
+    return process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, executable_name) catch null;
 }
 
 pub fn remoteHerdrCommandLineAlloc(allocator: std.mem.Allocator, session: []const u8, args: []const []const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
     try writer.writer.writeAll("$HOME/.local/bin/herdr --session ");
-    try shellQuote(&writer.writer, session);
+    try appendRemotePosixShellArg(&writer.writer, session);
     for (args) |arg| {
         try writer.writer.writeByte(' ');
-        try shellQuote(&writer.writer, arg);
+        try appendRemotePosixShellArg(&writer.writer, arg);
     }
     return try writer.toOwnedSlice();
 }
@@ -467,7 +502,7 @@ fn appendSafePart(writer: *std.Io.Writer, value: []const u8) !void {
     if (!wrote) try writer.writeAll("default");
 }
 
-fn shellQuote(writer: *std.Io.Writer, arg: []const u8) !void {
+fn appendRemotePosixShellArg(writer: *std.Io.Writer, arg: []const u8) !void {
     if (arg.len == 0) return writer.writeAll("''");
     var needs_quote = false;
     for (arg) |byte| {
@@ -533,6 +568,30 @@ test "remote exec command line quotes cwd and argv" {
         \\bash -lc 'mkdir -p -- '\''.local/share/verde/herdr-workspaces/has space'\'' && cd -- '\''.local/share/verde/herdr-workspaces/has space'\'' && exec /bin/sh -lc '\''printf '\''\'\'''\''hi there'\''\'\'''\'''\'''
     ;
     try std.testing.expectEqualStrings(expected, command);
+}
+
+test "Windows OpenSSH control argv stays structured and remote command remains POSIX" {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.testing.allocator);
+    try appendRemoteControlArgv(
+        std.testing.allocator,
+        &argv,
+        .windows,
+        "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+        "dev box",
+        "bash -lc \"cd -- '/srv/client repo'\"",
+    );
+    try std.testing.expectEqualStrings("C:\\Windows\\System32\\OpenSSH\\ssh.exe", argv.items[0]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, argv.items[0], ' ') == null);
+    try std.testing.expectEqualStrings("ConnectTimeout=20", argv.items[10]);
+    try std.testing.expectEqualStrings("dev box", argv.items[11]);
+    try std.testing.expectEqualStrings("bash -lc \"cd -- '/srv/client repo'\"", argv.items[12]);
+
+    var unix_argv: std.ArrayList([]const u8) = .empty;
+    defer unix_argv.deinit(std.testing.allocator);
+    try appendRemoteControlArgv(std.testing.allocator, &unix_argv, .linux, "ssh", "dev", "true");
+    try std.testing.expectEqualStrings("timeout", unix_argv.items[0]);
+    try std.testing.expectEqualStrings("20s", unix_argv.items[1]);
 }
 
 test "unlink request rejects ambiguous workspace selector" {

@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const platform_runtime = @import("platform_runtime");
 
 const STDERR_LOG_FILE_NAME = "verde.stderr.log";
 const LAST_CRASH_LOG_FILE_NAME = "last-crash.log";
@@ -12,6 +13,7 @@ var runtime_io: ?std.Io = null;
 var stderr_log_path: ?[]const u8 = null;
 var last_crash_log_path: ?[]const u8 = null;
 var log_mutex: std.atomic.Mutex = .unlocked;
+var log_file_mutex: std.atomic.Mutex = .unlocked;
 var log_entries: [LOG_ENTRY_CAPACITY]LogEntry = [_]LogEntry{LogEntry.empty()} ** LOG_ENTRY_CAPACITY;
 var log_sequence: u64 = 0;
 var log_total: usize = 0;
@@ -92,6 +94,9 @@ pub fn diagnostic(comptime format: []const u8, args: anytype) void {
     const path = stderr_log_path orelse return;
     const io = runtime_io orelse return;
 
+    while (!log_file_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer log_file_mutex.unlock();
+
     var file = std.Io.Dir.createFileAbsolute(io, path, .{
         .read = true,
         .truncate = false,
@@ -116,8 +121,40 @@ pub fn logFn(
     const scope_name = comptime @tagName(scope);
     appendLogEntry(level, scope_name, format, args);
 
+    // A GUI-subsystem Windows process has no usable stderr stream to redirect.
+    // Persist the same log line explicitly so diagnostics remain available in
+    // the pref-directory log just as they are on Unix hosts.
+    if (builtin.os.tag == .windows) appendWindowsLogLine(level, scope_name, format, args);
+
     const prefix = "[" ++ comptime level.asText() ++ "] (" ++ scope_name ++ "): ";
     std.debug.print(prefix ++ format ++ "\n", args);
+}
+
+fn appendWindowsLogLine(
+    comptime level: std.log.Level,
+    comptime scope_name: []const u8,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const path = stderr_log_path orelse return;
+    const io = runtime_io orelse return;
+
+    while (!log_file_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer log_file_mutex.unlock();
+
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = false,
+    }) catch return;
+    defer file.close(io);
+
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.pos = file.length(io) catch return;
+    writer.interface.print("[{s}] ({s}): ", .{ level.asText(), scope_name }) catch return;
+    writer.interface.print(format, args) catch return;
+    writer.interface.writeByte('\n') catch return;
+    writer.interface.flush() catch return;
 }
 
 pub fn logEntryCount() usize {
@@ -221,15 +258,9 @@ fn writePanicMarker(msg: []const u8, first_trace_addr: ?usize) void {
 }
 
 fn processId() u32 {
-    return switch (builtin.os.tag) {
-        .windows => 0,
-        else => @intCast(std.c.getpid()),
-    };
+    return platform_runtime.processId();
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }

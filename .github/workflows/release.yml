@@ -340,11 +340,103 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
 
+  build-windows:
+    timeout-minutes: 180
+    runs-on: windows-latest
+    env:
+      ZIG_VERSION: 0.16.0
+      RUST_VERSION: 1.95.0
+      BUN_VERSION: 1.3.14
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.cache\zig-global
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.5"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install pinned Rust MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_VERSION
+          cargo --version
+          rustc --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .cache/zig-global
+            .zig-cache/windows-deps
+            vendor/fff/target
+          key: windows-release-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/build-windows.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock') }}
+
+      - name: Install JavaScript dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --production
+
+      - name: Compute release version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
+            $Version = $env:GITHUB_REF_NAME
+          } else {
+            $Version = "manual-$env:GITHUB_RUN_NUMBER-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+          "value=$Version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Compile native Windows tests
+        shell: pwsh
+        run: .\scripts\dev\build-windows.ps1 -CompileTests
+
+      - name: Build, sign, and verify Windows package
+        shell: pwsh
+        env:
+          VERDE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          VERDE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $IsTagRelease = $env:GITHUB_REF_TYPE -eq "tag"
+          $PackageArguments = @{
+            Version = "${{ steps.version.outputs.value }}"
+            OutputDir = "dist"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)) {
+            $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
+            [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
+            $PackageArguments.CertificatePath = $CertificatePath
+            $PackageArguments.CertificatePassword = $env:VERDE_SIGNING_PFX_PASSWORD
+            $PackageArguments.RequireSignature = $true
+          } elseif ($IsTagRelease) {
+            throw "Tag releases require WINDOWS_SIGNING_CERTIFICATE_BASE64."
+          }
+          .\scripts\release\package-windows.ps1 @PackageArguments
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          if-no-files-found: error
+          path: dist/*
+
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs:
       - build-linux
       - build-macos
+      - build-windows
     runs-on: ubuntu-24.04
 
     steps:
