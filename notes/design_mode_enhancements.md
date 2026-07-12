@@ -286,6 +286,13 @@ browser via the bundled inspector:
   "prompt text + selection context + crop thumbnail".
 - Multi-element selection already existed (draw-box / draw-freeform union
   regions) and now flows through the same auto-send + capture path.
+- **Thread targeting.** Prompts go to the project's last-focused chat thread
+  (`selected_thread_index`; focusing the browser pane does not change it).
+  When a selection is captured, the host pushes the visible chat panes into
+  the bubble (`setPromptTargets`): with one open chat pane nothing is shown
+  (the destination is unambiguous), with two or more the bubble shows a
+  "Send to" selector defaulting to the last-focused thread, and the submit
+  payload carries the chosen pane id so the host routes the send there.
 
 ### TODOs — not in this pass
 

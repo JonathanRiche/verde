@@ -1003,6 +1003,9 @@ const InspectorPromptSubmittedEvent = struct {
         prompt: []const u8,
         selection: InspectorSelectionPayload,
         viewport: ?InspectorViewportPayload = null,
+        /// Workspace pane id (stringified) the user picked in the bubble's
+        /// "Send to" selector; null when the host never pushed targets.
+        target: ?[]const u8 = null,
     },
 };
 
@@ -11402,6 +11405,9 @@ pub const AppState = struct {
                         self.browser_state.setLastJsMessage(message) catch {};
                         if (isInspectorSelectionMessage(message)) {
                             self.setSidebarNotice("Browser inspector captured a selection.");
+                            // The bubble just opened; refresh its "Send to"
+                            // targets so they track the current pane layout.
+                            self.pushInspectorPromptTargets();
                         } else if (isInspectorPromptSubmittedMessage(message)) {
                             self.handleInspectorPromptSubmitted(message);
                         }
@@ -11563,6 +11569,10 @@ pub const AppState = struct {
             return;
         }
 
+        // Route to the chat pane the user picked in the bubble's "Send to"
+        // selector before any currentThread() reads below.
+        if (parsed.value.payload.target) |target| self.applyInspectorPromptTarget(target);
+
         const context_block = self.buildInspectorContextBlock(parsed.value.payload.selection) catch |err| {
             log.warn("failed to build inspector context block: {s}", .{@errorName(err)});
             self.setSidebarNotice("Browser inspector prompt could not be prepared.");
@@ -11719,6 +11729,86 @@ pub const AppState = struct {
             return null;
         };
         return .{ .path = path, .byte_len = png.len };
+    }
+
+    // Switches the project's selected thread to the chat pane the user picked
+    // in the bubble's "Send to" selector. Invalid/closed panes are ignored so
+    // the send falls back to the last-focused thread.
+    fn applyInspectorPromptTarget(self: *AppState, target: []const u8) void {
+        const pane_id = std.fmt.parseInt(WorkspacePaneId, target, 10) catch return;
+        const thread_index = self.workspaceChatThreadIndexByPane(pane_id) orelse return;
+        const project = &self.projects.items[self.selected_project_index];
+        if (project.selected_thread_index == thread_index) return;
+        project.selected_thread_index = thread_index;
+        self.syncPaletteComposerFromDraft();
+    }
+
+    /// Pushes the visible chat panes of the current project into the inspector
+    /// bubble as "Send to" targets (the bubble shows a selector only when more
+    /// than one exists). Called whenever a selection is captured so the list
+    /// tracks pane layout changes.
+    fn pushInspectorPromptTargets(self: *AppState) void {
+        if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) return;
+        if (self.projects.items.len == 0) return;
+        const project = &self.projects.items[self.selected_project_index];
+
+        const TargetJson = struct {
+            id: []const u8,
+            label: []const u8,
+        };
+        var ids = std.ArrayList([]u8).empty;
+        defer {
+            for (ids.items) |id| self.allocator.free(id);
+            ids.deinit(self.allocator);
+        }
+        var targets = std.ArrayList(TargetJson).empty;
+        defer targets.deinit(self.allocator);
+        var selected_id: ?[]const u8 = null;
+
+        const current_thread_index = project.currentThreadIndex();
+        for (project.workspace_layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            const thread_index = switch (pane.ref) {
+                .chat => |ref| ref.thread_index,
+                else => continue,
+            };
+            if (thread_index >= project.threads.items.len) continue;
+            const id = std.fmt.allocPrint(self.allocator, "{d}", .{pane.id}) catch return;
+            ids.append(self.allocator, id) catch {
+                self.allocator.free(id);
+                return;
+            };
+            targets.append(self.allocator, .{
+                .id = id,
+                .label = project.threads.items[thread_index].title,
+            }) catch return;
+            // Default the selector to the last-focused thread's pane.
+            if (selected_id == null and thread_index == current_thread_index) selected_id = id;
+        }
+        if (selected_id == null and targets.items.len > 0) selected_id = targets.items[0].id;
+
+        // Two argument literals for setPromptTargets(targets, selectedId);
+        // separate Stringify instances since each serializes one root value.
+        var json_buffer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer json_buffer.deinit();
+        var targets_jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        targets_jw.write(targets.items) catch return;
+        json_buffer.writer.writeAll(", ") catch return;
+        var selected_jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        selected_jw.write(selected_id) catch return;
+
+        const script = std.fmt.allocPrint(
+            self.allocator,
+            "(function() {{ const h = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null; if (h && typeof h.setPromptTargets === \"function\") h.setPromptTargets({s}); }})();",
+            .{json_buffer.written()},
+        ) catch return;
+        defer self.allocator.free(script);
+
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            log.warn("failed to push inspector prompt targets: {s}", .{@errorName(err)});
+        };
     }
 
     // Evaluates the host→page acknowledgement for a submitted design-mode
