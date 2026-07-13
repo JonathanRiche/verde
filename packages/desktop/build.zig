@@ -76,7 +76,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zsdl = b.dependency("zsdl", .{});
+    const zsdl = b.dependency("zsdl", .{
+        .target = target,
+        .optimize = optimize,
+        .@"use-prebuilt" = false,
+    });
     const ghostty = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
