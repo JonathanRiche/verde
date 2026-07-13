@@ -634,6 +634,15 @@ pub const Dock = struct {
         return try session.writeInput(bytes);
     }
 
+    /// Pastes host-provided text into the active pane's running session,
+    /// honoring bracketed-paste so TUI inputs are filled without executing.
+    pub fn pasteTextToActivePane(self: *Dock, allocator: std.mem.Allocator, text: []const u8) !bool {
+        if (text.len == 0) return false;
+        const pane = self.activePane() orelse return false;
+        const session = pane.session orelse return false;
+        return try session.pasteText(allocator, text);
+    }
+
     pub fn terminateActiveSession(self: *Dock) bool {
         const pane = self.activePane() orelse return false;
         const session = pane.session orelse return false;
@@ -1803,6 +1812,10 @@ const UnsupportedSession = struct {
         return false;
     }
 
+    pub fn pasteText(_: *UnsupportedSession, _: std.mem.Allocator, _: []const u8) !bool {
+        return false;
+    }
+
     pub fn terminate(_: *UnsupportedSession) bool {
         return false;
     }
@@ -2554,13 +2567,19 @@ const UnixSession = struct {
         const clipboard_ptr = sdl.getClipboardText() catch return false;
         defer sdl.free(clipboard_ptr);
         const clipboard_text = std.mem.sliceTo(clipboard_ptr, 0);
-        if (clipboard_text.len == 0) return false;
+        return try self.pasteText(allocator, clipboard_text);
+    }
+
+    /// Injects host-provided text as a paste (honoring bracketed-paste mode)
+    /// so multi-line content fills the running TUI's input without executing.
+    pub fn pasteText(self: *UnixSession, allocator: std.mem.Allocator, text: []const u8) !bool {
+        if (!self.running or text.len == 0) return false;
 
         if (self.backend == .local) {
-            try writeTerminalPaste(allocator, self.master_fd, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+            try writeTerminalPaste(allocator, self.master_fd, text, self.terminal.modes.get(.bracketed_paste));
             return true;
         }
-        const encoded = try terminalPasteBytesAlloc(allocator, clipboard_text, self.terminal.modes.get(.bracketed_paste));
+        const encoded = try terminalPasteBytesAlloc(allocator, text, self.terminal.modes.get(.bracketed_paste));
         defer allocator.free(encoded);
         return try self.writeRawInput(encoded);
     }

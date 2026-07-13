@@ -288,11 +288,18 @@ browser via the bundled inspector:
   regions) and now flows through the same auto-send + capture path.
 - **Thread targeting.** Prompts go to the project's last-focused chat thread
   (`selected_thread_index`; focusing the browser pane does not change it).
-  When a selection is captured, the host pushes the visible chat panes into
-  the bubble (`setPromptTargets`): with one open chat pane nothing is shown
-  (the destination is unambiguous), with two or more the bubble shows a
-  "Send to" selector defaulting to the last-focused thread, and the submit
-  payload carries the chosen pane id so the host routes the send there.
+  When a selection is captured, the host pushes the available destinations
+  into the bubble (`setPromptTargets`): with one destination nothing is shown
+  (it is unambiguous), with two or more the bubble shows a "Send to" selector
+  defaulting to the last-focused chat/terminal pane, and the submit payload
+  carries the chosen target so the host routes it there.
+- **TUI targets.** Threads running as TUIs (Codex/Claude/opencode/cursor/...
+  in a thread-bound terminal dock with a live session) appear in the selector
+  as "{title} (TUI)". Picking one pastes the prompt + selection context +
+  screenshot path into the TUI's input via bracketed paste — filled in, not
+  executed — and focuses that pane so the user reviews and hits Enter. If the
+  pane/session died between selection and submit, the prompt falls back to
+  the composer draft.
 
 ### TODOs — not in this pass
 
