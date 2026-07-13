@@ -14,6 +14,14 @@ pub const c = @cImport({
     // C compilation paths retain their normal hardening; this only keeps the
     // SDL header translation deterministic for Windows cross-builds.
     if (builtin.os.tag == .windows) @cDefine("_FORTIFY_SOURCE", "0");
+    // MSVC's stdint.h spells SIZE_MAX with a ui64 literal suffix that Zig's C
+    // translator rejects. Preserve the same value with portable C syntax.
+    if (builtin.abi == .msvc) {
+        @cInclude("stddef.h");
+        @cInclude("stdint.h");
+        @cUndef("SIZE_MAX");
+        @cDefine("SIZE_MAX", "((size_t)-1)");
+    }
     @cInclude("SDL3/SDL_gpu.h");
     @cInclude("SDL3_ttf/SDL_ttf.h");
 });

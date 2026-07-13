@@ -682,7 +682,7 @@ const WindowsWebView2Options = struct {
 };
 
 fn addWindowsIntegrations(b: *std.Build, compile: *std.Build.Step.Compile) void {
-    compile.root_module.link_libcpp = true;
+    if (compile.rootModuleTarget().abi != .msvc) compile.root_module.link_libcpp = true;
     compile.root_module.addCSourceFile(.{
         .file = b.path("src/platform/windows/integrations.cpp"),
         .flags = &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" },
@@ -691,7 +691,7 @@ fn addWindowsIntegrations(b: *std.Build, compile: *std.Build.Step.Compile) void 
 
 fn addWindowsWebView2(b: *std.Build, compile: *std.Build.Step.Compile, options: WindowsWebView2Options) void {
     if (options.real_webview) {
-        compile.root_module.link_libcpp = true;
+        if (compile.rootModuleTarget().abi != .msvc) compile.root_module.link_libcpp = true;
         if (options.include_dir) |path| compile.root_module.addIncludePath(.{ .cwd_relative = path });
         if (options.loader_import_lib) |path| {
             compile.root_module.addObjectFile(.{ .cwd_relative = path });
