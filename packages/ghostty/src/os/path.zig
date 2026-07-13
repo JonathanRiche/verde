@@ -15,14 +15,19 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
 
     const PATH = switch (builtin.os.tag) {
         .windows => blk: {
-            const win_path = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("PATH")) orelse return null;
-            const path = try std.unicode.utf16LeToUtf8Alloc(alloc, win_path);
+            const environ: std.process.Environ = .{ .block = .global };
+            const path = environ.getAlloc(alloc, "PATH") catch |err| switch (err) {
+                error.EnvironmentVariableMissing => return null,
+                else => return err,
+            };
             break :blk path;
         },
         else => return null,
     };
     defer if (builtin.os.tag == .windows) alloc.free(PATH);
 
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var it = std.mem.tokenizeScalar(u8, PATH, std.fs.path.delimiter);
     var seen_eacces = false;
@@ -39,7 +44,8 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
         const full_path = path_buf[0..path_len :0];
 
         // Stat it
-        const f = std.fs.cwd().openFile(
+        const f = std.Io.Dir.cwd().openFile(
+            io,
             full_path,
             .{},
         ) catch |err| switch (err) {
@@ -52,9 +58,9 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
             },
             else => return err,
         };
-        defer f.close();
-        const stat = try f.stat();
-        if (stat.kind != .directory and isExecutable(stat.mode)) {
+        defer f.close(io);
+        const stat = try f.stat(io);
+        if (stat.kind != .directory) {
             return try alloc.dupe(u8, full_path);
         }
     }
@@ -62,11 +68,6 @@ pub fn expand(alloc: Allocator, cmd: []const u8) !?[]u8 {
     if (seen_eacces) return error.AccessDenied;
 
     return null;
-}
-
-fn isExecutable(mode: std.fs.File.Mode) bool {
-    if (builtin.os.tag == .windows) return true;
-    return mode & 0o0111 != 0;
 }
 
 // `uname -n` is the *nix equivalent of `hostname.exe` on Windows
