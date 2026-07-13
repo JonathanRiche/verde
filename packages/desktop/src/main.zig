@@ -671,8 +671,11 @@ fn paletteGpuFontPath(
     bytes: []const u8,
     dev_candidates: []const [:0]const u8,
 ) ![:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     for (dev_candidates) |candidate| {
-        if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
         return try allocator.dupeZ(u8, candidate);
     }
 
@@ -709,6 +712,10 @@ fn ghosttyFontFamily(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var compact = std.ArrayList(u8).empty;
     defer compact.deinit(allocator);
     for (family) |byte| {
@@ -723,8 +730,11 @@ fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 
     };
     for (candidates) |dir| {
         const path = try allocFontCandidatePath(allocator, dir, compact_name);
-        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
-        allocator.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        return path;
     }
 
     const home = std.c.getenv("HOME") orelse return null;
@@ -737,8 +747,11 @@ fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 
         const parent = try std.fs.path.join(allocator, &.{ home_slice, dir });
         defer allocator.free(parent);
         const path = try allocFontCandidatePath(allocator, parent, compact_name);
-        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
-        allocator.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        return path;
     }
     return null;
 }

@@ -284,6 +284,11 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_exe.subsystem = .windows;
+            if (target.result.abi == .msvc) {
+                // The MSVC GUI subsystem otherwise selects WinMainCRTStartup,
+                // while Zig's libc startup exports main for this root module.
+                gui_exe.entry = .{ .symbol_name = "mainCRTStartup" };
+            }
             gui_exe.build_id = .sha1;
             gui_exe.each_lib_rpath = false;
             if (build_fff) |build_step| gui_exe.step.dependOn(&build_step.step);
