@@ -685,13 +685,14 @@ fn addWindowsIntegrations(b: *std.Build, compile: *std.Build.Step.Compile) void 
     if (compile.rootModuleTarget().abi != .msvc) compile.root_module.link_libcpp = true;
     compile.root_module.addCSourceFile(.{
         .file = b.path("src/platform/windows/integrations.cpp"),
-        .flags = &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" },
+        .flags = windowsCppFlags(compile),
     });
 }
 
 fn addWindowsWebView2(b: *std.Build, compile: *std.Build.Step.Compile, options: WindowsWebView2Options) void {
     if (options.real_webview) {
         if (compile.rootModuleTarget().abi != .msvc) compile.root_module.link_libcpp = true;
+        addMsvcSystemIncludePaths(b, compile);
         if (options.include_dir) |path| compile.root_module.addIncludePath(.{ .cwd_relative = path });
         if (options.loader_import_lib) |path| {
             compile.root_module.addObjectFile(.{ .cwd_relative = path });
@@ -700,13 +701,35 @@ fn addWindowsWebView2(b: *std.Build, compile: *std.Build.Step.Compile, options: 
         }
         compile.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/windows_webview2.cpp"),
-            .flags = &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" },
+            .flags = windowsCppFlags(compile),
         });
     } else {
         compile.root_module.addCSourceFile(.{
             .file = b.path("src/browser/platform/windows_webview2_test_stub.c"),
             .flags = &.{},
         });
+    }
+}
+
+fn windowsCppFlags(compile: *std.Build.Step.Compile) []const []const u8 {
+    if (compile.rootModuleTarget().abi == .msvc) {
+        // Zig passes -nostdinc++ for MSVC C++ sources even without link_libcpp;
+        // Clang otherwise promotes the unused driver argument to an error.
+        return &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE", "-Wno-unused-command-line-argument" };
+    }
+    return &.{ "-std=c++17", "-DUNICODE", "-D_UNICODE" };
+}
+
+fn addMsvcSystemIncludePaths(b: *std.Build, compile: *std.Build.Step.Compile) void {
+    if (compile.rootModuleTarget().abi != .msvc) return;
+    const include_paths = b.graph.environ_map.get("INCLUDE") orelse return;
+    var paths = std.mem.splitScalar(u8, include_paths, ';');
+    while (paths.next()) |path| {
+        if (!std.ascii.endsWithIgnoreCase(path, "\\winrt") and
+            !std.ascii.endsWithIgnoreCase(path, "/winrt")) continue;
+        // Zig discovers the core MSVC headers but not the SDK's WinRT path,
+        // where WebView2's WRL dependency is installed.
+        compile.root_module.addSystemIncludePath(.{ .cwd_relative = path });
     }
 }
 
