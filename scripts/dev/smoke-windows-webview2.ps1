@@ -115,6 +115,7 @@ $CleanupForced = $false
 $GracefulCloseRequested = $false
 $ProcessExitCode = $null
 $CleanupError = $null
+$OutputCaptureTimedOut = $false
 $PrefPath = $null
 $StatePath = $null
 $LegacyStatePath = $null
@@ -281,7 +282,9 @@ try {
         if (-not $AppProcess.WaitForExit(5000)) {
           $CleanupForced = $true
           $AppProcess.Kill()
-          $AppProcess.WaitForExit()
+          if (-not $AppProcess.WaitForExit(5000)) {
+            throw "Verde GUI did not exit within 5 seconds after forced termination."
+          }
         }
       }
       if ($AppStarted -and $AppProcess.HasExited) {
@@ -297,10 +300,24 @@ try {
       }
     }
     if ($null -ne $ProcessExitCode -and $null -ne $AppStdoutTask) {
-      try { $AppStdout = [string]$AppStdoutTask.Result } catch {}
+      try {
+        if ($AppStdoutTask.Wait(1000)) {
+          $AppStdout = [string]$AppStdoutTask.Result
+        } else {
+          # A spawned child can retain an inherited pipe after the GUI exits.
+          # Diagnostics are best-effort and must not hang the readiness result.
+          $OutputCaptureTimedOut = $true
+        }
+      } catch {}
     }
     if ($null -ne $ProcessExitCode -and $null -ne $AppStderrTask) {
-      try { $AppStderr = [string]$AppStderrTask.Result } catch {}
+      try {
+        if ($AppStderrTask.Wait(1000)) {
+          $AppStderr = [string]$AppStderrTask.Result
+        } else {
+          $OutputCaptureTimedOut = $true
+        }
+      } catch {}
     }
     try { $AppProcess.Dispose() } catch {}
   }
@@ -361,6 +378,7 @@ try {
       graceful_close_requested = $GracefulCloseRequested
       forced = $CleanupForced
       process_exited = -not $AppStarted -or $null -ne $ProcessExitCode
+      output_capture_timed_out = $OutputCaptureTimedOut
       error = $CleanupError
     }
     runtime_diagnostics = [ordered]@{
