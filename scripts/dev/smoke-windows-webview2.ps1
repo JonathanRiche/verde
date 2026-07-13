@@ -37,12 +37,14 @@ foreach ($Path in @($AppExe, $CliExe)) {
 function Invoke-VerdeCli {
   param(
     [string]$Executable,
-    [string]$CommandLine
+    [string[]]$Arguments
   )
 
   $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
   $StartInfo.FileName = $Executable
-  $StartInfo.Arguments = $CommandLine
+  foreach ($Argument in $Arguments) {
+    $StartInfo.ArgumentList.Add($Argument)
+  }
   $StartInfo.WorkingDirectory = Split-Path -Parent $Executable
   $StartInfo.UseShellExecute = $false
   $StartInfo.CreateNoWindow = $true
@@ -60,7 +62,7 @@ function Invoke-VerdeCli {
     if (-not $Process.WaitForExit(10000)) {
       $Process.Kill()
       $Process.WaitForExit()
-      throw "Verde CLI command '$CommandLine' did not exit within 10 seconds."
+      throw "Verde CLI command '$($Arguments -join ' ')' did not exit within 10 seconds."
     }
     return [pscustomobject]@{
       exit_code = $Process.ExitCode
@@ -70,6 +72,27 @@ function Invoke-VerdeCli {
   } finally {
     $Process.Dispose()
   }
+}
+
+function Invoke-VerdeJson {
+  param(
+    [string]$Executable,
+    [string[]]$Arguments
+  )
+
+  $Probe = Invoke-VerdeCli -Executable $Executable -Arguments $Arguments
+  if ($Probe.exit_code -ne 0) {
+    throw "Verde CLI command '$($Arguments -join ' ')' failed with exit code $($Probe.exit_code): $($Probe.stderr.Trim())"
+  }
+  try {
+    $Payload = $Probe.stdout | ConvertFrom-Json
+  } catch {
+    throw "Verde CLI command '$($Arguments -join ' ')' returned invalid JSON: $($_.Exception.Message)"
+  }
+  if ($Payload.ok -ne $true) {
+    throw "Verde CLI command '$($Arguments -join ' ')' returned an error: $($Payload.error | ConvertTo-Json -Compress)"
+  }
+  return $Payload
 }
 
 $StartedAt = [DateTime]::UtcNow
@@ -97,6 +120,11 @@ $StatePath = $null
 $LegacyStatePath = $null
 $PendingOpenPath = $null
 $CleanStateVerified = $false
+$InitialWorkspaceCount = $null
+$SmokeWorkspacePath = Join-Path ([IO.Path]::GetTempPath()) ("verde-webview2-smoke-{0}" -f [Guid]::NewGuid().ToString("N"))
+$SmokeWorkspaceCreated = $false
+$BrowserOpenRequested = $false
+$EvalRequested = $false
 $LastWorkspaceCount = $null
 $RuntimeLogSource = $null
 $RuntimeLogDestination = Join-Path $EvidenceDir "verde.stderr.log"
@@ -105,7 +133,7 @@ $RuntimeLogCopied = $false
 $RuntimeLogCopyError = $null
 
 try {
-  $StatePathProbe = Invoke-VerdeCli -Executable $CliExe -CommandLine "state path --json"
+  $StatePathProbe = Invoke-VerdeCli -Executable $CliExe -Arguments @("state", "path", "--json")
   if ($StatePathProbe.exit_code -ne 0) {
     throw "Unable to discover Verde state paths (exit code $($StatePathProbe.exit_code)): $($StatePathProbe.stderr.Trim())"
   }
@@ -130,7 +158,7 @@ try {
   }
   $CleanStateVerified = $true
 
-  $Preflight = Invoke-VerdeCli -Executable $CliExe -CommandLine "live status --json"
+  $Preflight = Invoke-VerdeCli -Executable $CliExe -Arguments @("live", "status", "--json")
   $LastCliExitCode = $Preflight.exit_code
   $LastCliStderr = $Preflight.stderr.Trim()
   if ($Preflight.exit_code -eq 0) {
@@ -147,11 +175,6 @@ try {
   $StartInfo.CreateNoWindow = $true
   $StartInfo.RedirectStandardOutput = $true
   $StartInfo.RedirectStandardError = $true
-  $StartInfo.EnvironmentVariables["VERDE_OPEN_BROWSER_ON_START"] = "1"
-  $StartInfo.EnvironmentVariables["VERDE_BROWSER_START_URL"] = $StartUrl
-  # This runs only after a successful navigation-completed event, so observing
-  # the result proves more than controller allocation alone.
-  $StartInfo.EnvironmentVariables["VERDE_BROWSER_START_EVAL"] = "true"
 
   $AppProcess = New-Object System.Diagnostics.Process
   $AppProcess.StartInfo = $StartInfo
@@ -169,7 +192,7 @@ try {
     }
 
     $Attempts += 1
-    $Probe = Invoke-VerdeCli -Executable $CliExe -CommandLine "live status --json"
+    $Probe = Invoke-VerdeCli -Executable $CliExe -Arguments @("live", "status", "--json")
     $LastCliExitCode = $Probe.exit_code
     $LastCliStderr = $Probe.stderr.Trim()
     if ($Probe.exit_code -eq 0 -and -not [string]::IsNullOrWhiteSpace($Probe.stdout)) {
@@ -180,28 +203,50 @@ try {
         $LastWorkspaceCount = if ($null -ne $Payload.result) { [int]$Payload.result.workspace_count } else { $null }
         if ($null -ne $Browser) {
           $LastBrowser = $Browser
-          if ($LastWorkspaceCount -ne 0) {
-            throw "Clean project state check failed: runtime reported $LastWorkspaceCount workspaces."
+          if (-not $SmokeWorkspaceCreated) {
+            $InitialWorkspaceCount = $LastWorkspaceCount
+            if ($InitialWorkspaceCount -ne 0) {
+              throw "Clean project state check failed: runtime reported $InitialWorkspaceCount workspaces before smoke setup."
+            }
+            New-Item -ItemType Directory -Force -Path $SmokeWorkspacePath | Out-Null
+            [void](Invoke-VerdeJson -Executable $CliExe -Arguments @("live", "workspace", "create", "--path", $SmokeWorkspacePath, "--json"))
+            $SmokeWorkspaceCreated = $true
+            [void](Invoke-VerdeJson -Executable $CliExe -Arguments @("live", "browser", "open", "--workspace", "current", "--url", $StartUrl, "--json"))
+            $BrowserOpenRequested = $true
+            continue
+          }
+          if ($LastWorkspaceCount -ne 1) {
+            throw "Smoke workspace check failed: runtime reported $LastWorkspaceCount workspaces, expected 1."
           }
           if ($Browser.status -eq "Failed" -or $null -ne $Browser.last_error) {
             throw "WebView2 reported a startup failure: $($Browser.last_error)"
           }
+          $BrowserReady = $BrowserOpenRequested -and
+            $Browser.runtime_kind -eq "native_webview" -and
+            $Browser.presentation_kind -eq "native_child_view" -and
+            $Browser.runtime_initialized -eq $true -and
+            $Browser.status -eq "Ready" -and
+            $Browser.visible -eq $true -and
+            $Browser.surface_suspended_for_layout -eq $false -and
+            $null -ne $Browser.workspace_index -and
+            $null -ne $Browser.pane_id -and
+            $Browser.url -eq $StartUrl
+          if ($BrowserReady -and -not $EvalRequested) {
+            [void](Invoke-VerdeJson -Executable $CliExe -Arguments @("live", "browser", "eval", "--script", "true", "--json"))
+            $EvalRequested = $true
+            continue
+          }
           $EvalCompleted = ([string]$Browser.last_eval_result) -eq "true"
-          if ($Browser.runtime_kind -eq "native_webview" -and
-              $Browser.presentation_kind -eq "native_child_view" -and
-              $Browser.runtime_initialized -eq $true -and
-              $Browser.status -eq "Ready" -and
-              $Browser.visible -eq $true -and
-              $Browser.url -eq $StartUrl -and
-              $LastWorkspaceCount -eq 0 -and
-              $EvalCompleted) {
+          if ($BrowserReady -and $EvalRequested -and $EvalCompleted) {
             $Passed = $true
             break
           }
         }
       } catch {
         if ($_.Exception.Message.StartsWith("WebView2 reported a startup failure:") -or
-            $_.Exception.Message.StartsWith("Clean project state check failed:")) {
+            $_.Exception.Message.StartsWith("Clean project state check failed:") -or
+            $_.Exception.Message.StartsWith("Smoke workspace check failed:") -or
+            $_.Exception.Message.StartsWith("Verde CLI command '")) {
           throw
         }
         $LastCliStderr = "Invalid live status JSON: $($_.Exception.Message)"
@@ -269,6 +314,9 @@ try {
       $RuntimeLogCopyError = $_.Exception.Message
     }
   }
+  if (Test-Path -LiteralPath $SmokeWorkspacePath -PathType Container) {
+    Remove-Item -LiteralPath $SmokeWorkspacePath -Recurse -Force -ErrorAction SilentlyContinue
+  }
 
   $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
   [System.IO.File]::WriteAllText((Join-Path $EvidenceDir "webview2-app.stdout.log"), $AppStdout, $Utf8NoBom)
@@ -295,6 +343,9 @@ try {
       verified_before_launch = $CleanStateVerified
       legacy_state_path = $LegacyStatePath
       pending_open_path = $PendingOpenPath
+      initial_runtime_workspace_count = $InitialWorkspaceCount
+      smoke_workspace_created = $SmokeWorkspaceCreated
+      smoke_workspace_path = $SmokeWorkspacePath
       runtime_workspace_count = $LastWorkspaceCount
     }
     app_pid = $AppPid

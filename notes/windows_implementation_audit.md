@@ -98,11 +98,13 @@ Implemented:
   layout ownership, including modal/menu suppression.
 - `smoke-windows-webview2.ps1` launches the native GUI on Windows, polls browser
   state through the console CLI, requires WebView2 native-child initialization,
-  successful `about:blank` navigation and post-navigation JavaScript eval from
-  a clean zero-workspace state, then cleans up only the process it started and
-  records structured evidence. It also preserves the pref-directory runtime
-  log when present without treating an absent log as a browser failure. This is
-  startup readiness, not a substitute for physical input/DPI validation.
+  creates a disposable workspace so the native child has a real browser-pane
+  layout, and requires successful `about:blank` navigation plus JavaScript eval.
+  The smoke verifies zero workspaces before that setup, then cleans up only the
+  process and temporary directory it created and records structured evidence.
+  It also preserves the pref-directory runtime log when present without treating
+  an absent log as a browser failure. This is startup readiness, not a substitute
+  for physical input/DPI validation.
 
 External validation:
 
