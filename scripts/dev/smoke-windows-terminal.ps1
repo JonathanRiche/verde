@@ -49,25 +49,42 @@ if (-not (Test-Path -LiteralPath $CliExe -PathType Leaf)) {
 function Invoke-VerdeJson {
   param([string[]]$Arguments)
 
-  # Windows PowerShell 5 promotes native stderr to its error stream. Verde
-  # writes lifecycle diagnostics there, so combining 2>&1 under Stop would
-  # abort on a harmless info line before the CLI can return its JSON payload.
-  $StdoutPath = [IO.Path]::GetTempFileName()
-  $StderrPath = [IO.Path]::GetTempFileName()
-  $PreviousErrorActionPreference = $ErrorActionPreference
-  try {
-    $ErrorActionPreference = "Continue"
-    & $CliExe @Arguments 1> $StdoutPath 2> $StderrPath
-    $ExitCode = $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $PreviousErrorActionPreference
+  $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+  $StartInfo.FileName = $CliExe
+  foreach ($Argument in $Arguments) {
+    $StartInfo.ArgumentList.Add($Argument)
   }
+  $StartInfo.WorkingDirectory = Split-Path -Parent $CliExe
+  $StartInfo.UseShellExecute = $false
+  $StartInfo.CreateNoWindow = $true
+  $StartInfo.RedirectStandardOutput = $true
+  $StartInfo.RedirectStandardError = $true
 
+  $Process = New-Object System.Diagnostics.Process
+  $Process.StartInfo = $StartInfo
   try {
-    $Text = ([string](Get-Content -LiteralPath $StdoutPath -Raw)).Trim()
-    $Diagnostics = ([string](Get-Content -LiteralPath $StderrPath -Raw)).Trim()
+    if (-not $Process.Start()) {
+      throw "Failed to start verde $($Arguments -join ' ')."
+    }
+    $StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+    $StderrTask = $Process.StandardError.ReadToEndAsync()
+    if (-not $Process.WaitForExit(10000)) {
+      $Process.Kill()
+      if (-not $Process.WaitForExit(5000)) {
+        throw "verde $($Arguments -join ' ') did not stop after forced termination."
+      }
+      throw "verde $($Arguments -join ' ') did not exit within 10 seconds."
+    }
+    if (-not $StdoutTask.Wait(1000) -or -not $StderrTask.Wait(1000)) {
+      # The session daemon and ConPTY shell must not keep a foreground CLI
+      # invocation alive by retaining inherited diagnostic pipe handles.
+      throw "verde $($Arguments -join ' ') left redirected output handles open."
+    }
+    $ExitCode = $Process.ExitCode
+    $Text = ([string]$StdoutTask.Result).Trim()
+    $Diagnostics = ([string]$StderrTask.Result).Trim()
   } finally {
-    Remove-Item -LiteralPath $StdoutPath, $StderrPath -Force -ErrorAction SilentlyContinue
+    $Process.Dispose()
   }
   if ($ExitCode -ne 0) {
     throw "verde $($Arguments -join ' ') failed with exit code ${ExitCode}: $Diagnostics $Text".Trim()
