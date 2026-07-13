@@ -221,6 +221,10 @@ try {
           if ($Browser.status -eq "Failed" -or $null -ne $Browser.last_error) {
             throw "WebView2 reported a startup failure: $($Browser.last_error)"
           }
+          # WebView2 can already be on about:blank when the explicit navigation
+          # arrives, so SourceChanged may leave url null. The address records the
+          # requested target; the eval result below still proves document readiness.
+          $BrowserLocationMatches = $Browser.url -eq $StartUrl -or $Browser.address -eq $StartUrl
           $BrowserReady = $BrowserOpenRequested -and
             $Browser.runtime_kind -eq "native_webview" -and
             $Browser.presentation_kind -eq "native_child_view" -and
@@ -230,7 +234,7 @@ try {
             $Browser.surface_suspended_for_layout -eq $false -and
             $null -ne $Browser.workspace_index -and
             $null -ne $Browser.pane_id -and
-            $Browser.url -eq $StartUrl
+            $BrowserLocationMatches
           if ($BrowserReady -and -not $EvalRequested) {
             [void](Invoke-VerdeJson -Executable $CliExe -Arguments @("live", "browser", "eval", "--script", "true", "--json"))
             $EvalRequested = $true
