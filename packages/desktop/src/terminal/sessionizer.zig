@@ -385,29 +385,7 @@ pub fn spawnDaemon(allocator: std.mem.Allocator, exe_path: []const u8) !void {
     defer allocator.free(daemon_exe);
     if (builtin.os.tag == .windows) {
         log.info("spawning Windows session daemon executable={s}", .{daemon_exe});
-        // Zig 0.16 Threaded I/O starts with an empty process environment. Pass
-        // the augmented map explicitly so the daemon can resolve APPDATA and
-        // inherit the same CLI search path as the desktop process.
-        var env_map = try process_env.buildAugmentedEnvMap(allocator);
-        defer env_map.deinit();
-        var threaded = std.Io.Threaded.init(allocator, .{});
-        defer threaded.deinit();
-        var child = try std.process.spawn(threaded.io(), .{
-            .argv = &.{ daemon_exe, "__session-daemon" },
-            .environ_map = &env_map,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-            .create_no_window = true,
-        });
-        // The daemon is intentionally independent of the GUI. Closing the
-        // parent's handles detaches ownership without terminating the process.
-        if (child.id) |process| {
-            std.os.windows.CloseHandle(process);
-            child.id = null;
-        }
-        std.os.windows.CloseHandle(child.thread_handle);
-        return;
+        return spawnWindowsDaemon(allocator, daemon_exe);
     }
 
     const daemon_exe_z = try allocator.dupeZ(u8, daemon_exe);
@@ -421,6 +399,50 @@ pub fn spawnDaemon(allocator: std.mem.Allocator, exe_path: []const u8) !void {
         _ = std.c.execve(daemon_exe_z.ptr, &child_argv, std.c.environ);
         std.c._exit(127);
     }
+}
+
+fn spawnWindowsDaemon(allocator: std.mem.Allocator, daemon_exe: []const u8) !void {
+    comptime std.debug.assert(builtin.os.tag == .windows);
+    const windows = std.os.windows;
+
+    // Zig 0.16's process spawn always enables Windows handle inheritance. A
+    // detached daemon would then retain redirected CI/parent pipes after this
+    // process exits, so use CreateProcessW with inheritance explicitly off.
+    const command_line = try windows_conpty.windowsCreateCommandLine(allocator, &.{ daemon_exe, "__session-daemon" });
+    defer allocator.free(command_line);
+    const command_line_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, command_line);
+    defer allocator.free(command_line_w);
+    const application_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, daemon_exe);
+    defer allocator.free(application_w);
+
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    const environment = try env_map.createWindowsBlock(allocator, .{});
+    defer environment.deinit(allocator);
+
+    var startup_info: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+    startup_info.cb = @sizeOf(windows.STARTUPINFOW);
+    var process_info: windows.PROCESS.INFORMATION = undefined;
+    const creation_flags: windows.CreateProcessFlags = .{
+        .create_unicode_environment = true,
+        .create_no_window = true,
+    };
+    if (!windows.kernel32.CreateProcessW(
+        application_w.ptr,
+        command_line_w.ptr,
+        null,
+        null,
+        .FALSE,
+        creation_flags,
+        environment.slice.ptr,
+        null,
+        &startup_info,
+        &process_info,
+    ).toBool()) return windows.unexpectedError(windows.GetLastError());
+
+    // The daemon owns its lifetime; the launcher only releases its references.
+    windows.CloseHandle(process_info.hThread);
+    windows.CloseHandle(process_info.hProcess);
 }
 
 pub fn daemonExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
