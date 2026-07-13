@@ -3558,6 +3558,9 @@ pub const Project = struct {
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
+    /// Last chat or terminal workspace pane the user focused; used to default
+    /// the inspector design-mode "Send to" target (not persisted).
+    last_content_pane_id: ?WorkspacePaneId = null,
     sidebar_thread_indices: std.ArrayList(usize) = .empty,
     sidebar_committed_thread_count: usize = 0,
     sidebar_thread_cache_dirty: bool = true,
@@ -11569,10 +11572,6 @@ pub const AppState = struct {
             return;
         }
 
-        // Route to the chat pane the user picked in the bubble's "Send to"
-        // selector before any currentThread() reads below.
-        if (parsed.value.payload.target) |target| self.applyInspectorPromptTarget(target);
-
         const context_block = self.buildInspectorContextBlock(parsed.value.payload.selection) catch |err| {
             log.warn("failed to build inspector context block: {s}", .{@errorName(err)});
             self.setSidebarNotice("Browser inspector prompt could not be prepared.");
@@ -11588,6 +11587,17 @@ pub const AppState = struct {
             parsed.value.payload.viewport,
         );
         defer if (capture) |c| self.allocator.free(c.path);
+
+        // Route to the destination the user picked in the bubble's "Send to"
+        // selector: a TUI pane gets the prompt pasted into its input, a chat
+        // pane retargets the thread for the send below.
+        if (parsed.value.payload.target) |target| {
+            if (std.mem.startsWith(u8, target, "tui:")) {
+                self.fillInspectorPromptIntoTui(target["tui:".len..], context_block, prompt, capture);
+                return;
+            }
+            self.applyInspectorPromptTarget(target);
+        }
 
         const thread = self.currentThreadMutable();
         const draft_text = std.mem.trim(u8, self.currentDraft(), &std.ascii.whitespace);
@@ -11634,6 +11644,51 @@ pub const AppState = struct {
             self.setSidebarNotice("Browser inspector prompt was added to the composer draft.");
             self.notifyInspectorPromptResult(.drafted, null);
         }
+    }
+
+    // Pastes the design-mode prompt into a TUI pane's input (Codex/Claude/
+    // opencode/... running in a thread-bound terminal dock). Bracketed paste
+    // fills the input without submitting so the user reviews and hits Enter.
+    // The screenshot rides along as a file path the CLI can read itself.
+    fn fillInspectorPromptIntoTui(
+        self: *AppState,
+        pane_token: []const u8,
+        context_block: []const u8,
+        prompt: []const u8,
+        capture: ?InspectorCapture,
+    ) void {
+        const failed = blk: {
+            const pane_id = std.fmt.parseInt(WorkspacePaneId, pane_token, 10) catch break :blk true;
+            const text = if (capture) |c|
+                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}Screenshot: {s}", .{ prompt, context_block, c.path })
+            else
+                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ prompt, context_block });
+            const resolved_text = text catch break :blk true;
+            defer self.allocator.free(resolved_text);
+
+            const pasted = self.pasteWorkspaceTerminalPaneForProject(
+                self.selected_project_index,
+                pane_id,
+                resolved_text,
+            ) catch |err| {
+                log.warn("failed to paste inspector prompt into TUI pane: {s}", .{@errorName(err)});
+                break :blk true;
+            };
+            if (!pasted) break :blk true;
+
+            // Hand focus to the TUI so the user can review and submit there.
+            _ = self.focusWorkspacePane(self.selected_project_index, pane_id);
+            break :blk false;
+        };
+
+        if (failed) {
+            // The TUI pane vanished or its session died between selection and
+            // submit; keep the prompt by parking it in the composer draft.
+            self.fallbackInspectorPromptToDraft(self.currentThreadMutable(), context_block, prompt, capture, false);
+            return;
+        }
+        self.setSidebarNotice("Browser inspector prompt filled into the TUI input.");
+        self.notifyInspectorPromptResult(.sent, null);
     }
 
     // Appends the design-mode prompt to the composer draft when auto-send is
@@ -11733,9 +11788,11 @@ pub const AppState = struct {
 
     // Switches the project's selected thread to the chat pane the user picked
     // in the bubble's "Send to" selector. Invalid/closed panes are ignored so
-    // the send falls back to the last-focused thread.
+    // the send falls back to the last-focused thread. Accepts "chat:<pane>"
+    // (current bundles) and bare "<pane>" (transitional).
     fn applyInspectorPromptTarget(self: *AppState, target: []const u8) void {
-        const pane_id = std.fmt.parseInt(WorkspacePaneId, target, 10) catch return;
+        const pane_token = if (std.mem.startsWith(u8, target, "chat:")) target["chat:".len..] else target;
+        const pane_id = std.fmt.parseInt(WorkspacePaneId, pane_token, 10) catch return;
         const thread_index = self.workspaceChatThreadIndexByPane(pane_id) orelse return;
         const project = &self.projects.items[self.selected_project_index];
         if (project.selected_thread_index == thread_index) return;
@@ -11743,10 +11800,12 @@ pub const AppState = struct {
         self.syncPaletteComposerFromDraft();
     }
 
-    /// Pushes the visible chat panes of the current project into the inspector
-    /// bubble as "Send to" targets (the bubble shows a selector only when more
-    /// than one exists). Called whenever a selection is captured so the list
-    /// tracks pane layout changes.
+    /// Pushes the current project's chat destinations into the inspector
+    /// bubble as "Send to" targets: visible chat panes plus threads open in a
+    /// TUI pane (Codex/Claude/opencode/... running in a thread-bound terminal
+    /// dock). The bubble shows a selector only when more than one exists.
+    /// Called whenever a selection is captured so the list tracks pane layout
+    /// changes.
     fn pushInspectorPromptTargets(self: *AppState) void {
         if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) return;
         if (self.projects.items.len == 0) return;
@@ -11756,14 +11815,16 @@ pub const AppState = struct {
             id: []const u8,
             label: []const u8,
         };
-        var ids = std.ArrayList([]u8).empty;
+        var owned_strings = std.ArrayList([]u8).empty;
         defer {
-            for (ids.items) |id| self.allocator.free(id);
-            ids.deinit(self.allocator);
+            for (owned_strings.items) |item| self.allocator.free(item);
+            owned_strings.deinit(self.allocator);
         }
         var targets = std.ArrayList(TargetJson).empty;
         defer targets.deinit(self.allocator);
-        var selected_id: ?[]const u8 = null;
+        var target_pane_ids = std.ArrayList(WorkspacePaneId).empty;
+        defer target_pane_ids.deinit(self.allocator);
+        var chat_default: ?[]const u8 = null;
 
         const current_thread_index = project.currentThreadIndex();
         for (project.workspace_layout.panes.items) |pane| {
@@ -11773,8 +11834,8 @@ pub const AppState = struct {
                 else => continue,
             };
             if (thread_index >= project.threads.items.len) continue;
-            const id = std.fmt.allocPrint(self.allocator, "{d}", .{pane.id}) catch return;
-            ids.append(self.allocator, id) catch {
+            const id = std.fmt.allocPrint(self.allocator, "chat:{d}", .{pane.id}) catch return;
+            owned_strings.append(self.allocator, id) catch {
                 self.allocator.free(id);
                 return;
             };
@@ -11782,9 +11843,43 @@ pub const AppState = struct {
                 .id = id,
                 .label = project.threads.items[thread_index].title,
             }) catch return;
-            // Default the selector to the last-focused thread's pane.
-            if (selected_id == null and thread_index == current_thread_index) selected_id = id;
+            target_pane_ids.append(self.allocator, pane.id) catch return;
+            if (chat_default == null and thread_index == current_thread_index) chat_default = id;
         }
+
+        // Threads running as TUIs in thread-bound terminal docks are chat
+        // destinations too: the prompt gets pasted into the TUI's input.
+        for (project.threads.items) |*thread| {
+            const dock_id = thread.tui_dock_id orelse continue;
+            const pane_id = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) orelse continue;
+            const dock = self.projectTerminalDockMutable(self.selected_project_index, dock_id) orelse continue;
+            if (!dock.hasRunningSession()) continue;
+            const id = std.fmt.allocPrint(self.allocator, "tui:{d}", .{pane_id}) catch return;
+            owned_strings.append(self.allocator, id) catch {
+                self.allocator.free(id);
+                return;
+            };
+            const label = std.fmt.allocPrint(self.allocator, "{s} (TUI)", .{thread.title}) catch return;
+            owned_strings.append(self.allocator, label) catch {
+                self.allocator.free(label);
+                return;
+            };
+            targets.append(self.allocator, .{ .id = id, .label = label }) catch return;
+            target_pane_ids.append(self.allocator, pane_id) catch return;
+        }
+
+        // Default: the last-focused chat/terminal pane wins, then the pane of
+        // the currently selected thread, then the first target.
+        var selected_id: ?[]const u8 = null;
+        if (project.last_content_pane_id) |last_pane_id| {
+            for (target_pane_ids.items, 0..) |pane_id, index| {
+                if (pane_id == last_pane_id) {
+                    selected_id = targets.items[index].id;
+                    break;
+                }
+            }
+        }
+        if (selected_id == null) selected_id = chat_default;
         if (selected_id == null and targets.items.len > 0) selected_id = targets.items[0].id;
 
         // Two argument literals for setPromptTargets(targets, selectedId);
@@ -12330,6 +12425,23 @@ pub const AppState = struct {
     pub fn writeWorkspaceTerminalPane(self: *AppState, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
         if (self.projects.items.len == 0) return false;
         return self.writeWorkspaceTerminalPaneForProject(self.selected_project_index, pane_id, bytes);
+    }
+
+    /// Pastes text into a terminal pane's running session (bracketed paste),
+    /// so agent TUIs receive it as filled-in input rather than executed lines.
+    /// Unlike the write path this never restarts a dead session: pasting a
+    /// prompt into a fresh shell would be wrong.
+    pub fn pasteWorkspaceTerminalPaneForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, text: []const u8) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+        const dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => return false,
+        };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        if (!dock.hasRunningSession()) return false;
+        return try dock.pasteTextToActivePane(self.allocator, text);
     }
 
     pub fn terminalPaneOutputTailForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
@@ -13296,6 +13408,7 @@ pub const AppState = struct {
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
                 }
+                project.last_content_pane_id = pane_id;
                 if (self.selected_project_index == project_index) {
                     self.terminal_focused = false;
                     self.unfocusBrowserPane();
@@ -13303,7 +13416,10 @@ pub const AppState = struct {
                     self.syncPaletteComposerFromDraft();
                 }
             },
-            .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
+            .terminal => |ref| {
+                self.projects.items[project_index].last_content_pane_id = pane_id;
+                if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
+            },
             .browser => {
                 if (self.selected_project_index == project_index) {
                     self.terminal_focused = false;
