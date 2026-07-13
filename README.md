@@ -45,7 +45,9 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 - Windows x64 preview: verify and extract the ZIP, then run `install.ps1` to
   install for the current user and create the `Verde.Desktop` Start Menu
   identity. `app\Verde.exe` is the desktop entry point and `bin\verde.exe` is
-  the console CLI.
+  the console CLI. Preview artifacts are currently unsigned, so Windows may
+  show an unknown-publisher or SmartScreen warning. Confirm the adjacent
+  SHA-256 file matches the ZIP before choosing **More info → Run anyway**.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
 
 ```bash

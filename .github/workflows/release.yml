@@ -168,23 +168,23 @@ jobs:
           ldconfig
 
       - name: Compute release version
-        id: version
         shell: bash
         run: |
           if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            release_version="${GITHUB_REF_NAME}"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
             fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
-            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
+            release_version="manual-${fallback_run_number}-${fallback_sha::7}"
           fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
 
       - name: Build release artifact
         shell: bash
         run: |
           mkdir -p dist
           for attempt in 1 2 3; do
-            if bash scripts/release/package-linux.sh "${{ steps.version.outputs.value }}" dist; then
+            if bash scripts/release/package-linux.sh "${RELEASE_VERSION:?missing release version}" dist; then
               exit 0
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -299,16 +299,16 @@ jobs:
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Compute release version
-        id: version
         shell: bash
         run: |
           if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            release_version="${GITHUB_REF_NAME}"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
             fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
-            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
+            release_version="manual-${fallback_run_number}-${fallback_sha::7}"
           fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
 
       - name: Build release artifact
         shell: bash
@@ -325,7 +325,7 @@ jobs:
 
           mkdir -p dist
           for attempt in 1 2 3; do
-            if bash "${PACKAGE_SCRIPT}" "${{ steps.version.outputs.value }}" dist; then
+            if bash "${PACKAGE_SCRIPT}" "${RELEASE_VERSION:?missing release version}" dist; then
               exit 0
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -402,15 +402,22 @@ jobs:
           python -m unittest scripts.release.test_package_windows_integrity scripts.release.test_package_windows_version
 
       - name: Compute release version
-        id: version
         shell: pwsh
         run: |
-          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME.StartsWith("v")) {
+          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -like "v*") {
             $Version = $env:GITHUB_REF_NAME
           } else {
-            $Version = "manual-$env:GITHUB_RUN_NUMBER-$($env:GITHUB_SHA.Substring(0, 7))"
+            $Sha = if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) {
+              (git rev-parse --short HEAD).Trim()
+            } else {
+              $env:GITHUB_SHA
+            }
+            $RunNumber = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_NUMBER)) { "local" } else { $env:GITHUB_RUN_NUMBER }
+            $ShortSha = $Sha.Substring(0, [Math]::Min(7, $Sha.Length))
+            $Version = "manual-$RunNumber-$ShortSha"
           }
-          "value=$Version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ([string]::IsNullOrWhiteSpace($Version)) { throw "Failed to compute a release version." }
+          "RELEASE_VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Compile native Windows tests
         shell: pwsh
@@ -419,33 +426,37 @@ jobs:
       - name: Build and verify unsigned Windows package
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
-        run: .\scripts\release\package-windows.ps1 -Version "${{ steps.version.outputs.value }}" -OutputDir dist
+        run: .\scripts\release\package-windows.ps1 -Version "$env:RELEASE_VERSION" -OutputDir dist
 
-      - name: Build, sign, and verify Windows package
+      - name: Build, optionally sign, and verify Windows package
         if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         shell: pwsh
         env:
           VERDE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
           VERDE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)) {
-            throw "Tag releases require WINDOWS_SIGNING_CERTIFICATE_BASE64."
-          }
-          if ([string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_PASSWORD)) {
-            throw "Tag releases require WINDOWS_SIGNING_CERTIFICATE_PASSWORD."
+          $HasCertificate = -not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)
+          $HasPassword = -not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_PASSWORD)
+          if ($HasCertificate -xor $HasPassword) {
+            throw "Configure both Windows signing secrets together, or leave both unset for an unsigned release."
           }
 
-          $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
-          try {
-            [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
-            .\scripts\release\package-windows.ps1 `
-              -Version "${{ steps.version.outputs.value }}" `
-              -OutputDir dist `
-              -CertificatePath $CertificatePath `
-              -CertificatePassword $env:VERDE_SIGNING_PFX_PASSWORD `
-              -RequireSignature
-          } finally {
-            Remove-Item -LiteralPath $CertificatePath -Force -ErrorAction SilentlyContinue
+          if (-not $HasCertificate) {
+            Write-Host "No Windows signing certificate configured; publishing an explicitly unsigned package."
+            .\scripts\release\package-windows.ps1 -Version "$env:RELEASE_VERSION" -OutputDir dist
+          } else {
+            $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
+            try {
+              [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
+              .\scripts\release\package-windows.ps1 `
+                -Version "$env:RELEASE_VERSION" `
+                -OutputDir dist `
+                -CertificatePath $CertificatePath `
+                -CertificatePassword $env:VERDE_SIGNING_PFX_PASSWORD `
+                -RequireSignature
+            } finally {
+              Remove-Item -LiteralPath $CertificatePath -Force -ErrorAction SilentlyContinue
+            }
           }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

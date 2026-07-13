@@ -54,12 +54,13 @@ installer does not change saved execution policy, and enterprise script policy
 may still block these optional hooks. OpenCode and Cursor remain supported chat
 providers even though they have no managed hook installer.
 
-Manual and internal workflow builds may be unsigned, but they must carry
+Manual, internal, and tag workflow builds may be unsigned, but they must carry
 `WINDOWS-SIGNING.json` with `signed: false` and be distributed with the ZIP's
-SHA-256 file through a trusted channel. Tag releases require an Authenticode
-certificate and RFC 3161 timestamping in the release workflow. A stable
-installer is deferred until certificate ownership, upgrade/downgrade behavior,
-uninstall cleanup, shortcut migration, and toast activation are validated.
+SHA-256 file through a trusted channel. When both signing secrets are
+configured, tag releases instead require Authenticode signing and RFC 3161
+timestamping. A stable installer is deferred until certificate ownership,
+upgrade/downgrade behavior, uninstall cleanup, shortcut migration, and toast
+activation are validated.
 
 ## GitHub Actions setup
 
@@ -80,11 +81,14 @@ an unrelated-looking change affects shared build or provider code.
 The `Release` workflow builds Linux, both macOS architectures, and Windows. A
 manual dispatch is an unsigned rehearsal with a `manual-*` version. Only a
 GitHub `push` event for a `v*` tag can receive the Windows signing material or
-publish a release. Configure these Actions repository secrets before creating
-the first release tag:
+publish a release. Signing is optional; configure both of these Actions
+repository secrets together when ready to enable it:
 
 - `WINDOWS_SIGNING_CERTIFICATE_BASE64`: base64-encoded Authenticode PFX.
 - `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: password for that PFX.
+
+Leaving both secrets unset publishes an explicitly unsigned Windows ZIP.
+Configuring only one is treated as a release-configuration error.
 
 Protect `v*` tags so only release maintainers can create them. The release is
 published only after every Linux, macOS, and Windows artifact job succeeds.

@@ -20,9 +20,9 @@ in `WINDOWS-TESTING.md` passes.
 - Native Windows runtime paths are implemented for D3D12, WebView2, named-pipe
   IPC, ConPTY terminals, provider/process ownership, shell integration,
   notifications, clipboard images, paths, hooks, and PowerShell completion.
-- The package is an internal-preview ZIP. Signing is supported and required by
-  the tag-release workflow, but a locally produced tester ZIP may explicitly be
-  unsigned and must be authenticated by its adjacent SHA-256 file.
+- The package is an internal-preview ZIP. Signing is supported when both
+  release secrets are configured, but tag and local tester ZIPs may explicitly
+  be unsigned and must be authenticated by their adjacent SHA-256 files.
 - DPI/IME/GPU, WebView2 behavior beyond automated startup readiness, ConPTY,
   provider, and clean-machine claims remain external validation because
   Windows executables cannot be run on this Arch host.
@@ -265,8 +265,9 @@ Implemented:
   extracted ZIP tree.
 - `install.ps1` performs a per-user install under
   `%LOCALAPPDATA%\Programs\Verde` and creates/verifies the Start Menu identity.
-- Release CI has a Windows build/package/sign job, tag signing requires a
-  certificate secret and timestamp, and publishing depends on the Windows job.
+- Release CI has a Windows build/package job, signs and timestamps tags when
+  both certificate secrets are configured, and otherwise publishes an
+  explicitly unsigned ZIP. Publishing depends on the Windows job either way.
 - `verde-windows-x64` is an npm optional dependency. The JavaScript launcher
   selects the GUI entry point for a no-argument desktop launch and the console
   entry point for CLI arguments. The npm assembler accepts
