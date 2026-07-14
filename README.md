@@ -32,11 +32,21 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 
 ## Install
 
-On Linux, install the latest release from the website:
+On Linux or macOS, install the latest release from the website:
 
 ```bash
 curl -fsSL https://verdeai.dev/install.sh | sh
 ```
+
+On Windows x64, open PowerShell and run:
+
+```powershell
+irm https://verdeai.dev/install.ps1 | iex
+```
+
+The Windows installer downloads and verifies the latest package, installs it
+for the current user, adds a Start Menu shortcut, and launches Verde. It does
+not require administrator access.
 
 Or download a release from [GitHub Releases](https://github.com/JonathanRiche/verde/releases).
 
@@ -53,7 +63,8 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 yay -S verde-bin
 ```
 
-For Windows, open Windows PowerShell in the download directory and run:
+For a manual Windows install, open Windows PowerShell in the download directory
+and run:
 
 ```powershell
 $zip = Get-Item .\verde-v*-windows-x86_64.zip

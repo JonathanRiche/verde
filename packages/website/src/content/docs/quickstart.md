@@ -8,16 +8,27 @@ slug: quickstart
 
 ## Install
 
-Verde ships as a single native binary. Install the latest release from the website:
+Install the latest Verde release from the website.
+
+On Linux or macOS:
 
 ```bash
 curl -fsSL https://verdeai.dev/install.sh | sh
 ```
 
-The installer detects your platform, downloads the matching release artifact from
-GitHub, and drops Verde into `~/.local` (Linux) or `/Applications` (macOS). For
-other paths — Arch Linux via the AUR, an npm launcher, a custom prefix, or a
-source build — see the [install section on the homepage](/#install).
+On Windows x64, open PowerShell and run:
+
+```powershell
+irm https://verdeai.dev/install.ps1 | iex
+```
+
+The installers download the matching release artifact from GitHub and verify it
+before installation. Linux installs into `~/.local`, macOS installs into
+`/Applications`, and Windows installs the complete app and runtime package into
+`%LOCALAPPDATA%\Programs\Verde`, creates a Start Menu shortcut, and launches the
+app. The Windows install does not require administrator access. For other paths
+— Arch Linux via the AUR, an npm launcher, a custom prefix, or a source build —
+see the [install section on the homepage](/#install).
 
 On Linux, the embedded browser pane uses the system WPE WebKit runtime. The
 installer will warn if the required libraries are missing and print the package
