@@ -452,8 +452,7 @@ fn mainInner(init: std.process.Init) !void {
     }) {
         log.info("consumed pending Herdr open request", .{});
     }
-    state.startOpencodeModelOptionsRefresh();
-    state.startCursorModelOptionsRefresh();
+    state.startProviderReadinessCheck();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
         log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
         break :blk null;
@@ -512,6 +511,7 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollOpencodeModelOptionsCache();
                 app_state.pollClaudeModelOptionsCache();
                 app_state.pollCursorModelOptionsCache();
+                app_state.pollProviderReadiness();
             }
         }.run, .{&state});
         var send_needs_render = false;

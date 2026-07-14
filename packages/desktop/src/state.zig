@@ -131,6 +131,9 @@ pub const SurfaceState = struct {
 };
 
 pub const PaletteModalAction = enum {
+    provider_onboarding_close,
+    provider_onboarding_recheck,
+    provider_onboarding_open_guide,
     image_close,
     project_rename_cancel,
     project_rename_submit,
@@ -1583,6 +1586,47 @@ const ClaudeModelCacheState = struct {
     mutex: Mutex = .{},
     status: ClaudeModelCacheStatus = .idle,
     models: ?[]ai_harness.ModelInfo = null,
+    worker: ?std.Thread = null,
+};
+
+pub const ProviderReadiness = enum {
+    checking,
+    missing,
+    signed_out,
+    ready,
+    unavailable,
+};
+
+pub const ProviderReadinessSnapshot = struct {
+    codex: ProviderReadiness = .checking,
+    opencode: ProviderReadiness = .checking,
+    claude: ProviderReadiness = .checking,
+    cursor: ProviderReadiness = .checking,
+
+    pub fn forProvider(self: ProviderReadinessSnapshot, provider: Provider) ProviderReadiness {
+        return switch (provider) {
+            .codex => self.codex,
+            .opencode => self.opencode,
+            .claude => self.claude,
+            .cursor => self.cursor,
+        };
+    }
+
+    fn hasReadyProvider(self: ProviderReadinessSnapshot) bool {
+        return self.codex == .ready or self.opencode == .ready or self.claude == .ready or self.cursor == .ready;
+    }
+};
+
+const ProviderReadinessStatus = enum {
+    idle,
+    pending,
+    completed,
+};
+
+const ProviderReadinessState = struct {
+    mutex: Mutex = .{},
+    status: ProviderReadinessStatus = .idle,
+    snapshot: ProviderReadinessSnapshot = .{},
     worker: ?std.Thread = null,
 };
 
@@ -4246,6 +4290,8 @@ pub const AppState = struct {
     /// live accelerator hints; set by main after keybinds load/reload.
     keyboard_config: ?*const keybinds.NativeKeyboardConfig,
     show_project_creator: bool,
+    provider_onboarding_visible: bool,
+    provider_onboarding_dismissed: bool,
     show_settings_modal: bool,
     settings_draft: SettingsDraft,
     settings_hook_claude_installed: bool,
@@ -4263,6 +4309,7 @@ pub const AppState = struct {
     opencode_model_cache_state: OpencodeModelCacheState,
     claude_model_cache_state: ClaudeModelCacheState,
     cursor_model_cache_state: CursorModelCacheState,
+    provider_readiness_state: ProviderReadinessState,
     file_search_state: FileSearchState,
     browser_state: browser_runtime.State,
     browser_launch_open_delay_frames: u8,
@@ -4494,6 +4541,8 @@ pub const AppState = struct {
             .command_palette_action_selected = 0,
             .keyboard_config = null,
             .show_project_creator = false,
+            .provider_onboarding_visible = false,
+            .provider_onboarding_dismissed = false,
             .show_settings_modal = false,
             .settings_draft = .{},
             .settings_hook_claude_installed = false,
@@ -4511,6 +4560,7 @@ pub const AppState = struct {
             .opencode_model_cache_state = .{},
             .claude_model_cache_state = .{},
             .cursor_model_cache_state = .{},
+            .provider_readiness_state = .{},
             .file_search_state = .{},
             .browser_state = browser_state,
             .browser_launch_open_delay_frames = 0,
@@ -4693,6 +4743,80 @@ pub const AppState = struct {
 
     pub fn startClaudeModelOptionsRefresh(self: *AppState) void {
         self.refreshClaudeModelOptionsCacheAsync();
+    }
+
+    pub fn startProviderReadinessCheck(self: *AppState) void {
+        self.pollProviderReadiness();
+
+        self.provider_readiness_state.mutex.lock();
+        defer self.provider_readiness_state.mutex.unlock();
+        if (self.provider_readiness_state.status == .pending) return;
+
+        self.provider_readiness_state.status = .pending;
+        self.provider_readiness_state.snapshot = .{};
+        self.provider_readiness_state.worker = std.Thread.spawn(.{}, providerReadinessWorker, .{
+            &self.provider_readiness_state,
+        }) catch {
+            self.provider_readiness_state.status = .completed;
+            self.provider_readiness_state.snapshot = .{
+                .codex = .unavailable,
+                .opencode = .unavailable,
+                .claude = .unavailable,
+                .cursor = .unavailable,
+            };
+            return;
+        };
+        self.markDirty();
+    }
+
+    pub fn pollProviderReadiness(self: *AppState) void {
+        var completed = false;
+        var snapshot: ProviderReadinessSnapshot = .{};
+
+        self.provider_readiness_state.mutex.lock();
+        if (self.provider_readiness_state.status == .completed) {
+            snapshot = self.provider_readiness_state.snapshot;
+            self.provider_readiness_state.status = .idle;
+            completed = true;
+        }
+        self.provider_readiness_state.mutex.unlock();
+        if (!completed) return;
+
+        self.finishProviderReadinessThread();
+        if (snapshot.hasReadyProvider()) {
+            self.provider_onboarding_visible = false;
+            self.provider_onboarding_dismissed = false;
+        } else if (!self.provider_onboarding_dismissed) {
+            self.provider_onboarding_visible = true;
+        }
+        self.markDirty();
+    }
+
+    pub fn providerReadinessSnapshot(self: *AppState) ProviderReadinessSnapshot {
+        self.provider_readiness_state.mutex.lock();
+        defer self.provider_readiness_state.mutex.unlock();
+        return self.provider_readiness_state.snapshot;
+    }
+
+    pub fn dismissProviderOnboarding(self: *AppState) void {
+        self.provider_onboarding_visible = false;
+        self.provider_onboarding_dismissed = true;
+        self.markDirty();
+    }
+
+    pub fn recheckProviderReadiness(self: *AppState) void {
+        self.provider_onboarding_visible = true;
+        self.provider_onboarding_dismissed = false;
+        self.startProviderReadinessCheck();
+    }
+
+    pub fn openProviderSetupGuide(self: *AppState) void {
+        utils.openUrlInDefaultBrowser(self.allocator, "https://verdeai.dev/docs/providers") catch |err| {
+            log.warn("failed to open provider setup guide: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Could not open the provider setup guide.");
+            return;
+        };
+        self.setSidebarNotice("Opened provider setup guide.");
     }
 
     fn refreshOpencodeModelOptionsCacheAsync(self: *AppState) void {
@@ -15505,6 +15629,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit claude model cache finished", .{});
         self.finishCursorModelCacheThread();
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
+        self.finishProviderReadinessThread();
+        runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         _ = self.pollSend();
@@ -16774,6 +16900,15 @@ pub const AppState = struct {
         }
     }
 
+    fn finishProviderReadinessThread(self: *AppState) void {
+        self.provider_readiness_state.mutex.lock();
+        const maybe_worker = self.provider_readiness_state.worker;
+        self.provider_readiness_state.worker = null;
+        self.provider_readiness_state.mutex.unlock();
+
+        if (maybe_worker) |worker| worker.join();
+    }
+
     fn finishAllSendThreads(self: *AppState) void {
         for (self.projects.items) |*project| {
             for (project.threads.items) |*thread| {
@@ -17239,6 +17374,56 @@ fn readThreadFailureMessage(provider: Provider, err: anyerror) []const u8 {
             error.UnsupportedOperation => "Cursor CLI does not support thread imports in this version.",
             else => "Failed to import the selected Cursor thread.",
         },
+    };
+}
+
+fn providerReadinessWorker(state: *ProviderReadinessState) void {
+    const snapshot: ProviderReadinessSnapshot = .{
+        .codex = detectProviderReadiness(.codex),
+        .opencode = detectProviderReadiness(.opencode),
+        .claude = detectProviderReadiness(.claude),
+        .cursor = detectProviderReadiness(.cursor),
+    };
+
+    state.mutex.lock();
+    defer state.mutex.unlock();
+    state.snapshot = snapshot;
+    state.status = .completed;
+}
+
+fn detectProviderReadiness(provider: Provider) ProviderReadiness {
+    const executable_ready = switch (provider) {
+        .codex => process_env.commandExists("codex"),
+        .opencode => process_env.commandExists("opencode"),
+        .claude => process_env.commandExists("node") and process_env.commandExists("claude"),
+        .cursor => process_env.commandExists("agent"),
+    };
+    if (!executable_ready) return .missing;
+
+    const provider_config = switch (provider) {
+        .codex => ai_harness.ProviderConfig{ .codex = .{} },
+        .opencode => ai_harness.ProviderConfig{ .opencode = .{
+            .allocator = std.heap.page_allocator,
+            .working_directory = null,
+            .launch_if_missing = true,
+        } },
+        .claude => ai_harness.ProviderConfig{ .claude = .{} },
+        .cursor => ai_harness.ProviderConfig{ .cursor = .{} },
+    };
+    var client = ai_harness.connect(std.heap.page_allocator, provider_config) catch |err| {
+        log.warn("provider readiness connect failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });
+        return if (err == error.FileNotFound) .missing else .unavailable;
+    };
+    defer client.deinit();
+
+    const auth_state = client.authState() catch |err| {
+        log.warn("provider readiness auth failed provider={s}: {s}", .{ @tagName(provider), @errorName(err) });
+        return if (err == error.FileNotFound) .missing else .unavailable;
+    };
+    return switch (auth_state) {
+        .signed_in => .ready,
+        .signed_out => .signed_out,
+        .unknown, .pending => .unavailable,
     };
 }
 
