@@ -1,6 +1,8 @@
 const app_state = @import("state.zig");
 const ai_harness = @import("harness.zig");
 const loop_wakeup = @import("loop_wakeup.zig");
+const platform_runtime = @import("platform_runtime");
+const windows_integrations = @import("platform/windows/integrations.zig");
 const process_env = @import("process_env.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
@@ -109,6 +111,7 @@ pub fn canOpenProjectDirectory() bool {
     return switch (@import("builtin").os.tag) {
         .macos => commandExists("open"),
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => commandExists("xdg-open") or commandExists("gio"),
+        .windows => true,
         else => false,
     };
 }
@@ -131,6 +134,10 @@ pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const 
             runtime_log.diagnostic("openProjectDirectory launcher unavailable path={s}", .{project_path});
             return error.LauncherUnavailable;
         },
+        .windows => {
+            runtime_log.diagnostic("openProjectDirectory launcher=ShellExecute path={s}", .{project_path});
+            if (!windows_integrations.shellOpen(project_path, null)) return error.LauncherUnavailable;
+        },
         else => error.UnsupportedOperatingSystem,
     };
 }
@@ -138,20 +145,24 @@ pub fn openProjectDirectory(allocator: std.mem.Allocator, project_path: []const 
 pub fn openUrlInDefaultBrowser(allocator: std.mem.Allocator, url: []const u8) OpenProjectError!void {
     return switch (@import("builtin").os.tag) {
         .macos => {
-            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=open url={s}", .{url});
+            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=open url_len={d}", .{url.len});
             return spawnDetached(allocator, &.{ "open", url }, null);
         },
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
             if (commandExists("xdg-open")) {
-                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=xdg-open url={s}", .{url});
+                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=xdg-open url_len={d}", .{url.len});
                 return spawnDetached(allocator, &.{ "xdg-open", url }, null);
             }
             if (commandExists("gio")) {
-                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=gio open url={s}", .{url});
+                runtime_log.diagnostic("openUrlInDefaultBrowser launcher=gio open url_len={d}", .{url.len});
                 return spawnDetached(allocator, &.{ "gio", "open", url }, null);
             }
-            runtime_log.diagnostic("openUrlInDefaultBrowser launcher unavailable url={s}", .{url});
+            runtime_log.diagnostic("openUrlInDefaultBrowser launcher unavailable url_len={d}", .{url.len});
             return error.LauncherUnavailable;
+        },
+        .windows => {
+            runtime_log.diagnostic("openUrlInDefaultBrowser launcher=ShellExecute url_len={d}", .{url.len});
+            if (!windows_integrations.shellOpen(url, null)) return error.LauncherUnavailable;
         },
         else => error.UnsupportedOperatingSystem,
     };
@@ -232,6 +243,10 @@ pub fn runCustomProjectCommand(
     project_path: []const u8,
     command: []const u8,
 ) OpenProjectError!void {
+    if (builtin.os.tag == .windows) {
+        const shell = if (commandExists("pwsh")) "pwsh" else if (commandExists("powershell")) "powershell" else return error.LauncherUnavailable;
+        return spawnDetached(allocator, &.{ shell, "-NoLogo", "-NoProfile", "-Command", command }, project_path);
+    }
     return spawnDetached(allocator, &.{ "sh", "-lc", command, "verde-open-action", project_path }, project_path);
 }
 
@@ -271,6 +286,11 @@ pub fn pickDirectory(allocator: std.mem.Allocator, start_path: []const u8) PickD
     return switch (@import("builtin").os.tag) {
         .macos => pickDirectoryMacOS(allocator, start_path),
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => pickDirectoryLinux(allocator, start_path),
+        .windows => windows_integrations.pickDirectoryAlloc(allocator, start_path) catch |err| switch (err) {
+            error.Cancelled => error.UserCancelled,
+            error.Unavailable => error.FolderPickerUnavailable,
+            error.OutOfMemory => error.OutOfMemory,
+        },
         else => error.UnsupportedOperatingSystem,
     };
 }
@@ -424,7 +444,7 @@ fn runDirectoryPickerCommand(
 
     switch (result.term) {
         .exited => |code| {
-            runtime_log.diagnostic("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d} stderr={s}", .{ argv[0], code, result.stdout.len, result.stderr.len, result.stderr });
+            runtime_log.diagnostic("runDirectoryPickerCommand exited argv={s} code={d} stdout_len={d} stderr_len={d}", .{ argv[0], code, result.stdout.len, result.stderr.len });
             if (code == 1) return error.UserCancelled;
             if (unavailable_exit_code) |expected| {
                 if (code == expected) return error.FolderPickerUnavailable;
@@ -462,22 +482,22 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
     }
 
     std.debug.print(
-        "[codex-debug] sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}\n",
+        "[codex-debug] sendWorker begin provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}\n",
         .{
             @tagName(request.provider),
             request_cwd,
-            request.model_ref orelse "(default)",
-            request.provider_thread_id orelse "(new)",
+            if (request.model_ref) |model| model.len else 0,
+            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
             request.prompt.len,
         },
     );
     runtime_log.diagnostic(
-        "sendWorker begin provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        "sendWorker begin provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}",
         .{
             @tagName(request.provider),
             request_cwd,
-            request.model_ref orelse "(default)",
-            request.provider_thread_id orelse "(new)",
+            if (request.model_ref) |model| model.len else 0,
+            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
             request.prompt.len,
         },
     );
@@ -504,22 +524,22 @@ pub fn sendWorker(state: *app_state.SendState, request: *SendWorkerRequest) void
         state.status = .completed;
     } else |err| {
         std.debug.print(
-            "[codex-debug] sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}\n",
+            "[codex-debug] sendWorker failed provider={s} cwd={s} model_len={d} thread_id_len={d} err={s}\n",
             .{
                 @tagName(request.provider),
                 request_cwd,
-                request.model_ref orelse "(default)",
-                request.provider_thread_id orelse "(new)",
+                if (request.model_ref) |model| model.len else 0,
+                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
                 @errorName(err),
             },
         );
         runtime_log.diagnostic(
-            "sendWorker failed provider={s} cwd={s} model={s} thread_id={s} err={s}",
+            "sendWorker failed provider={s} cwd={s} model_len={d} thread_id_len={d} err={s}",
             .{
                 @tagName(request.provider),
                 request_cwd,
-                request.model_ref orelse "(default)",
-                request.provider_thread_id orelse "(new)",
+                if (request.model_ref) |model| model.len else 0,
+                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
                 @errorName(err),
             },
         );
@@ -600,12 +620,12 @@ pub fn runSendWorker(
     };
 
     log.info(
-        "send worker starting provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}",
+        "send worker starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}",
         .{
             @tagName(request.provider),
             request_cwd,
-            request.model_ref orelse "(default)",
-            request.provider_thread_id orelse "(new)",
+            if (request.model_ref) |model| model.len else 0,
+            if (request.provider_thread_id) |thread_id| thread_id.len else 0,
             request.prompt.len,
         },
     );
@@ -644,32 +664,32 @@ pub fn runSendWorker(
         .on_approval_request = handleSendApprovalRequest,
     }) catch |err| {
         std.debug.print(
-            "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}\n",
+            "[codex-debug] client.sendPrompt failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}\n",
             .{
                 @tagName(request.provider),
                 request_cwd,
-                request.model_ref orelse "(default)",
-                request.provider_thread_id orelse "(new)",
+                if (request.model_ref) |model| model.len else 0,
+                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
                 @errorName(err),
             },
         );
         runtime_log.diagnostic(
-            "client.sendPrompt failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
+            "client.sendPrompt failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}",
             .{
                 @tagName(request.provider),
                 request_cwd,
-                request.model_ref orelse "(default)",
-                request.provider_thread_id orelse "(new)",
+                if (request.model_ref) |model| model.len else 0,
+                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
                 @errorName(err),
             },
         );
         log.err(
-            "send worker failed provider={s} cwd={s} model={s} thread_id={s}: {s}",
+            "send worker failed provider={s} cwd={s} model_len={d} thread_id_len={d}: {s}",
             .{
                 @tagName(request.provider),
                 request_cwd,
-                request.model_ref orelse "(default)",
-                request.provider_thread_id orelse "(new)",
+                if (request.model_ref) |model| model.len else 0,
+                if (request.provider_thread_id) |thread_id| thread_id.len else 0,
                 @errorName(err),
             },
         );
@@ -677,8 +697,8 @@ pub fn runSendWorker(
     };
 
     log.info(
-        "send worker completed provider={s} provider_thread_id={s} reply_len={d}",
-        .{ @tagName(request.provider), result.thread_id, result.reply_text.len },
+        "send worker completed provider={s} provider_thread_id_len={d} reply_len={d}",
+        .{ @tagName(request.provider), result.thread_id.len, result.reply_text.len },
     );
 
     return .{
@@ -753,15 +773,21 @@ fn spawnDetached(
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
-    const child = try std.process.spawn(threaded.io(), .{
+    var child = try std.process.spawn(threaded.io(), .{
         .argv = argv_storage.items,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .environ_map = &env_map,
+        .create_no_window = builtin.os.tag == .windows,
     });
     runtime_log.diagnostic("spawnDetached started arg0={s} pid={?}", .{ if (argv.len > 0) argv[0] else "", child.id });
+    if (builtin.os.tag == .windows) {
+        std.os.windows.CloseHandle(child.thread_handle);
+        if (child.id) |process| std.os.windows.CloseHandle(process);
+        child.id = null;
+    }
 }
 
 fn runChild(
@@ -811,6 +837,9 @@ fn openConfiguredEditor(
     editor: PreferredEditorEnv,
     project_path: []const u8,
 ) OpenProjectError!void {
+    if (builtin.os.tag == .windows) {
+        return openConfiguredEditorWindows(allocator, editor.value, project_path, project_path, isTerminalEditorCommand(editor.value));
+    }
     const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
     defer allocator.free(script);
 
@@ -835,6 +864,10 @@ fn openConfiguredEditorPath(
     }
     if (std.ascii.eqlIgnoreCase(executable, "zed") or std.ascii.eqlIgnoreCase(executable, "zeditor")) {
         return openZedPath(allocator, working_dir, path);
+    }
+
+    if (builtin.os.tag == .windows) {
+        return openConfiguredEditorWindows(allocator, editor.value, working_dir, path, isTerminalEditorCommand(editor.value));
     }
 
     const script = try std.fmt.allocPrint(allocator, "exec ${s} \"$1\"", .{editor.name});
@@ -892,6 +925,7 @@ fn canLaunchConfiguredEditorTerminal() bool {
     return switch (@import("builtin").os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => preferredLinuxTerminalLauncher() != null,
         .macos => commandExists("osascript"),
+        .windows => commandExists("wt"),
         else => false,
     };
 }
@@ -904,8 +938,81 @@ fn launchConfiguredEditorInTerminal(
     return switch (@import("builtin").os.tag) {
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => launchConfiguredEditorInLinuxTerminal(allocator, project_path, script),
         .macos => launchConfiguredEditorInMacTerminal(allocator, project_path, script),
+        .windows => error.UnsupportedOperatingSystem,
         else => error.UnsupportedOperatingSystem,
     };
+}
+
+const ParsedCommand = struct {
+    argv: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *ParsedCommand, allocator: std.mem.Allocator) void {
+        for (self.argv.items) |arg| allocator.free(arg);
+        self.argv.deinit(allocator);
+    }
+};
+
+fn parseConfiguredCommand(allocator: std.mem.Allocator, command: []const u8) !ParsedCommand {
+    var parsed: ParsedCommand = .{};
+    errdefer parsed.deinit(allocator);
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
+    var quote: ?u8 = null;
+    var index: usize = 0;
+
+    while (index < command.len) : (index += 1) {
+        const byte = command[index];
+        if (quote) |active_quote| {
+            if (byte == active_quote) {
+                quote = null;
+            } else if (byte == '\\' and index + 1 < command.len and command[index + 1] == active_quote) {
+                index += 1;
+                try current.append(allocator, command[index]);
+            } else {
+                try current.append(allocator, byte);
+            }
+            continue;
+        }
+        if (byte == '\'' or byte == '"') {
+            quote = byte;
+        } else if (std.ascii.isWhitespace(byte)) {
+            if (current.items.len > 0) try finishParsedCommandArg(allocator, &parsed, &current);
+        } else {
+            try current.append(allocator, byte);
+        }
+    }
+    if (quote != null) return error.InvalidArguments;
+    if (current.items.len > 0) try finishParsedCommandArg(allocator, &parsed, &current);
+    if (parsed.argv.items.len == 0) return error.InvalidArguments;
+    return parsed;
+}
+
+fn finishParsedCommandArg(allocator: std.mem.Allocator, parsed: *ParsedCommand, current: *std.ArrayList(u8)) !void {
+    const arg = try current.toOwnedSlice(allocator);
+    errdefer allocator.free(arg);
+    try parsed.argv.append(allocator, arg);
+}
+
+fn openConfiguredEditorWindows(
+    allocator: std.mem.Allocator,
+    command: []const u8,
+    working_dir: []const u8,
+    target: []const u8,
+    terminal: bool,
+) OpenProjectError!void {
+    var parsed = parseConfiguredCommand(allocator, command) catch return error.LauncherUnavailable;
+    defer parsed.deinit(allocator);
+    const target_copy = try allocator.dupe(u8, target);
+    errdefer allocator.free(target_copy);
+    try parsed.argv.append(allocator, target_copy);
+
+    if (!terminal) return spawnDetached(allocator, parsed.argv.items, working_dir);
+    if (!commandExists("wt")) return error.LauncherUnavailable;
+    var terminal_argv: std.ArrayList([]const u8) = .empty;
+    defer terminal_argv.deinit(allocator);
+    try terminal_argv.appendSlice(allocator, &.{ "wt", "-d", working_dir, "--" });
+    try terminal_argv.appendSlice(allocator, parsed.argv.items);
+    return spawnDetached(allocator, terminal_argv.items, working_dir);
 }
 
 const LinuxTerminalLauncher = enum {
@@ -1196,6 +1303,9 @@ fn revealFileInFileManager(allocator: std.mem.Allocator, file_path: []const u8) 
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => {
             const parent_dir = std.fs.path.dirname(file_path) orelse file_path;
             return openProjectDirectory(allocator, parent_dir);
+        },
+        .windows => {
+            if (!windows_integrations.revealFile(file_path)) return error.LauncherUnavailable;
         },
         else => error.UnsupportedOperatingSystem,
     };
@@ -1660,6 +1770,10 @@ pub fn captureClipboardImage(allocator: std.mem.Allocator) !?ClipboardImageCaptu
             if (try captureClipboardImageWayland(allocator)) |image| return image;
             return try captureClipboardImageX11(allocator);
         },
+        .windows => if (try windows_integrations.clipboardImageAlloc(allocator, CLIPBOARD_IMAGE_MAX_BYTES)) |image| .{
+            .bytes = image.bytes,
+            .mime = image.mime,
+        } else null,
         else => null,
     };
 }
@@ -1673,6 +1787,7 @@ pub fn captureClipboardText(allocator: std.mem.Allocator) !?[]u8 {
             if (try captureClipboardTextCommand(allocator, &.{ "sh", "-c", "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; export WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY:-wayland-1}\"; wl-paste --no-newline" })) |text| return text;
             return try captureClipboardTextCommand(allocator, &.{ "xclip", "-selection", "clipboard", "-o" });
         },
+        .windows => windows_integrations.clipboardTextAlloc(allocator, 1024 * 1024),
         else => null,
     };
 }
@@ -1907,7 +2022,7 @@ fn convertClipboardTiffToPng(
 
 fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCapture {
     var threaded = std.Io.Threaded.init_single_threaded;
-    const types_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-types-{d}.txt", .{std.c.getpid()});
+    const types_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-types-{d}.txt", .{platform_runtime.processId()});
     defer allocator.free(types_path);
     defer std.Io.Dir.deleteFileAbsolute(threaded.io(), types_path) catch {};
 
@@ -1945,7 +2060,7 @@ fn captureClipboardImageWayland(allocator: std.mem.Allocator) !?ClipboardImageCa
 
     const mime = selectClipboardImageMime(types_output) orelse return null;
     runtime_log.diagnostic("clipboard image wayland mime={s}", .{mime});
-    const output_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-image-{d}.bin", .{std.c.getpid()});
+    const output_path = try std.fmt.allocPrint(allocator, "/tmp/verde-clipboard-image-{d}.bin", .{platform_runtime.processId()});
     defer allocator.free(output_path);
     defer std.Io.Dir.deleteFileAbsolute(threaded.io(), output_path) catch {};
 
@@ -2079,6 +2194,17 @@ test "handleSendThreadId stores provisional provider thread id while pending" {
     send_state.status = .idle;
     handleSendThreadId(&send_state, "ses_456");
     try std.testing.expectEqualStrings("ses_123", send_state.provisional_provider_thread_id.?);
+}
+
+test "configured editor parsing preserves Windows paths and quoted arguments" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseConfiguredCommand(allocator, "\"C:\\Program Files\\Editor\\editor.exe\" --reuse-window 'two words'");
+    defer parsed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.argv.items.len);
+    try std.testing.expectEqualStrings("C:\\Program Files\\Editor\\editor.exe", parsed.argv.items[0]);
+    try std.testing.expectEqualStrings("--reuse-window", parsed.argv.items[1]);
+    try std.testing.expectEqualStrings("two words", parsed.argv.items[2]);
 }
 
 test "upsertPendingDiffFileLocked preserves patch when later updates omit it" {

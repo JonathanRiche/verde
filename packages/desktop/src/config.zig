@@ -1,10 +1,10 @@
 //! Shared user config loading for the native Verde shell.
 
 const std = @import("std");
+const platform_paths = @import("platform_paths");
 const theme = @import("./ui/theme.zig");
 
 const log = std.log.scoped(.native_config);
-const VERDE_CONFIG_RELATIVE_PATH = ".config/verde/verde.json";
 pub const MIN_FONT_SIZE: f32 = 10.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 18.0;
@@ -283,15 +283,7 @@ fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
 }
 
 pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
-        const trimmed = std.mem.trim(u8, std.mem.sliceTo(xdg_config_home, 0), &std.ascii.whitespace);
-        if (trimmed.len > 0) {
-            return std.fs.path.join(allocator, &.{ trimmed, "verde", "verde.json" });
-        }
-    }
-
-    const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
-    return std.fs.path.join(allocator, &.{ std.mem.sliceTo(home, 0), VERDE_CONFIG_RELATIVE_PATH });
+    return platform_paths.configPath(allocator);
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -366,7 +358,7 @@ fn parseThemeSource(raw: []const u8) ?theme.ThemeSource {
     const value = std.mem.trim(u8, raw, &std.ascii.whitespace);
     if (std.ascii.eqlIgnoreCase(value, "omarchy") or std.ascii.eqlIgnoreCase(value, "auto")) return .omarchy;
     if (std.ascii.eqlIgnoreCase(value, "default") or std.ascii.eqlIgnoreCase(value, "verde")) return .default;
-    log.warn("ignoring unsupported theme.theme value: {s}", .{value});
+    log.warn("ignoring unsupported theme.theme value_len={d}", .{value.len});
     return null;
 }
 
@@ -469,7 +461,7 @@ fn parseLinkOpenTarget(value: std.json.Value) ?LinkOpenTarget {
         std.ascii.eqlIgnoreCase(trimmed, "default_browser") or
         std.ascii.eqlIgnoreCase(trimmed, "default")) return .system_browser;
 
-    log.warn("ignoring unsupported open.links value: {s}", .{trimmed});
+    log.warn("ignoring unsupported open.links value_len={d}", .{trimmed.len});
     return null;
 }
 
@@ -497,7 +489,7 @@ fn parseNamedOpenAction(name: []const u8) ?DefaultOpenAction {
     if (std.ascii.eqlIgnoreCase(trimmed, "vscode") or std.ascii.eqlIgnoreCase(trimmed, "code")) return .vscode;
     if (std.ascii.eqlIgnoreCase(trimmed, "zed")) return .zed;
 
-    log.warn("ignoring unsupported open.default value: {s}", .{trimmed});
+    log.warn("ignoring unsupported open.default value_len={d}", .{trimmed.len});
     return null;
 }
 

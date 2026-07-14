@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "architecture": "x86_64",
+  "packages": {
+    "sdl3": {
+      "version": "3.2.26",
+      "gnu": {
+        "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.2.26/SDL3-devel-3.2.26-mingw.zip",
+        "sha256": "7d52bb8f05666c01449e85ab3b8b6464b6e2cd905b511623c3857312701fdc1b"
+      },
+      "msvc": {
+        "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.2.26/SDL3-devel-3.2.26-VC.zip",
+        "sha256": "687c88003034fc596ef95507703e6e8af62415f11783fe0b07a7a486fa49e1c0"
+      }
+    },
+    "sdl3_ttf": {
+      "version": "3.2.2",
+      "gnu": {
+        "url": "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-devel-3.2.2-mingw.zip",
+        "sha256": "e44e78d6dec080f1d96bd8ac1bac98ddc2574eff980d777c223c799c5a03b1ba"
+      },
+      "msvc": {
+        "url": "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-devel-3.2.2-VC.zip",
+        "sha256": "67805c5babfc49ca0c56882dc9b8cabbcdd1e6f9edde10ddac91ddb38f3afb8c"
+      }
+    },
+    "webview2": {
+      "version": "1.0.3537.50",
+      "url": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.3537.50/microsoft.web.webview2.1.0.3537.50.nupkg",
+      "sha256": "5ea526bbd728adda0da4d31219267e96460494a427e4894c4e09d9f320f4b9aa"
+    },
+    "event_token": {
+      "version": "c8e3c545df5da6a8c03625909cdf35fd3dd2313b",
+      "kind": "file",
+      "url": "https://raw.githubusercontent.com/mingw-w64/mingw-w64/c8e3c545df5da6a8c03625909cdf35fd3dd2313b/mingw-w64-headers/include/eventtoken.h",
+      "sha256": "9651a17d00d635e8d950e138f3a83b558e3270742349f422e274dde28498d68a"
+    }
+  }
+}

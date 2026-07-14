@@ -2,23 +2,58 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.option([]const u8, "target", "Target triple forwarded to packages/desktop");
+    const version = b.option([]const u8, "version", "Version embedded in the desktop binaries") orelse
+        b.graph.environ_map.get("VERDE_VERSION");
     const optimize = b.standardOptimizeOption(.{});
     const ui_debug = b.option(bool, "ui-debug", "Show the desktop UI debug window");
     const palette_renderer = b.option(PaletteRendererBackend, "palette-renderer", "Palette frame renderer backend: sdl_gpu");
     const browser_backend = b.option(BrowserBackendKind, "browser-backend", "Browser backend: native_webview, cef, or stub");
+    const terminal_backend = b.option(bool, "terminal_backend", "Enable the native terminal backend");
+    const local_ipc = b.option(bool, "local_ipc", "Enable the local live-control IPC backend");
+    const windows_integrations = b.option(bool, "windows_integrations", "Enable native Windows integrations");
     const cef_sdk_path = b.option([]const u8, "cef-sdk-path", "Path to a CEF binary distribution for the embedded browser pane");
+    const build_fff = b.option(bool, "build-fff", "Build the vendored fff-c library with Cargo");
+    const fff_cargo_target = b.option([]const u8, "fff-cargo-target", "Rust target triple used to build fff-c");
+    const fff_lib_dir = b.option([]const u8, "fff-lib-dir", "Directory containing the fff-c link library");
+    const fff_import_lib = b.option([]const u8, "fff-import-lib", "Exact fff-c import library for Windows builds");
+    const fff_runtime_lib = b.option([]const u8, "fff-runtime-lib", "Path to the fff-c runtime library to install");
+    const sdl3_include_dir = b.option([]const u8, "sdl3-include-dir", "Directory containing SDL3 headers");
+    const sdl3_lib_dir = b.option([]const u8, "sdl3-lib-dir", "Directory containing the SDL3 link library");
     const sdl3_runtime_lib = b.option([]const u8, "sdl3-runtime-lib", "Path to the SDL3 runtime library to install beside the desktop executable");
+    const sdl3_ttf_include_dir = b.option([]const u8, "sdl3-ttf-include-dir", "Directory containing SDL3_ttf headers");
+    const sdl3_ttf_lib_dir = b.option([]const u8, "sdl3-ttf-lib-dir", "Directory containing the SDL3_ttf link library");
+    const sdl3_ttf_runtime_lib = b.option([]const u8, "sdl3-ttf-runtime-lib", "Path to the SDL3_ttf runtime library to install beside the desktop executable");
+    const webview2_include_dir = b.option([]const u8, "webview2-include-dir", "Directory containing WebView2.h");
+    const webview2_loader_lib = b.option([]const u8, "webview2-loader-lib", "Exact WebView2 loader import library");
+    const webview2_loader_dll = b.option([]const u8, "webview2-loader-dll", "Path to WebView2Loader.dll to install beside the desktop executable");
     const cef_stub_preview = b.option(bool, "cef-stub-preview", "Use the in-app CEF pane scaffold without a real CEF SDK");
 
     const build_cmd = addDesktopCommand(b, optimize, .{
         .subcommand = null,
         .forward_runtime_args = false,
         .target = target,
+        .version = version,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
         .cef_sdk_path = cef_sdk_path,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
         .cef_stub_preview = cef_stub_preview,
     });
     b.default_step.dependOn(&build_cmd.step);
@@ -27,11 +62,28 @@ pub fn build(b: *std.Build) void {
         .subcommand = "run",
         .forward_runtime_args = true,
         .target = target,
+        .version = version,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
         .cef_sdk_path = cef_sdk_path,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
         .cef_stub_preview = cef_stub_preview,
     });
     const run_step = b.step("run", "Run the desktop app from the repo root");
@@ -44,26 +96,91 @@ pub fn build(b: *std.Build) void {
         .subcommand = "test",
         .forward_runtime_args = false,
         .target = target,
+        .version = version,
         .ui_debug = ui_debug,
         .palette_renderer = palette_renderer,
         .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
         .cef_sdk_path = cef_sdk_path,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
         .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
         .cef_stub_preview = cef_stub_preview,
     });
     const test_step = b.step("test", "Run desktop tests from the repo root");
     test_step.dependOn(&test_cmd.step);
+
+    const test_compile_cmd = addDesktopCommand(b, test_optimize, .{
+        .subcommand = "test-compile",
+        .forward_runtime_args = false,
+        .target = target,
+        .version = version,
+        .ui_debug = ui_debug,
+        .palette_renderer = palette_renderer,
+        .browser_backend = browser_backend,
+        .terminal_backend = terminal_backend,
+        .local_ipc = local_ipc,
+        .windows_integrations = windows_integrations,
+        .cef_sdk_path = cef_sdk_path,
+        .build_fff = build_fff,
+        .fff_cargo_target = fff_cargo_target,
+        .fff_lib_dir = fff_lib_dir,
+        .fff_import_lib = fff_import_lib,
+        .fff_runtime_lib = fff_runtime_lib,
+        .sdl3_include_dir = sdl3_include_dir,
+        .sdl3_lib_dir = sdl3_lib_dir,
+        .sdl3_runtime_lib = sdl3_runtime_lib,
+        .sdl3_ttf_include_dir = sdl3_ttf_include_dir,
+        .sdl3_ttf_lib_dir = sdl3_ttf_lib_dir,
+        .sdl3_ttf_runtime_lib = sdl3_ttf_runtime_lib,
+        .webview2_include_dir = webview2_include_dir,
+        .webview2_loader_lib = webview2_loader_lib,
+        .webview2_loader_dll = webview2_loader_dll,
+        .cef_stub_preview = cef_stub_preview,
+    });
+    const test_compile_step = b.step("test-compile", "Compile desktop tests without running them");
+    test_compile_step.dependOn(&test_compile_cmd.step);
 }
 
 const DesktopCommandOptions = struct {
     subcommand: ?[]const u8,
     forward_runtime_args: bool,
     target: ?[]const u8 = null,
+    version: ?[]const u8 = null,
     ui_debug: ?bool = null,
     palette_renderer: ?PaletteRendererBackend = null,
     browser_backend: ?BrowserBackendKind = null,
+    terminal_backend: ?bool = null,
+    local_ipc: ?bool = null,
+    windows_integrations: ?bool = null,
     cef_sdk_path: ?[]const u8 = null,
+    build_fff: ?bool = null,
+    fff_cargo_target: ?[]const u8 = null,
+    fff_lib_dir: ?[]const u8 = null,
+    fff_import_lib: ?[]const u8 = null,
+    fff_runtime_lib: ?[]const u8 = null,
+    sdl3_include_dir: ?[]const u8 = null,
+    sdl3_lib_dir: ?[]const u8 = null,
     sdl3_runtime_lib: ?[]const u8 = null,
+    sdl3_ttf_include_dir: ?[]const u8 = null,
+    sdl3_ttf_lib_dir: ?[]const u8 = null,
+    sdl3_ttf_runtime_lib: ?[]const u8 = null,
+    webview2_include_dir: ?[]const u8 = null,
+    webview2_loader_lib: ?[]const u8 = null,
+    webview2_loader_dll: ?[]const u8 = null,
     cef_stub_preview: ?bool = null,
 };
 
@@ -85,6 +202,7 @@ fn addDesktopCommand(
     if (options.target) |value| {
         argv.append(b.allocator, b.fmt("-Dtarget={s}", .{value})) catch @panic("OOM");
     }
+    appendStringOption(b, &argv, "version", options.version);
     if (options.ui_debug) |value| {
         argv.append(b.allocator, b.fmt("-Dui-debug={}", .{value})) catch @panic("OOM");
     }
@@ -94,12 +212,30 @@ fn addDesktopCommand(
     if (options.browser_backend) |value| {
         argv.append(b.allocator, b.fmt("-Dbrowser-backend={s}", .{@tagName(value)})) catch @panic("OOM");
     }
+    appendBoolOption(b, &argv, "terminal_backend", options.terminal_backend);
+    appendBoolOption(b, &argv, "local_ipc", options.local_ipc);
+    appendBoolOption(b, &argv, "windows_integrations", options.windows_integrations);
     if (options.cef_sdk_path) |value| {
         argv.append(b.allocator, b.fmt("-Dcef-sdk-path={s}", .{value})) catch @panic("OOM");
     }
+    if (options.build_fff) |value| {
+        argv.append(b.allocator, b.fmt("-Dbuild-fff={}", .{value})) catch @panic("OOM");
+    }
+    appendStringOption(b, &argv, "fff-cargo-target", options.fff_cargo_target);
+    appendStringOption(b, &argv, "fff-lib-dir", options.fff_lib_dir);
+    appendStringOption(b, &argv, "fff-import-lib", options.fff_import_lib);
+    appendStringOption(b, &argv, "fff-runtime-lib", options.fff_runtime_lib);
+    appendStringOption(b, &argv, "sdl3-include-dir", options.sdl3_include_dir);
+    appendStringOption(b, &argv, "sdl3-lib-dir", options.sdl3_lib_dir);
     if (options.sdl3_runtime_lib) |value| {
         argv.append(b.allocator, b.fmt("-Dsdl3-runtime-lib={s}", .{value})) catch @panic("OOM");
     }
+    appendStringOption(b, &argv, "sdl3-ttf-include-dir", options.sdl3_ttf_include_dir);
+    appendStringOption(b, &argv, "sdl3-ttf-lib-dir", options.sdl3_ttf_lib_dir);
+    appendStringOption(b, &argv, "sdl3-ttf-runtime-lib", options.sdl3_ttf_runtime_lib);
+    appendStringOption(b, &argv, "webview2-include-dir", options.webview2_include_dir);
+    appendStringOption(b, &argv, "webview2-loader-lib", options.webview2_loader_lib);
+    appendStringOption(b, &argv, "webview2-loader-dll", options.webview2_loader_dll);
     if (options.cef_stub_preview) |value| {
         argv.append(b.allocator, b.fmt("-Dcef-stub-preview={}", .{value})) catch @panic("OOM");
     }
@@ -116,6 +252,28 @@ fn addDesktopCommand(
     }
 
     return cmd;
+}
+
+fn appendStringOption(
+    b: *std.Build,
+    argv: *std.ArrayList([]const u8),
+    name: []const u8,
+    value: ?[]const u8,
+) void {
+    if (value) |resolved| {
+        argv.append(b.allocator, b.fmt("-D{s}={s}", .{ name, resolved })) catch @panic("OOM");
+    }
+}
+
+fn appendBoolOption(
+    b: *std.Build,
+    argv: *std.ArrayList([]const u8),
+    name: []const u8,
+    value: ?bool,
+) void {
+    if (value) |resolved| {
+        argv.append(b.allocator, b.fmt("-D{s}={}", .{ name, resolved })) catch @panic("OOM");
+    }
 }
 
 fn appendInstallArgs(b: *std.Build, argv: *std.ArrayList([]const u8)) void {

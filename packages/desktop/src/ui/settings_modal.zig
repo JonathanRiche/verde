@@ -471,7 +471,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .y = layout.notifications_hint_y,
         .w = layout.notifications_card.w - m.card_pad * 2.0,
         .h = m.label_h,
-    }, "System notification when an agent finishes · macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
+    }, "System notification when an agent finishes · Windows, macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     drawFooterBar(state, layout, dirty);
 }
