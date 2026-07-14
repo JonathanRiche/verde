@@ -1,10 +1,10 @@
-# Verde Windows internal-preview test handoff
+# Verde Windows preview test handoff
 
-This handoff is for the first x86-64 Windows internal preview. It is a test
-build, not a stable release. The purpose of this round is to find native
-Windows defects in rendering, WebView2, ConPTY, provider process management,
-local named-pipe control, paths, and packaging before the port is called
-stable.
+This handoff is for the first x86-64 Windows preview. It is a preview release,
+not a declaration of stable Windows support. The purpose of this round is to
+find native Windows defects in rendering, WebView2, ConPTY, provider process
+management, local named-pipe control, paths, and packaging before the port is
+called stable.
 
 ## What the tester should receive
 
@@ -12,7 +12,7 @@ stable.
 - `verde-<version>-windows-x86_64.zip.sha256`
 - the signing state from the person who produced the archive: either a valid
   Authenticode identity or an explicit statement that this is an unsigned
-  internal preview
+  Windows preview
 
 After extraction, the package manifest and `SHA256SUMS.txt` are authoritative
 for its contents. The desktop entry point is `app\Verde.exe`; the console entry
@@ -333,5 +333,5 @@ summary containing:
 - configurations tested (OS/GPU/DPI/shells/providers);
 - blockers that prevented rows from running;
 - orphan processes or handle/resource symptoms;
-- whether the build is suitable for another internal preview only, or is ready
+- whether the build is suitable for another preview only, or is ready
   to advance toward signed installer/stable-release validation.

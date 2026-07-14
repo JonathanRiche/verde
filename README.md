@@ -19,7 +19,7 @@ The desktop app lives in [`packages/desktop/`](packages/desktop). Verde's UI is 
 - **Scriptable.** Every running instance exposes per-user local control through
   `verde live` (Windows named pipes or Unix sockets); `verde state` inspects the
   persisted state without launching the app.
-- **Native, not Electron.** A single Zig + SDL3 binary built on Verde's own Palette UI framework.
+- **Native, not Electron.** A Zig + SDL3 app built on Verde's own Palette UI framework.
 
 ## Getting Started
 
@@ -32,7 +32,7 @@ Verde talks to provider runtimes on your machine rather than bundling its own ho
 
 ## Install
 
-Install the latest release from the website:
+On Linux, install the latest release from the website:
 
 ```bash
 curl -fsSL https://verdeai.dev/install.sh | sh
@@ -42,17 +42,41 @@ Or download a release from [GitHub Releases](https://github.com/JonathanRiche/ve
 
 - Linux: download `verde-v<version>-linux-x86_64.tar.gz`, extract it, then run `./install-local.sh`.
 - macOS: download the `.dmg` or `.zip` for your architecture, then move `Verde.app` into `Applications`.
-- Windows x64 preview: verify and extract the ZIP, then run `install.ps1` to
-  install for the current user and create the `Verde.Desktop` Start Menu
-  identity. `app\Verde.exe` is the desktop entry point and `bin\verde.exe` is
-  the console CLI. Preview artifacts are currently unsigned, so Windows may
-  show an unknown-publisher or SmartScreen warning. Confirm the adjacent
-  SHA-256 file matches the ZIP before choosing **More info → Run anyway**.
+- Windows x64 preview: download `verde-v<version>-windows-x86_64.zip` and its
+  adjacent `.sha256` file. Verify and extract the ZIP, then run the included
+  `install.ps1`. The script copies the complete package to
+  `%LOCALAPPDATA%\Programs\Verde` and creates a Start Menu shortcut; it does not
+  require administrator access.
 - Arch Linux: install [`verde-bin`](https://aur.archlinux.org/packages/verde-bin) from the AUR.
 
 ```bash
 yay -S verde-bin
 ```
+
+For Windows, open Windows PowerShell in the download directory and run:
+
+```powershell
+$zip = Get-Item .\verde-v*-windows-x86_64.zip
+$expected = ((Get-Content "$($zip.FullName).sha256" -Raw) -split '\s+')[0]
+$actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected.ToLowerInvariant()) { throw "ZIP checksum mismatch" }
+Expand-Archive $zip.FullName -DestinationPath '.\Verde' -Force
+$root = Get-ChildItem '.\Verde' -Directory | Select-Object -First 1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install.ps1')
+```
+
+Launch **Verde** from the Start Menu afterward. The GUI executable is
+`%LOCALAPPDATA%\Programs\Verde\app\Verde.exe`; the console CLI is
+`%LOCALAPPDATA%\Programs\Verde\bin\verde.exe` and is not automatically added to
+`PATH`. The package also contains adjacent runtime DLLs, so do not copy either
+EXE out of its directory or run it from inside Explorer's compressed-folder
+view. You can run `app\Verde.exe` directly from the extracted tree for a
+portable test without installing it.
+
+Check `WINDOWS-SIGNING.json` inside the extracted package for its signing
+state. If the release is unsigned, Windows may show an unknown-publisher or
+SmartScreen warning; verify the adjacent `.sha256` file before choosing
+**More info → Run anyway**.
 
 The Windows preview requires the Microsoft Edge WebView2 Evergreen Runtime;
 the packaged `WebView2Loader.dll` is only its application loader. Verde live
