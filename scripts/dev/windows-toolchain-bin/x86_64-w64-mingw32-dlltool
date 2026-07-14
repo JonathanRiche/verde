@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+
+# Rust's windows-gnu target looks up the GNU-prefixed tool name directly.
+# Zig ships a compatible implementation, so keep the cross-build self-contained
+# instead of requiring a host MinGW binutils package solely for dlltool.
+exec zig dlltool "$@"

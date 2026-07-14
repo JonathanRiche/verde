@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.workflow }}
-  cancel-in-progress: true
+  group: release-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-linux:
@@ -24,9 +24,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -168,23 +168,23 @@ jobs:
           ldconfig
 
       - name: Compute release version
-        id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            release_version="${GITHUB_REF_NAME}"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
             fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
-            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
+            release_version="manual-${fallback_run_number}-${fallback_sha::7}"
           fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
 
       - name: Build release artifact
         shell: bash
         run: |
           mkdir -p dist
           for attempt in 1 2 3; do
-            if bash scripts/release/package-linux.sh "${{ steps.version.outputs.value }}" dist; then
+            if bash scripts/release/package-linux.sh "${RELEASE_VERSION:?missing release version}" dist; then
               exit 0
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -194,7 +194,7 @@ jobs:
             sleep 15
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-linux-x86_64
           path: dist/*
@@ -214,9 +214,9 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.cache/zig-global
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -299,16 +299,16 @@ jobs:
           echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
 
       - name: Compute release version
-        id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME:-}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            release_version="${GITHUB_REF_NAME}"
           else
             fallback_sha="${GITHUB_SHA:-$(git rev-parse --short HEAD)}"
             fallback_run_number="${GITHUB_RUN_NUMBER:-local}"
-            echo "value=manual-${fallback_run_number}-${fallback_sha::7}" >> "$GITHUB_OUTPUT"
+            release_version="manual-${fallback_run_number}-${fallback_sha::7}"
           fi
+          echo "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
 
       - name: Build release artifact
         shell: bash
@@ -325,7 +325,7 @@ jobs:
 
           mkdir -p dist
           for attempt in 1 2 3; do
-            if bash "${PACKAGE_SCRIPT}" "${{ steps.version.outputs.value }}" dist; then
+            if bash "${PACKAGE_SCRIPT}" "${RELEASE_VERSION:?missing release version}" dist; then
               exit 0
             fi
             if [[ "$attempt" -eq 3 ]]; then
@@ -335,22 +335,150 @@ jobs:
             sleep 15
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*
 
+  build-windows:
+    name: Windows x86-64
+    timeout-minutes: 180
+    runs-on: windows-2022
+    env:
+      ZIG_VERSION: 0.16.0
+      RUST_VERSION: 1.95.0
+      BUN_VERSION: 1.3.14
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.cache\zig-global
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13.5"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Install pinned Rust MSVC toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal --target x86_64-pc-windows-msvc
+          rustup default $env:RUST_VERSION
+          cargo --version
+          rustc --version
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            .cache/zig-global
+            .zig-cache/windows-deps
+            vendor/fff/target
+          key: windows-release-${{ github.event_name }}-${{ github.sha }}-x64-${{ env.ZIG_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('bun.lock', 'package.json', 'scripts/windows-dependencies.json', 'scripts/dev/bootstrap_windows_deps.py', 'scripts/dev/bootstrap-windows-deps.ps1', 'scripts/dev/build-windows.ps1', 'scripts/dev/verify-windows-package.ps1', 'scripts/release/package-windows.ps1', 'scripts/release/package-windows.py', 'scripts/release/sign-windows.ps1', 'packages/desktop/build.zig', 'packages/desktop/build.zig.zon', 'packages/ghostty/build.zig', 'packages/ghostty/build.zig.zon', 'build.zig', 'vendor/fff/Cargo.lock', 'vendor/fff/Cargo.toml') }}
+
+      - name: Install JavaScript dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile --production
+
+      - name: Test Windows packaging and launcher contracts
+        shell: pwsh
+        run: |
+          node --test scripts/release/package-npm.test.mjs scripts/release/windows-npm-integrity.test.mjs packages/npm/verde/test/windows-launcher.test.js
+          python -m unittest scripts.release.test_package_windows_integrity scripts.release.test_package_windows_version
+
+      - name: Compute release version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -like "v*") {
+            $Version = $env:GITHUB_REF_NAME
+          } else {
+            $Sha = if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) {
+              (git rev-parse --short HEAD).Trim()
+            } else {
+              $env:GITHUB_SHA
+            }
+            $RunNumber = if ([string]::IsNullOrWhiteSpace($env:GITHUB_RUN_NUMBER)) { "local" } else { $env:GITHUB_RUN_NUMBER }
+            $ShortSha = $Sha.Substring(0, [Math]::Min(7, $Sha.Length))
+            $Version = "manual-$RunNumber-$ShortSha"
+          }
+          if ([string]::IsNullOrWhiteSpace($Version)) { throw "Failed to compute a release version." }
+          "RELEASE_VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Compile native Windows tests
+        shell: pwsh
+        run: .\scripts\dev\build-windows.ps1 -CompileTests
+
+      - name: Build and verify unsigned Windows package
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: .\scripts\release\package-windows.ps1 -Version "$env:RELEASE_VERSION" -OutputDir dist
+
+      - name: Build, optionally sign, and verify Windows package
+        if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        shell: pwsh
+        env:
+          VERDE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          VERDE_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          $HasCertificate = -not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_BASE64)
+          $HasPassword = -not [string]::IsNullOrWhiteSpace($env:VERDE_SIGNING_PFX_PASSWORD)
+          if ($HasCertificate -xor $HasPassword) {
+            throw "Configure both Windows signing secrets together, or leave both unset for an unsigned release."
+          }
+
+          if (-not $HasCertificate) {
+            Write-Host "No Windows signing certificate configured; publishing an explicitly unsigned package."
+            .\scripts\release\package-windows.ps1 -Version "$env:RELEASE_VERSION" -OutputDir dist
+          } else {
+            $CertificatePath = Join-Path $env:RUNNER_TEMP "verde-release-signing.pfx"
+            try {
+              [IO.File]::WriteAllBytes($CertificatePath, [Convert]::FromBase64String($env:VERDE_SIGNING_PFX_BASE64))
+              .\scripts\release\package-windows.ps1 `
+                -Version "$env:RELEASE_VERSION" `
+                -OutputDir dist `
+                -CertificatePath $CertificatePath `
+                -CertificatePassword $env:VERDE_SIGNING_PFX_PASSWORD `
+                -RequireSignature
+            } finally {
+              Remove-Item -LiteralPath $CertificatePath -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows-x86_64
+          if-no-files-found: error
+          path: dist/*
+
   publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs:
       - build-linux
       - build-macos
+      - build-windows
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           merge-multiple: true
@@ -362,18 +490,18 @@ jobs:
           cd release-assets
           sha256sum * > SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-assets/*
           generate_release_notes: true
 
   sync-aur:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: publish
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Configure AUR SSH key
         shell: bash

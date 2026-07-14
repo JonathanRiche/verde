@@ -16,6 +16,7 @@
   },
   "files": [
     "bin",
+    "lib",
     "README.md"
   ],
   "engines": {
@@ -24,7 +25,8 @@
   "optionalDependencies": {
     "verde-app-darwin-arm64": "0.1.27",
     "verde-app-darwin-x64": "0.1.27",
-    "verde-app-linux-x64": "0.1.27"
+    "verde-app-linux-x64": "0.1.27",
+    "verde-app-windows-x64": "0.1.27"
   },
   "keywords": [
     "verde",

@@ -1,6 +1,8 @@
 //! Cursor provider harness backed by Cursor CLI ACP (`agent acp`).
 
 const std = @import("std");
+const provider_diagnostics = @import("diagnostics.zig");
+const platform_process = @import("../platform/process.zig");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -25,7 +27,7 @@ const Mutex = struct {
 
 const ActiveProcessState = struct {
     mutex: Mutex = .{},
-    child: ?*std.process.Child = null,
+    child: ?*platform_process.OwnedChild = null,
     stdin: ?std.Io.File = null,
     session_id: ?[]const u8 = null,
 };
@@ -122,7 +124,7 @@ pub const Client = struct {
         try acp.closeStdin();
 
         var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        var reader = acp.process.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
         while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -181,7 +183,7 @@ pub const Client = struct {
         try acp.closeStdin();
 
         var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        var reader = acp.process.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
         while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -226,17 +228,17 @@ pub const Client = struct {
         }
 
         var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = acp.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
+        var reader = acp.process.child.stdout.?.reader(acp.threaded.io(), &read_buffer);
         while (try takeAcpLineAlloc(allocator, &reader)) |raw_line| {
             defer allocator.free(raw_line);
             const line = std.mem.trim(u8, raw_line, " \t\r");
             if (line.len == 0) continue;
-            const action = try handleSendPromptLine(allocator, line, request, &state, acp.child.stdin);
+            const action = try handleSendPromptLine(allocator, line, request, &state, acp.process.child.stdin);
             switch (action) {
                 .continue_reading => {},
                 .session_ready => {
                     if (state.session_id) |session_id| {
-                        registerActiveChild(&acp.child, acp.child.stdin, session_id);
+                        registerActiveChild(&acp.process, acp.process.child.stdin, session_id);
                         if (request.on_thread_id) |on_thread_id| on_thread_id(request.stream_context, session_id);
                         if (request.on_turn_id) |on_turn_id| on_turn_id(request.stream_context, session_id);
                         try acp.writeLine(try makePromptRequestAlloc(allocator, 3, session_id, request, state.capabilities.image));
@@ -254,7 +256,7 @@ pub const Client = struct {
             }
         }
 
-        unregisterActiveChild(&acp.child);
+        unregisterActiveChild(&acp.process);
         try acp.closeStdin();
         acp.stop();
 
@@ -280,12 +282,10 @@ pub const Client = struct {
             const line = try makeCancelNotificationAlloc(std.heap.page_allocator, session_id);
             defer std.heap.page_allocator.free(line);
             writeJsonLineToFile(std.heap.page_allocator, stdin, line) catch {
-                var threaded = std.Io.Threaded.init_single_threaded;
-                child.kill(threaded.io());
+                child.terminateTree();
             };
         } else {
-            var threaded = std.Io.Threaded.init_single_threaded;
-            child.kill(threaded.io());
+            child.terminateTree();
         }
     }
 
@@ -316,7 +316,7 @@ pub const Client = struct {
         errdefer threaded.deinit();
         const argv_with_model = [_][]const u8{ executable, "--model", model_arg orelse "", "acp" };
         const argv_default = [_][]const u8{ executable, "acp" };
-        var child = try std.process.spawn(threaded.io(), .{
+        var child = try platform_process.spawn(allocator, threaded.io(), .{
             .argv = if (model_arg != null) argv_with_model[0..] else argv_default[0..],
             .stdin = .pipe,
             .stdout = .pipe,
@@ -325,12 +325,11 @@ pub const Client = struct {
             .environ_map = &env_map,
         });
         errdefer child.kill(threaded.io());
-        if (child.id) |pid| _ = std.c.setpgid(pid, pid);
 
         return .{
             .allocator = allocator,
             .threaded = threaded,
-            .child = child,
+            .process = child,
             .env_map = env_map,
             .executable = executable,
         };
@@ -349,50 +348,54 @@ pub const Client = struct {
     }
 };
 
-pub fn shutdownOwnedServer() void {}
+pub fn shutdownOwnedServer() void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    if (active_process_state.child) |child| child.terminateTree();
+}
 
 const AcpProcess = struct {
     allocator: std.mem.Allocator,
     threaded: std.Io.Threaded,
-    child: std.process.Child,
+    process: platform_process.OwnedChild,
     env_map: std.process.Environ.Map,
     executable: []u8,
     finished: bool = false,
 
     fn writeLine(self: *AcpProcess, line: []u8) !void {
         defer self.allocator.free(line);
-        const stdin = self.child.stdin orelse return error.ConnectionClosed;
+        const stdin = self.process.child.stdin orelse return error.ConnectionClosed;
         try writeJsonLineToFile(self.allocator, stdin, line);
     }
 
     fn closeStdin(self: *AcpProcess) !void {
-        if (self.child.stdin) |stdin| {
+        if (self.process.child.stdin) |stdin| {
             stdin.close(self.threaded.io());
-            self.child.stdin = null;
+            self.process.child.stdin = null;
         }
     }
 
     fn stop(self: *AcpProcess) void {
-        if (self.finished or self.child.id == null) return;
-        self.child.kill(self.threaded.io());
+        if (self.finished or self.process.child.id == null) return;
+        self.process.kill(self.threaded.io());
         self.finished = true;
-        self.child.stdin = null;
-        self.child.stdout = null;
+        self.process.child.stdin = null;
+        self.process.child.stdout = null;
     }
 
     fn deinit(self: *AcpProcess) void {
-        unregisterActiveChild(&self.child);
-        if (!self.finished and self.child.id != null) {
-            self.child.kill(self.threaded.io());
+        unregisterActiveChild(&self.process);
+        if (!self.finished and self.process.child.id != null) {
+            self.process.kill(self.threaded.io());
         }
-        if (self.child.stdin) |stdin| stdin.close(self.threaded.io());
+        if (self.process.child.stdin) |stdin| stdin.close(self.threaded.io());
         self.env_map.deinit();
         self.allocator.free(self.executable);
         self.threaded.deinit();
     }
 };
 
-fn registerActiveChild(child: *std.process.Child, stdin: ?std.Io.File, session_id: []const u8) void {
+fn registerActiveChild(child: *platform_process.OwnedChild, stdin: ?std.Io.File, session_id: []const u8) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     active_process_state.child = child;
@@ -400,7 +403,7 @@ fn registerActiveChild(child: *std.process.Child, stdin: ?std.Io.File, session_i
     active_process_state.session_id = session_id;
 }
 
-fn unregisterActiveChild(child: *std.process.Child) void {
+fn unregisterActiveChild(child: *platform_process.OwnedChild) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     if (active_process_state.child == child) {
@@ -809,7 +812,11 @@ fn failIfJsonRpcError(value: std.json.Value) !void {
     const error_value = getObjectField(value, "error") orelse return;
     const message = getOptionalObjectString(error_value, "message") orelse "";
     if (isAuthError(message)) return error.CursorSignedOut;
-    runtime_log.diagnostic("cursor.acp error: {s}", .{message});
+    provider_diagnostics.logError(
+        .cursor_acp,
+        getOptionalObjectInteger(error_value, "code"),
+        message,
+    );
     return error.CursorAcpFailed;
 }
 
@@ -1303,7 +1310,7 @@ fn resolveCursorExecutableAlloc(
             else => return err,
         };
     }
-    runtime_log.diagnostic("cursor CLI not found; install with `curl https://cursor.com/install -fsS | bash`, ensure ~/.local/bin is on PATH, then run `agent login`.", .{});
+    runtime_log.diagnostic("cursor CLI not found; install Cursor Agent for this platform, ensure `agent` or `cursor-agent` is on PATH, then run `agent login`.", .{});
     return error.FileNotFound;
 }
 

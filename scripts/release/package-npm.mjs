@@ -17,19 +17,112 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import {
+  verifyWindowsNpmPayload,
+  WINDOWS_NPM_PAYLOAD_ENTRIES,
+} from "./windows-npm-integrity.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
 
-if (process.argv.length !== 5) {
-  console.error("usage: node scripts/release/package-npm.mjs <version> <release-assets-dir> <output-dir>");
+const supportedPlatforms = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-x64",
+  "windows-x64",
+];
+
+const usage = `Usage:
+  node scripts/release/package-npm.mjs [--platform <platform>] <version> <release-assets-dir> <output-dir>
+
+Package Verde release assets as npm packages. The root verde-app launcher is
+always packaged. Without --platform, all platform packages are included.
+
+Options:
+  --platform <platform>  Package one platform plus the root launcher.
+                         Supported: ${supportedPlatforms.join(", ")}
+  -h, --help             Show this help.`;
+
+function parseArgs(args) {
+  let platform = null;
+  let platformSeen = false;
+  let help = false;
+  const positional = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+
+    if (arg === "-h" || arg === "--help") {
+      help = true;
+      continue;
+    }
+
+    if (arg === "--") {
+      positional.push(...args.slice(i + 1));
+      break;
+    }
+
+    if (arg === "--platform" || arg.startsWith("--platform=")) {
+      if (platformSeen) {
+        throw new Error("--platform may only be specified once");
+      }
+      platformSeen = true;
+      platform = arg === "--platform" ? args[++i] : arg.slice("--platform=".length);
+      if (!platform) {
+        throw new Error("--platform requires a value");
+      }
+      continue;
+    }
+
+    if (arg.startsWith("-")) {
+      throw new Error(`unknown option: ${arg}`);
+    }
+
+    positional.push(arg);
+  }
+
+  if (help) {
+    return { help: true };
+  }
+
+  if (platform !== null && !supportedPlatforms.includes(platform)) {
+    throw new Error(
+      `unsupported platform: ${platform} (expected one of: ${supportedPlatforms.join(", ")})`,
+    );
+  }
+
+  if (positional.length !== 3) {
+    throw new Error("expected <version> <release-assets-dir> <output-dir>");
+  }
+
+  return {
+    help: false,
+    platform,
+    rawVersion: positional[0],
+    releaseAssetsDir: positional[1],
+    outputDir: positional[2],
+  };
+}
+
+let options;
+try {
+  options = parseArgs(process.argv.slice(2));
+} catch (error) {
+  console.error(`error: ${error.message}\n`);
+  console.error(usage);
   process.exit(1);
 }
 
-const rawVersion = process.argv[2];
+if (options.help) {
+  console.log(usage);
+  process.exit(0);
+}
+
+const rawVersion = options.rawVersion;
 const npmVersion = rawVersion.replace(/^v/, "");
-const releaseAssetsDir = path.resolve(process.cwd(), process.argv[3]);
-const outputDir = path.resolve(process.cwd(), process.argv[4]);
+const releaseAssetsDir = path.resolve(process.cwd(), options.releaseAssetsDir);
+const outputDir = path.resolve(process.cwd(), options.outputDir);
 
 const tempRoot = mkdtempSync(path.join(os.tmpdir(), "verde-npm-"));
 const stagingRoot = path.join(tempRoot, "staging");
@@ -38,6 +131,7 @@ mkdirSync(outputDir, { recursive: true });
 
 const platformPackages = [
   {
+    platform: "darwin-arm64",
     name: "verde-app-darwin-arm64",
     templateDir: path.join(repoRoot, "packages", "npm", "verde-darwin-arm64"),
     archiveName: `verde-${rawVersion}-macos-arm64.zip`,
@@ -50,6 +144,7 @@ const platformPackages = [
     },
   },
   {
+    platform: "darwin-x64",
     name: "verde-app-darwin-x64",
     templateDir: path.join(repoRoot, "packages", "npm", "verde-darwin-x64"),
     archiveName: `verde-${rawVersion}-macos-x86_64.zip`,
@@ -62,6 +157,7 @@ const platformPackages = [
     },
   },
   {
+    platform: "linux-x64",
     name: "verde-app-linux-x64",
     templateDir: path.join(repoRoot, "packages", "npm", "verde-linux-x64"),
     archiveName: `verde-${rawVersion}-linux-x86_64.tar.gz`,
@@ -76,6 +172,23 @@ const platformPackages = [
         });
       }
       chmodSync(path.join(destDir, "bin", "verde"), 0o755);
+    },
+  },
+  {
+    platform: "windows-x64",
+    name: "verde-app-windows-x64",
+    templateDir: path.join(repoRoot, "packages", "npm", "verde-windows-x64"),
+    archiveName: `verde-${rawVersion}-windows-x86_64.zip`,
+    copyFromExtracted(extractDir, destDir) {
+      const extractedRoot = resolveSingleDirectory(extractDir);
+      for (const entry of WINDOWS_NPM_PAYLOAD_ENTRIES) {
+        const source = path.join(extractedRoot, entry);
+        if (!existsSync(source)) continue;
+        cpSync(source, path.join(destDir, entry), {
+          recursive: true,
+          force: true,
+        });
+      }
     },
   },
 ];
@@ -161,8 +274,11 @@ function packPackage(packageDir) {
 }
 
 const packedTarballs = [];
+const selectedPlatformPackages = options.platform === null
+  ? platformPackages
+  : platformPackages.filter((pkg) => pkg.platform === options.platform);
 
-for (const pkg of platformPackages) {
+for (const pkg of selectedPlatformPackages) {
   const archivePath = path.join(releaseAssetsDir, pkg.archiveName);
   if (!existsSync(archivePath)) {
     throw new Error(`missing release asset: ${archivePath}`);
@@ -182,6 +298,9 @@ for (const pkg of platformPackages) {
   rewritePackageJson(packageDir, (packageJson) => {
     packageJson.version = npmVersion;
   });
+  if (pkg.name === "verde-app-windows-x64") {
+    verifyWindowsNpmPayload(packageDir);
+  }
 
   const tarballPath = packPackage(packageDir);
   packedTarballs.push({

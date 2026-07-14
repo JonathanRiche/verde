@@ -17,6 +17,7 @@ const sidebar = @import("sidebar.zig");
 const workspace_panes = @import("workspace_panes.zig");
 const native_state = @import("../state.zig");
 const keybinds = @import("../keybinds.zig");
+const platform_runtime = @import("platform_runtime");
 const Provider = native_state.Provider;
 const AgentProvider = native_state.AgentTuiProvider;
 
@@ -753,9 +754,7 @@ fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 /// Wall-clock seconds; `std.time.timestamp` was removed in the Zig 0.16 std
 /// reorganization, so this mirrors `state.zig`'s libc-based helper.
 fn unixTimestampSeconds() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @intCast(ts.sec);
+    return @divTrunc(platform_runtime.unixTimestampMs(), std.time.ms_per_s);
 }
 
 fn maxOptional(a: ?i32, b: ?i32) ?i32 {

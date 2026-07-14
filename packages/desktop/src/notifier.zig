@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const platform_paths = @import("platform_paths");
 const process_env = @import("process_env.zig");
 
 const log = std.log.scoped(.native_notifier);
@@ -42,8 +43,54 @@ pub fn notifyAgentDone(allocator: std.mem.Allocator, title: []const u8, body: []
     switch (builtin.os.tag) {
         .macos => notifyMacos(allocator, title, body, icon_path),
         .linux, .freebsd, .netbsd, .openbsd, .dragonfly => notifyLinux(allocator, title, body, icon_path),
+        .windows => notifyWindows(allocator, title, body),
         else => {},
     }
+}
+
+// Windows path: invoke the in-box WinRT toast API through a hidden PowerShell
+// host. Notification text travels through the child environment, never shell
+// interpolation, so quotes and non-ASCII content remain data rather than code.
+fn notifyWindows(allocator: std.mem.Allocator, title: []const u8, body: []const u8) void {
+    if (std.mem.indexOfScalar(u8, title, 0) != null or std.mem.indexOfScalar(u8, body, 0) != null) return;
+    var env_map = process_env.buildAugmentedEnvMap(allocator) catch return;
+    defer env_map.deinit();
+    env_map.put("VERDE_NOTIFICATION_TITLE", title) catch return;
+    env_map.put("VERDE_NOTIFICATION_BODY", body) catch return;
+
+    const shell = process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "pwsh") catch
+        process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, "powershell") catch return;
+    defer allocator.free(shell);
+
+    const script =
+        \\$ErrorActionPreference = 'Stop'
+        \\[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+        \\[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+        \\[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+        \\$title = [Environment]::GetEnvironmentVariable('VERDE_NOTIFICATION_TITLE')
+        \\$body = [Environment]::GetEnvironmentVariable('VERDE_NOTIFICATION_BODY')
+        \\$escapedTitle = [Security.SecurityElement]::Escape($title)
+        \\$escapedBody = [Security.SecurityElement]::Escape($body)
+        \\$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+        \\$xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$escapedTitle</text><text>$escapedBody</text></binding></visual><audio src='ms-winsoundevent:Notification.Default'/></toast>")
+        \\$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+        \\[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Verde.Desktop').Show($toast)
+    ;
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    var child = std.process.spawn(threaded.io(), .{
+        .argv = &.{ shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .environ_map = &env_map,
+        .create_no_window = true,
+    }) catch |err| {
+        log.debug("Windows notification spawn failed: {s}", .{@errorName(err)});
+        return;
+    };
+    closeDetachedWindowsChild(&child);
 }
 
 // Linux/BSD path: `notify-send` for the toast plus an optional `paplay` chime.
@@ -127,6 +174,11 @@ fn materializeIcon(allocator: std.mem.Allocator, icon: Icon) ?[]u8 {
 // Resolves the icon cache directory (`$XDG_CACHE_HOME/verde/icons` or
 // `$HOME/.cache/verde/icons`). Caller owns the returned slice.
 fn iconCacheDir(allocator: std.mem.Allocator) ?[]u8 {
+    if (builtin.os.tag == .windows) {
+        const base = platform_paths.localDataDir(allocator, "Verde", "Native") catch return null;
+        defer allocator.free(base);
+        return std.fs.path.join(allocator, &.{ base, "icons" }) catch null;
+    }
     if (std.c.getenv("XDG_CACHE_HOME")) |xdg| {
         const trimmed = std.mem.trim(u8, std.mem.sliceTo(xdg, 0), &std.ascii.whitespace);
         if (trimmed.len > 0) {
@@ -168,13 +220,23 @@ fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) void {
 
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
-    _ = std.process.spawn(threaded.io(), .{
+    var child = std.process.spawn(threaded.io(), .{
         .argv = argv_storage.items,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .environ_map = &env_map,
+        .create_no_window = builtin.os.tag == .windows,
     }) catch |err| {
         log.debug("notification spawn failed: {s}", .{@errorName(err)});
+        return;
     };
+    if (builtin.os.tag == .windows) closeDetachedWindowsChild(&child);
+}
+
+fn closeDetachedWindowsChild(child: *std.process.Child) void {
+    if (builtin.os.tag != .windows) return;
+    std.os.windows.CloseHandle(child.thread_handle);
+    if (child.id) |process| std.os.windows.CloseHandle(process);
+    child.id = null;
 }

@@ -132,6 +132,7 @@ pub const EventType = enum(u32) {
     window_moved,
     window_resized,
     window_pixel_size_changed,
+    window_metal_view_resized,
     window_minimized,
     window_maximized,
     window_restored,
@@ -543,4 +544,11 @@ var ttf_measure_engine: ?*TextEngine = null;
 
 test "event union stays SDL sized" {
     try std.testing.expect(@sizeOf(Event) >= 128);
+}
+
+test "window event values match the SDL 3.2 ABI" {
+    // Palette mirrors the SDL event prefix used by its standalone examples.
+    try std.testing.expectEqual(@as(u32, 0x208), @intFromEnum(EventType.window_metal_view_resized));
+    try std.testing.expectEqual(@as(u32, 0x20f), @intFromEnum(EventType.window_focus_lost));
+    try std.testing.expectEqual(@as(u32, 0x210), @intFromEnum(EventType.window_close_requested));
 }

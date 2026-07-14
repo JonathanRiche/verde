@@ -2,6 +2,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const provider_diagnostics = @import("diagnostics.zig");
+const platform_process = @import("../platform/process.zig");
+const platform_runtime = @import("platform_runtime");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -22,8 +25,7 @@ const Mutex = struct {
 
 const ActiveProcessState = struct {
     mutex: Mutex = .{},
-    child: ?*std.process.Child = null,
-    process_group: ?std.posix.pid_t = null,
+    child: ?*platform_process.OwnedChild = null,
 };
 
 var active_process_state: ActiveProcessState = .{};
@@ -299,16 +301,7 @@ pub const Client = struct {
         defer active_process_state.mutex.unlock();
 
         const child = active_process_state.child orelse return;
-        const process_group = active_process_state.process_group;
-        var threaded = std.Io.Threaded.init_single_threaded;
-        if (process_group) |pgid| {
-            std.posix.kill(-pgid, std.posix.SIG.TERM) catch |err| {
-                runtime_log.diagnostic("claude.interruptThread group SIGTERM failed pgid={d}: {s}", .{ pgid, @errorName(err) });
-                child.kill(threaded.io());
-            };
-        } else {
-            child.kill(threaded.io());
-        }
+        child.terminateTree();
     }
 
     pub fn steerThread(self: *Client, request: provider_types.SteerThreadRequest) !void {
@@ -330,7 +323,7 @@ pub const Client = struct {
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
         runtime_log.diagnostic("claude.runBridge spawning cwd={s} bridge={s}", .{ self.config.cwd orelse "(inherit)", bridge_path });
-        var child = try std.process.spawn(threaded.io(), .{
+        var child = try platform_process.spawn(self.allocator, threaded.io(), .{
             .argv = &.{ executable, bridge_path },
             .stdin = .pipe,
             .stdout = .pipe,
@@ -339,40 +332,39 @@ pub const Client = struct {
             .environ_map = &env_map,
         });
         errdefer child.kill(threaded.io());
-        if (child.id) |pid| {
-            _ = std.c.setpgid(pid, pid);
-        }
         registerActiveChild(&child);
         defer unregisterActiveChild(&child);
 
-        try writeJsonLine(self.allocator, child.stdin.?, payload);
+        try writeJsonLine(self.allocator, child.child.stdin.?, payload);
         const keep_stdin_open = if (stream_request) |request| request.on_approval_request != null else false;
         if (!keep_stdin_open) {
-            child.stdin.?.close(threaded.io());
-            child.stdin = null;
+            child.child.stdin.?.close(threaded.io());
+            child.child.stdin = null;
         }
 
         var response: BridgeResponse = .{};
         errdefer response.deinit(self.allocator);
 
         var read_buffer: [16 * 1024]u8 = undefined;
-        var reader = child.stdout.?.reader(threaded.io(), &read_buffer);
+        var reader = child.child.stdout.?.reader(threaded.io(), &read_buffer);
         while (true) {
             const maybe_line = try reader.interface.takeDelimiter('\n');
             if (maybe_line == null) break;
             const line = std.mem.trimEnd(u8, maybe_line.?, "\r");
             if (line.len == 0) continue;
-            try self.handleBridgeLine(line, stream_request, child.stdin, &response);
+            try self.handleBridgeLine(line, stream_request, child.child.stdin, &response);
         }
 
+        // Stop exposing the pointer before wait closes its platform handles.
+        unregisterActiveChild(&child);
         const term = try child.wait(threaded.io());
-        if (child.stdin) |stdin| {
+        if (child.child.stdin) |stdin| {
             stdin.close(threaded.io());
-            child.stdin = null;
+            child.child.stdin = null;
         }
-        child.stdout = null;
+        child.child.stdout = null;
         if (response.error_message) |message| {
-            runtime_log.diagnostic("claude.runBridge error: {s}", .{message});
+            provider_diagnostics.logError(.claude_bridge, null, message);
             return error.ClaudeRequestFailed;
         }
         switch (term) {
@@ -470,21 +462,23 @@ pub const Client = struct {
     }
 };
 
-pub fn shutdownOwnedServer() void {}
+pub fn shutdownOwnedServer() void {
+    active_process_state.mutex.lock();
+    defer active_process_state.mutex.unlock();
+    if (active_process_state.child) |child| child.terminateTree();
+}
 
-fn registerActiveChild(child: *std.process.Child) void {
+fn registerActiveChild(child: *platform_process.OwnedChild) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     active_process_state.child = child;
-    active_process_state.process_group = child.id;
 }
 
-fn unregisterActiveChild(child: *std.process.Child) void {
+fn unregisterActiveChild(child: *platform_process.OwnedChild) void {
     active_process_state.mutex.lock();
     defer active_process_state.mutex.unlock();
     if (active_process_state.child == child) {
         active_process_state.child = null;
-        active_process_state.process_group = null;
     }
 }
 
@@ -543,16 +537,15 @@ fn containsImagePath(images: []const provider_types.ImageAttachment, path: []con
 }
 
 fn providerBridgePathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const exe_path = try selfExePathAlloc(allocator);
+    const exe_path = try platform_runtime.executablePathAlloc(allocator);
     defer allocator.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
 
-    const installed = switch (builtin.os.tag) {
-        .macos => try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "Resources", "provider_bridge.mjs" }),
-        else => try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "share", "verde", "provider_bridge.mjs" }),
-    };
-    if (pathExists(allocator, installed)) return installed;
-    allocator.free(installed);
+    var installed = try providerBridgeInstalledPathsAlloc(allocator, builtin.os.tag, exe_dir);
+    defer deinitOwnedPaths(allocator, &installed);
+    for (installed.items) |candidate| {
+        if (pathExists(allocator, candidate)) return try allocator.dupe(u8, candidate);
+    }
 
     const dev = try std.fs.path.resolve(allocator, &.{ "zig-out", "share", "verde", "provider_bridge.mjs" });
     if (pathExists(allocator, dev)) return dev;
@@ -565,37 +558,47 @@ fn providerBridgePathAlloc(allocator: std.mem.Allocator) ![]u8 {
     return error.ProviderBridgeNotFound;
 }
 
+fn providerBridgeInstalledPathsAlloc(
+    allocator: std.mem.Allocator,
+    comptime os_tag: std.Target.Os.Tag,
+    exe_dir: []const u8,
+) !std.ArrayList([]u8) {
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    if (os_tag == .macos) {
+        try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "..", "Resources", "provider_bridge.mjs" });
+        return paths;
+    }
+
+    // Packaged CLI binaries live in bin/, while the Windows GUI executable may
+    // live at the package root. Probe both layouts before falling back to dev.
+    try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "..", "share", "verde", "provider_bridge.mjs" });
+    if (os_tag == .windows) {
+        try appendProviderBridgePath(allocator, &paths, &.{ exe_dir, "share", "verde", "provider_bridge.mjs" });
+    }
+    return paths;
+}
+
+fn appendProviderBridgePath(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8), components: []const []const u8) !void {
+    const path = try std.fs.path.resolve(allocator, components);
+    errdefer allocator.free(path);
+    try paths.append(allocator, path);
+}
+
+fn deinitOwnedPaths(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8)) void {
+    for (paths.items) |path| allocator.free(path);
+    paths.deinit(allocator);
+}
+
 fn pathExists(allocator: std.mem.Allocator, path: []const u8) bool {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     std.Io.Dir.cwd().access(threaded.io(), path, .{}) catch return false;
     return true;
 }
-
-fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
-            if (len < 0) return error.FileNotFound;
-            return allocator.dupe(u8, buffer[0..@intCast(len)]);
-        },
-        .macos => {
-            var size: u32 = std.fs.max_path_bytes;
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            if (_NSGetExecutablePath(&buffer, &size) != 0) {
-                const dynamic_buffer = try allocator.alloc(u8, size);
-                errdefer allocator.free(dynamic_buffer);
-                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
-                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
-            }
-            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
-        },
-        else => return error.FileNotFound,
-    }
-}
-
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 
 fn writeJsonLine(allocator: std.mem.Allocator, file: std.Io.File, payload: anytype) !void {
     const encoded = try std.json.Stringify.valueAlloc(allocator, payload, .{});
@@ -768,4 +771,31 @@ test "BridgeSendPromptRequest serializes multiple images" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"images\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/one.png") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "/tmp/two.png") != null);
+}
+
+test "Windows provider bridge probes CLI and package-root GUI layouts" {
+    var paths = try providerBridgeInstalledPathsAlloc(std.testing.allocator, .windows, "/package/bin");
+    defer deinitOwnedPaths(std.testing.allocator, &paths);
+
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    for (paths.items) |path| {
+        for (path) |*byte| if (byte.* == '\\') {
+            byte.* = '/';
+        };
+    }
+    try std.testing.expect(std.mem.endsWith(u8, paths.items[0], "/package/share/verde/provider_bridge.mjs"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.items[1], "/package/bin/share/verde/provider_bridge.mjs"));
+}
+
+test "Windows detached bridge source uses PowerShell temp paths and tree cleanup" {
+    const source = @embedFile("provider_bridge.ts");
+    try std.testing.expect(std.mem.indexOf(u8, source, "process.platform === \"win32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "tmpdir()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "detachedPosixShellCommand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "setsid sh -lc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "taskkill.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "'/T' '/F'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "PID file:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "Stop-Process") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "Write-Output"));
 }

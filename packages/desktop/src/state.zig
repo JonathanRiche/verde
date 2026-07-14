@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 const profiler = @import("profiler.zig");
@@ -15,6 +16,10 @@ const herdr = @import("herdr.zig");
 const keybinds = @import("keybinds.zig");
 const loop_wakeup = @import("loop_wakeup.zig");
 const notifier = @import("notifier.zig");
+const platform_paths = @import("platform_paths");
+const platform_runtime = @import("platform_runtime");
+const platform_process = @import("platform/process.zig");
+const process_env = @import("process_env.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const runtime_log = @import("runtime_log.zig");
 const slash_commands = @import("slash_commands.zig");
@@ -595,6 +600,7 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
             if (state.handleProviderSlashCommand(state.currentProject().currentDraft())) return;
             state.sendDraft() catch |err| {
                 log.err("failed to send draft: {s}", .{@errorName(err)});
+                state.setSidebarNotice(initialSendStartFailureMessage(err));
             };
         },
         .model_changed => |index| {
@@ -1390,7 +1396,13 @@ pub const ChatThread = struct {
     }
 
     fn backgroundTaskPidPathForId(allocator: std.mem.Allocator, task_id: []const u8) ![:0]const u8 {
-        return try allocPrintZCompat(allocator, "/tmp/verde-claude-bg-{s}.pid", .{task_id});
+        const temp_dir = try platform_paths.tempDir(allocator);
+        defer allocator.free(temp_dir);
+        const filename = try std.fmt.allocPrint(allocator, "verde-claude-bg-{s}.pid", .{task_id});
+        defer allocator.free(filename);
+        const joined = try std.fs.path.join(allocator, &.{ temp_dir, filename });
+        defer allocator.free(joined);
+        return try allocator.dupeZ(u8, joined);
     }
 
     fn replaceOptionalZ(
@@ -1408,14 +1420,16 @@ pub const ChatThread = struct {
     }
 
     fn refreshBackgroundTaskMetadata(task: *BackgroundTask, allocator: std.mem.Allocator, body_raw: []const u8) !void {
+        const explicit_pid_path = backgroundTaskMetadataValue(body_raw, "PID file:");
         if (backgroundTaskMetadataValue(body_raw, "Verde task ID:")) |task_id| {
             const previous_matches = task.task_id != null and std.mem.eql(u8, task.task_id.?, task_id);
             try replaceOptionalZ(allocator, &task.task_id, task_id);
-            if (task.pid_path == null or !previous_matches) {
+            if (explicit_pid_path == null and (task.pid_path == null or !previous_matches)) {
                 if (task.pid_path) |existing| allocator.free(existing);
                 task.pid_path = try backgroundTaskPidPathForId(allocator, task_id);
             }
         }
+        try replaceOptionalZ(allocator, &task.pid_path, explicit_pid_path);
         try replaceOptionalZ(allocator, &task.log_path, backgroundTaskMetadataValue(body_raw, "Output log:"));
     }
 
@@ -1904,6 +1918,7 @@ pub const ManagedProcess = struct {
     name: []u8,
     kind: stack_config.ProcessKind,
     command: []u8,
+    argv: std.ArrayList([]u8) = .empty,
     cwd: []u8,
     restart: stack_config.RestartPolicy,
     provider: ?stack_config.AgentProvider = null,
@@ -1931,10 +1946,12 @@ pub const ManagedProcess = struct {
     explicit_stop: bool = false,
 
     fn initFromDefinition(allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !ManagedProcess {
+        const launch = definition.launchForOs(builtin.os.tag) orelse return error.ManagedProcessUnavailableOnPlatform;
         var process: ManagedProcess = .{
             .name = try allocator.dupe(u8, definition.name),
             .kind = definition.kind,
-            .command = try allocator.dupe(u8, definition.command),
+            .command = try allocator.dupe(u8, if (launch == .command) launch.command else ""),
+            .argv = .empty,
             .cwd = try allocator.dupe(u8, definition.cwd),
             .restart = definition.restart,
             .provider = definition.provider,
@@ -1945,13 +1962,17 @@ pub const ManagedProcess = struct {
             .watch = .empty,
         };
         errdefer process.deinit(allocator);
+        if (launch == .argv) {
+            for (launch.argv) |arg| try appendOwnedString(allocator, &process.argv, arg);
+        }
         for (definition.watch.items) |pattern| {
-            try process.watch.append(allocator, try allocator.dupe(u8, pattern));
+            try appendOwnedString(allocator, &process.watch, pattern);
         }
         return process;
     }
 
     fn updateFromDefinition(self: *ManagedProcess, allocator: std.mem.Allocator, definition: stack_config.ProcessDefinition) !void {
+        const launch = definition.launchForOs(builtin.os.tag) orelse return error.ManagedProcessUnavailableOnPlatform;
         self.kind = definition.kind;
         self.restart = definition.restart;
         self.provider = definition.provider;
@@ -1960,9 +1981,19 @@ pub const ManagedProcess = struct {
         self.mcp = definition.mcp;
         self.hooks = definition.hooks;
         var reset_watch_state = false;
-        if (!std.mem.eql(u8, self.command, definition.command)) {
+        const next_command = if (launch == .command) launch.command else "";
+        const next_argv = if (launch == .argv) launch.argv else &.{};
+        if (!std.mem.eql(u8, self.command, next_command) or !argvEqual(self.argv.items, next_argv)) {
+            const replacement_command = try allocator.dupe(u8, next_command);
+            errdefer allocator.free(replacement_command);
+            var replacement_argv: std.ArrayList([]u8) = .empty;
+            errdefer deinitOwnedArgv(allocator, &replacement_argv);
+            for (next_argv) |arg| try appendOwnedString(allocator, &replacement_argv, arg);
+
             allocator.free(self.command);
-            self.command = try allocator.dupe(u8, definition.command);
+            deinitOwnedArgv(allocator, &self.argv);
+            self.command = replacement_command;
+            self.argv = replacement_argv;
         }
         if (!std.mem.eql(u8, self.cwd, definition.cwd)) {
             allocator.free(self.cwd);
@@ -1973,7 +2004,7 @@ pub const ManagedProcess = struct {
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.clearRetainingCapacity();
         for (definition.watch.items) |pattern| {
-            try self.watch.append(allocator, try allocator.dupe(u8, pattern));
+            try appendOwnedString(allocator, &self.watch, pattern);
         }
         if (reset_watch_state) self.resetWatchState();
     }
@@ -1981,6 +2012,7 @@ pub const ManagedProcess = struct {
     fn deinit(self: *ManagedProcess, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.command);
+        deinitOwnedArgv(allocator, &self.argv);
         allocator.free(self.cwd);
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.deinit(allocator);
@@ -2002,7 +2034,26 @@ pub const ManagedProcess = struct {
         }
         return true;
     }
+
+    fn argvEqual(left: []const []u8, right: []const []u8) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |l, r| {
+            if (!std.mem.eql(u8, l, r)) return false;
+        }
+        return true;
+    }
+
+    fn deinitOwnedArgv(allocator: std.mem.Allocator, argv: *std.ArrayList([]u8)) void {
+        for (argv.items) |arg| allocator.free(arg);
+        argv.deinit(allocator);
+    }
 };
+
+fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), value: []const u8) !void {
+    const owned = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned);
+    try list.append(allocator, owned);
+}
 
 const DefaultAgentTui = struct {
     name: []const u8,
@@ -2019,11 +2070,17 @@ const OPENCODE_TUI_COMMAND =
     \\exec opencode
 ;
 
+fn opencodeTuiCommandForOs(comptime os_tag: std.Target.Os.Tag) []const u8 {
+    // The npx cache fallback is Unix-specific. Windows executable discovery
+    // already honors PATHEXT, including the common opencode.cmd shim.
+    return if (os_tag == .windows) "opencode" else OPENCODE_TUI_COMMAND;
+}
+
 fn defaultAgentTui(provider: stack_config.AgentProvider) ?DefaultAgentTui {
     return switch (provider) {
         .codex => .{ .name = "codex", .command = "codex", .provider = .codex, .notify = true, .mcp = true, .hooks = true },
         .claude => .{ .name = "claude", .command = "claude", .provider = .claude },
-        .opencode => .{ .name = "opencode", .command = OPENCODE_TUI_COMMAND, .provider = .opencode },
+        .opencode => .{ .name = "opencode", .command = opencodeTuiCommandForOs(builtin.os.tag), .provider = .opencode },
         .cursor => .{ .name = "cursor", .command = "agent", .provider = .cursor },
         .amp => .{ .name = "amp", .command = "amp", .provider = .amp },
         .other => null,
@@ -3986,6 +4043,40 @@ pub const SendResultPayload = struct {
     reply_text: []const u8,
 };
 
+const InitialSendSnapshot = struct {
+    message_count: usize,
+    committed: bool,
+    last_activity_at: i64,
+    title: ?[:0]u8,
+
+    fn init(allocator: std.mem.Allocator, thread: *const ChatThread) !InitialSendSnapshot {
+        return .{
+            .message_count = thread.messages.items.len,
+            .committed = thread.committed,
+            .last_activity_at = thread.last_activity_at,
+            .title = if (thread.committed) null else try allocator.dupeZ(u8, thread.title),
+        };
+    }
+
+    fn deinit(self: *InitialSendSnapshot, allocator: std.mem.Allocator) void {
+        if (self.title) |title| allocator.free(title);
+        self.title = null;
+    }
+
+    fn restore(self: *InitialSendSnapshot, state: *AppState, thread: *ChatThread) void {
+        while (thread.messages.items.len > self.message_count) {
+            state.releaseMessage(thread.messages.pop().?);
+        }
+        if (self.title) |title| {
+            state.allocator.free(thread.title);
+            thread.title = title;
+            self.title = null;
+        }
+        thread.committed = self.committed;
+        thread.last_activity_at = self.last_activity_at;
+    }
+};
+
 fn freePendingFollowup(allocator: std.mem.Allocator, followup: *?PendingFollowup) void {
     if (followup.*) |pending| {
         allocator.free(pending.prompt);
@@ -4249,10 +4340,15 @@ pub const AppState = struct {
     /// previous frame's value to keep a ~30fps animation tick going (the loop
     /// otherwise sleeps and the pulse would step at the 1Hz label cadence).
     sidebar_pulse_animating: bool,
-    /// Monotonic ms timestamp of the last visible terminal output, driving a
-    /// short fast-poll burst so TUI redraws aren't capped at the idle wake
-    /// cadence (terminal output is pull-only; there is no fd to wake on).
-    last_terminal_output_ms: i64,
+    /// Monotonic ms timestamp of the last visible terminal input or output.
+    /// Input starts the fast-poll window before ConPTY has produced its echo,
+    /// avoiding a cold keystroke falling back to the idle wake cadence.
+    last_terminal_activity_ms: i64,
+    /// Caps synchronous daemon-tail RPCs when SDL delivers a burst of input or
+    /// mouse events. A terminal input can explicitly bypass the cap once so
+    /// the first output check still happens in the same event-loop iteration.
+    last_terminal_poll_ms: i64,
+    terminal_poll_requested: bool,
     /// Wall-clock ms deadline for ignoring Linux close requests immediately
     /// after a successful xdg-open/gio launch. Some file managers briefly send
     /// a focused SDL close event back to Verde even though the user only opened
@@ -4480,7 +4576,9 @@ pub const AppState = struct {
             .last_interaction_at_ms = 0,
             .pending_send_count = 0,
             .sidebar_pulse_animating = false,
-            .last_terminal_output_ms = 0,
+            .last_terminal_activity_ms = 0,
+            .last_terminal_poll_ms = 0,
+            .terminal_poll_requested = false,
             .external_open_close_suppress_until_ms = 0,
         };
         state.palette_composer.setCallbacks(.{});
@@ -5773,7 +5871,7 @@ pub const AppState = struct {
         } else |_| {}
         for (self.projects.items, 0..) |project, index| {
             if (std.mem.eql(u8, project.id, selector) or
-                std.mem.eql(u8, project.path, selector) or
+                self.projectPathMatches(project.path, selector) or
                 std.mem.eql(u8, project.label, selector)) return index;
         }
         return null;
@@ -5791,7 +5889,7 @@ pub const AppState = struct {
         defer self.allocator.free(command);
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
-        const result = try herdr.runRemoteShell(self.allocator, threaded.io(), remote, command, 64 * 1024);
+        const result = try herdr.runRemoteShell(self.allocator, threaded.io(), remote, .{ .bytes = command }, 64 * 1024);
         defer self.freeHerdrRunResult(result);
         try self.ensureHerdrCliSuccess(result, "remote mkdir");
     }
@@ -5921,7 +6019,7 @@ pub const AppState = struct {
             .exited => |code| if (code == 0) return,
             else => {},
         }
-        log.warn("Herdr CLI {s} failed stderr={s}", .{ action, result.stderr });
+        log.warn("Herdr CLI {s} failed stderr_len={d}", .{ action, result.stderr.len });
         return error.HerdrCommandFailed;
     }
 
@@ -6110,13 +6208,7 @@ pub const AppState = struct {
     fn absolutePathForCreate(self: *AppState, raw_path: []const u8) ![]u8 {
         const trimmed = std.mem.trim(u8, raw_path, &std.ascii.whitespace);
         if (trimmed.len == 0) return error.EmptyProjectPath;
-        const expanded = if (std.mem.eql(u8, trimmed, "~")) blk: {
-            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
-            break :blk try self.allocator.dupe(u8, home);
-        } else if (std.mem.startsWith(u8, trimmed, "~/")) blk: {
-            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
-            break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, trimmed[2..] });
-        } else try self.allocator.dupe(u8, trimmed);
+        const expanded = try platform_paths.expandUserPath(self.allocator, trimmed);
         defer self.allocator.free(expanded);
         if (std.fs.path.isAbsolute(expanded)) return try self.allocator.dupe(u8, expanded);
 
@@ -6160,6 +6252,13 @@ pub const AppState = struct {
 
     fn appendMessage(self: *AppState, role: ChatRole, author: []const u8, body: []const u8, image: ?*const ChatImageAttachment) !void {
         return self.appendMessageToThread(self.currentThreadMutable(), role, author, body, image, &.{});
+    }
+
+    fn appendInitialSendFailure(self: *AppState, thread: *ChatThread, message: []const u8) void {
+        self.appendMessageToThread(thread, .system, "Send failed", message, null, &.{}) catch |err| {
+            log.err("failed to append initial-send failure: {s}", .{@errorName(err)});
+        };
+        self.setSidebarNotice(message);
     }
 
     pub fn importProjectFromInput(self: *AppState) !void {
@@ -6742,14 +6841,14 @@ pub const AppState = struct {
         defer client.deinit();
 
         const imported_thread = client.readThread(self.allocator, trimmed_id) catch |err| {
-            log.warn("failed to read {s} thread for import id={s}: {s}", .{ @tagName(provider), trimmed_id, @errorName(err) });
+            log.warn("failed to read {s} thread for import id_len={d}: {s}", .{ @tagName(provider), trimmed_id.len, @errorName(err) });
             self.setThreadImportNotice(readThreadFailureMessage(provider, err));
             return;
         };
         defer imported_thread.deinit(self.allocator);
 
         var imported = self.buildImportedThread(imported_thread, null) catch |err| {
-            log.warn("failed to build imported {s} thread id={s}: {s}", .{ @tagName(provider), trimmed_id, @errorName(err) });
+            log.warn("failed to build imported {s} thread id_len={d}: {s}", .{ @tagName(provider), trimmed_id.len, @errorName(err) });
             self.setThreadImportNotice(failedCreateImportedThreadNotice(provider));
             return;
         };
@@ -7189,19 +7288,66 @@ pub const AppState = struct {
             draft_image_count,
         ) orelse return;
 
+        // Prove the daemon is reachable before staging a persisted user turn.
+        // A failure here cannot be an ambiguously accepted send, so the draft,
+        // attachments, title, and existing transcript all remain retryable.
+        self.ensureSessionDaemon() catch |err| {
+            const thread = self.currentThreadMutable();
+            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+            self.currentProjectMutable().invalidateSidebarThreadCache();
+            self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+            return err;
+        };
+
         const trimmed_title = std.mem.trim(u8, draft, &std.ascii.whitespace);
         const thread = self.currentThreadMutable();
+        var snapshot = try InitialSendSnapshot.init(self.allocator, thread);
+        defer snapshot.deinit(self.allocator);
         if (!thread.committed) {
-            try thread.commitFromPrompt(self.allocator, if (trimmed_title.len > 0) trimmed_title else "Image");
+            thread.commitFromPrompt(self.allocator, if (trimmed_title.len > 0) trimmed_title else "Image") catch |err| {
+                snapshot.restore(self, thread);
+                self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+                self.currentProjectMutable().invalidateSidebarThreadCache();
+                self.requestTranscriptScrollToBottom();
+                self.flushDirtyBlocking();
+                return err;
+            };
         }
         var draft_image_copy = draft_image;
-        try self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null, thread.draft_extra_images.items);
+        self.appendMessageToThread(thread, .user, "You", draft, if (draft_image_copy) |*image| image else null, thread.draft_extra_images.items) catch |err| {
+            snapshot.restore(self, thread);
+            self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+            self.currentProjectMutable().invalidateSidebarThreadCache();
+            self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+            return err;
+        };
         self.currentProjectMutable().invalidateSidebarThreadCache();
         // Persist the user turn before handing provider execution to the daemon,
         // so a fast app quit can still reattach the daemon-owned reply to a
         // known local chat thread.
         self.flushDirtyBlocking();
-        try self.beginSendForThread(self.selected_project_index, thread, draft, execution_target);
+        self.beginSendForThreadWithReadyDaemon(self.selected_project_index, thread, draft, execution_target) catch |err| {
+            if (err == error.DaemonRequestFailed) {
+                // A daemon JSON-RPC error is a confirmed rejection, so removing
+                // the staged user row is safe and leaves the draft retryable.
+                snapshot.restore(self, thread);
+                self.appendInitialSendFailure(thread, initialSendStartFailureMessage(err));
+            } else {
+                // Transport and response failures may happen after acceptance.
+                // Keep the one persisted user row, but clear the composer so a
+                // blind retry cannot duplicate it (or the provider turn).
+                self.clearDraft();
+                thread.clearDraftImage(self.allocator);
+                self.resetComposerInputWidget();
+                self.appendInitialSendFailure(thread, ambiguousInitialSendFailureMessage());
+            }
+            self.currentProjectMutable().invalidateSidebarThreadCache();
+            self.requestTranscriptScrollToBottom();
+            self.flushDirtyBlocking();
+            return err;
+        };
         self.clearDraft();
         thread.clearDraftImage(self.allocator);
         self.resetComposerInputWidget();
@@ -7444,6 +7590,17 @@ pub const AppState = struct {
         prompt: []const u8,
         execution_target: ProviderExecutionTarget,
     ) !void {
+        try self.ensureSessionDaemon();
+        return self.beginSendForThreadWithReadyDaemon(project_index, thread, prompt, execution_target);
+    }
+
+    fn beginSendForThreadWithReadyDaemon(
+        self: *AppState,
+        project_index: usize,
+        thread: *ChatThread,
+        prompt: []const u8,
+        execution_target: ProviderExecutionTarget,
+    ) !void {
         const page_alloc = std.heap.page_allocator;
         const execution_cwd = execution_target.cwd();
         const turn_id = try std.fmt.allocPrint(page_alloc, "gui:{s}:{s}:{d}", .{ self.projects.items[project_index].id, thread.local_thread_id, unixTimestampMs() });
@@ -7451,13 +7608,29 @@ pub const AppState = struct {
         const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
         defer if (cursor_model_params_json) |params| page_alloc.free(params);
 
-        try self.ensureSessionDaemon();
         // The daemon response is owned by self.allocator (startDaemonChatTurn ->
         // sessionizer.requestAlloc); freeing it with page_alloc trips
         // PageAllocator's alignment safety check and crashes the send.
-        const response = try self.startDaemonChatTurn(project_index, thread, prompt, execution_target, execution_cwd, cursor_model_params_json, turn_id);
-        defer self.allocator.free(response);
-        try ensureJsonRpcOk(self.allocator, response);
+        const response: ?[]u8 = self.startDaemonChatTurn(
+            project_index,
+            thread,
+            prompt,
+            execution_target,
+            execution_cwd,
+            cursor_model_params_json,
+            turn_id,
+        ) catch |err| recovered: {
+            // A lost reply can follow successful acceptance. Probe this exact
+            // idempotency key before exposing a retry that could run twice.
+            if (!self.daemonChatTurnExists(turn_id)) return err;
+            break :recovered null;
+        };
+        defer if (response) |owned| self.allocator.free(owned);
+        if (response) |json| {
+            ensureJsonRpcOk(self.allocator, json) catch |err| {
+                if (!self.daemonChatTurnExists(turn_id)) return err;
+            };
+        }
 
         const send_state = thread.send_state;
         send_state.mutex.lock();
@@ -7551,6 +7724,16 @@ pub const AppState = struct {
             .remote_ssh_host = if (execution_target.remoteHost()) |host| host else null,
             .remote_cwd = if (execution_target.remoteHost() != null) execution_cwd else null,
         }, 1);
+    }
+
+    fn daemonChatTurnExists(self: *AppState, turn_id: []const u8) bool {
+        const response = sessionizer.requestAlloc(self.allocator, self.storage.pref_path, "chat.turn.tail", .{
+            .turn_id = turn_id,
+            .after_seq = 0,
+        }, 2) catch return false;
+        defer self.allocator.free(response);
+        ensureJsonRpcOk(self.allocator, response) catch return false;
+        return true;
     }
 
     fn cancelDaemonChatTurn(self: *AppState, turn_id: []const u8) void {
@@ -8391,7 +8574,7 @@ pub const AppState = struct {
     fn terminalDockForSurface(self: *AppState, surface: *const SurfaceState) ?*terminal.Dock {
         for (self.projects.items, 0..) |*project, idx| {
             const owns = std.mem.eql(u8, surface.workspace_id, project.id) or
-                std.mem.eql(u8, surface.workspace_path, project.path);
+                self.projectPathMatches(surface.workspace_path, project.path);
             if (!owns) continue;
             return self.projectTerminalDockMutable(idx, surface.dock_id);
         }
@@ -8482,7 +8665,7 @@ pub const AppState = struct {
         if (project_index >= self.projects.items.len) return false;
         const project = &self.projects.items[project_index];
         for (self.surfaces.items) |*surface| {
-            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
                 if (!project.workspace_layout.hasTerminalDockPane(surface.dock_id)) continue;
                 // The pane you're actively in shouldn't raise a background alert.
                 if (self.isFocusedTerminalSurface(project_index, surface.dock_id)) continue;
@@ -8515,7 +8698,7 @@ pub const AppState = struct {
         const project = &self.projects.items[project_index];
         for (self.surfaces.items) |*surface| {
             if (surface.dock_id != dock_id) continue;
-            if (std.mem.eql(u8, surface.workspace_id, project.id) or std.mem.eql(u8, surface.workspace_path, project.path)) {
+            if (std.mem.eql(u8, surface.workspace_id, project.id) or self.projectPathMatches(surface.workspace_path, project.path)) {
                 return surface;
             }
         }
@@ -8770,6 +8953,7 @@ pub const AppState = struct {
     }
 
     pub fn attachClipboardImageToCurrentDraft(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
         const capture = captureClipboardImage(self.allocator) catch |err| {
             log.err("failed to capture clipboard image: {s}", .{@errorName(err)});
             runtime_log.diagnostic("clipboard image capture failed: {s}", .{@errorName(err)});
@@ -8807,6 +8991,7 @@ pub const AppState = struct {
     }
 
     pub fn pasteClipboardTextIntoPaletteComposer(self: *AppState) bool {
+        if (self.projects.items.len == 0) return false;
         if (self.isBrowserPaneFocused() or self.browser_address_focused or self.palette_modal_text_focus != .none) {
             runtime_log.diagnostic(
                 "palette paste blocked browser_focused={} address_focused={} modal_focus={s}",
@@ -8910,6 +9095,7 @@ pub const AppState = struct {
     }
 
     pub fn clearCurrentDraftImageAt(self: *AppState, index: usize) void {
+        if (self.projects.items.len == 0) return;
         const thread = self.currentThreadMutable();
         if (thread.draftImageAt(index)) |image| {
             var threaded = std.Io.Threaded.init_single_threaded;
@@ -9594,6 +9780,7 @@ pub const AppState = struct {
     }
 
     pub fn slashCommandPickerActive(self: *const AppState) bool {
+        if (self.projects.items.len == 0) return false;
         return slashCommandPrefix(self.currentDraft()) != null;
     }
 
@@ -9604,6 +9791,7 @@ pub const AppState = struct {
     }
 
     pub fn slashCommandPickerRowCount(self: *const AppState) usize {
+        if (self.projects.items.len == 0) return 0;
         var count: usize = 0;
         const prefix = slashCommandPrefix(self.currentDraft()) orelse return 0;
         for (slash_commands.LOCAL_COMMANDS) |command| {
@@ -9617,6 +9805,7 @@ pub const AppState = struct {
     }
 
     pub fn slashCommandPickerRow(self: *const AppState, index: usize) ?SlashPickerRow {
+        if (self.projects.items.len == 0) return null;
         const prefix = slashCommandPrefix(self.currentDraft()) orelse return null;
         var current: usize = 0;
         for (slash_commands.LOCAL_COMMANDS) |command| {
@@ -9980,25 +10169,42 @@ pub const AppState = struct {
         self.setSidebarNotice(if (is_visible) "Terminal opened." else "Terminal hidden.");
     }
 
-    // Visible terminal output within this window keeps the main loop polling
-    // at display rate. Long enough to bridge frame-to-frame gaps of a TUI
-    // redrawing continuously; short enough that one stray prompt repaint
-    // doesn't keep the loop hot.
-    const TERMINAL_OUTPUT_BURST_WINDOW_MS: i64 = 250;
+    // Visible terminal activity within this window keeps the main loop polling
+    // at display rate. Input counts because its first same-loop tail can race
+    // ConPTY's asynchronous writer and otherwise miss the echo before sleeping.
+    const TERMINAL_ACTIVITY_BURST_WINDOW_MS: i64 = 250;
+    const TERMINAL_POLL_INTERVAL_MS: i64 = 16;
 
     fn monotonicMs() i64 {
         return @intCast(@divTrunc(profiler.nowNs(), std.time.ns_per_ms));
     }
 
-    /// True while a visible terminal recently produced output; the main loop
-    /// uses this to shorten its event wait so the next chunk renders promptly.
-    pub fn terminalOutputBurstActive(self: *const AppState) bool {
-        if (self.last_terminal_output_ms == 0) return false;
-        return monotonicMs() - self.last_terminal_output_ms < TERMINAL_OUTPUT_BURST_WINDOW_MS;
+    /// True while a visible terminal recently accepted input or produced
+    /// output; the main loop uses this to render the next echo/chunk promptly.
+    pub fn terminalActivityBurstActive(self: *const AppState) bool {
+        if (self.last_terminal_activity_ms == 0) return false;
+        return monotonicMs() - self.last_terminal_activity_ms < TERMINAL_ACTIVITY_BURST_WINDOW_MS;
+    }
+
+    /// Starts a short active-poll window after accepted terminal input. The
+    /// forced poll preserves the immediate post-event check while the cadence
+    /// guard prevents high-rate SDL events from opening one pipe RPC each.
+    pub fn noteTerminalInputActivity(self: *AppState) void {
+        self.last_terminal_activity_ms = monotonicMs();
+        self.terminal_poll_requested = true;
     }
 
     pub fn pollTerminals(self: *AppState) bool {
         var visible_changed = false;
+        const now_ms = monotonicMs();
+        if (!self.terminal_poll_requested and
+            self.last_terminal_poll_ms != 0 and
+            now_ms - self.last_terminal_poll_ms < TERMINAL_POLL_INTERVAL_MS)
+        {
+            return false;
+        }
+        self.terminal_poll_requested = false;
+        self.last_terminal_poll_ms = now_ms;
         for (self.projects.items, 0..) |*project, project_index| {
             const project_selected = project_index == self.selected_project_index;
             const base_visible = project.terminal_dock.visible or project.workspace_layout.hasTerminalDockPane(0);
@@ -10006,7 +10212,7 @@ pub const AppState = struct {
                 self.pollManagedProcesses(project_index);
                 continue;
             }
-            if (project_selected and base_visible and !project.terminal_dock.hasRunningSession()) {
+            if (project_selected and base_visible and !project.terminal_dock.hasRunningSession() and project.terminal_dock.reserveAutoRestart(now_ms)) {
                 const start_result = if (project.terminal_dock.hasRestorableSession())
                     project.terminal_dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, 0)
                 else
@@ -10040,7 +10246,7 @@ pub const AppState = struct {
                     exited_editor_dock_id = entry.id;
                     break;
                 }
-                if (project_selected and dock_visible and !entry.dock.hasRunningSession()) {
+                if (project_selected and dock_visible and !entry.dock.hasRunningSession() and entry.dock.reserveAutoRestart(now_ms)) {
                     const start_result = if (entry.dock.hasRestorableSession())
                         entry.dock.ensureSessionPersistent(self.allocator, project.path, self.storage.pref_path, entry.id)
                     else
@@ -10074,7 +10280,7 @@ pub const AppState = struct {
             }
             self.pollManagedProcesses(project_index);
         }
-        if (visible_changed) self.last_terminal_output_ms = monotonicMs();
+        if (visible_changed) self.last_terminal_activity_ms = monotonicMs();
         return visible_changed;
     }
 
@@ -11359,7 +11565,7 @@ pub const AppState = struct {
                         self.browserInspectorPolicyAllowsCurrentPage();
                     if (!inspector_message_allowed and !self.browserBridgePolicyAllowsCurrentPage()) {
                         const page_url = if (self.browser_state.current_url) |url| url else self.browser_state.addressInput();
-                        log.warn("blocked browser bridge message from disallowed page URL: {s}", .{page_url});
+                        log.warn("blocked browser bridge message from disallowed page url_len={d}", .{page_url.len});
                         self.browser_state.setLastError("Browser bridge message rejected by origin policy.") catch {};
                         self.setSidebarNotice("Browser bridge message blocked for this page.");
                         continue;
@@ -11769,6 +11975,7 @@ pub const AppState = struct {
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
         const handled = dock.handleKeyDown(self.allocator, keyboard, event);
         if (dock.consumeWorkspaceChange()) self.markDirty();
+        if (handled) self.noteTerminalInputActivity();
         return handled;
     }
 
@@ -11776,7 +11983,9 @@ pub const AppState = struct {
         if (!self.canRouteTerminalInput()) return false;
         const dock_id = self.terminalInputDockId() orelse return false;
         var dock = self.currentProjectTerminalDockMutable(dock_id) orelse return false;
-        return dock.handleTextInput(std.mem.sliceTo(text, 0));
+        const handled = dock.handleTextInput(std.mem.sliceTo(text, 0));
+        if (handled) self.noteTerminalInputActivity();
+        return handled;
     }
 
     fn canRouteTerminalInput(self: *const AppState) bool {
@@ -12029,9 +12238,16 @@ pub const AppState = struct {
             .terminal => |ref| ref.dock_id,
             else => return false,
         };
+        const workspace_pane_visible = project.workspace_layout.hasTerminalDockPane(dock_id);
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
         if (!dock.hasRunningSession()) try self.restartTerminalDockForWorkspace(project_index, dock_id);
-        return try dock.writeInputToActivePane(bytes);
+        const wrote = try dock.writeInputToActivePane(bytes);
+        if (wrote and project_index == self.selected_project_index and
+            (dock.visible or workspace_pane_visible))
+        {
+            self.noteTerminalInputActivity();
+        }
+        return wrote;
     }
 
     pub fn writeWorkspaceTerminalPane(self: *AppState, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
@@ -12076,7 +12292,7 @@ pub const AppState = struct {
         if (changed and project_index == self.selected_project_index) {
             const project = &self.projects.items[project_index];
             if (dock.visible or project.workspace_layout.hasTerminalDockPane(dock_id)) {
-                self.last_terminal_output_ms = monotonicMs();
+                self.last_terminal_activity_ms = monotonicMs();
                 self.markDirty();
             }
         }
@@ -12116,6 +12332,7 @@ pub const AppState = struct {
         }
 
         for (loaded.processes.items) |definition| {
+            if (definition.launchForOs(builtin.os.tag) == null) continue;
             if (project.managedProcessByName(definition.name)) |process| {
                 try process.updateFromDefinition(self.allocator, definition);
             } else {
@@ -12127,7 +12344,7 @@ pub const AppState = struct {
 
     fn stackDefinitionByName(config: *const stack_config.Config, name: []const u8) ?*const stack_config.ProcessDefinition {
         for (config.processes.items) |*definition| {
-            if (std.mem.eql(u8, definition.name, name)) return definition;
+            if (std.mem.eql(u8, definition.name, name) and definition.launchForOs(builtin.os.tag) != null) return definition;
         }
         return null;
     }
@@ -12224,13 +12441,12 @@ pub const AppState = struct {
         const cwd = try self.resolveManagedProcessCwd(project.path, process.cwd);
         defer self.allocator.free(cwd);
         try self.ensureManagedAgentProjectHooks(project.path, process);
-        const command = try self.managedProcessLaunchCommand(process);
-        defer self.allocator.free(command);
-        const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
+        var launch = try self.managedProcessLaunchArgs(process);
+        defer launch.deinit(self.allocator);
         try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
             .kind = .custom,
             .label = process.name,
-            .command = &command_args,
+            .command = launch.argv.items,
         });
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
         process.status = .running;
@@ -12298,13 +12514,12 @@ pub const AppState = struct {
             return false;
         };
         project = &self.projects.items[project_index];
-        const command = try self.managedProcessLaunchCommand(process);
-        defer self.allocator.free(command);
-        const command_args = [_][]const u8{ "/bin/sh", "-lc", command };
+        var launch = try self.managedProcessLaunchArgs(process);
+        defer launch.deinit(self.allocator);
         try self.restartTerminalDockForWorkspaceProfile(project_index, dock_id, cwd, .{
             .kind = .custom,
             .label = process.name,
-            .command = &command_args,
+            .command = launch.argv.items,
         });
         var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
 
@@ -12391,6 +12606,7 @@ pub const AppState = struct {
                 .name = try self.allocator.dupe(u8, name),
                 .kind = .agent,
                 .command = try self.allocator.dupe(u8, defaults.command),
+                .argv = .empty,
                 .cwd = try self.allocator.dupe(u8, "."),
                 .restart = .manual,
                 .provider = defaults.provider,
@@ -12490,6 +12706,78 @@ pub const AppState = struct {
             .amp => null,
             .other => null,
         };
+    }
+
+    const ManagedProcessLaunch = struct {
+        argv: std.ArrayList([]u8) = .empty,
+
+        fn deinit(self: *ManagedProcessLaunch, allocator: std.mem.Allocator) void {
+            for (self.argv.items) |arg| allocator.free(arg);
+            self.argv.deinit(allocator);
+        }
+    };
+
+    fn managedProcessLaunchArgs(self: *AppState, process: *const ManagedProcess) !ManagedProcessLaunch {
+        var launch: ManagedProcessLaunch = .{};
+        errdefer launch.deinit(self.allocator);
+
+        if (process.argv.items.len > 0) {
+            const add_codex_hooks = process.kind == .agent and
+                process.provider == .codex and
+                process.hooks and
+                isCodexExecutable(process.argv.items[0]) and
+                !argvContains(process.argv.items, "features.codex_hooks");
+            for (process.argv.items, 0..) |arg, index| {
+                try appendOwnedString(self.allocator, &launch.argv, arg);
+                if (index == 0 and add_codex_hooks) {
+                    try appendOwnedString(self.allocator, &launch.argv, "-c");
+                    try appendOwnedString(self.allocator, &launch.argv, "features.codex_hooks=true");
+                }
+            }
+            return launch;
+        }
+
+        if (builtin.os.tag == .windows) {
+            try self.appendManagedLaunchOwnedArg(&launch, try self.windowsManagedProcessShellAlloc());
+            try appendOwnedString(self.allocator, &launch.argv, "-NoLogo");
+            try appendOwnedString(self.allocator, &launch.argv, "-NoProfile");
+            try appendOwnedString(self.allocator, &launch.argv, "-Command");
+        } else {
+            try appendOwnedString(self.allocator, &launch.argv, "/bin/sh");
+            try appendOwnedString(self.allocator, &launch.argv, "-lc");
+        }
+        try self.appendManagedLaunchOwnedArg(&launch, try self.managedProcessLaunchCommand(process));
+        return launch;
+    }
+
+    fn appendManagedLaunchOwnedArg(self: *AppState, launch: *ManagedProcessLaunch, owned: []u8) !void {
+        errdefer self.allocator.free(owned);
+        try launch.argv.append(self.allocator, owned);
+    }
+
+    fn windowsManagedProcessShellAlloc(self: *AppState) ![]u8 {
+        var env_map = try process_env.buildAugmentedEnvMap(self.allocator);
+        defer env_map.deinit();
+        return process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, "pwsh.exe") catch
+            process_env.resolveExecutableInEnvMapAlloc(self.allocator, &env_map, "powershell.exe") catch
+            error.WindowsPowerShellNotFound;
+    }
+
+    fn argvContains(argv: []const []u8, needle: []const u8) bool {
+        for (argv) |arg| {
+            if (std.mem.indexOf(u8, arg, needle) != null) return true;
+        }
+        return false;
+    }
+
+    fn isCodexExecutable(path: []const u8) bool {
+        const name = std.mem.trimStart(u8, path, " \t\r\n");
+        const base_index = std.mem.lastIndexOfAny(u8, name, "/\\");
+        const base = if (base_index) |index| name[index + 1 ..] else name;
+        return std.ascii.eqlIgnoreCase(base, "codex") or
+            std.ascii.eqlIgnoreCase(base, "codex.exe") or
+            std.ascii.eqlIgnoreCase(base, "codex.cmd") or
+            std.ascii.eqlIgnoreCase(base, "codex.bat");
     }
 
     fn managedProcessLaunchCommand(self: *AppState, process: *const ManagedProcess) ![]u8 {
@@ -12737,7 +13025,7 @@ pub const AppState = struct {
                         .requires_thread = false,
                     };
                     self.beginProviderSlashCommand(command, unknown.args, raw_text) catch |err| {
-                        log.err("failed to start Claude slash command {s}: {s}", .{ unknown.name, @errorName(err) });
+                        log.err("failed to start Claude slash command name_len={d}: {s}", .{ unknown.name.len, @errorName(err) });
                         self.setSidebarNotice("Failed to start Claude slash command.");
                         return true;
                     };
@@ -12857,8 +13145,10 @@ pub const AppState = struct {
 
     fn resolveManagedProcessCwd(self: *AppState, project_path: []const u8, raw_cwd: []const u8) ![]u8 {
         if (raw_cwd.len == 0 or std.mem.eql(u8, raw_cwd, ".")) return self.allocator.dupe(u8, project_path);
-        if (std.fs.path.isAbsolute(raw_cwd)) return self.allocator.dupe(u8, raw_cwd);
-        return std.fs.path.join(self.allocator, &.{ project_path, raw_cwd });
+        const expanded = try platform_paths.expandUserPath(self.allocator, raw_cwd);
+        defer self.allocator.free(expanded);
+        if (std.fs.path.isAbsolute(expanded)) return self.allocator.dupe(u8, expanded);
+        return std.fs.path.join(self.allocator, &.{ project_path, expanded });
     }
 
     fn managedProcessRestartBackoffMs(restart_count: u32) i64 {
@@ -12873,7 +13163,7 @@ pub const AppState = struct {
         const project = &self.projects.items[project_index];
         const signature = self.scanManagedProcessWatchSignature(project.path, process.watch.items) catch |err| {
             process.watch_error_count += 1;
-            log.warn("failed to scan watch patterns for managed process {s}: {s}", .{ process.name, @errorName(err) });
+            log.warn("failed to scan watch patterns for managed process name_len={d}: {s}", .{ process.name.len, @errorName(err) });
             return;
         };
         if (!process.watch_ready or process.watch_signature == 0) {
@@ -13909,6 +14199,7 @@ pub const AppState = struct {
     }
 
     pub fn syncPaletteComposerFromDraft(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
         const draft = self.currentDraft();
         if (std.mem.eql(u8, self.palette_composer.text(), draft)) return;
         const callbacks = self.palette_composer.callbacks;
@@ -13920,6 +14211,7 @@ pub const AppState = struct {
     }
 
     pub fn syncDraftFromPaletteComposer(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
         const text = self.palette_composer.text();
         if (std.mem.eql(u8, self.currentDraft(), text)) return;
         self.setDraft(text);
@@ -13951,6 +14243,7 @@ pub const AppState = struct {
     }
 
     pub fn syncPaletteComposerControls(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
         self.palette_composer.setCallbacks(.{ .context = self, .on_event = paletteComposerPromptEvent, .get_clipboard = paletteComposerGetClipboard });
         self.palette_composer.setStyle(paletteComposerStyle());
         // Composer font sizes are CSS units in the comptime config but the
@@ -14070,6 +14363,7 @@ pub const AppState = struct {
     }
 
     pub fn openPaletteModelCascadeMenu(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
         }
@@ -14113,6 +14407,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
+        if (self.projects.items.len == 0) return false;
         if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const insert_text = self.clampPaletteComposerInsertText(text);
@@ -14129,6 +14424,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
+        if (self.projects.items.len == 0) return false;
         if (self.terminal_focused) return false;
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
         if (palette_key.primary and palette_key.code == .v) {
@@ -14157,6 +14453,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelCascadeMouseButton(point, event.down)) return true;
@@ -14221,6 +14518,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
         if (self.routePaletteModelCascadeMouseMove(point, event.state.left != 0)) return true;
         const input: palette.ComposerPromptInput = if (event.state.left != 0)
@@ -14239,6 +14537,7 @@ pub const AppState = struct {
     }
 
     pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
         if (self.routePaletteModelCascadeWheel(paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
         const handled = self.palette_composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
@@ -14481,6 +14780,7 @@ pub const AppState = struct {
     }
 
     pub fn handleComposerDraftImageClearMouseButton(self: *AppState, x: f32, y: f32, down: bool) bool {
+        if (self.projects.items.len == 0) return false;
         if (!self.composer_draft_image_clear_valid) return false;
         var i: usize = self.composer_draft_image_clear_count;
         while (i > 0) {
@@ -14804,6 +15104,7 @@ pub const AppState = struct {
     }
 
     pub fn handleComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent) bool {
+        if (self.projects.items.len == 0) return false;
         if (!self.composer_input_bounds_valid) return false;
         if (event.mouse_x < self.composer_input_min[0] or event.mouse_x > self.composer_input_max[0]) return false;
         if (event.mouse_y < self.composer_input_min[1] or event.mouse_y > self.composer_input_max[1]) return false;
@@ -15372,7 +15673,6 @@ pub const AppState = struct {
                     return;
                 };
                 self.normalizeCurrentOpencodeThreadModel();
-                self.normalizeOpencodeReasoningVariant(self.currentThreadMutable());
             },
             .failed => {
                 log.warn("failed to refresh OpenCode model cache", .{});
@@ -15734,32 +16034,17 @@ pub const AppState = struct {
         return try allocator.dupeZ(u8, task.command);
     }
 
-    fn readBackgroundTaskPid(allocator: std.mem.Allocator, pid_path: []const u8) ?std.posix.pid_t {
+    fn readBackgroundTaskPid(allocator: std.mem.Allocator, pid_path: []const u8) ?u32 {
         var threaded = std.Io.Threaded.init_single_threaded;
         const raw = std.Io.Dir.cwd().readFileAlloc(threaded.io(), pid_path, allocator, .limited(256)) catch return null;
         defer allocator.free(raw);
         const trimmed = std.mem.trim(u8, raw, "\n\r\t ");
         if (trimmed.len == 0) return null;
-        return std.fmt.parseInt(std.posix.pid_t, trimmed, 10) catch null;
+        return std.fmt.parseInt(u32, trimmed, 10) catch null;
     }
 
-    fn backgroundTaskProcessIsAlive(pid: std.posix.pid_t) bool {
-        if (pid <= 0) return false;
-        const group_alive = blk: {
-            std.posix.kill(-pid, @enumFromInt(0)) catch |group_err| switch (group_err) {
-                error.ProcessNotFound => break :blk false,
-                error.PermissionDenied => break :blk true,
-                else => break :blk false,
-            };
-            break :blk true;
-        };
-        if (group_alive) return true;
-        std.posix.kill(pid, @enumFromInt(0)) catch |pid_err| switch (pid_err) {
-            error.ProcessNotFound => return false,
-            error.PermissionDenied => return true,
-            else => return false,
-        };
-        return true;
+    fn backgroundTaskProcessIsAlive(pid: u32) bool {
+        return platform_process.processIdIsAlive(pid);
     }
 
     fn pollDaemonChatTurn(self: *AppState, thread: *ChatThread) bool {
@@ -16516,7 +16801,7 @@ pub const AppState = struct {
             return;
         }
         if (send_state.daemon_owned) {
-            runtime_log.diagnostic("shutdown leaving daemon-owned send running provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
+            runtime_log.diagnostic("shutdown leaving daemon-owned send running provider={s} thread_title_len={d}", .{ @tagName(thread.provider), thread.title.len });
             send_state.mutex.unlock();
             return;
         }
@@ -16524,7 +16809,7 @@ pub const AppState = struct {
         send_state.stop_signal_sent = false;
         send_state.approval_decision = .deny;
         send_state.condition.broadcast();
-        runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title={s}", .{ @tagName(thread.provider), thread.title });
+        runtime_log.diagnostic("shutdown requested send stop provider={s} thread_title_len={d}", .{ @tagName(thread.provider), thread.title.len });
         send_state.mutex.unlock();
 
         self.issuePendingThreadStop(null, project_path, thread);
@@ -16697,10 +16982,7 @@ pub const AppState = struct {
     }
 
     fn resolveProjectPath(self: *AppState, raw_path: []const u8) ![]u8 {
-        const expanded = if (std.mem.startsWith(u8, raw_path, "~/")) blk: {
-            const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound, 0);
-            break :blk try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ home, raw_path[2..] });
-        } else try self.allocator.dupe(u8, raw_path);
+        const expanded = try platform_paths.expandUserPath(self.allocator, raw_path);
         defer self.allocator.free(expanded);
 
         var threaded = std.Io.Threaded.init_single_threaded;
@@ -16717,16 +16999,20 @@ pub const AppState = struct {
 
     fn findProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
         for (self.projects.items, 0..) |project, index| {
-            if (std.mem.eql(u8, project.path, path)) return index;
+            if (self.projectPathMatches(project.path, path)) return index;
         }
         return null;
     }
 
     fn findArchivedProjectIndexByPath(self: *const AppState, path: []const u8) ?usize {
         for (self.archived_projects.items, 0..) |project, index| {
-            if (std.mem.eql(u8, project.path, path)) return index;
+            if (self.projectPathMatches(project.path, path)) return index;
         }
         return null;
+    }
+
+    fn projectPathMatches(self: *const AppState, left: []const u8, right: []const u8) bool {
+        return platform_paths.projectPathsEqual(self.allocator, left, right) catch std.mem.eql(u8, left, right);
     }
 
     fn findThreadIndexByProviderThreadId(self: *const AppState, project_index: usize, provider: Provider, thread_id: []const u8) ?usize {
@@ -16741,8 +17027,10 @@ pub const AppState = struct {
     }
 
     fn deriveProjectId(self: *AppState, path: []const u8) ![]u8 {
+        const comparison_key = try platform_paths.projectComparisonKeyAllocForOs(self.allocator, builtin.os.tag, path);
+        defer self.allocator.free(comparison_key);
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(path);
+        hasher.update(comparison_key);
         return std.fmt.allocPrint(self.allocator, "{x}", .{hasher.final()});
     }
 
@@ -16804,8 +17092,7 @@ pub const AppState = struct {
             } else |_| {}
         }
 
-        const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return self.allocator.dupe(u8, "."), 0);
-        return self.allocator.dupe(u8, home);
+        return platform_paths.userHome(self.allocator) catch self.allocator.dupe(u8, ".");
     }
 
     fn pushCodeCopyButtonTrampoline(context: *anyopaque, hit: chat_markdown.CodeCopyButtonSink) void {
@@ -17059,8 +17346,8 @@ fn slashCommandWorker(state: *SlashCommandState, request: *SlashCommandWorkerReq
     }
 
     runtime_log.diagnostic(
-        "slash command worker begin provider={s} command={s} thread_id={s}",
-        .{ @tagName(request.provider), @tagName(request.command), request.thread_id orelse "(none)" },
+        "slash command worker begin provider={s} command={s} thread_id_len={d}",
+        .{ @tagName(request.provider), @tagName(request.command), if (request.thread_id) |thread_id| thread_id.len else 0 },
     );
 
     const result = runSlashCommandWorker(page_alloc, request);
@@ -17311,6 +17598,70 @@ fn trailingFileSearchToken(draft: []const u8) ?FileSearchToken {
     };
 }
 
+test "empty workspace ignores hidden composer and slash input" {
+    var state: AppState = undefined;
+    state.projects = .empty;
+    state.selected_project_index = 0;
+
+    try std.testing.expect(!state.slashCommandPickerActive());
+    try std.testing.expectEqual(@as(usize, 0), state.slashCommandPickerRowCount());
+    try std.testing.expect(state.slashCommandPickerRow(0) == null);
+
+    var key_event: sdl.KeyboardEvent = undefined;
+    var button_event: sdl.MouseButtonEvent = undefined;
+    var motion_event: sdl.MouseMotionEvent = undefined;
+    var wheel_event: sdl.MouseWheelEvent = undefined;
+    try std.testing.expect(!state.routePaletteComposerTextInput("ignored"));
+    try std.testing.expect(!state.routePaletteComposerKeyDown(&key_event));
+    try std.testing.expect(!state.routePaletteComposerMouseButton(&button_event, 1.0));
+    try std.testing.expect(!state.routePaletteComposerMouseMotion(&motion_event, 1.0));
+    try std.testing.expect(!state.routePaletteComposerWheel(&wheel_event, 1.0));
+    try std.testing.expect(!state.handleComposerWheel(&wheel_event));
+    try std.testing.expect(!state.handleComposerDraftImageClearMouseButton(0.0, 0.0, true));
+    try std.testing.expect(!state.attachClipboardImageToCurrentDraft());
+    try std.testing.expect(!state.pasteClipboardTextIntoPaletteComposer());
+
+    state.syncPaletteComposerFromDraft();
+    state.syncDraftFromPaletteComposer();
+    state.syncPaletteComposerControls();
+    state.openPaletteModelCascadeMenu();
+    state.clearCurrentDraftImageAt(0);
+}
+
+test "completed OpenCode model refresh tolerates zero workspaces" {
+    const allocator = std.testing.allocator;
+    const page = std.heap.page_allocator;
+
+    const models = try page.alloc(ai_harness.ModelInfo, 1);
+    models[0] = .{
+        .provider_id = try page.dupe(u8, "test-provider"),
+        .provider_name = try page.dupe(u8, "Test Provider"),
+        .model_id = try page.dupe(u8, "test-model"),
+        .model_name = try page.dupe(u8, "Test Model"),
+    };
+
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.projects = .empty;
+    state.selected_project_index = 0;
+    state.opencode_model_options = .empty;
+    state.opencode_reasoning_menu = .empty;
+    state.opencode_model_cache_state = .{
+        .status = .completed,
+        .models = models,
+    };
+    defer {
+        state.clearOpencodeModelOptions();
+        state.opencode_model_options.deinit(allocator);
+        state.opencode_reasoning_menu.deinit(allocator);
+    }
+
+    state.pollOpencodeModelOptionsCache();
+
+    try std.testing.expectEqual(@as(usize, 0), state.projects.items.len);
+    try std.testing.expect(state.opencode_model_options.items.len > 0);
+}
+
 test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     try std.testing.expectEqualStrings("gpt-5.6-sol", DEFAULT_CODEX_MODEL);
     try std.testing.expectEqual(ReasoningEffort.low, DEFAULT_CODEX_REASONING_EFFORT);
@@ -17320,6 +17671,34 @@ test "new Codex threads default to GPT-5.6 Sol with low reasoning" {
     defer thread.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(DEFAULT_CODEX_MODEL, thread.model_ref.?);
     try std.testing.expectEqual(DEFAULT_CODEX_REASONING_EFFORT, thread.reasoning_effort.?);
+}
+
+test "initial send snapshot restores retryable draft and attachment" {
+    const allocator = std.testing.allocator;
+    var thread = try ChatThread.init(allocator, "New thread");
+    defer thread.deinit(allocator);
+    thread.setDraft("retry this prompt");
+    try thread.setDraftImage(allocator, "/tmp/retry.png", "image/png", 42);
+
+    var state: AppState = undefined;
+    state.allocator = allocator;
+    state.image_texture_cache = std.StringHashMap(CachedImageTexture).init(allocator);
+    defer state.image_texture_cache.deinit();
+    state.dirty = false;
+    state.last_dirty_at_ms = 0;
+    state.last_interaction_at_ms = 0;
+
+    var snapshot = try InitialSendSnapshot.init(allocator, &thread);
+    defer snapshot.deinit(allocator);
+    try thread.commitFromPrompt(allocator, thread.currentDraft());
+    try state.appendMessageToThread(&thread, .user, "You", thread.currentDraft(), &thread.draft_image.?, &.{});
+
+    snapshot.restore(&state, &thread);
+    try std.testing.expect(!thread.committed);
+    try std.testing.expectEqualStrings("New thread", thread.title);
+    try std.testing.expectEqual(@as(usize, 0), thread.messages.items.len);
+    try std.testing.expectEqualStrings("retry this prompt", thread.currentDraft());
+    try std.testing.expectEqual(@as(usize, 1), thread.draftImageCount());
 }
 
 test "workspace layout prunes stale root leaves" {
@@ -17383,16 +17762,21 @@ fn unixTimestampSeconds() i64 {
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 fn ensureJsonRpcOk(allocator: std.mem.Allocator, response: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
     defer parsed.deinit();
     _ = try jsonRpcResult(parsed.value);
+}
+
+fn initialSendStartFailureMessage(_: anyerror) []const u8 {
+    return "Verde could not start this message. Your draft and attachments are still in the composer; try Send again.";
+}
+
+fn ambiguousInitialSendFailureMessage() []const u8 {
+    return "Verde could not confirm that the provider request started. Your submitted message is preserved above; copy it before retrying.";
 }
 
 fn jsonRpcResult(value: std.json.Value) !std.json.Value {

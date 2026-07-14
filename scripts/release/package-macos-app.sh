@@ -118,7 +118,7 @@ compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.solid.frag.
 compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.text.frag.msl"
 compile_palette_metallib "$REPO_ROOT/packages/palette/src/shaders/ui.image.frag.msl"
 
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview)
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview -Dversion="$VERSION")
 "${BUILD_ARGS[@]}"
 
 mkdir -p \

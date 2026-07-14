@@ -408,11 +408,17 @@ fn decodeEnumOr(comptime Enum: type, raw: i64, fallback: Enum) Enum {
     return fallback;
 }
 
+fn testDirPathAlloc(dir: std.Io.Dir, allocator: std.mem.Allocator) ![]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try dir.realPath(testing.io, &buffer);
+    return allocator.dupe(u8, buffer[0..len]);
+}
+
 test "save clears orphaned threads left behind by manual db edits" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
     var client = try Client.init(testing.allocator, pref_path);
@@ -442,6 +448,8 @@ test "save clears orphaned threads left behind by manual db edits" {
 
     try client.conn.execNoArgs(
         \\pragma foreign_keys = off;
+        \\delete from messages;
+        \\delete from threads;
         \\delete from app_state;
         \\delete from workspaces;
         \\insert into threads (
@@ -486,7 +494,7 @@ test "save clears orphaned threads left behind by manual db edits" {
     };
     try client.save(recovered_state);
 
-    const loaded = try client.load(testing.allocator);
+    var loaded = try client.load(testing.allocator);
     defer if (loaded) |*state| state.deinit();
 
     try testing.expect(loaded != null);
@@ -500,7 +508,7 @@ test "save and load preserve archived projects and threads" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
     var client = try Client.init(testing.allocator, pref_path);
@@ -563,7 +571,7 @@ test "save and load preserve archived projects and threads" {
     };
     try client.save(archived_state);
 
-    const loaded = try client.load(testing.allocator);
+    var loaded = try client.load(testing.allocator);
     defer if (loaded) |*state| state.deinit();
 
     try testing.expect(loaded != null);
@@ -581,7 +589,7 @@ test "save and load preserve Herdr workspace links" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const pref_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const pref_path = try testDirPathAlloc(tmp.dir, testing.allocator);
     defer testing.allocator.free(pref_path);
 
     var client = try Client.init(testing.allocator, pref_path);
@@ -614,7 +622,7 @@ test "save and load preserve Herdr workspace links" {
     };
     try client.save(state);
 
-    const loaded = try client.load(testing.allocator);
+    var loaded = try client.load(testing.allocator);
     defer if (loaded) |*value| value.deinit();
 
     try testing.expect(loaded != null);

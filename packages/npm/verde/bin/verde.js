@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 const { spawn } = require("node:child_process");
+const { selectRuntimeExecutable } = require("../lib/runtime-executable");
 
 const runtimePackages = {
   "darwin:arm64": "verde-app-darwin-arm64",
   "darwin:x64": "verde-app-darwin-x64",
   "linux:x64": "verde-app-linux-x64",
+  "win32:x64": "verde-app-windows-x64",
 };
 
 function resolveRuntimePackage() {
@@ -39,17 +41,15 @@ if (runtimePackage === null) {
 }
 
 const runtime = loadRuntimePackage(runtimePackage);
-const executablePath =
-  runtime && typeof runtime.getExecutablePath === "function"
-    ? runtime.getExecutablePath()
-    : null;
+const runtimeArgs = process.argv.slice(2);
+const executablePath = selectRuntimeExecutable(runtime, process.platform, runtimeArgs);
 
 if (!executablePath) {
   console.error(`The installed Verde runtime package is invalid: ${runtimePackage}`);
   process.exit(1);
 }
 
-const child = spawn(executablePath, process.argv.slice(2), {
+const child = spawn(executablePath, runtimeArgs, {
   stdio: "inherit",
   env: process.env,
 });

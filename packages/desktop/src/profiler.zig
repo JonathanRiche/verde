@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform_runtime = @import("platform_runtime");
 
 const FRAME_CAPACITY = 240;
 pub const SLOW_FRAME_NS: u64 = 33 * std.time.ns_per_ms;
@@ -66,10 +67,7 @@ var total: usize = 0;
 var sequence: u64 = 0;
 
 pub fn nowNs() i128 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
-        @as(i128, @intCast(ts.nsec));
+    return platform_runtime.monotonicTimestampNs();
 }
 
 pub fn elapsedNs(start: i128) u64 {
@@ -93,10 +91,7 @@ pub fn recordFrame(sample: FrameSample) void {
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 pub fn frameCount() usize {

@@ -1,7 +1,9 @@
 //! Codex provider harness backed by `codex app-server`.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const provider_diagnostics = @import("diagnostics.zig");
+const platform_process = @import("../platform/process.zig");
+const platform_runtime = @import("platform_runtime");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -64,11 +66,7 @@ pub fn providerSlashCommands() []const provider_types.ProviderSlashCommand {
 }
 
 fn sleepMs(ms: u64) void {
-    const request: std.c.timespec = .{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&request, null);
+    platform_runtime.sleepMillis(ms);
 }
 
 const Mutex = struct {
@@ -105,7 +103,7 @@ pub const RemoteSshConfig = struct {
 
 const SharedServerState = struct {
     mutex: Mutex = .{},
-    child: ?std.process.Child = null,
+    child: ?platform_process.OwnedChild = null,
     owns_child: bool = false,
 };
 
@@ -113,7 +111,7 @@ var shared_server_state: SharedServerState = .{};
 
 const RemoteServerState = struct {
     mutex: Mutex = .{},
-    child: ?std.process.Child = null,
+    child: ?platform_process.OwnedChild = null,
     key: ?[]u8 = null,
 };
 
@@ -129,10 +127,10 @@ pub const Client = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Client {
         runtime_log.diagnostic(
-            "codex.Client.init begin transport={s} url={s} cwd={s} launch_on_connect={}",
+            "codex.Client.init begin transport={s} url_len={d} cwd={s} launch_on_connect={}",
             .{
                 @tagName(config.transport),
-                config.websocket_url orelse "(null)",
+                if (config.websocket_url) |url| url.len else 0,
                 config.cwd orelse "(inherit)",
                 config.launch_on_connect,
             },
@@ -295,13 +293,13 @@ pub const Client = struct {
         request: provider_types.SendPromptRequest,
     ) !provider_types.SendPromptResult {
         runtime_log.diagnostic(
-            "codex.sendPrompt begin thread_id={s} model={s} prompt_len={d}",
-            .{ request.thread_id orelse "(new)", request.model orelse "(default)", request.prompt.len },
+            "codex.sendPrompt begin thread_id_len={d} model_len={d} prompt_len={d}",
+            .{ if (request.thread_id) |thread_id| thread_id.len else 0, if (request.model) |model| model.len else 0, request.prompt.len },
         );
         try self.ensureConnected();
 
         const thread_id = if (request.thread_id) |existing| blk: {
-            runtime_log.diagnostic("codex.sendPrompt using existing thread_id={s}", .{existing});
+            runtime_log.diagnostic("codex.sendPrompt using existing thread_id_len={d}", .{existing.len});
             break :blk try allocator.dupe(u8, existing);
         } else blk: {
             runtime_log.diagnostic("codex.sendPrompt starting new thread", .{});
@@ -313,13 +311,13 @@ pub const Client = struct {
             on_thread_id(request.stream_context, thread_id);
         }
 
-        runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id={s}", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt ensuring thread loaded thread_id_len={d}", .{thread_id.len});
         try self.ensureThreadLoaded(thread_id);
 
-        runtime_log.diagnostic("codex.sendPrompt starting turn thread_id={s}", .{thread_id});
+        runtime_log.diagnostic("codex.sendPrompt starting turn thread_id_len={d}", .{thread_id.len});
         const reply = try self.startTurnAndCollectReply(allocator, thread_id, request);
         errdefer allocator.free(reply);
-        runtime_log.diagnostic("codex.sendPrompt completed thread_id={s} reply_len={d}", .{ thread_id, reply.len });
+        runtime_log.diagnostic("codex.sendPrompt completed thread_id_len={d} reply_len={d}", .{ thread_id.len, reply.len });
 
         return .{
             .thread_id = thread_id,
@@ -646,7 +644,7 @@ pub const Client = struct {
         if (self.config.remote_ssh != null) return self.connectRemoteWebSocket();
 
         const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
-        runtime_log.diagnostic("codex.connectWebSocket begin raw_url={s}", .{raw_url});
+        runtime_log.diagnostic("codex.connectWebSocket begin url_len={d}", .{raw_url.len});
         const uri = std.Uri.parse(raw_url) catch |err| {
             runtime_log.diagnostic("codex.connectWebSocket Uri.parse failed: {s}", .{@errorName(err)});
             return err;
@@ -663,7 +661,7 @@ pub const Client = struct {
         }
 
         const port = uri.port orelse 80;
-        runtime_log.diagnostic("codex.connectWebSocket target host={s} port={d}", .{ host, port });
+        runtime_log.diagnostic("codex.connectWebSocket target host_len={d} port={d}", .{ host.len, port });
         if (try self.tryConnectWebSocket(uri, host, port)) |stream| {
             runtime_log.diagnostic("codex.connectWebSocket connected existing server", .{});
             self.stream = stream;
@@ -733,7 +731,7 @@ pub const Client = struct {
     fn connectRemoteWebSocket(self: *Client) !void {
         const remote = self.config.remote_ssh orelse return error.MissingRemoteConfig;
         const raw_url = self.effectiveWebSocketUrl() orelse return error.MissingWebSocketUrl;
-        runtime_log.diagnostic("codex.connectRemoteWebSocket begin host={s} cwd={s} url={s}", .{ remote.host, remote.cwd, raw_url });
+        runtime_log.diagnostic("codex.connectRemoteWebSocket begin host_len={d} cwd={s} url_len={d}", .{ remote.host.len, remote.cwd, raw_url.len });
 
         const uri = std.Uri.parse(raw_url) catch |err| {
             runtime_log.diagnostic("codex.connectRemoteWebSocket Uri.parse failed: {s}", .{@errorName(err)});
@@ -825,29 +823,29 @@ pub const Client = struct {
         defer env_map.deinit();
         var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded_spawn.deinit();
-        const child = std.process.spawn(threaded_spawn.io(), .{
+        var child = platform_process.spawn(self.allocator, threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
             .environ_map = &env_map,
-            .pgid = if (builtin.os.tag == .windows) null else 0,
         }) catch |err| {
-            runtime_log.diagnostic("codex.spawnRemoteWebSocketServer process.spawn failed host={s}: {s}", .{ remote.host, @errorName(err) });
+            runtime_log.diagnostic("codex.spawnRemoteWebSocketServer process.spawn failed host_len={d}: {s}", .{ remote.host.len, @errorName(err) });
             return err;
         };
+        errdefer child.kill(threaded_spawn.io());
 
         const owned_key = try std.heap.page_allocator.dupe(u8, key);
         errdefer std.heap.page_allocator.free(owned_key);
         remote_server_state.child = child;
         remote_server_state.key = owned_key;
-        runtime_log.diagnostic("codex.spawnRemoteWebSocketServer started pid={d} host={s}", .{ child.id orelse -1, remote.host });
+        runtime_log.diagnostic("codex.spawnRemoteWebSocketServer started pid={d} host_len={d}", .{ child.processId() orelse 0, remote.host.len });
     }
 
     fn spawnWebSocketServer(self: *Client, url: []const u8) !void {
         if (shared_server_state.child != null) return;
 
-        runtime_log.diagnostic("codex.spawnWebSocketServer begin url={s}", .{url});
+        runtime_log.diagnostic("codex.spawnWebSocketServer begin url_len={d}", .{url.len});
         var env_map = process_env.buildAugmentedEnvMap(self.allocator) catch |err| {
             runtime_log.diagnostic("codex.spawnWebSocketServer buildAugmentedEnvMap failed: {s}", .{@errorName(err)});
             return err;
@@ -870,20 +868,19 @@ pub const Client = struct {
 
         var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded_spawn.deinit();
-        const child = std.process.spawn(threaded_spawn.io(), .{
+        const child = platform_process.spawn(self.allocator, threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
             .cwd = if (self.config.cwd) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
-            .pgid = if (builtin.os.tag == .windows) null else 0,
         }) catch |err| {
             runtime_log.diagnostic("codex.spawnWebSocketServer process.spawn failed: {s}", .{@errorName(err)});
             return err;
         };
 
-        runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.id orelse -1});
+        runtime_log.diagnostic("codex.spawnWebSocketServer started pid={d}", .{child.processId() orelse 0});
         shared_server_state.child = child;
         shared_server_state.owns_child = true;
     }
@@ -1261,7 +1258,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        runtime_log.diagnostic("Codex RPC turn/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
+        runtime_log.diagnostic("Codex RPC turn/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -1366,7 +1363,11 @@ pub const Client = struct {
                 if (response_id != id) continue;
 
                 if (getObjectField(root, "error")) |rpc_error| {
-                    runtime_log.diagnostic("Codex RPC compact response id={d} returned error: {s}", .{ id, message });
+                    provider_diagnostics.logError(
+                        .codex_compact_rpc,
+                        getOptionalObjectInteger(rpc_error, "code"),
+                        message,
+                    );
                     if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                         if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                     }
@@ -1412,7 +1413,11 @@ pub const Client = struct {
             if (parseMessageId(root)) |response_id| {
                 if (response_id != id) continue;
                 if (getObjectField(root, "error")) |rpc_error| {
-                    runtime_log.diagnostic("Codex RPC review response id={d} returned error: {s}", .{ id, message });
+                    provider_diagnostics.logError(
+                        .codex_review_rpc,
+                        getOptionalObjectInteger(rpc_error, "code"),
+                        message,
+                    );
                     if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                         if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                     }
@@ -1458,7 +1463,11 @@ pub const Client = struct {
             if (parseMessageId(root)) |response_id| {
                 if (response_id != id) continue;
                 if (getObjectField(root, "error")) |rpc_error| {
-                    runtime_log.diagnostic("Codex RPC shell response id={d} returned error: {s}", .{ id, message });
+                    provider_diagnostics.logError(
+                        .codex_shell_rpc,
+                        getOptionalObjectInteger(rpc_error, "code"),
+                        message,
+                    );
                     if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                         if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                     }
@@ -1502,7 +1511,7 @@ pub const Client = struct {
 
         const payload = try writer.toOwnedSlice();
         defer self.allocator.free(payload);
-        runtime_log.diagnostic("Codex RPC review/start id={d} thread_id={s} payload_len={d}", .{ id, thread_id, payload.len });
+        runtime_log.diagnostic("Codex RPC review/start id={d} thread_id_len={d} payload_len={d}", .{ id, thread_id.len, payload.len });
         try self.writeTextMessage(payload);
         return id;
     }
@@ -1524,7 +1533,11 @@ pub const Client = struct {
             if (response_id != id) continue;
 
             if (getObjectField(root, "error")) |rpc_error| {
-                runtime_log.diagnostic("Codex RPC response id={d} returned error: {s}", .{ id, message });
+                provider_diagnostics.logError(
+                    .codex_rpc,
+                    getOptionalObjectInteger(rpc_error, "code"),
+                    message,
+                );
                 if (getOptionalObjectInteger(rpc_error, "code")) |code| {
                     if (code == OVERLOAD_ERROR_CODE) return error.ServerOverloaded;
                 }
@@ -1699,8 +1712,9 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            runtime_log.diagnostic("codex.stopOwnedServer stopping pid={d}", .{child.id orelse -1});
-            stopSpawnedProcessGroup(child);
+            runtime_log.diagnostic("codex.stopOwnedServer stopping pid={d}", .{child.processId() orelse 0});
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1709,27 +1723,15 @@ fn stopOwnedServerLocked() void {
 
 fn stopRemoteServerLocked() void {
     if (remote_server_state.child) |*child| {
-        runtime_log.diagnostic("codex.stopRemoteServer stopping pid={d}", .{child.id orelse -1});
-        stopSpawnedProcessGroup(child);
+        runtime_log.diagnostic("codex.stopRemoteServer stopping pid={d}", .{child.processId() orelse 0});
+        var threaded = std.Io.Threaded.init_single_threaded;
+        child.kill(threaded.io());
         remote_server_state.child = null;
     }
     if (remote_server_state.key) |key| {
         std.heap.page_allocator.free(key);
         remote_server_state.key = null;
     }
-}
-
-fn stopSpawnedProcessGroup(child: *std.process.Child) void {
-    switch (builtin.os.tag) {
-        .windows, .wasi => {},
-        else => if (child.id) |pid| {
-            // The Codex launcher may spawn a native child, so stopping only the
-            // launcher leaves an outdated app-server holding Verde's fixed port.
-            std.posix.kill(-pid, .TERM) catch {};
-        },
-    }
-    var threaded = std.Io.Threaded.init_single_threaded;
-    child.kill(threaded.io());
 }
 
 fn remoteServerKeyAlloc(allocator: std.mem.Allocator, remote: RemoteSshConfig) ![]u8 {
@@ -1933,17 +1935,8 @@ fn writeClientFrame(
 
 fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
     if (buffer.len == 0) return 0;
-
-    while (true) {
-        const result = std.c.recv(stream.socket.handle, buffer.ptr, buffer.len, 0);
-        if (result >= 0) return @intCast(result);
-
-        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-            .INTR => continue,
-            .AGAIN => error.WouldBlock,
-            else => error.InputOutput,
-        };
-    }
+    var threaded = std.Io.Threaded.init_single_threaded;
+    return streamReadWithIo(threaded.io(), stream, buffer);
 }
 
 fn streamReadInterruptible(
@@ -1952,55 +1945,59 @@ fn streamReadInterruptible(
     request: provider_types.SendPromptRequest,
 ) !usize {
     if (buffer.len == 0) return 0;
+    if (request.on_should_stop) |should_stop| {
+        if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
+    }
 
+    const Event = union(enum) {
+        read: std.Io.net.Stream.Reader.Error!usize,
+        poll: std.Io.Cancelable!void,
+    };
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var result_buffer: [2]Event = undefined;
+    var select = std.Io.Select(Event).init(io, &result_buffer);
+    defer select.cancelDiscard();
+
+    try select.concurrent(.read, streamReadWithIo, .{ io, stream, buffer });
+    try select.concurrent(.poll, std.Io.sleep, .{
+        io,
+        std.Io.Duration.fromMilliseconds(INTERRUPTIBLE_READ_POLL_MS),
+        std.Io.Clock.awake,
+    });
     while (true) {
-        if (request.on_should_stop) |should_stop| {
-            if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
-        }
-
-        var fds = [_]std.c.pollfd{.{
-            .fd = stream.socket.handle,
-            .events = std.c.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = std.c.poll(&fds, fds.len, INTERRUPTIBLE_READ_POLL_MS);
-        if (ready < 0) {
-            switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-                .INTR => continue,
-                else => return error.InputOutput,
-            }
-        }
-        if (ready == 0) continue;
-        if ((fds[0].revents & (std.c.POLL.ERR | std.c.POLL.HUP | std.c.POLL.NVAL)) != 0) return error.EndOfStream;
-        if ((fds[0].revents & std.c.POLL.IN) == 0) continue;
-
-        const result = std.c.recv(stream.socket.handle, buffer.ptr, buffer.len, 0);
-        if (result >= 0) return @intCast(result);
-
-        switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-            .INTR => continue,
-            .AGAIN => continue,
-            else => return error.InputOutput,
+        switch (try select.await()) {
+            .read => |result| return try result,
+            .poll => |result| {
+                try result;
+                if (request.on_should_stop) |should_stop| {
+                    if (should_stop(request.stream_context)) return error.CodexTurnInterrupted;
+                }
+                try select.concurrent(.poll, std.Io.sleep, .{
+                    io,
+                    std.Io.Duration.fromMilliseconds(INTERRUPTIBLE_READ_POLL_MS),
+                    std.Io.Clock.awake,
+                });
+            },
         }
     }
 }
 
-fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
-    var index: usize = 0;
-    while (index < bytes.len) {
-        const result = std.c.send(stream.socket.handle, bytes[index..].ptr, bytes.len - index, 0);
-        if (result > 0) {
-            index += @intCast(result);
-            continue;
-        }
-        if (result == 0) return error.EndOfStream;
+fn streamReadWithIo(io: std.Io, stream: std.Io.net.Stream, buffer: []u8) std.Io.net.Stream.Reader.Error!usize {
+    var reader_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &reader_buffer);
+    return reader.interface.readSliceShort(buffer) catch {
+        return reader.err orelse error.Unexpected;
+    };
+}
 
-        return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-            .INTR => continue,
-            .AGAIN => error.WouldBlock,
-            else => error.InputOutput,
-        };
-    }
+fn streamWriteAll(stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var buffer: [16 * 1024]u8 = undefined;
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var writer = stream.writer(threaded.io(), &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
 }
 
 fn readServerFrameAlloc(allocator: std.mem.Allocator, stream: std.Io.net.Stream) !Frame {
@@ -2532,9 +2529,7 @@ fn writeResetTime(writer: anytype, resets_at: i64) !void {
 }
 
 fn unixTimestampSeconds() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @intCast(ts.sec);
+    return @divTrunc(platform_runtime.unixTimestampMs(), std.time.ms_per_s);
 }
 
 fn pluralSuffix(count: i64) []const u8 {

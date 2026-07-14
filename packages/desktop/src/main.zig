@@ -15,6 +15,8 @@ const cli = @import("cli.zig");
 const live_ipc = @import("ipc/server.zig");
 const loop_wakeup = @import("loop_wakeup.zig");
 const keybinds = @import("keybinds.zig");
+const platform_runtime = @import("platform_runtime");
+const windows_integrations = @import("platform/windows/integrations.zig");
 const profiler = @import("profiler.zig");
 const runtime_log = @import("runtime_log.zig");
 const stb_image = @import("stb_image.zig");
@@ -29,6 +31,14 @@ const terminal_panel_ui = @import("ui/terminal_panel.zig");
 const palette_frame_renderer = @import("ui/palette_frame_renderer.zig");
 const ui_theme = @import("ui/theme.zig");
 const colors = @import("ui/colors.zig");
+
+comptime {
+    if (builtin.os.tag == .windows and
+        (!build_options.terminal_backend or !build_options.local_ipc or !build_options.windows_integrations))
+    {
+        @compileError("Windows desktop artifacts require the terminal, local IPC, and native integration backends");
+    }
+}
 
 const native_state = @import("state.zig");
 const AppState = native_state.AppState;
@@ -199,6 +209,10 @@ fn mainInner(init: std.process.Init) !void {
         .launch_app => {},
     }
 
+    if (builtin.os.tag == .windows and !windows_integrations.setProcessAppUserModelId()) {
+        log.warn("failed to set Windows application identity to {s}", .{windows_integrations.app_user_model_id});
+    }
+
     _ = SDL_SetHint("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY", "1");
     // SDL defaults SDL_VIDEO_ALLOW_SCREENSAVER to "0", which makes it inhibit
     // the OS idle/screensaver for the whole window lifetime (on Wayland via the
@@ -211,7 +225,7 @@ fn mainInner(init: std.process.Init) !void {
         _ = SDL_SetHint("SDL_WINDOW_ACTIVATE_WHEN_RAISED", "1");
         _ = SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
     }
-    try sdl.setAppMetadata("verde Native", "0.0.0", "com.verde.native");
+    try sdl.setAppMetadata("verde Native", build_options.version, "com.verde.native");
     try sdl.init(.{ .video = true, .events = true });
     loop_wakeup.init();
     defer {
@@ -657,8 +671,11 @@ fn paletteGpuFontPath(
     bytes: []const u8,
     dev_candidates: []const [:0]const u8,
 ) ![:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     for (dev_candidates) |candidate| {
-        if (std.c.access(candidate.ptr, std.c.R_OK) != 0) continue;
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
         return try allocator.dupeZ(u8, candidate);
     }
 
@@ -695,6 +712,10 @@ fn ghosttyFontFamily(allocator: std.mem.Allocator) !?[]u8 {
 }
 
 fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var compact = std.ArrayList(u8).empty;
     defer compact.deinit(allocator);
     for (family) |byte| {
@@ -709,8 +730,11 @@ fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 
     };
     for (candidates) |dir| {
         const path = try allocFontCandidatePath(allocator, dir, compact_name);
-        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
-        allocator.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        return path;
     }
 
     const home = std.c.getenv("HOME") orelse return null;
@@ -723,8 +747,11 @@ fn fontPathForFamily(allocator: std.mem.Allocator, family: []const u8) !?[:0]u8 
         const parent = try std.fs.path.join(allocator, &.{ home_slice, dir });
         defer allocator.free(parent);
         const path = try allocFontCandidatePath(allocator, parent, compact_name);
-        if (std.c.access(path.ptr, std.c.R_OK) == 0) return path;
-        allocator.free(path);
+        std.Io.Dir.cwd().access(io, path, .{}) catch {
+            allocator.free(path);
+            continue;
+        };
+        return path;
     }
     return null;
 }
@@ -1136,9 +1163,9 @@ fn eventWaitTimeoutMs(state: *AppState) c_int {
     }
     // Terminal output only reaches the screen when the loop wakes and polls
     // (daemon sessions tail over an RPC; there is no fd to push a wake from).
-    // While output was seen recently, poll at display rate so TUI redraws
-    // aren't capped at the idle cadence; decays back to idle on quiet panes.
-    if (state.terminalOutputBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
+    // Recent input starts the same display-rate window before ConPTY has an
+    // echo ready, while output extends it for continuously redrawing TUIs.
+    if (state.terminalActivityBurstActive()) return ACTIVE_WAIT_TIMEOUT_MS;
     if (state.sidebar_pulse_animating) return PIP_PULSE_WAIT_TIMEOUT_MS;
     // While a chat turn is pending we still want the wall-clock "Working"
     // label to tick. pollSend bumps once per whole second; this just caps
@@ -1384,8 +1411,8 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             }
             if (browserInputDebugEnabled()) {
                 log.info(
-                    "browser-input sdl text_input text=\"{s}\" timestamp={} focused={} native_focused={} visible={}",
-                    .{ text_input, event.text.timestamp, state.isBrowserPaneFocused(), native_browser_focused, state.isBrowserVisible() },
+                    "browser-input sdl text_input text_len={d} timestamp={} focused={} native_focused={} visible={}",
+                    .{ text_input.len, event.text.timestamp, state.isBrowserPaneFocused(), native_browser_focused, state.isBrowserVisible() },
                 );
             }
             const browser_text_handled = state.handleBrowserKey(.{
@@ -2169,9 +2196,7 @@ fn noteMacosWorkspaceCloseShortcut(event: *const sdl.KeyboardEvent, action: keyb
 }
 
 fn currentTimeMillis() i64 {
-    var tv: std.c.timeval = undefined;
-    if (std.c.gettimeofday(&tv, null) != 0) return 0;
-    return (@as(i64, @intCast(tv.sec)) * std.time.ms_per_s) + @divTrunc(@as(i64, @intCast(tv.usec)), std.time.us_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 fn activateMacosHostWindow(window: *sdl.Window) void {
@@ -2197,7 +2222,7 @@ fn suppressDuplicateMacosTextInput(text: []const u8, timestamp_ns: u64) bool {
     @memcpy(macos_last_text_input[0..macos_last_text_input_len], text[0..macos_last_text_input_len]);
 
     if (duplicate) {
-        runtime_log.diagnostic("suppressed duplicate macOS text_input text=\"{s}\" timestamp={}", .{ text, timestamp_ns });
+        runtime_log.diagnostic("suppressed duplicate macOS text_input text_len={d} timestamp={}", .{ text.len, timestamp_ns });
     }
     return duplicate;
 }
@@ -2315,7 +2340,11 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
 }
 
 test {
+    _ = @import("ipc/server.zig");
+    _ = @import("platform/mod.zig");
     _ = @import("providers/claude.zig");
+    _ = @import("providers/diagnostics.zig");
     _ = @import("slash_commands.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("windows_conpty_compile_test.zig");
 }
