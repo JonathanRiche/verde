@@ -33,17 +33,16 @@ preview asset directory, use:
 npm run package:npm -- --platform windows-x64 <version> <release-assets-dir> <output-dir>
 ```
 
-Native Windows CI runs `scripts\dev\smoke-windows.ps1`, which launches the GUI
-from an absent persisted-state database, requires the runtime to report zero
-workspaces while opening the browser, waits through the console CLI for
-WebView2 to report a ready native child view, and verifies a
-navigation-completed JavaScript evaluation. It writes cleanup/status evidence
+Before a release, `scripts\dev\smoke-windows.ps1` can launch the GUI from an
+absent persisted-state database, require the runtime to report zero workspaces
+while opening the browser, wait through the console CLI for WebView2 to report
+a ready native child view, verify a navigation-completed JavaScript evaluation,
+and exercise the persistent terminal session. It writes cleanup/status evidence
 below `.zig-cache\windows-smoke\evidence` and copies the pref-directory
-`verde.stderr.log` there when that log exists. A missing diagnostics log is
-recorded but does not invalidate otherwise successful browser readiness. This
-is an automated startup-readiness gate only. It does not claim physical D3D12
-rendering, DPI, keyboard/IME, pointer/clipboard, focus, overlay z-order, or
-repeated-lifecycle validation; those remain in `WINDOWS-TESTING.md`.
+`verde.stderr.log` there when that log exists. This is a startup-readiness gate,
+not a substitute for physical D3D12 rendering, DPI, keyboard/IME,
+pointer/clipboard, focus, overlay z-order, or repeated-lifecycle validation;
+those remain in `WINDOWS-TESTING.md`.
 
 Verde live and session control use current-logon named pipes and require no
 firewall exception. Codex app-server and OpenCode use separate loopback-only
@@ -62,27 +61,21 @@ timestamping. A stable installer is deferred until certificate ownership,
 upgrade/downgrade behavior, uninstall cleanup, shortcut migration, and toast
 activation are validated.
 
-## GitHub Actions setup
+## GitHub Actions release flow
 
-The `Windows native smoke` workflow runs its `Windows build and smoke` job on
-every pull request, merge-queue check, push to `master`, and manual dispatch.
-It uses the native MSVC toolchain on `windows-2022`, compiles the Windows test
-targets, exercises WebView2 and ConPTY at runtime, and validates an extracted
-deterministic ZIP.
-PR packages are unsigned and retained for seven days; executable ZIPs are not
-uploaded from untrusted fork pull requests.
+The repository does not run an automatic pull-request or `master`-push build.
+The `Release` workflow is the build gate for Linux, both macOS architectures,
+and Windows. Its Windows job uses the native MSVC toolchain on `windows-2022`,
+compiles the Windows test targets, builds the package, and verifies the
+extracted deterministic ZIP. Run `scripts\dev\smoke-windows.ps1` explicitly on
+a Windows test host when runtime WebView2 and ConPTY readiness must be repeated
+before tagging.
 
-After the workflow has completed once on the pull request, configure the
-repository's `master` branch protection or ruleset to require the `Windows build
-and smoke` check, shown under the `Windows native smoke` workflow. The workflow
-intentionally has no path filter so a required check cannot remain pending when
-an unrelated-looking change affects shared build or provider code.
-
-The `Release` workflow builds Linux, both macOS architectures, and Windows. A
-manual dispatch is an unsigned rehearsal with a `manual-*` version. Only a
-GitHub `push` event for a `v*` tag can receive the Windows signing material or
-publish a release. Signing is optional; configure both of these Actions
-repository secrets together when ready to enable it:
+A manual Release dispatch is an unsigned rehearsal with a `manual-*` version;
+it uploads artifacts but does not publish a GitHub release. Only a GitHub
+`push` event for a `v*` tag can receive the Windows signing material and publish
+the release. Signing is optional; configure both of these Actions repository
+secrets together when ready to enable it:
 
 - `WINDOWS_SIGNING_CERTIFICATE_BASE64`: base64-encoded Authenticode PFX.
 - `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: password for that PFX.
