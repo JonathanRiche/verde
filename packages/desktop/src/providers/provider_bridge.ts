@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import readline from "node:readline";
-import { extname } from "node:path";
+import { Buffer } from "node:buffer";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
 import * as claudeSdkStatic from "@anthropic-ai/claude-agent-sdk";
 
 const write = (message) => {
@@ -152,20 +154,41 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
+function powershellQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function powershellInvocation(script) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}`;
+}
+
 function randomTaskId() {
   return `vbg${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function detachedTaskPaths(taskId) {
+  const base = process.platform === "win32" ? tmpdir() : "/tmp";
+  const commandSuffix = process.platform === "win32" ? ".command.ps1" : ".command";
   return {
-    command: `/tmp/verde-claude-bg-${taskId}.command`,
-    log: `/tmp/verde-claude-bg-${taskId}.log`,
-    pid: `/tmp/verde-claude-bg-${taskId}.pid`,
+    command: join(base, `verde-claude-bg-${taskId}${commandSuffix}`),
+    log: join(base, `verde-claude-bg-${taskId}.log`),
+    pid: join(base, `verde-claude-bg-${taskId}.pid`),
   };
 }
 
 function detachedTaskStopCommand(taskId) {
   const { pid } = detachedTaskPaths(taskId);
+  if (process.platform === "win32") {
+    return powershellInvocation([
+      `$rawPid = [System.IO.File]::ReadAllText(${powershellQuote(pid)}).Trim()`,
+      "$taskPid = 0",
+      "if (-not [int]::TryParse($rawPid, [ref]$taskPid)) { throw 'Invalid Verde background task PID' }",
+      "$taskkill = Join-Path $env:SystemRoot 'System32\\taskkill.exe'",
+      "& $taskkill '/PID' ([string]$taskPid) '/T' '/F'",
+      "if ($LASTEXITCODE -ne 0) { throw 'Failed to stop Verde background task tree' }",
+    ].join("; "));
+  }
   return `pid=$(cat ${shellQuote(pid)}); kill -TERM -- -$pid 2>/dev/null || kill -TERM "$pid"`;
 }
 
@@ -174,11 +197,12 @@ function detachedTaskSummary(taskId) {
   return [
     `Verde task ID: ${taskId}`,
     `Output log: ${paths.log}`,
+    `PID file: ${paths.pid}`,
     `Stop command: ${detachedTaskStopCommand(taskId)}`,
   ].join("\n");
 }
 
-function detachedShellCommand(command, taskId) {
+function detachedPosixShellCommand(command, taskId) {
   const paths = detachedTaskPaths(taskId);
   const quotedCommand = shellQuote(command);
   const quotedCommandFile = shellQuote(paths.command);
@@ -192,6 +216,28 @@ function detachedShellCommand(command, taskId) {
     `printf '%s\\n' "$pid" > ${quotedPid}`,
     `printf 'Verde background task ${taskId} started. PID: %s. Output log: ${paths.log}. Stop command: %s\\n' "$pid" ${quotedStop}`,
   ].join("; ");
+}
+
+function detachedPowerShellCommand(command, taskId) {
+  const paths = detachedTaskPaths(taskId);
+  const childScript = `& ${powershellQuote(paths.command)} *> ${powershellQuote(paths.log)}`;
+  const childEncoded = Buffer.from(childScript, "utf16le").toString("base64");
+  const launcher = [
+    "$ErrorActionPreference = 'Stop'",
+    `$utf8 = New-Object System.Text.UTF8Encoding($false)`,
+    `[System.IO.File]::WriteAllText(${powershellQuote(paths.command)}, ${powershellQuote(command)}, $utf8)`,
+    `$childArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', '${childEncoded}')`,
+    "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $childArgs -WorkingDirectory (Get-Location).Path -WindowStyle Hidden -PassThru",
+    `[System.IO.File]::WriteAllText(${powershellQuote(paths.pid)}, [string]$child.Id, $utf8)`,
+    `Write-Output ('Verde background task ${taskId} started. PID: ' + $child.Id + '. Output log: ${String(paths.log).replaceAll("'", "''")}')`,
+  ].join("; ");
+  return powershellInvocation(launcher);
+}
+
+function detachedShellCommand(command, taskId) {
+  return process.platform === "win32"
+    ? detachedPowerShellCommand(command, taskId)
+    : detachedPosixShellCommand(command, taskId);
 }
 
 function backgroundTaskResultTitle(status) {

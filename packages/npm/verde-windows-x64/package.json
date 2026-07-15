@@ -1,0 +1,34 @@
+{
+  "name": "verde-app-windows-x64",
+  "version": "0.1.27",
+  "description": "Windows x64 runtime package for Verde",
+  "license": "MIT",
+  "homepage": "https://github.com/JonathanRiche/verde",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonathanRiche/verde.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "app",
+    "bin",
+    "share",
+    "README.md",
+    "LICENSE",
+    "WINDOWS-RUNTIME.txt",
+    "WINDOWS-SIGNING.json",
+    "WINDOWS-TESTING.md",
+    "WINDOWS-PREVIEW.md",
+    "WINDOWS-IMPLEMENTATION.md",
+    "PACKAGE-MANIFEST.json",
+    "SHA256SUMS.txt",
+    "test-terminal.ps1",
+    "install.ps1",
+    "index.js"
+  ]
+}

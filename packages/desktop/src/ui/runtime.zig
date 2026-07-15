@@ -10,6 +10,7 @@ pub const PaletteModalAction = native_state.PaletteModalAction;
 pub const PaletteModalHit = native_state.PaletteModalHit;
 pub const PaletteModalTextFocus = native_state.PaletteModalTextFocus;
 pub const Provider = native_state.Provider;
+pub const ProviderReadiness = native_state.ProviderReadiness;
 pub const SurfaceStatus = native_state.SurfaceStatus;
 pub const WorkspaceNode = native_state.WorkspaceNode;
 pub const WorkspacePaneId = native_state.WorkspacePaneId;

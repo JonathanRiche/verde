@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     examples_step.dependOn(&b.addRunArtifact(component_catalog_tests).step);
 
     const test_step = b.step("test", "Run unit tests");
-    const gpu_backends_step = b.step("test-gpu-backends", "Validate SDL_GPU Vulkan/Metal renderer coverage");
+    const gpu_backends_step = b.step("test-gpu-backends", "Validate SDL_GPU Vulkan/Metal/D3D12 renderer coverage");
     const compile_shader_steps = compileGpuShaders(b);
     const exe_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -275,6 +275,7 @@ fn compileGpuShaders(b: *std.Build) *std.Build.Step {
         .{ .stage = "vertex", .input = "src/shaders/ui.vert.glsl", .output = "src/shaders/ui.vert.spv" },
         .{ .stage = "fragment", .input = "src/shaders/ui.solid.frag.glsl", .output = "src/shaders/ui.solid.frag.spv" },
         .{ .stage = "fragment", .input = "src/shaders/ui.text.frag.glsl", .output = "src/shaders/ui.text.frag.spv" },
+        .{ .stage = "fragment", .input = "src/shaders/ui.image.frag.glsl", .output = "src/shaders/ui.image.frag.spv" },
     };
     for (shaders) |shader| {
         const compile = b.addSystemCommand(&.{

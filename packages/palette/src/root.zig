@@ -3,6 +3,7 @@
 const std = @import("std");
 
 pub const atlas = @import("atlas.zig");
+pub const clock = @import("clock.zig");
 pub const draw = @import("draw.zig");
 pub const image_loader = @import("image_loader.zig");
 pub const input_clipboard = @import("input/clipboard.zig");
@@ -247,6 +248,7 @@ pub fn textArea(comptime config: TextAreaConfig) type {
 
 test {
     _ = draw;
+    _ = clock;
     _ = image_loader;
     _ = input_clipboard;
     _ = input_key;

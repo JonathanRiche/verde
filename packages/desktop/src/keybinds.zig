@@ -825,7 +825,7 @@ pub const NativeKeyboardConfig = struct {
         }
 
         const parsed = parseAccelerator(trimmed) orelse {
-            log.warn("ignoring invalid keybind for {s}: {s}", .{ field_name, trimmed });
+            log.warn("ignoring invalid keybind for {s} value_len={d}", .{ field_name, trimmed.len });
             return self.allocator.alloc(Keybind, 0) catch null;
         };
 
@@ -854,7 +854,7 @@ pub const NativeKeyboardConfig = struct {
             }
 
             const binding = parseAccelerator(trimmed) orelse {
-                log.warn("ignoring invalid keybind for {s}: {s}", .{ field_name, trimmed });
+                log.warn("ignoring invalid keybind for {s} value_len={d}", .{ field_name, trimmed.len });
                 continue;
             };
 

@@ -5,6 +5,11 @@ const assert = std.debug.assert;
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
+    const use_prebuilt = b.option(
+        bool,
+        "use-prebuilt",
+        "Resolve bundled SDL libraries for zsdl tests and install steps",
+    ) orelse true;
 
     const zsdl2_module = b.addModule("zsdl2", .{
         .root_source_file = b.path("src/sdl2.zig"),
@@ -34,7 +39,7 @@ pub fn build(b: *std.Build) void {
         { // Test SDL2 bindings
             const zsdl2_tests = addTests(test_step, target, optimize, "zsdl2-tests", "src/sdl2.zig");
             link_SDL2_libs_testing(zsdl2_tests);
-            prebuilt_sdl2.addLibraryPathsTo(zsdl2_tests);
+            if (use_prebuilt) prebuilt_sdl2.addLibraryPathsTo(zsdl2_tests);
         }
         { // Test SDL2_ttf bindings
             const zsdl2_ttf_tests = addTestsAux(
@@ -47,7 +52,7 @@ pub fn build(b: *std.Build) void {
                 zsdl2_module,
             );
             link_SDL2_libs_testing(zsdl2_ttf_tests);
-            prebuilt_sdl2.addLibraryPathsTo(zsdl2_ttf_tests);
+            if (use_prebuilt) prebuilt_sdl2.addLibraryPathsTo(zsdl2_ttf_tests);
         }
         { // Test SDL2_image bindings
             const zsdl2_image_tests = addTestsAux(
@@ -60,20 +65,22 @@ pub fn build(b: *std.Build) void {
                 zsdl2_module,
             );
             link_SDL2_libs_testing(zsdl2_image_tests);
-            prebuilt_sdl2.addLibraryPathsTo(zsdl2_image_tests);
+            if (use_prebuilt) prebuilt_sdl2.addLibraryPathsTo(zsdl2_image_tests);
         }
         { // Test SDL3 bindings
             const zsdl3_tests = addTests(test_step, target, optimize, "zsdl3-tests", "src/sdl3.zig");
             link_SDL3_libs_testing(zsdl3_tests);
-            prebuilt_sdl3.addLibraryPathsTo(zsdl3_tests);
+            if (use_prebuilt) prebuilt_sdl3.addLibraryPathsTo(zsdl3_tests);
         }
 
-        if (prebuilt_sdl2.install(b, target.result, .bin, .{ .ttf = true, .image = true })) |install_sdl2_step| {
-            b.getInstallStep().dependOn(install_sdl2_step);
-        }
+        if (use_prebuilt) {
+            if (prebuilt_sdl2.install(b, target.result, .bin, .{ .ttf = true, .image = true })) |install_sdl2_step| {
+                b.getInstallStep().dependOn(install_sdl2_step);
+            }
 
-        if (prebuilt_sdl3.install(b, target.result, .bin, .{})) |install_sdl3_step| {
-            b.getInstallStep().dependOn(install_sdl3_step);
+            if (prebuilt_sdl3.install(b, target.result, .bin, .{})) |install_sdl3_step| {
+                b.getInstallStep().dependOn(install_sdl3_step);
+            }
         }
     }
 }
@@ -153,7 +160,8 @@ pub const prebuilt_sdl2 = struct {
         const target = compile_step.rootModuleTarget();
         switch (target.os.tag) {
             .windows => {
-                if (target.cpu.arch.isX86()) {
+                // This archive only contains GNU-compatible import libraries.
+                if (target.cpu.arch == .x86_64 and target.abi.isGnu()) {
                     if (b.lazyDependency("sdl2_prebuilt_x86_64_windows_gnu", .{})) |sdl2_prebuilt| {
                         compile_step.root_module.addLibraryPath(sdl2_prebuilt.path("lib"));
                     }
@@ -188,7 +196,7 @@ pub const prebuilt_sdl2 = struct {
 
         switch (target.os.tag) {
             .windows => {
-                if (target.cpu.arch.isX86()) {
+                if (target.cpu.arch == .x86_64 and target.abi.isGnu()) {
                     if (b.lazyDependency("sdl2_prebuilt_x86_64_windows_gnu", .{})) |sdl2_prebuilt| {
                         install_step.dependOn(&b.addInstallFileWithDir(
                             sdl2_prebuilt.path("bin/SDL2.dll"),
@@ -273,7 +281,8 @@ pub const prebuilt_sdl3 = struct {
         const target = compile_step.rootModuleTarget();
         switch (target.os.tag) {
             .windows => {
-                if (target.cpu.arch.isX86()) {
+                // This archive only contains GNU-compatible import libraries.
+                if (target.cpu.arch == .x86_64 and target.abi.isGnu()) {
                     if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
                         compile_step.root_module.addLibraryPath(sdl3_prebuilt.path("bin"));
                     }
@@ -306,7 +315,7 @@ pub const prebuilt_sdl3 = struct {
         _ = aux_libs;
         switch (target.os.tag) {
             .windows => {
-                if (target.cpu.arch.isX86()) {
+                if (target.cpu.arch == .x86_64 and target.abi.isGnu()) {
                     if (b.lazyDependency("sdl3_prebuilt_x86_64_windows_gnu", .{})) |sdl3_prebuilt| {
                         return &b.addInstallFileWithDir(
                             sdl3_prebuilt.path("bin/SDL3.dll"),

@@ -1,0 +1,3 @@
+#define VERDE_ICON 101
+
+VERDE_ICON ICON "verde.ico"

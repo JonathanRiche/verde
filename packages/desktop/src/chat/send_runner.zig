@@ -61,11 +61,11 @@ pub fn run(allocator: std.mem.Allocator, request: Request, sink: Sink) !Result {
         .cursor => harness.ProviderConfig{ .cursor = .{ .cwd = request_cwd, .model = request.model_ref } },
     };
 
-    log.info("send starting provider={s} cwd={s} model={s} thread_id={s} prompt_len={d}", .{
+    log.info("send starting provider={s} cwd={s} model_len={d} thread_id_len={d} prompt_len={d}", .{
         @tagName(request.provider),
         request_cwd,
-        request.model_ref orelse "(default)",
-        request.provider_thread_id orelse "(new)",
+        if (request.model_ref) |model| model.len else 0,
+        if (request.provider_thread_id) |thread_id| thread_id.len else 0,
         request.prompt.len,
     });
 

@@ -41,6 +41,7 @@ pub fn handleSettingsModalWheel(state: *runtime.AppState, width: f32, height: f3
 /// processed. `renderRoot` runs after `processEvents`, so hits must not depend on that order.
 pub fn refreshPaletteModalHits(state: *runtime.AppState, width: f32, height: f32) void {
     state.palette_modal_hits.clearRetainingCapacity();
+    registerProviderOnboardingHits(state, width, height);
     registerImageModalHits(state, width, height);
     registerTranscriptSelectionModalHits(state, width, height);
     registerWorkspaceAddModalHits(state, width, height);
@@ -148,6 +149,7 @@ pub fn renderRoot(state: *runtime.AppState, width: f32, height: f32) void {
     renderWorkspaceRenameModal(state, width, height);
     renderThreadImportModal(state, width, height);
     renderHerdrProfilePickerModal(state, width, height);
+    renderProviderOnboardingModal(state, width, height);
     settings_modal.render(state, width, height);
     command_palette.render(state, width, height);
     debug_window.render(state, width, height);
@@ -478,6 +480,9 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
         }
         if (!down) return true;
         switch (hit.action) {
+            .provider_onboarding_close => state.dismissProviderOnboarding(),
+            .provider_onboarding_recheck => state.recheckProviderReadiness(),
+            .provider_onboarding_open_guide => state.openProviderSetupGuide(),
             .image_close => state.closeImageModal(),
             .project_rename_cancel => state.cancelProjectRename(),
             .project_rename_submit => state.finishProjectRename(),
@@ -592,6 +597,7 @@ pub fn handlePaletteTextInput(state: *runtime.AppState, text: []const u8) bool {
 
 pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.KeyboardEvent) bool {
     const has_modal_open = state.modal_image_path != null or
+        state.provider_onboarding_visible or
         state.rename_project_index != null or
         state.transcriptSelectionBuffer() != null or
         state.thread_import_provider != null or
@@ -611,6 +617,10 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
             return true;
         },
         .@"return", .kp_enter => {
+            if (state.provider_onboarding_visible) {
+                state.recheckProviderReadiness();
+                return true;
+            }
             if (state.palette_modal_text_focus == .project_rename) {
                 state.finishProjectRename();
                 return true;
@@ -708,7 +718,9 @@ fn dismissTopModal(state: *runtime.AppState) void {
         state.closeCommandPalette();
         return;
     }
-    if (state.modal_image_path != null) {
+    if (state.provider_onboarding_visible) {
+        state.dismissProviderOnboarding();
+    } else if (state.modal_image_path != null) {
         state.closeImageModal();
     } else if (state.transcriptSelectionBuffer() != null) {
         state.closeTranscriptSelectionModal();
@@ -827,6 +839,28 @@ fn registerTranscriptSelectionModalHits(state: *runtime.AppState, width: f32, he
     const pad = theme.scaledUi(18.0);
     const close_rect: palette.Rect = .{ .x = modal.x + pad, .y = modal.y + modal.h - pad - theme.scaledUi(34.0), .w = theme.scaledUi(112.0), .h = theme.scaledUi(34.0) };
     queueModalHit(state, close_rect, .transcript_close, 0);
+}
+
+fn providerOnboardingRect(width: f32, height: f32) palette.Rect {
+    const modal_w = theme.clampf(width * 0.54, theme.scaledUi(540.0), theme.scaledUi(720.0));
+    const modal_h = theme.clampf(height * 0.78, theme.scaledUi(500.0), theme.scaledUi(620.0));
+    return .{ .x = (width - modal_w) * 0.5, .y = (height - modal_h) * 0.5, .w = modal_w, .h = modal_h };
+}
+
+fn registerProviderOnboardingHits(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.provider_onboarding_visible) return;
+    const modal = providerOnboardingRect(width, height);
+    registerModalChromeHits(state, width, height, modal, false);
+    const pad = theme.scaledUi(22.0);
+    const button_h = theme.scaledUi(36.0);
+    const gap = theme.scaledUi(10.0);
+    const close_w = theme.scaledUi(104.0);
+    const guide_w = theme.scaledUi(156.0);
+    const check_w = theme.scaledUi(126.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    queueModalHit(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, .provider_onboarding_close, 0);
+    queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, .provider_onboarding_recheck, 0);
+    queueModalHit(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, .provider_onboarding_open_guide, 0);
 }
 
 fn registerWorkspaceAddModalHits(state: *runtime.AppState, width: f32, height: f32) void {
@@ -950,6 +984,91 @@ fn registerHerdrProfilePickerHits(state: *runtime.AppState, width: f32, height: 
 }
 
 /// Shows the attachment preview modal for the selected image.
+// Renders the first-run provider checklist when no authenticated GUI provider is available.
+fn renderProviderOnboardingModal(state: *runtime.AppState, width: f32, height: f32) void {
+    if (!state.provider_onboarding_visible) return;
+    const modal = providerOnboardingRect(width, height);
+    drawModalChromeVisual(state, width, height, modal);
+    const pad = theme.scaledUi(22.0);
+    const clip = modal;
+    var y = modal.y + pad;
+
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(28.0) }, "Connect an AI provider", paletteColor(theme.COLOR_WHITE), theme.scaledUi(22.0), clip);
+    y += theme.scaledUi(34.0);
+    queuePaletteText(state, .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = theme.scaledUi(42.0) }, "Verde uses coding-agent accounts already installed on this computer. Set up any one provider to start chatting; Verde does not require its own subscription.", paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(13.5), clip);
+    y += theme.scaledUi(52.0);
+
+    const snapshot = state.providerReadinessSnapshot();
+    const providers = [_]runtime.Provider{ .codex, .opencode, .claude, .cursor };
+    const button_h = theme.scaledUi(36.0);
+    const button_y = modal.y + modal.h - pad - button_h;
+    const rows_bottom = button_y - theme.scaledUi(18.0);
+    const row_gap = theme.scaledUi(8.0);
+    const row_h = @max((rows_bottom - y - row_gap * 3.0) / 4.0, theme.scaledUi(58.0));
+    for (providers) |provider| {
+        const row: palette.Rect = .{ .x = modal.x + pad, .y = y, .w = modal.w - pad * 2.0, .h = row_h };
+        renderProviderReadinessRow(state, row, provider, snapshot.forProvider(provider), clip);
+        y += row_h + row_gap;
+    }
+
+    const gap = theme.scaledUi(10.0);
+    const close_w = theme.scaledUi(104.0);
+    const guide_w = theme.scaledUi(156.0);
+    const check_w = theme.scaledUi(126.0);
+    drawActionButton(state, .{ .x = modal.x + pad, .y = button_y, .w = close_w, .h = button_h }, "Not now", theme.COLOR_PANEL_ALT);
+    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w - gap - guide_w, .y = button_y, .w = guide_w, .h = button_h }, "Open setup guide", theme.COLOR_PANEL_MUTED);
+    const checking = snapshot.codex == .checking and snapshot.opencode == .checking and snapshot.claude == .checking and snapshot.cursor == .checking;
+    drawActionButton(state, .{ .x = modal.x + modal.w - pad - check_w, .y = button_y, .w = check_w, .h = button_h }, if (checking) "Checking..." else "Check again", theme.COLOR_SECONDARY_GREEN);
+}
+
+// Renders one provider's executable/auth status and its shortest recovery step.
+fn renderProviderReadinessRow(state: *runtime.AppState, rect: palette.Rect, provider: runtime.Provider, readiness: runtime.ProviderReadiness, clip: palette.Rect) void {
+    queuePaletteRoundedRect(state, rect, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.025)), theme.scaledUi(9.0));
+    queuePaletteBorder(state, rect, paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 190)), theme.scaledUi(9.0), theme.scaledUi(1.0));
+
+    const dot_color = switch (readiness) {
+        .ready => theme.COLOR_SECONDARY_GREEN,
+        .signed_out => theme.COLOR_YELLOW,
+        .missing => theme.COLOR_DIFF_REMOVE,
+        .checking => theme.COLOR_TEXT_MUTED,
+        .unavailable => theme.COLOR_YELLOW,
+    };
+    const dot = theme.scaledUi(8.0);
+    queuePaletteRoundedRect(state, .{ .x = rect.x + theme.scaledUi(14.0), .y = rect.y + theme.scaledUi(16.0), .w = dot, .h = dot }, paletteColor(dot_color), dot * 0.5);
+
+    const title = switch (provider) {
+        .codex => "Codex",
+        .opencode => "OpenCode",
+        .claude => "Claude Code",
+        .cursor => "Cursor",
+    };
+    const status = switch (readiness) {
+        .checking => "Checking...",
+        .missing => "CLI not found",
+        .signed_out => "Sign-in needed",
+        .ready => "Ready",
+        .unavailable => "Could not verify",
+    };
+    const step = providerReadinessStep(provider, readiness);
+    const text_x = rect.x + theme.scaledUi(34.0);
+    const status_w = theme.scaledUi(116.0);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(8.0), .w = rect.w - status_w - theme.scaledUi(48.0), .h = theme.scaledUi(20.0) }, title, paletteColor(theme.COLOR_WHITE), theme.scaledUi(14.5), clip);
+    queuePaletteText(state, .{ .x = rect.x + rect.w - status_w - theme.scaledUi(12.0), .y = rect.y + theme.scaledUi(9.0), .w = status_w, .h = theme.scaledUi(18.0) }, status, paletteColor(dot_color), theme.scaledUi(12.0), clip);
+    queuePaletteText(state, .{ .x = text_x, .y = rect.y + theme.scaledUi(31.0), .w = rect.w - theme.scaledUi(48.0), .h = @max(rect.h - theme.scaledUi(36.0), theme.scaledUi(18.0)) }, step, paletteColor(theme.COLOR_TEXT_SUBTLE), theme.scaledUi(12.0), clip);
+}
+
+fn providerReadinessStep(provider: runtime.Provider, readiness: runtime.ProviderReadiness) []const u8 {
+    if (readiness == .ready) return "Installed and authenticated. You can select this provider in the composer.";
+    if (readiness == .checking) return "Checking the local CLI and account session...";
+    return switch (provider) {
+        .codex => if (readiness == .missing) "Install the Codex CLI, then run: codex login" else "Run codex login, then return here and check again.",
+        .opencode => if (readiness == .missing) "Install OpenCode, then run: opencode" else "Open opencode, connect a model provider, then check again.",
+        .claude => if (readiness == .missing) "Install Claude Code, then run: claude" else "Open claude, complete sign-in, then check again.",
+        .cursor => if (readiness == .missing) "Install the Cursor CLI, then run: agent login" else "Run agent login, then return here and check again.",
+    };
+}
+
+// Renders the full-size image preview modal over the workspace.
 fn renderImageModal(state: *runtime.AppState, width: f32, height: f32) void {
     const modal_path = state.modal_image_path orelse return;
     const modal_padding_x: f32 = 22.0;

@@ -1,10 +1,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const args = @import("cli_args.zig");
 const completion = @import("cli_completion.zig");
 const output = @import("cli_output.zig");
 const herdr = @import("herdr.zig");
+const platform_ipc = @import("platform/ipc.zig");
+const live_endpoint = @import("platform/live_endpoint.zig");
+const platform_paths = @import("platform_paths");
+const platform_runtime = @import("platform_runtime");
 const process_env = @import("process_env.zig");
 const provider_hooks = @import("provider_hooks.zig");
 const spec = @import("cli_spec.zig");
@@ -12,11 +17,12 @@ const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
 
-const VERSION = "0.0.0";
-const SOCKET_NAME = "verde.sock";
-const LIVE_RESPONSE_TIMEOUT_MS: i64 = 5000;
+const VERSION = build_options.version;
+const SOCKET_NAME = live_endpoint.SOCKET_NAME;
+const LIVE_RESPONSE_TIMEOUT_MS: u32 = 5000;
 const TERMINAL_GET_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x40087468)),
+    .windows => 0,
     else => @intCast(std.c.T.IOCGWINSZ),
 };
 
@@ -207,8 +213,9 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
             .encodings = spec.encodings[0..],
         },
         .ipc = .{
-            .transport = "unix",
+            .transport = live_endpoint.transportName(),
             .socket_name = SOCKET_NAME,
+            .endpoint_env = live_endpoint.ENDPOINT_ENV,
             .terminal_binary_frames = false,
             .mcp_bridge = true,
         },
@@ -225,7 +232,7 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
         \\  integrations: list, doctor, install, remove, disable
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
         \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
-        \\  completion: bash, zsh, fish
+        \\  completion: bash, zsh, fish, powershell
         \\  encodings: json, jsonl
         \\  terminal binary frames: no
         \\
@@ -242,7 +249,7 @@ fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []co
         return;
     }
     const shell = args.positional(argv, 0) orelse {
-        try out.stderr("missing completion shell; expected bash, zsh, or fish\n", .{});
+        try out.stderr("missing completion shell; expected bash, zsh, fish, or powershell\n", .{});
         std.process.exit(2);
     };
     if (std.mem.eql(u8, shell, "help")) {
@@ -250,7 +257,7 @@ fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []co
         return;
     }
     if (!try completion.print(allocator, out, shell)) {
-        try out.stderr("unsupported completion shell: {s}; expected bash, zsh, or fish\n", .{shell});
+        try out.stderr("unsupported completion shell: {s}; expected bash, zsh, fish, or powershell\n", .{shell});
         std.process.exit(2);
     }
 }
@@ -261,6 +268,7 @@ fn printCompletionHelp(out: output.Output) !void {
         \\  verde completion bash
         \\  verde completion zsh
         \\  verde completion fish
+        \\  verde completion powershell
         \\
     , .{});
 }
@@ -671,10 +679,7 @@ fn runExitCode(result: std.process.RunResult) i64 {
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 const HerdrProfileDefaults = struct {
@@ -1406,7 +1411,10 @@ fn printIntegrationsList(allocator: std.mem.Allocator, out: output.Output, json:
 fn printIntegrationsDoctor(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
     const verde_env = getenvSlice("VERDE") orelse "";
     const has_identity = getenvSlice("VERDE_SESSION_ID") != null and
-        (getenvSlice("VERDE_SOCKET") != null or getenvSlice("VERDE_LIVE_SOCKET") != null or getenvSlice("VERDE_SESSIONIZER_SOCKET") != null);
+        (getenvSlice("VERDE_LIVE_ENDPOINT") != null or
+            getenvSlice("VERDE_SOCKET") != null or
+            getenvSlice("VERDE_LIVE_SOCKET") != null or
+            getenvSlice("VERDE_SESSIONIZER_SOCKET") != null);
     if (json) {
         try out.jsonValue(allocator, .{
             .verde_env = std.mem.eql(u8, verde_env, "1"),
@@ -2058,12 +2066,10 @@ fn sendLiveRequest(allocator: std.mem.Allocator, out: output.Output, io: std.Io,
 }
 
 fn sendLiveRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const u8, params: anytype, request_id: u64) ![]u8 {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const live_io = threaded.io();
     const pref_path = try prefPath(allocator);
     defer allocator.free(pref_path);
-    const socket_path = try std.fs.path.join(allocator, &.{ pref_path, SOCKET_NAME });
-    defer allocator.free(socket_path);
+    const endpoint = try live_endpoint.alloc(allocator, pref_path);
+    defer allocator.free(endpoint);
 
     var request_writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer request_writer.deinit();
@@ -2078,38 +2084,9 @@ fn sendLiveRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const
     try s.endObject();
     const request_json = try request_writer.toOwnedSlice();
     defer allocator.free(request_json);
-
-    const address = try std.Io.net.UnixAddress.init(socket_path);
-    const stream = try address.connect(live_io);
-    defer stream.close(live_io);
-
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(live_io, &write_buffer);
-    try writer.interface.writeAll(request_json);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
-
-    return try readLiveResponseLineAlloc(allocator, live_io, stream);
-}
-
-fn readLiveResponseLineAlloc(allocator: std.mem.Allocator, live_io: std.Io, stream: std.Io.net.Stream) ![]u8 {
-    var read_buffer: [256 * 1024]u8 = undefined;
-    var read_len: usize = 0;
-    const timeout: std.Io.Timeout = .{ .duration = .{
-        .raw = std.Io.Duration.fromMilliseconds(LIVE_RESPONSE_TIMEOUT_MS),
-        .clock = .awake,
-    } };
-    while (read_len < read_buffer.len) {
-        const message = try stream.socket.receiveTimeout(live_io, read_buffer[read_len..], timeout);
-        if (message.data.len == 0) return error.ConnectionAborted;
-        if (std.mem.indexOfScalar(u8, message.data, '\n')) |relative_end| {
-            const line_end = read_len + relative_end;
-            const response = std.mem.trim(u8, read_buffer[0..line_end], "\r");
-            return try allocator.dupe(u8, response);
-        }
-        read_len += message.data.len;
-    }
-    return error.LiveResponseTooLarge;
+    return try platform_ipc.requestAlloc(allocator, endpoint, request_json, .{
+        .timeout_ms = LIVE_RESPONSE_TIMEOUT_MS,
+    });
 }
 
 fn sendSessionRequestAlloc(allocator: std.mem.Allocator, _: std.Io, method: []const u8, params: anytype, request_id: u64) ![]u8 {
@@ -2145,16 +2122,19 @@ fn handleSessionAttach(
     const session_id = try resolveAttachSessionId(allocator, out, argv);
     defer allocator.free(session_id);
 
-    const attach_id = attachSessionClient(allocator, io, session_id, "verde-cli") catch null;
-    defer if (attach_id) |id| allocator.free(id);
-    defer if (attach_id) |id| detachSessionClient(allocator, io, session_id, id);
+    const attach_id = attachSessionClient(allocator, io, session_id, "verde-cli") catch |err| {
+        try out.stderr("failed to attach to terminal session {s}: {s}\n", .{ session_id, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(attach_id);
+    defer detachSessionClient(allocator, io, session_id, attach_id);
 
     const explicit_cols = parseOptionalU32(args.optionValue(argv, "--cols"));
     const explicit_rows = parseOptionalU32(args.optionValue(argv, "--rows"));
     var current_size = terminalAttachSize(explicit_cols, explicit_rows);
     const resize_response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
         .id = session_id,
-        .attach_id = attach_id orelse "",
+        .attach_id = attach_id,
         .cols = current_size.cols,
         .rows = current_size.rows,
     }, 1);
@@ -2163,8 +2143,8 @@ fn handleSessionAttach(
     const terminal_mode = enterRawMode() catch null;
     defer if (terminal_mode) |mode| restoreTerminalMode(mode);
 
-    const stdin_nonblock: ?c_int = setFdNonBlocking(std.posix.STDIN_FILENO) catch null;
-    defer if (stdin_nonblock) |flags| restoreFdFlags(std.posix.STDIN_FILENO, flags);
+    const input_polling = try beginAttachInputPolling();
+    defer endAttachInputPolling(input_polling);
 
     var next_offset: usize = 0;
     var stdin_eof = false;
@@ -2176,7 +2156,7 @@ fn handleSessionAttach(
                 current_size = next_size;
                 const response = try sendSessionRequestAlloc(allocator, io, "session.resize", .{
                     .id = session_id,
-                    .attach_id = attach_id orelse "",
+                    .attach_id = attach_id,
                     .cols = current_size.cols,
                     .rows = current_size.rows,
                 }, 1);
@@ -2184,10 +2164,11 @@ fn handleSessionAttach(
             }
         }
 
-        try drainAttachInput(allocator, io, session_id, attach_id orelse "", &stdin_eof, &detach_requested);
+        try forwardWindowsAttachControlEvents(allocator, io, session_id, attach_id);
+        try drainAttachInput(allocator, io, session_id, attach_id, &stdin_eof, &detach_requested);
         if (detach_requested) break;
 
-        var read_result = try readSessionOutput(allocator, io, session_id, attach_id orelse "", next_offset);
+        var read_result = try readSessionOutput(allocator, io, session_id, attach_id, next_offset);
         defer read_result.deinit(allocator);
         if (read_result.text.len > 0) {
             try writeStdout(read_result.text);
@@ -2224,6 +2205,8 @@ fn terminalAttachSize(explicit_cols: ?u32, explicit_rows: ?u32) AttachSize {
 }
 
 fn readTerminalAttachSize() ?AttachSize {
+    if (builtin.os.tag == .windows) return readWindowsTerminalAttachSize();
+
     var winsize: std.posix.winsize = undefined;
     if (std.c.ioctl(std.posix.STDOUT_FILENO, TERMINAL_GET_WINSIZE_IOCTL, &winsize) != 0 and
         std.c.ioctl(std.posix.STDIN_FILENO, TERMINAL_GET_WINSIZE_IOCTL, &winsize) != 0)
@@ -2232,6 +2215,15 @@ fn readTerminalAttachSize() ?AttachSize {
     }
     if (winsize.col == 0 or winsize.row == 0) return null;
     return .{ .cols = winsize.col, .rows = winsize.row };
+}
+
+fn readWindowsTerminalAttachSize() ?AttachSize {
+    var info: ConsoleScreenBufferInfo = undefined;
+    if (GetConsoleScreenBufferInfo(std.Io.File.stdout().handle, &info) == .FALSE) return null;
+    const cols = @as(i32, info.window.right) - @as(i32, info.window.left) + 1;
+    const rows = @as(i32, info.window.bottom) - @as(i32, info.window.top) + 1;
+    if (cols <= 0 or rows <= 0) return null;
+    return .{ .cols = @intCast(cols), .rows = @intCast(rows) };
 }
 
 fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) ![]u8 {
@@ -2267,6 +2259,20 @@ fn resolveAttachSessionId(allocator: std.mem.Allocator, out: output.Output, argv
 }
 
 fn drainAttachInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_id: []const u8,
+    attach_id: []const u8,
+    stdin_eof: *bool,
+    detach_requested: *bool,
+) !void {
+    if (builtin.os.tag == .windows) {
+        return drainWindowsAttachInput(allocator, io, session_id, attach_id, stdin_eof, detach_requested);
+    }
+    return drainPosixAttachInput(allocator, io, session_id, attach_id, stdin_eof, detach_requested);
+}
+
+fn drainPosixAttachInput(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_id: []const u8,
@@ -2312,6 +2318,73 @@ fn drainAttachInput(
     }
 }
 
+fn drainWindowsAttachInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_id: []const u8,
+    attach_id: []const u8,
+    stdin_eof: *bool,
+    detach_requested: *bool,
+) !void {
+    if (stdin_eof.*) return;
+    const windows = std.os.windows;
+    const stdin_handle = std.Io.File.stdin().handle;
+    var buffer: [4096]u8 = undefined;
+
+    while (windowsInputAvailable(stdin_handle)) |available| {
+        if (available == 0) return;
+        var read_len: windows.DWORD = 0;
+        const wanted: windows.DWORD = @intCast(@min(buffer.len, available));
+        if (ReadFile(stdin_handle, &buffer, wanted, &read_len, null) == .FALSE) {
+            switch (windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA => stdin_eof.* = true,
+                else => {},
+            }
+            return;
+        }
+        if (read_len == 0) {
+            stdin_eof.* = true;
+            return;
+        }
+        const input = buffer[0..read_len];
+        if (std.mem.indexOfScalar(u8, input, 0x1d) != null) {
+            detach_requested.* = true;
+            stdin_eof.* = true;
+            return;
+        }
+        const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{
+            .id = session_id,
+            .attach_id = attach_id,
+            .text = input,
+        }, 1);
+        allocator.free(response);
+    } else |_| {
+        stdin_eof.* = true;
+    }
+}
+
+fn windowsInputAvailable(handle: std.os.windows.HANDLE) !usize {
+    var console_mode: std.os.windows.DWORD = 0;
+    if (GetConsoleMode(handle, &console_mode) != .FALSE) {
+        var event_count: std.os.windows.DWORD = 0;
+        if (GetNumberOfConsoleInputEvents(handle, &event_count) == .FALSE) return error.ConsoleInputFailed;
+        // ReadFile consumes the VT-encoded bytes represented by one or more
+        // console input records. Its byte count is not the event count, so use
+        // the full buffer whenever at least one record is ready.
+        return if (event_count == 0) 0 else 4096;
+    }
+
+    var available: std.os.windows.DWORD = 0;
+    if (PeekNamedPipe(handle, null, 0, null, &available, null) != .FALSE) return available;
+    return switch (std.os.windows.GetLastError()) {
+        .BROKEN_PIPE, .NO_DATA => error.EndOfStream,
+        // Disk files are always synchronously readable; a failed pipe peek is
+        // not by itself evidence that stdin is unavailable.
+        .INVALID_HANDLE => 4096,
+        else => error.InputUnavailable,
+    };
+}
+
 fn readSessionOutput(allocator: std.mem.Allocator, io: std.Io, session_id: []const u8, attach_id: []const u8, offset: usize) !SessionReadResult {
     const response = try sendSessionRequestAlloc(allocator, io, "session.tail", .{ .id = session_id, .attach_id = attach_id, .offset = offset }, 1);
     defer allocator.free(response);
@@ -2329,11 +2402,74 @@ fn readSessionOutput(allocator: std.mem.Allocator, io: std.Io, session_id: []con
     };
 }
 
-const TerminalMode = struct {
+const TerminalMode = if (builtin.os.tag == .windows) WindowsTerminalMode else PosixTerminalMode;
+
+const PosixTerminalMode = struct {
     original: std.posix.termios,
 };
 
+const WindowsTerminalMode = struct {
+    input_handle: std.os.windows.HANDLE,
+    input_mode: std.os.windows.DWORD,
+    output_handle: std.os.windows.HANDLE,
+    output_mode: ?std.os.windows.DWORD,
+    input_code_page: std.os.windows.UINT,
+    output_code_page: std.os.windows.UINT,
+    control_handler_installed: bool,
+};
+
+const SmallRect = extern struct {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+};
+
+const ConsoleScreenBufferInfo = extern struct {
+    size: std.os.windows.COORD,
+    cursor_position: std.os.windows.COORD,
+    attributes: std.os.windows.WORD,
+    window: SmallRect,
+    maximum_window_size: std.os.windows.COORD,
+};
+
+const ENABLE_PROCESSED_INPUT: std.os.windows.DWORD = 0x0001;
+const ENABLE_LINE_INPUT: std.os.windows.DWORD = 0x0002;
+const ENABLE_ECHO_INPUT: std.os.windows.DWORD = 0x0004;
+const ENABLE_WINDOW_INPUT: std.os.windows.DWORD = 0x0008;
+const ENABLE_MOUSE_INPUT: std.os.windows.DWORD = 0x0010;
+const ENABLE_QUICK_EDIT_MODE: std.os.windows.DWORD = 0x0040;
+const ENABLE_EXTENDED_FLAGS: std.os.windows.DWORD = 0x0080;
+const ENABLE_VIRTUAL_TERMINAL_INPUT: std.os.windows.DWORD = 0x0200;
+const ENABLE_PROCESSED_OUTPUT: std.os.windows.DWORD = 0x0001;
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: std.os.windows.DWORD = 0x0004;
+const CP_UTF8: std.os.windows.UINT = 65001;
+const CTRL_C_EVENT: std.os.windows.DWORD = 0;
+const CTRL_BREAK_EVENT: std.os.windows.DWORD = 1;
+const WINDOWS_ATTACH_CTRL_C: u8 = 1 << 0;
+const WINDOWS_ATTACH_CTRL_BREAK: u8 = 1 << 1;
+
+var windows_attach_control_events: std.atomic.Value(u8) = .init(0);
+
+extern "kernel32" fn GetConsoleMode(handle: std.os.windows.HANDLE, mode: *std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleMode(handle: std.os.windows.HANDLE, mode: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn GetNumberOfConsoleInputEvents(handle: std.os.windows.HANDLE, count: *std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn GetConsoleScreenBufferInfo(handle: std.os.windows.HANDLE, info: *ConsoleScreenBufferInfo) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn PeekNamedPipe(handle: std.os.windows.HANDLE, buffer: ?*anyopaque, buffer_len: std.os.windows.DWORD, bytes_read: ?*std.os.windows.DWORD, total_available: ?*std.os.windows.DWORD, bytes_left: ?*std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn ReadFile(handle: std.os.windows.HANDLE, buffer: [*]u8, bytes_to_read: std.os.windows.DWORD, bytes_read: *std.os.windows.DWORD, overlapped: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn WriteFile(handle: std.os.windows.HANDLE, buffer: [*]const u8, bytes_to_write: std.os.windows.DWORD, bytes_written: *std.os.windows.DWORD, overlapped: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn GetConsoleCP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn SetConsoleCP(code_page: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleOutputCP(code_page: std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleCtrlHandler(
+    handler: ?*const fn (control_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
+    add: std.os.windows.BOOL,
+) callconv(.winapi) std.os.windows.BOOL;
+
 fn enterRawMode() !TerminalMode {
+    if (builtin.os.tag == .windows) return enterWindowsRawMode();
+
     const original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
     var raw = original;
     raw.iflag.BRKINT = false;
@@ -2355,7 +2491,119 @@ fn enterRawMode() !TerminalMode {
 }
 
 fn restoreTerminalMode(mode: TerminalMode) void {
+    if (builtin.os.tag == .windows) return restoreWindowsTerminalMode(mode);
     std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, mode.original) catch {};
+}
+
+fn enterWindowsRawMode() !WindowsTerminalMode {
+    const input_handle = std.Io.File.stdin().handle;
+    const output_handle = std.Io.File.stdout().handle;
+    var input_mode: std.os.windows.DWORD = 0;
+    if (GetConsoleMode(input_handle, &input_mode) == .FALSE) return error.NotTerminal;
+
+    const raw_input = (input_mode & ~@as(std.os.windows.DWORD, ENABLE_PROCESSED_INPUT |
+        ENABLE_LINE_INPUT |
+        ENABLE_ECHO_INPUT |
+        ENABLE_WINDOW_INPUT |
+        ENABLE_MOUSE_INPUT |
+        ENABLE_QUICK_EDIT_MODE)) |
+        ENABLE_EXTENDED_FLAGS |
+        ENABLE_VIRTUAL_TERMINAL_INPUT;
+    if (SetConsoleMode(input_handle, raw_input) == .FALSE) return error.ConsoleModeFailed;
+    errdefer _ = SetConsoleMode(input_handle, input_mode);
+
+    windows_attach_control_events.store(0, .release);
+    if (SetConsoleCtrlHandler(&windowsAttachControlHandler, .TRUE) == .FALSE) return error.ConsoleControlHandlerFailed;
+    errdefer _ = SetConsoleCtrlHandler(&windowsAttachControlHandler, .FALSE);
+
+    var output_mode_value: std.os.windows.DWORD = 0;
+    const output_mode: ?std.os.windows.DWORD = if (GetConsoleMode(output_handle, &output_mode_value) != .FALSE)
+        output_mode_value
+    else
+        null;
+    if (output_mode) |mode| {
+        _ = SetConsoleMode(output_handle, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+
+    const input_code_page = GetConsoleCP();
+    const output_code_page = GetConsoleOutputCP();
+    _ = SetConsoleCP(CP_UTF8);
+    _ = SetConsoleOutputCP(CP_UTF8);
+    return .{
+        .input_handle = input_handle,
+        .input_mode = input_mode,
+        .output_handle = output_handle,
+        .output_mode = output_mode,
+        .input_code_page = input_code_page,
+        .output_code_page = output_code_page,
+        .control_handler_installed = true,
+    };
+}
+
+fn restoreWindowsTerminalMode(mode: WindowsTerminalMode) void {
+    _ = SetConsoleMode(mode.input_handle, mode.input_mode);
+    if (mode.output_mode) |output_mode| _ = SetConsoleMode(mode.output_handle, output_mode);
+    if (mode.input_code_page != 0) _ = SetConsoleCP(mode.input_code_page);
+    if (mode.output_code_page != 0) _ = SetConsoleOutputCP(mode.output_code_page);
+    if (mode.control_handler_installed) _ = SetConsoleCtrlHandler(&windowsAttachControlHandler, .FALSE);
+    windows_attach_control_events.store(0, .release);
+}
+
+fn windowsAttachControlHandler(control_type: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
+    const event_bit = windowsAttachControlEventBit(control_type) orelse return .FALSE;
+    _ = windows_attach_control_events.fetchOr(event_bit, .release);
+    return .TRUE;
+}
+
+fn windowsAttachControlEventBit(control_type: std.os.windows.DWORD) ?u8 {
+    return switch (control_type) {
+        CTRL_C_EVENT => WINDOWS_ATTACH_CTRL_C,
+        CTRL_BREAK_EVENT => WINDOWS_ATTACH_CTRL_BREAK,
+        else => null,
+    };
+}
+
+fn forwardWindowsAttachControlEvents(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_id: []const u8,
+    attach_id: []const u8,
+) !void {
+    if (builtin.os.tag != .windows) return;
+    const events = windows_attach_control_events.swap(0, .acquire);
+    if (events == 0) return;
+
+    // ConPTY consumes terminal input bytes rather than inheriting this console
+    // process group. Translate both Windows control notifications to ETX, the
+    // same interrupt byte produced by Ctrl+C in raw VT input mode.
+    if (events & WINDOWS_ATTACH_CTRL_C != 0) {
+        const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{
+            .id = session_id,
+            .attach_id = attach_id,
+            .text = "\x03",
+        }, 1);
+        allocator.free(response);
+    }
+    if (events & WINDOWS_ATTACH_CTRL_BREAK != 0) {
+        const response = try sendSessionRequestAlloc(allocator, io, "session.write", .{
+            .id = session_id,
+            .attach_id = attach_id,
+            .text = "\x03",
+        }, 1);
+        allocator.free(response);
+    }
+}
+
+const AttachInputPolling = if (builtin.os.tag == .windows) struct {} else struct { original_flags: ?c_int };
+
+fn beginAttachInputPolling() !AttachInputPolling {
+    if (builtin.os.tag == .windows) return .{};
+    return .{ .original_flags = setFdNonBlocking(std.posix.STDIN_FILENO) catch null };
+}
+
+fn endAttachInputPolling(state: AttachInputPolling) void {
+    if (builtin.os.tag == .windows) return;
+    if (state.original_flags) |flags| restoreFdFlags(std.posix.STDIN_FILENO, flags);
 }
 
 fn setFdNonBlocking(fd: std.posix.fd_t) !c_int {
@@ -2371,6 +2619,8 @@ fn restoreFdFlags(fd: std.posix.fd_t, flags: c_int) void {
 }
 
 fn writeStdout(bytes: []const u8) !void {
+    if (builtin.os.tag == .windows) return writeWindowsStdout(bytes);
+
     var remaining = bytes;
     while (remaining.len > 0) {
         const written_raw = std.c.write(std.posix.STDOUT_FILENO, remaining.ptr, remaining.len);
@@ -2379,6 +2629,18 @@ fn writeStdout(bytes: []const u8) !void {
             return error.StdoutWriteFailed;
         }
         const written: usize = @intCast(written_raw);
+        if (written == 0) return error.StdoutWriteFailed;
+        remaining = remaining[written..];
+    }
+}
+
+fn writeWindowsStdout(bytes: []const u8) !void {
+    var remaining = bytes;
+    const stdout_handle = std.Io.File.stdout().handle;
+    while (remaining.len > 0) {
+        var written: std.os.windows.DWORD = 0;
+        const chunk_len: std.os.windows.DWORD = @intCast(@min(remaining.len, std.math.maxInt(std.os.windows.DWORD)));
+        if (WriteFile(stdout_handle, remaining.ptr, chunk_len, &written, null) == .FALSE) return error.StdoutWriteFailed;
         if (written == 0) return error.StdoutWriteFailed;
         remaining = remaining[written..];
     }
@@ -2405,7 +2667,7 @@ fn sessionIdForNewCommand(allocator: std.mem.Allocator, argv: []const []const u8
         }
         return try std.fmt.allocPrint(allocator, "verde:cli:{s}", .{if (safe_name.items.len > 0) safe_name.items else "session"});
     }
-    return try std.fmt.allocPrint(allocator, "verde:cli:{d}", .{std.c.getpid()});
+    return try std.fmt.allocPrint(allocator, "verde:cli:{d}", .{platform_runtime.processId()});
 }
 
 fn commandAfterDoubleDash(argv: []const []const u8) []const []const u8 {
@@ -3091,28 +3353,7 @@ fn resolvePersistedThread(threads: []const db_types.PersistedThread, ref: []cons
 }
 
 fn prefPath(allocator: std.mem.Allocator) ![]u8 {
-    return switch (builtin.os.tag) {
-        .linux, .freebsd, .openbsd, .netbsd => blk: {
-            if (envVarOwned(allocator, "XDG_DATA_HOME")) |xdg| {
-                defer allocator.free(xdg);
-                break :blk try std.fs.path.join(allocator, &.{ xdg, "verde", "Native" });
-            } else |_| {}
-            const home = try envVarOwned(allocator, "HOME");
-            defer allocator.free(home);
-            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", "verde", "Native" });
-        },
-        .macos => blk: {
-            const home = try envVarOwned(allocator, "HOME");
-            defer allocator.free(home);
-            break :blk try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "verde", "Native" });
-        },
-        else => try std.fs.path.join(allocator, &.{ ".", "verde", "Native" }),
-    };
-}
-
-fn envVarOwned(allocator: std.mem.Allocator, comptime name: [:0]const u8) ![]u8 {
-    const value_ptr = std.c.getenv(name.ptr) orelse return error.EnvironmentVariableNotFound;
-    return try allocator.dupe(u8, std.mem.sliceTo(value_ptr, 0));
+    return platform_paths.sdlPrefPathFallback(allocator, "verde", "Native");
 }
 
 test "cli args parse command and json flag" {
@@ -3148,4 +3389,10 @@ test "value-taking cli spec flags are covered by free arg parser" {
         if (flagIsBare(flag)) continue;
         try std.testing.expect(optionConsumesValue(flag));
     }
+}
+
+test "Windows attach console handler catches only interrupt controls" {
+    try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_C, windowsAttachControlEventBit(CTRL_C_EVENT).?);
+    try std.testing.expectEqual(WINDOWS_ATTACH_CTRL_BREAK, windowsAttachControlEventBit(CTRL_BREAK_EVENT).?);
+    try std.testing.expect(windowsAttachControlEventBit(2) == null);
 }

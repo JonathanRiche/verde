@@ -5,6 +5,7 @@ const std = @import("std");
 const browser_input = @import("input.zig");
 const browser_texture = @import("texture.zig");
 const browser_types = @import("types.zig");
+const platform_runtime = @import("platform_runtime");
 
 const DEFAULT_PANE_WIDTH: u32 = 1280;
 const DEFAULT_PANE_HEIGHT: u32 = 720;
@@ -230,7 +231,7 @@ pub const Backend = struct {
 
     /// Reports whether a platform-native child browser view owns OS keyboard focus.
     pub fn hasNativeFocus(self: *const Backend) bool {
-        if (builtin.os.tag != .macos) return false;
+        if (builtin.os.tag != .macos and builtin.os.tag != .windows) return false;
         return self.platform.hasFocus();
     }
 
@@ -295,8 +296,5 @@ fn nanosToMillis(nanos: i128) f64 {
 }
 
 fn monotonicTimestampNs() i128 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i128, @intCast(ts.sec)) * std.time.ns_per_s +
-        @as(i128, @intCast(ts.nsec));
+    return platform_runtime.monotonicTimestampNs();
 }

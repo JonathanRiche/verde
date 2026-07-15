@@ -1,6 +1,7 @@
 //! Browser texture metadata shared between the runtime backend and Palette renderer.
 
 const std = @import("std");
+const platform_runtime = @import("platform_runtime");
 
 const EXTERNAL_BROWSER_UPLOAD_INTERVAL_MS = 33;
 
@@ -103,8 +104,5 @@ fn shouldThrottleExternalUpload(last_upload_ms: i64) bool {
 }
 
 fn monotonicTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
 }
