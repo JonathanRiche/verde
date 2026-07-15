@@ -11923,6 +11923,7 @@ pub const AppState = struct {
         // pane retargets the thread for the send below.
         if (parsed.value.payload.target) |target| {
             if (std.mem.startsWith(u8, target, "tui:")) {
+                runtime_log.diagnostic("inspector prompt path=tui pane_token_len={d} prompt_len={d}", .{ target.len - "tui:".len, prompt.len });
                 self.fillInspectorPromptIntoTui(target["tui:".len..], context_block, prompt, capture);
                 return;
             }
@@ -11932,9 +11933,26 @@ pub const AppState = struct {
         const thread = self.currentThreadMutable();
         const draft_text = std.mem.trim(u8, self.currentDraft(), &std.ascii.whitespace);
         const send_busy = thread.isSendPending();
-        // A dirty composer means auto-sending would either clobber or bundle
-        // the user's in-progress draft; park the prompt in the draft instead.
-        if (send_busy or draft_text.len != 0 or thread.draftImageCount() != 0) {
+        const composer_dirty = draft_text.len != 0 or thread.draftImageCount() != 0;
+        runtime_log.diagnostic("inspector prompt submitted prompt_len={d} target={} busy={} dirty={} capture={}", .{
+            prompt.len,
+            parsed.value.payload.target != null,
+            send_busy,
+            composer_dirty,
+            capture != null,
+        });
+
+        // Mid-send with a clean composer: queue as a follow-up so the prompt
+        // dispatches right after the current reply, matching what queuing a
+        // message from the composer would do.
+        if (send_busy and !composer_dirty and !threadHasPendingFollowup(thread)) {
+            self.queueInspectorPromptAsFollowup(thread, context_block, prompt, capture);
+            return;
+        }
+        // A dirty composer (or an already-queued follow-up) means auto-sending
+        // would clobber or bundle the user's in-progress input; park the
+        // prompt in the draft instead.
+        if (send_busy or composer_dirty) {
             self.fallbackInspectorPromptToDraft(thread, context_block, prompt, capture, send_busy);
             return;
         }
@@ -11965,15 +11983,64 @@ pub const AppState = struct {
         };
 
         if (self.currentThread().isSendPending()) {
+            runtime_log.diagnostic("inspector prompt path=auto_send started", .{});
             self.setSidebarNotice("Browser inspector prompt sent to the current chat.");
             self.notifyInspectorPromptResult(.sent, null);
         } else {
             // sendDraft bailed without starting (e.g. no provider target); the
             // composed body is still sitting in the composer draft.
+            runtime_log.diagnostic("inspector prompt path=auto_send did_not_start", .{});
+            self.syncPaletteComposerFromDraft();
             self.requestComposerFocus();
             self.setSidebarNotice("Browser inspector prompt was added to the composer draft.");
             self.notifyInspectorPromptResult(.drafted, null);
         }
+    }
+
+    // Reports whether a follow-up is already queued on the thread's in-flight
+    // send; queuing another would silently clobber it.
+    fn threadHasPendingFollowup(thread: *ChatThread) bool {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        return send_state.pending_followup != null;
+    }
+
+    // Queues the design-mode prompt as a follow-up on the in-flight send
+    // (steer for Codex, queue otherwise). Follow-ups are text-only, so the
+    // screenshot rides along as a readable file path instead of an
+    // attachment. Falls back to the draft-park path if queuing fails.
+    fn queueInspectorPromptAsFollowup(
+        self: *AppState,
+        thread: *ChatThread,
+        context_block: []const u8,
+        prompt: []const u8,
+        capture: ?InspectorCapture,
+    ) void {
+        const followup_text = if (capture) |c|
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}Screenshot: {s}", .{ prompt, context_block, c.path })
+        else
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ prompt, context_block });
+        const resolved_text = followup_text catch |err| {
+            log.warn("failed to compose inspector follow-up: {s}", .{@errorName(err)});
+            self.fallbackInspectorPromptToDraft(thread, context_block, prompt, capture, true);
+            return;
+        };
+        defer self.allocator.free(resolved_text);
+
+        self.setDraft(resolved_text);
+        self.queueOrSteerDraftDuringSend();
+        // queueOrSteerDraftDuringSend consumes and clears the draft on
+        // success; a non-empty draft means it could not queue.
+        if (self.currentDraft().len == 0) {
+            runtime_log.diagnostic("inspector prompt path=followup queued", .{});
+            self.notifyInspectorPromptResult(.sent, null);
+            return;
+        }
+        runtime_log.diagnostic("inspector prompt path=followup queue_failed", .{});
+        self.syncPaletteComposerFromDraft();
+        self.requestComposerFocus();
+        self.notifyInspectorPromptResult(.drafted, null);
     }
 
     // Pastes the design-mode prompt into a TUI pane's input (Codex/Claude/
@@ -12062,7 +12129,11 @@ pub const AppState = struct {
                 log.warn("failed to attach inspector capture to draft: {s}", .{@errorName(err)});
             };
         }
+        // setDraft alone leaves the composer widget stale; sync so the parked
+        // prompt is actually visible to the user.
+        self.syncPaletteComposerFromDraft();
         self.requestComposerFocus();
+        runtime_log.diagnostic("inspector prompt path=draft busy={}", .{send_busy});
         self.setSidebarNotice(if (send_busy)
             "Browser inspector prompt added to the draft; a send is already running."
         else
@@ -12078,17 +12149,26 @@ pub const AppState = struct {
         selection: InspectorSelectionPayload,
         viewport: ?InspectorViewportPayload,
     ) ?InspectorCapture {
-        const vp = viewport orelse return null;
+        const vp = viewport orelse {
+            runtime_log.diagnostic("inspector capture skipped: no viewport payload", .{});
+            return null;
+        };
         if (vp.width <= 0.0 or vp.height <= 0.0) return null;
         const css_rect: InspectorRectPayload = selection.rect orelse blk: {
             const element = selection.element orelse return null;
-            break :blk element.rect orelse return null;
+            break :blk element.rect orelse {
+                runtime_log.diagnostic("inspector capture skipped: selection has no rect", .{});
+                return null;
+            };
         };
 
         const frame = (self.browser_state.controller.copyFramePixels(self.allocator) catch |err| {
             log.warn("failed to copy browser frame for inspector capture: {s}", .{@errorName(err)});
             return null;
-        }) orelse return null;
+        }) orelse {
+            runtime_log.diagnostic("inspector capture skipped: no CPU frame available", .{});
+            return null;
+        };
         defer frame.deinit(self.allocator);
 
         const crop = browser_screenshot.cropRectFromCss(
@@ -12229,6 +12309,7 @@ pub const AppState = struct {
         ) catch return;
         defer self.allocator.free(script);
 
+        runtime_log.diagnostic("inspector targets push count={d}", .{targets.items.len});
         self.browser_state.expectSuppressedEvalResult();
         self.browser_state.controller.eval(script) catch |err| {
             _ = self.browser_state.consumeSuppressedEvalResult();
@@ -12240,7 +12321,15 @@ pub const AppState = struct {
     // prompt. `message` must be a fixed string literal (it is interpolated
     // into a JS string without escaping).
     fn notifyInspectorPromptResult(self: *AppState, result: InspectorPromptResult, message: ?[]const u8) void {
-        if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) return;
+        if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) {
+            runtime_log.diagnostic("inspector ack skipped result={s} usable={} enabled={}", .{
+                result.jsValue(),
+                self.canUseBrowserInspector(),
+                self.browser_state.inspectorEnabled(),
+            });
+            return;
+        }
+        runtime_log.diagnostic("inspector ack dispatch result={s}", .{result.jsValue()});
         const script = std.fmt.allocPrint(
             self.allocator,
             "(function() {{ const h = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null; if (h && typeof h.notifyPromptResult === \"function\") h.notifyPromptResult(\"{s}\", \"{s}\"); }})();",

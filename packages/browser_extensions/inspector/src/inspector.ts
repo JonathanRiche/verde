@@ -39,8 +39,10 @@ const FREEFORM_CLOSE_SNAP_DISTANCE_MAX = 224;
 const PROMPT_ANCHOR_GAP = 12;
 const PROMPT_VIEWPORT_INSET = 12;
 // Host must resolve a submitted prompt within this window or the bubble
-// re-enables with a timeout notice (protects against a dead bridge).
-const PROMPT_PENDING_TIMEOUT_MS = 30000;
+// re-enables with a timeout notice (protects against a dead bridge or a
+// lost acknowledgement eval). Kept short so a lost ack recovers quickly;
+// the host normally acks well under a second.
+const PROMPT_PENDING_TIMEOUT_MS = 12000;
 
 type OverlayParts = {
   root: HTMLDivElement;
