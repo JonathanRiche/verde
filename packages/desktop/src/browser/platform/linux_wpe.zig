@@ -623,6 +623,15 @@ pub const Controller = struct {
             return true;
         }
         if (event.key_code == 0) return false;
+        // WebKit interprets printable keysyms on dispatch and inserts the
+        // character itself, but SDL's text_input event (the `.text` branch
+        // above) is the source of truth for typed text — it alone carries
+        // shifted and IME-composed characters. Dispatching printable keysyms
+        // here as well doubles every typed character, so swallow them and let
+        // text_input deliver the text. Ctrl/Alt/Super combos still dispatch
+        // so in-page shortcuts keep working.
+        const printable = event.key_code >= 0x20 and event.key_code <= 0x7f;
+        if (printable and !event.ctrl and !event.alt and !event.super) return true;
         try self.sendCommand(.{
             .kind = .key_input,
             .key_code = event.key_code,
