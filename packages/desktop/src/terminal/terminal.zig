@@ -2929,21 +2929,6 @@ const UnixSession = struct {
         const shell_pid = jsonUsize(result.object.get("pid") orelse .null);
         const foreground_process_group = jsonUsize(result.object.get("foreground_process_group") orelse .null);
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null) orelse self.remote_output_offset;
-        // Empty tails dominate (the main loop polls at up to display rate
-        // during output bursts); only log polls that actually moved data.
-        if (text.len > 0) log.info(
-            "daemon-tail session_len={d} offset={d}->{d} text_len={d} shell_pid={?d} pgrp={?d} suppress={} active_screen={s}",
-            .{
-                session_id.len,
-                self.remote_output_offset,
-                next_offset,
-                text.len,
-                shell_pid,
-                foreground_process_group,
-                suppress_replay_responses,
-                @tagName(self.terminal.screens.active_key),
-            },
-        );
         self.daemon_shell_pid = shell_pid;
         self.daemon_foreground_process_group = foreground_process_group;
         const stale_alt_screen_replay = suppress_replay_responses and
