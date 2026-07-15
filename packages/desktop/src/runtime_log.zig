@@ -4,6 +4,11 @@ const platform_runtime = @import("platform_runtime");
 
 const STDERR_LOG_FILE_NAME = "verde.stderr.log";
 const LAST_CRASH_LOG_FILE_NAME = "last-crash.log";
+/// Rotate the stderr log to `<name>.1` at session start once it exceeds this
+/// cap. Per-frame log spam once grew the shared log to 1.3 GB; rotating
+/// (instead of truncating) keeps the prior sessions' tail available for
+/// post-mortem debugging while bounding disk usage to roughly twice the cap.
+const STDERR_LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 const LOG_ENTRY_CAPACITY = 512;
 const LOG_MESSAGE_CAPACITY = 640;
 const LOG_SCOPE_CAPACITY = 48;
@@ -67,6 +72,8 @@ pub fn init(io: std.Io, pref_path: []const u8) !void {
 
     const crash_path = try std.fs.path.join(allocator, &.{ logs_dir, LAST_CRASH_LOG_FILE_NAME });
     errdefer allocator.free(crash_path);
+
+    rotateStderrLogIfOversized(io, pref_dir, allocator, stderr_path);
 
     var log_file = try std.Io.Dir.createFileAbsolute(io, stderr_path, .{
         .read = true,
@@ -255,6 +262,26 @@ fn writePanicMarker(msg: []const u8, first_trace_addr: ?usize) void {
         writer.interface.print("stderr_log={s}\n", .{path}) catch return;
     }
     writer.interface.flush() catch return;
+}
+
+// Best-effort session-start rotation: a rename failure must never block app
+// startup, so all errors are swallowed. Another live instance holding the old
+// file keeps writing to the renamed inode, which is the standard rotation
+// behavior and loses nothing.
+fn rotateStderrLogIfOversized(
+    io: std.Io,
+    dir: std.Io.Dir,
+    allocator: std.mem.Allocator,
+    stderr_path: []const u8,
+) void {
+    // `stderr_path` is absolute, so `dir` is ignored by statFile; it only
+    // satisfies the method receiver.
+    const stat = dir.statFile(io, stderr_path, .{}) catch return;
+    if (stat.size <= STDERR_LOG_ROTATE_BYTES) return;
+
+    const rotated_path = std.fmt.allocPrint(allocator, "{s}.1", .{stderr_path}) catch return;
+    defer allocator.free(rotated_path);
+    std.Io.Dir.renameAbsolute(stderr_path, rotated_path, io) catch return;
 }
 
 fn processId() u32 {
