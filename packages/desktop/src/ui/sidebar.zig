@@ -8,6 +8,7 @@ const colors = @import("colors.zig");
 const runtime = @import("runtime.zig");
 const utils = @import("../utils.zig");
 const profiler = @import("../profiler.zig");
+const platform_runtime = @import("platform_runtime");
 const native_state = @import("../state.zig");
 const Provider = native_state.Provider;
 
@@ -1706,10 +1707,7 @@ fn truncatedThreadTitle(buffer: *[64:0]u8, value: []const u8, max_len: usize) [:
 }
 
 fn unixTimestampMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 fn unixTimestampSeconds() i64 {

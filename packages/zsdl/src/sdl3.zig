@@ -1715,9 +1715,11 @@ pub const EventType = enum(u32) {
     // Display events
     // _reserved_sdl2compat_displayevent = 0x150,
     display_orientation = 0x151,
-    display_connected,
-    display_disconnected,
+    display_added,
+    display_removed,
     display_moved,
+    display_desktop_mode_changed,
+    display_current_mode_changed,
     display_content_scale_changed,
 
     // Window events
@@ -1729,6 +1731,7 @@ pub const EventType = enum(u32) {
     window_moved,
     window_resized,
     window_pixel_size_changed,
+    window_metal_view_resized,
     window_minimized,
     window_maximized,
     window_restored,
@@ -1737,11 +1740,14 @@ pub const EventType = enum(u32) {
     window_focus_gained,
     window_focus_lost,
     window_close_requested,
-    window_take_focus,
     window_hit_test,
     window_iccprof_changed,
     window_display_changed,
     window_display_scale_changed,
+    window_safe_area_changed,
+    window_occluded,
+    window_enter_fullscreen,
+    window_leave_fullscreen,
     window_destroyed,
     window_hdr_state_changed,
 
@@ -1851,6 +1857,16 @@ pub const EventType = enum(u32) {
     // user = 0x8000,
     _,
 };
+
+test "event type values match the SDL 3.2 ABI" {
+    // These values cross a DLL boundary; one missing enum member previously
+    // turned WINDOW_FOCUS_LOST into WINDOW_CLOSE_REQUESTED at runtime.
+    try std.testing.expectEqual(@as(u32, 0x157), @intFromEnum(EventType.display_content_scale_changed));
+    try std.testing.expectEqual(@as(u32, 0x208), @intFromEnum(EventType.window_metal_view_resized));
+    try std.testing.expectEqual(@as(u32, 0x20f), @intFromEnum(EventType.window_focus_lost));
+    try std.testing.expectEqual(@as(u32, 0x210), @intFromEnum(EventType.window_close_requested));
+    try std.testing.expectEqual(@as(u32, 0x21a), @intFromEnum(EventType.window_hdr_state_changed));
+}
 
 pub const CommonEvent = extern struct {
     type: EventType,

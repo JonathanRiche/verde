@@ -7,8 +7,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("../harness.zig");
+const platform_ipc = @import("../platform/ipc.zig");
+const platform_live_endpoint = @import("../platform/live_endpoint.zig");
+const platform_runtime = @import("platform_runtime");
 const process_env = @import("../process_env.zig");
 const send_runner = @import("../chat/send_runner.zig");
+const windows_conpty = @import("platform/windows_conpty.zig");
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const log = std.log.scoped(.sessionizer);
@@ -16,18 +20,25 @@ const log = std.log.scoped(.sessionizer);
 pub const SOCKET_NAME = "verde-sessionizer.sock";
 pub const LIVE_SOCKET_NAME = "verde.sock";
 pub const PID_FILE_NAME = "verde-sessionizer.pid";
+pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Bump whenever the daemon RPC/state surface changes incompatibly. GUI chat
 // turns are daemon-owned now; accepting an older daemon makes the UI
 // attach to a process that cannot list/tail those turns.
-pub const PROTOCOL_VERSION: u32 = 4;
+// Version 7 retires Windows daemons that treated ConPTY stream EOF as process
+// death. Without replacement, an upgrade could keep the old duplicate-session
+// behavior until the surviving daemon happened to exit.
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
 const DAEMON_POLL_READ_BUDGET: usize = 64 * 1024;
+const SESSIONIZER_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const SESSIONIZER_REQUEST_TIMEOUT_MS: u32 = 5000;
 const ATTACH_STALE_MS: i64 = 60 * std.time.ms_per_s;
 const IDLE_EXIT_MS: i64 = 30 * std.time.ms_per_s;
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
+    .windows => 0,
     else => @intCast(std.c.T.IOCSWINSZ),
 };
 const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
@@ -135,7 +146,21 @@ pub fn sessionIdForLeaf(
 }
 
 pub fn socketPath(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) return windowsPipeName(allocator, pref_path);
     return std.fs.path.join(allocator, &.{ pref_path, SOCKET_NAME });
+}
+
+fn windowsPipeName(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(allocator);
+    var end = pref_path.len;
+    while (end > 0 and (pref_path[end - 1] == '\\' or pref_path[end - 1] == '/')) : (end -= 1) {}
+    for (pref_path[0..end]) |byte| {
+        const canonical = if (byte == '/') '\\' else std.ascii.toLower(byte);
+        try normalized.append(allocator, canonical);
+    }
+    const hash = std.hash.Wyhash.hash(0, normalized.items);
+    return std.fmt.allocPrint(allocator, "{s}{x:0>16}", .{ WINDOWS_PIPE_PREFIX, hash });
 }
 
 pub fn pidFilePath(allocator: std.mem.Allocator, pref_path: []const u8) ![]u8 {
@@ -149,6 +174,22 @@ pub fn requestAlloc(
     params: anytype,
     request_id: u64,
 ) ![]u8 {
+    const result = try requestWithPeerAlloc(allocator, pref_path, method, params, request_id);
+    return result.response;
+}
+
+const RequestResult = struct {
+    response: []u8,
+    authenticated_server_process_id: ?u32 = null,
+};
+
+fn requestWithPeerAlloc(
+    allocator: std.mem.Allocator,
+    pref_path: []const u8,
+    method: []const u8,
+    params: anytype,
+    request_id: u64,
+) !RequestResult {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const socket_path = try socketPath(allocator, pref_path);
@@ -168,6 +209,18 @@ pub fn requestAlloc(
     const request_json = try request_writer.toOwnedSlice();
     defer allocator.free(request_json);
 
+    if (builtin.os.tag == .windows) {
+        const result = try platform_ipc.requestWithPeerAlloc(allocator, socket_path, request_json, .{
+            .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+            .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+        });
+        return .{
+            .response = result.response,
+            .authenticated_server_process_id = result.server_process_id,
+        };
+    }
+
     const address = try std.Io.net.UnixAddress.init(socket_path);
     const stream = try address.connect(io);
     defer stream.close(io);
@@ -182,11 +235,11 @@ pub fn requestAlloc(
     defer allocator.free(read_buffer);
     var reader = stream.reader(io, read_buffer);
     const line = try reader.interface.takeDelimiter('\n') orelse return error.ConnectionAborted;
-    return try allocator.dupe(u8, std.mem.trim(u8, line, "\r"));
+    return .{ .response = try allocator.dupe(u8, std.mem.trim(u8, line, "\r")) };
 }
 const DaemonStatus = struct {
     protocol_version: u32,
-    pid: ?std.posix.pid_t = null,
+    pid: ?usize = null,
 };
 
 fn parseDaemonStatus(allocator: std.mem.Allocator, response: []const u8) ?DaemonStatus {
@@ -196,7 +249,7 @@ fn parseDaemonStatus(allocator: std.mem.Allocator, response: []const u8) ?Daemon
     const result = parsed.value.object.get("result") orelse return null;
     if (result != .object) return null;
     const protocol_version = jsonU32(result.object.get("protocol_version") orelse .null) orelse return null;
-    const pid = if (jsonUsize(result.object.get("pid") orelse .null)) |value| @as(std.posix.pid_t, @intCast(value)) else null;
+    const pid = jsonUsize(result.object.get("pid") orelse .null);
     return .{ .protocol_version = protocol_version, .pid = pid };
 }
 
@@ -204,12 +257,12 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
 
-    if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
-        defer allocator.free(response);
-        if (parseDaemonStatus(allocator, response)) |status| {
+    if (requestWithPeerAlloc(allocator, pref_path, "status", .{}, 0)) |result| {
+        defer allocator.free(result.response);
+        if (parseDaemonStatus(allocator, result.response)) |status| {
             if (status.protocol_version == PROTOCOL_VERSION) return;
-            if (status.pid) |pid| {
-                std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            if (daemonProcessIdForReplacement(builtin.os.tag, status.pid, result.authenticated_server_process_id)) |pid| {
+                terminateDaemonProcess(pid);
                 std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
             }
         }
@@ -217,31 +270,124 @@ pub fn ensureDaemon(allocator: std.mem.Allocator, pref_path: []const u8, exe_pat
 
     try spawnDaemon(allocator, exe_path);
     var attempts: usize = 0;
+    var last_probe_error: anyerror = error.NoDaemonStatus;
     while (attempts < 250) : (attempts += 1) {
         if (requestAlloc(allocator, pref_path, "status", .{}, 0)) |response| {
             defer allocator.free(response);
             if (parseDaemonStatus(allocator, response)) |status| {
                 if (status.protocol_version == PROTOCOL_VERSION) return;
+                last_probe_error = error.IncompatibleDaemonProtocol;
+            } else {
+                last_probe_error = error.InvalidDaemonStatus;
             }
-        } else |_| {}
+        } else |err| {
+            last_probe_error = err;
+        }
         std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
     }
+    log.warn(
+        "session daemon unavailable after {d} status attempts last_probe_error={s}",
+        .{ attempts, @errorName(last_probe_error) },
+    );
     return error.SessionDaemonUnavailable;
 }
 
-/// Path to the currently running executable (the daemon binary), used to set
-/// VERDE_CLI so provider hooks invoke this exact binary. Linux-only; callers
-/// fall back to "verde" on failure (e.g. other platforms).
-fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
-    if (len < 0) return error.FileNotFound;
-    return allocator.dupe(u8, buffer[0..@intCast(len)]);
+/// Windows replacement must use the PID bound to the authenticated pipe
+/// handle. A JSON PID is only trusted on Unix, where the socket path supplies
+/// the peer boundary and there is no portable peer-PID result here.
+fn daemonProcessIdForReplacement(
+    comptime os_tag: std.Target.Os.Tag,
+    reported_process_id: ?usize,
+    authenticated_server_process_id: ?u32,
+) ?usize {
+    if (os_tag == .windows) {
+        return if (authenticated_server_process_id) |process_id| @as(usize, process_id) else null;
+    }
+    return reported_process_id;
+}
+
+/// Path to the currently running executable, used so provider hooks invoke
+/// this exact installed CLI rather than relying on a GUI-launch PATH.
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
+    return platform_runtime.executablePathAlloc(allocator);
+}
+
+/// Resolves the console CLI that terminal children should use for provider
+/// hooks. Windows packages keep the GUI and console subsystem executables in
+/// separate directories because their names collide on case-insensitive disks.
+fn sessionCliPathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
+    const executable = selfExePathAlloc(allocator) catch return allocator.dupeZ(u8, "verde");
+    defer allocator.free(executable);
+    if (builtin.os.tag != .windows) return allocator.dupeZ(u8, executable);
+
+    const resolved = resolveWindowsCliPathAlloc(allocator, executable) catch
+        return allocator.dupeZ(u8, executable);
+    defer allocator.free(resolved);
+    return allocator.dupeZ(u8, resolved);
+}
+
+const WindowsCliPathResolver = struct {
+    env_map: *const std.process.Environ.Map,
+
+    fn resolve(self: *const WindowsCliPathResolver, allocator: std.mem.Allocator, candidate: []const u8) !?[]u8 {
+        return process_env.resolveExecutableInEnvMapAlloc(allocator, self.env_map, candidate) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+    }
+};
+
+fn resolveWindowsCliPathAlloc(allocator: std.mem.Allocator, executable: []const u8) ![]u8 {
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    var resolver: WindowsCliPathResolver = .{ .env_map = &env_map };
+    return resolveWindowsCliPathWith(allocator, executable, &resolver);
+}
+
+fn resolveWindowsDaemonPathAlloc(allocator: std.mem.Allocator, executable: []const u8) ![]u8 {
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    var resolver: WindowsCliPathResolver = .{ .env_map = &env_map };
+    return resolveWindowsDaemonPathWith(allocator, executable, &resolver);
+}
+
+fn resolveWindowsDaemonPathWith(allocator: std.mem.Allocator, executable: []const u8, resolver: anytype) ![]u8 {
+    const executable_dir = std.fs.path.dirnameWindows(executable) orelse return allocator.dupe(u8, executable);
+    const parent_name = std.fs.path.basenameWindows(executable_dir);
+
+    // A raw Windows build installs its console executable in bin\cli. Keep
+    // that exact binary instead of letting a different Verde on PATH win when
+    // the general GUI-to-CLI resolver searches its fallback candidates.
+    if (std.ascii.eqlIgnoreCase(parent_name, "cli")) {
+        if (try resolver.resolve(allocator, executable)) |resolved| return resolved;
+    }
+    return resolveWindowsCliPathWith(allocator, executable, resolver);
+}
+
+fn resolveWindowsCliPathWith(allocator: std.mem.Allocator, executable: []const u8, resolver: anytype) ![]u8 {
+    const executable_dir = std.fs.path.dirnameWindows(executable) orelse return allocator.dupe(u8, executable);
+    const prefix_candidate = try std.fs.path.resolveWindows(allocator, &.{ executable_dir, "cli", "verde.exe" });
+    defer allocator.free(prefix_candidate);
+    const package_candidate = try std.fs.path.resolveWindows(allocator, &.{ executable_dir, "..", "bin", "verde.exe" });
+    defer allocator.free(package_candidate);
+
+    // Prefix installs use bin\cli\verde.exe; assembled ZIPs use
+    // app\Verde.exe + bin\verde.exe. PATH is the final way to avoid handing a
+    // GUI-subsystem executable to a terminal child.
+    for ([_][]const u8{ prefix_candidate, package_candidate, "verde.exe" }) |candidate| {
+        if (try resolver.resolve(allocator, candidate)) |resolved| return resolved;
+    }
+    return allocator.dupe(u8, executable);
 }
 
 pub fn spawnDaemon(allocator: std.mem.Allocator, exe_path: []const u8) !void {
     const daemon_exe = try daemonExecutablePath(allocator, exe_path);
     defer allocator.free(daemon_exe);
+    if (builtin.os.tag == .windows) {
+        log.info("spawning Windows session daemon executable={s}", .{daemon_exe});
+        return spawnWindowsDaemon(allocator, daemon_exe);
+    }
+
     const daemon_exe_z = try allocator.dupeZ(u8, daemon_exe);
     defer allocator.free(daemon_exe_z);
 
@@ -255,8 +401,60 @@ pub fn spawnDaemon(allocator: std.mem.Allocator, exe_path: []const u8) !void {
     }
 }
 
+fn spawnWindowsDaemon(allocator: std.mem.Allocator, daemon_exe: []const u8) !void {
+    comptime std.debug.assert(builtin.os.tag == .windows);
+    const windows = std.os.windows;
+
+    // Zig 0.16's process spawn always enables Windows handle inheritance. A
+    // detached daemon would then retain redirected CI/parent pipes after this
+    // process exits, so use CreateProcessW with inheritance explicitly off.
+    const command_line = try windows_conpty.windowsCreateCommandLine(allocator, &.{ daemon_exe, "__session-daemon" });
+    defer allocator.free(command_line);
+    const command_line_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, command_line);
+    defer allocator.free(command_line_w);
+    const application_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, daemon_exe);
+    defer allocator.free(application_w);
+
+    var env_map = try process_env.buildAugmentedEnvMap(allocator);
+    defer env_map.deinit();
+    const environment = try env_map.createWindowsBlock(allocator, .{});
+    defer environment.deinit(allocator);
+
+    var startup_info: windows.STARTUPINFOW = std.mem.zeroes(windows.STARTUPINFOW);
+    startup_info.cb = @sizeOf(windows.STARTUPINFOW);
+    var process_info: windows.PROCESS.INFORMATION = undefined;
+    const creation_flags: windows.CreateProcessFlags = .{
+        .create_unicode_environment = true,
+        .create_no_window = true,
+    };
+    if (!windows.kernel32.CreateProcessW(
+        application_w.ptr,
+        command_line_w.ptr,
+        null,
+        null,
+        .FALSE,
+        creation_flags,
+        environment.slice.ptr,
+        null,
+        &startup_info,
+        &process_info,
+    ).toBool()) return windows.unexpectedError(windows.GetLastError());
+
+    // The daemon owns its lifetime; the launcher only releases its references.
+    windows.CloseHandle(process_info.hThread);
+    windows.CloseHandle(process_info.hProcess);
+}
+
 pub fn daemonExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
-    if (std.mem.indexOfScalar(u8, exe_path, '/') != null) return allocator.dupe(u8, exe_path);
+    if (std.mem.indexOfAny(u8, exe_path, "/\\") != null or (exe_path.len >= 2 and exe_path[1] == ':')) {
+        if (builtin.os.tag == .windows) return resolveWindowsDaemonPathAlloc(allocator, exe_path);
+        return allocator.dupe(u8, exe_path);
+    }
+    if (builtin.os.tag == .windows) {
+        var env_map = try process_env.buildAugmentedEnvMap(allocator);
+        defer env_map.deinit();
+        return process_env.resolveExecutableInEnvMapAlloc(allocator, &env_map, exe_path);
+    }
     const path_ptr = std.c.getenv("PATH") orelse return allocator.dupe(u8, exe_path);
     const path_value = std.mem.span(path_ptr);
     var iterator = std.mem.splitScalar(u8, path_value, ':');
@@ -274,6 +472,14 @@ pub fn daemonExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) 
     return allocator.dupe(u8, exe_path);
 }
 
+fn terminateDaemonProcess(pid: usize) void {
+    if (builtin.os.tag == .windows) {
+        _ = windows_conpty.terminateProcessById(@intCast(pid));
+        return;
+    }
+    std.posix.kill(@intCast(pid), std.posix.SIG.TERM) catch {};
+}
+
 pub const CreateOptions = struct {
     session_id: []const u8,
     project_id: []const u8 = "",
@@ -287,6 +493,233 @@ pub const CreateOptions = struct {
     pane_id: u32 = 0,
     pref_path: []const u8 = "",
 };
+
+const ChildIdentity = struct {
+    session_id: [:0]u8,
+    project_id: [:0]u8,
+    project_path: [:0]u8,
+    dock_id: [:0]u8,
+    pane_id: [:0]u8,
+    live_endpoint: [:0]u8,
+    sessionizer_endpoint: [:0]u8,
+    cli_path: [:0]u8,
+
+    fn init(allocator: std.mem.Allocator, options: CreateOptions) !ChildIdentity {
+        const session_id = try allocator.dupeZ(u8, options.session_id);
+        errdefer allocator.free(session_id);
+        const project_id = try allocator.dupeZ(u8, options.project_id);
+        errdefer allocator.free(project_id);
+        const project_path = try allocator.dupeZ(u8, options.project_path);
+        errdefer allocator.free(project_path);
+        const dock_id = try std.fmt.allocPrintSentinel(allocator, "{d}", .{options.dock_id}, 0);
+        errdefer allocator.free(dock_id);
+        const pane_id = try std.fmt.allocPrintSentinel(allocator, "{d}", .{options.pane_id}, 0);
+        errdefer allocator.free(pane_id);
+
+        const live_endpoint_text = try platform_live_endpoint.alloc(allocator, options.pref_path);
+        defer allocator.free(live_endpoint_text);
+        const live_endpoint = try allocator.dupeZ(u8, live_endpoint_text);
+        errdefer allocator.free(live_endpoint);
+        const sessionizer_endpoint_text = try socketPath(allocator, options.pref_path);
+        defer allocator.free(sessionizer_endpoint_text);
+        const sessionizer_endpoint = try allocator.dupeZ(u8, sessionizer_endpoint_text);
+        errdefer allocator.free(sessionizer_endpoint);
+
+        const cli_path = try sessionCliPathAlloc(allocator);
+        errdefer allocator.free(cli_path);
+
+        return .{
+            .session_id = session_id,
+            .project_id = project_id,
+            .project_path = project_path,
+            .dock_id = dock_id,
+            .pane_id = pane_id,
+            .live_endpoint = live_endpoint,
+            .sessionizer_endpoint = sessionizer_endpoint,
+            .cli_path = cli_path,
+        };
+    }
+
+    fn deinit(self: ChildIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.project_id);
+        allocator.free(self.project_path);
+        allocator.free(self.dock_id);
+        allocator.free(self.pane_id);
+        allocator.free(self.live_endpoint);
+        allocator.free(self.sessionizer_endpoint);
+        allocator.free(self.cli_path);
+    }
+};
+
+const PosixPtyBackend = if (builtin.os.tag == .windows) struct {} else struct {
+    const Self = @This();
+
+    master_fd: std.posix.fd_t,
+    child_pid: std.posix.pid_t,
+    running: bool = true,
+    exit_status: ?u32 = null,
+
+    extern fn forkpty(
+        amaster: *c_int,
+        name: ?[*:0]u8,
+        termp: ?*const anyopaque,
+        winp: ?*const std.posix.winsize,
+    ) c_int;
+
+    fn create(
+        allocator: std.mem.Allocator,
+        cwd: []const u8,
+        command: []const [:0]u8,
+        identity: ChildIdentity,
+        cols: u16,
+        rows: u16,
+    ) !Self {
+        const cwd_z = try allocator.dupeZ(u8, cwd);
+        defer allocator.free(cwd_z);
+
+        var master_fd: c_int = -1;
+        const winsize: std.posix.winsize = .{
+            .row = @max(rows, 1),
+            .col = @max(cols, 1),
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const fork_result = forkpty(&master_fd, null, null, &winsize);
+        if (fork_result < 0) return error.ForkPtyFailed;
+        if (fork_result == 0) childExec(cwd_z, command, identity);
+
+        const owned_master: std.posix.fd_t = @intCast(master_fd);
+        errdefer {
+            std.posix.kill(@intCast(fork_result), std.posix.SIG.TERM) catch {};
+            _ = std.c.close(owned_master);
+        }
+        try setNonBlocking(owned_master);
+        return .{
+            .master_fd = owned_master,
+            .child_pid = @intCast(fork_result),
+        };
+    }
+
+    fn deinit(self: *Self, _: std.mem.Allocator) void {
+        if (self.running) std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+        _ = std.c.close(self.master_fd);
+        _ = self.captureExitStatus();
+    }
+
+    fn read(self: *Self, buffer: []u8) windows_conpty.ReadResult {
+        while (true) {
+            const read_raw = std.c.read(self.master_fd, buffer.ptr, buffer.len);
+            if (read_raw > 0) return .{ .bytes = @intCast(read_raw) };
+            if (read_raw == 0) return .{ .eof = true };
+            const errno = std.c._errno().*;
+            if (errno == @intFromEnum(std.c.E.INTR)) continue;
+            if (errno == @intFromEnum(std.c.E.AGAIN)) return .{};
+            return .{ .eof = true };
+        }
+    }
+
+    fn write(self: *Self, bytes: []const u8) !bool {
+        if (!self.running or bytes.len == 0) return false;
+        try writeAll(self.master_fd, bytes);
+        return true;
+    }
+
+    fn resize(self: *Self, cols: u16, rows: u16) !void {
+        if (!self.running) return;
+        var winsize: std.posix.winsize = .{
+            .row = @max(rows, 1),
+            .col = @max(cols, 1),
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        if (std.c.ioctl(self.master_fd, TERMINAL_WINSIZE_IOCTL, &winsize) != 0) return error.ResizeFailed;
+
+        const foreground_process_group = self.foregroundProcessGroup();
+        if (foreground_process_group) |pgrp| _ = std.c.kill(-@as(std.posix.pid_t, @intCast(pgrp)), std.c.SIG.WINCH);
+        _ = signalDescendantProcessGroups(std.heap.smp_allocator, self.child_pid, if (foreground_process_group) |pgrp| @intCast(pgrp) else null, std.c.SIG.WINCH);
+    }
+
+    fn terminate(self: *Self) bool {
+        if (!self.running) return false;
+        std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
+        self.running = false;
+        _ = self.captureExitStatus();
+        return true;
+    }
+
+    fn foregroundProcessGroup(self: *const Self) ?usize {
+        if (!self.running) return null;
+        const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
+        var pgrp: c_int = 0;
+        if (std.c.ioctl(self.master_fd, ioctl_value, &pgrp) != 0 or pgrp <= 0) return null;
+        return @intCast(pgrp);
+    }
+
+    fn processId(self: *const Self) usize {
+        return @intCast(self.child_pid);
+    }
+
+    fn isRunning(self: *Self) bool {
+        _ = self.captureExitStatus();
+        return self.running;
+    }
+
+    fn exitStatus(self: *Self) ?u32 {
+        _ = self.captureExitStatus();
+        return self.exit_status;
+    }
+
+    fn ioHealth(_: *const Self) windows_conpty.IoHealth {
+        return .{};
+    }
+
+    fn captureExitStatus(self: *Self) bool {
+        if (self.exit_status != null) return false;
+        var status: c_int = 0;
+        const wait_result = std.c.waitpid(self.child_pid, &status, std.c.W.NOHANG);
+        if (wait_result == 0) return false;
+        self.running = false;
+        self.exit_status = @bitCast(status);
+        return true;
+    }
+
+    fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: ChildIdentity) noreturn {
+        if (std.c.chdir(cwd.ptr) != 0) std.c._exit(127);
+        process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
+        const term = childTermEnvValue();
+        _ = setenv("TERM", term.ptr, 1);
+        _ = setenv("COLORTERM", "truecolor", 1);
+        _ = setenv("TERM_PROGRAM", "verde", 1);
+        _ = setenv("TERM_PROGRAM_VERSION", "1.1.0", 1);
+        _ = setenv("CLICOLOR", "1", 1);
+        _ = setenv("CLICOLOR_FORCE", "1", 1);
+        _ = setenv("FORCE_COLOR", "3", 1);
+        _ = setenv("VERDE", "1", 1);
+        _ = setenv("VERDE_SESSION_ID", identity.session_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_ID", identity.project_id.ptr, 1);
+        _ = setenv("VERDE_WORKSPACE_PATH", identity.project_path.ptr, 1);
+        _ = setenv("VERDE_DOCK_ID", identity.dock_id.ptr, 1);
+        _ = setenv("VERDE_PANE_ID", identity.pane_id.ptr, 1);
+        _ = setenv("VERDE_SOCKET", identity.live_endpoint.ptr, 1);
+        _ = setenv("VERDE_LIVE_ENDPOINT", identity.live_endpoint.ptr, 1);
+        _ = setenv("VERDE_LIVE_SOCKET", identity.live_endpoint.ptr, 1);
+        _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_endpoint.ptr, 1);
+        _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
+        if (std.c.getenv("LANG") == null) {
+            const lang = childLocaleEnvValue();
+            _ = setenv("LANG", lang.ptr, 1);
+        }
+
+        var argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
+        const count = @min(command.len, argv.len - 1);
+        for (command[0..count], 0..) |arg, index| argv[index] = arg.ptr;
+        if (count > 0) _ = std.c.execve(command[0].ptr, &argv, std.c.environ);
+        std.c._exit(127);
+    }
+};
+
+const PtyBackend = if (builtin.os.tag == .windows) windows_conpty.Backend else PosixPtyBackend;
 
 const PtySession = struct {
     const AttachClient = struct {
@@ -304,8 +737,8 @@ const PtySession = struct {
     command_label: []u8,
     dock_id: u32,
     pane_id: u32,
-    master_fd: std.posix.fd_t,
-    child_pid: std.posix.pid_t,
+    backend: PtyBackend,
+    child_pid: usize,
     cols: u16,
     rows: u16,
     output_ring: std.ArrayList(u8) = .empty,
@@ -317,22 +750,11 @@ const PtySession = struct {
     /// to an empty slice (the bug that froze TUI panes mid-output).
     output_total: u64 = 0,
     running: bool = true,
+    stream_eof: bool = false,
     exit_status: ?u32 = null,
     created_at_ms: i64,
     last_attached_at_ms: ?i64 = null,
     attach_clients: std.ArrayList(AttachClient) = .empty,
-
-    const SpawnResult = struct {
-        master_fd: std.posix.fd_t,
-        child_pid: std.posix.pid_t,
-    };
-
-    extern fn forkpty(
-        amaster: *c_int,
-        name: ?[*:0]u8,
-        termp: ?*const anyopaque,
-        winp: ?*const std.posix.winsize,
-    ) c_int;
 
     pub fn create(allocator: std.mem.Allocator, options: CreateOptions) !*PtySession {
         const self = try allocator.create(PtySession);
@@ -347,23 +769,33 @@ const PtySession = struct {
         const command_label = try commandLabel(allocator, command);
         errdefer allocator.free(command_label);
 
-        const child = try spawnCommand(allocator, cwd, options, command);
-        errdefer {
-            std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
-            _ = std.c.close(child.master_fd);
-        }
+        const identity = try ChildIdentity.init(allocator, options);
+        defer identity.deinit(allocator);
+        var backend = try PtyBackend.create(allocator, cwd, command, identity, options.cols, options.rows);
+        errdefer backend.deinit(allocator);
+
+        const session_id = try allocator.dupe(u8, options.session_id);
+        errdefer allocator.free(session_id);
+        const project_id = try allocator.dupe(u8, options.project_id);
+        errdefer allocator.free(project_id);
+        const project_path = try allocator.dupe(u8, options.project_path);
+        errdefer allocator.free(project_path);
+        const owned_cwd = try allocator.dupe(u8, cwd);
+        errdefer allocator.free(owned_cwd);
+        const label = try allocator.dupe(u8, if (options.label.len > 0) options.label else command_label);
+        errdefer allocator.free(label);
 
         self.* = .{
-            .session_id = try allocator.dupe(u8, options.session_id),
-            .project_id = try allocator.dupe(u8, options.project_id),
-            .project_path = try allocator.dupe(u8, options.project_path),
-            .cwd = try allocator.dupe(u8, cwd),
-            .label = try allocator.dupe(u8, if (options.label.len > 0) options.label else command_label),
+            .session_id = session_id,
+            .project_id = project_id,
+            .project_path = project_path,
+            .cwd = owned_cwd,
+            .label = label,
             .command_label = command_label,
             .dock_id = options.dock_id,
             .pane_id = options.pane_id,
-            .master_fd = child.master_fd,
-            .child_pid = child.child_pid,
+            .child_pid = backend.processId(),
+            .backend = backend,
             .cols = options.cols,
             .rows = options.rows,
             .created_at_ms = nowMs(),
@@ -372,9 +804,7 @@ const PtySession = struct {
     }
 
     pub fn deinit(self: *PtySession, allocator: std.mem.Allocator) void {
-        if (self.running) std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
-        _ = std.c.close(self.master_fd);
-        _ = self.captureExitStatus();
+        self.backend.deinit(allocator);
         allocator.free(self.session_id);
         allocator.free(self.project_id);
         allocator.free(self.project_path);
@@ -397,8 +827,7 @@ const PtySession = struct {
 
     fn writeInput(self: *PtySession, bytes: []const u8) !bool {
         if (!self.running or bytes.len == 0) return false;
-        try writeAll(self.master_fd, bytes);
-        return true;
+        return self.backend.write(bytes);
     }
 
     fn resize(self: *PtySession, cols: u16, rows: u16) void {
@@ -407,55 +836,36 @@ const PtySession = struct {
         const previous_rows = self.rows;
         self.cols = @max(cols, 1);
         self.rows = @max(rows, 1);
-        const foreground_process_group = self.foregroundProcessGroup();
-        var winsize = std.posix.winsize{
-            .row = self.rows,
-            .col = self.cols,
-            .xpixel = 0,
-            .ypixel = 0,
+        self.backend.resize(self.cols, self.rows) catch |err| {
+            log.warn("resize failed id_len={d} pid={d} err={s}", .{ self.session_id.len, self.child_pid, @errorName(err) });
+            return;
         };
-        const ioctl_result = std.c.ioctl(self.master_fd, TERMINAL_WINSIZE_IOCTL, &winsize);
-        const ioctl_errno = if (ioctl_result == 0) 0 else std.c._errno().*;
-        var sigwinch_result: c_int = -1;
-        var sigwinch_errno: c_int = 0;
-        if (foreground_process_group) |pgrp| {
-            sigwinch_result = std.c.kill(-pgrp, std.c.SIG.WINCH);
-            if (sigwinch_result != 0) sigwinch_errno = std.c._errno().*;
-        }
-        const descendant_sigwinch_count = signalDescendantProcessGroups(std.heap.smp_allocator, self.child_pid, foreground_process_group, std.c.SIG.WINCH);
         log.info(
-            "resize id={s} pid={d} pgrp={?d} {d}x{d}->{d}x{d} ioctl_result={d} ioctl_errno={d} sigwinch_result={d} sigwinch_errno={d} descendant_sigwinch_count={d}",
+            "resize id_len={d} pid={d} pgrp={?d} {d}x{d}->{d}x{d}",
             .{
-                self.session_id,
+                self.session_id.len,
                 self.child_pid,
-                foreground_process_group,
+                self.foregroundProcessGroup(),
                 previous_cols,
                 previous_rows,
                 self.cols,
                 self.rows,
-                ioctl_result,
-                ioctl_errno,
-                sigwinch_result,
-                sigwinch_errno,
-                descendant_sigwinch_count,
             },
         );
     }
 
     fn terminate(self: *PtySession) bool {
-        if (!self.running) return false;
-        std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
+        // Windows may still own descendants in the ConPTY job after the direct
+        // shell exits, so let the backend decide whether termination applies.
+        if (!self.backend.terminate()) return false;
         self.running = false;
         _ = self.captureExitStatus();
         return true;
     }
 
-    fn foregroundProcessGroup(self: *const PtySession) ?std.posix.pid_t {
+    fn foregroundProcessGroup(self: *const PtySession) ?usize {
         if (!self.running) return null;
-        const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
-        var pgrp: c_int = 0;
-        if (std.c.ioctl(self.master_fd, ioctl_value, &pgrp) != 0 or pgrp <= 0) return null;
-        return @intCast(pgrp);
+        return self.backend.foregroundProcessGroup();
     }
 
     fn attach(self: *PtySession, allocator: std.mem.Allocator, label: []const u8) ![]u8 {
@@ -512,23 +922,15 @@ const PtySession = struct {
         var buffer: [8192]u8 = undefined;
         var read_total: usize = 0;
         while (read_total < max_bytes) {
-            const read_raw = std.c.read(self.master_fd, &buffer, buffer.len);
-            if (read_raw > 0) {
-                const read_len: usize = @intCast(read_raw);
-                try self.appendOutput(allocator, buffer[0..read_len]);
-                read_total += read_len;
-                continue;
+            const capacity = @min(buffer.len, max_bytes - read_total);
+            const result = self.backend.read(buffer[0..capacity]);
+            self.output_total +%= result.dropped;
+            if (result.bytes > 0) {
+                try self.appendOutput(allocator, buffer[0..result.bytes]);
+                read_total += result.bytes;
             }
-            if (read_raw == 0) {
-                self.running = false;
-                _ = self.captureExitStatus();
-                return;
-            }
-            const err = std.c._errno().*;
-            if (err == @intFromEnum(std.c.E.AGAIN)) return;
-            self.running = false;
-            _ = self.captureExitStatus();
-            return;
+            if (result.eof) self.stream_eof = true;
+            if (result.bytes == 0) return;
         }
     }
 
@@ -567,123 +969,13 @@ const PtySession = struct {
     }
 
     fn captureExitStatus(self: *PtySession) bool {
-        if (self.exit_status != null) return false;
-        var status: c_int = 0;
-        const wait_result = std.c.waitpid(self.child_pid, &status, std.c.W.NOHANG);
-        if (wait_result == 0) return false;
-        self.running = false;
-        self.exit_status = @intCast(status);
-        return true;
-    }
-
-    fn spawnCommand(
-        allocator: std.mem.Allocator,
-        cwd: []const u8,
-        options: CreateOptions,
-        command: []const [:0]u8,
-    ) !SpawnResult {
-        const cwd_z = try allocator.dupeZ(u8, cwd);
-        defer allocator.free(cwd_z);
-        const session_id_z = try allocator.dupeZ(u8, options.session_id);
-        defer allocator.free(session_id_z);
-        const project_id_z = try allocator.dupeZ(u8, options.project_id);
-        defer allocator.free(project_id_z);
-        const project_path_z = try allocator.dupeZ(u8, options.project_path);
-        defer allocator.free(project_path_z);
-        const dock_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.dock_id});
-        defer allocator.free(dock_id_text);
-        const dock_id_z = try allocator.dupeZ(u8, dock_id_text);
-        defer allocator.free(dock_id_z);
-        const pane_id_text = try std.fmt.allocPrint(allocator, "{d}", .{options.pane_id});
-        defer allocator.free(pane_id_text);
-        const pane_id_z = try allocator.dupeZ(u8, pane_id_text);
-        defer allocator.free(pane_id_z);
-        const sessionizer_socket_path = try socketPath(allocator, options.pref_path);
-        defer allocator.free(sessionizer_socket_path);
-        const sessionizer_socket_z = try allocator.dupeZ(u8, sessionizer_socket_path);
-        defer allocator.free(sessionizer_socket_z);
-        const live_socket_path = try std.fs.path.join(allocator, &.{ options.pref_path, LIVE_SOCKET_NAME });
-        defer allocator.free(live_socket_path);
-        const live_socket_z = try allocator.dupeZ(u8, live_socket_path);
-        defer allocator.free(live_socket_z);
-        // Inject the daemon's own executable path as VERDE_CLI so provider hooks
-        // call this exact binary (which supports `notify`) rather than whatever
-        // stale `verde` happens to be on PATH.
-        var cli_path_owned: ?[:0]u8 = null;
-        defer if (cli_path_owned) |p| allocator.free(p);
-        const cli_path_z: [:0]const u8 = brk: {
-            const p = selfExePathAlloc(allocator) catch break :brk "verde";
-            defer allocator.free(p);
-            const z = allocator.dupeZ(u8, p) catch break :brk "verde";
-            cli_path_owned = z;
-            break :brk z;
-        };
-
-        var master_fd: c_int = -1;
-        const winsize = std.posix.winsize{
-            .row = options.rows,
-            .col = options.cols,
-            .xpixel = 0,
-            .ypixel = 0,
-        };
-        const fork_result = forkpty(&master_fd, null, null, &winsize);
-        if (fork_result < 0) return error.ForkPtyFailed;
-        if (fork_result == 0) childExec(cwd_z, command, .{
-            .session_id = session_id_z,
-            .project_id = project_id_z,
-            .project_path = project_path_z,
-            .dock_id = dock_id_z,
-            .pane_id = pane_id_z,
-            .live_socket = live_socket_z,
-            .sessionizer_socket = sessionizer_socket_z,
-            .cli_path = cli_path_z,
-        });
-
-        try setNonBlocking(@intCast(master_fd));
-        return .{
-            .master_fd = @intCast(master_fd),
-            .child_pid = @intCast(fork_result),
-        };
-    }
-
-    const ChildIdentityEnv = struct {
-        session_id: [:0]const u8,
-        project_id: [:0]const u8,
-        project_path: [:0]const u8,
-        dock_id: [:0]const u8,
-        pane_id: [:0]const u8,
-        live_socket: [:0]const u8,
-        sessionizer_socket: [:0]const u8,
-        cli_path: [:0]const u8,
-    };
-
-    fn childExec(cwd: [:0]const u8, command: []const [:0]u8, identity: ChildIdentityEnv) noreturn {
-        if (std.c.chdir(cwd.ptr) != 0) std.c._exit(127);
-        process_env.applyAugmentedPathToCurrentProcess(std.heap.page_allocator) catch {};
-        const term = childTermEnvValue();
-        _ = setenv("TERM", term.ptr, 1);
-        _ = setenv("COLORTERM", "truecolor", 1);
-        _ = setenv("TERM_PROGRAM", "verde", 1);
-        _ = setenv("VERDE", "1", 1);
-        _ = setenv("VERDE_SESSION_ID", identity.session_id.ptr, 1);
-        _ = setenv("VERDE_WORKSPACE_ID", identity.project_id.ptr, 1);
-        _ = setenv("VERDE_WORKSPACE_PATH", identity.project_path.ptr, 1);
-        _ = setenv("VERDE_DOCK_ID", identity.dock_id.ptr, 1);
-        _ = setenv("VERDE_PANE_ID", identity.pane_id.ptr, 1);
-        _ = setenv("VERDE_SOCKET", identity.live_socket.ptr, 1);
-        _ = setenv("VERDE_LIVE_SOCKET", identity.live_socket.ptr, 1);
-        _ = setenv("VERDE_SESSIONIZER_SOCKET", identity.sessionizer_socket.ptr, 1);
-        _ = setenv("VERDE_CLI", identity.cli_path.ptr, 1);
-        if (std.c.getenv("LANG") == null) {
-            const lang = childLocaleEnvValue();
-            _ = setenv("LANG", lang.ptr, 1);
-        }
-
-        var argv: [64:null]?[*:0]const u8 = [_:null]?[*:0]const u8{null} ** 64;
-        const count = @min(command.len, argv.len - 1);
-        for (command[0..count], 0..) |arg, index| argv[index] = arg.ptr;
-        if (count > 0) _ = std.c.execve(command[0].ptr, &argv, std.c.environ);
-        std.c._exit(127);
+        const was_running = self.running;
+        // A ConPTY pipe can fail independently of its hosted process. Keep the
+        // process handle/waitpid as the sole liveness authority and report pipe
+        // health separately so a degraded stream cannot create duplicate PTYs.
+        self.running = self.backend.isRunning();
+        self.exit_status = self.backend.exitStatus();
+        return was_running and !self.running;
     }
 };
 
@@ -905,7 +1197,7 @@ pub const Daemon = struct {
     fn statusResponse(self: *Daemon, id_value: std.json.Value) ![]u8 {
         return try okValueResponse(self.allocator, id_value, .{
             .protocol_version = PROTOCOL_VERSION,
-            .pid = std.c.getpid(),
+            .pid = platform_runtime.processId(),
             .session_count = self.sessions.items.len,
             .idle_exit_ms = IDLE_EXIT_MS,
         });
@@ -972,8 +1264,21 @@ pub const Daemon = struct {
         const session_id = jsonString(params.object.get("id") orelse .null) orelse
             return try errorResponseAlloc(self.allocator, id_value, "invalid_params", "missing id");
         if (self.find(session_id)) |existing| {
-            existing.last_attached_at_ms = nowMs();
-            return try okSessionResponse(self.allocator, id_value, existing, false);
+            // A duplicate create is an attach-or-create request. Preserve a live
+            // PTY, but never hand a stopped one back as though it were reusable:
+            // the desktop would otherwise discard and reattach the same dead
+            // session every frame without ever starting a replacement shell.
+            try existing.poll(self.allocator);
+            if (!existing.running) {
+                for (self.sessions.items, 0..) |candidate, index| {
+                    if (candidate != existing) continue;
+                    self.removeAt(index);
+                    break;
+                }
+            } else {
+                existing.last_attached_at_ms = nowMs();
+                return try okSessionResponse(self.allocator, id_value, existing, false);
+            }
         }
 
         const command = try jsonStringArray(self.allocator, params.object.get("command") orelse .null);
@@ -1030,8 +1335,8 @@ pub const Daemon = struct {
         const text = jsonString(params.object.get("text") orelse .null) orelse "";
         const wrote = try session.writeInput(text);
         log.info(
-            "write id={s} pid={d} pgrp={?d} input_bytes={d}",
-            .{ session.session_id, session.child_pid, session.foregroundProcessGroup(), text.len },
+            "write id_len={d} pid={d} pgrp={?d} input_bytes={d}",
+            .{ session.session_id.len, session.child_pid, session.foregroundProcessGroup(), text.len },
         );
         // Respond immediately with process metadata only (mirrors
         // resizeResponse). This used to pollSettle (~15ms) and return the
@@ -1246,7 +1551,11 @@ pub const Daemon = struct {
 
 pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     try process_env.applyAugmentedPathToCurrentProcess(allocator);
+    if (builtin.os.tag == .windows) return runWindowsDaemon(allocator, pref_path);
+    return runUnixDaemon(allocator, pref_path);
+}
 
+fn runUnixDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     var setup_threaded = std.Io.Threaded.init_single_threaded;
     try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
     const socket_path = try socketPath(allocator, pref_path);
@@ -1285,6 +1594,62 @@ pub fn runDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
     }
 }
 
+fn runWindowsDaemon(allocator: std.mem.Allocator, pref_path: []const u8) !void {
+    var setup_threaded = std.Io.Threaded.init_single_threaded;
+    try std.Io.Dir.cwd().createDirPath(setup_threaded.io(), pref_path);
+    const endpoint = try socketPath(allocator, pref_path);
+    defer allocator.free(endpoint);
+    const pid_path = try pidFilePath(allocator, pref_path);
+    defer allocator.free(pid_path);
+    try writePidFile(pid_path);
+    defer {
+        var cleanup_threaded = std.Io.Threaded.init_single_threaded;
+        deleteFilePath(cleanup_threaded.io(), pid_path);
+    }
+
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const drain_thread = try std.Thread.spawn(.{}, drainSessionsThread, .{DrainThreadContext{
+        .daemon = &daemon,
+        .socket_path = endpoint,
+        .pid_path = pid_path,
+    }});
+    drain_thread.detach();
+
+    var server_context: SessionizerServerContext = .{ .daemon = &daemon };
+    try platform_ipc.serve(allocator, endpoint, .{
+        .context = &server_context,
+        .should_stop = sessionizerServerShouldStop,
+        .handle_request = handleSessionizerServerRequest,
+    }, .{
+        .max_message_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .max_response_bytes = SESSIONIZER_MAX_MESSAGE_BYTES,
+        .timeout_ms = SESSIONIZER_REQUEST_TIMEOUT_MS,
+    });
+}
+
+const SessionizerServerContext = struct {
+    daemon: *Daemon,
+};
+
+fn sessionizerServerShouldStop(_: *anyopaque) bool {
+    return false;
+}
+
+fn handleSessionizerServerRequest(raw_context: *anyopaque, request: []u8) anyerror![]u8 {
+    const context: *SessionizerServerContext = @ptrCast(@alignCast(raw_context));
+    const daemon = context.daemon;
+    defer daemon.allocator.free(request);
+
+    lockDaemon(daemon);
+    const response = daemon.handleRequest(std.mem.trim(u8, request, "\r")) catch |err| {
+        daemon.mutex.unlock();
+        return errorResponseAlloc(daemon.allocator, .null, "internal_error", @errorName(err));
+    };
+    daemon.mutex.unlock();
+    return response;
+}
+
 const DrainThreadContext = struct {
     daemon: *Daemon,
     socket_path: []const u8,
@@ -1302,7 +1667,7 @@ fn drainSessionsThread(context: DrainThreadContext) void {
             deleteSocketPath(context.socket_path);
             var cleanup_threaded = std.Io.Threaded.init_single_threaded;
             deleteFilePath(cleanup_threaded.io(), context.pid_path);
-            std.c.exit(0);
+            std.process.exit(0);
         }
         sleepMs(20);
     }
@@ -1340,11 +1705,7 @@ fn lockTurn(turn: *ChatTurn) void {
 }
 
 fn sleepMs(milliseconds: i64) void {
-    var request = std.c.timespec{
-        .sec = @intCast(@divTrunc(milliseconds, std.time.ms_per_s)),
-        .nsec = @intCast(@mod(milliseconds, std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&request, null);
+    platform_runtime.sleepMillis(@intCast(@max(milliseconds, 0)));
 }
 
 fn okSessionResponse(allocator: std.mem.Allocator, id_value: std.json.Value, session: *const PtySession, created: bool) ![]u8 {
@@ -1403,6 +1764,7 @@ fn beginOk(s: *std.json.Stringify, id_value: std.json.Value) !void {
 }
 
 fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void {
+    const io_health = session.backend.ioHealth();
     try s.beginObject();
     try s.objectField("id");
     try s.write(session.session_id);
@@ -1432,6 +1794,18 @@ fn writeSessionSummary(s: *std.json.Stringify, session: *const PtySession) !void
     try s.write(session.running);
     try s.objectField("status");
     try s.write(if (session.running) "running" else "exited");
+    try s.objectField("exit_status");
+    if (session.exit_status) |value| try s.write(value) else try s.write(null);
+    try s.objectField("stream_eof");
+    try s.write(session.stream_eof);
+    try s.objectField("output_reader_status");
+    try s.write(@tagName(io_health.output_reader_status));
+    try s.objectField("output_reader_error_code");
+    if (io_health.output_reader_error_code) |value| try s.write(value) else try s.write(null);
+    try s.objectField("input_writer_status");
+    try s.write(@tagName(io_health.input_writer_status));
+    try s.objectField("input_writer_error_code");
+    if (io_health.input_writer_error_code) |value| try s.write(value) else try s.write(null);
     try s.objectField("cols");
     try s.write(session.cols);
     try s.objectField("rows");
@@ -1791,6 +2165,7 @@ fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) voi
 }
 
 fn commandForOptions(allocator: std.mem.Allocator, args: []const []const u8) ![][:0]u8 {
+    if (builtin.os.tag == .windows) return windows_conpty.commandForOptions(allocator, args);
     if (args.len > 0) return dupeCommand(allocator, args);
     return dupeCommand(allocator, &.{ defaultInteractiveShell(), "-i" });
 }
@@ -1916,7 +2291,12 @@ fn bytesFromOffset(allocator: std.mem.Allocator, bytes: []const u8, offset: usiz
     return allocator.dupe(u8, bytes[start..]);
 }
 
-fn childProcessCount(pid: std.posix.pid_t) ?usize {
+fn childProcessCount(pid: usize) ?usize {
+    if (builtin.os.tag != .linux or pid == 0) return null;
+    return linuxChildProcessCount(@intCast(pid));
+}
+
+fn linuxChildProcessCount(pid: std.posix.pid_t) ?usize {
     if (builtin.os.tag != .linux or pid <= 0) return null;
 
     var path_buffer: [128]u8 = undefined;
@@ -2022,9 +2402,7 @@ fn containsPid(items: []const std.posix.pid_t, pid: std.posix.pid_t) bool {
 }
 
 pub fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    return platform_runtime.unixTimestampMs();
 }
 
 fn setNonBlocking(fd: std.posix.fd_t) !void {
@@ -2057,7 +2435,7 @@ fn writePidFile(path: []const u8) !void {
         try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(threaded.io());
     var buffer: [64]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buffer, "{d}\n", .{std.c.getpid()});
+    const text = try std.fmt.bufPrint(&buffer, "{d}\n", .{platform_runtime.processId()});
     var write_buffer: [64]u8 = undefined;
     var writer = file.writer(threaded.io(), &write_buffer);
     try writer.interface.writeAll(text);
@@ -2065,6 +2443,7 @@ fn writePidFile(path: []const u8) !void {
 }
 
 fn deleteSocketPath(path: []const u8) void {
+    if (builtin.os.tag == .windows) return;
     var threaded = std.Io.Threaded.init_single_threaded;
     deleteFilePath(threaded.io(), path);
 }
@@ -2104,6 +2483,62 @@ fn isSafeIdByte(byte: u8) bool {
         byte == '.';
 }
 
+fn testSessionCreateResponseWasCreated(allocator: std.mem.Allocator, response: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result != .object) return error.InvalidResponse;
+    return jsonBool(result.object.get("created") orelse .null) orelse error.InvalidResponse;
+}
+
+test "session create reuses running session and replaces stopped session" {
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+
+    const allocator = std.testing.allocator;
+    var daemon = Daemon.init(allocator);
+    defer daemon.deinit();
+    const request =
+        \\{"jsonrpc":"2.0","id":1,"method":"session.create","params":{"id":"test-reuse-replace","cwd":".","command":["/bin/cat"],"pref_path":"/tmp"}}
+    ;
+
+    const initial_response = try daemon.handleRequest(request);
+    defer allocator.free(initial_response);
+    try std.testing.expect(try testSessionCreateResponseWasCreated(allocator, initial_response));
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+    const initial = daemon.sessions.items[0];
+    const initial_pid = initial.child_pid;
+
+    // Stream EOF is diagnostic state, not evidence that the child exited.
+    initial.stream_eof = true;
+    try std.testing.expect(!initial.captureExitStatus());
+    try std.testing.expect(initial.running);
+    initial.stream_eof = false;
+
+    const attach_id = try initial.attach(allocator, "test-client");
+    defer allocator.free(attach_id);
+    try std.testing.expectEqual(@as(usize, 1), initial.attach_clients.items.len);
+
+    const reused_response = try daemon.handleRequest(request);
+    defer allocator.free(reused_response);
+    try std.testing.expect(!try testSessionCreateResponseWasCreated(allocator, reused_response));
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+    try std.testing.expectEqual(initial_pid, daemon.sessions.items[0].child_pid);
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items[0].attach_clients.items.len);
+
+    try std.testing.expect(initial.terminate());
+    try std.testing.expect(!initial.running);
+
+    const replacement_response = try daemon.handleRequest(request);
+    defer allocator.free(replacement_response);
+    try std.testing.expect(try testSessionCreateResponseWasCreated(allocator, replacement_response));
+    try std.testing.expectEqual(@as(usize, 1), daemon.sessions.items.len);
+    try std.testing.expect(daemon.sessions.items[0].running);
+    try std.testing.expectEqual(@as(usize, 0), daemon.sessions.items[0].attach_clients.items.len);
+}
+
 test "stable session id sanitizes project id" {
     const allocator = std.testing.allocator;
     const session_id = try stableSessionId(allocator, "my project:/tmp/repo", 2, 9);
@@ -2128,4 +2563,126 @@ test "sessionizer socket paths use Verde pref path" {
     const socket = try socketPath(allocator, "/tmp/verde");
     defer allocator.free(socket);
     try std.testing.expect(std.mem.endsWith(u8, socket, "/tmp/verde/" ++ SOCKET_NAME));
+}
+
+test "Windows sessionizer pipe name is stable across path spelling" {
+    const allocator = std.testing.allocator;
+    const canonical = try windowsPipeName(allocator, "C:\\Users\\Test User\\AppData\\Roaming\\verde\\Native");
+    defer allocator.free(canonical);
+    const alternate = try windowsPipeName(allocator, "c:/users/test user/appdata/roaming/verde/native/");
+    defer allocator.free(alternate);
+
+    try std.testing.expect(std.mem.startsWith(u8, canonical, WINDOWS_PIPE_PREFIX));
+    try std.testing.expectEqualStrings(canonical, alternate);
+}
+
+test "Windows daemon replacement ignores the status payload PID" {
+    try std.testing.expectEqual(
+        @as(?usize, 77),
+        daemonProcessIdForReplacement(.windows, 999_999, 77),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        daemonProcessIdForReplacement(.windows, 999_999, null),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 42),
+        daemonProcessIdForReplacement(.linux, 42, null),
+    );
+}
+
+test "Windows pipe rollout rejects legacy daemons" {
+    const recreated_pipe_status = parseDaemonStatus(
+        std.testing.allocator,
+        "{\"result\":{\"protocol_version\":4,\"pid\":999999}}",
+    ).?;
+    const unflushed_pipe_status = parseDaemonStatus(
+        std.testing.allocator,
+        "{\"result\":{\"protocol_version\":5,\"pid\":999999}}",
+    ).?;
+    try std.testing.expect(recreated_pipe_status.protocol_version != PROTOCOL_VERSION);
+    try std.testing.expect(unflushed_pipe_status.protocol_version != PROTOCOL_VERSION);
+}
+
+const TestCliPathMapping = struct {
+    query: []const u8,
+    result: []const u8,
+};
+
+const TestCliPathResolver = struct {
+    mappings: []const TestCliPathMapping,
+
+    fn resolve(self: *const TestCliPathResolver, allocator: std.mem.Allocator, candidate: []const u8) !?[]u8 {
+        for (self.mappings) |mapping| {
+            if (std.ascii.eqlIgnoreCase(candidate, mapping.query)) return @as(?[]u8, try allocator.dupe(u8, mapping.result));
+        }
+        return null;
+    }
+};
+
+test "Windows CLI resolver selects packaged console executable" {
+    const allocator = std.testing.allocator;
+    var resolver: TestCliPathResolver = .{ .mappings = &.{.{
+        .query = "C:\\Verde\\bin\\verde.exe",
+        .result = "C:\\Verde\\bin\\verde.exe",
+    }} };
+    const resolved = try resolveWindowsCliPathWith(allocator, "C:\\Verde\\app\\Verde.exe", &resolver);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("C:\\Verde\\bin\\verde.exe", resolved);
+}
+
+test "Windows daemon resolver selects packaged console executable" {
+    const allocator = std.testing.allocator;
+    var resolver: TestCliPathResolver = .{ .mappings = &.{.{
+        .query = "C:\\Verde\\bin\\verde.exe",
+        .result = "C:\\Verde\\bin\\verde.exe",
+    }} };
+    const resolved = try resolveWindowsDaemonPathWith(allocator, "C:\\Verde\\app\\Verde.exe", &resolver);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("C:\\Verde\\bin\\verde.exe", resolved);
+}
+
+test "Windows daemon resolver preserves raw-prefix console executable" {
+    const allocator = std.testing.allocator;
+    var resolver: TestCliPathResolver = .{ .mappings = &.{
+        .{
+            .query = "C:\\verde-build\\bin\\cli\\verde.exe",
+            .result = "C:\\verde-build\\bin\\cli\\verde.exe",
+        },
+        .{ .query = "verde.exe", .result = "D:\\Installed\\verde.exe" },
+    } };
+    const resolved = try resolveWindowsDaemonPathWith(
+        allocator,
+        "C:\\verde-build\\bin\\cli\\verde.exe",
+        &resolver,
+    );
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("C:\\verde-build\\bin\\cli\\verde.exe", resolved);
+}
+
+test "Windows CLI resolver prefers raw-prefix cli subdirectory" {
+    const allocator = std.testing.allocator;
+    var resolver: TestCliPathResolver = .{ .mappings = &.{
+        .{ .query = "C:\\verde-build\\bin\\cli\\verde.exe", .result = "C:\\verde-build\\bin\\cli\\verde.exe" },
+        .{ .query = "C:\\verde-build\\bin\\verde.exe", .result = "C:\\verde-build\\bin\\verde.exe" },
+    } };
+    const resolved = try resolveWindowsCliPathWith(allocator, "C:\\verde-build\\bin\\Verde.exe", &resolver);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("C:\\verde-build\\bin\\cli\\verde.exe", resolved);
+}
+
+test "Windows CLI resolver falls back through PATH then current executable" {
+    const allocator = std.testing.allocator;
+    var path_resolver: TestCliPathResolver = .{ .mappings = &.{.{
+        .query = "verde.exe",
+        .result = "D:\\Tools\\verde.exe",
+    }} };
+    const from_path = try resolveWindowsCliPathWith(allocator, "C:\\standalone\\Verde.exe", &path_resolver);
+    defer allocator.free(from_path);
+    try std.testing.expectEqualStrings("D:\\Tools\\verde.exe", from_path);
+
+    var fallback_resolver: TestCliPathResolver = .{ .mappings = &.{} };
+    const fallback = try resolveWindowsCliPathWith(allocator, "C:\\standalone\\Verde.exe", &fallback_resolver);
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings("C:\\standalone\\Verde.exe", fallback);
 }

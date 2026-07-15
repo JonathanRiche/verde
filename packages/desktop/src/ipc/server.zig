@@ -5,10 +5,14 @@ const browser_runtime = @import("../browser/mod.zig");
 const browser_ui = @import("../ui/browser.zig");
 const command_palette = @import("../ui/command_palette.zig");
 const herdr = @import("../herdr.zig");
+const platform_ipc = @import("../platform/ipc.zig");
+const live_endpoint = @import("../platform/live_endpoint.zig");
+const platform_runtime = @import("platform_runtime");
 const provider_types = @import("../provider_types.zig");
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const SOCKET_NAME = "verde.sock";
+pub const SOCKET_NAME = live_endpoint.SOCKET_NAME;
+const LIVE_MAX_RESPONSE_BYTES = platform_ipc.DEFAULT_MAX_RESPONSE_BYTES;
 
 const Mutex = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -42,14 +46,13 @@ pub const LiveServer = struct {
     allocator: std.mem.Allocator,
     path: []u8,
     thread: ?std.Thread = null,
-    owns_socket: std.atomic.Value(bool) = .init(false),
     mutex: Mutex = .{},
     condition: Condition = .{},
     pending: std.ArrayList(*Command) = .empty,
     shutdown: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, pref_path: []const u8) !LiveServer {
-        const path = try std.fs.path.join(allocator, &.{ pref_path, SOCKET_NAME });
+        const path = try live_endpoint.alloc(allocator, pref_path);
         errdefer allocator.free(path);
         return .{
             .allocator = allocator,
@@ -67,7 +70,7 @@ pub const LiveServer = struct {
         self.condition.broadcast();
         self.mutex.unlock();
 
-        wakeServer(self.path);
+        platform_ipc.wake(self.allocator, self.path, .{});
         if (self.thread) |thread| thread.join();
 
         for (self.pending.items) |command| {
@@ -76,7 +79,6 @@ pub const LiveServer = struct {
             self.allocator.destroy(command);
         }
         self.pending.deinit(self.allocator);
-        if (self.owns_socket.load(.seq_cst)) deleteSocketPath(self.path);
         self.allocator.free(self.path);
         self.* = undefined;
     }
@@ -113,17 +115,37 @@ pub const LiveServer = struct {
     }
 
     fn enqueueAndWait(self: *LiveServer, request_json: []u8) ![]u8 {
-        const command = try self.allocator.create(Command);
+        const command = self.allocator.create(Command) catch |err| {
+            self.allocator.free(request_json);
+            return err;
+        };
         command.* = .{ .request_json = request_json };
-        errdefer self.allocator.destroy(command);
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.shutdown) return error.ShuttingDown;
-        try self.pending.append(self.allocator, command);
+        if (self.shutdown) {
+            self.allocator.free(request_json);
+            self.allocator.destroy(command);
+            return error.ShuttingDown;
+        }
+        self.pending.append(self.allocator, command) catch |err| {
+            self.allocator.free(request_json);
+            self.allocator.destroy(command);
+            return err;
+        };
         self.condition.broadcast();
         while (!command.done and !self.shutdown) self.condition.wait(&self.mutex);
-        if (self.shutdown and !command.done) return error.ShuttingDown;
+        if (self.shutdown and !command.done) {
+            for (self.pending.items, 0..) |pending, index| {
+                if (pending == command) {
+                    _ = self.pending.orderedRemove(index);
+                    break;
+                }
+            }
+            self.allocator.free(request_json);
+            self.allocator.destroy(command);
+            return error.ShuttingDown;
+        }
 
         const response = command.response_json orelse try errorResponseAlloc(self.allocator, null, "internal_error", "missing response");
         self.allocator.free(command.request_json);
@@ -133,51 +155,24 @@ pub const LiveServer = struct {
 };
 
 fn serverThreadMain(server: *LiveServer) void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    // A second Verde instance can start while the first app is still running.
-    // Do not unlink an active app socket: existing terminal hooks have this
-    // pathname in VERDE_LIVE_SOCKET, and unlinking it leaves the first server
-    // listening on an anonymous fd that no hook/CLI process can reach.
-    if (socketAcceptsConnections(threaded.io(), server.path)) return;
-    deleteSocketPath(server.path);
-
-    const address = std.Io.net.UnixAddress.init(server.path) catch return;
-    var listener = address.listen(threaded.io(), .{}) catch return;
-    server.owns_socket.store(true, .seq_cst);
-    defer listener.deinit(threaded.io());
-    defer {
-        if (server.owns_socket.load(.seq_cst)) deleteSocketPath(server.path);
-    }
-
-    while (true) {
-        server.mutex.lock();
-        const should_stop = server.shutdown;
-        server.mutex.unlock();
-        if (should_stop) break;
-
-        const stream = listener.accept(threaded.io()) catch |err| switch (err) {
-            error.WouldBlock, error.ConnectionAborted => continue,
-            else => break,
-        };
-        handleClient(server, threaded.io(), stream);
-    }
+    platform_ipc.serve(server.allocator, server.path, .{
+        .context = server,
+        .should_stop = transportShouldStop,
+        .handle_request = transportHandleRequest,
+    }, .{}) catch {};
 }
 
-fn handleClient(server: *LiveServer, io: std.Io, stream: std.Io.net.Stream) void {
-    defer stream.close(io);
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    const line = reader.interface.takeDelimiter('\n') catch return orelse return;
-    const request_json = server.allocator.dupe(u8, std.mem.trim(u8, line, "\r")) catch return;
-    const response_json = server.enqueueAndWait(request_json) catch |err|
-        errorResponseAlloc(server.allocator, null, "server_unavailable", @errorName(err)) catch return;
-    defer server.allocator.free(response_json);
+fn transportShouldStop(context: *anyopaque) bool {
+    const server: *LiveServer = @ptrCast(@alignCast(context));
+    server.mutex.lock();
+    defer server.mutex.unlock();
+    return server.shutdown;
+}
 
-    var write_buffer: [64 * 1024]u8 = undefined;
-    var writer = stream.writer(io, &write_buffer);
-    writer.interface.writeAll(response_json) catch return;
-    writer.interface.writeByte('\n') catch return;
-    writer.interface.flush() catch return;
+fn transportHandleRequest(context: *anyopaque, request_json: []u8) ![]u8 {
+    const server: *LiveServer = @ptrCast(@alignCast(context));
+    return server.enqueueAndWait(request_json) catch |err|
+        errorResponseAlloc(server.allocator, null, "server_unavailable", @errorName(err));
 }
 
 fn handleRequest(allocator: std.mem.Allocator, state: *app_state.AppState, request_json: []const u8) ![]u8 {
@@ -232,7 +227,7 @@ fn statusResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state:
     try s.objectField("protocol_version");
     try s.write(PROTOCOL_VERSION);
     try s.objectField("pid");
-    try s.write(std.c.getpid());
+    try s.write(platform_runtime.processId());
     try s.objectField("workspace_count");
     try s.write(state.projects.items.len);
     try s.objectField("selected_workspace_index");
@@ -1826,6 +1821,14 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     };
     if (ref.thread_index >= project.threads.items.len) return try errorResponseAlloc(allocator, id_value, "not_found", "thread not found");
     const thread = &project.threads.items[ref.thread_index];
+    if (!transcriptFitsLiveResponse(thread.messages.items, LIVE_MAX_RESPONSE_BYTES)) {
+        return try errorResponseAlloc(
+            allocator,
+            id_value,
+            "response_too_large",
+            "transcript exceeds the live response limit; use `verde state transcript` for the complete offline transcript",
+        );
+    }
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -1855,6 +1858,24 @@ fn chatTranscriptResponse(allocator: std.mem.Allocator, id_value: std.json.Value
     try s.endObject();
     try s.endObject();
     return try writer.toOwnedSlice();
+}
+
+/// JSON escaping can expand each input byte to six bytes. Reserve fixed syntax
+/// space per row so the transcript writer cannot cross the transport cap.
+fn transcriptFitsLiveResponse(messages: []const app_state.ChatMessage, max_bytes: usize) bool {
+    var remaining = max_bytes;
+    if (remaining < 512) return false;
+    remaining -= 512;
+    for (messages) |message| {
+        if (remaining < 64) return false;
+        remaining -= 64;
+        const role = @tagName(message.role);
+        for ([_][]const u8{ role, message.author, message.body }) |text| {
+            if (text.len > remaining / 6) return false;
+            remaining -= text.len * 6;
+        }
+    }
+    return true;
 }
 
 fn inspectPaneResponse(allocator: std.mem.Allocator, id_value: std.json.Value, state: *app_state.AppState, project_index: usize, pane_id: app_state.WorkspacePaneId) ![]u8 {
@@ -2033,21 +2054,12 @@ fn parseApprovalDecision(value: []const u8) ?provider_types.ApprovalDecision {
     return null;
 }
 
-fn deleteSocketPath(path: []const u8) void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    std.Io.Dir.deleteFileAbsolute(threaded.io(), path) catch {};
-}
-
-fn socketAcceptsConnections(io: std.Io, path: []const u8) bool {
-    const address = std.Io.net.UnixAddress.init(path) catch return false;
-    const stream = address.connect(io) catch return false;
-    stream.close(io);
-    return true;
-}
-
-fn wakeServer(path: []const u8) void {
-    var threaded = std.Io.Threaded.init_single_threaded;
-    const address = std.Io.net.UnixAddress.init(path) catch return;
-    const stream = address.connect(threaded.io()) catch return;
-    stream.close(threaded.io());
+test "live transcript response budget is bounded before JSON allocation" {
+    const messages = [_]app_state.ChatMessage{.{
+        .role = .user,
+        .author = "You",
+        .body = "hello",
+    }};
+    try std.testing.expect(transcriptFitsLiveResponse(&messages, 1024));
+    try std.testing.expect(!transcriptFitsLiveResponse(&messages, 512));
 }

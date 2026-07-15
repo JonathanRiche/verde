@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform_process = @import("../platform/process.zig");
+const platform_runtime = @import("platform_runtime");
 const process_env = @import("../process_env.zig");
 const provider_types = @import("../provider_types.zig");
 const runtime_log = @import("../runtime_log.zig");
@@ -18,11 +20,7 @@ const MAX_POLL_ATTEMPTS = 24_000;
 const EMPTY_IDLE_GRACE_POLLS: usize = 16;
 
 fn sleepMs(ms: u64) void {
-    const request: std.c.timespec = .{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&request, null);
+    platform_runtime.sleepMillis(ms);
 }
 
 const Mutex = struct {
@@ -59,7 +57,7 @@ pub const Config = struct {
 
 const SharedServerState = struct {
     mutex: Mutex = .{},
-    child: ?std.process.Child = null,
+    child: ?platform_process.OwnedChild = null,
     owns_child: bool = false,
 };
 
@@ -393,14 +391,13 @@ pub const Client = struct {
 
         var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded_spawn.deinit();
-        const child = try std.process.spawn(threaded_spawn.io(), .{
+        const child = try platform_process.spawn(self.allocator, threaded_spawn.io(), .{
             .argv = argv[0..],
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
             .cwd = if (self.config.working_directory) |path| .{ .path = path } else .inherit,
             .environ_map = &env_map,
-            .pgid = 0,
         });
 
         shared_server_state.child = child;
@@ -943,14 +940,10 @@ pub fn shutdownOwnedServer() void {
 fn stopOwnedServerLocked() void {
     if (shared_server_state.child) |*child| {
         if (shared_server_state.owns_child) {
-            const pid = child.id orelse -1;
+            const pid = child.processId() orelse 0;
             runtime_log.diagnostic("opencode.stopOwnedServer signalling pid={d}", .{pid});
-            if (child.id) |child_pid| {
-                std.posix.kill(-child_pid, std.posix.SIG.TERM) catch |err| {
-                    runtime_log.diagnostic("opencode.stopOwnedServer group SIGTERM failed pid={d}: {s}", .{ child_pid, @errorName(err) });
-                    std.posix.kill(child_pid, std.posix.SIG.TERM) catch {};
-                };
-            }
+            var threaded = std.Io.Threaded.init_single_threaded;
+            child.kill(threaded.io());
         }
         shared_server_state.child = null;
         shared_server_state.owns_child = false;
@@ -1024,7 +1017,7 @@ const EventStreamContext = struct {
     session_id: []u8,
     baseline_assistant_id: ?[]u8,
     request: provider_types.SendPromptRequest,
-    child: ?std.process.Child = null,
+    child: ?platform_process.OwnedChild = null,
     streamed_text: std.ArrayListUnmanaged(u8) = .empty,
     mutex: Mutex = .{},
     condition: Condition = .{},
@@ -1554,7 +1547,7 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
 
     var threaded_spawn = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded_spawn.deinit();
-    const child = try std.process.spawn(threaded_spawn.io(), .{
+    const child = try platform_process.spawn(context.allocator, threaded_spawn.io(), .{
         .argv = argv.items,
         .stdin = .ignore,
         .stdout = .pipe,
@@ -1567,12 +1560,12 @@ fn streamSessionEvents(context: *EventStreamContext) !void {
     context.mutex.unlock();
     defer cleanupEventStreamChild(context);
 
-    log.info("OpenCode event stream started for session {s} pid={d}", .{ context.session_id, child.id orelse -1 });
+    log.info("OpenCode event stream started session_len={d} pid={d}", .{ context.session_id.len, child.processId() orelse 0 });
 
     opened = true;
     signalEventStreamOpenState(context, .ready);
 
-    const stdout = context.child.?.stdout.?;
+    const stdout = context.child.?.child.stdout.?;
     var read_buffer: [64 * 1024]u8 = undefined;
     var threaded_read = std.Io.Threaded.init_single_threaded;
     var file_reader = stdout.reader(threaded_read.io(), &read_buffer);
@@ -1630,7 +1623,7 @@ fn signalEventStreamOpenState(context: *EventStreamContext, next: EventStreamOpe
 }
 
 fn signalEventStreamStop(handle: EventStreamHandle) void {
-    log.info("stopping OpenCode event stream for session {s}", .{handle.context.session_id});
+    log.info("stopping OpenCode event stream session_len={d}", .{handle.context.session_id.len});
     handle.context.mutex.lock();
     handle.context.stop_requested = true;
     if (handle.context.child) |*child| {
@@ -1656,13 +1649,13 @@ fn cleanupEventStreamChild(context: *EventStreamContext) void {
     context.mutex.unlock();
 
     if (maybe_child) |*owned_child| {
-        if (owned_child.id != null) {
+        if (owned_child.child.id != null) {
             var threaded = std.Io.Threaded.init_single_threaded;
-            _ = owned_child.wait(threaded.io()) catch {};
+            _ = owned_child.wait(threaded.io()) catch owned_child.kill(threaded.io());
         }
     }
 
-    log.info("OpenCode event stream exited for session {s}", .{context.session_id});
+    log.info("OpenCode event stream exited session_len={d}", .{context.session_id.len});
 }
 
 fn processEventStreamMessage(context: *EventStreamContext, raw_event_name: []const u8, raw_event_data: []const u8) !bool {

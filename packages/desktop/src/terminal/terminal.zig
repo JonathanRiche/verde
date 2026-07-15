@@ -4,6 +4,7 @@ const sdl = @import("zsdl3");
 const ghostty_vt = @import("../vendor/ghostty_vt.zig");
 const keybinds = @import("../keybinds.zig");
 const process_env = @import("../process_env.zig");
+const platform_runtime = @import("platform_runtime");
 pub const sessionizer = @import("sessionizer.zig");
 const stb_image = @import("../stb_image.zig");
 const theme = @import("../ui/theme.zig");
@@ -15,7 +16,10 @@ pub const DEFAULT_DOCK_HEIGHT: f32 = 136.0;
 pub const MIN_DOCK_HEIGHT: f32 = 96.0;
 pub const MAX_DOCK_HEIGHT: f32 = 900.0;
 
-const SESSION_SUPPORTED = builtin.os.tag == .linux or builtin.os.tag == .macos;
+const SESSION_SUPPORTED = builtin.os.tag == .linux or builtin.os.tag == .macos or builtin.os.tag == .windows;
+const LOCAL_PTY_SUPPORTED = builtin.os.tag != .windows;
+const LocalPtyFd = if (builtin.os.tag == .windows) c_int else std.posix.fd_t;
+const LocalPtyPid = if (builtin.os.tag == .windows) c_int else std.posix.pid_t;
 const INITIAL_COLS: u16 = 96;
 const INITIAL_ROWS: u16 = 12;
 const MIN_COLS: u16 = 24;
@@ -61,12 +65,19 @@ fn decodeTerminalPng(allocator: std.mem.Allocator, bytes: []const u8) ghostty_vt
 // ~2 seconds at display rate; see daemon_poll_failures for why one miss
 // must not trigger a revive.
 const DAEMON_POLL_FAILURE_LIMIT: u32 = 120;
+// Automatic recovery preserves the stopped VT model between attempts. A shell
+// that keeps dying backs off exponentially; a healthy shell must stay alive
+// long enough to prove the recovery before the failure streak is forgotten.
+const AUTO_RESTART_BASE_DELAY_MS: i64 = 1_000;
+const AUTO_RESTART_MAX_DELAY_MS: i64 = 30_000;
+const AUTO_RESTART_HEALTHY_RESET_MS: i64 = 10_000;
 const LOCAL_TERMINAL_VIEW_RESET = "\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[0m\x1b[2J\x1b[H";
 const LOCAL_TERMINAL_SCREEN_CLEAR = "\x1b[0m\x1b[2J\x1b[H";
 pub const DEFAULT_FONT_SIZE: f32 = @floatFromInt(CELL_PIXEL_HEIGHT);
 // Darwin exposes the winsize setter under the BSD ioctl value, not std.c.T.IOCSWINSZ.
 const TERMINAL_WINSIZE_IOCTL: c_int = switch (builtin.os.tag) {
     .macos => @bitCast(@as(u32, 0x80087467)),
+    .windows => 0,
     else => @intCast(std.c.T.IOCSWINSZ),
 };
 const TERMINAL_GET_PGRP_IOCTL: ?c_int = switch (builtin.os.tag) {
@@ -86,7 +97,6 @@ const ColorScheme = std.meta.Child(
 );
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
 
 const Session = if (SESSION_SUPPORTED) UnixSession else UnsupportedSession;
 pub const MIN_SPLIT_RATIO: f32 = 0.12;
@@ -210,6 +220,58 @@ pub const PersistedNode = struct {
     second_node_id: ?u32 = null,
 };
 
+const AutoRestartBackoff = struct {
+    attempts: u8 = 0,
+    retry_after_ms: i64 = 0,
+    healthy_since_ms: ?i64 = null,
+    stopped_since_ms: ?i64 = null,
+
+    fn reserve(self: *AutoRestartBackoff, now_ms: i64) bool {
+        if (now_ms < self.retry_after_ms) return false;
+        self.attempts +|= 1;
+        self.retry_after_ms = now_ms +| autoRestartDelayMs(self.attempts);
+        self.healthy_since_ms = null;
+        self.stopped_since_ms = null;
+        return true;
+    }
+
+    /// Starts the retry delay after creation finishes. Some creation paths are
+    /// explicit user actions and do not call `reserve`; without this arm, a
+    /// short-lived shell can have its parsed exit output discarded immediately.
+    fn armAfterCreate(self: *AutoRestartBackoff, now_ms: i64, running: bool) void {
+        if (self.attempts == 0) self.attempts = 1;
+        self.retry_after_ms = @max(
+            self.retry_after_ms,
+            now_ms +| autoRestartDelayMs(self.attempts),
+        );
+        self.healthy_since_ms = null;
+        self.stopped_since_ms = if (running) null else now_ms;
+    }
+
+    fn observeHealth(self: *AutoRestartBackoff, now_ms: i64, running: bool) void {
+        if (!running) {
+            self.healthy_since_ms = null;
+            if (self.stopped_since_ms == null) {
+                self.stopped_since_ms = now_ms;
+                self.retry_after_ms = @max(
+                    self.retry_after_ms,
+                    now_ms +| autoRestartDelayMs(@max(self.attempts, 1)),
+                );
+            }
+            return;
+        }
+        self.stopped_since_ms = null;
+        if (self.attempts == 0) return;
+
+        const healthy_since_ms = self.healthy_since_ms orelse {
+            self.healthy_since_ms = now_ms;
+            return;
+        };
+        if (now_ms < healthy_since_ms or now_ms - healthy_since_ms < AUTO_RESTART_HEALTHY_RESET_MS) return;
+        self.* = .{};
+    }
+};
+
 pub const PaneLeaf = struct {
     id: u32,
     session: ?*Session = null,
@@ -292,6 +354,7 @@ pub const Dock = struct {
     focus_requested: bool = false,
     orphan_prune_done: bool = false,
     launch_profile: TerminalLaunchProfile = .{},
+    auto_restart_backoff: AutoRestartBackoff = .{},
 
     pub fn init(_: std.mem.Allocator) !Dock {
         return .{};
@@ -453,6 +516,8 @@ pub const Dock = struct {
             changed = (try pollPaneNode(tab.root, allocator, &terminal_modes_changed)) or changed;
             if (self.captureTabObservedTitle(allocator, tab)) changed = true;
         }
+        const now_ms: i64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
+        self.auto_restart_backoff.observeHealth(now_ms, self.hasRunningSession());
         if (terminal_modes_changed) self.workspace_changed = true;
         return changed;
     }
@@ -599,6 +664,22 @@ pub const Dock = struct {
             if (paneNodeHasSessionId(tab.root)) return true;
         }
         return false;
+    }
+
+    /// Reserves one automatic recovery attempt while preventing a shell that
+    /// exits immediately from being recreated on every main-loop iteration.
+    pub fn reserveAutoRestart(self: *Dock, now_ms: i64) bool {
+        if (!self.auto_restart_backoff.reserve(now_ms)) return false;
+        runtime_log.diagnostic(
+            "terminal automatic restart reserved dock={d} pane={?d} attempt={d} delay_ms={d}",
+            .{
+                self.session_dock_id,
+                if (self.activePaneConst()) |pane| pane.id else null,
+                self.auto_restart_backoff.attempts,
+                autoRestartDelayMs(self.auto_restart_backoff.attempts),
+            },
+        );
+        return true;
     }
 
     pub fn takeFocusRequest(self: *Dock) bool {
@@ -1116,11 +1197,11 @@ pub const Dock = struct {
             if (attached_clients != 0) continue;
 
             const kill_response = sessionizer.requestAlloc(allocator, pref_path, "session.kill", .{ .id = session_id }, 1) catch |err| {
-                log.debug("failed to kill orphan daemon terminal session {s}: {s}", .{ session_id, @errorName(err) });
+                log.debug("failed to kill orphan daemon terminal session id_len={d}: {s}", .{ session_id.len, @errorName(err) });
                 continue;
             };
             allocator.free(kill_response);
-            log.info("pruned orphan daemon terminal session {s}", .{session_id});
+            log.info("pruned orphan daemon terminal session id_len={d}", .{session_id.len});
         }
     }
 
@@ -1164,8 +1245,13 @@ pub const Dock = struct {
     }
 
     fn ensureLeafSession(self: *Dock, allocator: std.mem.Allocator, leaf: *PaneLeaf) !void {
-        if (leaf.session != null) return;
         const cwd = self.cwd orelse return;
+        // A non-null slot is not necessarily usable: sustained daemon loss can
+        // leave the local session object present but definitively stopped. Drop
+        // only that stopped object so the persisted identity below can attach
+        // to a surviving daemon session or create its replacement. The Dock's
+        // automatic-restart gate limits how often this destructive step runs.
+        if (!prepareSessionSlotForCreate(Session, allocator, &leaf.session)) return;
 
         const profile = TerminalLaunchProfile{
             .kind = leaf.launch_kind orelse self.launch_profile.kind,
@@ -1201,6 +1287,8 @@ pub const Dock = struct {
             .pane_id = leaf.id,
             .revive_policy = leaf.revive_policy,
         });
+        const now_ms: i64 = @intCast(@divTrunc(platform_runtime.monotonicTimestampNs(), std.time.ns_per_ms));
+        self.auto_restart_backoff.armAfterCreate(now_ms, leaf.session.?.isRunning());
         leaf.restored_modes = null;
         // Restart is a one-shot user action. Once the fresh daemon session is
         // created, future app launches should reattach like normal terminals.
@@ -1378,6 +1466,26 @@ fn deinitPaneLeaf(leaf: *PaneLeaf, allocator: std.mem.Allocator) void {
     }
     freeStringSlice(allocator, leaf.launch_command);
     leaf.launch_command = &.{};
+}
+
+/// Leaves running sessions untouched while releasing a stopped session so its
+/// persisted leaf can create a fresh local attachment on the next ensure pass.
+fn prepareSessionSlotForCreate(comptime SessionType: type, allocator: std.mem.Allocator, slot: *?*SessionType) bool {
+    const session = slot.* orelse return true;
+    if (session.isRunning()) return false;
+    session.deinit(allocator);
+    allocator.destroy(session);
+    slot.* = null;
+    return true;
+}
+
+fn autoRestartDelayMs(attempts: u8) i64 {
+    var delay_ms = AUTO_RESTART_BASE_DELAY_MS;
+    var remaining = attempts;
+    while (remaining > 1 and delay_ms < AUTO_RESTART_MAX_DELAY_MS) : (remaining -= 1) {
+        delay_ms = @min(delay_ms * 2, AUTO_RESTART_MAX_DELAY_MS);
+    }
+    return delay_ms;
 }
 
 fn pollPaneNode(node: *PaneNode, allocator: std.mem.Allocator, terminal_modes_changed: *bool) !bool {
@@ -1871,8 +1979,8 @@ const TerminalScroll = union(enum) {
 
 const UnixSession = struct {
     backend: Backend = .local,
-    master_fd: std.posix.fd_t,
-    child_pid: std.posix.pid_t,
+    master_fd: LocalPtyFd,
+    child_pid: LocalPtyPid,
     terminal: ghostty_vt.Terminal,
     stream: TerminalStream,
     render_state: ghostty_vt.RenderState = .empty,
@@ -1930,8 +2038,8 @@ const UnixSession = struct {
     };
 
     const SpawnResult = struct {
-        master_fd: std.posix.fd_t,
-        child_pid: std.posix.pid_t,
+        master_fd: LocalPtyFd,
+        child_pid: LocalPtyPid,
     };
 
     extern fn forkpty(
@@ -1995,6 +2103,11 @@ const UnixSession = struct {
             return self;
         }
 
+        // Windows terminals are daemon-owned ConPTY sessions. Keeping the
+        // fallback local-PTY path Unix-only prevents fork/termios symbols from
+        // leaking into Windows while retaining the existing Unix behavior.
+        if (!LOCAL_PTY_SUPPORTED) return error.PersistentTerminalIdentityRequired;
+
         const child = try spawnCommand(allocator, options);
         errdefer {
             std.posix.kill(child.child_pid, std.posix.SIG.TERM) catch {};
@@ -2029,10 +2142,12 @@ const UnixSession = struct {
     }
 
     pub fn deinit(self: *UnixSession, allocator: std.mem.Allocator) void {
-        if (self.backend == .local and self.running) {
-            std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+        if (LOCAL_PTY_SUPPORTED) {
+            if (self.backend == .local and self.running) {
+                std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
+            }
+            if (self.backend == .local) _ = std.c.close(self.master_fd);
         }
-        if (self.backend == .local) _ = std.c.close(self.master_fd);
         _ = self.captureExitStatus();
         if (self.backend == .daemon) self.detachDaemon(allocator);
         self.stream.deinit();
@@ -2069,7 +2184,7 @@ const UnixSession = struct {
 
     pub fn poll(self: *UnixSession, allocator: std.mem.Allocator) !bool {
         const changed = switch (self.backend) {
-            .local => try self.drainOutput(allocator),
+            .local => if (LOCAL_PTY_SUPPORTED) try self.drainOutput(allocator) else false,
             .daemon => try self.drainDaemonOutput(allocator),
         };
         const exited = self.captureExitStatus();
@@ -2165,7 +2280,7 @@ const UnixSession = struct {
         const needs_initial_replay = self.backend == .daemon and self.suppress_next_daemon_replay and self.remote_output_offset == 0;
         switch (self.backend) {
             .local => {
-                if (size_changed) self.applyWinsize();
+                if (LOCAL_PTY_SUPPORTED and size_changed) self.applyWinsize();
             },
             .daemon => {
                 try self.resizeDaemon(allocator);
@@ -2186,9 +2301,9 @@ const UnixSession = struct {
                 // primary reflows iff `wraparound` is set; alternate never
                 // reflows.
                 log.info(
-                    "resize-mode session={s} active_screen={s} wraparound={} old_cols={d} new_cols={d} old_rows={d} new_rows={d}",
+                    "resize-mode session_len={d} active_screen={s} wraparound={} old_cols={d} new_cols={d} old_rows={d} new_rows={d}",
                     .{
-                        self.session_id orelse "<local>",
+                        if (self.session_id) |session_id| session_id.len else 0,
                         @tagName(self.terminal.screens.active_key),
                         self.terminal.modes.get(.wraparound),
                         prev_cols,
@@ -2261,6 +2376,9 @@ const UnixSession = struct {
             }
         }
         if (self.exit_status) |status| {
+            if (builtin.os.tag == .windows) {
+                return std.fmt.bufPrint(buf, "{s} exited with code {d}", .{ self.launch_label, status }) catch "Terminal exited";
+            }
             if (std.c.W.IFEXITED(status)) {
                 return std.fmt.bufPrint(buf, "{s} exited with code {d}", .{ self.launch_label, std.c.W.EXITSTATUS(status) }) catch "Terminal exited";
             }
@@ -2309,6 +2427,7 @@ const UnixSession = struct {
     pub fn snapshot(self: *const UnixSession) SessionSnapshot {
         if (self.running) return .{ .running = true };
         const status = self.exit_status orelse return .{ .running = false };
+        if (builtin.os.tag == .windows) return .{ .running = false, .exit_code = status };
         if (std.c.W.IFEXITED(status)) {
             return .{ .running = false, .exit_code = @intCast(std.c.W.EXITSTATUS(status)) };
         }
@@ -2330,6 +2449,7 @@ const UnixSession = struct {
             self.running = false;
             return true;
         }
+        if (!LOCAL_PTY_SUPPORTED) return false;
         std.posix.kill(self.child_pid, std.posix.SIG.TERM) catch return false;
         self.running = false;
         _ = self.captureExitStatus();
@@ -2433,6 +2553,7 @@ const UnixSession = struct {
     fn foregroundProcessGroup(self: *const UnixSession) ?usize {
         switch (self.backend) {
             .local => {
+                if (!LOCAL_PTY_SUPPORTED) return null;
                 const ioctl_value = TERMINAL_GET_PGRP_IOCTL orelse return null;
                 var foreground_process_group: c_int = 0;
                 if (std.c.ioctl(self.master_fd, ioctl_value, &foreground_process_group) != 0) return null;
@@ -2576,6 +2697,7 @@ const UnixSession = struct {
         if (!self.running or text.len == 0) return false;
 
         if (self.backend == .local) {
+            if (!LOCAL_PTY_SUPPORTED) return false;
             try writeTerminalPaste(allocator, self.master_fd, text, self.terminal.modes.get(.bracketed_paste));
             return true;
         }
@@ -2616,22 +2738,23 @@ const UnixSession = struct {
         const second_trimmed = std.mem.trim(u8, second, " \r\t");
         const third_trimmed = std.mem.trim(u8, third, " \r\t");
         runtime_log.diagnostic(
-            "terminal render snapshot session={?s} screen={s} cells={d}x{d} cursor_viewport=({?d},{?d}) row1=\"{s}\" row2=\"{s}\" row3=\"{s}\"",
+            "terminal render snapshot session_len={d} screen={s} cells={d}x{d} cursor_viewport=({?d},{?d}) row1_len={d} row2_len={d} row3_len={d}",
             .{
-                self.session_id,
+                if (self.session_id) |session_id| session_id.len else 0,
                 @tagName(self.terminal.screens.active_key),
                 self.cols,
                 self.rows,
                 if (self.render_state.cursor.viewport) |cursor| cursor.x else null,
                 if (self.render_state.cursor.viewport) |cursor| cursor.y else null,
-                clippedLogText(first_trimmed),
-                clippedLogText(second_trimmed),
-                clippedLogText(third_trimmed),
+                first_trimmed.len,
+                second_trimmed.len,
+                third_trimmed.len,
             },
         );
     }
 
     fn drainOutput(self: *UnixSession, allocator: std.mem.Allocator) !bool {
+        if (!LOCAL_PTY_SUPPORTED) return false;
         if (!self.running) return false;
 
         var changed = false;
@@ -2660,23 +2783,22 @@ const UnixSession = struct {
         return changed;
     }
 
-    /// Diagnostic: dump suspicious chunk boundaries so we can catch parser
-    /// desync (e.g. visible `5;174m` leaks, stray `\e`) in the act. Two cases:
+    /// Diagnostic: record suspicious chunk-boundary geometry so we can catch
+    /// parser desync (e.g. visible `5;174m` leaks, stray `\e`) without
+    /// persisting terminal content. Two cases:
     ///   1. The previous chunk ended with an ESC near its tail (potentially
     ///      mid-sequence). The continuation arrives at the head of THIS chunk
     ///      — log it, because that's where a desync becomes visible.
     ///   2. THIS chunk ends with an ESC near its tail. Remember it so we can
     ///      log case (1) on the next iteration, and dump the tail itself for
     ///      context.
-    /// Bytes are formatted printable-ASCII-with-\xNN escapes; one line per event.
+    /// Only offsets and byte counts are logged; one line per event.
     fn logParserBoundary(self: *UnixSession, chunk: []const u8) void {
         if (chunk.len == 0) return;
 
         if (self.parser_log_prev_tail_had_esc) {
-            var buf: [256]u8 = undefined;
             const head_len = @min(chunk.len, 48);
-            const formatted = formatBytesForLog(chunk[0..head_len], &buf);
-            log.warn("parser-boundary: continuation chunk head len={d} bytes='{s}'", .{ chunk.len, formatted });
+            log.warn("parser-boundary: continuation chunk_len={d} inspected_head_len={d}", .{ chunk.len, head_len });
         }
 
         var last_esc: ?usize = null;
@@ -2691,11 +2813,9 @@ const UnixSession = struct {
         if (last_esc) |pos| {
             const dist_from_end = chunk.len - pos;
             if (dist_from_end <= 32) {
-                var buf: [256]u8 = undefined;
                 const tail = chunk[pos..];
-                const formatted = formatBytesForLog(tail, &buf);
-                log.warn("parser-boundary: ESC near chunk end chunk_len={d} esc_count={d} last_esc_at={d} dist_from_end={d} tail='{s}'", .{
-                    chunk.len, esc_count, pos, dist_from_end, formatted,
+                log.warn("parser-boundary: ESC near chunk end chunk_len={d} esc_count={d} last_esc_at={d} dist_from_end={d} tail_len={d}", .{
+                    chunk.len, esc_count, pos, dist_from_end, tail.len,
                 });
                 self.parser_log_prev_tail_had_esc = true;
                 return;
@@ -2748,21 +2868,21 @@ const UnixSession = struct {
         self.defer_daemon_replay_until_resize = attached_existing_session;
         self.needs_attach_repaint_kick = attached_existing_session;
         runtime_log.diagnostic(
-            "terminal daemon attach session={s} existing={} revive_policy={s}",
-            .{ session_id, attached_existing_session, @tagName(options.revive_policy) },
+            "terminal daemon attach dock={d} pane={d} session_len={d} existing={} revive_policy={s}",
+            .{ options.dock_id, options.pane_id, session_id.len, attached_existing_session, @tagName(options.revive_policy) },
         );
 
         const attach_response = sessionizer.requestAlloc(allocator, pref_path, "session.attach", .{
             .id = session_id,
             .label = "verde-ui",
         }, 1) catch |err| blk: {
-            log.debug("daemon terminal session {s} does not support attach registration: {s}", .{ session_id, @errorName(err) });
+            log.debug("daemon terminal session id_len={d} does not support attach registration: {s}", .{ session_id.len, @errorName(err) });
             break :blk null;
         };
         if (attach_response) |response| {
             defer allocator.free(response);
             self.attach_id = sessionResultStringAlloc(allocator, response, "attach_id") catch |err| blk: {
-                log.debug("daemon terminal session {s} attach registration failed: {s}", .{ session_id, @errorName(err) });
+                log.debug("daemon terminal session id_len={d} attach registration failed: {s}", .{ session_id.len, @errorName(err) });
                 break :blk null;
             };
         }
@@ -2792,8 +2912,8 @@ const UnixSession = struct {
             self.daemon_poll_failures += 1;
             if (self.daemon_poll_failures == 1 or self.daemon_poll_failures == DAEMON_POLL_FAILURE_LIMIT) {
                 runtime_log.diagnostic(
-                    "terminal daemon tail failure session={s} count={d} err={s}",
-                    .{ session_id, self.daemon_poll_failures, @errorName(err) },
+                    "terminal daemon tail failure session_len={d} count={d} err={s}",
+                    .{ session_id.len, self.daemon_poll_failures, @errorName(err) },
                 );
             }
             if (self.daemon_poll_failures < DAEMON_POLL_FAILURE_LIMIT) return false;
@@ -2808,15 +2928,15 @@ const UnixSession = struct {
             // sequence) would otherwise recur identically every frame and
             // freeze the pane; surface it instead of erroring the poll loop.
             runtime_log.diagnostic(
-                "terminal daemon tail parse failure session={s} err={s} response_len={d}",
-                .{ session_id, @errorName(err), response.len },
+                "terminal daemon tail parse failure session_len={d} err={s} response_len={d}",
+                .{ session_id.len, @errorName(err), response.len },
             );
             return err;
         };
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSessionResponse;
         if (parsed.value.object.get("error")) |_| {
-            runtime_log.diagnostic("terminal daemon tail rejected session={s} marking missing", .{session_id});
+            runtime_log.diagnostic("terminal daemon tail rejected session_len={d} marking missing", .{session_id.len});
             self.daemon_state = .missing;
             self.running = false;
             return false;
@@ -2831,9 +2951,9 @@ const UnixSession = struct {
         // Empty tails dominate (the main loop polls at up to display rate
         // during output bursts); only log polls that actually moved data.
         if (text.len > 0) log.info(
-            "daemon-tail session={s} offset={d}->{d} text_len={d} shell_pid={?d} pgrp={?d} suppress={} active_screen={s}",
+            "daemon-tail session_len={d} offset={d}->{d} text_len={d} shell_pid={?d} pgrp={?d} suppress={} active_screen={s}",
             .{
-                session_id,
+                session_id.len,
                 self.remote_output_offset,
                 next_offset,
                 text.len,
@@ -2857,7 +2977,7 @@ const UnixSession = struct {
         self.daemon_poll_failures = 0;
         if (stale_alt_screen_replay) {
             self.resetLocalTerminalView(allocator) catch |err| {
-                log.warn("failed to reset stale daemon terminal replay for {s}: {s}", .{ session_id, @errorName(err) });
+                log.warn("failed to reset stale daemon terminal replay session_len={d}: {s}", .{ session_id.len, @errorName(err) });
             };
             return true;
         }
@@ -2894,8 +3014,8 @@ const UnixSession = struct {
             self.terminal.scrollViewport(.{ .top = {} });
             if (terminalLayoutDiagnosticsEnabled()) {
                 runtime_log.diagnostic(
-                    "terminal alternate viewport reset session={?s} anchor=top cells={d}x{d}",
-                    .{ self.session_id, self.cols, self.rows },
+                    "terminal alternate viewport reset session_len={d} anchor=top cells={d}x{d}",
+                    .{ if (self.session_id) |session_id| session_id.len else 0, self.cols, self.rows },
                 );
             }
         }
@@ -2920,8 +3040,8 @@ const UnixSession = struct {
         self.cols = cols;
         self.resizeDaemon(allocator) catch |err| {
             runtime_log.diagnostic(
-                "terminal attach repaint kick failed session={?s} err={s}",
-                .{ self.session_id, @errorName(err) },
+                "terminal attach repaint kick failed session_len={d} err={s}",
+                .{ if (self.session_id) |session_id| session_id.len else 0, @errorName(err) },
             );
             return;
         };
@@ -2929,8 +3049,8 @@ const UnixSession = struct {
         // in-band too (no-op unless the replayed model saw the mode set).
         self.sendInBandSizeReportAfterResize();
         runtime_log.diagnostic(
-            "terminal attach repaint kick session={?s} cells={d}x{d}",
-            .{ self.session_id, cols, self.rows },
+            "terminal attach repaint kick session_len={d} cells={d}x{d}",
+            .{ if (self.session_id) |session_id| session_id.len else 0, cols, self.rows },
         );
     }
 
@@ -2960,9 +3080,9 @@ const UnixSession = struct {
         const text = jsonString(result.object.get("text") orelse .null) orelse "";
         const next_offset = jsonUsize(result.object.get("next_offset") orelse .null);
         log.info(
-            "daemon-resize-response session={s} cols={d} rows={d} shell_pid={?d} pgrp={?d} text_len={d} next_offset={?d} active_screen={s}",
+            "daemon-resize-response session_len={d} cols={d} rows={d} shell_pid={?d} pgrp={?d} text_len={d} next_offset={?d} active_screen={s}",
             .{
-                session_id,
+                session_id.len,
                 self.cols,
                 self.rows,
                 self.daemon_shell_pid,
@@ -2996,6 +3116,7 @@ const UnixSession = struct {
 
     fn writeRawInput(self: *UnixSession, bytes: []const u8) !bool {
         if (self.backend == .local) {
+            if (!LOCAL_PTY_SUPPORTED) return false;
             try writeAll(self.master_fd, bytes);
             return true;
         }
@@ -3347,6 +3468,7 @@ const UnixSession = struct {
 
     fn captureExitStatus(self: *UnixSession) bool {
         if (self.backend == .daemon) return false;
+        if (!LOCAL_PTY_SUPPORTED) return false;
         if (self.exit_status != null) return false;
 
         var status: c_int = 0;
@@ -3359,6 +3481,7 @@ const UnixSession = struct {
     }
 
     fn applyWinsize(self: *UnixSession) void {
+        if (!LOCAL_PTY_SUPPORTED) return;
         if (!self.running or self.backend == .daemon) return;
 
         var winsize = std.posix.winsize{
@@ -3375,6 +3498,7 @@ const UnixSession = struct {
     }
 
     fn spawnCommand(allocator: std.mem.Allocator, options: SessionCreateOptions) !SpawnResult {
+        if (!LOCAL_PTY_SUPPORTED) return error.UnsupportedPlatform;
         const cwd_z = try allocator.dupeZ(u8, options.cwd);
         defer allocator.free(cwd_z);
         const command = try commandForProfile(allocator, options.profile);
@@ -3518,37 +3642,6 @@ const UnixSession = struct {
     }
 };
 
-/// Format a byte slice for diagnostic logging: printable ASCII passes through
-/// (except `\` itself, which is escaped to disambiguate), ESC renders as `\e`,
-/// everything else as `\xNN`. Writes into the caller-provided buffer and
-/// returns the populated prefix; truncates silently if the buffer is too small.
-fn formatBytesForLog(bytes: []const u8, buf: []u8) []const u8 {
-    const hex = "0123456789abcdef";
-    var idx: usize = 0;
-    for (bytes) |b| {
-        if (idx + 4 > buf.len) break;
-        if (b == 0x1b) {
-            buf[idx] = '\\';
-            buf[idx + 1] = 'e';
-            idx += 2;
-        } else if (b == '\\') {
-            buf[idx] = '\\';
-            buf[idx + 1] = '\\';
-            idx += 2;
-        } else if (b >= 0x20 and b < 0x7f) {
-            buf[idx] = b;
-            idx += 1;
-        } else {
-            buf[idx] = '\\';
-            buf[idx + 1] = 'x';
-            buf[idx + 2] = hex[b >> 4];
-            buf[idx + 3] = hex[b & 0x0f];
-            idx += 4;
-        }
-    }
-    return buf[0..idx];
-}
-
 fn setNonBlocking(fd: std.posix.fd_t) !void {
     const current = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
     if (current < 0) return error.FcntlFailed;
@@ -3656,6 +3749,9 @@ fn daemonCommandForProfile(allocator: std.mem.Allocator, profile: TerminalLaunch
         return command;
     }
     if (profile.kind == .shell) {
+        // An empty daemon command asks the Windows backend to select the best
+        // installed interactive shell (pwsh, Windows PowerShell, then cmd).
+        if (builtin.os.tag == .windows) return allocator.alloc([]const u8, 0);
         const command = try allocator.alloc([]const u8, 2);
         command[0] = defaultInteractiveShell();
         command[1] = "-i";
@@ -3771,27 +3867,8 @@ fn lastIndexOf(haystack: []const u8, needle: []const u8) ?usize {
     return result;
 }
 
-fn selfExePathAlloc(allocator: std.mem.Allocator) ![]u8 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const len = std.c.readlink("/proc/self/exe", &buffer, buffer.len);
-            if (len < 0) return error.FileNotFound;
-            return allocator.dupe(u8, buffer[0..@intCast(len)]);
-        },
-        .macos => {
-            var size: u32 = std.fs.max_path_bytes;
-            var buffer: [std.fs.max_path_bytes]u8 = undefined;
-            if (_NSGetExecutablePath(&buffer, &size) != 0) {
-                const dynamic_buffer = try allocator.alloc(u8, size);
-                defer allocator.free(dynamic_buffer);
-                if (_NSGetExecutablePath(dynamic_buffer.ptr, &size) != 0) return error.NameTooLong;
-                return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(dynamic_buffer, 0)});
-            }
-            return std.fs.path.resolve(allocator, &.{std.mem.sliceTo(&buffer, 0)});
-        },
-        else => return error.FileNotFound,
-    }
+fn selfExePathAlloc(allocator: std.mem.Allocator) ![:0]u8 {
+    return platform_runtime.executablePathAlloc(allocator);
 }
 
 fn shouldDeferToTextInput(event: *const sdl.KeyboardEvent) bool {
@@ -4224,10 +4301,6 @@ fn terminalLayoutDiagnosticsEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
-fn clippedLogText(value: []const u8) []const u8 {
-    return value[0..@min(value.len, 96)];
-}
-
 fn sanitizeCellCount(value: u16, min_value: u16) u16 {
     return @max(value, min_value);
 }
@@ -4276,6 +4349,7 @@ fn defaultInteractiveShell() []const u8 {
     }
     return switch (builtin.os.tag) {
         .macos => "/bin/zsh",
+        .windows => "cmd.exe",
         else => "/bin/bash",
     };
 }
@@ -4434,12 +4508,125 @@ test "persisted restart revive policy reloads as attach" {
     try std.testing.expectEqual(TerminalRevivePolicy.attach_or_create, dock.activePaneConst().?.revive_policy);
 }
 
+test "session ensure preserves a running non-null session" {
+    const allocator = std.testing.allocator;
+    const FakeSession = struct {
+        running: bool,
+        deinit_count: *usize,
+
+        fn isRunning(self: *const @This()) bool {
+            return self.running;
+        }
+
+        fn deinit(self: *@This(), _: std.mem.Allocator) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    var deinit_count: usize = 0;
+    const session = try allocator.create(FakeSession);
+    session.* = .{ .running = true, .deinit_count = &deinit_count };
+    var slot: ?*FakeSession = session;
+    defer if (slot) |remaining| allocator.destroy(remaining);
+
+    try std.testing.expect(!prepareSessionSlotForCreate(FakeSession, allocator, &slot));
+    try std.testing.expect(slot.? == session);
+    try std.testing.expectEqual(@as(usize, 0), deinit_count);
+}
+
+test "session ensure releases a stopped non-null session" {
+    const allocator = std.testing.allocator;
+    const FakeSession = struct {
+        running: bool,
+        deinit_count: *usize,
+
+        fn isRunning(self: *const @This()) bool {
+            return self.running;
+        }
+
+        fn deinit(self: *@This(), _: std.mem.Allocator) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    var deinit_count: usize = 0;
+    const session = try allocator.create(FakeSession);
+    session.* = .{ .running = false, .deinit_count = &deinit_count };
+    var slot: ?*FakeSession = session;
+
+    try std.testing.expect(prepareSessionSlotForCreate(FakeSession, allocator, &slot));
+    try std.testing.expectEqual(@as(?*FakeSession, null), slot);
+    try std.testing.expectEqual(@as(usize, 1), deinit_count);
+}
+
+test "automatic terminal restart uses capped exponential backoff" {
+    var backoff: AutoRestartBackoff = .{};
+    const expected_delays = [_]i64{ 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000 };
+    var now_ms: i64 = 10_000;
+
+    for (expected_delays) |delay_ms| {
+        try std.testing.expect(backoff.reserve(now_ms));
+        try std.testing.expectEqual(now_ms + delay_ms, backoff.retry_after_ms);
+        try std.testing.expect(!backoff.reserve(backoff.retry_after_ms - 1));
+        now_ms = backoff.retry_after_ms;
+    }
+
+    try std.testing.expectEqual(@as(u8, @intCast(expected_delays.len)), backoff.attempts);
+    try std.testing.expectEqual(AUTO_RESTART_MAX_DELAY_MS, autoRestartDelayMs(backoff.attempts));
+}
+
+test "automatic terminal restart retains stopped render state after creation" {
+    var backoff: AutoRestartBackoff = .{};
+
+    // Explicit starts do not reserve an automatic attempt first, but still
+    // need a hold so their stopped VT model reaches the renderer.
+    backoff.armAfterCreate(1_000, true);
+    try std.testing.expectEqual(@as(u8, 1), backoff.attempts);
+    try std.testing.expectEqual(@as(i64, 2_000), backoff.retry_after_ms);
+
+    // Anchor a full delay at the transition to stopped, rather than leaving
+    // only the unused remainder of the delay that began before the shell ran.
+    backoff.observeHealth(1_900, false);
+    try std.testing.expectEqual(@as(?i64, 1_900), backoff.stopped_since_ms);
+    try std.testing.expectEqual(@as(i64, 2_900), backoff.retry_after_ms);
+    try std.testing.expect(!backoff.reserve(2_899));
+    try std.testing.expect(backoff.reserve(2_900));
+
+    // Creation time can move past work done by the reservation; extend the
+    // next deadline without double-counting the attempt.
+    backoff.armAfterCreate(3_000, false);
+    try std.testing.expectEqual(@as(u8, 2), backoff.attempts);
+    try std.testing.expectEqual(@as(i64, 5_000), backoff.retry_after_ms);
+    try std.testing.expectEqual(@as(?i64, 3_000), backoff.stopped_since_ms);
+}
+
+test "automatic terminal restart resets only after continuous health" {
+    var backoff: AutoRestartBackoff = .{};
+    try std.testing.expect(backoff.reserve(1_000));
+
+    backoff.observeHealth(1_500, true);
+    backoff.observeHealth(5_000, true);
+    try std.testing.expectEqual(@as(u8, 1), backoff.attempts);
+
+    backoff.observeHealth(6_000, false);
+    try std.testing.expectEqual(@as(?i64, null), backoff.healthy_since_ms);
+    backoff.observeHealth(7_000, true);
+    backoff.observeHealth(16_999, true);
+    try std.testing.expectEqual(@as(u8, 1), backoff.attempts);
+
+    backoff.observeHealth(17_000, true);
+    try std.testing.expectEqual(@as(u8, 0), backoff.attempts);
+    try std.testing.expectEqual(@as(i64, 0), backoff.retry_after_ms);
+    try std.testing.expectEqual(@as(?i64, null), backoff.healthy_since_ms);
+    try std.testing.expectEqual(@as(?i64, null), backoff.stopped_since_ms);
+}
+
 test "unix session PTY smoke" {
     if (!SESSION_SUPPORTED) return error.SkipZigTest;
 
     const testing = std.testing;
     const allocator = testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
     defer allocator.free(cwd);
 
     const session = try UnixSession.create(allocator, .{
@@ -4452,7 +4639,7 @@ test "unix session PTY smoke" {
         allocator.destroy(session);
     }
 
-    try session.writeInput("printf 'verde-terminal-smoke'\r");
+    _ = try session.writeInput("printf 'verde-terminal-smoke'\r");
 
     var found = false;
     var saw_change = false;
@@ -4464,7 +4651,7 @@ test "unix session PTY smoke" {
             found = true;
             break;
         }
-        std.time.sleep(50 * std.time.ns_per_ms);
+        try std.Io.sleep(testing.io, .fromMilliseconds(50), .awake);
     }
 
     try testing.expect(saw_change);
@@ -4474,7 +4661,7 @@ test "unix session PTY smoke" {
     for (0..40) |_| {
         _ = try session.poll(allocator);
         if (!session.running) break;
-        std.time.sleep(25 * std.time.ns_per_ms);
+        try std.Io.sleep(testing.io, .fromMilliseconds(25), .awake);
     }
 }
 
@@ -4483,7 +4670,7 @@ test "unix session clears render dirty state after render" {
 
     const testing = std.testing;
     const allocator = testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
     defer allocator.free(cwd);
 
     const session = try UnixSession.create(allocator, .{
@@ -4512,7 +4699,7 @@ test "unix session alternate-screen resize follows terminal model without cleari
 
     const testing = std.testing;
     const allocator = testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
     defer allocator.free(cwd);
 
     const session = try UnixSession.create(allocator, .{
@@ -4565,7 +4752,7 @@ test "unix session restores alternate screen and mouse modes before daemon repla
 
     const testing = std.testing;
     const allocator = testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
     defer allocator.free(cwd);
 
     const session = try UnixSession.create(allocator, .{
@@ -4593,12 +4780,12 @@ test "unix session restores alternate screen and mouse modes before daemon repla
 test "terminal geometry sanitization never returns zero cells" {
     const testing = std.testing;
 
-    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(0.0));
-    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(-40.0));
-    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(std.math.nan(f32)));
-    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(0.0));
-    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(-10.0));
-    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(std.math.nan(f32)));
+    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(0.0, 1.0));
+    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(-40.0, 1.0));
+    try testing.expectEqual(@as(u16, INITIAL_COLS), columnsForWidth(std.math.nan(f32), 1.0));
+    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(0.0, 1.0));
+    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(-10.0, 1.0));
+    try testing.expectEqual(@as(u16, INITIAL_ROWS), rowsForHeight(std.math.nan(f32), 1.0));
 }
 
 test "repair terminal state resets invalid scrolling region" {
@@ -4606,7 +4793,7 @@ test "repair terminal state resets invalid scrolling region" {
 
     const testing = std.testing;
     const allocator = testing.allocator;
-    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    const cwd = try std.process.currentPathAlloc(testing.io, allocator);
     defer allocator.free(cwd);
 
     const session = try UnixSession.create(allocator, .{

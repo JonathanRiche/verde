@@ -35,6 +35,11 @@ pub const ProcessDefinition = struct {
     name: []u8,
     kind: ProcessKind,
     command: []u8,
+    command_windows: ?[]u8 = null,
+    command_unix: ?[]u8 = null,
+    argv: std.ArrayList([]u8) = .empty,
+    argv_windows: std.ArrayList([]u8) = .empty,
+    argv_unix: std.ArrayList([]u8) = .empty,
     cwd: []u8,
     restart: RestartPolicy,
     provider: ?AgentProvider = null,
@@ -47,11 +52,57 @@ pub const ProcessDefinition = struct {
     pub fn deinit(self: *ProcessDefinition, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.command);
+        if (self.command_windows) |value| allocator.free(value);
+        if (self.command_unix) |value| allocator.free(value);
+        deinitArgv(allocator, &self.argv);
+        deinitArgv(allocator, &self.argv_windows);
+        deinitArgv(allocator, &self.argv_unix);
         allocator.free(self.cwd);
         for (self.watch.items) |pattern| allocator.free(pattern);
         self.watch.deinit(allocator);
     }
+
+    /// Selects one launch description without serializing structured argv into
+    /// a shell string. Platform-specific entries override portable entries.
+    pub fn launchForOs(self: *const ProcessDefinition, comptime os_tag: std.Target.Os.Tag) ?LaunchSpec {
+        if (os_tag == .windows) {
+            if (self.argv_windows.items.len > 0) return .{ .argv = self.argv_windows.items };
+            if (nonEmpty(self.command_windows)) |command| return .{ .command = command };
+        } else {
+            if (self.argv_unix.items.len > 0) return .{ .argv = self.argv_unix.items };
+            if (nonEmpty(self.command_unix)) |command| return .{ .command = command };
+        }
+        if (self.argv.items.len > 0) return .{ .argv = self.argv.items };
+        if (std.mem.trim(u8, self.command, " \t\r\n").len > 0) return .{ .command = self.command };
+        return null;
+    }
+
+    fn hasAnyLaunch(self: *const ProcessDefinition) bool {
+        return self.argv.items.len > 0 or
+            self.argv_windows.items.len > 0 or
+            self.argv_unix.items.len > 0 or
+            std.mem.trim(u8, self.command, " \t\r\n").len > 0 or
+            nonEmpty(self.command_windows) != null or
+            nonEmpty(self.command_unix) != null;
+    }
 };
+
+/// A managed process is either a legacy shell command or a structured argv.
+/// Keeping these distinct is what makes paths containing spaces portable.
+pub const LaunchSpec = union(enum) {
+    command: []const u8,
+    argv: []const []u8,
+};
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const slice = value orelse return null;
+    return if (std.mem.trim(u8, slice, " \t\r\n").len == 0) null else slice;
+}
+
+fn deinitArgv(allocator: std.mem.Allocator, argv: *std.ArrayList([]u8)) void {
+    for (argv.items) |arg| allocator.free(arg);
+    argv.deinit(allocator);
+}
 
 pub const Config = struct {
     path: []u8,
@@ -68,6 +119,14 @@ const Section = enum {
     none,
     processes,
     agents,
+};
+
+const ListField = enum {
+    none,
+    watch,
+    argv,
+    argv_windows,
+    argv_unix,
 };
 
 pub fn loadFromProject(allocator: std.mem.Allocator, project_path: []const u8) !?Config {
@@ -99,7 +158,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
 
     var section: Section = .none;
     var current_index: ?usize = null;
-    var in_watch_list = false;
+    var list_field: ListField = .none;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
@@ -111,7 +170,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
 
         if (indent == 0) {
             current_index = null;
-            in_watch_list = false;
+            list_field = .none;
             if (std.mem.eql(u8, trimmed, "processes:")) {
                 section = .processes;
             } else if (std.mem.eql(u8, trimmed, "agents:")) {
@@ -129,6 +188,11 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
                 .name = try allocator.dupe(u8, raw_name),
                 .kind = if (section == .agents) .agent else .process,
                 .command = try allocator.dupe(u8, ""),
+                .command_windows = null,
+                .command_unix = null,
+                .argv = .empty,
+                .argv_windows = .empty,
+                .argv_unix = .empty,
                 .cwd = try allocator.dupe(u8, "."),
                 .restart = if (section == .agents) .manual else .manual,
                 .provider = null,
@@ -139,16 +203,22 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
                 .watch = .empty,
             });
             current_index = config.processes.items.len - 1;
-            in_watch_list = false;
+            list_field = .none;
             continue;
         }
 
         const index = current_index orelse continue;
         var process = &config.processes.items[index];
-        if (indent >= 4 and in_watch_list and std.mem.startsWith(u8, trimmed, "-")) {
+        if (indent >= 4 and list_field != .none and std.mem.startsWith(u8, trimmed, "-")) {
             const value = try parseScalarAlloc(allocator, std.mem.trim(u8, trimmed[1..], " \t\r"));
             errdefer allocator.free(value);
-            try process.watch.append(allocator, value);
+            switch (list_field) {
+                .watch => try process.watch.append(allocator, value),
+                .argv => try process.argv.append(allocator, value),
+                .argv_windows => try process.argv_windows.append(allocator, value),
+                .argv_unix => try process.argv_unix.append(allocator, value),
+                .none => unreachable,
+            }
             continue;
         }
 
@@ -156,12 +226,29 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
         const colon_index = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
         const key = std.mem.trim(u8, trimmed[0..colon_index], " \t\r");
         const raw_value = std.mem.trim(u8, trimmed[colon_index + 1 ..], " \t\r");
-        in_watch_list = std.mem.eql(u8, key, "watch");
+        list_field = .none;
 
         if (std.mem.eql(u8, key, "command")) {
             const value = try parseScalarAlloc(allocator, raw_value);
             allocator.free(process.command);
             process.command = value;
+        } else if (std.mem.eql(u8, key, "command_windows")) {
+            const value = try parseScalarAlloc(allocator, raw_value);
+            if (process.command_windows) |old| allocator.free(old);
+            process.command_windows = value;
+        } else if (std.mem.eql(u8, key, "command_unix")) {
+            const value = try parseScalarAlloc(allocator, raw_value);
+            if (process.command_unix) |old| allocator.free(old);
+            process.command_unix = value;
+        } else if (std.mem.eql(u8, key, "argv")) {
+            if (raw_value.len != 0) return error.InvalidStackConfig;
+            list_field = .argv;
+        } else if (std.mem.eql(u8, key, "argv_windows")) {
+            if (raw_value.len != 0) return error.InvalidStackConfig;
+            list_field = .argv_windows;
+        } else if (std.mem.eql(u8, key, "argv_unix")) {
+            if (raw_value.len != 0) return error.InvalidStackConfig;
+            list_field = .argv_unix;
         } else if (std.mem.eql(u8, key, "cwd")) {
             const value = try parseScalarAlloc(allocator, raw_value);
             allocator.free(process.cwd);
@@ -178,12 +265,15 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8, source_path: []c
             process.mcp = parseBool(raw_value) orelse return error.InvalidStackConfig;
         } else if (std.mem.eql(u8, key, "hooks")) {
             process.hooks = parseBool(raw_value) orelse return error.InvalidStackConfig;
+        } else if (std.mem.eql(u8, key, "watch")) {
+            if (raw_value.len != 0) return error.InvalidStackConfig;
+            list_field = .watch;
         }
     }
 
     var index: usize = 0;
     while (index < config.processes.items.len) {
-        if (std.mem.trim(u8, config.processes.items[index].command, " \t\r").len != 0) {
+        if (config.processes.items[index].hasAnyLaunch()) {
             index += 1;
             continue;
         }
@@ -307,4 +397,66 @@ test "parse amp agent provider" {
     try std.testing.expectEqualStrings("amp", config.processes.items[0].name);
     try std.testing.expectEqual(ProcessKind.agent, config.processes.items[0].kind);
     try std.testing.expectEqual(AgentProvider.amp, config.processes.items[0].provider.?);
+}
+
+test "platform commands override legacy command without changing Unix semantics" {
+    const content =
+        \\version: 1
+        \\processes:
+        \\  web:
+        \\    command: "npm run dev"
+        \\    command_windows: "npm.cmd run dev:windows"
+        \\    command_unix: "exec npm run dev:unix"
+        \\
+    ;
+    var config = try parse(std.testing.allocator, content, "verde.yml");
+    defer config.deinit(std.testing.allocator);
+
+    const definition = &config.processes.items[0];
+    try std.testing.expectEqualStrings("npm.cmd run dev:windows", definition.launchForOs(.windows).?.command);
+    try std.testing.expectEqualStrings("exec npm run dev:unix", definition.launchForOs(.linux).?.command);
+    try std.testing.expectEqualStrings("exec npm run dev:unix", definition.launchForOs(.macos).?.command);
+}
+
+test "structured argv preserves spaces and supports platform overrides" {
+    const content =
+        \\version: 1
+        \\processes:
+        \\  worker:
+        \\    argv:
+        \\      - "node"
+        \\      - "scripts/worker task.mjs"
+        \\      - "--label=client repo"
+        \\    argv_windows:
+        \\      - "node.exe"
+        \\      - "scripts\worker task.mjs"
+        \\
+    ;
+    var config = try parse(std.testing.allocator, content, "verde.yml");
+    defer config.deinit(std.testing.allocator);
+
+    const windows_launch = config.processes.items[0].launchForOs(.windows).?.argv;
+    try std.testing.expectEqual(@as(usize, 2), windows_launch.len);
+    try std.testing.expectEqualStrings("node.exe", windows_launch[0]);
+    try std.testing.expectEqualStrings("scripts\\worker task.mjs", windows_launch[1]);
+
+    const unix_launch = config.processes.items[0].launchForOs(.linux).?.argv;
+    try std.testing.expectEqual(@as(usize, 3), unix_launch.len);
+    try std.testing.expectEqualStrings("scripts/worker task.mjs", unix_launch[1]);
+    try std.testing.expectEqualStrings("--label=client repo", unix_launch[2]);
+}
+
+test "platform-only managed process is retained" {
+    const content =
+        \\processes:
+        \\  windows-only:
+        \\    command_windows: "pwsh.exe -File scripts\serve.ps1"
+        \\
+    ;
+    var config = try parse(std.testing.allocator, content, "verde.yml");
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), config.processes.items.len);
+    try std.testing.expect(config.processes.items[0].launchForOs(.linux) == null);
+    try std.testing.expectEqualStrings("pwsh.exe -File scripts\\serve.ps1", config.processes.items[0].launchForOs(.windows).?.command);
 }

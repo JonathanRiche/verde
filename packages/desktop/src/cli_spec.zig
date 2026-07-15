@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const shells = [_][]const u8{ "bash", "zsh", "fish" };
+pub const shells = [_][]const u8{ "bash", "zsh", "fish", "powershell" };
 pub const encodings = [_][]const u8{ "json", "jsonl" };
 
 pub const top_level_commands = [_][]const u8{

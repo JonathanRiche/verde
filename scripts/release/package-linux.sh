@@ -157,7 +157,7 @@ EOF
 }
 
 mkdir -p "$OUTPUT_DIR"
-BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview)
+BUILD_ARGS=(zig build --release=safe -p "$PREFIX_DIR" -Dbrowser-backend=native_webview -Dversion="$VERSION")
 
 cd "$DESKTOP_ROOT"
 "${BUILD_ARGS[@]}"
