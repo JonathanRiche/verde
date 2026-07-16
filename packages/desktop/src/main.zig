@@ -2328,6 +2328,11 @@ fn applyAppConfigRuntime(state: *AppState) void {
     state.rethemeTerminalSessions() catch |err| {
         log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
     };
+    // An armed browser inspector carries theme colors into the page; re-arm
+    // so its overlay picks up the refreshed palette.
+    if (state.browser_state.inspectorEnabled() and state.canUseBrowserInspector() and state.isBrowserVisible()) {
+        state.enableBrowserInspector(false);
+    }
     state.markDirty();
     runtime_log.diagnostic("apply app config runtime done", .{});
 }
@@ -2377,5 +2382,6 @@ test {
     _ = @import("providers/diagnostics.zig");
     _ = @import("slash_commands.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("browser/screenshot.zig");
     _ = @import("windows_conpty_compile_test.zig");
 }

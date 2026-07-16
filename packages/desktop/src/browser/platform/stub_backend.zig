@@ -91,6 +91,13 @@ pub const Controller = struct {
         return null;
     }
 
+    /// The stub produces no frames to copy.
+    pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        _ = self;
+        _ = allocator;
+        return null;
+    }
+
     /// Marks the browser as visible and emits the corresponding lifecycle event.
     pub fn show(self: *Controller) !void {
         if (self.visible) return;
