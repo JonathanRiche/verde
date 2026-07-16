@@ -56,6 +56,7 @@ fn writePowerShell(w: *std.Io.Writer) !void {
     try writePowerShellRoute(w, "", &spec.top_level_commands);
     try writePowerShellRoute(w, "completion", &spec.shells);
     try writePowerShellRoute(w, "state", &spec.state_commands);
+    try writePowerShellRoute(w, "theme", &spec.theme_commands);
     try writePowerShellRoute(w, "herdr", &spec.herdr_commands);
     try writePowerShellRoute(w, "herdr profiles", &spec.herdr_profile_commands);
     try writePowerShellRoute(w, "integrations", &spec.integration_commands);
@@ -138,6 +139,8 @@ fn writeBash(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local theme=\"");
+    try writeWords(w, &spec.theme_commands);
     try w.writeAll("\"\n  local herdr=\"");
     try writeWords(w, &spec.herdr_commands);
     try w.writeAll("\"\n  local integrations=\"");
@@ -276,6 +279,13 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
         \\        esac
         \\        ;;
+        \\      theme)
+        \\        case "$sub" in
+        \\          import) COMPREPLY=( $(compgen -W "--dry-run --json" -- "$cur") ) ;;
+        \\          export) COMPREPLY=( $(compgen -W "--name --json" -- "$cur") ) ;;
+        \\          *) COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") ) ;;
+        \\        esac
+        \\        ;;
         \\      herdr)
         \\        case "$sub" in
         \\          open) COMPREPLY=( $(compgen -W "$herdr_open_flags" -- "$cur") ) ;;
@@ -379,6 +389,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\    1:*) COMPREPLY=( $(compgen -W "$top --help -h" -- "$cur") ) ;;
         \\    2:completion:*) COMPREPLY=( $(compgen -W "$shells" -- "$cur") ) ;;
         \\    2:state:*) COMPREPLY=( $(compgen -W "$state" -- "$cur") ) ;;
+        \\    2:theme:*) COMPREPLY=( $(compgen -W "$theme" -- "$cur") ) ;;
         \\    2:herdr:*) COMPREPLY=( $(compgen -W "$herdr" -- "$cur") ) ;;
         \\    2:integrations:*) COMPREPLY=( $(compgen -W "$integrations" -- "$cur") ) ;;
         \\    2:session:*) COMPREPLY=( $(compgen -W "$session" -- "$cur") ) ;;
@@ -420,6 +431,8 @@ fn writeZsh(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("\"\n  local state=\"");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("\"\n  local theme=\"");
+    try writeWords(w, &spec.theme_commands);
     try w.writeAll("\"\n  local herdr=\"");
     try writeWords(w, &spec.herdr_commands);
     try w.writeAll("\"\n  local integrations=\"");
@@ -558,6 +571,13 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\          *) compadd -- ${(s: :)json_flags} ;;
         \\        esac
         \\        ;;
+        \\      theme)
+        \\        case "$sub" in
+        \\          import) compadd -- --dry-run --json ;;
+        \\          export) compadd -- --name --json ;;
+        \\          *) compadd -- ${(s: :)json_flags} ;;
+        \\        esac
+        \\        ;;
         \\      herdr)
         \\        case "$sub" in
         \\          open) compadd -- ${(s: :)herdr_open_flags} ;;
@@ -661,6 +681,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\    2:*) compadd -- ${(s: :)top} --help -h ;;
         \\    3:completion:*) compadd -- ${(s: :)shells} ;;
         \\    3:state:*) compadd -- ${(s: :)state} ;;
+        \\    3:theme:*) compadd -- ${(s: :)theme} ;;
         \\    3:herdr:*) compadd -- ${(s: :)herdr} ;;
         \\    3:integrations:*) compadd -- ${(s: :)integrations} ;;
         \\    3:session:*) compadd -- ${(s: :)session} ;;
@@ -710,6 +731,8 @@ fn writeFish(w: *std.Io.Writer) !void {
     try writeWords(w, &spec.shells);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after state' -a '");
     try writeWords(w, &spec.state_commands);
+    try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after theme' -a '");
+    try writeWords(w, &spec.theme_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after herdr' -a '");
     try writeWords(w, &spec.herdr_commands);
     try w.writeAll("'\ncomplete -c verde -n '__verde_complete_after herdr profiles' -a '");

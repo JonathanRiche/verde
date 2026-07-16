@@ -520,8 +520,16 @@ pub fn handlePaletteMouseButton(state: *runtime.AppState, x: f32, y: f32, down: 
                 }
             },
             .settings_control => settings_modal.applyControl(state, hit.index),
+            .settings_theme_option => settings_modal.applyThemeOption(state, hit.index),
             .modal_dismiss => dismissTopModal(state),
-            .modal_block => state.palette_modal_text_focus = .none,
+            .modal_block => {
+                state.palette_modal_text_focus = .none;
+                if (state.settings_theme_dropdown_open) {
+                    state.settings_theme_dropdown_open = false;
+                    state.settings_theme_hover_index = null;
+                    state.markDirty();
+                }
+            },
             .project_rename_input => focusModalInput(state, .project_rename, hit.rect, x, clicks),
             .thread_import_input => focusModalInput(state, .thread_import, hit.rect, x, clicks),
             .project_import_input => focusModalInput(state, .project_import, hit.rect, x, clicks),
@@ -609,6 +617,7 @@ pub fn handlePaletteKeyDown(state: *runtime.AppState, event: *const sdl.Keyboard
     // Palette-owned navigation/activation keys; editing keys fall through to
     // the shared modal text path below.
     if (state.command_palette_open and command_palette.handleKeyDown(state, event)) return true;
+    if (state.show_settings_modal and settings_modal.handleKeyDown(state, event.key)) return true;
     const primary = (keymodBits(event.mod) & (sdl.Keymod.ctrl | sdl.Keymod.gui)) != 0;
     const shift = (keymodBits(event.mod) & sdl.Keymod.shift) != 0;
     switch (event.key) {

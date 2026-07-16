@@ -71,10 +71,30 @@ pub const TerminalLaunchProfileConfig = struct {
     }
 };
 
+pub const InstalledTheme = struct {
+    name: []u8,
+    theme_config: theme.ThemeConfig,
+    font_size: ?f32 = null,
+    terminal_font_size: ?f32 = null,
+
+    pub fn deinit(self: *InstalledTheme, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+
+    pub fn apply(self: InstalledTheme, config: *AppConfig) void {
+        config.theme_config = self.theme_config;
+        if (self.font_size) |value| config.font_size = value;
+        if (self.terminal_font_size) |value| config.terminal_font_size = value;
+    }
+};
+
 pub const AppConfig = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     terminal_font_size: f32 = DEFAULT_TERMINAL_FONT_SIZE,
     theme_config: theme.ThemeConfig = .{},
+    active_theme: ?[]u8 = null,
+    installed_themes: []InstalledTheme = &.{},
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
@@ -85,9 +105,82 @@ pub const AppConfig = struct {
     notifications_enabled: bool = true,
 
     pub fn deinit(self: *AppConfig, allocator: std.mem.Allocator) void {
+        if (self.active_theme) |name| allocator.free(name);
+        for (self.installed_themes) |*installed| installed.deinit(allocator);
+        allocator.free(self.installed_themes);
         self.default_open_action.deinit(allocator);
         for (self.terminal_launch_profiles) |*profile| profile.deinit(allocator);
         allocator.free(self.terminal_launch_profiles);
+    }
+
+    pub fn activeThemeIndex(self: AppConfig) ?usize {
+        const active_name = self.active_theme orelse return null;
+        for (self.installed_themes, 0..) |installed, index| {
+            if (std.ascii.eqlIgnoreCase(active_name, installed.name)) return index;
+        }
+        return null;
+    }
+
+    pub fn themeChoiceIndex(self: AppConfig) usize {
+        if (self.activeThemeIndex()) |index| return index + 2;
+        return if (self.theme_config.source == .omarchy) 1 else 0;
+    }
+
+    pub fn installTheme(
+        self: *AppConfig,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        theme_config: theme.ThemeConfig,
+        font_size: ?f32,
+        terminal_font_size: ?f32,
+    ) !usize {
+        for (self.installed_themes, 0..) |*installed, index| {
+            if (!std.ascii.eqlIgnoreCase(name, installed.name)) continue;
+            const owned_name = try allocator.dupe(u8, name);
+            installed.deinit(allocator);
+            installed.* = .{
+                .name = owned_name,
+                .theme_config = theme_config,
+                .font_size = font_size,
+                .terminal_font_size = terminal_font_size,
+            };
+            return index;
+        }
+
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        const next = try allocator.alloc(InstalledTheme, self.installed_themes.len + 1);
+        @memcpy(next[0..self.installed_themes.len], self.installed_themes);
+        next[self.installed_themes.len] = .{
+            .name = owned_name,
+            .theme_config = theme_config,
+            .font_size = font_size,
+            .terminal_font_size = terminal_font_size,
+        };
+        const index = self.installed_themes.len;
+        allocator.free(self.installed_themes);
+        self.installed_themes = next;
+        return index;
+    }
+
+    pub fn selectThemeChoice(self: *AppConfig, allocator: std.mem.Allocator, choice_index: usize) !void {
+        if (choice_index >= self.installed_themes.len + 2) return error.InvalidThemeChoice;
+        if (self.active_theme) |name| allocator.free(name);
+        self.active_theme = null;
+
+        if (choice_index == 0) {
+            self.theme_config = .{ .source = .default };
+            return;
+        }
+        if (choice_index == 1) {
+            self.theme_config = .{ .source = .omarchy };
+            return;
+        }
+
+        const installed = self.installed_themes[choice_index - 2];
+        const active_name = try allocator.dupe(u8, installed.name);
+        installed.apply(self);
+        self.active_theme = active_name;
     }
 };
 
@@ -157,6 +250,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
 
     try writeUiSection(tree_allocator, &root.object, config);
     try writeThemeSection(tree_allocator, &root.object, config);
+    try writeInstalledThemesSection(tree_allocator, &root.object, config);
     try writeOpenSection(tree_allocator, &root.object, config);
     try writeTerminalSection(tree_allocator, &root.object, config);
     try writeUpdatesSection(tree_allocator, &root.object, config);
@@ -209,6 +303,11 @@ fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, 
         .default => "default",
     };
     try theme_object.put(allocator, "theme", .{ .string = source_name });
+    if (config.active_theme) |active_name| {
+        try theme_object.put(allocator, "active", .{ .string = active_name });
+    } else {
+        _ = theme_object.orderedRemove("active");
+    }
 
     var has_color_override = false;
     inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
@@ -224,7 +323,38 @@ fn writeThemeSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, 
             }
         }
         try theme_object.put(allocator, "colors", .{ .object = colors_object });
+    } else {
+        // Import/reset replaces the complete theme. Remove persisted overrides
+        // so stale colors cannot survive a package that intentionally has none.
+        _ = theme_object.orderedRemove("colors");
     }
+}
+
+fn writeInstalledThemesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    var installed_values = std.json.Array.init(allocator);
+    for (config.installed_themes) |installed| {
+        var installed_object: std.json.ObjectMap = .empty;
+        try installed_object.put(allocator, "name", .{ .string = installed.name });
+
+        var package_theme: std.json.ObjectMap = .empty;
+        const source_name = if (installed.theme_config.source == .omarchy) "omarchy" else "default";
+        try package_theme.put(allocator, "theme", .{ .string = source_name });
+        var colors_object: std.json.ObjectMap = .empty;
+        var has_colors = false;
+        inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
+            if (@field(installed.theme_config.colors, field.name)) |value| {
+                const hex = try colorToHex(allocator, value);
+                try colors_object.put(allocator, field.name, .{ .string = hex });
+                has_colors = true;
+            }
+        }
+        if (has_colors) try package_theme.put(allocator, "colors", .{ .object = colors_object });
+        try installed_object.put(allocator, "theme", .{ .object = package_theme });
+        if (installed.font_size) |value| try installed_object.put(allocator, "ui_font_size", .{ .float = value });
+        if (installed.terminal_font_size) |value| try installed_object.put(allocator, "terminal_font_size", .{ .float = value });
+        try installed_values.append(.{ .object = installed_object });
+    }
+    try object.put(allocator, "installed_themes", .{ .array = installed_values });
 }
 
 fn writeOpenSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
@@ -272,21 +402,23 @@ fn writeTerminalSection(allocator: std.mem.Allocator, object: *std.json.ObjectMa
     try terminal_object.put(allocator, "profiles", .{ .array = profiles });
 }
 
-fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
-    const notifications_object = try objectSection(allocator, object, "notifications");
-    try notifications_object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
-}
 fn writeUpdatesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
     const updates_object = try objectSection(allocator, object, "updates");
     try updates_object.put(allocator, "check_automatically", .{ .bool = config.check_for_updates_automatically });
 }
 
+fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const notifications_object = try objectSection(allocator, object, "notifications");
+    try notifications_object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
+}
 
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
     const r: u8 = @intFromFloat(@round(theme.clampf(color[0], 0.0, 1.0) * 255.0));
     const g: u8 = @intFromFloat(@round(theme.clampf(color[1], 0.0, 1.0) * 255.0));
     const b: u8 = @intFromFloat(@round(theme.clampf(color[2], 0.0, 1.0) * 255.0));
-    return std.fmt.allocPrint(allocator, "#{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b });
+    const a: u8 = @intFromFloat(@round(theme.clampf(color[3], 0.0, 1.0) * 255.0));
+    if (a == 255) return std.fmt.allocPrint(allocator, "#{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b });
+    return std.fmt.allocPrint(allocator, "#{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b, a });
 }
 
 pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
@@ -312,7 +444,7 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
         applyUiOverrides(config, ui_value);
     }
     if (root.object.get("theme")) |theme_value| {
-        applyThemeOverrides(config, theme_value);
+        applyThemeOverrides(allocator, config, theme_value);
     }
     if (root.object.get("open")) |open_value| {
         applyOpenOverrides(allocator, config, open_value);
@@ -320,20 +452,18 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
     if (root.object.get("terminal")) |terminal_value| {
         applyTerminalOverrides(allocator, config, terminal_value);
     }
+    if (root.object.get("installed_themes")) |installed_value| {
+        applyInstalledThemeOverrides(allocator, config, installed_value);
+    }
+    validateActiveTheme(allocator, config);
+    if (root.object.get("updates")) |updates_value| {
+        applyUpdatesOverrides(config, updates_value);
+    }
     if (root.object.get("notifications")) |notifications_value| {
         applyNotificationsOverrides(config, notifications_value);
     }
 }
 
-fn applyNotificationsOverrides(config: *AppConfig, notifications_value: std.json.Value) void {
-    if (root.object.get("updates")) |updates_value| {
-        applyUpdatesOverrides(config, updates_value);
-    }
-    if (notifications_value != .object) {
-        log.warn("notifications must be an object when provided", .{});
-        return;
-    }
-    if (notifications_value.object.get("enabled")) |enabled_value| {
 fn applyUpdatesOverrides(config: *AppConfig, updates_value: std.json.Value) void {
     if (updates_value != .object) {
         log.warn("updates must be an object when provided", .{});
@@ -348,6 +478,12 @@ fn applyUpdatesOverrides(config: *AppConfig, updates_value: std.json.Value) void
     }
 }
 
+fn applyNotificationsOverrides(config: *AppConfig, notifications_value: std.json.Value) void {
+    if (notifications_value != .object) {
+        log.warn("notifications must be an object when provided", .{});
+        return;
+    }
+    if (notifications_value.object.get("enabled")) |enabled_value| {
         if (enabled_value == .bool) {
             config.notifications_enabled = enabled_value.bool;
         } else {
@@ -356,17 +492,32 @@ fn applyUpdatesOverrides(config: *AppConfig, updates_value: std.json.Value) void
     }
 }
 
-fn applyThemeOverrides(config: *AppConfig, theme_value: std.json.Value) void {
+fn applyThemeOverrides(allocator: std.mem.Allocator, config: *AppConfig, theme_value: std.json.Value) void {
     if (theme_value != .object) {
         log.warn("theme must be an object when provided", .{});
         return;
     }
 
+    if (theme_value.object.get("active")) |active_value| {
+        if (active_value != .string) {
+            log.warn("theme.active must be a string when provided", .{});
+        } else {
+            const active_name = std.mem.trim(u8, active_value.string, &std.ascii.whitespace);
+            if (active_name.len > 0) {
+                config.active_theme = allocator.dupe(u8, active_name) catch null;
+            }
+        }
+    }
+
+    applyThemeConfigOverrides(&config.theme_config, theme_value);
+}
+
+fn applyThemeConfigOverrides(theme_config: *theme.ThemeConfig, theme_value: std.json.Value) void {
     if (theme_value.object.get("theme")) |source_value| {
         if (source_value != .string) {
             log.warn("theme.theme must be a string when provided", .{});
         } else if (parseThemeSource(source_value.string)) |source| {
-            config.theme_config.source = source;
+            theme_config.source = source;
         }
     }
 
@@ -375,7 +526,7 @@ fn applyThemeOverrides(config: *AppConfig, theme_value: std.json.Value) void {
         log.warn("theme.colors must be an object when provided", .{});
         return;
     }
-    applyThemeColorOverrides(config, colors_value.object);
+    applyThemeColorOverrides(theme_config, colors_value.object);
 }
 
 fn parseThemeSource(raw: []const u8) ?theme.ThemeSource {
@@ -386,16 +537,66 @@ fn parseThemeSource(raw: []const u8) ?theme.ThemeSource {
     return null;
 }
 
-fn applyThemeColorOverrides(config: *AppConfig, object: std.json.ObjectMap) void {
+fn applyThemeColorOverrides(theme_config: *theme.ThemeConfig, object: std.json.ObjectMap) void {
     inline for (std.meta.fields(theme.ThemeColorOverrides)) |field| {
         if (object.get(field.name)) |value| {
             if (parseConfigColor(value)) |parsed| {
-                @field(config.theme_config.colors, field.name) = parsed;
+                @field(theme_config.colors, field.name) = parsed;
             } else {
                 log.warn("theme.colors.{s} must be a hex string or RGB/RGBA number array", .{field.name});
             }
         }
     }
+}
+
+fn applyInstalledThemeOverrides(allocator: std.mem.Allocator, config: *AppConfig, value: std.json.Value) void {
+    if (value != .array) {
+        log.warn("installed_themes must be an array when provided", .{});
+        return;
+    }
+    for (value.array.items) |item| {
+        if (item != .object) {
+            log.warn("installed theme entries must be objects", .{});
+            continue;
+        }
+        const name_value = item.object.get("name") orelse continue;
+        const theme_value = item.object.get("theme") orelse continue;
+        if (name_value != .string or theme_value != .object) {
+            log.warn("installed theme name/theme fields are invalid", .{});
+            continue;
+        }
+        const name = std.mem.trim(u8, name_value.string, &std.ascii.whitespace);
+        if (name.len == 0 or name.len > 128) {
+            log.warn("installed theme name is empty or too long", .{});
+            continue;
+        }
+
+        var theme_config: theme.ThemeConfig = .{ .source = .default };
+        applyThemeConfigOverrides(&theme_config, theme_value);
+        const font_size = parseInstalledFontSize(item.object.get("ui_font_size"), MIN_FONT_SIZE, MAX_FONT_SIZE);
+        const terminal_font_size = parseInstalledFontSize(item.object.get("terminal_font_size"), MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
+        _ = config.installTheme(allocator, name, theme_config, font_size, terminal_font_size) catch |err| {
+            log.warn("failed to load installed theme: {s}", .{@errorName(err)});
+            continue;
+        };
+    }
+}
+
+fn parseInstalledFontSize(value: ?std.json.Value, min: f32, max: f32) ?f32 {
+    const present = value orelse return null;
+    const number: f32 = switch (present) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| @floatCast(float),
+        else => return null,
+    };
+    if (!std.math.isFinite(number) or number < min or number > max) return null;
+    return number;
+}
+
+fn validateActiveTheme(allocator: std.mem.Allocator, config: *AppConfig) void {
+    if (config.active_theme == null or config.activeThemeIndex() != null) return;
+    allocator.free(config.active_theme.?);
+    config.active_theme = null;
 }
 
 fn parseConfigColor(value: std.json.Value) ?[4]f32 {
@@ -409,12 +610,16 @@ fn parseConfigColor(value: std.json.Value) ?[4]f32 {
 fn parseHexConfigColor(raw: []const u8) ?[4]f32 {
     var value = std.mem.trim(u8, raw, &std.ascii.whitespace);
     if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
-    if (value.len != 7 or value[0] != '#') return null;
+    if ((value.len != 7 and value.len != 9) or value[0] != '#') return null;
+    const alpha: u8 = if (value.len == 9)
+        std.fmt.parseInt(u8, value[7..9], 16) catch return null
+    else
+        255;
     return .{
         @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[1..3], 16) catch return null)) / 255.0,
         @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[3..5], 16) catch return null)) / 255.0,
         @as(f32, @floatFromInt(std.fmt.parseInt(u8, value[5..7], 16) catch return null)) / 255.0,
-        1.0,
+        @as(f32, @floatFromInt(alpha)) / 255.0,
     };
 }
 
@@ -700,6 +905,40 @@ test "app config accepts theme source and color overrides" {
     try std.testing.expectEqual(@as(f32, 80) / 255.0, config.theme_config.colors.accent.?[0]);
 }
 
+test "app config loads and selects installed themes" {
+    var root = try parseTestRoot(
+        \\{
+        \\  "theme": { "theme": "default", "active": "Forest" },
+        \\  "installed_themes": [{
+        \\    "name": "Forest",
+        \\    "theme": { "theme": "default", "colors": { "background": "#101820" } },
+        \\    "ui_font_size": 22,
+        \\    "terminal_font_size": 19
+        \\  }]
+        \\}
+    );
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expectEqual(@as(usize, 1), config.installed_themes.len);
+    try std.testing.expectEqualStrings("Forest", config.installed_themes[0].name);
+    try std.testing.expectEqual(@as(usize, 2), config.themeChoiceIndex());
+    try std.testing.expectEqual(@as(?f32, 22), config.installed_themes[0].font_size);
+
+    try config.selectThemeChoice(std.testing.allocator, 2);
+    try std.testing.expectEqualStrings("Forest", config.active_theme.?);
+    try std.testing.expectEqual(@as(f32, 0x10) / 255.0, config.theme_config.colors.background.?[0]);
+    try std.testing.expectEqual(@as(f32, 19), config.terminal_font_size);
+
+    try config.selectThemeChoice(std.testing.allocator, 1);
+    try std.testing.expect(config.active_theme == null);
+    try std.testing.expectEqual(theme.ThemeSource.omarchy, config.theme_config.source);
+    try std.testing.expect(config.theme_config.colors.background == null);
+}
+
 test "app config accepts named open default" {
     var root = try parseTestRoot("{\"open\":{\"default\":\"cursor\"}}");
     defer root.deinit();
@@ -722,16 +961,6 @@ test "app config accepts link open target" {
     try std.testing.expectEqual(LinkOpenTarget.system_browser, config.link_open_target);
 }
 
-test "app config accepts custom open default" {
-    var root = try parseTestRoot("{\"open\":{\"default\":{\"label\":\"Workbench\",\"action\":\"cursor .\"}}}");
-    defer root.deinit();
-
-    var config: AppConfig = .{};
-    defer config.deinit(std.testing.allocator);
-    applyAppOverrides(std.testing.allocator, &config, root.value);
-
-    try std.testing.expect(config.default_open_action == .custom);
-    try std.testing.expectEqualStrings("Workbench", config.default_open_action.custom.label);
 test "app config accepts automatic update check preference" {
     var root = try parseTestRoot("{\"updates\":{\"check_automatically\":false}}");
     defer root.deinit();
@@ -743,6 +972,16 @@ test "app config accepts automatic update check preference" {
     try std.testing.expect(!config.check_for_updates_automatically);
 }
 
+test "app config accepts custom open default" {
+    var root = try parseTestRoot("{\"open\":{\"default\":{\"label\":\"Workbench\",\"action\":\"cursor .\"}}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expect(config.default_open_action == .custom);
+    try std.testing.expectEqualStrings("Workbench", config.default_open_action.custom.label);
     try std.testing.expectEqualStrings("cursor .", config.default_open_action.custom.action);
 }
 

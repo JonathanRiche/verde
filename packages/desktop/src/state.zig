@@ -162,6 +162,7 @@ pub const PaletteModalAction = enum {
     settings_close,
     settings_save,
     settings_control,
+    settings_theme_option,
     command_palette_input,
     command_palette_row,
     command_palette_action_row,
@@ -180,6 +181,7 @@ pub const SettingsDraft = struct {
     font_size: f32 = theme.DEFAULT_FONT_SIZE,
     terminal_font_size: f32 = app_config.DEFAULT_TERMINAL_FONT_SIZE,
     theme_source: theme.ThemeSource = .omarchy,
+    theme_choice: usize = 1,
     open_action: SettingsOpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
     check_for_updates_automatically: bool = true,
@@ -4513,6 +4515,12 @@ pub const AppState = struct {
     settings_scroll_y: f32,
     settings_hover_control: ?u8,
     settings_close_hovered: bool,
+    settings_theme_dropdown_open: bool,
+    settings_theme_hover_index: ?usize,
+    settings_theme_menu_scroll: usize,
+    update_state: updater.State,
+    update_installer_started: bool,
+    update_exit_requested: bool,
     app_config_file_mtime: i128,
     app_config_runtime_sync_pending: bool,
     project_directory_browse_requested: bool,
@@ -4520,9 +4528,6 @@ pub const AppState = struct {
     picker_state: PickerState,
     slash_command_state: SlashCommandState,
     opencode_model_cache_state: OpencodeModelCacheState,
-    update_state: updater.State,
-    update_installer_started: bool,
-    update_exit_requested: bool,
     claude_model_cache_state: ClaudeModelCacheState,
     cursor_model_cache_state: CursorModelCacheState,
     provider_readiness_state: ProviderReadinessState,
@@ -4773,6 +4778,12 @@ pub const AppState = struct {
             .settings_scroll_y = 0.0,
             .settings_hover_control = null,
             .settings_close_hovered = false,
+            .settings_theme_dropdown_open = false,
+            .settings_theme_hover_index = null,
+            .settings_theme_menu_scroll = 0,
+            .update_state = .{},
+            .update_installer_started = false,
+            .update_exit_requested = false,
             .app_config_file_mtime = -1,
             .app_config_runtime_sync_pending = false,
             .project_directory_browse_requested = false,
@@ -4780,9 +4791,6 @@ pub const AppState = struct {
             .picker_state = .{},
             .slash_command_state = .{},
             .opencode_model_cache_state = .{},
-            .update_state = .{},
-            .update_installer_started = false,
-            .update_exit_requested = false,
             .claude_model_cache_state = .{},
             .cursor_model_cache_state = .{},
             .provider_readiness_state = .{},
@@ -8624,8 +8632,10 @@ pub const AppState = struct {
             .font_size = self.app_config.font_size,
             .terminal_font_size = self.app_config.terminal_font_size,
             .theme_source = self.app_config.theme_config.source,
+            .theme_choice = self.app_config.themeChoiceIndex(),
             .open_action = settingsOpenActionFromConfig(self.app_config.default_open_action),
             .link_open_target = self.app_config.link_open_target,
+            .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
             .notifications_enabled = self.app_config.notifications_enabled,
         };
     }
@@ -8633,10 +8643,10 @@ pub const AppState = struct {
     pub fn isSettingsDraftDirty(self: *const AppState) bool {
         const draft = self.settings_draft;
         if (draft.font_size != self.app_config.font_size) return true;
-            .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
-        if (draft.theme_source != self.app_config.theme_config.source) return true;
+        if (draft.theme_choice != self.app_config.themeChoiceIndex()) return true;
         if (draft.link_open_target != self.app_config.link_open_target) return true;
+        if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
         if (draft.notifications_enabled != self.app_config.notifications_enabled) return true;
         return draft.open_action != settingsOpenActionFromConfig(self.app_config.default_open_action);
     }
@@ -8644,7 +8654,6 @@ pub const AppState = struct {
     pub fn openSettingsModal(self: *AppState) void {
         self.closeSidebarContextMenu();
         self.workspace_header_open_menu_open = false;
-        if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
         self.workspace_header_open_menu_pane_id = null;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
@@ -8654,7 +8663,13 @@ pub const AppState = struct {
         self.settings_scroll_y = 0.0;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
+        self.settings_theme_dropdown_open = false;
+        self.settings_theme_hover_index = null;
+        self.settings_theme_menu_scroll = 0;
         self.show_settings_modal = true;
+        if (self.app_config.check_for_updates_automatically and self.update_state.status == .idle) {
+            self.update_state.start();
+        }
         self.palette_modal_text_focus = .none;
         self.blurPaletteComposer();
         self.noteInteraction();
@@ -8662,9 +8677,6 @@ pub const AppState = struct {
     }
 
     /// Installs or removes the global Claude notify hooks and refreshes the
-        if (self.app_config.check_for_updates_automatically and self.update_state.status == .idle) {
-            self.update_state.start();
-        }
     /// settings toggle state. Acts immediately (filesystem side effect).
     pub fn toggleClaudeGlobalHooks(self: *AppState) void {
         if (self.settings_hook_claude_installed) {
@@ -8745,6 +8757,8 @@ pub const AppState = struct {
         self.show_settings_modal = false;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
+        self.settings_theme_dropdown_open = false;
+        self.settings_theme_hover_index = null;
         self.syncSettingsDraftFromConfig();
         self.palette_modal_text_focus = .none;
         self.markDirty();
@@ -8756,10 +8770,13 @@ pub const AppState = struct {
             self.settings_draft.font_size,
             self.settings_draft.terminal_font_size,
         });
+        try self.app_config.selectThemeChoice(self.allocator, self.settings_draft.theme_choice);
         self.app_config.font_size = theme.clampf(self.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE);
         self.app_config.terminal_font_size = theme.clampf(self.settings_draft.terminal_font_size, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE);
-        self.app_config.theme_config.source = self.settings_draft.theme_source;
         self.app_config.link_open_target = self.settings_draft.link_open_target;
+        const previous_auto_update_check = self.app_config.check_for_updates_automatically;
+        errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
+        self.app_config.check_for_updates_automatically = self.settings_draft.check_for_updates_automatically;
         self.app_config.notifications_enabled = self.settings_draft.notifications_enabled;
         try self.applySettingsDraftOpenAction();
 
@@ -8767,12 +8784,11 @@ pub const AppState = struct {
         self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
         self.applyTerminalFontSizesFromConfig();
         self.app_config_runtime_sync_pending = true;
-        const previous_auto_update_check = self.app_config.check_for_updates_automatically;
-        errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
-        self.app_config.check_for_updates_automatically = self.settings_draft.check_for_updates_automatically;
         self.show_settings_modal = false;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
+        self.settings_theme_dropdown_open = false;
+        self.settings_theme_hover_index = null;
         self.palette_modal_text_focus = .none;
         self.markDirty();
         runtime_log.diagnostic("settings save done", .{});
@@ -8795,13 +8811,42 @@ pub const AppState = struct {
         return self.show_settings_modal;
     }
 
-    fn applySettingsDraftOpenAction(self: *AppState) !void {
-        if (self.settings_draft.open_action == .custom) return;
+    pub fn settingsThemeChoiceCount(self: *const AppState) usize {
+        return self.app_config.installed_themes.len + 2;
+    }
 
-        const next: app_config.DefaultOpenAction = switch (self.settings_draft.open_action) {
-            .folder => .folder,
-            .editor => .editor,
-            .cursor => .cursor,
+    pub fn settingsThemeChoiceLabel(self: *const AppState, choice_index: usize) []const u8 {
+        if (choice_index == 0) return "Verde";
+        if (choice_index == 1) return "Omarchy";
+        const installed_index = choice_index - 2;
+        if (installed_index >= self.app_config.installed_themes.len) return "Unknown theme";
+        return self.app_config.installed_themes[installed_index].name;
+    }
+
+    pub fn selectSettingsThemeChoice(self: *AppState, choice_index: usize) void {
+        if (choice_index >= self.settingsThemeChoiceCount()) return;
+        if (choice_index == self.settings_draft.theme_choice) {
+            self.settings_theme_dropdown_open = false;
+            self.settings_theme_hover_index = null;
+            self.markDirty();
+            return;
+        }
+        self.settings_draft.theme_choice = choice_index;
+        if (choice_index == 0) {
+            self.settings_draft.theme_source = .default;
+        } else if (choice_index == 1) {
+            self.settings_draft.theme_source = .omarchy;
+        } else {
+            const installed = self.app_config.installed_themes[choice_index - 2];
+            self.settings_draft.theme_source = installed.theme_config.source;
+            if (installed.font_size) |value| self.settings_draft.font_size = value;
+            if (installed.terminal_font_size) |value| self.settings_draft.terminal_font_size = value;
+        }
+        self.settings_theme_dropdown_open = false;
+        self.settings_theme_hover_index = null;
+        self.markDirty();
+    }
+
     pub fn startUpdateCheck(self: *AppState) void {
         self.update_state.start();
         self.markDirty();
@@ -8844,6 +8889,13 @@ pub const AppState = struct {
         return true;
     }
 
+    fn applySettingsDraftOpenAction(self: *AppState) !void {
+        if (self.settings_draft.open_action == .custom) return;
+
+        const next: app_config.DefaultOpenAction = switch (self.settings_draft.open_action) {
+            .folder => .folder,
+            .editor => .editor,
+            .cursor => .cursor,
             .vscode => .vscode,
             .zed => .zed,
             .custom => unreachable,
@@ -16821,6 +16873,8 @@ pub const AppState = struct {
         runtime_log.diagnostic("AppState.deinit cursor model cache finished", .{});
         self.finishProviderReadinessThread();
         runtime_log.diagnostic("AppState.deinit provider readiness finished", .{});
+        self.update_state.deinit();
+        runtime_log.diagnostic("AppState.deinit updater finished", .{});
         self.finishAllSendThreads();
         runtime_log.diagnostic("AppState.deinit send threads finished", .{});
         _ = self.pollSend();
@@ -16870,8 +16924,6 @@ pub const AppState = struct {
             }
             for (project.archived_threads.items) |*thread| {
                 self.prepareThreadSendForShutdown(project.path, thread);
-        self.update_state.deinit();
-        runtime_log.diagnostic("AppState.deinit updater finished", .{});
             }
         }
         for (self.archived_projects.items) |*project| {

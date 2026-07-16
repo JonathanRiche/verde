@@ -3,6 +3,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const palette = @import("palette");
+const sdl = @import("zsdl3");
 const app_config = @import("../config.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
@@ -12,8 +13,7 @@ pub const Control = enum(u8) {
     ui_font_inc,
     terminal_font_dec,
     terminal_font_inc,
-    theme_omarchy,
-    theme_default,
+    theme_dropdown,
     open_folder,
     open_editor,
     open_cursor,
@@ -42,6 +42,10 @@ const OPEN_CHOICES = [_]OpenChoice{
     .{ .label = "VS Code", .control = .open_vscode },
     .{ .label = "Zed", .control = .open_zed },
 };
+
+const THEME_MENU_MAX_ROWS: usize = 6;
+const NF_COD_CHEVRON_DOWN = "\u{EAB4}";
+const NF_COD_CHEVRON_UP = "\u{EAB7}";
 
 const Metrics = struct {
     modal_pad: f32,
@@ -95,8 +99,7 @@ const SettingsLayout = struct {
     cancel: palette.Rect,
     save: palette.Rect,
     appearance_card: palette.Rect,
-    theme_omarchy: palette.Rect,
-    theme_default: palette.Rect,
+    theme_dropdown: palette.Rect,
     ui_font_dec: palette.Rect,
     ui_font_inc: palette.Rect,
     terminal_card: palette.Rect,
@@ -242,11 +245,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     const appearance_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = appearance_h };
     const theme_row_y = appearance_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
-    const segment_gap = m.inner_gap;
-    const segment_w = (content_w - m.card_pad * 2.0 - segment_gap) * 0.5;
     const theme_x = appearance_card.x + m.card_pad;
-    const theme_omarchy: palette.Rect = .{ .x = theme_x, .y = theme_row_y, .w = segment_w, .h = m.row_h };
-    const theme_default: palette.Rect = .{ .x = theme_x + segment_w + segment_gap, .y = theme_row_y, .w = segment_w, .h = m.row_h };
+    const theme_dropdown: palette.Rect = .{ .x = theme_x, .y = theme_row_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const ui_font_y = theme_row_y + m.row_h + m.row_gap;
     const ui_stepper = stepperRects(appearance_card, m.card_pad, ui_font_y, m);
 
@@ -329,8 +329,7 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .cancel = cancel,
         .save = save,
         .appearance_card = appearance_card,
-        .theme_omarchy = theme_omarchy,
-        .theme_default = theme_default,
+        .theme_dropdown = theme_dropdown,
         .ui_font_dec = ui_stepper.dec,
         .ui_font_inc = ui_stepper.inc,
         .terminal_card = terminal_card,
@@ -385,6 +384,47 @@ fn queueControlHit(
     queue_hit(state, visible, .settings_control, @intFromEnum(control));
 }
 
+fn themeMenuVisibleCount(state: *const runtime.AppState) usize {
+    return @min(state.settingsThemeChoiceCount(), THEME_MENU_MAX_ROWS);
+}
+
+fn themeMenuMaxScroll(state: *const runtime.AppState) usize {
+    return state.settingsThemeChoiceCount() - themeMenuVisibleCount(state);
+}
+
+fn themeMenuRect(state: *const runtime.AppState, layout: SettingsLayout) palette.Rect {
+    const row_count = themeMenuVisibleCount(state);
+    return .{
+        .x = layout.theme_dropdown.x,
+        .y = layout.theme_dropdown.y + layout.theme_dropdown.h + theme.scaledUi(4.0),
+        .w = layout.theme_dropdown.w,
+        .h = @as(f32, @floatFromInt(row_count)) * metrics().row_h,
+    };
+}
+
+fn themeOptionRect(state: *const runtime.AppState, layout: SettingsLayout, visible_index: usize) palette.Rect {
+    const menu = themeMenuRect(state, layout);
+    return .{
+        .x = menu.x,
+        .y = menu.y + @as(f32, @floatFromInt(visible_index)) * metrics().row_h,
+        .w = menu.w,
+        .h = metrics().row_h,
+    };
+}
+
+fn registerThemeOptionHits(
+    state: *runtime.AppState,
+    layout: SettingsLayout,
+    queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void,
+) void {
+    if (!state.settings_theme_dropdown_open) return;
+    state.settings_theme_menu_scroll = @min(state.settings_theme_menu_scroll, themeMenuMaxScroll(state));
+    for (0..themeMenuVisibleCount(state)) |visible_index| {
+        const rect = intersectRect(themeOptionRect(state, layout, visible_index), layout.body_clip) orelse continue;
+        queue_hit(state, rect, .settings_theme_option, state.settings_theme_menu_scroll + visible_index);
+    }
+}
+
 /// Registers palette hit targets for the settings modal.
 pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit: *const fn (*runtime.AppState, palette.Rect, runtime.PaletteModalAction, usize) void) void {
     if (!state.show_settings_modal) return;
@@ -396,8 +436,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queue_hit(state, layout.close, .settings_close, 0);
     queue_hit(state, layout.cancel, .settings_cancel, 0);
     queue_hit(state, layout.save, .settings_save, 0);
-    queueControlHit(state, layout.theme_omarchy, layout.body_clip, .theme_omarchy, queue_hit);
-    queueControlHit(state, layout.theme_default, layout.body_clip, .theme_default, queue_hit);
+    queueControlHit(state, layout.theme_dropdown, layout.body_clip, .theme_dropdown, queue_hit);
     queueControlHit(state, layout.ui_font_dec, layout.body_clip, .ui_font_dec, queue_hit);
     queueControlHit(state, layout.ui_font_inc, layout.body_clip, .ui_font_inc, queue_hit);
     queueControlHit(state, layout.terminal_font_dec, layout.body_clip, .terminal_font_dec, queue_hit);
@@ -418,6 +457,7 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     }
     queueControlHit(state, layout.updates_automatic, layout.body_clip, .updates_automatic, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
+    registerThemeOptionHits(state, layout, queue_hit);
 }
 
 /// Renders the settings modal over the workspace.
@@ -441,8 +481,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     // Appearance
     drawCardTitle(state, layout.appearance_card, "Appearance", layout.body_clip);
     drawFieldLabel(state, layout.appearance_card, m, "Theme", layout.body_clip);
-    drawToggleCell(state, layout.theme_omarchy, "Omarchy", state.settings_draft.theme_source == .omarchy, isControlHovered(state, .theme_omarchy), layout.body_clip);
-    drawToggleCell(state, layout.theme_default, "Verde", state.settings_draft.theme_source == .default, isControlHovered(state, .theme_default), layout.body_clip);
+    drawThemeDropdown(state, layout);
     drawStepperRow(state, layout.appearance_card, m, layout.ui_font_dec.y, "UI font size", state.settings_draft.font_size, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE, .ui_font_dec, .ui_font_inc, layout.ui_font_dec, layout.ui_font_inc, layout.body_clip);
 
     // Terminal
@@ -546,6 +585,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .h = m.label_h,
     }, "System notification when an agent finishes · Windows, macOS & Linux", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
+    drawThemeDropdownMenu(state, layout);
     drawFooterBar(state, layout, dirty);
 }
 
@@ -555,6 +595,20 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 
     const layout = computeLayout(state, width, height);
     if (!rectContains(layout.modal, x, y)) return true;
+    if (state.settings_theme_dropdown_open and rectContains(themeMenuRect(state, layout), x, y)) {
+        const max_scroll = themeMenuMaxScroll(state);
+        const next = if (wheel_y < 0.0)
+            @min(state.settings_theme_menu_scroll + 1, max_scroll)
+        else if (wheel_y > 0.0)
+            state.settings_theme_menu_scroll -| 1
+        else
+            state.settings_theme_menu_scroll;
+        if (next != state.settings_theme_menu_scroll) {
+            state.settings_theme_menu_scroll = next;
+            state.markDirty();
+        }
+        return true;
+    }
     if (layout.max_scroll_y <= 0.0) return true;
     if (!rectContains(layout.body_clip, x, y)) return true;
 
@@ -570,15 +624,17 @@ pub fn handleWheel(state: *runtime.AppState, width: f32, height: f32, x: f32, y:
 /// Updates settings-modal hover using hits from `refreshPaletteModalHits`.
 pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
     if (!state.show_settings_modal) {
-        if (state.settings_hover_control != null or state.settings_close_hovered) {
+        if (state.settings_hover_control != null or state.settings_close_hovered or state.settings_theme_hover_index != null) {
             state.settings_hover_control = null;
             state.settings_close_hovered = false;
+            state.settings_theme_hover_index = null;
             state.markDirty();
         }
         return;
     }
 
     var new_hover: ?u8 = null;
+    var theme_hover: ?usize = null;
     var close_hovered = false;
     var i = state.palette_modal_hits.items.len;
     while (i > 0) {
@@ -588,28 +644,44 @@ pub fn updateHover(state: *runtime.AppState, x: f32, y: f32) void {
             if (rectContains(hit.rect, x, y)) close_hovered = true;
             continue;
         }
+        if (hit.action == .settings_theme_option and rectContains(hit.rect, x, y)) {
+            theme_hover = hit.index;
+            break;
+        }
         if (hit.action != .settings_control) continue;
         if (!rectContains(hit.rect, x, y)) continue;
         new_hover = @intCast(hit.index);
         break;
     }
 
-    if (state.settings_hover_control == new_hover and state.settings_close_hovered == close_hovered) return;
+    if (state.settings_hover_control == new_hover and state.settings_close_hovered == close_hovered and state.settings_theme_hover_index == theme_hover) return;
     state.settings_hover_control = new_hover;
     state.settings_close_hovered = close_hovered;
+    state.settings_theme_hover_index = theme_hover;
     state.markDirty();
 }
 
 /// Applies a settings control interaction to the in-modal draft.
 pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
     const control: Control = @enumFromInt(control_index);
+    if (control != .theme_dropdown) {
+        state.settings_theme_dropdown_open = false;
+        state.settings_theme_hover_index = null;
+    }
     switch (control) {
         .ui_font_dec => state.settings_draft.font_size = theme.clampf(state.settings_draft.font_size - 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .ui_font_inc => state.settings_draft.font_size = theme.clampf(state.settings_draft.font_size + 1.0, app_config.MIN_FONT_SIZE, app_config.MAX_FONT_SIZE),
         .terminal_font_dec => state.settings_draft.terminal_font_size = theme.clampf(state.settings_draft.terminal_font_size - 1.0, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE),
         .terminal_font_inc => state.settings_draft.terminal_font_size = theme.clampf(state.settings_draft.terminal_font_size + 1.0, app_config.MIN_TERMINAL_FONT_SIZE, app_config.MAX_TERMINAL_FONT_SIZE),
-        .theme_omarchy => state.settings_draft.theme_source = .omarchy,
-        .theme_default => state.settings_draft.theme_source = .default,
+        .theme_dropdown => {
+            state.settings_theme_dropdown_open = !state.settings_theme_dropdown_open;
+            if (state.settings_theme_dropdown_open) {
+                state.settings_theme_hover_index = state.settings_draft.theme_choice;
+                ensureThemeChoiceVisible(state, state.settings_draft.theme_choice);
+            } else {
+                state.settings_theme_hover_index = null;
+            }
+        },
         .open_folder => state.settings_draft.open_action = .folder,
         .open_editor => state.settings_draft.open_action = .editor,
         .open_cursor => state.settings_draft.open_action = .cursor,
@@ -643,6 +715,52 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
         .notifications_toggle => state.settings_draft.notifications_enabled = !state.settings_draft.notifications_enabled,
     }
     state.markDirty();
+}
+
+/// Selects a built-in or installed theme from the open settings dropdown.
+pub fn applyThemeOption(state: *runtime.AppState, choice_index: usize) void {
+    state.selectSettingsThemeChoice(choice_index);
+}
+
+/// Handles navigation while the settings theme dropdown owns keyboard focus.
+pub fn handleKeyDown(state: *runtime.AppState, key: sdl.Keycode) bool {
+    if (!state.show_settings_modal or !state.settings_theme_dropdown_open) return false;
+    const count = state.settingsThemeChoiceCount();
+    if (count == 0) return false;
+    const current = state.settings_theme_hover_index orelse state.settings_draft.theme_choice;
+    const next = switch (key) {
+        .up => current -| 1,
+        .down => @min(current + 1, count - 1),
+        .home => 0,
+        .end => count - 1,
+        .escape => {
+            state.settings_theme_dropdown_open = false;
+            state.settings_theme_hover_index = null;
+            state.markDirty();
+            return true;
+        },
+        .@"return", .kp_enter => {
+            state.selectSettingsThemeChoice(current);
+            return true;
+        },
+        else => return false,
+    };
+    state.settings_theme_hover_index = next;
+    ensureThemeChoiceVisible(state, next);
+    state.markDirty();
+    return true;
+}
+
+fn ensureThemeChoiceVisible(state: *runtime.AppState, choice_index: usize) void {
+    if (choice_index < state.settings_theme_menu_scroll) {
+        state.settings_theme_menu_scroll = choice_index;
+    } else {
+        const visible_count = themeMenuVisibleCount(state);
+        if (choice_index >= state.settings_theme_menu_scroll + visible_count) {
+            state.settings_theme_menu_scroll = choice_index - visible_count + 1;
+        }
+    }
+    state.settings_theme_menu_scroll = @min(state.settings_theme_menu_scroll, themeMenuMaxScroll(state));
 }
 
 fn releaseNotesPreview(notes: []const u8) []const u8 {
@@ -742,6 +860,86 @@ fn drawFieldLabel(state: *runtime.AppState, card: palette.Rect, m: Metrics, labe
         .w = card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, label, paletteColor(textLabel()), theme.scaledUi(12.0), clip);
+}
+
+// Appearance theme selector control.
+fn drawThemeDropdown(state: *runtime.AppState, layout: SettingsLayout) void {
+    const rect = layout.theme_dropdown;
+    const hovered = isControlHovered(state, .theme_dropdown);
+    const background = if (state.settings_theme_dropdown_open)
+        theme.withAlpha(theme.COLOR_GREEN, 34)
+    else if (hovered)
+        theme.lighten(theme.COLOR_PANEL_MUTED, 0.06)
+    else
+        theme.lighten(theme.COLOR_PANEL_MUTED, 0.02);
+    queueRoundedRectClipped(state, rect, paletteColor(background), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, rect, paletteColor(if (state.settings_theme_dropdown_open) theme.withAlpha(theme.COLOR_GREEN, 150) else theme.withAlpha(theme.COLOR_WHITE, 24)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    const selected = @min(state.settings_draft.theme_choice, state.settingsThemeChoiceCount() - 1);
+    queueText(state, .{
+        .x = rect.x + theme.scaledUi(10.0),
+        .y = rect.y + (rect.h - theme.scaledUi(15.0)) * 0.5,
+        .w = rect.w - theme.scaledUi(38.0),
+        .h = theme.scaledUi(15.0),
+    }, state.settingsThemeChoiceLabel(selected), paletteColor(theme.COLOR_WHITE), theme.scaledUi(12.5), layout.body_clip);
+    const chevron_size = theme.scaledUi(13.0);
+    queueIconText(state, .{
+        .x = rect.x + rect.w - theme.scaledUi(18.0),
+        .y = rect.y + (rect.h - chevron_size) * 0.5,
+        .w = chevron_size,
+        .h = chevron_size,
+    }, if (state.settings_theme_dropdown_open) NF_COD_CHEVRON_UP else NF_COD_CHEVRON_DOWN, paletteColor(textLabel()), chevron_size, layout.body_clip);
+}
+
+// Appearance theme selector popup rows.
+fn drawThemeDropdownMenu(state: *runtime.AppState, layout: SettingsLayout) void {
+    if (!state.settings_theme_dropdown_open) return;
+    const menu = themeMenuRect(state, layout);
+    queueRoundedRectClipped(state, menu, paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.06)), radiusSm(), layout.body_clip);
+    queueBorderClipped(state, menu, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 34)), radiusSm(), theme.scaledUi(1.0), layout.body_clip);
+
+    for (0..themeMenuVisibleCount(state)) |visible_index| {
+        const choice_index = state.settings_theme_menu_scroll + visible_index;
+        const row = themeOptionRect(state, layout, visible_index);
+        const selected = choice_index == state.settings_draft.theme_choice;
+        const hovered = state.settings_theme_hover_index == choice_index;
+        if (selected or hovered) {
+            const color = if (selected) theme.withAlpha(theme.COLOR_GREEN, 38) else theme.lighten(theme.COLOR_PANEL_MUTED, 0.05);
+            queueRoundedRectClipped(state, row, paletteColor(color), theme.scaledUi(4.0), layout.body_clip);
+        }
+
+        const dot_size = theme.scaledUi(6.0);
+        const dot_color = if (selected) theme.COLOR_GREEN else theme.withAlpha(theme.COLOR_TEXT_MUTED, 110);
+        queueRoundedRectClipped(state, .{
+            .x = row.x + theme.scaledUi(10.0),
+            .y = row.y + (row.h - dot_size) * 0.5,
+            .w = dot_size,
+            .h = dot_size,
+        }, paletteColor(dot_color), dot_size * 0.5, layout.body_clip);
+        queueText(state, .{
+            .x = row.x + theme.scaledUi(25.0),
+            .y = row.y + (row.h - theme.scaledUi(15.0)) * 0.5,
+            .w = row.w - theme.scaledUi(42.0),
+            .h = theme.scaledUi(15.0),
+        }, state.settingsThemeChoiceLabel(choice_index), paletteColor(if (selected or hovered) theme.COLOR_WHITE else textLabel()), theme.scaledUi(12.5), layout.body_clip);
+    }
+
+    const count = state.settingsThemeChoiceCount();
+    const visible_count = themeMenuVisibleCount(state);
+    if (count > visible_count) {
+        const track: palette.Rect = .{
+            .x = menu.x + menu.w - theme.scaledUi(5.0),
+            .y = menu.y + theme.scaledUi(4.0),
+            .w = theme.scaledUi(2.0),
+            .h = menu.h - theme.scaledUi(8.0),
+        };
+        const thumb_h = track.h * @as(f32, @floatFromInt(visible_count)) / @as(f32, @floatFromInt(count));
+        const travel = track.h - thumb_h;
+        const max_scroll = themeMenuMaxScroll(state);
+        const progress = @as(f32, @floatFromInt(state.settings_theme_menu_scroll)) / @as(f32, @floatFromInt(max_scroll));
+        queueRoundedRectClipped(state, track, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 20)), theme.scaledUi(1.0), layout.body_clip);
+        queueRoundedRectClipped(state, .{ .x = track.x, .y = track.y + travel * progress, .w = track.w, .h = thumb_h }, paletteColor(theme.withAlpha(theme.COLOR_WHITE, 100)), theme.scaledUi(1.0), layout.body_clip);
+    }
 }
 
 fn drawToggleCell(state: *runtime.AppState, rect: palette.Rect, label: []const u8, selected: bool, hovered: bool, clip: palette.Rect) void {
@@ -869,6 +1067,13 @@ fn queueBorder(state: *runtime.AppState, rect: palette.Rect, color: palette.Colo
     };
 }
 
+fn queueBorderClipped(state: *runtime.AppState, rect: palette.Rect, color: palette.Color, radius: f32, width: f32, clip: palette.Rect) void {
+    if (intersectRect(rect, clip) == null) return;
+    state.palette_overlay_batch.rectBorderClipped(state.allocator, rect, color, radius, width, clip) catch |err| {
+        log.warn("failed to queue clipped settings border: {s}", .{@errorName(err)});
+    };
+}
+
 fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
     const stable_value = state.palette_frame_text_arena.allocator().dupe(u8, value) catch |err| {
         log.warn("failed to retain settings text: {s}", .{@errorName(err)});
@@ -887,6 +1092,25 @@ fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, co
         false,
     ) catch |err| {
         log.warn("failed to queue settings text: {s}", .{@errorName(err)});
+    };
+}
+
+fn queueIconText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    const stable_value = state.palette_frame_text_arena.allocator().dupe(u8, value) catch |err| {
+        log.warn("failed to retain settings icon: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.roleText(
+        state.allocator,
+        rect,
+        stable_value,
+        color,
+        font_size,
+        .icon,
+        null,
+        clip,
+    ) catch |err| {
+        log.warn("failed to queue settings icon: {s}", .{@errorName(err)});
     };
 }
 
