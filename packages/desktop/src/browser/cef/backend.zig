@@ -137,6 +137,13 @@ pub const Backend = struct {
         return null;
     }
 
+    /// CEF keeps no host-side CPU copy of the composited frame today.
+    pub fn copyFramePixels(self: *Backend, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        _ = self;
+        _ = allocator;
+        return null;
+    }
+
     /// Creates the pane session on demand and marks it visible inside the desktop layout.
     pub fn show(self: *Backend) !void {
         try self.ensureRuntime();
