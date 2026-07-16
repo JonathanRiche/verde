@@ -10,7 +10,10 @@ import type {
   InspectorMode,
   InspectorModeInput,
   InspectorOptions,
+  InspectorPromptResult,
+  InspectorPromptTarget,
   InspectorSelection,
+  InspectorThemeInput,
   RegionSelection,
 } from "./types";
 
@@ -18,20 +21,70 @@ const OVERLAY_ROOT_ID = "verde-inspector-overlay-root";
 const OVERLAY_IGNORE_ATTR = "data-verde-inspector-ignore";
 const BOX_ATTR = "data-verde-box";
 const SVG_NS = "http://www.w3.org/2000/svg";
-const VERDE_RGB = "34, 197, 94";
-const VERDE_BORDER_GLOW = "rgba(240, 253, 244, 0.98)";
-const OVERLAY_MARGIN_FILL = `rgba(${VERDE_RGB}, 0.12)`;
-const OVERLAY_BORDER_FILL = `rgba(${VERDE_RGB}, 0.19)`;
-const OVERLAY_PADDING_FILL = `rgba(${VERDE_RGB}, 0.29)`;
-const OVERLAY_CONTENT_FILL = `rgba(${VERDE_RGB}, 0.05)`;
-const OVERLAY_REGION_FILL = `rgba(${VERDE_RGB}, 0.12)`;
-const OVERLAY_REGION_STROKE = `rgba(${VERDE_RGB}, 0.78)`;
-const OVERLAY_FREEFORM_FILL = `rgba(${VERDE_RGB}, 0.1)`;
-const OVERLAY_STROKE = `rgba(${VERDE_RGB}, 0.05)`;
+
+type ThemeRgb = { r: number; g: number; b: number };
+
+/** Overlay colors resolved from the host theme (see InspectorThemeInput);
+ * defaults reproduce the historical built-in green look. */
+type ResolvedTheme = {
+  accent: ThemeRgb;
+  panelBackground: ThemeRgb;
+  inputBackground: ThemeRgb;
+  text: string;
+  textMuted: string;
+  error: string;
+};
+
+const DEFAULT_THEME: ResolvedTheme = {
+  accent: { r: 80, g: 200, b: 120 },
+  panelBackground: { r: 25, g: 31, b: 36 },
+  inputBackground: { r: 29, g: 38, b: 43 },
+  text: "#f0f0f5",
+  textMuted: "#b9bbc3",
+  error: "#f2a4a4",
+};
+
+function parseHexColor(value: string | undefined): ThemeRgb | null {
+  if (!value) return null;
+  const match = /^#?([0-9a-f]{6})$/i.exec(value.trim());
+  if (!match) return null;
+  const num = parseInt(match[1]!, 16);
+  return { r: (num >> 16) & 0xff, g: (num >> 8) & 0xff, b: num & 0xff };
+}
+
+function rgbaOf(color: ThemeRgb, alpha: number): string {
+  return `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`;
+}
+
+function resolveTheme(input?: InspectorThemeInput | null): ResolvedTheme {
+  return {
+    accent: parseHexColor(input?.accent) ?? DEFAULT_THEME.accent,
+    panelBackground: parseHexColor(input?.panelBackground) ?? DEFAULT_THEME.panelBackground,
+    inputBackground: parseHexColor(input?.inputBackground) ?? DEFAULT_THEME.inputBackground,
+    text: parseHexColor(input?.text) ? input!.text! : DEFAULT_THEME.text,
+    textMuted: parseHexColor(input?.textMuted) ? input!.textMuted! : DEFAULT_THEME.textMuted,
+    error: parseHexColor(input?.error) ? input!.error! : DEFAULT_THEME.error,
+  };
+}
+
+/** Black-or-white foreground for a solid accent surface. */
+function accentForeground(color: ThemeRgb): string {
+  const luminance = (0.299 * color.r + 0.587 * color.g + 0.114 * color.b) / 255.0;
+  return luminance > 0.62 ? "#14181c" : "#ffffff";
+}
 const FREEFORM_BRUSH_RADIUS = 14;
 const FREEFORM_POINT_STEP = 4;
 const FREEFORM_CLOSE_SNAP_DISTANCE = 120;
 const FREEFORM_CLOSE_SNAP_DISTANCE_MAX = 224;
+// Gap between the selection rect and the anchored prompt panel, and the
+// minimum inset that keeps the panel inside the viewport.
+const PROMPT_ANCHOR_GAP = 12;
+const PROMPT_VIEWPORT_INSET = 12;
+// Host must resolve a submitted prompt within this window or the bubble
+// re-enables with a timeout notice (protects against a dead bridge or a
+// lost acknowledgement eval). Kept short so a lost ack recovers quickly;
+// the host normally acks well under a second.
+const PROMPT_PENDING_TIMEOUT_MS = 12000;
 
 type OverlayParts = {
   root: HTMLDivElement;
@@ -49,6 +102,12 @@ type OverlayParts = {
   promptTextarea: HTMLTextAreaElement;
   promptActions: HTMLDivElement;
   promptButton: HTMLButtonElement;
+  promptSpinner: HTMLSpanElement;
+  promptButtonLabel: HTMLSpanElement;
+  promptTargetRow: HTMLDivElement;
+  promptTargetControl: HTMLButtonElement;
+  promptTargetControlLabel: HTMLSpanElement;
+  promptTargetList: HTMLDivElement;
 };
 
 type PointerPosition = {
@@ -72,8 +131,20 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   let boxStart: PointerPosition | null = null;
   let freeformPoints: PointerPosition[] = [];
   let suppressNextClick = false;
+  let promptPending = false;
+  let promptPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  let promptTargets: InspectorPromptTarget[] = [];
+  let selectedTargetId: string | null = null;
+  let theme = resolveTheme(options.theme);
 
   const overlay = createOverlay(doc);
+  applyOverlayTheme(overlay, theme);
+
+  const setTheme = (input: InspectorThemeInput | null | undefined): void => {
+    theme = resolveTheme(input);
+    applyOverlayTheme(overlay, theme);
+    syncPromptTargetsUi(selectedTargetId);
+  };
 
   const emit = <TType extends InspectorEventType>(
     type: TType,
@@ -153,10 +224,138 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     overlay.promptTextarea.select();
   };
 
+  // Anchors the prompt panel directly below the selection (above it when the
+  // selection hugs the bottom edge), clamped inside the viewport so the
+  // bubble never renders offscreen.
+  const positionPromptPanel = (rect: ElementBoxRect): void => {
+    const panel = overlay.promptPanel;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    const panelWidth = panel.offsetWidth || 420;
+    const panelHeight = panel.offsetHeight || 220;
+    const maxLeft = Math.max(win.innerWidth - panelWidth - PROMPT_VIEWPORT_INSET, PROMPT_VIEWPORT_INSET);
+    const left = Math.min(Math.max(rect.x, PROMPT_VIEWPORT_INSET), maxLeft);
+    let top = rect.y + rect.height + PROMPT_ANCHOR_GAP;
+    if (top + panelHeight > win.innerHeight - PROMPT_VIEWPORT_INSET) {
+      top = rect.y - panelHeight - PROMPT_ANCHOR_GAP;
+    }
+    top = Math.min(
+      Math.max(top, PROMPT_VIEWPORT_INSET),
+      Math.max(win.innerHeight - panelHeight - PROMPT_VIEWPORT_INSET, PROMPT_VIEWPORT_INSET),
+    );
+    panel.style.left = `${Math.round(left)}px`;
+    panel.style.top = `${Math.round(top)}px`;
+  };
+
+  const setPromptMetaText = (text: string, isError: boolean): void => {
+    overlay.promptMeta.textContent = text;
+    overlay.promptMeta.style.color = isError ? theme.error : theme.textMuted;
+  };
+
+  const setPromptPendingUi = (pending: boolean): void => {
+    overlay.promptTextarea.disabled = pending;
+    overlay.promptButton.disabled = pending;
+    overlay.promptTargetControl.disabled = pending;
+    overlay.promptButton.style.cursor = pending ? "default" : "pointer";
+    overlay.promptPanel.style.opacity = pending ? "0.72" : "1";
+    overlay.promptSpinner.style.display = pending ? "inline-block" : "none";
+    overlay.promptButtonLabel.textContent = pending ? "Sending..." : "Send";
+    if (pending) closeTargetList();
+  };
+
+  const closeTargetList = (): void => {
+    overlay.promptTargetList.hidden = true;
+  };
+
+  const selectedPromptTarget = (): string | null => {
+    if (promptTargets.length === 0) return null;
+    if (selectedTargetId && promptTargets.some((target) => target.id === selectedTargetId)) {
+      return selectedTargetId;
+    }
+    return promptTargets[0]!.id;
+  };
+
+  const selectPromptTarget = (id: string): void => {
+    selectedTargetId = id;
+    const selected = promptTargets.find((target) => target.id === id);
+    overlay.promptTargetControlLabel.textContent = selected ? selected.label : "";
+    closeTargetList();
+  };
+
+  // Rebuilds the custom "Send to" dropdown. The row only shows when the
+  // choice is ambiguous (2+ chat destinations); one destination stays
+  // implicit. Rows are plain divs because native <select> popups cannot open
+  // in offscreen webview embeddings.
+  const syncPromptTargetsUi = (selectedId?: string | null): void => {
+    const previous = selectedId ?? selectedTargetId;
+    selectedTargetId =
+      previous && promptTargets.some((target) => target.id === previous)
+        ? previous
+        : (promptTargets[0]?.id ?? null);
+
+    const list = overlay.promptTargetList;
+    list.textContent = "";
+    for (const target of promptTargets) {
+      const row = doc.createElement("div");
+      row.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+      const isSelected = target.id === selectedTargetId;
+      row.textContent = target.label;
+      row.style.cssText = [
+        "padding:6px 8px",
+        "border-radius:6px",
+        "font-size:12px",
+        "cursor:pointer",
+        "overflow:hidden",
+        "text-overflow:ellipsis",
+        "white-space:nowrap",
+        `color:${theme.text}`,
+        `background:${isSelected ? rgbaOf(theme.accent, 0.28) : "transparent"}`,
+      ].join(";");
+      row.addEventListener("mouseenter", () => {
+        row.style.background = rgbaOf(theme.accent, 0.18);
+      });
+      row.addEventListener("mouseleave", () => {
+        row.style.background = target.id === selectedTargetId ? rgbaOf(theme.accent, 0.28) : "transparent";
+      });
+      row.addEventListener("mousedown", (event) => event.stopPropagation());
+      row.addEventListener("click", (event) => {
+        event.stopPropagation();
+        selectPromptTarget(target.id);
+      });
+      list.appendChild(row);
+    }
+
+    const selected = promptTargets.find((target) => target.id === selectedTargetId);
+    overlay.promptTargetControlLabel.textContent = selected ? selected.label : "";
+    closeTargetList();
+    overlay.promptTargetRow.style.display = promptTargets.length > 1 ? "flex" : "none";
+  };
+
+  const setPromptTargets = (
+    targets: InspectorPromptTarget[],
+    selectedId?: string | null,
+  ): void => {
+    promptTargets = Array.isArray(targets)
+      ? targets.filter((target) => target && typeof target.id === "string")
+      : [];
+    syncPromptTargetsUi(selectedId);
+  };
+
+  const clearPromptPendingTimer = (): void => {
+    if (promptPendingTimer != null) {
+      clearTimeout(promptPendingTimer);
+      promptPendingTimer = null;
+    }
+  };
+
   const syncPrompt = (nextSelection: InspectorSelection | null): void => {
     if (!nextSelection) {
       overlay.promptPanel.hidden = true;
       overlay.promptTextarea.value = "";
+      promptPending = false;
+      clearPromptPendingTimer();
+      setPromptPendingUi(false);
+      closeTargetList();
       return;
     }
 
@@ -164,8 +363,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     if (nextSelection.mode === "point") {
       const snapshot = nextSelection.element;
       overlay.promptTitle.textContent = `Selected: ${snapshot.selector}`;
-      overlay.promptMeta.textContent =
-        `${snapshot.rect.width} x ${snapshot.rect.height} at (${snapshot.rect.x}, ${snapshot.rect.y})`;
+      setPromptMetaText(
+        `${snapshot.rect.width} x ${snapshot.rect.height} at (${snapshot.rect.x}, ${snapshot.rect.y})`,
+        false,
+      );
+      positionPromptPanel(snapshot.rect);
       return;
     }
 
@@ -173,8 +375,11 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       nextSelection.mode === "draw-box" ? "Selected box region" : "Selected freeform region";
     overlay.promptTitle.textContent =
       `${selectionLabel}: ${nextSelection.elements.length} element${nextSelection.elements.length === 1 ? "" : "s"}`;
-    overlay.promptMeta.textContent =
-      `${nextSelection.rect.width} x ${nextSelection.rect.height} at (${nextSelection.rect.x}, ${nextSelection.rect.y})`;
+    setPromptMetaText(
+      `${nextSelection.rect.width} x ${nextSelection.rect.height} at (${nextSelection.rect.x}, ${nextSelection.rect.y})`,
+      false,
+    );
+    positionPromptPanel(nextSelection.rect);
   };
 
   const renderPointSnapshot = (
@@ -223,7 +428,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     showFreeformPath();
     syncFreeformViewport(overlay.freeformSvg, win);
     overlay.freeformPath.setAttribute("d", buildFreeformPath(points, closed));
-    overlay.freeformPath.setAttribute("fill", closed ? OVERLAY_FREEFORM_FILL : "none");
+    overlay.freeformPath.setAttribute("fill", closed ? rgbaOf(theme.accent, 0.1) : "none");
     showTooltip(label, expandRect(boundsFromPoints(points), FREEFORM_BRUSH_RADIUS));
   };
 
@@ -382,7 +587,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handlePointerMove = (event: MouseEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
 
     if (boxStart) {
       const rect = rectFromPoints(boxStart, {
@@ -446,7 +651,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleMouseDown = (event: MouseEvent): void => {
-    if (!enabled || destroyed || mode === "point") return;
+    if (!enabled || destroyed || promptPending || mode === "point") return;
     if (event.button !== 0 || isInsideIgnoredSurface(event.target)) return;
 
     event.preventDefault();
@@ -510,7 +715,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleClick = (event: MouseEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
     if (isInsideIgnoredSurface(event.target)) return;
 
     if (suppressNextClick) {
@@ -541,7 +746,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   };
 
   const handleKeyDown = (event: KeyboardEvent): void => {
-    if (!enabled || destroyed) return;
+    if (!enabled || destroyed || promptPending) return;
 
     if (event.key === "Escape") {
       event.preventDefault();
@@ -560,6 +765,61 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     }
   };
 
+  // Submits the current prompt: hides the overlay for two frames so the host
+  // can capture a clean screenshot crop of the selection, emits the event,
+  // then parks the bubble in a pending state until the host acknowledges via
+  // notifyPromptResult (or the timeout fires).
+  const submitPrompt = (): void => {
+    if (!selection || promptPending) return;
+    const prompt = overlay.promptTextarea.value.trim();
+    if (prompt.length === 0) {
+      focusPrompt();
+      return;
+    }
+
+    const submittedSelection = selection;
+    promptPending = true;
+    setPromptPendingUi(true);
+    overlay.root.style.visibility = "hidden";
+    win.requestAnimationFrame(() => {
+      win.requestAnimationFrame(() => {
+        emit("prompt:submitted", {
+          selection: submittedSelection,
+          prompt,
+          viewport: {
+            width: win.innerWidth,
+            height: win.innerHeight,
+            devicePixelRatio: win.devicePixelRatio || 1,
+            scrollX: win.scrollX,
+            scrollY: win.scrollY,
+          },
+          target: selectedPromptTarget(),
+        });
+        overlay.root.style.visibility = "visible";
+      });
+    });
+
+    clearPromptPendingTimer();
+    promptPendingTimer = setTimeout(() => {
+      notifyPromptResult("failed", "No response from Verde. Try again.");
+    }, PROMPT_PENDING_TIMEOUT_MS);
+  };
+
+  const notifyPromptResult = (result: InspectorPromptResult, message?: string | null): void => {
+    if (destroyed || !promptPending) return;
+    promptPending = false;
+    clearPromptPendingTimer();
+    setPromptPendingUi(false);
+
+    if (result === "failed") {
+      setPromptMetaText(message ?? "Verde could not send this prompt.", true);
+      focusPrompt();
+      return;
+    }
+
+    clearSelection();
+  };
+
   overlay.promptTextarea.addEventListener("input", () => {
     if (!selection) return;
     emit("prompt:changed", {
@@ -572,14 +832,33 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       event.stopPropagation();
     });
   }
+  for (const eventName of ["mousedown", "mouseup"] as const) {
+    overlay.promptTargetControl.addEventListener(eventName, (event) => {
+      event.stopPropagation();
+    });
+  }
+  overlay.promptTargetControl.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (promptPending) return;
+    overlay.promptTargetList.hidden = !overlay.promptTargetList.hidden;
+  });
+  // Clicking anywhere else in the panel dismisses the open dropdown.
+  overlay.promptPanel.addEventListener("mousedown", () => {
+    closeTargetList();
+  });
+  // Enter submits (Shift+Enter keeps inserting a newline). Escape is handled
+  // by the document-level capture listener so it is intentionally not wired
+  // here.
+  overlay.promptTextarea.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      submitPrompt();
+    }
+  });
 
   overlay.promptButton.addEventListener("click", () => {
-    if (!selection) return;
-    emit("prompt:submitted", {
-      selection,
-      prompt: overlay.promptTextarea.value.trim(),
-    });
-    clearSelection();
+    submitPrompt();
   });
 
   const enable = (): void => {
@@ -647,6 +926,9 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       if (selection == null || selection.mode !== "point") return null;
       return selection.element;
     },
+    notifyPromptResult,
+    setPromptTargets,
+    setTheme,
   };
 }
 
@@ -664,10 +946,10 @@ function createOverlay(doc: Document): OverlayParts {
     "user-select:none",
   ].join(";");
 
-  const margin = createBox(doc, "margin", OVERLAY_MARGIN_FILL);
-  const border = createBox(doc, "border", OVERLAY_BORDER_FILL);
-  const padding = createBox(doc, "padding", OVERLAY_PADDING_FILL);
-  const content = createBox(doc, "content", OVERLAY_CONTENT_FILL);
+  const margin = createBox(doc, "margin");
+  const border = createBox(doc, "border");
+  const padding = createBox(doc, "padding");
+  const content = createBox(doc, "content");
 
   const region = doc.createElement("div");
   region.setAttribute(OVERLAY_IGNORE_ATTR, "true");
@@ -679,8 +961,6 @@ function createOverlay(doc: Document): OverlayParts {
     "display:none",
     "box-sizing:border-box",
     "pointer-events:none",
-    `background:${OVERLAY_REGION_FILL}`,
-    `border:2px solid ${OVERLAY_REGION_STROKE}`,
     "border-radius:18px",
     "box-shadow:0 0 0 1px rgba(240, 253, 244, 0.3) inset",
   ].join(";");
@@ -697,7 +977,6 @@ function createOverlay(doc: Document): OverlayParts {
 
   const freeformPath = doc.createElementNS(SVG_NS, "path");
   freeformPath.setAttribute("fill", "none");
-  freeformPath.setAttribute("stroke", OVERLAY_REGION_STROKE);
   freeformPath.setAttribute("stroke-width", String(FREEFORM_BRUSH_RADIUS * 2));
   freeformPath.setAttribute("stroke-linecap", "round");
   freeformPath.setAttribute("stroke-linejoin", "round");
@@ -713,8 +992,6 @@ function createOverlay(doc: Document): OverlayParts {
     "transform:translate(8px, 8px)",
     "padding:6px 10px",
     "border-radius:999px",
-    "background:rgba(15, 23, 42, 0.92)",
-    "color:#eff6ff",
     "font-size:12px",
     "line-height:1",
     "white-space:nowrap",
@@ -722,19 +999,23 @@ function createOverlay(doc: Document): OverlayParts {
     "opacity:0",
   ].join(";");
 
+  // Spin keyframes for the submit spinner; scoped to an inspector-prefixed
+  // name so it cannot collide with page styles.
+  const spinnerStyle = doc.createElement("style");
+  spinnerStyle.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  spinnerStyle.textContent =
+    "@keyframes verde-inspector-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
+
   const promptPanel = doc.createElement("div");
   promptPanel.hidden = true;
   promptPanel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptPanel.style.cssText = [
     "position:fixed",
-    "right:20px",
-    "bottom:20px",
+    "left:20px",
+    "top:20px",
     "width:min(420px, calc(100vw - 40px))",
     "padding:12px",
-    "border:1px solid rgba(80, 200, 120, 0.22)",
     "border-radius:10px",
-    "background:rgba(25, 31, 36, 0.96)",
-    "color:#f0f0f5",
     "box-shadow:0 18px 48px rgba(0, 0, 0, 0.38)",
     "pointer-events:auto",
     "user-select:none",
@@ -742,15 +1023,90 @@ function createOverlay(doc: Document): OverlayParts {
 
   const promptTitle = doc.createElement("div");
   promptTitle.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTitle.style.cssText = "font-size:12px;font-weight:700;color:#f0f0f5;margin-bottom:6px;";
+  promptTitle.style.cssText = "font-size:12px;font-weight:700;margin-bottom:6px;";
 
   const promptMeta = doc.createElement("div");
   promptMeta.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptMeta.style.cssText = "font-size:11px;color:#b9bbc3;margin-bottom:10px;";
+  promptMeta.style.cssText = "font-size:11px;margin-bottom:10px;";
+
+  // "Send to" destination row; hidden unless the host reports 2+ chat panes.
+  const promptTargetRow = doc.createElement("div");
+  promptTargetRow.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetRow.style.cssText = [
+    "display:none",
+    "align-items:center",
+    "gap:8px",
+    "margin-bottom:10px",
+  ].join(";");
+
+  const promptTargetLabel = doc.createElement("span");
+  promptTargetLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetLabel.textContent = "Send to";
+  promptTargetLabel.setAttribute("data-verde-role", "muted-label");
+  promptTargetLabel.style.cssText = "font-size:11px;flex:0 0 auto;";
+
+  // Custom dropdown instead of a native <select>: offscreen webview
+  // embeddings (WPE) have no host surface for native option popups, so a
+  // <select> silently fails to open there.
+  const promptTargetControl = doc.createElement("button");
+  promptTargetControl.type = "button";
+  promptTargetControl.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetControl.style.cssText = [
+    "pointer-events:auto",
+    "flex:1 1 auto",
+    "min-width:0",
+    "display:inline-flex",
+    "align-items:center",
+    "justify-content:space-between",
+    "gap:8px",
+    "padding:6px 8px",
+    "border-radius:6px",
+    "font:inherit",
+    "font-size:12px",
+    "text-align:left",
+    "cursor:pointer",
+    "outline:none",
+  ].join(";");
+
+  const promptTargetControlLabel = doc.createElement("span");
+  promptTargetControlLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetControlLabel.style.cssText = [
+    "flex:1 1 auto",
+    "min-width:0",
+    "overflow:hidden",
+    "text-overflow:ellipsis",
+    "white-space:nowrap",
+  ].join(";");
+
+  const promptTargetCaret = doc.createElement("span");
+  promptTargetCaret.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetCaret.textContent = "▾";
+  promptTargetCaret.style.cssText = "flex:0 0 auto;opacity:0.8;";
+  promptTargetControl.append(promptTargetControlLabel, promptTargetCaret);
+
+  const promptTargetList = doc.createElement("div");
+  promptTargetList.hidden = true;
+  promptTargetList.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetList.style.cssText = [
+    "position:absolute",
+    "left:0",
+    "right:0",
+    "top:calc(100% + 4px)",
+    "max-height:180px",
+    "overflow-y:auto",
+    "border-radius:8px",
+    "padding:4px",
+    "box-shadow:0 12px 32px rgba(0, 0, 0, 0.4)",
+    "pointer-events:auto",
+    "z-index:1",
+  ].join(";");
+
+  promptTargetRow.style.position = "relative";
+  promptTargetRow.append(promptTargetLabel, promptTargetControl, promptTargetList);
 
   const promptTextarea = doc.createElement("textarea");
   promptTextarea.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTextarea.placeholder = "Describe what you want to do with this selection...";
+  promptTextarea.placeholder = "What should the agent do with this?";
   promptTextarea.style.cssText = [
     "display:block",
     "width:100%",
@@ -758,15 +1114,11 @@ function createOverlay(doc: Document): OverlayParts {
     "resize:vertical",
     "padding:12px",
     "border-radius:8px",
-    "border:1px solid rgba(80, 200, 120, 0.2)",
-    "background:rgba(29, 38, 43, 0.95)",
-    "color:#f0f0f5",
     "font:inherit",
     "font-size:13px",
     "line-height:1.45",
     "box-sizing:border-box",
     "outline:none",
-    "caret-color:#50c878",
     "user-select:text",
     "-webkit-user-select:text",
   ].join(";");
@@ -777,23 +1129,41 @@ function createOverlay(doc: Document): OverlayParts {
 
   const promptButton = doc.createElement("button");
   promptButton.type = "button";
-  promptButton.textContent = "Send prompt";
   promptButton.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptButton.style.cssText = [
     "pointer-events:auto",
+    "display:inline-flex",
+    "align-items:center",
+    "gap:8px",
     "padding:9px 14px",
     "border:0",
     "border-radius:8px",
-    "background:#375846",
-    "color:white",
     "font:inherit",
     "font-weight:700",
     "cursor:pointer",
   ].join(";");
 
+  const promptSpinner = doc.createElement("span");
+  promptSpinner.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptSpinner.style.cssText = [
+    "display:none",
+    "width:12px",
+    "height:12px",
+    "box-sizing:border-box",
+    "border:2px solid rgba(240, 253, 244, 0.35)",
+    "border-top-color:#f0fdf4",
+    "border-radius:50%",
+    "animation:verde-inspector-spin 0.8s linear infinite",
+  ].join(";");
+
+  const promptButtonLabel = doc.createElement("span");
+  promptButtonLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptButtonLabel.textContent = "Send";
+
+  promptButton.append(promptSpinner, promptButtonLabel);
   promptActions.appendChild(promptButton);
-  promptPanel.append(promptTitle, promptMeta, promptTextarea, promptActions);
-  root.append(margin, border, padding, content, region, freeformSvg, tooltip, promptPanel);
+  promptPanel.append(promptTitle, promptMeta, promptTargetRow, promptTextarea, promptActions);
+  root.append(spinnerStyle, margin, border, padding, content, region, freeformSvg, tooltip, promptPanel);
 
   return {
     root,
@@ -811,10 +1181,16 @@ function createOverlay(doc: Document): OverlayParts {
     promptTextarea,
     promptActions,
     promptButton,
+    promptSpinner,
+    promptButtonLabel,
+    promptTargetRow,
+    promptTargetControl,
+    promptTargetControlLabel,
+    promptTargetList,
   };
 }
 
-function createBox(doc: Document, name: string, background: string): HTMLDivElement {
+function createBox(doc: Document, name: string): HTMLDivElement {
   const box = doc.createElement("div");
   box.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   box.setAttribute(BOX_ATTR, name);
@@ -825,12 +1201,56 @@ function createBox(doc: Document, name: string, background: string): HTMLDivElem
     "display:none",
     "box-sizing:border-box",
     "pointer-events:none",
-    "background:" + background,
-    name === "content"
-      ? `border:1px solid ${VERDE_BORDER_GLOW}`
-      : `border:1px solid ${OVERLAY_STROKE}`,
   ].join(";");
   return box;
+}
+
+// Restyles every themable overlay surface from the resolved theme. Kept as
+// one function so a host setTheme() call re-skins the overlay in place.
+function applyOverlayTheme(overlay: OverlayParts, theme: ResolvedTheme): void {
+  const accent = theme.accent;
+
+  // Box-model layers use graded accent alphas (DevTools-style).
+  overlay.margin.style.background = rgbaOf(accent, 0.12);
+  overlay.margin.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.border.style.background = rgbaOf(accent, 0.19);
+  overlay.border.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.padding.style.background = rgbaOf(accent, 0.29);
+  overlay.padding.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.content.style.background = rgbaOf(accent, 0.05);
+  // The content outline stays a light glow so it reads on any accent hue.
+  overlay.content.style.border = "1px solid rgba(250, 250, 250, 0.95)";
+
+  overlay.region.style.background = rgbaOf(accent, 0.12);
+  overlay.region.style.border = `2px solid ${rgbaOf(accent, 0.78)}`;
+  overlay.freeformPath.setAttribute("stroke", rgbaOf(accent, 0.78));
+
+  overlay.tooltip.style.background = rgbaOf(theme.panelBackground, 0.92);
+  overlay.tooltip.style.color = theme.text;
+
+  overlay.promptPanel.style.background = rgbaOf(theme.panelBackground, 0.96);
+  overlay.promptPanel.style.border = `1px solid ${rgbaOf(accent, 0.22)}`;
+  overlay.promptPanel.style.color = theme.text;
+  overlay.promptTitle.style.color = theme.text;
+  overlay.promptMeta.style.color = theme.textMuted;
+
+  const inputBackground = rgbaOf(theme.inputBackground, 0.95);
+  const inputBorder = `1px solid ${rgbaOf(accent, 0.2)}`;
+  overlay.promptTextarea.style.background = inputBackground;
+  overlay.promptTextarea.style.border = inputBorder;
+  overlay.promptTextarea.style.color = theme.text;
+  overlay.promptTextarea.style.caretColor = rgbaOf(accent, 1.0);
+  overlay.promptTargetControl.style.background = inputBackground;
+  overlay.promptTargetControl.style.border = inputBorder;
+  overlay.promptTargetControl.style.color = theme.text;
+  // Opaque surface: the dropdown floats over page content.
+  overlay.promptTargetList.style.background = rgbaOf(theme.panelBackground, 1.0);
+  overlay.promptTargetList.style.border = `1px solid ${rgbaOf(accent, 0.25)}`;
+  const targetLabel = overlay.promptTargetRow.querySelector("span");
+  if (targetLabel instanceof HTMLElement) targetLabel.style.color = theme.textMuted;
+
+  overlay.promptButton.style.background = rgbaOf(accent, 1.0);
+  overlay.promptButton.style.color = accentForeground(accent);
 }
 
 function positionBox(node: HTMLDivElement, rect: ElementBoxRect): void {
