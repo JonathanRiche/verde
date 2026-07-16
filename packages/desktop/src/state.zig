@@ -29,6 +29,8 @@ const sessionizer = @import("terminal/sessionizer.zig");
 const terminal = @import("terminal/terminal.zig");
 const theme = @import("ui/theme.zig");
 const text_measure = @import("ui/text_measure.zig");
+const updater = @import("updater.zig");
+const update_installer = @import("update_installer.zig");
 const utils = @import("utils.zig");
 
 /// Arrow-key line step for transcript scroll (scaled px per key repeat).
@@ -179,6 +181,7 @@ pub const SettingsDraft = struct {
     theme_source: theme.ThemeSource = .omarchy,
     open_action: SettingsOpenAction = .folder,
     link_open_target: app_config.LinkOpenTarget = .verde_browser,
+    check_for_updates_automatically: bool = true,
     notifications_enabled: bool = true,
 };
 
@@ -4495,6 +4498,9 @@ pub const AppState = struct {
     picker_state: PickerState,
     slash_command_state: SlashCommandState,
     opencode_model_cache_state: OpencodeModelCacheState,
+    update_state: updater.State,
+    update_installer_started: bool,
+    update_exit_requested: bool,
     claude_model_cache_state: ClaudeModelCacheState,
     cursor_model_cache_state: CursorModelCacheState,
     provider_readiness_state: ProviderReadinessState,
@@ -4752,6 +4758,9 @@ pub const AppState = struct {
             .picker_state = .{},
             .slash_command_state = .{},
             .opencode_model_cache_state = .{},
+            .update_state = .{},
+            .update_installer_started = false,
+            .update_exit_requested = false,
             .claude_model_cache_state = .{},
             .cursor_model_cache_state = .{},
             .provider_readiness_state = .{},
@@ -8602,6 +8611,7 @@ pub const AppState = struct {
     pub fn isSettingsDraftDirty(self: *const AppState) bool {
         const draft = self.settings_draft;
         if (draft.font_size != self.app_config.font_size) return true;
+            .check_for_updates_automatically = self.app_config.check_for_updates_automatically,
         if (draft.terminal_font_size != self.app_config.terminal_font_size) return true;
         if (draft.theme_source != self.app_config.theme_config.source) return true;
         if (draft.link_open_target != self.app_config.link_open_target) return true;
@@ -8612,6 +8622,7 @@ pub const AppState = struct {
     pub fn openSettingsModal(self: *AppState) void {
         self.closeSidebarContextMenu();
         self.workspace_header_open_menu_open = false;
+        if (draft.check_for_updates_automatically != self.app_config.check_for_updates_automatically) return true;
         self.workspace_header_open_menu_pane_id = null;
         self.browser_inspector_menu_open = false;
         self.syncSettingsDraftFromConfig();
@@ -8629,6 +8640,9 @@ pub const AppState = struct {
     }
 
     /// Installs or removes the global Claude notify hooks and refreshes the
+        if (self.app_config.check_for_updates_automatically and self.update_state.status == .idle) {
+            self.update_state.start();
+        }
     /// settings toggle state. Acts immediately (filesystem side effect).
     pub fn toggleClaudeGlobalHooks(self: *AppState) void {
         if (self.settings_hook_claude_installed) {
@@ -8731,6 +8745,9 @@ pub const AppState = struct {
         self.app_config_file_mtime = app_config.configFileMtime(self.allocator) catch self.app_config_file_mtime;
         self.applyTerminalFontSizesFromConfig();
         self.app_config_runtime_sync_pending = true;
+        const previous_auto_update_check = self.app_config.check_for_updates_automatically;
+        errdefer self.app_config.check_for_updates_automatically = previous_auto_update_check;
+        self.app_config.check_for_updates_automatically = self.settings_draft.check_for_updates_automatically;
         self.show_settings_modal = false;
         self.settings_hover_control = null;
         self.settings_close_hovered = false;
@@ -8763,6 +8780,48 @@ pub const AppState = struct {
             .folder => .folder,
             .editor => .editor,
             .cursor => .cursor,
+    pub fn startUpdateCheck(self: *AppState) void {
+        self.update_state.start();
+        self.markDirty();
+    }
+
+    pub fn startAutomaticUpdateCheck(self: *AppState) void {
+        if (self.app_config.check_for_updates_automatically) self.startUpdateCheck();
+    }
+
+    pub fn pollUpdateCheck(self: *AppState) void {
+        const previous = self.update_state.status;
+        self.update_state.poll();
+        if (self.update_state.status != previous) self.markDirty();
+    }
+
+    pub fn installAvailableUpdate(self: *AppState) void {
+        if (self.update_installer_started) return;
+        const launch = update_installer.launch(self.allocator) catch |err| {
+            log.warn("failed to launch update installer: {s}", .{@errorName(err)});
+            const url = self.update_state.downloadUrl() orelse updater.State.releasesUrl();
+            utils.openUrlInDefaultBrowser(self.allocator, url) catch {
+                self.setSidebarNotice("Could not start the installer or open the release download.");
+                return;
+            };
+            self.setSidebarNotice("Could not start the installer; opened the release download instead.");
+            return;
+        };
+        self.update_installer_started = true;
+        self.update_exit_requested = launch == .started_and_exit_required;
+        self.setSidebarNotice(if (self.update_exit_requested)
+            "Restarting to install the Verde update…"
+        else
+            "Verde update installer started. Restart Verde when it completes.");
+        self.markDirty();
+    }
+
+    pub fn consumeUpdateExitRequest(self: *AppState) bool {
+        if (!self.update_exit_requested) return false;
+        self.update_exit_requested = false;
+        return true;
+    }
+
             .vscode => .vscode,
             .zed => .zed,
             .custom => unreachable,
@@ -16228,6 +16287,8 @@ pub const AppState = struct {
             }
             for (project.archived_threads.items) |*thread| {
                 self.prepareThreadSendForShutdown(project.path, thread);
+        self.update_state.deinit();
+        runtime_log.diagnostic("AppState.deinit updater finished", .{});
             }
         }
         for (self.archived_projects.items) |*project| {

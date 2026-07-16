@@ -266,7 +266,7 @@ fn writeBash(w: *std.Io.Writer) !void {
         \\      "")
         \\        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
         \\        ;;
-        \\      version|capabilities)
+        \\      version|update|capabilities)
         \\        COMPREPLY=( $(compgen -W "$json_flags" -- "$cur") )
         \\        ;;
         \\      state)
@@ -548,7 +548,7 @@ fn writeZsh(w: *std.Io.Writer) !void {
         \\      "")
         \\        compadd -- --help -h
         \\        ;;
-        \\      version|capabilities)
+        \\      version|update|capabilities)
         \\        compadd -- ${(s: :)json_flags}
         \\        ;;
         \\      state)

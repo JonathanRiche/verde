@@ -179,6 +179,7 @@ verde                         # Launch the desktop app
 verde app                     # Launch the desktop app explicitly
 verde --help                  # Show CLI help
 verde version [--json]        # Print version metadata
+verde update [--json]         # Install the latest Verde release
 verde capabilities [--json]   # Print supported CLI/live features
 verde open <url> [--json]     # Open a URL in this Verde workspace's browser pane
 verde completion <shell>      # Print shell completion script
