@@ -384,6 +384,17 @@ pub const Controller = struct {
         };
     }
 
+    /// Returns a caller-owned copy of the most recent CPU-side browser frame,
+    /// or null when the active backend keeps no CPU frame (or none exists yet).
+    pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        const backend = if (self.backend) |*backend| backend else return null;
+        return switch (backend.*) {
+            .native_webview => |*active| active.copyFramePixels(allocator),
+            .cef => |*active| active.copyFramePixels(allocator),
+            .stub => null,
+        };
+    }
+
     /// Drains one pending backend event, if available.
     pub fn pollEvent(self: *Controller) ?browser_types.Event {
         const backend = if (self.backend) |*backend| backend else return null;

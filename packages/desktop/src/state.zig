@@ -8,6 +8,7 @@ const app_config = @import("config.zig");
 const ai_harness = @import("harness.zig");
 const browser_inspector = @import("browser/inspector.zig");
 const browser_runtime = @import("browser/mod.zig");
+const browser_screenshot = @import("browser/screenshot.zig");
 const chat_threads = @import("chat/threads.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
@@ -1192,7 +1193,21 @@ const InspectorPromptSubmittedEvent = struct {
     payload: struct {
         prompt: []const u8,
         selection: InspectorSelectionPayload,
+        viewport: ?InspectorViewportPayload = null,
+        /// Workspace pane id (stringified) the user picked in the bubble's
+        /// "Send to" selector; null when the host never pushed targets.
+        target: ?[]const u8 = null,
     },
+};
+
+/// Viewport metrics the inspector bundle reports at submit time; used to map
+/// CSS selection coordinates onto browser frame pixels for screenshot crops.
+const InspectorViewportPayload = struct {
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+    devicePixelRatio: f32 = 1.0,
+    scrollX: f32 = 0.0,
+    scrollY: f32 = 0.0,
 };
 
 const BrowserClipboardEvent = struct {
@@ -1214,6 +1229,7 @@ const InspectorElementPayload = struct {
     textSnippet: ?[]const u8 = null,
     ariaLabel: ?[]const u8 = null,
     href: ?[]const u8 = null,
+    rect: ?InspectorRectPayload = null,
 };
 
 const InspectorRectPayload = struct {
@@ -3825,6 +3841,9 @@ pub const Project = struct {
     threads: std.ArrayList(ChatThread),
     archived_threads: std.ArrayList(ChatThread),
     selected_thread_index: usize = 0,
+    /// Last chat or terminal workspace pane the user focused; used to default
+    /// the inspector design-mode "Send to" target (not persisted).
+    last_content_pane_id: ?WorkspacePaneId = null,
     sidebar_thread_indices: std.ArrayList(usize) = .empty,
     sidebar_committed_thread_count: usize = 0,
     sidebar_thread_cache_dirty: bool = true,
@@ -10065,7 +10084,19 @@ pub const AppState = struct {
     }
 
     fn writeClipboardImageToStorage(self: *AppState, mime: []const u8, bytes: []const u8) ![]u8 {
-        const images_dir = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, "clipboard-images" });
+        return self.writeImageBytesToStorage("clipboard-images", "clipboard", extensionForImageMime(mime), bytes);
+    }
+
+    // Persists encoded image bytes under `{pref_path}/{dir_name}` with a
+    // timestamped, collision-retrying file name and returns the owned path.
+    fn writeImageBytesToStorage(
+        self: *AppState,
+        dir_name: []const u8,
+        prefix: []const u8,
+        ext: []const u8,
+        bytes: []const u8,
+    ) ![]u8 {
+        const images_dir = try std.fs.path.join(self.allocator, &.{ self.storage.pref_path, dir_name });
         defer self.allocator.free(images_dir);
         var threaded = std.Io.Threaded.init_single_threaded;
         std.Io.Dir.createDirAbsolute(threaded.io(), images_dir, .default_dir) catch |err| switch (err) {
@@ -10073,14 +10104,13 @@ pub const AppState = struct {
             else => return err,
         };
 
-        const ext = extensionForImageMime(mime);
-        const timestamp_ms = @as(u64, @intCast(@max(@as(i64, 0), 0)));
+        const timestamp_ms = @as(u64, @intCast(@max(unixTimestampMs(), 0)));
         var attempt: usize = 0;
         while (attempt < 256) : (attempt += 1) {
             const file_name = if (attempt == 0)
-                try std.fmt.allocPrint(self.allocator, "clipboard-{d}.{s}", .{ timestamp_ms, ext })
+                try std.fmt.allocPrint(self.allocator, "{s}-{d}.{s}", .{ prefix, timestamp_ms, ext })
             else
-                try std.fmt.allocPrint(self.allocator, "clipboard-{d}-{d}.{s}", .{ timestamp_ms, attempt, ext });
+                try std.fmt.allocPrint(self.allocator, "{s}-{d}-{d}.{s}", .{ prefix, timestamp_ms, attempt, ext });
             defer self.allocator.free(file_name);
 
             const image_path = try std.fs.path.join(self.allocator, &.{ images_dir, file_name });
@@ -11981,6 +12011,9 @@ pub const AppState = struct {
                         self.browser_state.setLastJsMessage(message) catch {};
                         if (isInspectorSelectionMessage(message)) {
                             self.setSidebarNotice("Browser inspector captured a selection.");
+                            // The bubble just opened; refresh its "Send to"
+                            // targets so they track the current pane layout.
+                            self.pushInspectorPromptTargets();
                         } else if (isInspectorPromptSubmittedMessage(message)) {
                             self.handleInspectorPromptSubmitted(message);
                         }
@@ -12094,9 +12127,33 @@ pub const AppState = struct {
         self.copyBrowserEvalResultToClipboard(parsed.value.text);
     }
 
+    // Design-mode prompts submit straight to the active chat; the crop padding
+    // keeps a little page context around the selected element in the capture.
+    const INSPECTOR_CROP_PADDING_CSS: f32 = 12.0;
+
+    const InspectorPromptResult = enum {
+        sent,
+        drafted,
+        failed,
+
+        fn jsValue(self: InspectorPromptResult) []const u8 {
+            return switch (self) {
+                .sent => "sent",
+                .drafted => "drafted",
+                .failed => "failed",
+            };
+        }
+    };
+
+    const InspectorCapture = struct {
+        path: []u8,
+        byte_len: usize,
+    };
+
     fn handleInspectorPromptSubmitted(self: *AppState, message: []const u8) void {
         if (self.projects.items.len == 0) {
             self.setSidebarNotice("No active chat is available for the browser inspector prompt.");
+            self.notifyInspectorPromptResult(.failed, "No active chat is available.");
             return;
         }
 
@@ -12106,6 +12163,7 @@ pub const AppState = struct {
         }) catch |err| {
             log.warn("failed to parse inspector prompt submission: {s}", .{@errorName(err)});
             self.setSidebarNotice("Browser inspector prompt could not be parsed.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not parse this prompt.");
             return;
         };
         defer parsed.deinit();
@@ -12113,12 +12171,214 @@ pub const AppState = struct {
         const prompt = std.mem.trim(u8, parsed.value.payload.prompt, &std.ascii.whitespace);
         if (prompt.len == 0) {
             self.setSidebarNotice("Browser inspector prompt was empty.");
+            self.notifyInspectorPromptResult(.failed, "The prompt was empty.");
             return;
         }
 
-        const draft_block = buildInspectorDraftBlock(self.allocator, parsed.value.payload.selection, prompt) catch |err| {
+        const context_block = self.buildInspectorContextBlock(parsed.value.payload.selection) catch |err| {
+            log.warn("failed to build inspector context block: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be prepared.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not prepare this prompt.");
+            return;
+        };
+        defer self.allocator.free(context_block);
+
+        // Best-effort screenshot crop; text-only context still sends when the
+        // backend has no CPU frame (or the selection is offscreen).
+        const capture = self.captureInspectorSelectionImage(
+            parsed.value.payload.selection,
+            parsed.value.payload.viewport,
+        );
+        defer if (capture) |c| self.allocator.free(c.path);
+
+        // Route to the destination the user picked in the bubble's "Send to"
+        // selector: a TUI pane gets the prompt pasted into its input, a chat
+        // pane retargets the thread for the send below.
+        if (parsed.value.payload.target) |target| {
+            if (std.mem.startsWith(u8, target, "tui:")) {
+                runtime_log.diagnostic("inspector prompt path=tui pane_token_len={d} prompt_len={d}", .{ target.len - "tui:".len, prompt.len });
+                self.fillInspectorPromptIntoTui(target["tui:".len..], context_block, prompt, capture);
+                return;
+            }
+            self.applyInspectorPromptTarget(target);
+        }
+
+        const thread = self.currentThreadMutable();
+        const draft_text = std.mem.trim(u8, self.currentDraft(), &std.ascii.whitespace);
+        const send_busy = thread.isSendPending();
+        const composer_dirty = draft_text.len != 0 or thread.draftImageCount() != 0;
+        runtime_log.diagnostic("inspector prompt submitted prompt_len={d} target={} busy={} dirty={} capture={}", .{
+            prompt.len,
+            parsed.value.payload.target != null,
+            send_busy,
+            composer_dirty,
+            capture != null,
+        });
+
+        // Mid-send with a clean composer: queue as a follow-up so the prompt
+        // dispatches right after the current reply, matching what queuing a
+        // message from the composer would do.
+        if (send_busy and !composer_dirty and !threadHasPendingFollowup(thread)) {
+            self.queueInspectorPromptAsFollowup(thread, context_block, prompt, capture);
+            return;
+        }
+        // A dirty composer (or an already-queued follow-up) means auto-sending
+        // would clobber or bundle the user's in-progress input; park the
+        // prompt in the draft instead.
+        if (send_busy or composer_dirty) {
+            self.fallbackInspectorPromptToDraft(thread, context_block, prompt, capture, send_busy);
+            return;
+        }
+
+        const send_body = std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n\n{s}",
+            .{ prompt, context_block },
+        ) catch |err| {
+            log.warn("failed to compose inspector send body: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be prepared.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not prepare this prompt.");
+            return;
+        };
+        defer self.allocator.free(send_body);
+
+        self.setDraft(send_body);
+        if (capture) |c| {
+            thread.addDraftImage(self.allocator, c.path, "image/png", c.byte_len) catch |err| {
+                log.warn("failed to attach inspector capture: {s}", .{@errorName(err)});
+            };
+        }
+        self.sendDraft() catch |err| {
+            log.warn("failed to send inspector prompt: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Browser inspector prompt could not be sent.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not start the send.");
+            return;
+        };
+
+        if (self.currentThread().isSendPending()) {
+            runtime_log.diagnostic("inspector prompt path=auto_send started", .{});
+            self.setSidebarNotice("Browser inspector prompt sent to the current chat.");
+            self.notifyInspectorPromptResult(.sent, null);
+        } else {
+            // sendDraft bailed without starting (e.g. no provider target); the
+            // composed body is still sitting in the composer draft.
+            runtime_log.diagnostic("inspector prompt path=auto_send did_not_start", .{});
+            self.syncPaletteComposerFromDraft();
+            self.requestComposerFocus();
+            self.setSidebarNotice("Browser inspector prompt was added to the composer draft.");
+            self.notifyInspectorPromptResult(.drafted, null);
+        }
+    }
+
+    // Reports whether a follow-up is already queued on the thread's in-flight
+    // send; queuing another would silently clobber it.
+    fn threadHasPendingFollowup(thread: *ChatThread) bool {
+        const send_state = thread.send_state;
+        send_state.mutex.lock();
+        defer send_state.mutex.unlock();
+        return send_state.pending_followup != null;
+    }
+
+    // Queues the design-mode prompt as a follow-up on the in-flight send
+    // (steer for Codex, queue otherwise). Follow-ups are text-only, so the
+    // screenshot rides along as a readable file path instead of an
+    // attachment. Falls back to the draft-park path if queuing fails.
+    fn queueInspectorPromptAsFollowup(
+        self: *AppState,
+        thread: *ChatThread,
+        context_block: []const u8,
+        prompt: []const u8,
+        capture: ?InspectorCapture,
+    ) void {
+        const followup_text = if (capture) |c|
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}Screenshot: {s}", .{ prompt, context_block, c.path })
+        else
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ prompt, context_block });
+        const resolved_text = followup_text catch |err| {
+            log.warn("failed to compose inspector follow-up: {s}", .{@errorName(err)});
+            self.fallbackInspectorPromptToDraft(thread, context_block, prompt, capture, true);
+            return;
+        };
+        defer self.allocator.free(resolved_text);
+
+        self.setDraft(resolved_text);
+        self.queueOrSteerDraftDuringSend();
+        // queueOrSteerDraftDuringSend consumes and clears the draft on
+        // success; a non-empty draft means it could not queue.
+        if (self.currentDraft().len == 0) {
+            runtime_log.diagnostic("inspector prompt path=followup queued", .{});
+            self.notifyInspectorPromptResult(.sent, null);
+            return;
+        }
+        runtime_log.diagnostic("inspector prompt path=followup queue_failed", .{});
+        self.syncPaletteComposerFromDraft();
+        self.requestComposerFocus();
+        self.notifyInspectorPromptResult(.drafted, null);
+    }
+
+    // Pastes the design-mode prompt into a TUI pane's input (Codex/Claude/
+    // opencode/... running in a thread-bound terminal dock). Bracketed paste
+    // fills the input without submitting so the user reviews and hits Enter.
+    // The screenshot rides along as a file path the CLI can read itself.
+    fn fillInspectorPromptIntoTui(
+        self: *AppState,
+        pane_token: []const u8,
+        context_block: []const u8,
+        prompt: []const u8,
+        capture: ?InspectorCapture,
+    ) void {
+        const failed = blk: {
+            const pane_id = std.fmt.parseInt(WorkspacePaneId, pane_token, 10) catch break :blk true;
+            const text = if (capture) |c|
+                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}Screenshot: {s}", .{ prompt, context_block, c.path })
+            else
+                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ prompt, context_block });
+            const resolved_text = text catch break :blk true;
+            defer self.allocator.free(resolved_text);
+
+            const pasted = self.pasteWorkspaceTerminalPaneForProject(
+                self.selected_project_index,
+                pane_id,
+                resolved_text,
+            ) catch |err| {
+                log.warn("failed to paste inspector prompt into TUI pane: {s}", .{@errorName(err)});
+                break :blk true;
+            };
+            if (!pasted) break :blk true;
+
+            // Hand focus to the TUI so the user can review and submit there.
+            _ = self.focusWorkspacePane(self.selected_project_index, pane_id);
+            break :blk false;
+        };
+
+        if (failed) {
+            // The TUI pane vanished or its session died between selection and
+            // submit; keep the prompt by parking it in the composer draft.
+            self.fallbackInspectorPromptToDraft(self.currentThreadMutable(), context_block, prompt, capture, false);
+            return;
+        }
+        self.setSidebarNotice("Browser inspector prompt filled into the TUI input.");
+        self.notifyInspectorPromptResult(.sent, null);
+    }
+
+    // Appends the design-mode prompt to the composer draft when auto-send is
+    // unsafe (send already running, or the user has an in-progress draft).
+    fn fallbackInspectorPromptToDraft(
+        self: *AppState,
+        thread: *ChatThread,
+        context_block: []const u8,
+        prompt: []const u8,
+        capture: ?InspectorCapture,
+        send_busy: bool,
+    ) void {
+        const draft_block = std.fmt.allocPrint(
+            self.allocator,
+            "{s}Requested change:\n{s}",
+            .{ context_block, prompt },
+        ) catch |err| {
             log.warn("failed to build inspector draft block: {s}", .{@errorName(err)});
             self.setSidebarNotice("Browser inspector prompt could not be prepared.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not prepare this prompt.");
             return;
         };
         defer self.allocator.free(draft_block);
@@ -12131,20 +12391,239 @@ pub const AppState = struct {
         const resolved_next_draft = next_draft catch |err| {
             log.warn("failed to append inspector prompt to draft: {s}", .{@errorName(err)});
             self.setSidebarNotice("Browser inspector prompt could not be added to the draft.");
+            self.notifyInspectorPromptResult(.failed, "Verde could not add this prompt to the draft.");
             return;
         };
         defer self.allocator.free(resolved_next_draft);
 
         self.setDraft(resolved_next_draft);
+        if (capture) |c| {
+            thread.addDraftImage(self.allocator, c.path, "image/png", c.byte_len) catch |err| {
+                log.warn("failed to attach inspector capture to draft: {s}", .{@errorName(err)});
+            };
+        }
+        // setDraft alone leaves the composer widget stale; sync so the parked
+        // prompt is actually visible to the user.
+        self.syncPaletteComposerFromDraft();
         self.requestComposerFocus();
-        self.setSidebarNotice("Browser inspector prompt added to the current chat draft.");
+        runtime_log.diagnostic("inspector prompt path=draft busy={}", .{send_busy});
+        self.setSidebarNotice(if (send_busy)
+            "Browser inspector prompt added to the draft; a send is already running."
+        else
+            "Browser inspector prompt added to the current chat draft.");
+        self.notifyInspectorPromptResult(.drafted, null);
     }
 
-    fn buildInspectorDraftBlock(
-        allocator: std.mem.Allocator,
+    /// Crops the latest CPU-side browser frame to the submitted selection and
+    /// stores it as a PNG attachment. Returns null when any step is
+    /// unavailable — the prompt then sends with text-only context.
+    fn captureInspectorSelectionImage(
+        self: *AppState,
         selection: InspectorSelectionPayload,
-        prompt: []const u8,
+        viewport: ?InspectorViewportPayload,
+    ) ?InspectorCapture {
+        const vp = viewport orelse {
+            runtime_log.diagnostic("inspector capture skipped: no viewport payload", .{});
+            return null;
+        };
+        if (vp.width <= 0.0 or vp.height <= 0.0) return null;
+        const css_rect: InspectorRectPayload = selection.rect orelse blk: {
+            const element = selection.element orelse return null;
+            break :blk element.rect orelse {
+                runtime_log.diagnostic("inspector capture skipped: selection has no rect", .{});
+                return null;
+            };
+        };
+
+        const frame = (self.browser_state.controller.copyFramePixels(self.allocator) catch |err| {
+            log.warn("failed to copy browser frame for inspector capture: {s}", .{@errorName(err)});
+            return null;
+        }) orelse {
+            runtime_log.diagnostic("inspector capture skipped: no CPU frame available", .{});
+            return null;
+        };
+        defer frame.deinit(self.allocator);
+
+        const crop = browser_screenshot.cropRectFromCss(
+            css_rect.x,
+            css_rect.y,
+            css_rect.width,
+            css_rect.height,
+            vp.width,
+            vp.height,
+            frame.width,
+            frame.height,
+            INSPECTOR_CROP_PADDING_CSS,
+        ) orelse return null;
+
+        const png = browser_screenshot.encodeFrameCropPng(self.allocator, frame, crop) catch |err| {
+            log.warn("failed to encode inspector capture: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer self.allocator.free(png);
+
+        const path = self.writeImageBytesToStorage("inspector-captures", "inspector", "png", png) catch |err| {
+            log.warn("failed to store inspector capture: {s}", .{@errorName(err)});
+            return null;
+        };
+        return .{ .path = path, .byte_len = png.len };
+    }
+
+    // Switches the project's selected thread to the chat pane the user picked
+    // in the bubble's "Send to" selector. Invalid/closed panes are ignored so
+    // the send falls back to the last-focused thread. Accepts "chat:<pane>"
+    // (current bundles) and bare "<pane>" (transitional).
+    fn applyInspectorPromptTarget(self: *AppState, target: []const u8) void {
+        const pane_token = if (std.mem.startsWith(u8, target, "chat:")) target["chat:".len..] else target;
+        const pane_id = std.fmt.parseInt(WorkspacePaneId, pane_token, 10) catch return;
+        const thread_index = self.workspaceChatThreadIndexByPane(pane_id) orelse return;
+        const project = &self.projects.items[self.selected_project_index];
+        if (project.selected_thread_index == thread_index) return;
+        project.selected_thread_index = thread_index;
+        self.syncPaletteComposerFromDraft();
+    }
+
+    /// Pushes the current project's chat destinations into the inspector
+    /// bubble as "Send to" targets: visible chat panes plus threads open in a
+    /// TUI pane (Codex/Claude/opencode/... running in a thread-bound terminal
+    /// dock). The bubble shows a selector only when more than one exists.
+    /// Called whenever a selection is captured so the list tracks pane layout
+    /// changes.
+    fn pushInspectorPromptTargets(self: *AppState) void {
+        if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) return;
+        if (self.projects.items.len == 0) return;
+        const project = &self.projects.items[self.selected_project_index];
+
+        const TargetJson = struct {
+            id: []const u8,
+            label: []const u8,
+        };
+        var owned_strings = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_strings.items) |item| self.allocator.free(item);
+            owned_strings.deinit(self.allocator);
+        }
+        var targets = std.ArrayList(TargetJson).empty;
+        defer targets.deinit(self.allocator);
+        var target_pane_ids = std.ArrayList(WorkspacePaneId).empty;
+        defer target_pane_ids.deinit(self.allocator);
+        var chat_default: ?[]const u8 = null;
+
+        const current_thread_index = project.currentThreadIndex();
+        for (project.workspace_layout.panes.items) |pane| {
+            if (pane.minimized) continue;
+            const thread_index = switch (pane.ref) {
+                .chat => |ref| ref.thread_index,
+                else => continue,
+            };
+            if (thread_index >= project.threads.items.len) continue;
+            const id = std.fmt.allocPrint(self.allocator, "chat:{d}", .{pane.id}) catch return;
+            owned_strings.append(self.allocator, id) catch {
+                self.allocator.free(id);
+                return;
+            };
+            targets.append(self.allocator, .{
+                .id = id,
+                .label = project.threads.items[thread_index].title,
+            }) catch return;
+            target_pane_ids.append(self.allocator, pane.id) catch return;
+            if (chat_default == null and thread_index == current_thread_index) chat_default = id;
+        }
+
+        // Threads running as TUIs in thread-bound terminal docks are chat
+        // destinations too: the prompt gets pasted into the TUI's input.
+        for (project.threads.items) |*thread| {
+            const dock_id = thread.tui_dock_id orelse continue;
+            const pane_id = project.workspace_layout.visibleTerminalPaneIdForDock(dock_id) orelse continue;
+            const dock = self.projectTerminalDockMutable(self.selected_project_index, dock_id) orelse continue;
+            if (!dock.hasRunningSession()) continue;
+            const id = std.fmt.allocPrint(self.allocator, "tui:{d}", .{pane_id}) catch return;
+            owned_strings.append(self.allocator, id) catch {
+                self.allocator.free(id);
+                return;
+            };
+            const label = std.fmt.allocPrint(self.allocator, "{s} (TUI)", .{thread.title}) catch return;
+            owned_strings.append(self.allocator, label) catch {
+                self.allocator.free(label);
+                return;
+            };
+            targets.append(self.allocator, .{ .id = id, .label = label }) catch return;
+            target_pane_ids.append(self.allocator, pane_id) catch return;
+        }
+
+        // Default: the last-focused chat/terminal pane wins, then the pane of
+        // the currently selected thread, then the first target.
+        var selected_id: ?[]const u8 = null;
+        if (project.last_content_pane_id) |last_pane_id| {
+            for (target_pane_ids.items, 0..) |pane_id, index| {
+                if (pane_id == last_pane_id) {
+                    selected_id = targets.items[index].id;
+                    break;
+                }
+            }
+        }
+        if (selected_id == null) selected_id = chat_default;
+        if (selected_id == null and targets.items.len > 0) selected_id = targets.items[0].id;
+
+        // Two argument literals for setPromptTargets(targets, selectedId);
+        // separate Stringify instances since each serializes one root value.
+        var json_buffer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer json_buffer.deinit();
+        var targets_jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        targets_jw.write(targets.items) catch return;
+        json_buffer.writer.writeAll(", ") catch return;
+        var selected_jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        selected_jw.write(selected_id) catch return;
+
+        const script = std.fmt.allocPrint(
+            self.allocator,
+            "(function() {{ const h = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null; if (h && typeof h.setPromptTargets === \"function\") h.setPromptTargets({s}); }})();",
+            .{json_buffer.written()},
+        ) catch return;
+        defer self.allocator.free(script);
+
+        runtime_log.diagnostic("inspector targets push count={d}", .{targets.items.len});
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            log.warn("failed to push inspector prompt targets: {s}", .{@errorName(err)});
+        };
+    }
+
+    // Evaluates the host→page acknowledgement for a submitted design-mode
+    // prompt. `message` must be a fixed string literal (it is interpolated
+    // into a JS string without escaping).
+    fn notifyInspectorPromptResult(self: *AppState, result: InspectorPromptResult, message: ?[]const u8) void {
+        if (!self.canUseBrowserInspector() or !self.browser_state.inspectorEnabled()) {
+            runtime_log.diagnostic("inspector ack skipped result={s} usable={} enabled={}", .{
+                result.jsValue(),
+                self.canUseBrowserInspector(),
+                self.browser_state.inspectorEnabled(),
+            });
+            return;
+        }
+        runtime_log.diagnostic("inspector ack dispatch result={s}", .{result.jsValue()});
+        const script = std.fmt.allocPrint(
+            self.allocator,
+            "(function() {{ const h = window.VerdeInspector && window.VerdeInspector.get ? window.VerdeInspector.get() : null; if (h && typeof h.notifyPromptResult === \"function\") h.notifyPromptResult(\"{s}\", \"{s}\"); }})();",
+            .{ result.jsValue(), message orelse "" },
+        ) catch return;
+        defer self.allocator.free(script);
+
+        self.browser_state.expectSuppressedEvalResult();
+        self.browser_state.controller.eval(script) catch |err| {
+            _ = self.browser_state.consumeSuppressedEvalResult();
+            log.warn("failed to deliver inspector prompt result: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Formats the selection metadata (mode, page, region, elements) that
+    /// accompanies every design-mode prompt. Ends with a trailing newline.
+    fn buildInspectorContextBlock(
+        self: *const AppState,
+        selection: InspectorSelectionPayload,
     ) ![]u8 {
+        const allocator = self.allocator;
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(allocator);
 
@@ -12155,6 +12634,12 @@ pub const AppState = struct {
         );
         defer allocator.free(header);
         try buffer.appendSlice(allocator, header);
+
+        if (self.browser_state.current_url) |url| {
+            const page_line = try std.fmt.allocPrint(allocator, "Page: {s}\n", .{url});
+            defer allocator.free(page_line);
+            try buffer.appendSlice(allocator, page_line);
+        }
 
         if (selection.rect) |rect| {
             const region = try std.fmt.allocPrint(
@@ -12190,14 +12675,6 @@ pub const AppState = struct {
                 try buffer.appendSlice(allocator, more_label);
             }
         }
-
-        const prompt_label = try std.fmt.allocPrint(
-            allocator,
-            "Requested change:\n{s}",
-            .{prompt},
-        );
-        defer allocator.free(prompt_label);
-        try buffer.appendSlice(allocator, prompt_label);
 
         return buffer.toOwnedSlice(allocator);
     }
@@ -12269,7 +12746,14 @@ pub const AppState = struct {
             return;
         }
 
-        const script = browser_inspector.enableScriptAlloc(self.allocator, self.browser_state.inspectorMode()) catch |err| {
+        const theme_json = inspectorThemeJsonAlloc(self.allocator) catch |err| {
+            log.err("failed to build browser inspector theme: {s}", .{@errorName(err)});
+            if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
+            return;
+        };
+        defer self.allocator.free(theme_json);
+
+        const script = browser_inspector.enableScriptAlloc(self.allocator, self.browser_state.inspectorMode(), theme_json) catch |err| {
             log.err("failed to build browser inspector script: {s}", .{@errorName(err)});
             if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
             return;
@@ -12286,6 +12770,40 @@ pub const AppState = struct {
             return;
         };
         if (show_notice) self.setSidebarNotice(success_notice);
+    }
+
+    /// Serializes the active UI theme tokens into the inspector bundle's
+    /// InspectorThemeInput shape (hex colors) so the in-page overlay matches
+    /// the app theme instead of the built-in green defaults.
+    fn inspectorThemeJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
+        var accent_buf: [7]u8 = undefined;
+        var panel_buf: [7]u8 = undefined;
+        var input_buf: [7]u8 = undefined;
+        var text_buf: [7]u8 = undefined;
+        var muted_buf: [7]u8 = undefined;
+        var error_buf: [7]u8 = undefined;
+        const theme_payload = .{
+            .accent = cssHexFromColor(&accent_buf, theme.current_colors.accent),
+            .panelBackground = cssHexFromColor(&panel_buf, theme.current_colors.panel_alt),
+            .inputBackground = cssHexFromColor(&input_buf, theme.current_colors.panel),
+            .text = cssHexFromColor(&text_buf, theme.current_colors.text),
+            .textMuted = cssHexFromColor(&muted_buf, theme.current_colors.text_muted),
+            .@"error" = cssHexFromColor(&error_buf, theme.current_colors.diff_remove),
+        };
+
+        var json_buffer: std.Io.Writer.Allocating = .init(allocator);
+        defer json_buffer.deinit();
+        var jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        try jw.write(theme_payload);
+        return json_buffer.toOwnedSlice();
+    }
+
+    // Formats a normalized [4]f32 UI color as "#rrggbb" into `buffer`.
+    fn cssHexFromColor(buffer: *[7]u8, color: [4]f32) []const u8 {
+        const r: u8 = @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0));
+        const g: u8 = @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0));
+        const b: u8 = @intFromFloat(@round(std.math.clamp(color[2], 0.0, 1.0) * 255.0));
+        return std.fmt.bufPrint(buffer, "#{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b }) catch unreachable;
     }
 
     // Disables the bundled inspector overlay while leaving the page alive.
@@ -12650,6 +13168,23 @@ pub const AppState = struct {
     pub fn writeWorkspaceTerminalPane(self: *AppState, pane_id: WorkspacePaneId, bytes: []const u8) !bool {
         if (self.projects.items.len == 0) return false;
         return self.writeWorkspaceTerminalPaneForProject(self.selected_project_index, pane_id, bytes);
+    }
+
+    /// Pastes text into a terminal pane's running session (bracketed paste),
+    /// so agent TUIs receive it as filled-in input rather than executed lines.
+    /// Unlike the write path this never restarts a dead session: pasting a
+    /// prompt into a fresh shell would be wrong.
+    pub fn pasteWorkspaceTerminalPaneForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, text: []const u8) !bool {
+        if (project_index >= self.projects.items.len) return false;
+        var project = &self.projects.items[project_index];
+        const pane = project.workspace_layout.paneById(pane_id) orelse return false;
+        const dock_id = switch (pane.ref) {
+            .terminal => |ref| ref.dock_id,
+            else => return false,
+        };
+        var dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        if (!dock.hasRunningSession()) return false;
+        return try dock.pasteTextToActivePane(self.allocator, text);
     }
 
     pub fn terminalPaneOutputTailForProject(self: *AppState, project_index: usize, pane_id: WorkspacePaneId, max_bytes: usize) !?[]u8 {
@@ -13695,6 +14230,7 @@ pub const AppState = struct {
                 if (ref.thread_index < project.threads.items.len) {
                     project.selected_thread_index = ref.thread_index;
                 }
+                project.last_content_pane_id = pane_id;
                 if (self.selected_project_index == project_index) {
                     self.terminal_focused = false;
                     self.unfocusBrowserPane();
@@ -13702,7 +14238,10 @@ pub const AppState = struct {
                     self.syncPaletteComposerFromDraft();
                 }
             },
-            .terminal => |ref| if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id),
+            .terminal => |ref| {
+                self.projects.items[project_index].last_content_pane_id = pane_id;
+                if (self.selected_project_index == project_index) self.requestTerminalDockFocus(ref.dock_id);
+            },
             .browser => {
                 if (self.selected_project_index == project_index) {
                     self.terminal_focused = false;

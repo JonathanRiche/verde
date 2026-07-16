@@ -2334,6 +2334,11 @@ fn applyAppConfigRuntime(state: *AppState) void {
     state.rethemeTerminalSessions() catch |err| {
         log.warn("failed to retheme terminal sessions: {s}", .{@errorName(err)});
     };
+    // An armed browser inspector carries theme colors into the page; re-arm
+    // so its overlay picks up the refreshed palette.
+    if (state.browser_state.inspectorEnabled() and state.canUseBrowserInspector() and state.isBrowserVisible()) {
+        state.enableBrowserInspector(false);
+    }
     state.markDirty();
     runtime_log.diagnostic("apply app config runtime done", .{});
 }
@@ -2377,6 +2382,7 @@ fn reloadApplication(state: *AppState, keyboard: *keybinds.NativeKeyboardConfig)
 }
 
 test {
+    _ = @import("browser/screenshot.zig");
     _ = @import("ipc/server.zig");
     _ = @import("platform/mod.zig");
     _ = @import("providers/claude.zig");
