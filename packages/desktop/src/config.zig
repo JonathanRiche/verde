@@ -78,6 +78,7 @@ pub const AppConfig = struct {
     default_open_action: DefaultOpenAction = .folder,
     link_open_target: LinkOpenTarget = .verde_browser,
     terminal_launch_profiles: []TerminalLaunchProfileConfig = &.{},
+    check_for_updates_automatically: bool = true,
     // Fire a desktop notification when an agent surface finishes (transitions
     // to `.done`). Defaults on so the feature works without first opening
     // Settings; users can disable it from the Settings cog / verde.json.
@@ -158,6 +159,7 @@ pub fn saveAppConfig(allocator: std.mem.Allocator, config: *const AppConfig) !vo
     try writeThemeSection(tree_allocator, &root.object, config);
     try writeOpenSection(tree_allocator, &root.object, config);
     try writeTerminalSection(tree_allocator, &root.object, config);
+    try writeUpdatesSection(tree_allocator, &root.object, config);
     try writeNotificationsSection(tree_allocator, &root.object, config);
 
     const encoded = try std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
@@ -274,6 +276,11 @@ fn writeNotificationsSection(allocator: std.mem.Allocator, object: *std.json.Obj
     const notifications_object = try objectSection(allocator, object, "notifications");
     try notifications_object.put(allocator, "enabled", .{ .bool = config.notifications_enabled });
 }
+fn writeUpdatesSection(allocator: std.mem.Allocator, object: *std.json.ObjectMap, config: *const AppConfig) !void {
+    const updates_object = try objectSection(allocator, object, "updates");
+    try updates_object.put(allocator, "check_automatically", .{ .bool = config.check_for_updates_automatically });
+}
+
 
 fn colorToHex(allocator: std.mem.Allocator, color: [4]f32) ![]u8 {
     const r: u8 = @intFromFloat(@round(theme.clampf(color[0], 0.0, 1.0) * 255.0));
@@ -319,11 +326,28 @@ fn applyAppOverrides(allocator: std.mem.Allocator, config: *AppConfig, root: std
 }
 
 fn applyNotificationsOverrides(config: *AppConfig, notifications_value: std.json.Value) void {
+    if (root.object.get("updates")) |updates_value| {
+        applyUpdatesOverrides(config, updates_value);
+    }
     if (notifications_value != .object) {
         log.warn("notifications must be an object when provided", .{});
         return;
     }
     if (notifications_value.object.get("enabled")) |enabled_value| {
+fn applyUpdatesOverrides(config: *AppConfig, updates_value: std.json.Value) void {
+    if (updates_value != .object) {
+        log.warn("updates must be an object when provided", .{});
+        return;
+    }
+    if (updates_value.object.get("check_automatically")) |enabled_value| {
+        if (enabled_value == .bool) {
+            config.check_for_updates_automatically = enabled_value.bool;
+        } else {
+            log.warn("updates.check_automatically must be a boolean when provided", .{});
+        }
+    }
+}
+
         if (enabled_value == .bool) {
             config.notifications_enabled = enabled_value.bool;
         } else {
@@ -708,6 +732,17 @@ test "app config accepts custom open default" {
 
     try std.testing.expect(config.default_open_action == .custom);
     try std.testing.expectEqualStrings("Workbench", config.default_open_action.custom.label);
+test "app config accepts automatic update check preference" {
+    var root = try parseTestRoot("{\"updates\":{\"check_automatically\":false}}");
+    defer root.deinit();
+
+    var config: AppConfig = .{};
+    defer config.deinit(std.testing.allocator);
+    applyAppOverrides(std.testing.allocator, &config, root.value);
+
+    try std.testing.expect(!config.check_for_updates_automatically);
+}
+
     try std.testing.expectEqualStrings("cursor .", config.default_open_action.custom.action);
 }
 

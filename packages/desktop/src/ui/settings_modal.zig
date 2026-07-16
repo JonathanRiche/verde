@@ -1,6 +1,7 @@
 //! Settings modal for viewing and editing `verde.json` app config.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const palette = @import("palette");
 const app_config = @import("../config.zig");
 const theme = @import("theme.zig");
@@ -23,6 +24,9 @@ pub const Control = enum(u8) {
     hooks_claude,
     hooks_codex,
     hooks_amp,
+    updates_check,
+    updates_download,
+    updates_automatic,
     notifications_toggle,
 };
 
@@ -109,6 +113,12 @@ const SettingsLayout = struct {
     hooks_codex: palette.Rect,
     hooks_amp: palette.Rect,
     integrations_hint_y: f32,
+    updates_card: palette.Rect,
+    updates_check: palette.Rect,
+    updates_download: palette.Rect,
+    updates_automatic: palette.Rect,
+    updates_status_y: f32,
+    updates_notes_y: f32,
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
     notifications_hint_y: f32,
@@ -182,8 +192,10 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
+    // Version/status, action row, automatic-check preference, and a release-note preview.
+    const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h * 2.0;
 
-    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + notifications_h;
+    const body_h = appearance_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
     const modal = layoutModal(width, height, modal_h);
 
@@ -291,6 +303,17 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
 
     y += integrations_h + m.card_gap;
 
+    const updates_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = updates_h };
+    const updates_status_y = updates_card.y + m.card_pad + m.title_h + m.inner_gap;
+    const updates_actions_y = updates_status_y + m.label_h + m.inner_gap;
+    const update_action_w = (content_w - m.card_pad * 2.0 - m.inner_gap) * 0.5;
+    const updates_check: palette.Rect = .{ .x = updates_card.x + m.card_pad, .y = updates_actions_y, .w = update_action_w, .h = m.row_h };
+    const updates_download: palette.Rect = .{ .x = updates_check.x + update_action_w + m.inner_gap, .y = updates_actions_y, .w = update_action_w, .h = m.row_h };
+    const updates_automatic: palette.Rect = .{ .x = updates_check.x, .y = updates_actions_y + m.row_h + m.inner_gap, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
+    const updates_notes_y = updates_automatic.y + m.row_h + m.inner_gap;
+
+    y += updates_h + m.card_gap;
+
     const notifications_card: palette.Rect = .{ .x = content_x, .y = y, .w = content_w, .h = notifications_h };
     const notifications_toggle_y = notifications_card.y + m.card_pad + m.title_h + m.row_gap + m.label_h + m.inner_gap;
     const notifications_toggle: palette.Rect = .{ .x = notifications_card.x + m.card_pad, .y = notifications_toggle_y, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
@@ -324,6 +347,12 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .hooks_codex = hooks_codex,
         .hooks_amp = hooks_amp,
         .integrations_hint_y = integrations_hint_y,
+        .updates_card = updates_card,
+        .updates_check = updates_check,
+        .updates_download = updates_download,
+        .updates_automatic = updates_automatic,
+        .updates_status_y = updates_status_y,
+        .updates_notes_y = updates_notes_y,
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
         .notifications_hint_y = notifications_hint_y,
@@ -381,6 +410,13 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
     queueControlHit(state, layout.hooks_claude, layout.body_clip, .hooks_claude, queue_hit);
     queueControlHit(state, layout.hooks_codex, layout.body_clip, .hooks_codex, queue_hit);
     queueControlHit(state, layout.hooks_amp, layout.body_clip, .hooks_amp, queue_hit);
+    if (state.update_state.status != .checking) {
+        queueControlHit(state, layout.updates_check, layout.body_clip, .updates_check, queue_hit);
+    }
+    if (state.update_state.status == .update_available and !state.update_installer_started) {
+        queueControlHit(state, layout.updates_download, layout.body_clip, .updates_download, queue_hit);
+    }
+    queueControlHit(state, layout.updates_automatic, layout.body_clip, .updates_automatic, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
 }
 
@@ -399,6 +435,7 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
     drawCard(state, layout.terminal_card, layout.body_clip);
     drawCard(state, layout.workspace_card, layout.body_clip);
     drawCard(state, layout.integrations_card, layout.body_clip);
+    drawCard(state, layout.updates_card, layout.body_clip);
     drawCard(state, layout.notifications_card, layout.body_clip);
 
     // Appearance
@@ -460,6 +497,42 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         .w = layout.integrations_card.w - m.card_pad * 2.0,
         .h = m.label_h,
     }, "Writes hooks/plugins globally · no-op outside Verde panes", paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
+
+    // Updates
+    drawCardTitle(state, layout.updates_card, "Updates", layout.body_clip);
+    var version_buf: [96]u8 = undefined;
+    const update_status = switch (state.update_state.status) {
+        .idle => std.fmt.bufPrint(&version_buf, "Installed {s}", .{build_options.version}) catch "Installed version unavailable",
+        .checking => std.fmt.bufPrint(&version_buf, "Installed {s} · Checking…", .{build_options.version}) catch "Checking for updates…",
+        .up_to_date => std.fmt.bufPrint(&version_buf, "Installed {s} · Up to date", .{build_options.version}) catch "Verde is up to date",
+        .update_available => if (state.update_state.release) |release|
+            std.fmt.bufPrint(&version_buf, "Installed {s} · {s} available", .{ build_options.version, release.version }) catch "Update available"
+        else
+            "Update available",
+        .failed => std.fmt.bufPrint(&version_buf, "Installed {s} · Check failed", .{build_options.version}) catch "Update check failed",
+    };
+    queueText(state, .{
+        .x = layout.updates_card.x + m.card_pad,
+        .y = layout.updates_status_y,
+        .w = layout.updates_card.w - m.card_pad * 2.0,
+        .h = m.label_h,
+    }, update_status, paletteColor(textLabel()), theme.scaledUi(12.0), layout.body_clip);
+    drawToggleCell(state, layout.updates_check, if (state.update_state.status == .checking) "Checking…" else "Check now", false, isControlHovered(state, .updates_check), layout.body_clip);
+    const update_action_label = if (state.update_installer_started)
+        "Installer started"
+    else if (state.update_state.status == .update_available)
+        "Install update"
+    else
+        "No update available";
+    drawToggleCell(state, layout.updates_download, update_action_label, state.update_state.status == .update_available and !state.update_installer_started, isControlHovered(state, .updates_download), layout.body_clip);
+    drawToggleCell(state, layout.updates_automatic, "Check automatically", state.settings_draft.check_for_updates_automatically, isControlHovered(state, .updates_automatic), layout.body_clip);
+    const notes = if (state.update_state.release) |release| releaseNotesPreview(release.notes) else "Release notes appear here when a release is found.";
+    queueText(state, .{
+        .x = layout.updates_card.x + m.card_pad,
+        .y = layout.updates_notes_y,
+        .w = layout.updates_card.w - m.card_pad * 2.0,
+        .h = m.label_h * 2.0,
+    }, notes, paletteColor(textHint()), theme.scaledUi(11.5), layout.body_clip);
 
     // Notifications
     drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
@@ -557,10 +630,33 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             state.toggleAmpGlobalHooks();
             return;
         },
+        .updates_check => {
+            state.startUpdateCheck();
+            return;
+        },
+        .updates_download => {
+            if (state.update_state.status == .update_available) state.installAvailableUpdate();
+            return;
+        },
+        .updates_automatic => state.settings_draft.check_for_updates_automatically = !state.settings_draft.check_for_updates_automatically,
         // Draft toggle: persisted to verde.json on Save, like the other fields.
         .notifications_toggle => state.settings_draft.notifications_enabled = !state.settings_draft.notifications_enabled,
     }
     state.markDirty();
+}
+
+fn releaseNotesPreview(notes: []const u8) []const u8 {
+    var remaining = std.mem.trim(u8, notes, &std.ascii.whitespace);
+    while (remaining.len > 0) {
+        const line_end = std.mem.indexOfAny(u8, remaining, "\r\n") orelse remaining.len;
+        var line = std.mem.trim(u8, remaining[0..line_end], &std.ascii.whitespace);
+        if (line.len > 0 and line[0] != '#') {
+            if (std.mem.startsWith(u8, line, "* ") or std.mem.startsWith(u8, line, "- ")) line = line[2..];
+            return line[0..@min(line.len, 220)];
+        }
+        remaining = std.mem.trimStart(u8, remaining[line_end..], &std.ascii.whitespace);
+    }
+    return "No release notes were provided.";
 }
 
 fn drawModalChrome(state: *runtime.AppState, width: f32, height: f32, modal: palette.Rect) void {

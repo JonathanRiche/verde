@@ -7,6 +7,7 @@ pub const top_level_commands = [_][]const u8{
     "app",
     "help",
     "version",
+    "update",
     "capabilities",
     "open",
     "herdr",

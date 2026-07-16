@@ -453,6 +453,7 @@ fn mainInner(init: std.process.Init) !void {
         log.info("consumed pending Herdr open request", .{});
     }
     state.startProviderReadinessCheck();
+    state.startAutomaticUpdateCheck();
     var live_server: ?live_ipc.LiveServer = live_ipc.LiveServer.init(allocator, storage.pref_path) catch |err| blk: {
         log.warn("failed to initialize live-control server: {s}", .{@errorName(err)});
         break :blk null;
@@ -512,8 +513,13 @@ fn mainInner(init: std.process.Init) !void {
                 app_state.pollClaudeModelOptionsCache();
                 app_state.pollCursorModelOptionsCache();
                 app_state.pollProviderReadiness();
+                app_state.pollUpdateCheck();
             }
         }.run, .{&state});
+        if (state.consumeUpdateExitRequest()) {
+            running = false;
+            continue;
+        }
         var send_needs_render = false;
         recordSpan(&frame_sample, .poll_send, struct {
             fn run(app_state: *AppState, changed: *bool) void {
@@ -2377,5 +2383,7 @@ test {
     _ = @import("providers/diagnostics.zig");
     _ = @import("slash_commands.zig");
     _ = @import("ui/command_palette.zig");
+    _ = @import("update_installer.zig");
+    _ = @import("updater.zig");
     _ = @import("windows_conpty_compile_test.zig");
 }

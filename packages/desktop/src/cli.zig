@@ -16,6 +16,7 @@ const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
+const update_installer = @import("update_installer.zig");
 
 const VERSION = build_options.version;
 const SOCKET_NAME = live_endpoint.SOCKET_NAME;
@@ -60,6 +61,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
     }
     if (std.mem.eql(u8, parsed.command, "capabilities")) {
         try printCapabilities(allocator, out, parsed.json);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "update")) {
+        try handleUpdate(allocator, out, parsed.rest, parsed.json);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "open")) {
@@ -125,6 +130,7 @@ fn printHelp(out: output.Output) !void {
         \\  verde notify [options]        Update the current terminal surface
         \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
+        \\  verde update [--json]         Install the latest Verde release
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
         \\
@@ -213,12 +219,56 @@ fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: boo
             .encodings = spec.encodings[0..],
         },
         .ipc = .{
+fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8, json: bool) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try out.stdout(
+            \\Usage:
+            \\  verde update [--json]
+            \\
+            \\Installs the latest Verde release using the official platform installer.
+            \\
+        , .{});
+        return;
+    }
+
+    const launch = update_installer.launch(allocator) catch |err| {
+        if (json) {
+            try out.jsonValue(allocator, .{
+                .ok = false,
+                .@"error" = .{ .code = "launch_failed", .message = @errorName(err) },
+            });
+        } else {
+            try out.stderr("failed to start Verde updater: {s}\n", .{@errorName(err)});
+        }
+        std.process.exit(1);
+    };
+
+    const app_exit_required = launch == .started_and_exit_required;
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .ok = true,
+            .result = .{
+                .status = "started",
+                .restart_required = !app_exit_required,
+                .app_exit_required = app_exit_required,
+            },
+        });
+        return;
+    }
+    if (app_exit_required) {
+        try out.stdout("Verde updater started. Installation will continue after this process exits.\n", .{});
+    } else {
+        try out.stdout("Verde updater started. Restart Verde after installation completes.\n", .{});
+    }
+}
+
             .transport = live_endpoint.transportName(),
             .socket_name = SOCKET_NAME,
             .endpoint_env = live_endpoint.ENDPOINT_ENV,
             .terminal_binary_frames = false,
             .mcp_bridge = true,
         },
+            .update = true,
     };
     if (json) {
         try out.jsonValue(allocator, caps);
@@ -243,6 +293,7 @@ fn workspaceOption(argv: []const []const u8) ?[]const u8 {
     return args.optionValue(argv, "--workspace") orelse args.optionValue(argv, "--project");
 }
 
+        \\  update: yes
 fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
     if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
         try printCompletionHelp(out);
