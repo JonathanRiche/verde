@@ -35,6 +35,7 @@ pub const BrowserBackend = struct {
         const sdk_configured_fn: fn (*const T) bool = T.sdkConfigured;
         const pane_session_fn: fn (*const T) ?browser_types.SessionId = T.paneSessionId;
         const pane_texture_fn: fn (*const T) ?browser_texture.PaneTexture = T.paneTexture;
+        const copy_frame_fn: fn (*T, std.mem.Allocator) anyerror!?browser_texture.CopiedFrame = T.copyFramePixels;
         const poll_event_fn: fn (*T) ?browser_types.Event = T.pollEvent;
 
         _ = init_fn;
@@ -64,6 +65,7 @@ pub const BrowserBackend = struct {
         _ = sdk_configured_fn;
         _ = pane_session_fn;
         _ = pane_texture_fn;
+        _ = copy_frame_fn;
         _ = poll_event_fn;
     }
 };

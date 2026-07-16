@@ -623,6 +623,15 @@ pub const Controller = struct {
             return true;
         }
         if (event.key_code == 0) return false;
+        // WebKit interprets printable keysyms on dispatch and inserts the
+        // character itself, but SDL's text_input event (the `.text` branch
+        // above) is the source of truth for typed text — it alone carries
+        // shifted and IME-composed characters. Dispatching printable keysyms
+        // here as well doubles every typed character, so swallow them and let
+        // text_input deliver the text. Ctrl/Alt/Super combos still dispatch
+        // so in-page shortcuts keep working.
+        const printable = event.key_code >= 0x20 and event.key_code <= 0x7f;
+        if (printable and !event.ctrl and !event.alt and !event.super) return true;
         try self.sendCommand(.{
             .kind = .key_input,
             .key_code = event.key_code,
@@ -661,6 +670,41 @@ pub const Controller = struct {
             return false;
         }
         return try self.frame.uploadIntoTexture(self.allocator, &self.frame_buffer, texture);
+    }
+
+    /// Returns a caller-owned copy of the most recent helper frame, or null when
+    /// no frame has been produced yet (e.g. subsurface mode, browser not shown).
+    pub fn copyFramePixels(self: *Controller, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        var frame_width: u32 = 0;
+        var frame_height: u32 = 0;
+        var frame_byte_len: usize = 0;
+        {
+            self.frame.mutex.lock();
+            defer self.frame.mutex.unlock();
+            frame_width = self.frame.width;
+            frame_height = self.frame.height;
+            frame_byte_len = self.frame.byte_len;
+            if (frame_byte_len > 0 and frame_width > 0 and frame_height > 0 and
+                self.frame.staging.items.len >= frame_byte_len)
+            {
+                return .{
+                    .width = frame_width,
+                    .height = frame_height,
+                    .format = .bgra,
+                    .pixels = try allocator.dupe(u8, self.frame.staging.items[0..frame_byte_len]),
+                };
+            }
+        }
+        // Temp-file frames bypass staging; fall back to the main-thread-owned
+        // copy of the last uploaded frame.
+        if (frame_byte_len == 0 or frame_width == 0 or frame_height == 0) return null;
+        if (self.frame_buffer.items.len < frame_byte_len) return null;
+        return .{
+            .width = frame_width,
+            .height = frame_height,
+            .format = .bgra,
+            .pixels = try allocator.dupe(u8, self.frame_buffer.items[0..frame_byte_len]),
+        };
     }
 
     // Launches the installed browser helper binary beside the desktop executable.

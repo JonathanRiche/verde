@@ -58,6 +58,41 @@ export interface RegionSelection {
 
 export type InspectorSelection = PointSelection | RegionSelection;
 
+/** Viewport metrics captured at submit time so the host can map CSS
+ * selection coordinates onto browser frame pixels for screenshot crops. */
+export interface InspectorViewportInfo {
+  width: number;
+  height: number;
+  devicePixelRatio: number;
+  scrollX: number;
+  scrollY: number;
+}
+
+/** Host verdict for a submitted prompt: "sent"/"drafted" close the bubble,
+ * "failed" re-enables it with an optional message. */
+export type InspectorPromptResult = "sent" | "drafted" | "failed";
+
+/** One chat destination the host can route a design-mode prompt to. The id is
+ * opaque to the page (Verde uses the workspace pane id). */
+export interface InspectorPromptTarget {
+  id: string;
+  label: string;
+}
+
+/** Host-provided colors (hex "#rrggbb") so the overlay matches the app theme.
+ * Any omitted field keeps the built-in default. */
+export interface InspectorThemeInput {
+  /** Selection outlines, region strokes, button, caret. */
+  accent?: string;
+  /** Bubble/tooltip surface color. */
+  panelBackground?: string;
+  /** Textarea / select surface color. */
+  inputBackground?: string;
+  text?: string;
+  textMuted?: string;
+  error?: string;
+}
+
 export interface InspectorEventPayloadMap {
   "inspector:enabled": null;
   "inspector:disabled": null;
@@ -74,6 +109,10 @@ export interface InspectorEventPayloadMap {
   "prompt:submitted": {
     selection: InspectorSelection;
     prompt: string;
+    viewport: InspectorViewportInfo;
+    /** Selected target id from the host-provided list, or null when the host
+     * never pushed targets (host falls back to its active thread). */
+    target: string | null;
   };
 }
 
@@ -92,6 +131,7 @@ export interface InspectorOptions {
   enabled?: boolean;
   mode?: InspectorModeInput;
   root?: Document;
+  theme?: InspectorThemeInput;
   onEvent?: (event: InspectorAnyEvent) => void;
   bridge?: {
     postMessage: (event: InspectorAnyEvent) => void;
@@ -108,4 +148,11 @@ export interface InspectorHandle {
   getSelection(): InspectorSelection | null;
   getSelectedElements(): ElementSnapshot[];
   getSelectedElement(): ElementSnapshot | null;
+  /** Host callback resolving the pending state after a prompt:submitted. */
+  notifyPromptResult(result: InspectorPromptResult, message?: string | null): void;
+  /** Host push of available chat destinations; the bubble shows a selector
+   * only when more than one target exists. */
+  setPromptTargets(targets: InspectorPromptTarget[], selectedId?: string | null): void;
+  /** Host push of app theme colors; restyles the overlay in place. */
+  setTheme(theme: InspectorThemeInput | null | undefined): void;
 }
