@@ -308,5 +308,3 @@ of amp / cursor / opencode in a terminal pane, confirm:
 - correct provider logo in the sidebar split glyph (not the letter fallback),
 - live title updates while the agent runs,
 - (after hooks) busy → done status color + pinned title persists across restart.
-
-Run the `agent-ci` skill before considering any of this done.
