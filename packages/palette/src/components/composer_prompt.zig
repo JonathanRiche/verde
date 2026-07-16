@@ -302,6 +302,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         focused: bool = false,
         show_fast_toggle: bool = true,
         show_reasoning_toggle: bool = true,
+        show_access_toggle: bool = true,
+        /// When set, clicking the model / reasoning pill emits `model_clicked` /
+        /// `reasoning_clicked` without opening the built-in dropdown, so hosts
+        /// can attach richer popovers (rich picker, run-config panel) instead.
+        external_model_menu: bool = false,
+        external_reasoning_menu: bool = false,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
@@ -334,6 +340,33 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
         pub fn showFastToggle(self: *const Component) bool {
             return self.show_fast_toggle;
+        }
+
+        pub fn setShowAccessToggle(self: *Component, show: bool) void {
+            self.show_access_toggle = show;
+            if (!show) {
+                self.hovered_part = if (self.hovered_part == .access) null else self.hovered_part;
+            }
+        }
+
+        pub fn showAccessToggle(self: *const Component) bool {
+            return self.show_access_toggle;
+        }
+
+        pub fn setExternalModelMenu(self: *Component, external: bool) void {
+            self.external_model_menu = external;
+            if (external and self.active_menu == .model) {
+                self.active_menu = null;
+                self.hovered_menu_index = null;
+            }
+        }
+
+        pub fn setExternalReasoningMenu(self: *Component, external: bool) void {
+            self.external_reasoning_menu = external;
+            if (external and self.active_menu == .reasoning) {
+                self.active_menu = null;
+                self.hovered_menu_index = null;
+            }
         }
 
         pub fn init() Component {
@@ -570,7 +603,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (geometry.model.contains(point)) return .model;
             if (self.show_reasoning_toggle and geometry.reasoning.w > 0.0 and geometry.reasoning.contains(point)) return .reasoning;
             if (self.show_fast_toggle and geometry.fast.w > 0.0 and geometry.fast.contains(point)) return .fast;
-            if (geometry.access.contains(point)) return .access;
+            if (self.show_access_toggle and geometry.access.w > 0.0 and geometry.access.contains(point)) return .access;
             return null;
         }
 
@@ -655,9 +688,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
             if (self.show_fast_toggle) {
                 try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.fast), geometry.toolbar);
-                try self.renderSeparator(allocator, batch, separatorX(geometry.fast, geometry.access), geometry.toolbar);
-            } else {
-                try self.renderSeparator(allocator, batch, separatorX(left_before_fast, geometry.access), geometry.toolbar);
+            }
+            if (self.show_access_toggle) {
+                const left_before_access: draw.Rect = if (self.show_fast_toggle) geometry.fast else left_before_fast;
+                try self.renderSeparator(allocator, batch, separatorX(left_before_access, geometry.access), geometry.toolbar);
             }
 
             try self.renderPill(allocator, batch, true, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
@@ -667,7 +701,9 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             if (self.show_fast_toggle) {
                 try self.renderPill(allocator, batch, true, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
             }
-            try self.renderPill(allocator, batch, true, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
+            if (self.show_access_toggle) {
+                try self.renderPill(allocator, batch, true, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
+            }
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
             const send_panel_color: draw.Color = blk: {
@@ -1034,11 +1070,11 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 self.hovered_part = part;
                 switch (part) {
                     .model => {
-                        self.toggleMenu(.model);
+                        if (!self.external_model_menu) self.toggleMenu(.model);
                         self.emit(.model_clicked);
                     },
                     .reasoning => {
-                        self.toggleMenu(.reasoning);
+                        if (!self.external_reasoning_menu) self.toggleMenu(.reasoning);
                         self.emit(.reasoning_clicked);
                     },
                     .fast => {
@@ -1525,7 +1561,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 self.pillNaturalNeedWidth(true, config.fast_icon, self.fastLabel(), "")
             else
                 0.0;
-            const need_a = self.pillNaturalNeedWidth(true, config.access_icon, self.accessLabel(), "");
+            const need_a = if (self.show_access_toggle)
+                self.pillNaturalNeedWidth(true, config.access_icon, self.accessLabel(), "")
+            else
+                0.0;
 
             var iter: u32 = 0;
             while (iter < 16) : (iter += 1) {
@@ -1536,7 +1575,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 const min_m = @max(config.model_min_width, @min(need_m, config.model_max_width));
                 const min_r = if (self.show_reasoning_toggle) @max(config.reasoning_min_width, @min(need_r, config.reasoning_max_width)) else 0.0;
                 const min_f = if (self.show_fast_toggle) @max(config.fast_min_width, @min(need_f, config.fast_max_width)) else 0.0;
-                const min_a = @max(config.access_min_width, @min(need_a, config.access_max_width));
+                const min_a = if (self.show_access_toggle) @max(config.access_min_width, @min(need_a, config.access_max_width)) else 0.0;
 
                 const flex_m = @max(0.0, model_w.* - min_m);
                 const flex_r = @max(0.0, reasoning_w.* - min_r);
@@ -1588,7 +1627,10 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 self.pillWidth(true, config.fast_icon, self.fastLabel(), "", config.fast_min_width, config.fast_max_width)
             else
                 0.0;
-            var access_w = self.pillWidth(true, config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width);
+            var access_w: f32 = if (self.show_access_toggle)
+                self.pillWidth(true, config.access_icon, self.accessLabel(), "", config.access_min_width, config.access_max_width)
+            else
+                0.0;
 
             self.shrinkToolbarPillWidthsToFit(avail, &model_w, &reasoning_w, &fast_w, &access_w);
 
@@ -1852,6 +1894,34 @@ test "composer prompt sizes toolbar pills from measured content" {
     const trailing = 3.0 + @max(6.0, @max(16.0 * 0.82, 21.0));
     const expected = 12 * 2 + 6 + 4 + @as(f32, @floatFromInt("GPT-5.5".len)) * 5 + slack + trailing;
     try std.testing.expectEqual(expected, model.w);
+}
+
+test "composer prompt external menus emit clicks without opening dropdowns" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    var probe: ComposerProbe = .{};
+    prompt.setCallbacks(.{ .context = &probe, .on_event = probeComposerEvent });
+    prompt.setModelOptions(null, 3, testModelOption);
+    prompt.setExternalModelMenu(true);
+    prompt.setExternalReasoningMenu(true);
+
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.modelRect().x + 2, .y = prompt.modelRect().y + 2 } }));
+    try std.testing.expect(prompt.active_menu == null);
+    try std.testing.expect(try prompt.handleInput(std.testing.allocator, .{ .mouse_down = .{ .x = prompt.reasoningRect().x + 2, .y = prompt.reasoningRect().y + 2 } }));
+    try std.testing.expect(prompt.active_menu == null);
+}
+
+test "composer prompt hides access pill from geometry and hit testing" {
+    const Prompt = ComposerPrompt(.{});
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    const shown_access = prompt.accessRect();
+    try std.testing.expect(shown_access.w > 0.0);
+
+    prompt.setShowAccessToggle(false);
+    try std.testing.expectEqual(@as(f32, 0.0), prompt.accessRect().w);
+    try std.testing.expect(prompt.hitTest(.{ .x = shown_access.x + 2, .y = shown_access.y + 2 }) != .access);
 }
 
 test "composer prompt scrolls overflowing text and renders scrollbar" {

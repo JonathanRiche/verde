@@ -36,6 +36,17 @@ pub const TextInputConfig = struct {
     z_index: i32 = 0,
 };
 
+/// Runtime color overrides so hosts with dynamic theming can restyle a field
+/// without recompiling the comptime config; defaults mirror the config.
+pub const TextInputStyle = struct {
+    background_color: draw.Color,
+    border_color: draw.Color,
+    text_color: draw.Color,
+    cursor_color: draw.Color,
+    selection_color: draw.Color,
+    placeholder_color: draw.Color,
+};
+
 pub const Input = union(enum) {
     text: []const u8,
     key: Key,
@@ -75,6 +86,7 @@ pub const TextInputCallbacks = struct {
 pub fn TextInput(comptime config: TextInputConfig) type {
     return struct {
         const Component = @This();
+        pub const Style = TextInputStyle;
 
         buffer: std.ArrayList(u8) = .empty,
         cursor: usize = 0,
@@ -89,6 +101,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
         rect: draw.Rect = .{ .x = config.x, .y = config.y, .w = config.width, .h = config.height },
         font_metrics: ?text_layout.FontMetrics = null,
         z_index: i32 = config.z_index,
+        style: Style = defaultStyle(),
         callbacks: TextInputCallbacks = .{},
 
         pub fn init(allocator: std.mem.Allocator, initial: []const u8) !Component {
@@ -106,6 +119,21 @@ pub fn TextInput(comptime config: TextInputConfig) type {
 
         pub fn text(self: *const Component) []const u8 {
             return self.buffer.items;
+        }
+
+        pub fn defaultStyle() Style {
+            return .{
+                .background_color = config.background_color,
+                .border_color = config.border_color,
+                .text_color = config.text_color,
+                .cursor_color = config.cursor_color,
+                .selection_color = config.selection_color,
+                .placeholder_color = config.placeholder_color,
+            };
+        }
+
+        pub fn setStyle(self: *Component, style: Style) void {
+            self.style = style;
         }
 
         pub fn placeholderVisible(self: *const Component) bool {
@@ -235,10 +263,10 @@ pub fn TextInput(comptime config: TextInputConfig) type {
 
             const bounds_rect = self.bounds();
             const text_rect = self.textRect();
-            try batch.panel(allocator, bounds_rect, config.background_color, config.border_color, config.corner_radius, config.border_width);
+            try batch.panel(allocator, bounds_rect, self.style.background_color, self.style.border_color, config.corner_radius, config.border_width);
             if (self.selection()) |range| try self.renderSelection(allocator, batch, range);
             const value = if (self.placeholderVisible()) config.placeholder_text else self.buffer.items;
-            const color = if (self.placeholderVisible()) config.placeholder_color else config.text_color;
+            const color = if (self.placeholderVisible()) self.style.placeholder_color else self.style.text_color;
             const metrics_value = self.metrics();
             const runs = [_]draw.TextRun{.{
                 .text = value,
@@ -257,7 +285,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             if (self.focused and self.cursor_visible) {
                 const x = self.cursorX();
                 if (x >= text_rect.x and x <= text_rect.x + text_rect.w) {
-                    try batch.cursor(allocator, .{ .x = x, .y = text_rect.y, .w = 1.5, .h = text_rect.h }, config.cursor_color);
+                    try batch.cursor(allocator, .{ .x = x, .y = text_rect.y, .w = 1.5, .h = text_rect.h }, self.style.cursor_color);
                 }
             }
         }
@@ -401,7 +429,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             const x0 = @max(start_x, text_rect.x);
             const x1 = @min(end_x, text_rect.x + text_rect.w);
             if (x1 <= x0) return;
-            try batch.selection(allocator, .{ .x = x0, .y = text_rect.y, .w = @max(x1 - x0, 2.0), .h = text_rect.h }, config.selection_color);
+            try batch.selection(allocator, .{ .x = x0, .y = text_rect.y, .w = @max(x1 - x0, 2.0), .h = text_rect.h }, self.style.selection_color);
         }
 
         fn cursorX(self: *const Component) f32 {
@@ -441,7 +469,7 @@ pub fn TextInput(comptime config: TextInputConfig) type {
             return .{
                 .rect = self.textRect(),
                 .text = value,
-                .color = config.text_color,
+                .color = self.style.text_color,
                 .metrics = self.metrics(),
                 .wrap = false,
                 .scroll = .{ .x = self.scroll_x },
