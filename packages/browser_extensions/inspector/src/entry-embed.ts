@@ -22,6 +22,7 @@ function mount(options: InspectorOptions = {}): InspectorHandle {
     enabled: options.enabled ?? true,
     mode: options.mode,
     root: options.root,
+    theme: options.theme,
     onEvent: options.onEvent,
     bridge: options.bridge ?? window.__VERDE_INSPECTOR_BRIDGE__,
   });

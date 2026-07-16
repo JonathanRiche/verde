@@ -79,6 +79,20 @@ export interface InspectorPromptTarget {
   label: string;
 }
 
+/** Host-provided colors (hex "#rrggbb") so the overlay matches the app theme.
+ * Any omitted field keeps the built-in default. */
+export interface InspectorThemeInput {
+  /** Selection outlines, region strokes, button, caret. */
+  accent?: string;
+  /** Bubble/tooltip surface color. */
+  panelBackground?: string;
+  /** Textarea / select surface color. */
+  inputBackground?: string;
+  text?: string;
+  textMuted?: string;
+  error?: string;
+}
+
 export interface InspectorEventPayloadMap {
   "inspector:enabled": null;
   "inspector:disabled": null;
@@ -117,6 +131,7 @@ export interface InspectorOptions {
   enabled?: boolean;
   mode?: InspectorModeInput;
   root?: Document;
+  theme?: InspectorThemeInput;
   onEvent?: (event: InspectorAnyEvent) => void;
   bridge?: {
     postMessage: (event: InspectorAnyEvent) => void;
@@ -138,4 +153,6 @@ export interface InspectorHandle {
   /** Host push of available chat destinations; the bubble shows a selector
    * only when more than one target exists. */
   setPromptTargets(targets: InspectorPromptTarget[], selectedId?: string | null): void;
+  /** Host push of app theme colors; restyles the overlay in place. */
+  setTheme(theme: InspectorThemeInput | null | undefined): void;
 }
