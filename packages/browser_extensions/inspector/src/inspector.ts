@@ -105,7 +105,9 @@ type OverlayParts = {
   promptSpinner: HTMLSpanElement;
   promptButtonLabel: HTMLSpanElement;
   promptTargetRow: HTMLDivElement;
-  promptTargetSelect: HTMLSelectElement;
+  promptTargetControl: HTMLButtonElement;
+  promptTargetControlLabel: HTMLSpanElement;
+  promptTargetList: HTMLDivElement;
 };
 
 type PointerPosition = {
@@ -132,6 +134,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   let promptPending = false;
   let promptPendingTimer: ReturnType<typeof setTimeout> | null = null;
   let promptTargets: InspectorPromptTarget[] = [];
+  let selectedTargetId: string | null = null;
   let theme = resolveTheme(options.theme);
 
   const overlay = createOverlay(doc);
@@ -140,6 +143,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   const setTheme = (input: InspectorThemeInput | null | undefined): void => {
     theme = resolveTheme(input);
     applyOverlayTheme(overlay, theme);
+    syncPromptTargetsUi(selectedTargetId);
   };
 
   const emit = <TType extends InspectorEventType>(
@@ -251,28 +255,79 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   const setPromptPendingUi = (pending: boolean): void => {
     overlay.promptTextarea.disabled = pending;
     overlay.promptButton.disabled = pending;
-    overlay.promptTargetSelect.disabled = pending;
+    overlay.promptTargetControl.disabled = pending;
     overlay.promptButton.style.cursor = pending ? "default" : "pointer";
     overlay.promptPanel.style.opacity = pending ? "0.72" : "1";
     overlay.promptSpinner.style.display = pending ? "inline-block" : "none";
     overlay.promptButtonLabel.textContent = pending ? "Sending..." : "Send";
+    if (pending) closeTargetList();
   };
 
-  // Rebuilds the "Send to" selector. The row only shows when the choice is
-  // ambiguous (2+ chat destinations); a single destination stays implicit.
+  const closeTargetList = (): void => {
+    overlay.promptTargetList.hidden = true;
+  };
+
+  const selectedPromptTarget = (): string | null => {
+    if (promptTargets.length === 0) return null;
+    if (selectedTargetId && promptTargets.some((target) => target.id === selectedTargetId)) {
+      return selectedTargetId;
+    }
+    return promptTargets[0]!.id;
+  };
+
+  const selectPromptTarget = (id: string): void => {
+    selectedTargetId = id;
+    const selected = promptTargets.find((target) => target.id === id);
+    overlay.promptTargetControlLabel.textContent = selected ? selected.label : "";
+    closeTargetList();
+  };
+
+  // Rebuilds the custom "Send to" dropdown. The row only shows when the
+  // choice is ambiguous (2+ chat destinations); one destination stays
+  // implicit. Rows are plain divs because native <select> popups cannot open
+  // in offscreen webview embeddings.
   const syncPromptTargetsUi = (selectedId?: string | null): void => {
-    const select = overlay.promptTargetSelect;
-    const previous = selectedId ?? select.value;
-    select.textContent = "";
+    const previous = selectedId ?? selectedTargetId;
+    selectedTargetId =
+      previous && promptTargets.some((target) => target.id === previous)
+        ? previous
+        : (promptTargets[0]?.id ?? null);
+
+    const list = overlay.promptTargetList;
+    list.textContent = "";
     for (const target of promptTargets) {
-      const option = overlay.promptPanel.ownerDocument.createElement("option");
-      option.value = target.id;
-      option.textContent = target.label;
-      select.appendChild(option);
+      const row = doc.createElement("div");
+      row.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+      const isSelected = target.id === selectedTargetId;
+      row.textContent = target.label;
+      row.style.cssText = [
+        "padding:6px 8px",
+        "border-radius:6px",
+        "font-size:12px",
+        "cursor:pointer",
+        "overflow:hidden",
+        "text-overflow:ellipsis",
+        "white-space:nowrap",
+        `color:${theme.text}`,
+        `background:${isSelected ? rgbaOf(theme.accent, 0.28) : "transparent"}`,
+      ].join(";");
+      row.addEventListener("mouseenter", () => {
+        row.style.background = rgbaOf(theme.accent, 0.18);
+      });
+      row.addEventListener("mouseleave", () => {
+        row.style.background = target.id === selectedTargetId ? rgbaOf(theme.accent, 0.28) : "transparent";
+      });
+      row.addEventListener("mousedown", (event) => event.stopPropagation());
+      row.addEventListener("click", (event) => {
+        event.stopPropagation();
+        selectPromptTarget(target.id);
+      });
+      list.appendChild(row);
     }
-    if (previous && promptTargets.some((target) => target.id === previous)) {
-      select.value = previous;
-    }
+
+    const selected = promptTargets.find((target) => target.id === selectedTargetId);
+    overlay.promptTargetControlLabel.textContent = selected ? selected.label : "";
+    closeTargetList();
     overlay.promptTargetRow.style.display = promptTargets.length > 1 ? "flex" : "none";
   };
 
@@ -284,13 +339,6 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       ? targets.filter((target) => target && typeof target.id === "string")
       : [];
     syncPromptTargetsUi(selectedId);
-  };
-
-  const selectedPromptTarget = (): string | null => {
-    if (promptTargets.length === 0) return null;
-    const value = overlay.promptTargetSelect.value;
-    if (value && promptTargets.some((target) => target.id === value)) return value;
-    return promptTargets[0]!.id;
   };
 
   const clearPromptPendingTimer = (): void => {
@@ -307,6 +355,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       promptPending = false;
       clearPromptPendingTimer();
       setPromptPendingUi(false);
+      closeTargetList();
       return;
     }
 
@@ -783,11 +832,20 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
       event.stopPropagation();
     });
   }
-  for (const eventName of ["mousedown", "mouseup", "click", "change"] as const) {
-    overlay.promptTargetSelect.addEventListener(eventName, (event) => {
+  for (const eventName of ["mousedown", "mouseup"] as const) {
+    overlay.promptTargetControl.addEventListener(eventName, (event) => {
       event.stopPropagation();
     });
   }
+  overlay.promptTargetControl.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (promptPending) return;
+    overlay.promptTargetList.hidden = !overlay.promptTargetList.hidden;
+  });
+  // Clicking anywhere else in the panel dismisses the open dropdown.
+  overlay.promptPanel.addEventListener("mousedown", () => {
+    closeTargetList();
+  });
   // Enter submits (Shift+Enter keeps inserting a newline). Escape is handled
   // by the document-level capture listener so it is intentionally not wired
   // here.
@@ -987,21 +1045,64 @@ function createOverlay(doc: Document): OverlayParts {
   promptTargetLabel.setAttribute("data-verde-role", "muted-label");
   promptTargetLabel.style.cssText = "font-size:11px;flex:0 0 auto;";
 
-  const promptTargetSelect = doc.createElement("select");
-  promptTargetSelect.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTargetSelect.style.cssText = [
+  // Custom dropdown instead of a native <select>: offscreen webview
+  // embeddings (WPE) have no host surface for native option popups, so a
+  // <select> silently fails to open there.
+  const promptTargetControl = doc.createElement("button");
+  promptTargetControl.type = "button";
+  promptTargetControl.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetControl.style.cssText = [
     "pointer-events:auto",
     "flex:1 1 auto",
     "min-width:0",
+    "display:inline-flex",
+    "align-items:center",
+    "justify-content:space-between",
+    "gap:8px",
     "padding:6px 8px",
     "border-radius:6px",
     "font:inherit",
     "font-size:12px",
+    "text-align:left",
+    "cursor:pointer",
     "outline:none",
-    "text-overflow:ellipsis",
   ].join(";");
 
-  promptTargetRow.append(promptTargetLabel, promptTargetSelect);
+  const promptTargetControlLabel = doc.createElement("span");
+  promptTargetControlLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetControlLabel.style.cssText = [
+    "flex:1 1 auto",
+    "min-width:0",
+    "overflow:hidden",
+    "text-overflow:ellipsis",
+    "white-space:nowrap",
+  ].join(";");
+
+  const promptTargetCaret = doc.createElement("span");
+  promptTargetCaret.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetCaret.textContent = "▾";
+  promptTargetCaret.style.cssText = "flex:0 0 auto;opacity:0.8;";
+  promptTargetControl.append(promptTargetControlLabel, promptTargetCaret);
+
+  const promptTargetList = doc.createElement("div");
+  promptTargetList.hidden = true;
+  promptTargetList.setAttribute(OVERLAY_IGNORE_ATTR, "true");
+  promptTargetList.style.cssText = [
+    "position:absolute",
+    "left:0",
+    "right:0",
+    "top:calc(100% + 4px)",
+    "max-height:180px",
+    "overflow-y:auto",
+    "border-radius:8px",
+    "padding:4px",
+    "box-shadow:0 12px 32px rgba(0, 0, 0, 0.4)",
+    "pointer-events:auto",
+    "z-index:1",
+  ].join(";");
+
+  promptTargetRow.style.position = "relative";
+  promptTargetRow.append(promptTargetLabel, promptTargetControl, promptTargetList);
 
   const promptTextarea = doc.createElement("textarea");
   promptTextarea.setAttribute(OVERLAY_IGNORE_ATTR, "true");
@@ -1083,7 +1184,9 @@ function createOverlay(doc: Document): OverlayParts {
     promptSpinner,
     promptButtonLabel,
     promptTargetRow,
-    promptTargetSelect,
+    promptTargetControl,
+    promptTargetControlLabel,
+    promptTargetList,
   };
 }
 
@@ -1137,9 +1240,12 @@ function applyOverlayTheme(overlay: OverlayParts, theme: ResolvedTheme): void {
   overlay.promptTextarea.style.border = inputBorder;
   overlay.promptTextarea.style.color = theme.text;
   overlay.promptTextarea.style.caretColor = rgbaOf(accent, 1.0);
-  overlay.promptTargetSelect.style.background = inputBackground;
-  overlay.promptTargetSelect.style.border = inputBorder;
-  overlay.promptTargetSelect.style.color = theme.text;
+  overlay.promptTargetControl.style.background = inputBackground;
+  overlay.promptTargetControl.style.border = inputBorder;
+  overlay.promptTargetControl.style.color = theme.text;
+  // Opaque surface: the dropdown floats over page content.
+  overlay.promptTargetList.style.background = rgbaOf(theme.panelBackground, 1.0);
+  overlay.promptTargetList.style.border = `1px solid ${rgbaOf(accent, 0.25)}`;
   const targetLabel = overlay.promptTargetRow.querySelector("span");
   if (targetLabel instanceof HTMLElement) targetLabel.style.color = theme.textMuted;
 
