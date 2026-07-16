@@ -21,6 +21,15 @@ const MAX_PROTOCOL_INIT_ATTEMPTS = 8;
 const REMOTE_CODEX_LOCAL_PORT: u16 = 14510;
 const REMOTE_CODEX_SERVER_PORT: u16 = 14511;
 const REMOTE_CODEX_WS_URL = "ws://127.0.0.1:14510";
+const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+
+const ServerRequestKind = enum {
+    command_approval,
+    file_change_approval,
+    permissions_approval,
+    dynamic_tool,
+    unsupported,
+};
 
 const CODEX_SLASH_COMMANDS = [_]provider_types.ProviderSlashCommand{
     .{
@@ -1607,22 +1616,21 @@ pub const Client = struct {
 
     fn maybeHandleServerRequest(self: *Client, root: std.json.Value, request: provider_types.SendPromptRequest) !bool {
         const method = getOptionalObjectString(root, "method") orelse return false;
-        const request_id = parseMessageId(root) orelse return false;
+        const request_id = parseServerRequestId(root) orelse return false;
 
-        if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
-            try handleCommandApprovalRequest(self, root, request_id, request);
-            return true;
+        switch (serverRequestKind(method)) {
+            .command_approval => try handleCommandApprovalRequest(self, root, request_id, request),
+            .file_change_approval => try handleFileChangeApprovalRequest(self, root, request_id, request),
+            .permissions_approval => try handlePermissionsApprovalRequest(self, root, request_id, request),
+            .dynamic_tool => try handleDynamicToolCallRequest(self, root, request_id, request),
+            .unsupported => {
+                // App-server stops the turn while a server request is unanswered.
+                // A protocol addition must fail explicitly instead of becoming a
+                // silent infinite "Working" state in the GUI.
+                try handleUnsupportedServerRequest(self, method, request_id, request);
+            },
         }
-        if (std.mem.eql(u8, method, "item/fileChange/requestApproval")) {
-            try handleFileChangeApprovalRequest(self, root, request_id, request);
-            return true;
-        }
-        if (std.mem.eql(u8, method, "item/permissions/requestApproval")) {
-            try handlePermissionsApprovalRequest(self, root, request_id, request);
-            return true;
-        }
-
-        return false;
+        return true;
     }
 
     fn writeTextMessage(self: *Client, payload: []const u8) !void {
@@ -2126,6 +2134,22 @@ fn parseMessageId(root: std.json.Value) ?u64 {
         .integer => |value| if (value < 0) null else @as(u64, @intCast(value)),
         else => null,
     };
+}
+
+fn parseServerRequestId(root: std.json.Value) ?std.json.Value {
+    const id_value = getObjectField(root, "id") orelse return null;
+    return switch (id_value) {
+        .integer, .string => id_value,
+        else => null,
+    };
+}
+
+fn serverRequestKind(method: []const u8) ServerRequestKind {
+    if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) return .command_approval;
+    if (std.mem.eql(u8, method, "item/fileChange/requestApproval")) return .file_change_approval;
+    if (std.mem.eql(u8, method, "item/permissions/requestApproval")) return .permissions_approval;
+    if (std.mem.eql(u8, method, "item/tool/call")) return .dynamic_tool;
+    return .unsupported;
 }
 
 fn getObjectField(value: std.json.Value, field: []const u8) ?std.json.Value {
@@ -2794,11 +2818,11 @@ fn emitItemEvent(
     return false;
 }
 
-fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
+fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
     const decision = if (shouldAutoApproveRequest(request))
         .approve
     else blk: {
-        const on_approval_request = request.on_approval_request orelse return;
+        const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractCommandApprovalSummary(root) orelse "Codex requested command approval.";
         break :blk on_approval_request(request.stream_context, .{
             .call_id = "",
@@ -2812,11 +2836,11 @@ fn handleCommandApprovalRequest(self: *Client, root: std.json.Value, request_id:
     });
 }
 
-fn handleFileChangeApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
+fn handleFileChangeApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
     const decision = if (shouldAutoApproveRequest(request))
         .approve
     else blk: {
-        const on_approval_request = request.on_approval_request orelse return;
+        const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractFileChangeApprovalSummary(root) orelse "Codex requested file change approval.";
         break :blk on_approval_request(request.stream_context, .{
             .call_id = "",
@@ -2830,11 +2854,11 @@ fn handleFileChangeApprovalRequest(self: *Client, root: std.json.Value, request_
     });
 }
 
-fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request_id: u64, request: provider_types.SendPromptRequest) !void {
+fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request_id: std.json.Value, request: provider_types.SendPromptRequest) !void {
     const decision = if (shouldAutoApproveRequest(request))
         .approve
     else blk: {
-        const on_approval_request = request.on_approval_request orelse return;
+        const on_approval_request = request.on_approval_request orelse break :blk .deny;
         const body = extractPermissionsApprovalSummary(root) orelse "Codex requested additional permissions.";
         break :blk on_approval_request(request.stream_context, .{
             .call_id = "",
@@ -2848,7 +2872,72 @@ fn handlePermissionsApprovalRequest(self: *Client, root: std.json.Value, request
     });
 }
 
-fn respondToServerRequest(request_id: u64, self: *Client, result: anytype) !void {
+fn handleDynamicToolCallRequest(
+    self: *Client,
+    root: std.json.Value,
+    request_id: std.json.Value,
+    request: provider_types.SendPromptRequest,
+) !void {
+    const params = getObjectField(root, "params") orelse .null;
+    const tool = getOptionalObjectString(params, "tool") orelse "unknown";
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "Verde cannot execute client-hosted Codex tool `{s}`. Continue without it or use built-in Codex tools instead.",
+        .{tool},
+    );
+    defer self.allocator.free(message);
+
+    if (request.on_stream_event) |on_stream_event| {
+        on_stream_event(request.stream_context, .{ .message = .{
+            .title = "Tool unavailable",
+            .body = message,
+        } });
+    }
+
+    const payload = try dynamicToolFailurePayloadAlloc(self.allocator, request_id, message);
+    defer self.allocator.free(payload);
+    try self.writeTextMessage(payload);
+}
+
+fn handleUnsupportedServerRequest(
+    self: *Client,
+    method: []const u8,
+    request_id: std.json.Value,
+    request: provider_types.SendPromptRequest,
+) !void {
+    const message = try std.fmt.allocPrint(self.allocator, "Unsupported Codex app-server request: {s}", .{method});
+    defer self.allocator.free(message);
+    runtime_log.diagnostic("Codex server request unsupported method={s}", .{method});
+
+    if (request.on_stream_event) |on_stream_event| {
+        on_stream_event(request.stream_context, .{ .message = .{
+            .title = "Codex request unsupported",
+            .body = message,
+        } });
+    }
+
+    try respondServerError(request_id, self, JSON_RPC_METHOD_NOT_FOUND, message);
+}
+
+fn dynamicToolFailurePayloadAlloc(allocator: std.mem.Allocator, request_id: std.json.Value, message: []const u8) ![]u8 {
+    const ContentItem = struct {
+        type: []const u8,
+        text: []const u8,
+    };
+    const content_items = [_]ContentItem{.{
+        .type = "inputText",
+        .text = message,
+    }};
+    return stringifyAlloc(allocator, .{
+        .id = request_id,
+        .result = .{
+            .success = false,
+            .contentItems = &content_items,
+        },
+    });
+}
+
+fn respondToServerRequest(request_id: std.json.Value, self: *Client, result: anytype) !void {
     const payload = try stringifyAlloc(self.allocator, .{
         .id = request_id,
         .result = result,
@@ -2857,14 +2946,18 @@ fn respondToServerRequest(request_id: u64, self: *Client, result: anytype) !void
     try self.writeTextMessage(payload);
 }
 
-fn respondServerError(request_id: u64, self: *Client, code: i64, message: []const u8) !void {
-    const payload = try stringifyAlloc(self.allocator, .{
+fn serverErrorPayloadAlloc(allocator: std.mem.Allocator, request_id: std.json.Value, code: i64, message: []const u8) ![]u8 {
+    return stringifyAlloc(allocator, .{
         .id = request_id,
         .@"error" = .{
             .code = code,
             .message = message,
         },
     });
+}
+
+fn respondServerError(request_id: std.json.Value, self: *Client, code: i64, message: []const u8) !void {
+    const payload = try serverErrorPayloadAlloc(self.allocator, request_id, code, message);
     defer self.allocator.free(payload);
     try self.writeTextMessage(payload);
 }
@@ -3451,6 +3544,54 @@ test "shouldAutoApproveRequest follows approval policy" {
     try std.testing.expect(shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .never }));
     try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi", .approval_policy = .on_request }));
     try std.testing.expect(!shouldAutoApproveRequest(.{ .prompt = "hi" }));
+}
+
+test "dynamic tool server request returns a failure result instead of hanging" {
+    const allocator = std.testing.allocator;
+    const request_json =
+        \\{
+        \\  "id": "server-request-1",
+        \\  "method": "item/tool/call",
+        \\  "params": {
+        \\    "threadId": "thread-123",
+        \\    "turnId": "turn-456",
+        \\    "callId": "call-789",
+        \\    "tool": "exec",
+        \\    "arguments": {}
+        \\  }
+        \\}
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{});
+    defer parsed.deinit();
+
+    const method = getOptionalObjectString(parsed.value, "method").?;
+    try std.testing.expectEqual(ServerRequestKind.dynamic_tool, serverRequestKind(method));
+    const request_id = parseServerRequestId(parsed.value).?;
+    const payload = try dynamicToolFailurePayloadAlloc(allocator, request_id, "Tool unavailable.");
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"server-request-1\",\"result\":{\"success\":false,\"contentItems\":[{\"type\":\"inputText\",\"text\":\"Tool unavailable.\"}]}}",
+        payload,
+    );
+}
+
+test "unknown Codex server request receives method not found" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(ServerRequestKind.unsupported, serverRequestKind("currentTime/read"));
+
+    const request_id: std.json.Value = .{ .integer = 42 };
+    const payload = try serverErrorPayloadAlloc(
+        allocator,
+        request_id,
+        JSON_RPC_METHOD_NOT_FOUND,
+        "Unsupported Codex app-server request: currentTime/read",
+    );
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "{\"id\":42,\"error\":{\"code\":-32601,\"message\":\"Unsupported Codex app-server request: currentTime/read\"}}",
+        payload,
+    );
 }
 
 test "detectTurnTerminalState recognizes thread idle fallback for the active thread" {
