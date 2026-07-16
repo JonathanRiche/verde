@@ -3972,6 +3972,36 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
+    // The run pill leads with the fast-mode and access state glyphs that the
+    // dedicated fast/access pills carried before they were consolidated; the
+    // composer reserves the label room via `setReasoningLeadingReserve`.
+    if (state.palette_composer.showReasoningToggle()) {
+        const run_rect = state.palette_composer.reasoningRect();
+        if (run_rect.w > 0.0) {
+            var icon_x = run_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X;
+            if (state.currentComposerShowsFastToggle()) {
+                const fast_icon_rect = snapIconRectOrigin(palette.Rect{
+                    .x = icon_x,
+                    .y = run_rect.y + (run_rect.h - icon_size) * 0.5,
+                    .w = icon_size,
+                    .h = icon_size,
+                });
+                if (state.currentThread().fast_mode == .on) {
+                    drawBoltIcon(state, fast_icon_rect, icon_color);
+                } else {
+                    drawDefaultModeIcon(state, fast_icon_rect, icon_color);
+                }
+                icon_x += app_state.COMPOSER_RUN_PILL_ICON_CELL;
+            }
+            drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
+                .x = icon_x,
+                .y = run_rect.y + (run_rect.h - icon_size) * 0.5,
+                .w = icon_size,
+                .h = icon_size,
+            }), icon_color);
+        }
+    }
+
     if (state.palette_composer.showFastToggle()) {
         const fast_icon_rect = snapIconRectOrigin(palette.Rect{
             .x = fast_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,

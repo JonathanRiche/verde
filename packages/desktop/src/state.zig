@@ -295,7 +295,8 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .reasoning_min_width = 74.0,
     // The run pill now shows a "Reasoning · Speed · Access" summary, so it
     // needs far more room than the old single reasoning label.
-    .reasoning_max_width = 300.0,
+    // Wide enough for the summary text plus the leading state-glyph reserve.
+    .reasoning_max_width = 340.0,
     .fast_min_width = 80.0,
     .fast_max_width = 180.0,
     .access_min_width = 138.0,
@@ -352,6 +353,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
 
 // CSS-unit width of the composer model picker popover; the component scales it
 // (and every other geometry token) by `setUiScale` for HiDPI displays.
+/// Width reserved per host-drawn state glyph leading the run pill's summary
+/// (fast bolt / access lock, ~22px drawn plus spacing); mirrors the sizing
+/// convention of `pill_overlay_icon_reserve`.
+pub const COMPOSER_RUN_PILL_ICON_CELL: f32 = 26.0;
 const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 /// Width of the provider-icon rail on the picker's left edge; the popover's
 /// total width is body + rail.
@@ -14615,6 +14620,12 @@ pub const AppState = struct {
         // is disabled via setExternalReasoningMenu and the run-config steppers
         // own the reasoning data instead.
         self.palette_composer.setShowReasoningToggle(true);
+        // The run pill leads with host-drawn fast/access state glyphs (see
+        // chat_panel.renderComposerToolbarIcons); reserve label room for the
+        // lock plus, when the provider has a speed tier, the bolt.
+        var run_icon_reserve: f32 = COMPOSER_RUN_PILL_ICON_CELL;
+        if (self.currentComposerShowsFastToggle()) run_icon_reserve += COMPOSER_RUN_PILL_ICON_CELL;
+        self.palette_composer.setReasoningLeadingReserve(run_icon_reserve);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
