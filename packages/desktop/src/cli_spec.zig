@@ -11,6 +11,7 @@ pub const top_level_commands = [_][]const u8{
     "capabilities",
     "open",
     "herdr",
+    "theme",
     "state",
     "notify",
     "integrations",
@@ -18,6 +19,13 @@ pub const top_level_commands = [_][]const u8{
     "live",
     "mcp",
     "completion",
+};
+
+pub const theme_commands = [_][]const u8{
+    "import",
+    "validate",
+    "export",
+    "reset",
 };
 
 pub const state_commands = [_][]const u8{

@@ -16,7 +16,10 @@ const spec = @import("cli_spec.zig");
 const db_client = @import("db/client.zig");
 const db_types = @import("db/types.zig");
 const sessionizer = @import("terminal/sessionizer.zig");
+const app_config = @import("config.zig");
+const theme_package = @import("theme_package.zig");
 const update_installer = @import("update_installer.zig");
+const ui_theme = @import("ui/theme.zig");
 
 const VERSION = build_options.version;
 const SOCKET_NAME = live_endpoint.SOCKET_NAME;
@@ -59,12 +62,12 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
         try printVersion(allocator, out, parsed.json);
         return .handled;
     }
-    if (std.mem.eql(u8, parsed.command, "capabilities")) {
-        try printCapabilities(allocator, out, parsed.json);
-        return .handled;
-    }
     if (std.mem.eql(u8, parsed.command, "update")) {
         try handleUpdate(allocator, out, parsed.rest, parsed.json);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "capabilities")) {
+        try printCapabilities(allocator, out, parsed.json);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "open")) {
@@ -77,6 +80,10 @@ fn dispatchArgs(allocator: std.mem.Allocator, io: std.Io, argv: []const []const 
     }
     if (std.mem.eql(u8, parsed.command, "completion")) {
         try handleCompletion(allocator, out, parsed.rest);
+        return .handled;
+    }
+    if (std.mem.eql(u8, parsed.command, "theme")) {
+        try handleTheme(allocator, out, parsed.rest);
         return .handled;
     }
     if (std.mem.eql(u8, parsed.command, "state")) {
@@ -122,15 +129,16 @@ fn printHelp(out: output.Output) !void {
         \\  verde app                     Launch the desktop app explicitly
         \\  verde --help                  Show this help
         \\  verde version [--json]        Print version metadata
+        \\  verde update [--json]         Install the latest Verde release
         \\  verde capabilities [--json]   Print CLI capability metadata
         \\  verde open <url>              Open a URL in this Verde workspace's browser pane
         \\  verde herdr <command>         Open or inspect Herdr-backed Verde workspaces
+        \\  verde theme <command>         Import, validate, export, or reset themes
         \\  verde completion <shell>       Print shell completion script
         \\  verde state <command>         Read persisted state with the app closed
         \\  verde notify [options]        Update the current terminal surface
         \\  verde integrations <command>  Inspect optional provider hook support
         \\  verde session <command>       Manage persistent terminal sessions
-        \\  verde update [--json]         Install the latest Verde release
         \\  verde live <command>          Talk to the running app
         \\  verde mcp                     Run the stdio MCP bridge
         \\
@@ -153,6 +161,12 @@ fn printHelp(out: output.Output) !void {
         \\  install <claude|codex|opencode|cursor>
         \\  remove <claude|codex|opencode|cursor>
         \\  disable <claude|codex|opencode|cursor>
+        \\
+        \\Theme commands:
+        \\  import <file-or-url> [--dry-run] [--json]
+        \\  validate <file-or-url> [--json]
+        \\  export [file] [--name <name>] [--json]
+        \\  reset [--json]
         \\
         \\Session commands:
         \\  list [--json]
@@ -204,21 +218,6 @@ fn printVersion(allocator: std.mem.Allocator, out: output.Output, json: bool) !v
     try out.stdout("verde {s}\n", .{VERSION});
 }
 
-fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
-    const caps = .{
-        .app = "verde",
-        .version = VERSION,
-        .protocol_version = 2,
-        .cli = .{
-            .state = spec.state_commands[0..],
-            .herdr = spec.herdr_commands[0..],
-            .integrations = spec.integration_commands[0..],
-            .session = spec.session_commands[0..],
-            .live = spec.live_capabilities[0..],
-            .completion = spec.shells[0..],
-            .encodings = spec.encodings[0..],
-        },
-        .ipc = .{
 fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8, json: bool) !void {
     if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
         try out.stdout(
@@ -262,13 +261,29 @@ fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const 
     }
 }
 
+fn printCapabilities(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    const caps = .{
+        .app = "verde",
+        .version = VERSION,
+        .protocol_version = 2,
+        .cli = .{
+            .update = true,
+            .state = spec.state_commands[0..],
+            .herdr = spec.herdr_commands[0..],
+            .integrations = spec.integration_commands[0..],
+            .theme = spec.theme_commands[0..],
+            .session = spec.session_commands[0..],
+            .live = spec.live_capabilities[0..],
+            .completion = spec.shells[0..],
+            .encodings = spec.encodings[0..],
+        },
+        .ipc = .{
             .transport = live_endpoint.transportName(),
             .socket_name = SOCKET_NAME,
             .endpoint_env = live_endpoint.ENDPOINT_ENV,
             .terminal_binary_frames = false,
             .mcp_bridge = true,
         },
-            .update = true,
     };
     if (json) {
         try out.jsonValue(allocator, caps);
@@ -277,9 +292,11 @@ fn handleUpdate(allocator: std.mem.Allocator, out: output.Output, argv: []const 
     try out.stdout(
         \\verde CLI capabilities
         \\  protocol: 1
+        \\  update: yes
         \\  state: path, workspaces, panes, threads, transcript
         \\  herdr: open, handoff, unlink, profiles, status
         \\  integrations: list, doctor, install, remove, disable
+        \\  theme: import, validate, export, reset
         \\  session: list, inspect, new, attach, write, tail, screen, kill, cleanup
         \\  live: status, workspaces, panes, pane control, chat control, terminal/process/agent control
         \\  completion: bash, zsh, fish, powershell
@@ -293,7 +310,6 @@ fn workspaceOption(argv: []const []const u8) ?[]const u8 {
     return args.optionValue(argv, "--workspace") orelse args.optionValue(argv, "--project");
 }
 
-        \\  update: yes
 fn handleCompletion(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
     if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
         try printCompletionHelp(out);
@@ -322,6 +338,219 @@ fn printCompletionHelp(out: output.Output) !void {
         \\  verde completion powershell
         \\
     , .{});
+}
+
+fn handleTheme(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
+    if (args.hasFlag(argv, "--help") or args.hasFlag(argv, "-h")) {
+        try printThemeHelp(out);
+        return;
+    }
+    const command = args.positional(argv, 0) orelse {
+        try out.stderr("missing theme command\n", .{});
+        std.process.exit(2);
+    };
+    if (std.mem.eql(u8, command, "help")) {
+        try printThemeHelp(out);
+        return;
+    }
+
+    const json = args.hasFlag(argv, "--json");
+    if (std.mem.eql(u8, command, "import") or std.mem.eql(u8, command, "validate")) {
+        return handleThemeImportOrValidate(allocator, out, argv, command, json);
+    }
+    if (std.mem.eql(u8, command, "export")) return handleThemeExport(allocator, out, argv, json);
+    if (std.mem.eql(u8, command, "reset")) return handleThemeReset(allocator, out, json);
+
+    try out.stderr("unknown theme command: {s}\n", .{command});
+    std.process.exit(2);
+}
+
+fn handleThemeImportOrValidate(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    argv: []const []const u8,
+    command: []const u8,
+    json: bool,
+) !void {
+    const source = trailingFreeArg(argv, 1) orelse {
+        try out.stderr("theme {s} requires a JSON file or HTTP(S) URL\n", .{command});
+        std.process.exit(2);
+    };
+    const raw = readThemeSourceAlloc(allocator, source) catch |err| {
+        failThemeCommand(allocator, out, json, "read theme", err);
+    };
+    defer allocator.free(raw);
+    var package = theme_package.parse(allocator, raw) catch |err| {
+        failThemeCommand(allocator, out, json, "validate theme", err);
+    };
+    defer package.deinit(allocator);
+    const display_name = package.name orelse themeNameFromSource(source);
+
+    const dry_run = std.mem.eql(u8, command, "validate") or args.hasFlag(argv, "--dry-run");
+    if (!dry_run) {
+        var config = app_config.loadAppConfig(allocator) catch |err| {
+            failThemeCommand(allocator, out, json, "load Verde config", err);
+        };
+        defer config.deinit(allocator);
+        const installed_index = config.installTheme(
+            allocator,
+            display_name,
+            package.theme_config,
+            package.font_size,
+            package.terminal_font_size,
+        ) catch |err| {
+            failThemeCommand(allocator, out, json, "install theme", err);
+        };
+        config.selectThemeChoice(allocator, installed_index + 2) catch |err| {
+            failThemeCommand(allocator, out, json, "activate theme", err);
+        };
+        app_config.saveAppConfig(allocator, &config) catch |err| {
+            failThemeCommand(allocator, out, json, "save Verde config", err);
+        };
+    }
+    return writeThemeImportResult(allocator, out, source, display_name, package, dry_run, json);
+}
+
+fn writeThemeImportResult(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    source: []const u8,
+    display_name: []const u8,
+    package: theme_package.Package,
+    dry_run: bool,
+    json: bool,
+) !void {
+    if (json) {
+        try out.jsonValue(allocator, .{
+            .ok = true,
+            .action = if (dry_run) "validated" else "imported",
+            .source = source,
+            .name = display_name,
+            .theme_source = @tagName(package.theme_config.source),
+            .ui_font_size = package.font_size,
+            .terminal_font_size = package.terminal_font_size,
+            .ignored_unsupported_fonts = package.ignored_font_settings,
+        });
+        return;
+    }
+    try out.stdout("Theme {s}: {s}\n", .{ if (dry_run) "validated" else "imported", display_name });
+    if (package.ignored_font_settings) {
+        try out.stderr("warning: unsupported font family settings were ignored; bundled Verde fonts remain active\n", .{});
+    }
+    if (!dry_run) try out.stdout("Installed and selected. You can switch themes from Settings → Appearance.\n", .{});
+}
+
+fn themeNameFromSource(source: []const u8) []const u8 {
+    const without_query = std.mem.sliceTo(source, '?');
+    const basename = std.fs.path.basename(without_query);
+    const stem = std.fs.path.stem(basename);
+    return if (stem.len > 0) stem else "Imported theme";
+}
+
+fn handleThemeExport(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    argv: []const []const u8,
+    json: bool,
+) !void {
+    var config = app_config.loadAppConfig(allocator) catch |err| {
+        failThemeCommand(allocator, out, json, "load Verde config", err);
+    };
+    defer config.deinit(allocator);
+    const name = args.optionValue(argv, "--name") orelse "Verde theme";
+    const encoded = theme_package.exportAlloc(allocator, config, name) catch |err| {
+        failThemeCommand(allocator, out, json, "export theme", err);
+    };
+    defer allocator.free(encoded);
+
+    const raw_path = trailingFreeArg(argv, 1) orelse return out.stdout("{s}", .{encoded});
+    const path = platform_paths.expandUserPath(allocator, raw_path) catch |err| {
+        failThemeCommand(allocator, out, json, "resolve export path", err);
+    };
+    defer allocator.free(path);
+    writeThemeFile(path, encoded) catch |err| {
+        failThemeCommand(allocator, out, json, "write theme", err);
+    };
+    if (json) {
+        try out.jsonValue(allocator, .{ .ok = true, .action = "exported", .path = path, .name = name });
+    } else {
+        try out.stdout("Theme exported to {s}\n", .{path});
+    }
+}
+
+fn handleThemeReset(allocator: std.mem.Allocator, out: output.Output, json: bool) !void {
+    var config = app_config.loadAppConfig(allocator) catch |err| {
+        failThemeCommand(allocator, out, json, "load Verde config", err);
+    };
+    defer config.deinit(allocator);
+    config.selectThemeChoice(allocator, 0) catch |err| {
+        failThemeCommand(allocator, out, json, "select Verde theme", err);
+    };
+    config.font_size = ui_theme.DEFAULT_FONT_SIZE;
+    config.terminal_font_size = app_config.DEFAULT_TERMINAL_FONT_SIZE;
+    app_config.saveAppConfig(allocator, &config) catch |err| {
+        failThemeCommand(allocator, out, json, "save Verde config", err);
+    };
+    if (json) {
+        try out.jsonValue(allocator, .{ .ok = true, .action = "reset" });
+    } else {
+        try out.stdout("Theme reset to platform defaults. The running app will reload it automatically.\n", .{});
+    }
+}
+
+fn printThemeHelp(out: output.Output) !void {
+    try out.stdout(
+        \\Usage:
+        \\  verde theme import <file-or-url> [--dry-run] [--json]
+        \\  verde theme validate <file-or-url> [--json]
+        \\  verde theme export [file] [--name <name>] [--json]
+        \\  verde theme reset [--json]
+        \\
+        \\Theme files are versioned JSON. Import also accepts a full verde.json
+        \\theme section or a bare {{"theme":"default","colors":{{...}}}} object.
+        \\GitHub file-page links and raw HTTP(S) JSON links are supported.
+        \\
+    , .{});
+}
+
+fn readThemeSourceAlloc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, source, "https://") or std.mem.startsWith(u8, source, "http://")) {
+        return theme_package.readSourceAlloc(allocator, source);
+    }
+    const path = try platform_paths.expandUserPath(allocator, source);
+    defer allocator.free(path);
+    return theme_package.readSourceAlloc(allocator, path);
+}
+
+fn writeThemeFile(path: []const u8, encoded: []const u8) !void {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.writeAll(encoded);
+    try writer.interface.flush();
+}
+
+fn failThemeCommand(
+    allocator: std.mem.Allocator,
+    out: output.Output,
+    json: bool,
+    action: []const u8,
+    err: anyerror,
+) noreturn {
+    if (json) {
+        out.jsonValue(allocator, .{
+            .ok = false,
+            .action = action,
+            .@"error" = @errorName(err),
+        }) catch {};
+    } else {
+        out.stderr("failed to {s}: {s}\n", .{ action, @errorName(err) }) catch {};
+    }
+    std.process.exit(1);
 }
 
 fn handleState(allocator: std.mem.Allocator, out: output.Output, argv: []const []const u8) !void {
@@ -3412,6 +3641,13 @@ test "cli args parse command and json flag" {
     const parsed = args.parse(&argv);
     try std.testing.expectEqualStrings("state", parsed.command);
     try std.testing.expect(parsed.json);
+}
+
+test "update is advertised as a top-level command" {
+    for (spec.top_level_commands) |command| {
+        if (std.mem.eql(u8, command, "update")) return;
+    }
+    return error.MissingUpdateCommand;
 }
 
 test "open free arg skips project option value" {
