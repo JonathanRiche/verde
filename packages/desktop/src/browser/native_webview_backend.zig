@@ -130,6 +130,12 @@ pub const Backend = struct {
         return self.pane_texture;
     }
 
+    /// Returns a caller-owned copy of the most recent CPU-side browser frame, if any.
+    pub fn copyFramePixels(self: *Backend, allocator: std.mem.Allocator) !?browser_texture.CopiedFrame {
+        if (builtin.os.tag != .linux) return null;
+        return self.platform.copyFramePixels(allocator);
+    }
+
     /// Shows the native browser surface.
     pub fn show(self: *Backend) !void {
         try self.platform.show();
