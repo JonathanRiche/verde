@@ -294,7 +294,9 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 270.0,
     .reasoning_min_width = 74.0,
-    .reasoning_max_width = 160.0,
+    // The run pill now shows a "Reasoning · Speed · Access" summary, so it
+    // needs far more room than the old single reasoning label.
+    .reasoning_max_width = 300.0,
     .fast_min_width = 80.0,
     .fast_max_width = 180.0,
     .access_min_width = 138.0,
@@ -349,12 +351,14 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .z_index = 120,
 });
 
-const COMPOSER_MODEL_CASCADE_WIDTH: f32 = 440.0;
-const COMPOSER_MODEL_CASCADE_ROW_HEIGHT: f32 = 42.0;
-const COMPOSER_MODEL_CASCADE_PADDING_Y: f32 = 12.0;
-const COMPOSER_MODEL_CASCADE_VISIBLE_ROWS: usize = 8;
-const COMPOSER_MODEL_CASCADE_GAP: f32 = 8.0;
-const COMPOSER_MODEL_CASCADE_ROOT_DROP: f32 = 26.0;
+// CSS-unit width of the composer model picker popover; the component scales it
+// (and every other geometry token) by `setUiScale` for HiDPI displays.
+const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
+/// Width of the provider-icon rail on the picker's left edge; the popover's
+/// total width is body + rail.
+const COMPOSER_MODEL_PICKER_RAIL_WIDTH: f32 = 52.0;
+const COMPOSER_MODEL_PICKER_Z: i32 = 1400;
+pub const COMPOSER_RUN_CONFIG_Z: i32 = 1400;
 const COMPOSER_PROVIDER_OPTIONS = [_]Provider{ .codex, .opencode, .claude, .cursor };
 
 fn paletteEstimatedFontAdvance(_: ?*anyopaque, text: []const u8, byte_offset: usize, font_size: f32) palette.FontAdvance {
@@ -549,23 +553,6 @@ fn paletteModelLabel(context: ?*anyopaque, index: usize) []const u8 {
     return options[index].label;
 }
 
-fn paletteReasoningLabel(context: ?*anyopaque, index: usize) []const u8 {
-    const state = appStateFromContext(context) orelse return "";
-    const thread = state.currentThread();
-    if (thread.provider == .codex) {
-        if (index >= CODEX_REASONING_OPTIONS.len) return "";
-        return CODEX_REASONING_OPTIONS[index].label;
-    }
-    if (thread.provider == .cursor) {
-        const rows = state.opencode_reasoning_menu.items;
-        if (index >= rows.len) return "";
-        return rows[index].label;
-    }
-    const rows = state.opencode_reasoning_menu.items;
-    if (index >= rows.len) return "";
-    return rows[index].label;
-}
-
 fn composerModelOptions(state: *const AppState, provider: Provider) []const ModelOption {
     return chat_threads.modelOptions(
         ModelOption,
@@ -680,7 +667,10 @@ fn paletteComposerPromptEvent(context: ?*anyopaque, event: palette.ComposerPromp
                 state.unfocusBrowserPane();
             }
         },
-        .model_clicked, .reasoning_clicked => {},
+        // Pill clicks that reach the composer directly (outside the overlay
+        // hit-rect path) still open the host popovers.
+        .model_clicked => state.openPaletteModelPicker(),
+        .reasoning_clicked => state.toggleRunConfigPopover(),
     }
 }
 
@@ -690,69 +680,75 @@ fn paletteComposerGetClipboard(context: ?*anyopaque, allocator: std.mem.Allocato
     return state.readClipboardTextForPaste();
 }
 
-fn providerForComposerCascadeIndex(index: usize) ?Provider {
-    if (index >= COMPOSER_PROVIDER_OPTIONS.len) return null;
-    return COMPOSER_PROVIDER_OPTIONS[index];
+/// One row of the composer model picker: a concrete model under a provider
+/// group. Rebuilt by `rebuildModelPickerEntries` whenever the picker syncs.
+pub const ModelPickerEntry = struct {
+    provider: Provider,
+    option_index: usize,
+};
+
+fn modelPickerEntryAt(state: *const AppState, index: usize) ?ModelPickerEntry {
+    if (index >= state.model_picker_entries.items.len) return null;
+    return state.model_picker_entries.items[index];
 }
 
-fn composerCascadeIndexForProvider(provider: Provider) ?usize {
-    for (COMPOSER_PROVIDER_OPTIONS, 0..) |candidate, index| {
-        if (candidate == provider) return index;
-    }
-    return null;
+fn modelPickerOptionAt(state: *const AppState, index: usize) ?ModelOption {
+    const entry = modelPickerEntryAt(state, index) orelse return null;
+    const options = composerModelOptions(state, entry.provider);
+    if (entry.option_index >= options.len) return null;
+    return options[entry.option_index];
 }
 
-fn paletteModelCascadeLabel(context: ?*anyopaque, path: []const usize, index: usize) []const u8 {
+fn paletteModelPickerLabel(context: ?*anyopaque, index: usize) []const u8 {
     const state = appStateFromContext(context) orelse return "";
-    if (path.len == 0) {
-        const provider = providerForComposerCascadeIndex(index) orelse return "";
-        return chat_threads.providerLabel(provider);
-    }
-    if (path.len == 1) {
-        const provider = providerForComposerCascadeIndex(path[0]) orelse return "";
-        const options = composerModelOptions(state, provider);
-        if (index >= options.len) return "";
-        return options[index].label;
-    }
+    const option = modelPickerOptionAt(state, index) orelse return "";
+    return option.label;
+}
+
+fn paletteModelPickerDescription(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = modelPickerEntryAt(state, index) orelse return "";
+    // Rows show the provider under the model name (with its logo rendered by
+    // `leading_on_description`), mirroring the reference picker design.
+    return chat_threads.providerLabel(entry.provider);
+}
+
+fn paletteModelPickerBadge(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = modelPickerEntryAt(state, index) orelse return "";
+    const option = modelPickerOptionAt(state, index) orelse return "";
+    const value = option.value orelse return "";
+    if (std.mem.eql(u8, value, composerDefaultModelRef(state, entry.provider))) return "Default";
     return "";
 }
 
-fn paletteModelCascadeChildCount(context: ?*anyopaque, path: []const usize, index: usize) usize {
-    const state = appStateFromContext(context) orelse return 0;
-    if (path.len != 0) return 0;
-    const provider = providerForComposerCascadeIndex(index) orelse return 0;
-    return composerModelOptions(state, provider).len;
+fn paletteModelPickerGroup(context: ?*anyopaque, index: usize) []const u8 {
+    const state = appStateFromContext(context) orelse return "";
+    const entry = modelPickerEntryAt(state, index) orelse return "";
+    return chat_threads.providerLabel(entry.provider);
 }
 
-fn paletteModelCascadeRenderRowLeading(
-    context: ?*anyopaque,
+/// Contain-fits the provider logo into `slot`. Serves both picker icon
+/// contexts: the small description-line icon and the rail entries.
+fn drawModelPickerProviderLogo(
+    state: *AppState,
     allocator: std.mem.Allocator,
     batch: *palette.draw.RenderBatch,
-    depth: usize,
-    path: []const usize,
-    index: usize,
+    provider: Provider,
     clip: palette.draw.Rect,
-    leading_rect: palette.draw.Rect,
+    slot: palette.draw.Rect,
 ) void {
-    _ = path;
-    if (depth != 0) return;
-    const state = appStateFromContext(context) orelse return;
-    const provider = providerForComposerCascadeIndex(index) orelse return;
-    const tex = switch (provider) {
-        .codex => state.codex_logo_texture,
-        .opencode => state.opencode_logo_texture,
-        .claude => state.claude_logo_texture,
-        .cursor => state.cursor_logo_texture,
-    } orelse return;
+    const tex = state.providerLogoTexture(provider) orelse return;
     if (!tex.valid or tex.texture_id == 0) return;
-    const inner = @min(leading_rect.w, leading_rect.h);
-    const sz = inner * @min(0.68 * 1.5, 0.96);
-    const ix = leading_rect.x + (leading_rect.w - sz) * 0.5;
-    const iy = leading_rect.y + (leading_rect.h - sz) * 0.5;
-    const slot: palette.Rect = .{ .x = ix, .y = iy, .w = sz, .h = sz };
-    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, slot.x, slot.y, slot.w, slot.h));
-    const r: palette.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
-    batch.image(allocator, r, palette.TextureId.init(tex.texture_id), .{
+    const inner = @min(slot.w, slot.h);
+    const square: palette.Rect = .{
+        .x = slot.x + (slot.w - inner) * 0.5,
+        .y = slot.y + (slot.h - inner) * 0.5,
+        .w = inner,
+        .h = inner,
+    };
+    const c = utils.snapImageRectToPixels(utils.imageRectContain(tex.width, tex.height, square.x, square.y, square.w, square.h));
+    batch.image(allocator, .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h }, palette.TextureId.init(tex.texture_id), .{
         .x = 0.0,
         .y = 0.0,
         .w = 1.0,
@@ -760,67 +756,245 @@ fn paletteModelCascadeRenderRowLeading(
     }, .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 }, clip) catch {};
 }
 
-fn paletteModelCascadeStyle() palette.CascadeMenuStyle {
+fn paletteModelPickerRenderRowLeading(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    index: usize,
+    clip: palette.draw.Rect,
+    leading_rect: palette.draw.Rect,
+) void {
+    const state = appStateFromContext(context) orelse return;
+    const entry = modelPickerEntryAt(state, index) orelse return;
+    drawModelPickerProviderLogo(state, allocator, batch, entry.provider, clip, leading_rect);
+}
+
+fn paletteModelPickerRailIcon(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    batch: *palette.draw.RenderBatch,
+    first_item: usize,
+    clip: palette.draw.Rect,
+    icon_rect: palette.draw.Rect,
+) void {
+    const state = appStateFromContext(context) orelse return;
+    const entry = modelPickerEntryAt(state, first_item) orelse return;
+    drawModelPickerProviderLogo(state, allocator, batch, entry.provider, clip, icon_rect);
+}
+
+fn paletteModelPickerStyle() palette.RichPickerStyle {
     return .{
         .background_color = paletteColor(theme.COLOR_PANEL_ALT),
         .border_color = paletteColor(theme.COLOR_PANEL_MUTED),
-        .highlighted_color = paletteColor(theme.withAlpha(theme.selection(), 190)),
+        .highlighted_color = paletteColor(theme.lighten(theme.COLOR_PANEL_ALT, 0.08)),
+        // The inline accent check marks the active model, so the row fill
+        // stays subtle instead of a solid selection block.
+        .selected_color = paletteColor(theme.withAlpha(theme.selection(), 70)),
         .text_color = paletteColor(theme.COLOR_WHITE),
-        .icon_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .description_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .header_color = paletteColor(theme.COLOR_TEXT_SUBTLE),
+        .badge_background_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 220)),
+        .badge_text_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .icon_color = paletteColor(theme.COLOR_GREEN),
+        .accent_color = paletteColor(theme.COLOR_GREEN),
+        .rail_background_color = paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.35)),
+        .search_background_color = paletteColor(theme.darken(theme.COLOR_PANEL_ALT, 0.25)),
+        .search_border_color = paletteColor(theme.COLOR_PANEL_MUTED),
+        .search_selection_color = paletteColor(theme.withAlpha(theme.selection(), 140)),
         .scrollbar_track_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 110)),
         .scrollbar_thumb_color = paletteColor(theme.withAlpha(theme.COLOR_TEXT_MUTED, 220)),
     };
 }
 
-pub const PaletteModelCascadeMenu = palette.cascadeMenu(.{
-    .width = COMPOSER_MODEL_CASCADE_WIDTH,
-    .row_height = COMPOSER_MODEL_CASCADE_ROW_HEIGHT,
-    .max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS,
-    .max_depth = 2,
-    .padding_x = 14.0,
-    .padding_y = COMPOSER_MODEL_CASCADE_PADDING_Y,
-    .submenu_gap = COMPOSER_MODEL_CASCADE_GAP,
-    .glyph_width = 10.8,
-    .font_size = 20.0,
-    .chevron_icon = "\u{EAB6}",
-    .icon_gap = 12.0,
-    .row_leading_width = 34.0,
-    .row_leading_to_label_gap = 8.0,
-    .render_row_leading = paletteModelCascadeRenderRowLeading,
-    .background_color = .{ .r = 0.09, .g = 0.10, .b = 0.13, .a = 1.0 },
-    .border_color = .{ .r = 0.24, .g = 0.28, .b = 0.34, .a = 1.0 },
-    .highlighted_color = .{ .r = 0.18, .g = 0.21, .b = 0.27, .a = 1.0 },
-    .text_color = .{ .r = 0.92, .g = 0.94, .b = 0.98, .a = 1.0 },
-    .icon_color = .{ .r = 0.67, .g = 0.71, .b = 0.80, .a = 1.0 },
-    .scrollbar_track_color = .{ .r = 0.17, .g = 0.19, .b = 0.22, .a = 0.55 },
-    .scrollbar_thumb_color = .{ .r = 0.48, .g = 0.54, .b = 0.64, .a = 0.88 },
-    .scrollbar_width = 5.0,
+pub const PaletteModelPicker = palette.richPicker(.{
+    .width = COMPOSER_MODEL_PICKER_WIDTH,
+    .row_height = 34.0,
+    .row_height_with_description = 50.0,
+    .header_row_height = 26.0,
+    .max_body_height = 380.0,
+    .padding_x = 10.0,
+    .padding_y = 10.0,
+    .row_padding_x = 10.0,
     .corner_radius = 14.0,
     .border_width = 1.0,
-    .z_index = 1400,
-    .submenu_z_offset = 20,
+    .font_size = 15.5,
+    .description_font_size = 12.0,
+    .header_font_size = 12.0,
+    .badge_font_size = 11.0,
+    .search_enabled = true,
+    .search_min_items = 8,
+    .search_height = 36.0,
+    .search_placeholder = "Search models…",
+    .search_style = .underline,
+    // codicon-search magnifier leads the query field.
+    .search_icon = "\u{EA6D}",
+    .search_gap = 10.0,
+    // The provider logo renders small on each row's description line rather
+    // than spanning the row.
+    .render_row_leading = paletteModelPickerRenderRowLeading,
+    .leading_on_description = true,
+    .item_label = paletteModelPickerLabel,
+    .item_description = paletteModelPickerDescription,
+    .item_badge = paletteModelPickerBadge,
+    .item_group = paletteModelPickerGroup,
+    // Provider rail on the left; codicon star-full tops it as "all models".
+    .rail_enabled = true,
+    .rail_width = COMPOSER_MODEL_PICKER_RAIL_WIDTH,
+    .rail_item_height = 46.0,
+    .rail_icon_size = 24.0,
+    .rail_all_icon = "\u{EB59}",
+    .render_rail_icon = paletteModelPickerRailIcon,
+    // codicon-check marks the active model inline after its name.
+    .check_icon = "\u{EAB2}",
+    .check_inline = true,
+    // Ctrl+1..9 select the first nine visible rows; the raw SDL digits are
+    // routed in `routePaletteComposerKeyDown`.
+    .shortcut_badge_limit = 9,
     .placement = .above,
-    .submenu_placement = .right,
-    .avoid_forbidden_for_root = false,
-    .avoid_forbidden_for_submenus = true,
-    .item_count = COMPOSER_PROVIDER_OPTIONS.len,
-    .item_label = paletteModelCascadeLabel,
-    .child_count = paletteModelCascadeChildCount,
+    .scrollbar_width = 5.0,
+    .z_index = COMPOSER_MODEL_PICKER_Z,
 });
 
-fn paletteModelCascadeEvent(context: ?*anyopaque, event: palette.CascadeMenuEvent) void {
+fn paletteModelPickerEvent(context: ?*anyopaque, event: palette.RichPickerEvent) void {
     const state = appStateFromContext(context) orelse return;
     switch (event) {
-        .selected => |selection| {
-            if (selection.path.len != 1) return;
-            const provider = providerForComposerCascadeIndex(selection.path[0]) orelse return;
-            const options = composerModelOptions(state, provider);
-            if (selection.index >= options.len) return;
-            state.setCurrentThreadProvider(provider);
-            state.setCurrentThreadModelRef(options[selection.index].value);
+        .selected => |index| {
+            const entry = modelPickerEntryAt(state, index) orelse return;
+            const option = modelPickerOptionAt(state, index) orelse return;
+            if (entry.provider != state.currentThread().provider) {
+                state.setCurrentThreadProvider(entry.provider);
+            }
+            state.setCurrentThreadModelRef(option.value);
             state.syncPaletteComposerControls();
         },
         .highlighted, .open_changed => {},
+    }
+}
+
+/// Ordered rows of the composer run-configuration popover. Reasoning and
+/// speed only appear when the current provider/model supports them; access
+/// applies to every provider.
+pub const RunConfigRowKind = enum(u8) {
+    reasoning = 0,
+    speed = 1,
+    access = 2,
+};
+
+/// Stable per-stepper context so one comptime Stepper type serves all three
+/// run-config rows; `state` is refreshed every sync in case AppState moved.
+pub const RunStepperContext = struct {
+    state: ?*AppState = null,
+    kind: RunConfigRowKind = .access,
+};
+
+const RUN_SPEED_STEP_LABELS = [_][:0]const u8{ "Default", "Fast" };
+const RUN_SPEED_STEP_DESCRIPTIONS = [_][:0]const u8{
+    "Balanced speed and quality",
+    "Prioritizes faster responses",
+};
+const RUN_ACCESS_STEP_LABELS = [_][:0]const u8{ "Supervised", "Full access" };
+const RUN_ACCESS_STEP_DESCRIPTIONS = [_][:0]const u8{
+    "Asks before running risky commands",
+    "Runs commands without asking first",
+};
+
+fn runStepperStateFromContext(context: ?*anyopaque) ?struct { state: *AppState, kind: RunConfigRowKind } {
+    const ptr = context orelse return null;
+    const stepper_context: *RunStepperContext = @ptrCast(@alignCast(ptr));
+    const state = stepper_context.state orelse return null;
+    return .{ .state = state, .kind = stepper_context.kind };
+}
+
+fn runReasoningStepLabel(state: *const AppState, index: usize) []const u8 {
+    if (state.currentThread().provider == .codex) {
+        if (index >= CODEX_REASONING_OPTIONS.len) return "";
+        return CODEX_REASONING_OPTIONS[index].label;
+    }
+    const rows = state.opencode_reasoning_menu.items;
+    if (index >= rows.len) return "";
+    return rows[index].label;
+}
+
+fn reasoningEffortStepDescription(effort: ?ReasoningEffort) []const u8 {
+    const value = effort orelse return "Provider default reasoning";
+    return switch (value) {
+        .low => "Fastest, lightest reasoning",
+        .medium => "Balanced depth and speed",
+        .high => "Deeper reasoning for harder tasks",
+        .xhigh => "Very deep reasoning, slower",
+        .max => "Maximum depth for the hardest problems",
+    };
+}
+
+fn runReasoningStepDescription(state: *const AppState, index: usize) []const u8 {
+    if (state.currentThread().provider == .codex) {
+        if (index >= CODEX_REASONING_OPTIONS.len) return "";
+        return reasoningEffortStepDescription(CODEX_REASONING_OPTIONS[index].value);
+    }
+    const rows = state.opencode_reasoning_menu.items;
+    if (index >= rows.len) return "";
+    const variant = rows[index].variant orelse return reasoningEffortStepDescription(null);
+    if (parseReasoningEffort(variant)) |effort| return reasoningEffortStepDescription(effort);
+    return "Model-specific reasoning variant";
+}
+
+fn runStepLabel(context: ?*anyopaque, index: usize) []const u8 {
+    const resolved = runStepperStateFromContext(context) orelse return "";
+    return switch (resolved.kind) {
+        .reasoning => runReasoningStepLabel(resolved.state, index),
+        .speed => if (index < RUN_SPEED_STEP_LABELS.len) RUN_SPEED_STEP_LABELS[index] else "",
+        .access => if (index < RUN_ACCESS_STEP_LABELS.len) RUN_ACCESS_STEP_LABELS[index] else "",
+    };
+}
+
+fn runStepDescription(context: ?*anyopaque, index: usize) []const u8 {
+    const resolved = runStepperStateFromContext(context) orelse return "";
+    return switch (resolved.kind) {
+        .reasoning => runReasoningStepDescription(resolved.state, index),
+        .speed => if (index < RUN_SPEED_STEP_DESCRIPTIONS.len) RUN_SPEED_STEP_DESCRIPTIONS[index] else "",
+        .access => if (index < RUN_ACCESS_STEP_DESCRIPTIONS.len) RUN_ACCESS_STEP_DESCRIPTIONS[index] else "",
+    };
+}
+
+fn paletteRunStepperStyle() palette.StepperStyle {
+    return .{
+        .track_color = paletteColor(theme.withAlpha(theme.background(), 160)),
+        .segment_color = paletteColor(theme.withAlpha(theme.COLOR_PANEL_MUTED, 140)),
+        .segment_hover_color = paletteColor(theme.lighten(theme.COLOR_PANEL_MUTED, 0.10)),
+        // The selected thumb uses the theme accent (like the send button) so
+        // it stands out from the muted base segments in every theme.
+        .segment_selected_color = paletteColor(theme.withAlpha(theme.COLOR_GREEN, 230)),
+        .text_color = paletteColor(theme.COLOR_TEXT_MUTED),
+        .text_selected_color = paletteColor(theme.COLOR_WHITE),
+        .description_color = paletteColor(theme.COLOR_TEXT_SUBTLE),
+    };
+}
+
+pub const PaletteRunStepper = palette.stepper(.{
+    .segment_height = 30.0,
+    .segment_gap = 4.0,
+    .corner_radius = 9.0,
+    .font_size = 13.0,
+    .description_font_size = 12.0,
+    .description_gap = 6.0,
+    .show_description = true,
+    .step_label = runStepLabel,
+    .step_description = runStepDescription,
+    .z_index = COMPOSER_RUN_CONFIG_Z + 2,
+});
+
+fn paletteRunStepperEvent(context: ?*anyopaque, event: palette.StepperEvent) void {
+    const resolved = runStepperStateFromContext(context) orelse return;
+    switch (event) {
+        .changed => |index| {
+            const composer_event: palette.ComposerPromptEvent = switch (resolved.kind) {
+                .reasoning => .{ .reasoning_changed = index },
+                .speed => .{ .fast_changed = index == 1 },
+                .access => .{ .access_changed = index == 1 },
+            };
+            paletteComposerPromptEvent(resolved.state, composer_event);
+        },
+        .hover_changed => {},
     }
 }
 
@@ -4210,7 +4384,16 @@ pub const AppState = struct {
     composer_toolbar_fast_rect: palette.Rect,
     composer_toolbar_access_rect: palette.Rect,
     palette_composer: PaletteComposerPrompt,
-    palette_model_cascade: PaletteModelCascadeMenu,
+    palette_model_picker: PaletteModelPicker,
+    model_picker_entries: std.ArrayList(ModelPickerEntry),
+    run_config_open: bool,
+    /// Index into the currently visible run-config rows for keyboard focus.
+    run_config_focused_row: usize,
+    /// Monotonic-ms timestamp of the last stepper animation tick; drives the
+    /// run-config thumb slide (see `tickRunConfigSteppers`).
+    run_config_last_tick_ms: i64,
+    run_steppers: [3]PaletteRunStepper,
+    run_stepper_contexts: [3]RunStepperContext,
     palette_overlay_batch: palette.RenderBatch,
     palette_frame_text: std.ArrayList(u8),
     palette_frame_text_arena: std.heap.ArenaAllocator,
@@ -4483,7 +4666,13 @@ pub const AppState = struct {
             .composer_toolbar_fast_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .composer_toolbar_access_rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 },
             .palette_composer = PaletteComposerPrompt.init(),
-            .palette_model_cascade = PaletteModelCascadeMenu.initFromConfig(),
+            .palette_model_picker = PaletteModelPicker.init(0),
+            .model_picker_entries = .empty,
+            .run_config_open = false,
+            .run_config_focused_row = 0,
+            .run_config_last_tick_ms = 0,
+            .run_steppers = .{ PaletteRunStepper.init(0), PaletteRunStepper.init(2), PaletteRunStepper.init(2) },
+            .run_stepper_contexts = .{ .{}, .{}, .{} },
             .palette_overlay_batch = .{},
             .palette_frame_text = .empty,
             .palette_frame_text_arena = std.heap.ArenaAllocator.init(allocator),
@@ -9892,6 +10081,17 @@ pub const AppState = struct {
         return self.currentDraft();
     }
 
+    /// Shared provider → logo texture lookup for pickers/pills; returns null
+    /// until the texture uploads.
+    pub fn providerLogoTexture(self: *const AppState, provider: Provider) ?CachedImageTexture {
+        return switch (provider) {
+            .codex => self.codex_logo_texture,
+            .opencode => self.opencode_logo_texture,
+            .claude => self.claude_logo_texture,
+            .cursor => self.cursor_logo_texture,
+        };
+    }
+
     pub fn currentComposerModelLabel(self: *const AppState) []const u8 {
         const thread = self.currentThread();
         const options = composerModelOptions(self, thread.provider);
@@ -11035,11 +11235,12 @@ pub const AppState = struct {
         return self.sidebar_context_menu_open;
     }
 
-    /// Reports whether a composer-owned menu/cascade is open over the workspace.
+    /// Reports whether a composer-owned menu/popover is open over the workspace.
     pub fn isComposerMenuOpen(self: *const AppState) bool {
         return self.composer_locked_model_picker_open or
             self.palette_composer.active_menu != null or
-            self.palette_model_cascade.isOpen();
+            self.palette_model_picker.isOpen() or
+            self.run_config_open;
     }
 
     /// Opens or closes the browser inspector mode menu for live parity smokes.
@@ -11083,10 +11284,16 @@ pub const AppState = struct {
     /// Opens or closes a composer-owned menu for live overlay parity smokes.
     pub fn setComposerMenuOpen(self: *AppState, open: bool) void {
         if (open) {
-            self.palette_composer.active_menu = .reasoning;
-            self.palette_composer.hovered_menu_index = 0;
+            self.openRunConfigPopover();
+            // Empty workspaces cannot host the run-config popover (no current
+            // thread), but live parity smokes still expect the overlay flag to
+            // report open; fall back to the composer's inert menu marker.
+            if (!self.run_config_open) {
+                self.palette_composer.active_menu = .reasoning;
+                self.palette_composer.hovered_menu_index = 0;
+            }
             self.composer_locked_model_picker_open = false;
-            _ = self.palette_model_cascade.handleInput(.close);
+            self.closePaletteModelPicker();
             self.browser_inspector_menu_open = false;
             self.workspace_header_open_menu_open = false;
             self.workspace_header_open_menu_pane_id = null;
@@ -11096,7 +11303,8 @@ pub const AppState = struct {
             self.palette_composer.active_menu = null;
             self.palette_composer.hovered_menu_index = null;
             self.composer_locked_model_picker_open = false;
-            _ = self.palette_model_cascade.handleInput(.close);
+            self.closePaletteModelPicker();
+            self.closeRunConfigPopover();
         }
         self.syncBrowserPaneBoundsToBackend();
     }
@@ -11341,7 +11549,8 @@ pub const AppState = struct {
             self.sidebar_context_menu_open or
             self.composer_locked_model_picker_open or
             self.palette_composer.active_menu != null or
-            self.palette_model_cascade.isOpen();
+            self.palette_model_picker.isOpen() or
+            self.run_config_open;
     }
 
     fn suppressNextBrowserClosedEvent(self: *AppState) void {
@@ -13945,6 +14154,11 @@ pub const AppState = struct {
         var layout = &self.projects.items[project_index].workspace_layout;
         const pane = layout.paneById(pane_id) orelse return false;
         if (pane.minimized) return false;
+        // Composer popovers belong to the live composer pane; leaving them
+        // open on a pane that no longer renders them would silently keep
+        // eating clicks through the popover routing.
+        self.closePaletteModelPicker();
+        self.closeRunConfigPopover();
         layout.focused_pane_id = pane_id;
         switch (pane.ref) {
             .chat => |ref| {
@@ -14917,9 +15131,13 @@ pub const AppState = struct {
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE)));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_ICON_FONT_SIZE)));
         const thread = self.currentThread();
-        const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
-        const show_fast_toggle = thread.provider == .codex or (cursor_model != null and cursor_model.?.cursor_fast_supported);
-        self.palette_composer.setShowFastToggle(show_fast_toggle);
+        // Model + run pills open host popovers (rich picker / run-config
+        // panel); fast and access moved into the run-config popover, so their
+        // dedicated pills stay hidden.
+        self.palette_composer.setExternalModelMenu(true);
+        self.palette_composer.setExternalReasoningMenu(true);
+        self.palette_composer.setShowFastToggle(false);
+        self.palette_composer.setShowAccessToggle(false);
         const hide_placeholder = thread.draftImageCount() > 0;
         self.palette_composer.setPlaceholder(self.allocator, if (!hide_placeholder) "Ask anything, or use / to show available commands" else " ") catch |err| {
             log.warn("failed to sync palette composer placeholder: {s}", .{@errorName(err)});
@@ -14930,21 +15148,13 @@ pub const AppState = struct {
             log.warn("failed to refresh OpenCode reasoning menu: {s}", .{@errorName(err)});
             self.clearOpencodeReasoningMenu();
         };
-        const show_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
-        self.palette_composer.setShowReasoningToggle(show_reasoning);
-        const reasoning_count: usize = switch (thread.provider) {
-            .codex => CODEX_REASONING_OPTIONS.len,
-            else => self.opencode_reasoning_menu.items.len,
-        };
-        self.palette_composer.setReasoningOptions(self, reasoning_count, paletteReasoningLabel);
+        // The run pill (former reasoning pill) is always visible: it anchors
+        // the run-config popover and summarizes reasoning / speed / access.
+        // Its option list stays un-synced on purpose — the built-in dropdown
+        // is disabled via setExternalReasoningMenu and the run-config steppers
+        // own the reasoning data instead.
+        self.palette_composer.setShowReasoningToggle(true);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
-        self.palette_composer.reasoning_index = composerReasoningIndexForThread(self, thread);
-        if (show_fast_toggle) {
-            self.palette_composer.fast_enabled = thread.fast_mode == .on;
-        } else {
-            self.palette_composer.fast_enabled = false;
-        }
-        self.palette_composer.access_enabled = thread.access_mode == .full_access;
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
             if (index < model_options.len) {
@@ -14953,79 +15163,126 @@ pub const AppState = struct {
                 };
             }
         }
-        if (self.palette_composer.reasoning_index) |index| {
-            if (thread.provider == .codex) {
-                if (index < CODEX_REASONING_OPTIONS.len) {
-                    self.palette_composer.setReasoningLabel(self.allocator, CODEX_REASONING_OPTIONS[index].label) catch |err| {
-                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
-                    };
-                }
-            } else {
-                const rows = self.opencode_reasoning_menu.items;
-                if (index < rows.len) {
-                    self.palette_composer.setReasoningLabel(self.allocator, std.mem.sliceTo(rows[index].label, 0)) catch |err| {
-                        log.warn("failed to sync palette composer reasoning label: {s}", .{@errorName(err)});
-                    };
+        // Sized for a worst-case dynamic reasoning-variant label plus both
+        // fixed segments; overflow degrades to a truncated summary.
+        var summary_buf: [192]u8 = undefined;
+        self.palette_composer.setReasoningLabel(self.allocator, self.composerRunSummary(&summary_buf)) catch |err| {
+            log.warn("failed to sync palette composer run summary label: {s}", .{@errorName(err)});
+        };
+        if (self.run_config_open) self.syncRunConfigSteppers();
+    }
+
+    /// Compact " · "-joined summary of the run settings (reasoning, speed,
+    /// access) shown on the composer run pill and the inactive preview pill.
+    pub fn composerRunSummary(self: *const AppState, buf: []u8) []const u8 {
+        var writer: std.Io.Writer = .fixed(buf);
+        var wrote_any = false;
+        const thread = self.currentThread();
+        const has_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
+        if (has_reasoning) {
+            writer.writeAll(self.currentComposerReasoningLabel()) catch {};
+            wrote_any = true;
+        }
+        if (self.currentComposerShowsFastToggle()) {
+            if (wrote_any) writer.writeAll(" · ") catch {};
+            writer.writeAll(self.currentComposerFastLabel()) catch {};
+            wrote_any = true;
+        }
+        if (wrote_any) writer.writeAll(" · ") catch {};
+        writer.writeAll(self.currentComposerAccessLabel()) catch {};
+        return writer.buffered();
+    }
+
+    pub fn syncPaletteModelPicker(self: *AppState) void {
+        self.palette_model_picker.setCallbacks(.{
+            .context = self,
+            .on_event = paletteModelPickerEvent,
+            // Ctrl+V pastes into the embedded search field while open.
+            .get_clipboard = paletteComposerGetClipboard,
+        });
+        self.palette_model_picker.setStyle(paletteModelPickerStyle());
+        self.palette_model_picker.setUiScale(theme.uiScaleFactor());
+        self.palette_model_picker.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(15.5)));
+        self.rebuildModelPickerEntries() catch |err| {
+            log.warn("failed to rebuild model picker entries: {s}", .{@errorName(err)});
+        };
+        self.palette_model_picker.setItemCount(self.model_picker_entries.items.len);
+        self.palette_model_picker.setSelectedItem(self.currentModelPickerSelection());
+        self.setPaletteModelPickerBoundsFromToolbar();
+    }
+
+    fn appendModelPickerEntries(self: *AppState, provider: Provider) !void {
+        const options = composerModelOptions(self, provider);
+        for (options, 0..) |_, option_index| {
+            try self.model_picker_entries.append(self.allocator, .{ .provider = provider, .option_index = option_index });
+        }
+    }
+
+    fn rebuildModelPickerEntries(self: *AppState) !void {
+        const previous = try self.allocator.dupe(ModelPickerEntry, self.model_picker_entries.items);
+        defer self.allocator.free(previous);
+        self.model_picker_entries.clearRetainingCapacity();
+        if (self.currentThreadAllowsProviderChoice()) {
+            for (COMPOSER_PROVIDER_OPTIONS) |candidate| try self.appendModelPickerEntries(candidate);
+        } else {
+            try self.appendModelPickerEntries(self.currentThread().provider);
+        }
+        // The rebuilt slice is the change signal: comparing it against the
+        // previous entries catches provider switches, async option refreshes,
+        // and reorders without a separate fingerprint to keep in sync.
+        var changed = previous.len != self.model_picker_entries.items.len;
+        if (!changed) {
+            for (previous, self.model_picker_entries.items) |old, new| {
+                if (old.provider != new.provider or old.option_index != new.option_index) {
+                    changed = true;
+                    break;
                 }
             }
         }
-        if (show_fast_toggle) {
-            self.palette_composer.setFastLabel(self.allocator, if (thread.fast_mode == .on) "Fast" else "Default") catch |err| {
-                log.warn("failed to sync palette composer fast label: {s}", .{@errorName(err)});
-            };
-        }
-        self.palette_composer.setAccessLabel(self.allocator, switch (thread.access_mode) {
-            .full_access => "Full access",
-            .supervised => "Supervised",
-        }) catch |err| {
-            log.warn("failed to sync palette composer access label: {s}", .{@errorName(err)});
+        if (changed) self.palette_model_picker.invalidateItems();
+    }
+
+    /// Funnels every model-picker input through one catch-log path so mouse,
+    /// keyboard, and text routing stay behaviorally identical.
+    fn modelPickerInput(self: *AppState, input: palette.RichPickerInput) bool {
+        const handled = self.palette_model_picker.handleInput(self.allocator, input) catch |err| blk: {
+            log.warn("model picker input failed: {s}", .{@errorName(err)});
+            break :blk false;
         };
+        if (handled) self.noteInteraction();
+        return handled;
     }
 
-    pub fn syncPaletteModelCascadeMenu(self: *AppState) void {
-        self.palette_model_cascade.setCallbacks(.{ .context = self, .on_event = paletteModelCascadeEvent });
-        self.palette_model_cascade.setStyle(paletteModelCascadeStyle());
-        self.palette_model_cascade.setFontMetrics(paletteEstimatedFontMetrics(20.0));
-        self.palette_model_cascade.setItemCount(COMPOSER_PROVIDER_OPTIONS.len);
+    fn currentModelPickerSelection(self: *const AppState) ?usize {
+        const thread = self.currentThread();
+        const option_index = self.composerModelIndex(thread.provider, thread.model_ref) orelse return null;
+        for (self.model_picker_entries.items, 0..) |entry, index| {
+            if (entry.provider == thread.provider and entry.option_index == option_index) return index;
+        }
+        return null;
     }
 
-    pub fn setPaletteModelCascadeBoundsFromToolbar(self: *AppState) void {
+    pub fn setPaletteModelPickerBoundsFromToolbar(self: *AppState) void {
         const anchor = self.composer_toolbar_model_rect;
         if (anchor.w <= 0.0 or anchor.h <= 0.0) return;
-
-        const composer_rect: palette.Rect = if (self.composer_input_bounds_valid) .{
-            .x = self.composer_input_min[0],
-            .y = self.composer_input_min[1],
-            .w = @max(self.composer_input_max[0] - self.composer_input_min[0], 0.0),
-            .h = @max(self.composer_input_max[1] - self.composer_input_min[1], 0.0),
-        } else anchor;
-        const root_height = COMPOSER_MODEL_CASCADE_PADDING_Y * 2.0 +
-            COMPOSER_MODEL_CASCADE_ROW_HEIGHT * @as(f32, @floatFromInt(COMPOSER_PROVIDER_OPTIONS.len));
-        const total_width = COMPOSER_MODEL_CASCADE_WIDTH * 2.0 + COMPOSER_MODEL_CASCADE_GAP;
+        const picker_width = (COMPOSER_MODEL_PICKER_WIDTH + COMPOSER_MODEL_PICKER_RAIL_WIDTH) * theme.uiScaleFactor();
         const min_x = if (self.composer_input_bounds_valid) self.composer_input_min[0] else anchor.x;
-        const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + total_width;
-        const viewport_top: f32 = 8.0;
-        const viewport_bottom = @max(viewport_top + root_height, composer_rect.y + composer_rect.h);
-        const x = @max(min_x, @min(anchor.x, max_x - total_width));
-        var menu_anchor = anchor;
-        menu_anchor.y += COMPOSER_MODEL_CASCADE_ROOT_DROP;
-        self.palette_model_cascade.setAnchorRect(menu_anchor);
-        self.palette_model_cascade.setForbiddenRect(self.palette_composer.toolbarRect());
-        self.palette_model_cascade.setViewportRect(.{
+        const max_x = if (self.composer_input_bounds_valid) self.composer_input_max[0] else anchor.x + picker_width;
+        const viewport_top: f32 = theme.scaledUi(8.0);
+        const viewport_bottom = if (self.composer_input_bounds_valid)
+            self.composer_input_max[1]
+        else
+            anchor.y + anchor.h;
+        self.palette_model_picker.setAnchorRect(anchor);
+        self.palette_model_picker.setViewportRect(.{
             .x = min_x,
             .y = viewport_top,
-            .w = @max(max_x - min_x, total_width),
-            .h = @max(viewport_bottom - viewport_top, root_height),
-        });
-        self.palette_model_cascade.setBounds(.{
-            .x = x,
-            .y = anchor.y,
-            .w = COMPOSER_MODEL_CASCADE_WIDTH,
-            .h = root_height,
+            .w = @max(max_x - min_x, picker_width),
+            .h = @max(viewport_bottom - viewport_top, theme.scaledUi(120.0)),
         });
     }
 
-    pub fn openPaletteModelCascadeMenu(self: *AppState) void {
+    pub fn openPaletteModelPicker(self: *AppState) void {
         if (self.projects.items.len == 0) return;
         if (self.opencode_model_options.items.len == 0) {
             self.refreshOpencodeModelOptionsCacheAsync();
@@ -15036,41 +15293,214 @@ pub const AppState = struct {
         if (self.cursor_model_options.items.len == 0) {
             self.refreshCursorModelOptionsCacheAsync();
         }
+        self.closeRunConfigPopover();
         self.palette_composer.active_menu = null;
         self.palette_composer.hovered_menu_index = null;
-        self.syncPaletteModelCascadeMenu();
-        self.setPaletteModelCascadeBoundsFromToolbar();
-        _ = self.palette_model_cascade.handleInput(.open);
-
-        const thread = self.currentThread();
-        if (composerCascadeIndexForProvider(thread.provider)) |provider_index| {
-            self.palette_model_cascade.highlighted[0] = provider_index;
-            self.palette_model_cascade.highlighted[1] = null;
-            self.palette_model_cascade.scroll_y[1] = 0.0;
-            const model_count = composerModelOptions(self, thread.provider).len;
-            if (model_count > 0) {
-                self.palette_model_cascade.active_depth = 2;
-                if (self.composerModelIndex(thread.provider, thread.model_ref)) |model_index| {
-                    self.palette_model_cascade.highlighted[1] = model_index;
-                    const max_visible_rows = COMPOSER_MODEL_CASCADE_VISIBLE_ROWS;
-                    if (model_index >= max_visible_rows) {
-                        const first_visible = model_index - max_visible_rows + 1;
-                        self.palette_model_cascade.scroll_y[1] = @as(f32, @floatFromInt(first_visible)) * COMPOSER_MODEL_CASCADE_ROW_HEIGHT;
-                    }
-                }
-            }
-        }
+        self.syncPaletteModelPicker();
+        _ = self.palette_model_picker.handleInput(self.allocator, .open) catch |err| blk: {
+            log.warn("failed to open model picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        self.palette_composer.focused = false;
+        self.composer_focused = false;
+        // The popover owns typing (search) and arrows while open.
+        self.terminal_focused = false;
+        self.noteInteraction();
     }
 
-    fn currentThreadNeedsProviderModelCascade(self: *const AppState) bool {
+    pub fn closePaletteModelPicker(self: *AppState) void {
+        if (!self.palette_model_picker.isOpen()) return;
+        _ = self.palette_model_picker.handleInput(self.allocator, .close) catch |err| blk: {
+            log.warn("failed to close model picker: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+    }
+
+    /// Fresh, never-sent threads may still switch provider; committed threads
+    /// keep their provider so transcripts stay consistent.
+    fn currentThreadAllowsProviderChoice(self: *const AppState) bool {
         const thread = self.currentThread();
         return thread.messages.items.len == 0 and
             thread.provider_thread_id == null and
             !thread.isSendPendingForUi();
     }
 
+    /// Which run-config rows apply right now: reasoning and speed depend on the
+    /// provider/model, access always applies. Fills `out` in display order.
+    pub fn runConfigVisibleRows(self: *const AppState, out: *[3]RunConfigRowKind) usize {
+        var count: usize = 0;
+        const thread = self.currentThread();
+        const reasoning_count: usize = if (thread.provider == .codex)
+            CODEX_REASONING_OPTIONS.len
+        else
+            self.opencode_reasoning_menu.items.len;
+        if (reasoning_count > 0) {
+            out[count] = .reasoning;
+            count += 1;
+        }
+        if (self.currentComposerShowsFastToggle()) {
+            out[count] = .speed;
+            count += 1;
+        }
+        out[count] = .access;
+        count += 1;
+        return count;
+    }
+
+    pub fn syncRunConfigSteppers(self: *AppState) void {
+        const thread = self.currentThread();
+        const style = paletteRunStepperStyle();
+        for (&self.run_steppers, 0..) |*stepper, index| {
+            self.run_stepper_contexts[index] = .{ .state = self, .kind = @enumFromInt(@as(u8, @intCast(index))) };
+            stepper.setCallbacks(.{ .context = &self.run_stepper_contexts[index], .on_event = paletteRunStepperEvent });
+            stepper.setStyle(style);
+            stepper.setUiScale(theme.uiScaleFactor());
+            stepper.setFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(13.0)));
+        }
+        const reasoning = &self.run_steppers[@intFromEnum(RunConfigRowKind.reasoning)];
+        reasoning.setStepCount(if (thread.provider == .codex) CODEX_REASONING_OPTIONS.len else self.opencode_reasoning_menu.items.len);
+        reasoning.setSelected(composerReasoningIndexForThread(self, thread));
+        const speed = &self.run_steppers[@intFromEnum(RunConfigRowKind.speed)];
+        speed.setStepCount(RUN_SPEED_STEP_LABELS.len);
+        speed.setSelected(if (thread.fast_mode == .on) 1 else 0);
+        const access = &self.run_steppers[@intFromEnum(RunConfigRowKind.access)];
+        access.setStepCount(RUN_ACCESS_STEP_LABELS.len);
+        access.setSelected(if (thread.access_mode == .full_access) 1 else 0);
+    }
+
+    /// True when the mouse rests on a clickable composer control — toolbar
+    /// pills, the send button, model-picker rows/rail, or run-config stepper
+    /// segments — so the main loop can show a pointer (hand) cursor.
+    pub fn pointerCursorWanted(self: *const AppState) bool {
+        if (self.projects.items.len == 0) return false;
+        const point: palette.draw.Vec2 = .{ .x = self.palette_mouse_x, .y = self.palette_mouse_y };
+        if (self.palette_model_picker.wantsPointerAt(point)) return true;
+        if (self.run_config_open) {
+            var kinds: [3]RunConfigRowKind = undefined;
+            const count = self.runConfigVisibleRows(&kinds);
+            var index: usize = 0;
+            while (index < count) : (index += 1) {
+                if (self.run_steppers[@intFromEnum(kinds[index])].wantsPointerAt(point)) return true;
+            }
+        }
+        // The overlay-valid flag guarantees the composer toolbar was laid
+        // out this frame, so its hit rects are trustworthy.
+        if (self.composer_toolbar_overlay_valid and self.palette_composer.hitTest(point) != null) return true;
+        return false;
+    }
+
+    /// Advances the run-config stepper thumb animations from monotonic
+    /// time; called once per rendered frame while the popover is open.
+    pub fn tickRunConfigSteppers(self: *AppState) void {
+        const now = monotonicMs();
+        defer self.run_config_last_tick_ms = now;
+        if (self.run_config_last_tick_ms == 0 or now <= self.run_config_last_tick_ms) return;
+        // Clamp so a long gap between frames (popover just reopened, app
+        // stalled) advances the slide instead of teleporting past it.
+        const elapsed: u32 = @intCast(@min(now - self.run_config_last_tick_ms, 100));
+        for (&self.run_steppers) |*stepper| stepper.tick(elapsed);
+    }
+
+    /// True while a stepper thumb is mid-slide; keeps the main loop pumping
+    /// frames for the ~160ms animation window.
+    pub fn runConfigStepperAnimating(self: *const AppState) bool {
+        if (!self.run_config_open) return false;
+        for (&self.run_steppers) |*stepper| {
+            if (stepper.isAnimating()) return true;
+        }
+        return false;
+    }
+
+    pub const RunConfigLayout = struct {
+        panel: palette.Rect,
+        row_kinds: [3]RunConfigRowKind,
+        title_rects: [3]palette.Rect,
+        row_count: usize,
+    };
+
+    /// Computes the run-config popover geometry above the composer run pill
+    /// and repositions the visible steppers' bounds as a side effect so render
+    /// and hit-testing always agree.
+    pub fn layoutRunConfigPopover(self: *AppState) RunConfigLayout {
+        const zero_rect: palette.Rect = .{ .x = 0.0, .y = 0.0, .w = 0.0, .h = 0.0 };
+        var layout: RunConfigLayout = .{
+            .panel = zero_rect,
+            .row_kinds = .{ .reasoning, .speed, .access },
+            .title_rects = .{ zero_rect, zero_rect, zero_rect },
+            .row_count = 0,
+        };
+        layout.row_count = self.runConfigVisibleRows(&layout.row_kinds);
+        const anchor = self.composer_toolbar_reasoning_rect;
+        const composer = self.palette_composer.bounds();
+        const pad = theme.scaledUi(14.0);
+        const title_h = theme.scaledUi(16.0);
+        const title_gap = theme.scaledUi(6.0);
+        const row_gap = theme.scaledUi(14.0);
+        const width = theme.clampf(composer.w * 0.5, theme.scaledUi(330.0), theme.scaledUi(440.0));
+
+        var height = pad * 2.0;
+        var index: usize = 0;
+        while (index < layout.row_count) : (index += 1) {
+            height += title_h + title_gap + self.run_steppers[@intFromEnum(layout.row_kinds[index])].requiredHeight();
+            if (index + 1 < layout.row_count) height += row_gap;
+        }
+
+        // Keep the panel inside the composer horizontally; when the composer
+        // is narrower than the panel, left-align rather than overflow right.
+        const x = @max(composer.x, @min(anchor.x, composer.x + @max(composer.w - width, 0.0)));
+        const y = @max(anchor.y - height - theme.scaledUi(8.0), theme.scaledUi(8.0));
+        layout.panel = .{ .x = x, .y = y, .w = width, .h = height };
+
+        var cursor_y = y + pad;
+        index = 0;
+        while (index < layout.row_count) : (index += 1) {
+            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            layout.title_rects[index] = .{ .x = x + pad, .y = cursor_y, .w = @max(width - pad * 2.0, 0.0), .h = title_h };
+            cursor_y += title_h + title_gap;
+            stepper.setBounds(.{ .x = x + pad, .y = cursor_y, .w = @max(width - pad * 2.0, 0.0), .h = stepper.requiredHeight() });
+            cursor_y += stepper.requiredHeight() + row_gap;
+        }
+        return layout;
+    }
+
+    pub fn openRunConfigPopover(self: *AppState) void {
+        if (self.projects.items.len == 0) return;
+        self.closePaletteModelPicker();
+        self.palette_composer.active_menu = null;
+        self.palette_composer.hovered_menu_index = null;
+        self.syncRunConfigSteppers();
+        self.run_config_open = true;
+        self.run_config_focused_row = 0;
+        _ = self.layoutRunConfigPopover();
+        self.palette_composer.focused = false;
+        self.composer_focused = false;
+        // Arrow keys steer the popover's steppers while it is open.
+        self.terminal_focused = false;
+        self.noteInteraction();
+    }
+
+    pub fn closeRunConfigPopover(self: *AppState) void {
+        self.run_config_open = false;
+    }
+
+    pub fn toggleRunConfigPopover(self: *AppState) void {
+        if (self.run_config_open) {
+            self.closeRunConfigPopover();
+        } else {
+            self.openRunConfigPopover();
+        }
+    }
+
     pub fn routePaletteComposerTextInput(self: *AppState, text: []const u8) bool {
         if (self.projects.items.len == 0) return false;
+        if (self.palette_model_picker.isOpen()) {
+            const handled = self.palette_model_picker.handleInput(self.allocator, .{ .text = text }) catch |err| blk: {
+                log.warn("model picker text input failed: {s}", .{@errorName(err)});
+                break :blk false;
+            };
+            if (handled) self.noteInteraction();
+            return handled;
+        }
         if (self.terminal_focused) return false;
         if (!self.palette_composer.focused) return false;
         const insert_text = self.clampPaletteComposerInsertText(text);
@@ -15088,8 +15518,40 @@ pub const AppState = struct {
 
     pub fn routePaletteComposerKeyDown(self: *AppState, event: *const sdl.KeyboardEvent) bool {
         if (self.projects.items.len == 0) return false;
+        // Escape never survives `paletteComposerKeyFromSdl`, so close the
+        // composer popovers from the raw SDL event before the conversion.
+        if (event.key == .escape or event.scancode == .escape) {
+            if (self.palette_model_picker.isOpen()) {
+                return self.routePaletteModelPickerKey(.{ .code = .escape });
+            }
+            if (self.run_config_open) {
+                self.closeRunConfigPopover();
+                self.noteInteraction();
+                return true;
+            }
+        }
         if (self.terminal_focused) return false;
+        // Ctrl+1..9 selects the picker's shortcut-chip rows. Digits never
+        // survive `paletteComposerKeyFromSdl`, so read the raw SDL key.
+        if (self.palette_model_picker.isOpen()) {
+            const key_value = @intFromEnum(event.key);
+            const ctrl_held = (keymodBits(event.mod) & sdl.Keymod.ctrl) != 0;
+            if (ctrl_held and key_value >= '1' and key_value <= '9') {
+                const handled = self.palette_model_picker.selectVisibleOrdinal(self.allocator, @intCast(key_value - '1')) catch |err| blk: {
+                    log.warn("model picker shortcut select failed: {s}", .{@errorName(err)});
+                    break :blk false;
+                };
+                if (handled) self.noteInteraction();
+                return true;
+            }
+        }
         const palette_key = paletteComposerKeyFromSdl(event) orelse return false;
+        if (self.palette_model_picker.isOpen()) {
+            // The picker owns typing while open: navigation keys move the
+            // highlight, everything else edits the embedded search field.
+            return self.routePaletteModelPickerKey(palette_key);
+        }
+        if (self.routeRunConfigKey(palette_key)) return true;
         if (palette_key.primary and palette_key.code == .v) {
             runtime_log.diagnostic(
                 "palette composer received primary-v focused={} draft_len={d}",
@@ -15097,7 +15559,6 @@ pub const AppState = struct {
             );
             return self.pasteClipboardTextIntoPaletteComposer();
         }
-        if (self.routePaletteModelCascadeKey(palette_key)) return true;
         if (!self.palette_composer.focused) return false;
         if (self.routeSlashCommandPickerKey(palette_key)) return true;
         if (self.handlePaletteComposerNavigationKey(palette_key)) {
@@ -15119,7 +15580,6 @@ pub const AppState = struct {
         if (self.projects.items.len == 0) return false;
         if (event.button != 1) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
-        if (self.routePaletteModelCascadeMouseButton(point, event.down)) return true;
         if (event.down and event.clicks >= 2 and self.palette_composer.textRect().contains(point)) {
             return self.routePaletteComposerMultiClick(point, event.clicks);
         }
@@ -15143,47 +15603,23 @@ pub const AppState = struct {
 
     fn routePaletteComposerToolbarOverlayClick(self: *AppState, point: palette.draw.Vec2) bool {
         if (!self.composer_toolbar_overlay_valid) return false;
-        if (self.composer_toolbar_model_rect.contains(point) and self.currentThreadNeedsProviderModelCascade()) {
-            self.openPaletteModelCascadeMenu();
-            self.palette_composer.focused = false;
-            self.composer_focused = false;
-            self.noteInteraction();
+        // Model and run pills open host-owned popovers (rich picker /
+        // run-config panel); the composer's built-in dropdowns stay disabled
+        // via `setExternalModelMenu` / `setExternalReasoningMenu`.
+        if (self.composer_toolbar_model_rect.contains(point)) {
+            self.openPaletteModelPicker();
             return true;
         }
-        const target = if (self.composer_toolbar_model_rect.contains(point))
-            self.palette_composer.modelRect()
-        else if (self.composer_toolbar_reasoning_rect.contains(point))
-            self.palette_composer.reasoningRect()
-        else if (self.palette_composer.showFastToggle() and self.composer_toolbar_fast_rect.contains(point))
-            self.palette_composer.fastRect()
-        else if (self.composer_toolbar_access_rect.contains(point))
-            self.palette_composer.accessRect()
-        else
-            return false;
-
-        _ = self.palette_model_cascade.handleInput(.close);
-        const target_point: palette.draw.Vec2 = .{
-            .x = target.x + target.w * 0.5,
-            .y = target.y + target.h * 0.5,
-        };
-        const was_focused = self.palette_composer.focused;
-        const handled = self.palette_composer.handleInput(self.allocator, .{ .mouse_down = target_point }) catch |err| {
-            log.warn("palette composer toolbar overlay click failed: {s}", .{@errorName(err)});
-            return false;
-        };
-        self.composer_focused = self.palette_composer.focused;
-        if (self.composer_focused) {
-            self.terminal_focused = false;
-            self.unfocusBrowserPane();
+        if (self.composer_toolbar_reasoning_rect.contains(point) and self.palette_composer.showReasoningToggle()) {
+            self.toggleRunConfigPopover();
+            return true;
         }
-        if (handled) self.noteInteraction();
-        return handled or was_focused != self.palette_composer.focused;
+        return false;
     }
 
     pub fn routePaletteComposerMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
         if (self.projects.items.len == 0) return false;
         const point = paletteMousePoint(event.x, event.y, ui_scale);
-        if (self.routePaletteModelCascadeMouseMove(point, event.state.left != 0)) return true;
         const input: palette.ComposerPromptInput = if (event.state.left != 0)
             .{ .mouse_drag = point }
         else
@@ -15201,7 +15637,6 @@ pub const AppState = struct {
 
     pub fn routePaletteComposerWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
         if (self.projects.items.len == 0) return false;
-        if (self.routePaletteModelCascadeWheel(paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), event.y)) return true;
         const handled = self.palette_composer.handleInput(self.allocator, .{
             .mouse_wheel = .{ .point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale), .y = event.y },
         }) catch |err| {
@@ -15212,11 +15647,70 @@ pub const AppState = struct {
         return handled;
     }
 
-    fn routePaletteModelCascadeKey(self: *AppState, key: palette.Key) bool {
-        if (!self.palette_model_cascade.isOpen()) return false;
-        const handled = self.palette_model_cascade.handleInput(.{ .key = key });
-        if (handled) self.noteInteraction();
-        return handled;
+    /// Composer popovers (model picker, run-config panel) render above the
+    /// panes at overlay z, so main.zig routes their pointer input ahead of
+    /// the pane/transcript handlers via these entry points.
+    pub fn routeComposerPopoverMouseButton(self: *AppState, event: *const sdl.MouseButtonEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
+        if (event.button != 1) return false;
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelPickerMouseButton(point, event.down, event.clicks)) return true;
+        return self.routeRunConfigMouseButton(point, event.down);
+    }
+
+    pub fn routeComposerPopoverMouseMotion(self: *AppState, event: *const sdl.MouseMotionEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
+        const point = paletteMousePoint(event.x, event.y, ui_scale);
+        if (self.routePaletteModelPickerMouseMove(point, event.state.left != 0)) return true;
+        return self.routeRunConfigMouseMove(point);
+    }
+
+    pub fn routeComposerPopoverWheel(self: *AppState, event: *const sdl.MouseWheelEvent, ui_scale: f32) bool {
+        if (self.projects.items.len == 0) return false;
+        const point = paletteMousePoint(event.mouse_x, event.mouse_y, ui_scale);
+        if (self.routePaletteModelPickerWheel(point, event.y)) return true;
+        return self.routeRunConfigWheel(point);
+    }
+
+    fn routePaletteModelPickerKey(self: *AppState, key: palette.Key) bool {
+        if (!self.palette_model_picker.isOpen()) return false;
+        return self.modelPickerInput(.{ .key = key });
+    }
+
+    fn routeRunConfigKey(self: *AppState, key: palette.Key) bool {
+        if (!self.run_config_open) return false;
+        var kinds: [3]RunConfigRowKind = undefined;
+        const count = self.runConfigVisibleRows(&kinds);
+        if (count == 0) {
+            self.closeRunConfigPopover();
+            return true;
+        }
+        if (self.run_config_focused_row >= count) self.run_config_focused_row = count - 1;
+        switch (key.code) {
+            .up => {
+                self.run_config_focused_row = (self.run_config_focused_row + count - 1) % count;
+                self.noteInteraction();
+                return true;
+            },
+            .down => {
+                self.run_config_focused_row = (self.run_config_focused_row + 1) % count;
+                self.noteInteraction();
+                return true;
+            },
+            .enter => {
+                self.closeRunConfigPopover();
+                self.noteInteraction();
+                return true;
+            },
+            .left, .right, .home, .end => {
+                _ = self.layoutRunConfigPopover();
+                const stepper = &self.run_steppers[@intFromEnum(kinds[self.run_config_focused_row])];
+                const handled = stepper.handleInput(.{ .key = key });
+                if (handled) self.noteInteraction();
+                return true;
+            },
+            else => return false,
+        }
     }
 
     fn routeSlashCommandPickerKey(self: *AppState, key: palette.Key) bool {
@@ -15245,31 +15739,74 @@ pub const AppState = struct {
         }
     }
 
-    fn routePaletteModelCascadeMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
-        if (!self.palette_model_cascade.isOpen()) return false;
-        const handled = self.palette_model_cascade.handleInput(if (down)
-            .{ .mouse_down = .{ .point = point } }
+    fn routePaletteModelPickerMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool, clicks: u8) bool {
+        if (!self.palette_model_picker.isOpen()) return false;
+        // Clicking the run pill swaps popovers in one click: dismiss the
+        // picker and let the toolbar overlay handler open the run config.
+        if (down and self.composer_toolbar_overlay_valid and self.composer_toolbar_reasoning_rect.contains(point)) {
+            self.closePaletteModelPicker();
+            return false;
+        }
+        const input: palette.RichPickerInput = if (down)
+            .{ .mouse_down = .{ .point = point, .clicks = clicks } }
         else
-            .{ .mouse_up = point });
-        if (handled) self.noteInteraction();
-        return handled;
+            .{ .mouse_up = point };
+        return self.modelPickerInput(input);
     }
 
-    fn routePaletteModelCascadeMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
-        if (!self.palette_model_cascade.isOpen()) return false;
-        const handled = self.palette_model_cascade.handleInput(if (dragging)
+    fn routePaletteModelPickerMouseMove(self: *AppState, point: palette.draw.Vec2, dragging: bool) bool {
+        if (!self.palette_model_picker.isOpen()) return false;
+        return self.modelPickerInput(if (dragging)
             .{ .mouse_drag = point }
         else
             .{ .mouse_move = point });
-        if (handled) self.noteInteraction();
-        return handled;
     }
 
-    fn routePaletteModelCascadeWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
-        if (!self.palette_model_cascade.isOpen()) return false;
-        const handled = self.palette_model_cascade.handleInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
-        if (handled) self.noteInteraction();
-        return handled;
+    fn routePaletteModelPickerWheel(self: *AppState, point: palette.draw.Vec2, y: f32) bool {
+        if (!self.palette_model_picker.isOpen()) return false;
+        return self.modelPickerInput(.{ .mouse_wheel = .{ .point = point, .y = y } });
+    }
+
+    fn routeRunConfigMouseButton(self: *AppState, point: palette.draw.Vec2, down: bool) bool {
+        if (!self.run_config_open) return false;
+        if (!down) return false;
+        const layout = self.layoutRunConfigPopover();
+        var index: usize = 0;
+        while (index < layout.row_count) : (index += 1) {
+            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            if (stepper.handleInput(.{ .mouse_down = point })) {
+                self.run_config_focused_row = index;
+                self.noteInteraction();
+                return true;
+            }
+        }
+        if (layout.panel.contains(point)) return true;
+        self.closeRunConfigPopover();
+        self.noteInteraction();
+        // Clicking the model pill swaps popovers in one click: fall through
+        // so the toolbar overlay handler opens the model picker. Any other
+        // outside click is swallowed so the press does not also activate
+        // whatever sits underneath the popover.
+        if (self.composer_toolbar_overlay_valid and self.composer_toolbar_model_rect.contains(point)) return false;
+        return true;
+    }
+
+    fn routeRunConfigMouseMove(self: *AppState, point: palette.draw.Vec2) bool {
+        if (!self.run_config_open) return false;
+        const layout = self.layoutRunConfigPopover();
+        var hovered = false;
+        var index: usize = 0;
+        while (index < layout.row_count) : (index += 1) {
+            const stepper = &self.run_steppers[@intFromEnum(layout.row_kinds[index])];
+            if (stepper.handleInput(.{ .mouse_move = point })) hovered = true;
+        }
+        return hovered or layout.panel.contains(point);
+    }
+
+    fn routeRunConfigWheel(self: *AppState, point: palette.draw.Vec2) bool {
+        if (!self.run_config_open) return false;
+        const layout = self.layoutRunConfigPopover();
+        return layout.panel.contains(point);
     }
 
     fn handlePaletteComposerNavigationKey(self: *AppState, key: palette.Key) bool {
@@ -18348,7 +18885,8 @@ test "empty workspace ignores hidden composer and slash input" {
     state.syncPaletteComposerFromDraft();
     state.syncDraftFromPaletteComposer();
     state.syncPaletteComposerControls();
-    state.openPaletteModelCascadeMenu();
+    state.openPaletteModelPicker();
+    state.openRunConfigPopover();
     state.clearCurrentDraftImageAt(0);
 }
 
