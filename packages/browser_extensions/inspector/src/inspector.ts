@@ -13,6 +13,7 @@ import type {
   InspectorPromptResult,
   InspectorPromptTarget,
   InspectorSelection,
+  InspectorThemeInput,
   RegionSelection,
 } from "./types";
 
@@ -20,16 +21,57 @@ const OVERLAY_ROOT_ID = "verde-inspector-overlay-root";
 const OVERLAY_IGNORE_ATTR = "data-verde-inspector-ignore";
 const BOX_ATTR = "data-verde-box";
 const SVG_NS = "http://www.w3.org/2000/svg";
-const VERDE_RGB = "34, 197, 94";
-const VERDE_BORDER_GLOW = "rgba(240, 253, 244, 0.98)";
-const OVERLAY_MARGIN_FILL = `rgba(${VERDE_RGB}, 0.12)`;
-const OVERLAY_BORDER_FILL = `rgba(${VERDE_RGB}, 0.19)`;
-const OVERLAY_PADDING_FILL = `rgba(${VERDE_RGB}, 0.29)`;
-const OVERLAY_CONTENT_FILL = `rgba(${VERDE_RGB}, 0.05)`;
-const OVERLAY_REGION_FILL = `rgba(${VERDE_RGB}, 0.12)`;
-const OVERLAY_REGION_STROKE = `rgba(${VERDE_RGB}, 0.78)`;
-const OVERLAY_FREEFORM_FILL = `rgba(${VERDE_RGB}, 0.1)`;
-const OVERLAY_STROKE = `rgba(${VERDE_RGB}, 0.05)`;
+
+type ThemeRgb = { r: number; g: number; b: number };
+
+/** Overlay colors resolved from the host theme (see InspectorThemeInput);
+ * defaults reproduce the historical built-in green look. */
+type ResolvedTheme = {
+  accent: ThemeRgb;
+  panelBackground: ThemeRgb;
+  inputBackground: ThemeRgb;
+  text: string;
+  textMuted: string;
+  error: string;
+};
+
+const DEFAULT_THEME: ResolvedTheme = {
+  accent: { r: 80, g: 200, b: 120 },
+  panelBackground: { r: 25, g: 31, b: 36 },
+  inputBackground: { r: 29, g: 38, b: 43 },
+  text: "#f0f0f5",
+  textMuted: "#b9bbc3",
+  error: "#f2a4a4",
+};
+
+function parseHexColor(value: string | undefined): ThemeRgb | null {
+  if (!value) return null;
+  const match = /^#?([0-9a-f]{6})$/i.exec(value.trim());
+  if (!match) return null;
+  const num = parseInt(match[1]!, 16);
+  return { r: (num >> 16) & 0xff, g: (num >> 8) & 0xff, b: num & 0xff };
+}
+
+function rgbaOf(color: ThemeRgb, alpha: number): string {
+  return `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`;
+}
+
+function resolveTheme(input?: InspectorThemeInput | null): ResolvedTheme {
+  return {
+    accent: parseHexColor(input?.accent) ?? DEFAULT_THEME.accent,
+    panelBackground: parseHexColor(input?.panelBackground) ?? DEFAULT_THEME.panelBackground,
+    inputBackground: parseHexColor(input?.inputBackground) ?? DEFAULT_THEME.inputBackground,
+    text: parseHexColor(input?.text) ? input!.text! : DEFAULT_THEME.text,
+    textMuted: parseHexColor(input?.textMuted) ? input!.textMuted! : DEFAULT_THEME.textMuted,
+    error: parseHexColor(input?.error) ? input!.error! : DEFAULT_THEME.error,
+  };
+}
+
+/** Black-or-white foreground for a solid accent surface. */
+function accentForeground(color: ThemeRgb): string {
+  const luminance = (0.299 * color.r + 0.587 * color.g + 0.114 * color.b) / 255.0;
+  return luminance > 0.62 ? "#14181c" : "#ffffff";
+}
 const FREEFORM_BRUSH_RADIUS = 14;
 const FREEFORM_POINT_STEP = 4;
 const FREEFORM_CLOSE_SNAP_DISTANCE = 120;
@@ -90,8 +132,15 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
   let promptPending = false;
   let promptPendingTimer: ReturnType<typeof setTimeout> | null = null;
   let promptTargets: InspectorPromptTarget[] = [];
+  let theme = resolveTheme(options.theme);
 
   const overlay = createOverlay(doc);
+  applyOverlayTheme(overlay, theme);
+
+  const setTheme = (input: InspectorThemeInput | null | undefined): void => {
+    theme = resolveTheme(input);
+    applyOverlayTheme(overlay, theme);
+  };
 
   const emit = <TType extends InspectorEventType>(
     type: TType,
@@ -196,7 +245,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
 
   const setPromptMetaText = (text: string, isError: boolean): void => {
     overlay.promptMeta.textContent = text;
-    overlay.promptMeta.style.color = isError ? "#f2a4a4" : "#b9bbc3";
+    overlay.promptMeta.style.color = isError ? theme.error : theme.textMuted;
   };
 
   const setPromptPendingUi = (pending: boolean): void => {
@@ -330,7 +379,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     showFreeformPath();
     syncFreeformViewport(overlay.freeformSvg, win);
     overlay.freeformPath.setAttribute("d", buildFreeformPath(points, closed));
-    overlay.freeformPath.setAttribute("fill", closed ? OVERLAY_FREEFORM_FILL : "none");
+    overlay.freeformPath.setAttribute("fill", closed ? rgbaOf(theme.accent, 0.1) : "none");
     showTooltip(label, expandRect(boundsFromPoints(points), FREEFORM_BRUSH_RADIUS));
   };
 
@@ -821,6 +870,7 @@ export function createInspector(options: InspectorOptions = {}): InspectorHandle
     },
     notifyPromptResult,
     setPromptTargets,
+    setTheme,
   };
 }
 
@@ -838,10 +888,10 @@ function createOverlay(doc: Document): OverlayParts {
     "user-select:none",
   ].join(";");
 
-  const margin = createBox(doc, "margin", OVERLAY_MARGIN_FILL);
-  const border = createBox(doc, "border", OVERLAY_BORDER_FILL);
-  const padding = createBox(doc, "padding", OVERLAY_PADDING_FILL);
-  const content = createBox(doc, "content", OVERLAY_CONTENT_FILL);
+  const margin = createBox(doc, "margin");
+  const border = createBox(doc, "border");
+  const padding = createBox(doc, "padding");
+  const content = createBox(doc, "content");
 
   const region = doc.createElement("div");
   region.setAttribute(OVERLAY_IGNORE_ATTR, "true");
@@ -853,8 +903,6 @@ function createOverlay(doc: Document): OverlayParts {
     "display:none",
     "box-sizing:border-box",
     "pointer-events:none",
-    `background:${OVERLAY_REGION_FILL}`,
-    `border:2px solid ${OVERLAY_REGION_STROKE}`,
     "border-radius:18px",
     "box-shadow:0 0 0 1px rgba(240, 253, 244, 0.3) inset",
   ].join(";");
@@ -871,7 +919,6 @@ function createOverlay(doc: Document): OverlayParts {
 
   const freeformPath = doc.createElementNS(SVG_NS, "path");
   freeformPath.setAttribute("fill", "none");
-  freeformPath.setAttribute("stroke", OVERLAY_REGION_STROKE);
   freeformPath.setAttribute("stroke-width", String(FREEFORM_BRUSH_RADIUS * 2));
   freeformPath.setAttribute("stroke-linecap", "round");
   freeformPath.setAttribute("stroke-linejoin", "round");
@@ -887,8 +934,6 @@ function createOverlay(doc: Document): OverlayParts {
     "transform:translate(8px, 8px)",
     "padding:6px 10px",
     "border-radius:999px",
-    "background:rgba(15, 23, 42, 0.92)",
-    "color:#eff6ff",
     "font-size:12px",
     "line-height:1",
     "white-space:nowrap",
@@ -912,10 +957,7 @@ function createOverlay(doc: Document): OverlayParts {
     "top:20px",
     "width:min(420px, calc(100vw - 40px))",
     "padding:12px",
-    "border:1px solid rgba(80, 200, 120, 0.22)",
     "border-radius:10px",
-    "background:rgba(25, 31, 36, 0.96)",
-    "color:#f0f0f5",
     "box-shadow:0 18px 48px rgba(0, 0, 0, 0.38)",
     "pointer-events:auto",
     "user-select:none",
@@ -923,11 +965,11 @@ function createOverlay(doc: Document): OverlayParts {
 
   const promptTitle = doc.createElement("div");
   promptTitle.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptTitle.style.cssText = "font-size:12px;font-weight:700;color:#f0f0f5;margin-bottom:6px;";
+  promptTitle.style.cssText = "font-size:12px;font-weight:700;margin-bottom:6px;";
 
   const promptMeta = doc.createElement("div");
   promptMeta.setAttribute(OVERLAY_IGNORE_ATTR, "true");
-  promptMeta.style.cssText = "font-size:11px;color:#b9bbc3;margin-bottom:10px;";
+  promptMeta.style.cssText = "font-size:11px;margin-bottom:10px;";
 
   // "Send to" destination row; hidden unless the host reports 2+ chat panes.
   const promptTargetRow = doc.createElement("div");
@@ -942,7 +984,8 @@ function createOverlay(doc: Document): OverlayParts {
   const promptTargetLabel = doc.createElement("span");
   promptTargetLabel.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   promptTargetLabel.textContent = "Send to";
-  promptTargetLabel.style.cssText = "font-size:11px;color:#b9bbc3;flex:0 0 auto;";
+  promptTargetLabel.setAttribute("data-verde-role", "muted-label");
+  promptTargetLabel.style.cssText = "font-size:11px;flex:0 0 auto;";
 
   const promptTargetSelect = doc.createElement("select");
   promptTargetSelect.setAttribute(OVERLAY_IGNORE_ATTR, "true");
@@ -952,9 +995,6 @@ function createOverlay(doc: Document): OverlayParts {
     "min-width:0",
     "padding:6px 8px",
     "border-radius:6px",
-    "border:1px solid rgba(80, 200, 120, 0.2)",
-    "background:rgba(29, 38, 43, 0.95)",
-    "color:#f0f0f5",
     "font:inherit",
     "font-size:12px",
     "outline:none",
@@ -973,15 +1013,11 @@ function createOverlay(doc: Document): OverlayParts {
     "resize:vertical",
     "padding:12px",
     "border-radius:8px",
-    "border:1px solid rgba(80, 200, 120, 0.2)",
-    "background:rgba(29, 38, 43, 0.95)",
-    "color:#f0f0f5",
     "font:inherit",
     "font-size:13px",
     "line-height:1.45",
     "box-sizing:border-box",
     "outline:none",
-    "caret-color:#50c878",
     "user-select:text",
     "-webkit-user-select:text",
   ].join(";");
@@ -1001,8 +1037,6 @@ function createOverlay(doc: Document): OverlayParts {
     "padding:9px 14px",
     "border:0",
     "border-radius:8px",
-    "background:#375846",
-    "color:white",
     "font:inherit",
     "font-weight:700",
     "cursor:pointer",
@@ -1053,7 +1087,7 @@ function createOverlay(doc: Document): OverlayParts {
   };
 }
 
-function createBox(doc: Document, name: string, background: string): HTMLDivElement {
+function createBox(doc: Document, name: string): HTMLDivElement {
   const box = doc.createElement("div");
   box.setAttribute(OVERLAY_IGNORE_ATTR, "true");
   box.setAttribute(BOX_ATTR, name);
@@ -1064,12 +1098,53 @@ function createBox(doc: Document, name: string, background: string): HTMLDivElem
     "display:none",
     "box-sizing:border-box",
     "pointer-events:none",
-    "background:" + background,
-    name === "content"
-      ? `border:1px solid ${VERDE_BORDER_GLOW}`
-      : `border:1px solid ${OVERLAY_STROKE}`,
   ].join(";");
   return box;
+}
+
+// Restyles every themable overlay surface from the resolved theme. Kept as
+// one function so a host setTheme() call re-skins the overlay in place.
+function applyOverlayTheme(overlay: OverlayParts, theme: ResolvedTheme): void {
+  const accent = theme.accent;
+
+  // Box-model layers use graded accent alphas (DevTools-style).
+  overlay.margin.style.background = rgbaOf(accent, 0.12);
+  overlay.margin.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.border.style.background = rgbaOf(accent, 0.19);
+  overlay.border.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.padding.style.background = rgbaOf(accent, 0.29);
+  overlay.padding.style.border = `1px solid ${rgbaOf(accent, 0.05)}`;
+  overlay.content.style.background = rgbaOf(accent, 0.05);
+  // The content outline stays a light glow so it reads on any accent hue.
+  overlay.content.style.border = "1px solid rgba(250, 250, 250, 0.95)";
+
+  overlay.region.style.background = rgbaOf(accent, 0.12);
+  overlay.region.style.border = `2px solid ${rgbaOf(accent, 0.78)}`;
+  overlay.freeformPath.setAttribute("stroke", rgbaOf(accent, 0.78));
+
+  overlay.tooltip.style.background = rgbaOf(theme.panelBackground, 0.92);
+  overlay.tooltip.style.color = theme.text;
+
+  overlay.promptPanel.style.background = rgbaOf(theme.panelBackground, 0.96);
+  overlay.promptPanel.style.border = `1px solid ${rgbaOf(accent, 0.22)}`;
+  overlay.promptPanel.style.color = theme.text;
+  overlay.promptTitle.style.color = theme.text;
+  overlay.promptMeta.style.color = theme.textMuted;
+
+  const inputBackground = rgbaOf(theme.inputBackground, 0.95);
+  const inputBorder = `1px solid ${rgbaOf(accent, 0.2)}`;
+  overlay.promptTextarea.style.background = inputBackground;
+  overlay.promptTextarea.style.border = inputBorder;
+  overlay.promptTextarea.style.color = theme.text;
+  overlay.promptTextarea.style.caretColor = rgbaOf(accent, 1.0);
+  overlay.promptTargetSelect.style.background = inputBackground;
+  overlay.promptTargetSelect.style.border = inputBorder;
+  overlay.promptTargetSelect.style.color = theme.text;
+  const targetLabel = overlay.promptTargetRow.querySelector("span");
+  if (targetLabel instanceof HTMLElement) targetLabel.style.color = theme.textMuted;
+
+  overlay.promptButton.style.background = rgbaOf(accent, 1.0);
+  overlay.promptButton.style.color = accentForeground(accent);
 }
 
 function positionBox(node: HTMLDivElement, rect: ElementBoxRect): void {

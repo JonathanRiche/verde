@@ -12473,7 +12473,14 @@ pub const AppState = struct {
             return;
         }
 
-        const script = browser_inspector.enableScriptAlloc(self.allocator, self.browser_state.inspectorMode()) catch |err| {
+        const theme_json = inspectorThemeJsonAlloc(self.allocator) catch |err| {
+            log.err("failed to build browser inspector theme: {s}", .{@errorName(err)});
+            if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
+            return;
+        };
+        defer self.allocator.free(theme_json);
+
+        const script = browser_inspector.enableScriptAlloc(self.allocator, self.browser_state.inspectorMode(), theme_json) catch |err| {
             log.err("failed to build browser inspector script: {s}", .{@errorName(err)});
             if (show_notice) self.setSidebarNotice("Failed to build the browser inspector.");
             return;
@@ -12490,6 +12497,40 @@ pub const AppState = struct {
             return;
         };
         if (show_notice) self.setSidebarNotice(success_notice);
+    }
+
+    /// Serializes the active UI theme tokens into the inspector bundle's
+    /// InspectorThemeInput shape (hex colors) so the in-page overlay matches
+    /// the app theme instead of the built-in green defaults.
+    fn inspectorThemeJsonAlloc(allocator: std.mem.Allocator) ![]u8 {
+        var accent_buf: [7]u8 = undefined;
+        var panel_buf: [7]u8 = undefined;
+        var input_buf: [7]u8 = undefined;
+        var text_buf: [7]u8 = undefined;
+        var muted_buf: [7]u8 = undefined;
+        var error_buf: [7]u8 = undefined;
+        const theme_payload = .{
+            .accent = cssHexFromColor(&accent_buf, theme.current_colors.accent),
+            .panelBackground = cssHexFromColor(&panel_buf, theme.current_colors.panel_alt),
+            .inputBackground = cssHexFromColor(&input_buf, theme.current_colors.panel),
+            .text = cssHexFromColor(&text_buf, theme.current_colors.text),
+            .textMuted = cssHexFromColor(&muted_buf, theme.current_colors.text_muted),
+            .@"error" = cssHexFromColor(&error_buf, theme.current_colors.diff_remove),
+        };
+
+        var json_buffer: std.Io.Writer.Allocating = .init(allocator);
+        defer json_buffer.deinit();
+        var jw: std.json.Stringify = .{ .writer = &json_buffer.writer, .options = .{} };
+        try jw.write(theme_payload);
+        return json_buffer.toOwnedSlice();
+    }
+
+    // Formats a normalized [4]f32 UI color as "#rrggbb" into `buffer`.
+    fn cssHexFromColor(buffer: *[7]u8, color: [4]f32) []const u8 {
+        const r: u8 = @intFromFloat(@round(std.math.clamp(color[0], 0.0, 1.0) * 255.0));
+        const g: u8 = @intFromFloat(@round(std.math.clamp(color[1], 0.0, 1.0) * 255.0));
+        const b: u8 = @intFromFloat(@round(std.math.clamp(color[2], 0.0, 1.0) * 255.0));
+        return std.fmt.bufPrint(buffer, "#{x:0>2}{x:0>2}{x:0>2}", .{ r, g, b }) catch unreachable;
     }
 
     // Disables the bundled inspector overlay while leaving the page alive.

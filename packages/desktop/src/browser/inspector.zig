@@ -18,11 +18,14 @@ pub const disable_script =
 ;
 
 /// Wraps the bundled inspector runtime with the backend-neutral browser bridge.
-pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.InspectorMode) ![]u8 {
+/// `theme_json` must be a JSON object literal matching the bundle's
+/// InspectorThemeInput (it is injected verbatim as a JS expression).
+pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.InspectorMode, theme_json: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         \\(function() {{
         \\  const mode = "{s}";
+        \\  const theme = {s};
         \\  const postToBridge = function(payload) {{
         \\    if (window.__VERDE_BROWSER_IPC__ && typeof window.__VERDE_BROWSER_IPC__.postMessage === "function") {{
         \\      window.__VERDE_BROWSER_IPC__.postMessage(payload);
@@ -54,17 +57,20 @@ pub fn enableScriptAlloc(allocator: std.mem.Allocator, mode: browser_runtime.Ins
         \\  if (handle && typeof handle.setMode === "function") {{
         \\    handle.setMode(mode);
         \\  }}
+        \\  if (handle && typeof handle.setTheme === "function") {{
+        \\    handle.setTheme(theme);
+        \\  }}
         \\  if (handle && typeof handle.enable === "function") {{
         \\    handle.enable();
         \\    return "enabled";
         \\  }}
         \\  if (window.VerdeInspector && typeof window.VerdeInspector.mount === "function") {{
-        \\    window.VerdeInspector.mount({{ mode: mode }});
+        \\    window.VerdeInspector.mount({{ mode: mode, theme: theme }});
         \\    return "mounted";
         \\  }}
         \\  return "unavailable";
         \\}})();
     ,
-        .{ mode.jsValue(), bundle },
+        .{ mode.jsValue(), theme_json, bundle },
     );
 }
