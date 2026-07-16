@@ -24,10 +24,9 @@ pub const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\verde-sessionizer-";
 // Bump whenever the daemon RPC/state surface changes incompatibly. GUI chat
 // turns are daemon-owned now; accepting an older daemon makes the UI
 // attach to a process that cannot list/tail those turns.
-// Version 7 retires Windows daemons that treated ConPTY stream EOF as process
-// death. Without replacement, an upgrade could keep the old duplicate-session
-// behavior until the surviving daemon happened to exit.
-pub const PROTOCOL_VERSION: u32 = 7;
+// Version 8 retires daemons whose Codex client could silently discard
+// app-server tool requests and leave GUI turns pending forever.
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 const MAX_OUTPUT_RING: usize = 1024 * 1024;
