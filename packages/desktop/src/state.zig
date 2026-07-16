@@ -299,8 +299,9 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     .reasoning_min_width = 74.0,
     // The run pill now shows a "Reasoning · Speed · Access" summary, so it
     // needs far more room than the old single reasoning label.
-    // Wide enough for the summary text plus the leading state-glyph reserve.
-    .reasoning_max_width = 340.0,
+    // Wide enough for the summary text plus three embedded state-glyph cells
+    // (COMPOSER_RUN_PILL_ICON_CELL each).
+    .reasoning_max_width = 360.0,
     .fast_min_width = 80.0,
     .fast_max_width = 180.0,
     .access_min_width = 138.0,
@@ -357,10 +358,12 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
 
 // CSS-unit width of the composer model picker popover; the component scales it
 // (and every other geometry token) by `setUiScale` for HiDPI displays.
-/// Width reserved per host-drawn state glyph leading the run pill's summary
-/// (fast bolt / access lock, ~22px drawn plus spacing); mirrors the sizing
-/// convention of `pill_overlay_icon_reserve`.
-pub const COMPOSER_RUN_PILL_ICON_CELL: f32 = 26.0;
+/// Width reserved per host-drawn state glyph embedded in the run pill's
+/// summary, beside the segment it describes (brain / bolt / lock, ~22px
+/// drawn, centered). The ~10px spare splits into the word-side and
+/// separator-side gaps, so widening this spaces the glyph away from both
+/// neighbors; mirrors the sizing convention of `pill_overlay_icon_reserve`.
+pub const COMPOSER_RUN_PILL_ICON_CELL: f32 = 32.0;
 const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 /// Width of the provider-icon rail on the picker's left edge; the popover's
 /// total width is body + rail.
@@ -10180,6 +10183,12 @@ pub const AppState = struct {
         return "Default";
     }
 
+    /// Whether the run summary carries a reasoning-level segment; keeps the
+    /// summary builder and the chat panel's glyph-slot ordering in sync.
+    pub fn currentComposerShowsReasoningSegment(self: *const AppState) bool {
+        return self.currentThread().provider == .codex or self.opencode_reasoning_menu.items.len > 0;
+    }
+
     pub fn currentComposerShowsFastToggle(self: *const AppState) bool {
         const thread = self.currentThread();
         const cursor_model = if (thread.provider == .cursor) self.cursorModelOptionForRef(thread.model_ref) else null;
@@ -15218,12 +15227,6 @@ pub const AppState = struct {
         // is disabled via setExternalReasoningMenu and the run-config steppers
         // own the reasoning data instead.
         self.palette_composer.setShowReasoningToggle(true);
-        // The run pill leads with host-drawn fast/access state glyphs (see
-        // chat_panel.renderComposerToolbarIcons); reserve label room for the
-        // lock plus, when the provider has a speed tier, the bolt.
-        var run_icon_reserve: f32 = COMPOSER_RUN_PILL_ICON_CELL;
-        if (self.currentComposerShowsFastToggle()) run_icon_reserve += COMPOSER_RUN_PILL_ICON_CELL;
-        self.palette_composer.setReasoningLeadingReserve(run_icon_reserve);
         self.palette_composer.model_index = self.composerModelIndex(thread.provider, thread.model_ref);
         self.palette_composer.setSendState(if (thread.isSendPendingForUi()) .stop else .send);
         if (self.palette_composer.model_index) |index| {
@@ -15236,31 +15239,72 @@ pub const AppState = struct {
         // Sized for a worst-case dynamic reasoning-variant label plus both
         // fixed segments; overflow degrades to a truncated summary.
         var summary_buf: [192]u8 = undefined;
-        self.palette_composer.setReasoningLabel(self.allocator, self.composerRunSummary(&summary_buf)) catch |err| {
+        const run_summary = self.composerRunSummaryParts(&summary_buf);
+        self.palette_composer.setReasoningLabel(self.allocator, run_summary.text) catch |err| {
             log.warn("failed to sync palette composer run summary label: {s}", .{@errorName(err)});
         };
+        // Host-drawn state glyphs sit inside the run pill label after the
+        // word each one describes — brain after the reasoning segment,
+        // bolt/circle after speed, lock after access (drawn in
+        // chat_panel.renderComposerToolbarIcons).
+        var run_slots: [3]palette.ComposerPromptIconSlot = undefined;
+        var run_slot_count: usize = 0;
+        if (run_summary.reasoning_offset) |offset| {
+            run_slots[run_slot_count] = .{ .byte_offset = offset, .width = COMPOSER_RUN_PILL_ICON_CELL };
+            run_slot_count += 1;
+        }
+        if (run_summary.fast_offset) |offset| {
+            run_slots[run_slot_count] = .{ .byte_offset = offset, .width = COMPOSER_RUN_PILL_ICON_CELL };
+            run_slot_count += 1;
+        }
+        run_slots[run_slot_count] = .{ .byte_offset = run_summary.access_offset, .width = COMPOSER_RUN_PILL_ICON_CELL };
+        run_slot_count += 1;
+        self.palette_composer.setReasoningIconSlots(run_slots[0..run_slot_count]);
         if (self.run_config_open) self.syncRunConfigSteppers();
     }
 
+    /// `composerRunSummary` text plus the byte offsets of the speed and access
+    /// segments, so `syncPaletteComposerControls` can pin each host-drawn state
+    /// glyph beside the word it describes on the run pill. Offsets point at the
+    /// end of each segment: the glyph trails its word so it cannot read as
+    /// belonging to the preceding segment (e.g. the bolt hugging "High ·").
+    pub const ComposerRunSummary = struct {
+        text: []const u8,
+        /// End of the reasoning segment; null when the provider has no
+        /// reasoning levels.
+        reasoning_offset: ?usize = null,
+        /// End of the speed segment; null when the provider has no speed tier.
+        fast_offset: ?usize = null,
+        /// End of the access segment (always present in the summary).
+        access_offset: usize = 0,
+    };
+
     /// Compact " · "-joined summary of the run settings (reasoning, speed,
     /// access) shown on the composer run pill and the inactive preview pill.
-    pub fn composerRunSummary(self: *const AppState, buf: []u8) []const u8 {
+    pub fn composerRunSummaryParts(self: *const AppState, buf: []u8) ComposerRunSummary {
         var writer: std.Io.Writer = .fixed(buf);
+        var result: ComposerRunSummary = .{ .text = "" };
         var wrote_any = false;
-        const thread = self.currentThread();
-        const has_reasoning = thread.provider == .codex or self.opencode_reasoning_menu.items.len > 0;
-        if (has_reasoning) {
+        if (self.currentComposerShowsReasoningSegment()) {
             writer.writeAll(self.currentComposerReasoningLabel()) catch {};
+            result.reasoning_offset = writer.buffered().len;
             wrote_any = true;
         }
         if (self.currentComposerShowsFastToggle()) {
             if (wrote_any) writer.writeAll(" · ") catch {};
             writer.writeAll(self.currentComposerFastLabel()) catch {};
+            result.fast_offset = writer.buffered().len;
             wrote_any = true;
         }
         if (wrote_any) writer.writeAll(" · ") catch {};
         writer.writeAll(self.currentComposerAccessLabel()) catch {};
-        return writer.buffered();
+        result.access_offset = writer.buffered().len;
+        result.text = writer.buffered();
+        return result;
+    }
+
+    pub fn composerRunSummary(self: *const AppState, buf: []u8) []const u8 {
+        return self.composerRunSummaryParts(buf).text;
     }
 
     pub fn syncPaletteModelPicker(self: *AppState) void {
