@@ -1204,7 +1204,7 @@ pub const Renderer = struct {
         return entry;
     }
 
-    fn fontForRoleAndSize(self: *Renderer, font_size: f32, role: ?draw.FontRole) !*c.TTF_Font {
+    fn fontForRoleAndSize(self: *Renderer, font_size: f32, role: ?draw.FontRole) error{ OutOfMemory, SdlTtfTextFailed }!*c.TTF_Font {
         const render_size = font_size * GPU_TEXT_FONT_SCALE;
         const key: FontCacheKey = .{
             .font_size_bits = @bitCast(render_size),
@@ -1216,8 +1216,39 @@ pub const Renderer = struct {
         const font = c.TTF_CopyFont(base_font) orelse return error.SdlTtfTextFailed;
         errdefer c.TTF_CloseFont(font);
         if (!c.TTF_SetFontSize(font, render_size)) return error.SdlTtfTextFailed;
+        try self.addCoverageFallbackFonts(font, font_size, role);
         try self.font_cache.put(key, font);
         return font;
+    }
+
+    // UI/prose text is shaped as whole runs through TTF_Text, so the
+    // per-glyph mono fallback in fallbackFontRoleForGlyph never applies to
+    // it — a codepoint the (subset) text face lacks rendered as tofu (e.g.
+    // → U+2192 in chat transcripts). Register the bundled symbol faces as
+    // native SDL_ttf fallbacks on the sized copy so shaping substitutes
+    // them. Mono is excluded: terminal cells force fixed advances through
+    // the per-glyph path, which stays authoritative there. Fallbacks are
+    // sized copies at the same render size because SDL_ttf renders fallback
+    // glyphs at the fallback font's own size; TTF_CloseFont unregisters
+    // both directions, so clearFontCache stays order-independent.
+    fn addCoverageFallbackFonts(self: *Renderer, font: *c.TTF_Font, font_size: f32, role: ?draw.FontRole) error{ OutOfMemory, SdlTtfTextFailed }!void {
+        const wants_fallback = if (role) |font_role| switch (font_role) {
+            .ui, .ui_bold, .prose, .prose_bold, .prose_italic, .prose_bold_italic => true,
+            else => false,
+        } else true;
+        if (!wants_fallback) return;
+        const fallback_roles = [_]draw.FontRole{ .symbols, .symbols_alt, .emoji };
+        for (fallback_roles) |fallback_role| {
+            const loaded = switch (fallback_role) {
+                .symbols => self.symbols_font != null,
+                .symbols_alt => self.symbols_alt_font != null,
+                .emoji => self.emoji_font != null,
+                else => false,
+            };
+            if (!loaded) continue;
+            const sized = try self.fontForRoleAndSize(font_size, fallback_role);
+            if (!c.TTF_AddFallbackFont(font, sized)) return error.SdlTtfTextFailed;
+        }
     }
 
     fn baseFontForRole(self: *Renderer, role: ?draw.FontRole) *c.TTF_Font {
