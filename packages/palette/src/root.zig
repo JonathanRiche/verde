@@ -22,8 +22,10 @@ pub const image_component = @import("components/image.zig");
 pub const list_box_component = @import("components/list_box.zig");
 pub const menu_component = @import("components/menu.zig");
 pub const modal_component = @import("components/modal.zig");
+pub const rich_picker_component = @import("components/rich_picker.zig");
 pub const scroll_area_component = @import("components/scroll_area.zig");
 pub const select_component = @import("components/select.zig");
+pub const stepper_component = @import("components/stepper.zig");
 pub const table_component = @import("components/table.zig");
 pub const tabs_component = @import("components/tabs.zig");
 pub const text_component = @import("components/text.zig");
@@ -84,10 +86,26 @@ pub const ModalEvent = modal_component.ModalEvent;
 pub const ScrollAreaCallbacks = scroll_area_component.ScrollAreaCallbacks;
 pub const ScrollAreaConfig = scroll_area_component.ScrollAreaConfig;
 pub const ScrollAreaEvent = scroll_area_component.ScrollAreaEvent;
+pub const RichPickerCallbacks = rich_picker_component.RichPickerCallbacks;
+pub const RichPickerConfig = rich_picker_component.RichPickerConfig;
+pub const RichPickerEvent = rich_picker_component.RichPickerEvent;
+pub const RichPickerInput = rich_picker_component.Input;
+pub const RichPickerItemTextFn = rich_picker_component.ItemTextFn;
+pub const RichPickerPlacement = rich_picker_component.Placement;
+pub const RichPickerRailIconRenderFn = rich_picker_component.RailIconRenderFn;
+pub const RichPickerRowLeadingRenderFn = rich_picker_component.RowLeadingRenderFn;
+pub const RichPickerSearchStyle = rich_picker_component.SearchStyle;
+pub const RichPickerStyle = rich_picker_component.RichPickerStyle;
 pub const SelectCallbacks = select_component.SelectCallbacks;
 pub const SelectConfig = select_component.SelectConfig;
 pub const SelectEvent = select_component.SelectEvent;
 pub const SelectVariant = select_component.SelectVariant;
+pub const StepperCallbacks = stepper_component.StepperCallbacks;
+pub const StepperConfig = stepper_component.StepperConfig;
+pub const StepperEvent = stepper_component.StepperEvent;
+pub const StepperInput = stepper_component.Input;
+pub const StepperStepTextFn = stepper_component.StepTextFn;
+pub const StepperStyle = stepper_component.StepperStyle;
 pub const TabsCallbacks = tabs_component.TabsCallbacks;
 pub const TabsConfig = tabs_component.TabsConfig;
 pub const TabsEvent = tabs_component.TabsEvent;
@@ -108,6 +126,7 @@ pub const TextInputAction = text_input_component.TextInputAction;
 pub const TextInputCallbacks = text_input_component.TextInputCallbacks;
 pub const TextInputConfig = text_input_component.TextInputConfig;
 pub const TextInputEvent = text_input_component.TextInputEvent;
+pub const TextInputStyle = text_input_component.TextInputStyle;
 pub const ToolbarConfig = toolbar_component.ToolbarConfig;
 pub const ToolbarItem = toolbar_component.ToolbarItem;
 pub const VirtualListCallbacks = virtual_list_component.VirtualListCallbacks;
@@ -201,9 +220,19 @@ pub fn modal(comptime config: ModalConfig) type {
     return modal_component.Modal(config);
 }
 
+/// Creates a retained rich picker popover (search, groups, descriptions, badges).
+pub fn richPicker(comptime config: RichPickerConfig) type {
+    return rich_picker_component.RichPicker(config);
+}
+
 /// Creates a retained select/dropdown with comptime styling.
 pub fn select(comptime config: SelectConfig) type {
     return select_component.Select(config);
+}
+
+/// Creates a retained stepped control (ordered options as visible steps).
+pub fn stepper(comptime config: StepperConfig) type {
+    return stepper_component.Stepper(config);
 }
 
 /// Creates a retained table with comptime styling.
@@ -264,8 +293,10 @@ test {
     _ = list_box_component;
     _ = menu_component;
     _ = modal_component;
+    _ = rich_picker_component;
     _ = scroll_area_component;
     _ = select_component;
+    _ = stepper_component;
     _ = table_component;
     _ = tabs_component;
     _ = text_component;

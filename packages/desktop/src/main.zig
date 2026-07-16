@@ -258,8 +258,8 @@ fn mainInner(init: std.process.Init) !void {
         },
     );
     defer window.destroy();
-    const terminal_pointer_cursor = try sdl.createSystemCursor(.pointer);
-    defer terminal_pointer_cursor.destroy();
+    const pointer_cursor = try sdl.createSystemCursor(.pointer);
+    defer pointer_cursor.destroy();
     window.setPosition(initial_window_frame.x, initial_window_frame.y) catch {};
     activateMacosHostWindow(window);
     if (builtin.os.tag == .macos) {
@@ -540,7 +540,7 @@ fn mainInner(init: std.process.Init) !void {
                 changed.* = app_state.pollTerminals();
             }
         }.run, .{ &state, &terminal_needs_render });
-        syncTerminalMouseCursor(&state, terminal_pointer_cursor);
+        syncMouseCursor(&state, pointer_cursor);
         pollAppConfigFileChanges(&state);
         if (state.app_config_runtime_sync_pending) {
             state.app_config_runtime_sync_pending = false;
@@ -646,12 +646,19 @@ fn mainInner(init: std.process.Init) !void {
     }
 }
 
-fn syncTerminalMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
-    const shape = terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y) orelse {
-        sdl.setCursor(sdl.getDefaultCursor()) catch {};
+// Resolves the OS mouse cursor each frame: terminal-reported shapes win,
+// then clickable composer controls (pills, popover rows/segments) show a
+// pointer hand, otherwise the default arrow.
+fn syncMouseCursor(state: *const AppState, pointer_cursor: *sdl.Cursor) void {
+    if (terminal_panel_ui.mouseShapeAtPoint(state, state.palette_mouse_x, state.palette_mouse_y)) |shape| {
+        sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
         return;
-    };
-    sdl.setCursor(if (shape == .pointer) pointer_cursor else sdl.getDefaultCursor()) catch {};
+    }
+    if (state.pointerCursorWanted()) {
+        sdl.setCursor(pointer_cursor) catch {};
+        return;
+    }
+    sdl.setCursor(sdl.getDefaultCursor()) catch {};
 }
 
 fn configuredPaletteRendererBackend() palette_frame_renderer.Backend {
@@ -1152,13 +1159,15 @@ fn appNeedsContinuousFrames(state: *AppState) bool {
         workspace_panes_ui.isCompletionPulseAnimating() or
         ui_layout.isSidebarAnimating() or
         state.hasPendingSlashCommand() or
+        // Run-config stepper thumbs slide for ~160ms after a selection.
+        state.runConfigStepperAnimating() or
         // Pulsing sidebar status pips need a steady tick or the sine wave
         // gets sampled at the 1Hz "Working" label cadence and looks steppy.
         state.sidebar_pulse_animating;
 }
 
 fn eventWaitTimeoutMs(state: *AppState) c_int {
-    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating()) {
+    if (state.isPickerPending() or state.isBrowserVisible() or state.transcriptMarkdownSelectionDragging() or workspace_panes_ui.isFocusAnimating() or workspace_panes_ui.isCompletionPulseAnimating() or ui_layout.isSidebarAnimating() or state.runConfigStepperAnimating()) {
         return ACTIVE_WAIT_TIMEOUT_MS;
     }
     // Terminal output only reaches the screen when the loop wakes and polls
@@ -1233,10 +1242,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             const paste_shortcut = shouldPasteClipboardImage(state, &event.key);
             logPasteShortcutEvent(state, &event.key, paste_shortcut);
             if (paste_shortcut) {
-                // Browser URL bar + modal text inputs handle their own paste
-                // further down the chain. Don't intercept here when one of
-                // them owns focus.
-                if (!state.browser_address_focused and state.palette_modal_text_focus == .none) {
+                // Browser URL bar, modal text inputs, and the model picker's
+                // search field handle their own paste further down the chain.
+                // Don't intercept here when one of them owns focus.
+                if (!state.browser_address_focused and state.palette_modal_text_focus == .none and
+                    !state.palette_model_picker.isOpen())
+                {
                     if (state.attachClipboardImageToCurrentDraft()) return true;
                     if (state.pasteClipboardTextIntoPaletteComposer()) return true;
                 }
@@ -1443,6 +1454,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             ui_layout.updateHerdrProfilePickerHover(state, event.motion.x, event.motion.y);
             ui_layout.updateSettingsModalHover(state, event.motion.x, event.motion.y);
             ui_layout.updateCommandPaletteHover(state, event.motion.x, event.motion.y);
+            // Composer popovers (model picker / run config) draw above the
+            // panes, so their hover/drag routing must win over transcript and
+            // pane motion handlers below.
+            if (state.routeComposerPopoverMouseMotion(&event.motion, ui_scale)) {
+                return true;
+            }
             chat_panel_ui.handleTranscriptPaletteMouseMotion(state);
             ui_layout.handlePaletteMouseMotion(state, event.motion.x, event.motion.y);
             const ctrl_down = isCtrlPressed() or isKeymodPressed(SDL_GetModState(), sdl.Keymod.ctrl);
@@ -1470,6 +1487,12 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
                 }
             }
             if (event.button.button == 1 and ui_layout.handlePaletteMouseButton(state, event.button.x, event.button.y, event.button.down, event.button.clicks)) {
+                syncWindowTextInput(window, state);
+                return true;
+            }
+            // Composer popovers overlay the panes; clicks on (or dismissing)
+            // them must not fall through to workspace/transcript handlers.
+            if (state.routeComposerPopoverMouseButton(&event.button, ui_scale)) {
                 syncWindowTextInput(window, state);
                 return true;
             }
@@ -1611,6 +1634,11 @@ fn handleEvent(window: *sdl.Window, state: *AppState, keyboard: *keybinds.Native
             )) {
                 return true;
             }
+            // Composer popovers overlay the panes; scrolling their lists must
+            // win over sidebar/terminal/transcript wheel handlers below.
+            if (state.routeComposerPopoverWheel(&event.wheel, ui_scale)) {
+                return true;
+            }
             if (sidebar_ui.handlePaletteWheel(event.wheel.mouse_x, event.wheel.mouse_y, event.wheel.y)) {
                 return true;
             }
@@ -1653,6 +1681,9 @@ fn syncWindowTextInput(window: *sdl.Window, state: *AppState) void {
     }
     const needs_sdl_text_input = state.terminal_focused or
         state.palette_composer.focused or
+        // The model picker's embedded search field consumes typed characters
+        // while the popover is open.
+        state.palette_model_picker.isOpen() or
         state.browser_address_focused or
         state.palette_modal_text_focus != .none or
         (state.isBrowserPaneFocused() and !macosNativeBrowserShouldOwnKeyboard(state));

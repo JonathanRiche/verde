@@ -14,6 +14,7 @@ const composer_pickers = @import("composer_pickers.zig");
 const file_icons = @import("file_icons.zig");
 const runtime = @import("runtime.zig");
 const terminal_panel = @import("terminal_panel.zig");
+const text_measure = @import("text_measure.zig");
 const theme = @import("theme.zig");
 
 const TOP_BAR_HEIGHT: f32 = 57.0; // ~70% of legacy 82px cap
@@ -3431,46 +3432,16 @@ fn renderInactiveComposerToolbar(state: *app_state.AppState, rect: palette.Rect)
         x += model_w + gap;
     }
 
-    const reasoning_label = state.currentComposerReasoningLabel();
-    const reasoning_w = inactiveComposerPillWidth(reasoning_label, false);
-    if (x + reasoning_w <= max_x) {
-        renderInactiveComposerPill(state, .{ .x = x, .y = y, .w = reasoning_w, .h = pill_h }, reasoning_label, false);
-        x += reasoning_w + gap;
-    }
-
-    if (state.currentComposerShowsFastToggle()) {
-        const fast_label = state.currentComposerFastLabel();
-        const fast_w = inactiveComposerPillWidth(fast_label, true);
-        if (x + fast_w <= max_x) {
-            const pill = palette.Rect{ .x = x, .y = y, .w = fast_w, .h = pill_h };
-            renderInactiveComposerPill(state, pill, fast_label, true);
-            const icon_rect = snapIconRectOrigin(.{
-                .x = pill.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
-                .y = pill.y + (pill.h - theme.scaledUi(19.0)) * 0.5,
-                .w = theme.scaledUi(19.0),
-                .h = theme.scaledUi(19.0),
-            });
-            const icon_color = paletteColor(theme.COLOR_TEXT_MUTED);
-            if (thread.fast_mode == .on) {
-                drawBoltIcon(state, icon_rect, icon_color);
-            } else {
-                drawDefaultModeIcon(state, icon_rect, icon_color);
-            }
-            x += fast_w + gap;
-        }
-    }
-
-    const access_label = state.currentComposerAccessLabel();
-    const access_w = inactiveComposerPillWidth(access_label, true);
-    if (x + access_w <= max_x) {
-        const pill = palette.Rect{ .x = x, .y = y, .w = access_w, .h = pill_h };
-        renderInactiveComposerPill(state, pill, access_label, true);
-        drawAccessIcon(state, snapIconRectOrigin(.{
-            .x = pill.x + theme.scaledUi(COMPOSER_TOOLBAR_PILL_PAD_X),
-            .y = pill.y + (pill.h - theme.scaledUi(19.0)) * 0.5,
-            .w = theme.scaledUi(19.0),
-            .h = theme.scaledUi(19.0),
-        }), paletteColor(theme.COLOR_TEXT_MUTED));
+    // The live composer consolidates reasoning/speed/access into one run
+    // pill; the read-only preview mirrors that with the same summary text.
+    // Measure the joined label (it spans up to three settings and includes
+    // multibyte separators) instead of guessing from byte count.
+    var summary_buf: [192]u8 = undefined;
+    const summary_label = state.composerRunSummary(&summary_buf);
+    const summary_text_w = text_measure.textWidth(.ui, theme.scaledUi(12.5), summary_label);
+    const summary_w = theme.clampf(summary_text_w + theme.scaledUi(26.0), theme.scaledUi(76.0), theme.scaledUi(320.0));
+    if (x + summary_w <= max_x) {
+        renderInactiveComposerPill(state, .{ .x = x, .y = y, .w = summary_w, .h = pill_h }, summary_label, false);
     }
 }
 
@@ -4015,12 +3986,16 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         }
     }
 
-    drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
-        .x = access_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
-        .y = access_rect.y + (access_rect.h - icon_size) * 0.5,
-        .w = icon_size,
-        .h = icon_size,
-    }), icon_color);
+    // Fast/access consolidated into the run-config popover; the access pill
+    // (and its lock glyph) only draws when a host re-enables the toggle.
+    if (state.palette_composer.showAccessToggle()) {
+        drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
+            .x = access_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X,
+            .y = access_rect.y + (access_rect.h - icon_size) * 0.5,
+            .w = icon_size,
+            .h = icon_size,
+        }), icon_color);
+    }
 }
 
 // Nerd Font Symbols glyphs used for composer-toolbar icons. Rendering them
