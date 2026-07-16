@@ -3935,6 +3935,24 @@ fn renderPendingFollowupPin(
     }, prompt, paletteColor(theme.COLOR_WHITE), body_font, rect);
 }
 
+// The run summary words are nearly all cap-height (no descenders), so their
+// optical center sits slightly above the pill's geometric center. Lift the
+// glyphs by the same amount so they align with the text instead of the pill
+// box. Tuned against screenshots: 0 reads a hair low, 2.5 floats high.
+const RUN_PILL_ICON_OPTICAL_LIFT: f32 = 1.0;
+
+// Centers a square glyph box of `size` inside a reserved run-pill label cell;
+// the cell's spare width splits evenly into the word-side and separator-side
+// gaps, and the box is lifted to the label text's optical midline.
+fn composerIconRectInCell(cell: palette.Rect, size: f32) palette.Rect {
+    return snapIconRectOrigin(.{
+        .x = cell.x + @max((cell.w - size) * 0.5, 0.0),
+        .y = cell.y + (cell.h - size) * 0.5 - theme.scaledUi(RUN_PILL_ICON_OPTICAL_LIFT),
+        .w = size,
+        .h = size,
+    });
+}
+
 fn snapIconRectOrigin(rect: palette.Rect) palette.Rect {
     return .{
         .x = @round(rect.x * 2.0) * 0.5,
@@ -3972,33 +3990,37 @@ fn renderComposerToolbarIcons(state: *app_state.AppState) void {
         queueImage(state, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, cached, model_rect);
     }
 
-    // The run pill leads with the fast-mode and access state glyphs that the
-    // dedicated fast/access pills carried before they were consolidated; the
-    // composer reserves the label room via `setReasoningLeadingReserve`.
+    // The run pill embeds the fast-mode and access state glyphs beside the
+    // label segment each one describes; the composer reserves the cells via
+    // `setReasoningIconSlots` and reports their rects so the glyphs track
+    // label layout and truncation. Each glyph is centered in its cell so the
+    // word→glyph and glyph→separator gaps stay balanced. Slot order matches
+    // `syncPaletteComposerControls`: optional reasoning glyph, then optional
+    // speed glyph, then access.
     if (state.palette_composer.showReasoningToggle()) {
-        const run_rect = state.palette_composer.reasoningRect();
-        if (run_rect.w > 0.0) {
-            var icon_x = run_rect.x + COMPOSER_TOOLBAR_PILL_PAD_X;
-            if (state.currentComposerShowsFastToggle()) {
-                const fast_icon_rect = snapIconRectOrigin(palette.Rect{
-                    .x = icon_x,
-                    .y = run_rect.y + (run_rect.h - icon_size) * 0.5,
-                    .w = icon_size,
-                    .h = icon_size,
-                });
-                if (state.currentThread().fast_mode == .on) {
-                    drawBoltIcon(state, fast_icon_rect, icon_color);
-                } else {
-                    drawDefaultModeIcon(state, fast_icon_rect, icon_color);
-                }
-                icon_x += app_state.COMPOSER_RUN_PILL_ICON_CELL;
+        const slots = state.palette_composer.reasoningIconSlotRects();
+        var slot_index: usize = 0;
+        if (state.currentComposerShowsReasoningSegment() and slot_index < slots.count) {
+            const cell = slots.rects[slot_index];
+            slot_index += 1;
+            // The brain glyph inks its full em square while the bolt/lock
+            // carry ~7-12% built-in side bearings; draw it smaller so the
+            // three glyphs read as the same visual weight.
+            drawThinkingIcon(state, composerIconRectInCell(cell, icon_size * 0.85), icon_color);
+        }
+        if (state.currentComposerShowsFastToggle() and slot_index < slots.count) {
+            const cell = slots.rects[slot_index];
+            slot_index += 1;
+            const fast_icon_rect = composerIconRectInCell(cell, icon_size);
+            if (state.currentThread().fast_mode == .on) {
+                drawBoltIcon(state, fast_icon_rect, icon_color);
+            } else {
+                drawDefaultModeIcon(state, fast_icon_rect, icon_color);
             }
-            drawAccessIcon(state, snapIconRectOrigin(palette.Rect{
-                .x = icon_x,
-                .y = run_rect.y + (run_rect.h - icon_size) * 0.5,
-                .w = icon_size,
-                .h = icon_size,
-            }), icon_color);
+        }
+        if (slot_index < slots.count) {
+            const cell = slots.rects[slot_index];
+            drawAccessIcon(state, composerIconRectInCell(cell, icon_size), icon_color);
         }
     }
 
@@ -4036,6 +4058,7 @@ const NF_FA_FLASH = "\u{F0E7}"; // lightning bolt
 const NF_COD_LOCK = "\u{EA75}";
 const NF_COD_UNLOCK = "\u{EB74}";
 const NF_COD_CIRCLE = "\u{EABC}"; // hollow circle — reads as "inactive / default" next to the bolt
+const NF_MD_BRAIN = "\u{F09D1}"; // brain — reasoning/thinking level on the run pill
 
 /// Renders a single codicon glyph centered inside `rect` using the icon font.
 /// SDL_ttf rasterizes the glyph with proper antialiasing at the requested
@@ -4069,6 +4092,10 @@ fn drawDefaultModeIcon(state: *app_state.AppState, rect: palette.Rect, color: pa
 fn drawAccessIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
     const glyph = if (state.currentThread().access_mode == .full_access) NF_COD_UNLOCK else NF_COD_LOCK;
     queueComposerIcon(state, rect, glyph, color);
+}
+
+fn drawThinkingIcon(state: *app_state.AppState, rect: palette.Rect, color: palette.Color) void {
+    queueComposerIcon(state, rect, NF_MD_BRAIN, color);
 }
 
 fn stableText(state: *app_state.AppState, value: []const u8) []const u8 {

@@ -144,6 +144,28 @@ pub const ComposerPromptOptionTarget = enum {
 
 pub const ComposerPromptOptionLabelFn = *const fn (context: ?*anyopaque, index: usize) []const u8;
 
+/// Upper bound on host-reserved icon cells inside the reasoning/run pill
+/// label; sized for one glyph per summary segment (speed, access, spare).
+pub const MAX_PILL_ICON_SLOTS = 3;
+
+/// One host-drawn glyph cell inside the reasoning/run pill label. The cell is
+/// inserted before the label byte at `byte_offset`, so the glyph sits beside
+/// the segment it describes instead of stacking at the front of the pill.
+pub const ComposerPromptIconSlot = struct {
+    byte_offset: usize,
+    /// Cell width in the same units as `pill_overlay_icon_reserve`; includes
+    /// the gap the host wants between the glyph and the following text.
+    width: f32,
+};
+
+/// Resolved screen rects for the reserved icon cells, in the same coordinate
+/// space as `reasoningRect()`. Cells clipped away with a truncated label are
+/// omitted so hosts never draw glyphs outside the pill.
+pub const ComposerPromptIconSlotRects = struct {
+    rects: [MAX_PILL_ICON_SLOTS]draw.Rect = undefined,
+    count: usize = 0,
+};
+
 pub const ComposerPromptInput = union(enum) {
     text: []const u8,
     key: key_input,
@@ -308,10 +330,12 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         /// can attach richer popovers (rich picker, run-config panel) instead.
         external_model_menu: bool = false,
         external_reasoning_menu: bool = false,
-        /// Width reserved after the reasoning/run pill's left padding for
-        /// host-drawn state glyphs (fast bolt, access lock). Same units as
-        /// `pill_overlay_icon_reserve`; the label starts after it.
-        reasoning_leading_reserve: f32 = 0.0,
+        /// Host-drawn glyph cells embedded in the reasoning/run pill label
+        /// (fast bolt beside the speed word, lock beside the access word).
+        /// Sorted by byte offset; only the first `reasoning_icon_slot_count`
+        /// entries are live.
+        reasoning_icon_slots: [MAX_PILL_ICON_SLOTS]ComposerPromptIconSlot = undefined,
+        reasoning_icon_slot_count: usize = 0,
         fast_enabled: bool = false,
         access_enabled: bool = false,
         send_state: ComposerPromptSendState = .send,
@@ -335,8 +359,57 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             return self.show_reasoning_toggle;
         }
 
-        pub fn setReasoningLeadingReserve(self: *Component, reserve: f32) void {
-            self.reasoning_leading_reserve = @max(reserve, 0.0);
+        /// Reserves host-drawn glyph cells inside the run pill label. Slots
+        /// must be sorted by ascending byte offset; offsets past the current
+        /// label clamp to its end when the cells are laid out.
+        pub fn setReasoningIconSlots(self: *Component, slots: []const ComposerPromptIconSlot) void {
+            const count = @min(slots.len, MAX_PILL_ICON_SLOTS);
+            for (slots[0..count], 0..) |slot, index| {
+                self.reasoning_icon_slots[index] = .{
+                    .byte_offset = slot.byte_offset,
+                    .width = @max(slot.width, 0.0),
+                };
+            }
+            self.reasoning_icon_slot_count = count;
+        }
+
+        fn reasoningIconSlots(self: *const Component) []const ComposerPromptIconSlot {
+            return self.reasoning_icon_slots[0..self.reasoning_icon_slot_count];
+        }
+
+        fn reasoningIconSlotsWidth(self: *const Component) f32 {
+            var total: f32 = 0.0;
+            for (self.reasoningIconSlots()) |slot| total += slot.width;
+            return total;
+        }
+
+        /// Screen rects of the reserved icon cells, mirroring the segment walk
+        /// `renderPill` uses to place the label pieces, so host glyphs line up
+        /// with the words they annotate even as the label or pill width change.
+        pub fn reasoningIconSlotRects(self: *const Component) ComposerPromptIconSlotRects {
+            var result: ComposerPromptIconSlotRects = .{};
+            if (!self.show_reasoning_toggle) return result;
+            const rect = self.toolbarGeometry().reasoning;
+            if (rect.w <= 0.0 or rect.h <= 0.0) return result;
+            const label = self.reasoningLabel();
+            const metrics = self.toolbarMetrics();
+            const label_area_right = rect.x + rect.w - config.pill_padding_x - self.trailingChevronReserve(config.chevron_icon);
+            var x = rect.x + config.pill_padding_x;
+            var byte: usize = 0;
+            for (self.reasoningIconSlots()) |slot| {
+                const offset = @min(slot.byte_offset, label.len);
+                if (offset > byte) {
+                    x += metrics.measureSlice(label[byte..offset]);
+                    byte = offset;
+                }
+                // A shrunken pill clips the label tail; drop the cells that
+                // fall past the clip so the host does not draw over the chevron.
+                if (x + slot.width > label_area_right) break;
+                result.rects[result.count] = .{ .x = x, .y = rect.y, .w = slot.width, .h = rect.h };
+                result.count += 1;
+                x += slot.width;
+            }
+            return result;
         }
 
         pub fn setShowFastToggle(self: *Component, show: bool) void {
@@ -702,15 +775,15 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 try self.renderSeparator(allocator, batch, separatorX(left_before_access, geometry.access), geometry.toolbar);
             }
 
-            try self.renderPill(allocator, batch, true, 0.0, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
+            try self.renderPill(allocator, batch, true, &.{}, geometry.model, config.model_icon, self.modelLabel(), config.chevron_icon, self.hovered_part == .model or self.active_menu == .model);
             if (self.show_reasoning_toggle) {
-                try self.renderPill(allocator, batch, false, self.reasoning_leading_reserve, geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
+                try self.renderPill(allocator, batch, false, self.reasoningIconSlots(), geometry.reasoning, "", self.reasoningLabel(), config.chevron_icon, self.hovered_part == .reasoning or self.active_menu == .reasoning);
             }
             if (self.show_fast_toggle) {
-                try self.renderPill(allocator, batch, true, 0.0, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
+                try self.renderPill(allocator, batch, true, &.{}, geometry.fast, config.fast_icon, self.fastLabel(), "", self.hovered_part == .fast or self.fast_enabled);
             }
             if (self.show_access_toggle) {
-                try self.renderPill(allocator, batch, true, 0.0, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
+                try self.renderPill(allocator, batch, true, &.{}, geometry.access, config.access_icon, self.accessLabel(), "", self.hovered_part == .access or self.access_enabled);
             }
 
             const send_disabled = self.send_state == .disabled or self.send_state == .pending;
@@ -734,14 +807,15 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
             }
         }
 
-        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, overlay_leading: bool, extra_leading: f32, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
+        fn renderPill(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, overlay_leading: bool, icon_slots: []const ComposerPromptIconSlot, rect: draw.Rect, left_icon: []const u8, label: []const u8, right_icon: []const u8, hovered: bool) !void {
             if (rect.w <= 0.0 or rect.h <= 0.0) return;
             try batch.panel(allocator, rect, if (hovered) self.style.control_hover_color else self.style.control_background_color, null, rect.h * 0.5, 0.0);
             const text_metrics = self.toolbarMetrics();
             const icon_metrics = self.iconMetrics();
-            var runs: [3]draw.TextRun = undefined;
+            // Left icon + one label segment per icon slot + the closing segment.
+            var runs: [2 + MAX_PILL_ICON_SLOTS]draw.TextRun = undefined;
             var count: usize = 0;
-            var x = rect.x + config.pill_padding_x + extra_leading;
+            var x = rect.x + config.pill_padding_x;
             if (overlay_leading and config.pill_overlay_icon_reserve > 0.0) {
                 x += config.pill_overlay_icon_reserve + config.pill_icon_gap;
             } else if (left_icon.len > 0) {
@@ -760,19 +834,21 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 .h = rect.h,
             };
             const label_clip = clippedRect(rect, label_strip) orelse label_strip;
-            runs[count] = .{
-                .text = label,
-                .byte_start = 0,
-                .byte_end = label.len,
-                .x = x,
-                .y = rect.y + @max((rect.h - text_metrics.line_height) * 0.5, 0.0),
-                .font_size = text_metrics.font_size,
-                .line_height = text_metrics.line_height,
-                .color = self.style.text_color,
-                .clip = label_clip,
-                .font_role = config.bold_font_role,
-                .font_id = config.font_id,
-            };
+            // Break the label around the reserved icon cells so each host
+            // glyph lands beside the segment it describes (keep this walk in
+            // sync with `reasoningIconSlotRects`).
+            var byte: usize = 0;
+            for (icon_slots) |slot| {
+                const offset = @min(slot.byte_offset, label.len);
+                if (offset > byte) {
+                    runs[count] = self.pillLabelRun(label, byte, offset, x, rect, label_clip, text_metrics);
+                    x += text_metrics.measureSlice(label[byte..offset]);
+                    count += 1;
+                    byte = offset;
+                }
+                x += slot.width;
+            }
+            runs[count] = self.pillLabelRun(label, byte, label.len, x, rect, label_clip, text_metrics);
             count += 1;
             if (right_icon.len > 0) {
                 const reserve = self.trailingChevronReserve(right_icon);
@@ -783,6 +859,22 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
                 try renderDisclosureArrow(allocator, batch, cell_rect, self.style.icon_color);
             }
             try batch.textRuns(allocator, rect, label, runs[0..count], self.style.text_color, text_metrics.font_size, rect, text_metrics.line_height, text_metrics.fixedAdvance());
+        }
+
+        fn pillLabelRun(self: *const Component, label: []const u8, byte_start: usize, byte_end: usize, x: f32, rect: draw.Rect, clip: draw.Rect, metrics: text_layout.FontMetrics) draw.TextRun {
+            return .{
+                .text = label,
+                .byte_start = byte_start,
+                .byte_end = byte_end,
+                .x = x,
+                .y = rect.y + @max((rect.h - metrics.line_height) * 0.5, 0.0),
+                .font_size = metrics.font_size,
+                .line_height = metrics.line_height,
+                .color = self.style.text_color,
+                .clip = clip,
+                .font_role = config.bold_font_role,
+                .font_id = config.font_id,
+            };
         }
 
         fn renderCenteredIcon(self: *const Component, allocator: std.mem.Allocator, batch: *draw.RenderBatch, rect: draw.Rect, icon: []const u8, color: draw.Color) !void {
@@ -1562,7 +1654,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
         fn shrinkToolbarPillWidthsToFit(self: *const Component, avail: f32, model_w: *f32, reasoning_w: *f32, fast_w: *f32, access_w: *f32) void {
             const need_m = self.pillNaturalNeedWidth(true, 0.0, config.model_icon, self.modelLabel(), config.chevron_icon);
             const need_r = if (self.show_reasoning_toggle)
-                self.pillNaturalNeedWidth(false, self.reasoning_leading_reserve, "", self.reasoningLabel(), config.chevron_icon)
+                self.pillNaturalNeedWidth(false, self.reasoningIconSlotsWidth(), "", self.reasoningLabel(), config.chevron_icon)
             else
                 0.0;
             const need_f = if (self.show_fast_toggle)
@@ -1628,7 +1720,7 @@ pub fn ComposerPrompt(comptime config: ComposerPromptConfig) type {
 
             var model_w = self.pillWidth(true, 0.0, config.model_icon, self.modelLabel(), config.chevron_icon, config.model_min_width, config.model_max_width);
             var reasoning_w: f32 = if (self.show_reasoning_toggle)
-                self.pillWidth(false, self.reasoning_leading_reserve, "", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width)
+                self.pillWidth(false, self.reasoningIconSlotsWidth(), "", self.reasoningLabel(), config.chevron_icon, config.reasoning_min_width, config.reasoning_max_width)
             else
                 0.0;
             var fast_w: f32 = if (self.show_fast_toggle)
@@ -1930,6 +2022,37 @@ test "composer prompt hides access pill from geometry and hit testing" {
     prompt.setShowAccessToggle(false);
     try std.testing.expectEqual(@as(f32, 0.0), prompt.accessRect().w);
     try std.testing.expect(prompt.hitTest(.{ .x = shown_access.x + 2, .y = shown_access.y + 2 }) != .access);
+}
+
+test "composer prompt lays icon slot cells beside their label segments" {
+    const Prompt = ComposerPrompt(.{
+        .width = 800,
+        .height = 150,
+        .pill_padding_x = 12,
+        .toolbar_fixed_advance = 5,
+        .reasoning_max_width = 400,
+    });
+    var prompt = Prompt.init();
+    defer prompt.deinit(std.testing.allocator);
+    try prompt.setReasoningLabel(std.testing.allocator, "High - Fast - Full access");
+    prompt.setReasoningIconSlots(&.{
+        .{ .byte_offset = 7, .width = 20 },
+        .{ .byte_offset = 14, .width = 20 },
+    });
+
+    const pill = prompt.reasoningRect();
+    const slots = prompt.reasoningIconSlotRects();
+    try std.testing.expectEqual(@as(usize, 2), slots.count);
+    // First cell sits after "High - " (7 chars * 5 advance) plus padding;
+    // second after the first cell plus "Fast - " (another 7 chars).
+    try std.testing.expectEqual(pill.x + 47.0, slots.rects[0].x);
+    try std.testing.expectEqual(slots.rects[0].x + 55.0, slots.rects[1].x);
+    try std.testing.expectEqual(@as(f32, 20.0), slots.rects[0].w);
+
+    // The reserved cells widen the pill by their combined width.
+    prompt.setReasoningIconSlots(&.{});
+    try std.testing.expectEqual(pill.w - 40.0, prompt.reasoningRect().w);
+    try std.testing.expectEqual(@as(usize, 0), prompt.reasoningIconSlotRects().count);
 }
 
 test "composer prompt scrolls overflowing text and renders scrollbar" {
