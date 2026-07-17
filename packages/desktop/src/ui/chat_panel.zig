@@ -503,6 +503,26 @@ pub fn handleWorkspaceHeaderPaletteMouseButton(state: *app_state.AppState, x: f3
     return false;
 }
 
+/// True when the mouse rests on a clickable workspace-header control (Open,
+/// its chevron, Browser) or an enabled Open-menu row, so the main loop can
+/// show a pointer (hand) cursor. Mirrors the precedence of
+/// `handleWorkspaceHeaderPaletteMouseButton`.
+pub fn workspaceHeaderWantsPointerAt(state: *const app_state.AppState, x: f32, y: f32) bool {
+    if (state.projects.items.len == 0) return false;
+    if (workspaceHeaderMenuHit(state)) |menu_hit| {
+        var i: usize = 0;
+        while (i < menu_hit.menu_row_count) : (i += 1) {
+            // Disabled rows dismiss the menu without acting, so they keep
+            // the default cursor.
+            if (menu_hit.menu_row_enabled[i] and rectContains(menu_hit.menu_row_rects[i], x, y)) return true;
+        }
+        // The open menu panel overlays the header controls; non-row panel
+        // area only dismisses, so no pointer affordance there.
+        if (rectContains(menu_hit.menu_panel_rect, x, y)) return false;
+    }
+    return workspaceHeaderControlHit(x, y) != null;
+}
+
 pub fn handleFileSearchPaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down: bool) bool {
     if (!down) return false;
     if (!state.hasActiveFileSearch()) return false;
