@@ -1319,14 +1319,16 @@ fn renderPaletteFencedCodeBlock(context: *PaletteRenderContext, block: FencedCod
     );
     queueCodeCopyButton(context, block, rect, options);
 
-    var y = start[1] + pad_y;
-    for (block.lines) |line| {
-        const rows = renderPaletteCodeLine(context, line, .{
-            .x = start[0] + pad_x,
-            .y = y,
-            .max_x = start[0] + width - pad_x,
-        }, options, rect);
-        y += line_height * @as(f32, @floatFromInt(rows));
+    if (visibleClipRect(context.clip, rect)) |code_clip| {
+        var y = start[1] + pad_y;
+        for (block.lines) |line| {
+            const rows = renderPaletteCodeLine(context, line, .{
+                .x = start[0] + pad_x,
+                .y = y,
+                .max_x = start[0] + width - pad_x,
+            }, options, code_clip);
+            y += line_height * @as(f32, @floatFromInt(rows));
+        }
     }
 
     advancePaletteCursor(context, height);
