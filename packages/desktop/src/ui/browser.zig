@@ -43,6 +43,7 @@ const BrowserHitKind = enum {
     inspect_mode_point,
     inspect_mode_draw_box,
     inspect_mode_draw_freeform,
+    setup_dev_server,
     close,
 };
 
@@ -226,6 +227,10 @@ pub fn handlePaletteMouseButton(state: *app_state.AppState, x: f32, y: f32, down
             .inspect_mode_point => selectInspectorMode(state, .point),
             .inspect_mode_draw_box => selectInspectorMode(state, .draw_box),
             .inspect_mode_draw_freeform => selectInspectorMode(state, .draw_freeform),
+            .setup_dev_server => {
+                blurAddress(state);
+                state.setupBrowserDevServer();
+            },
             .close => {
                 blurAddress(state);
                 state.browser_inspector_menu_open = false;
@@ -983,7 +988,15 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
         pane_hovered,
     );
 
+    const page_is_empty = browserPageIsEmpty(browser_state);
+    state.noteBrowserEmptyStateRendered(page_is_empty);
+
     queuePaletteRect(state, pane_rect, paletteColor(theme.background()));
+
+    if (page_is_empty) {
+        renderPanePlaceholder(state, pane_rect);
+        return;
+    }
 
     if (browser_state.controller.paneTexture()) |pane_texture| {
         if (pane_texture.isReady()) {
@@ -1000,8 +1013,47 @@ fn renderPaneCanvas(state: *app_state.AppState, pane_rect: palette.Rect) void {
     }
 
     // Fall back to the full pane bounds while the browser frame has not arrived yet.
-    renderPanePlaceholder();
+    renderPanePlaceholder(state, pane_rect);
 }
 
-/// Keeps the pane visually blank until the first browser frame arrives.
-fn renderPanePlaceholder() void {}
+// Renders the browser's useful empty/loading region.
+fn renderPanePlaceholder(state: *app_state.AppState, pane_rect: palette.Rect) void {
+    const content_width = @min(pane_rect.w - theme.scaledUi(48.0), theme.scaledUi(520.0));
+    if (content_width <= 0.0) return;
+    const title_size = theme.scaledUi(22.0);
+    const body_size = theme.scaledUi(14.0);
+    const button_width = theme.scaledUi(170.0);
+    const button_height = theme.scaledUi(38.0);
+    const block_height = theme.scaledUi(146.0);
+    const x = pane_rect.x + (pane_rect.w - content_width) * 0.5;
+    const y = pane_rect.y + @max((pane_rect.h - block_height) * 0.38, theme.scaledUi(28.0));
+
+    queuePaletteText(state, .{ .x = x, .y = y, .w = content_width, .h = title_size * 1.3 }, "Browse and verify", paletteColor(theme.COLOR_WHITE), title_size, pane_rect);
+    queuePaletteText(state, .{
+        .x = x,
+        .y = y + theme.scaledUi(38.0),
+        .w = content_width,
+        .h = body_size * 2.8,
+    }, "Your agent can browse, interact with, and screenshot pages in this browser. Enter a URL above or start your development server to preview and verify your app.", paletteColor(theme.COLOR_TEXT_MUTED), body_size, pane_rect);
+
+    const button_rect: palette.Rect = .{
+        .x = x,
+        .y = y + theme.scaledUi(96.0),
+        .w = button_width,
+        .h = button_height,
+    };
+    queuePaletteRoundedRect(state, button_rect, paletteColor(if (rectHovered(button_rect)) theme.lighten(theme.COLOR_SECONDARY_GREEN, 0.08) else theme.COLOR_SECONDARY_GREEN), theme.scaledUi(8.0));
+    queuePaletteText(state, .{
+        .x = button_rect.x + theme.scaledUi(14.0),
+        .y = button_rect.y + (button_rect.h - body_size * 1.25) * 0.5,
+        .w = button_rect.w - theme.scaledUi(28.0),
+        .h = body_size * 1.25,
+    }, "Set up dev server", paletteColor(theme.COLOR_WHITE), body_size, button_rect);
+    addPaletteHit(button_rect, .setup_dev_server);
+}
+
+fn browserPageIsEmpty(browser_state: *const browser_runtime.State) bool {
+    const raw = browser_state.current_url orelse browser_state.addressInput();
+    const url = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    return url.len == 0 or std.mem.eql(u8, url, "about:blank");
+}

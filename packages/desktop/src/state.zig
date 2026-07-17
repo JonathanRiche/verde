@@ -2110,6 +2110,19 @@ pub const BrowserOpenResult = struct {
     moved_from_workspace: ?usize,
 };
 
+pub const BrowserScreenshotResult = struct {
+    path: []u8,
+    png_bytes: []u8,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *BrowserScreenshotResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.png_bytes);
+        self.* = undefined;
+    }
+};
+
 pub const BrowserWorkspaceLocation = struct {
     index: usize,
     pane_id: WorkspacePaneId,
@@ -4574,8 +4587,13 @@ pub const AppState = struct {
     app_window_display_scale: f32,
     browser_surface_suspended_for_palette_overlay: bool,
     browser_surface_suspended_for_layout: bool,
+    browser_surface_suspended_for_empty_state: bool,
     browser_suppressed_closed_events: u8,
     browser_clipboard_copy_pending: bool,
+    browser_dev_server_project_index: ?usize,
+    browser_dev_server_process_index: ?usize,
+    browser_dev_server_next_check_ms: i64,
+    browser_dev_server_deadline_ms: i64,
     /// Palette sidebar thread row under the cursor (hover highlight).
     sidebar_thread_hover: ?SidebarThreadHover,
     sidebar_project_hover: ?usize,
@@ -4842,8 +4860,13 @@ pub const AppState = struct {
             .app_window_display_scale = 1.0,
             .browser_surface_suspended_for_palette_overlay = false,
             .browser_surface_suspended_for_layout = false,
+            .browser_surface_suspended_for_empty_state = false,
             .browser_suppressed_closed_events = 0,
             .browser_clipboard_copy_pending = false,
+            .browser_dev_server_project_index = null,
+            .browser_dev_server_process_index = null,
+            .browser_dev_server_next_check_ms = 0,
+            .browser_dev_server_deadline_ms = 0,
             .sidebar_thread_hover = null,
             .sidebar_project_hover = null,
             .sidebar_new_thread_hover = null,
@@ -11412,6 +11435,7 @@ pub const AppState = struct {
         self.browser_state.clearSuppressedEvalResults();
         self.browser_surface_suspended_for_palette_overlay = false;
         self.browser_surface_suspended_for_layout = false;
+        self.browser_surface_suspended_for_empty_state = false;
         self.unfocusBrowserPane();
         self.browser_pane_hovered = false;
         self.browser_address_focused = false;
@@ -11434,6 +11458,7 @@ pub const AppState = struct {
         self.browser_state.clearSuppressedEvalResults();
         self.browser_surface_suspended_for_palette_overlay = false;
         self.browser_surface_suspended_for_layout = false;
+        self.browser_surface_suspended_for_empty_state = false;
         self.unfocusBrowserPane();
         self.browser_address_focused = false;
         self.browser_inspector_menu_open = false;
@@ -11468,6 +11493,7 @@ pub const AppState = struct {
     /// Restores a visible browser dock after the host SDL window is shown/restored.
     pub fn resumeBrowserAfterHostWindowShown(self: *AppState) void {
         if (!self.isBrowserVisible()) return;
+        if (self.browser_surface_suspended_for_empty_state) return;
         self.browser_state.status = .opening;
         self.browser_state.controller.show() catch |err| {
             log.warn("failed to restore browser runtime after host window lifecycle: {s}", .{@errorName(err)});
@@ -11532,6 +11558,10 @@ pub const AppState = struct {
 
     pub fn isBrowserSurfaceSuspendedForLayout(self: *const AppState) bool {
         return self.browser_surface_suspended_for_layout;
+    }
+
+    pub fn isBrowserSurfaceSuspendedForEmptyState(self: *const AppState) bool {
+        return self.browser_surface_suspended_for_empty_state;
     }
 
     /// Reports whether the workspace header Open menu is currently open.
@@ -11734,6 +11764,39 @@ pub const AppState = struct {
         self.syncBrowserPaneBoundsToBackend();
     }
 
+    /// Keeps native child surfaces behind Palette while the useful browser empty state is rendered.
+    pub fn noteBrowserEmptyStateRendered(self: *AppState, is_empty: bool) void {
+        const uses_native_surface = switch (self.browser_state.controller.presentationKind()) {
+            .native_child_view, .native_wayland_surface, .helper_window => true,
+            .snapshot_texture, .offscreen_texture, .stub => false,
+        };
+        const should_suspend = is_empty and uses_native_surface;
+        if (should_suspend == self.browser_surface_suspended_for_empty_state) return;
+
+        if (should_suspend) {
+            self.browser_state.controller.hide() catch |err| {
+                log.warn("failed to hide native browser for empty state: {s}", .{@errorName(err)});
+                return;
+            };
+            self.suppressNextBrowserClosedEvent();
+            self.browser_surface_suspended_for_empty_state = true;
+            self.unfocusBrowserPane();
+            return;
+        }
+
+        self.browser_surface_suspended_for_empty_state = false;
+        if (!self.isBrowserVisible() or self.browser_surface_suspended_for_layout or
+            self.browser_surface_suspended_for_palette_overlay or self.browserBlockedByPaletteOverlay()) return;
+        self.browser_state.status = .opening;
+        self.browser_state.controller.show() catch |err| {
+            log.warn("failed to restore native browser after empty state: {s}", .{@errorName(err)});
+            self.browser_state.status = .failed;
+            self.browser_state.setLastError("Failed to restore browser runtime after the empty state.") catch {};
+            return;
+        };
+        self.syncBrowserPaneBoundsToBackend();
+    }
+
     pub fn noteBrowserPaneNotRendered(self: *AppState) void {
         if (!self.isBrowserVisible()) return;
         self.browser_pane_hovered = false;
@@ -11781,6 +11844,7 @@ pub const AppState = struct {
     fn syncBrowserPaneBoundsToBackend(self: *AppState) void {
         if (!self.isBrowserVisible()) return;
         if (self.browser_surface_suspended_for_layout) return;
+        if (self.browser_surface_suspended_for_empty_state) return;
         if (self.browser_pane_max[0] <= self.browser_pane_min[0] or self.browser_pane_max[1] <= self.browser_pane_min[1]) return;
         if (self.syncBrowserSurfaceOcclusion()) return;
         const pane_width = self.browser_pane_max[0] - self.browser_pane_min[0];
@@ -11821,6 +11885,7 @@ pub const AppState = struct {
         if (!self.browser_surface_suspended_for_layout) return;
         self.browser_surface_suspended_for_layout = false;
         if (self.browserBlockedByPaletteOverlay()) return;
+        if (self.browser_surface_suspended_for_empty_state) return;
         self.browser_state.status = .opening;
         self.browser_state.controller.show() catch |err| {
             log.warn("failed to restore browser runtime after pane returned to layout: {s}", .{@errorName(err)});
@@ -11854,6 +11919,7 @@ pub const AppState = struct {
 
         if (self.browser_surface_suspended_for_palette_overlay) {
             self.browser_surface_suspended_for_palette_overlay = false;
+            if (self.browser_surface_suspended_for_empty_state) return false;
             self.browser_state.status = .opening;
             self.browser_state.controller.show() catch |err| {
                 log.warn("failed to restore browser runtime after palette overlay: {s}", .{@errorName(err)});
@@ -12117,6 +12183,74 @@ pub const AppState = struct {
         };
     }
 
+    /// Captures the current CPU-side browser frame and stores the PNG beside
+    /// other browser captures so live-control and MCP callers can reuse it.
+    pub fn captureBrowserScreenshot(self: *AppState) !BrowserScreenshotResult {
+        if (!self.isBrowserVisible()) return error.BrowserNotVisible;
+        const frame = (try self.browser_state.controller.copyFramePixels(self.allocator)) orelse
+            return error.BrowserScreenshotUnavailable;
+        defer frame.deinit(self.allocator);
+
+        const crop: browser_screenshot.CropRect = .{
+            .x = 0,
+            .y = 0,
+            .width = frame.width,
+            .height = frame.height,
+        };
+        const png_bytes = try browser_screenshot.encodeFrameCropPng(self.allocator, frame, crop);
+        errdefer self.allocator.free(png_bytes);
+        const path = try self.writeImageBytesToStorage("browser-captures", "browser", "png", png_bytes);
+        errdefer self.allocator.free(path);
+        return .{
+            .path = path,
+            .png_bytes = png_bytes,
+            .width = frame.width,
+            .height = frame.height,
+        };
+    }
+
+    /// Reuses the workspace process manager for the browser empty-state CTA.
+    /// Existing process configuration wins; otherwise the workspace opens in
+    /// the configured editor so the user can add a `verde.yml` process.
+    pub fn setupBrowserDevServer(self: *AppState) void {
+        if (self.projects.items.len == 0) {
+            self.setSidebarNotice("Import a workspace before setting up a dev server.");
+            return;
+        }
+        const project_index = self.selected_project_index;
+        self.refreshProjectStackConfig(project_index) catch |err| {
+            log.warn("failed to load dev-server process config: {s}", .{@errorName(err)});
+            self.setSidebarNotice("Fix the workspace verde.yml before starting its dev server.");
+            return;
+        };
+
+        var process_index: ?usize = null;
+        for (self.projects.items[project_index].managed_processes.items, 0..) |process, index| {
+            if (process.kind == .process) {
+                process_index = index;
+                break;
+            }
+        }
+        if (process_index) |index| {
+            const name = self.projects.items[project_index].managed_processes.items[index].name;
+            const started = self.startManagedProcess(project_index, name) catch |err| {
+                log.warn("failed to start dev-server process {s}: {s}", .{ name, @errorName(err) });
+                self.setSidebarNotice("Failed to start the configured dev server.");
+                return;
+            };
+            const now = unixTimestampMs();
+            self.browser_dev_server_project_index = project_index;
+            self.browser_dev_server_process_index = index;
+            self.browser_dev_server_next_check_ms = now;
+            self.browser_dev_server_deadline_ms = now + 20_000;
+            self.setSidebarNotice(if (started) "Started the dev server; waiting for its local URL." else "Waiting for the dev server's local URL.");
+            return;
+        }
+
+        self.openCurrentProjectEditor(.configured);
+        self.setSidebarNotice("Add a dev-server process to verde.yml, then use this action again.");
+    }
+
     /// Navigates typed addresses or reloads when the URL bar already matches the current page.
     pub fn navigateOrReloadBrowserFromAddress(self: *AppState) void {
         const trimmed = std.mem.trim(u8, self.browser_state.addressInput(), &std.ascii.whitespace);
@@ -12211,9 +12345,9 @@ pub const AppState = struct {
     pub fn pollBrowser(self: *AppState) bool {
         if (!self.browser_textures_enabled) return false;
 
-        if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return false;
+        var needs_render = self.pollPendingBrowserDevServer();
+        if (self.browser_launch_open_delay_frames == 0 and !self.browser_state.controller.hasBackend()) return needs_render;
 
-        var needs_render = false;
         if (self.browser_launch_open_delay_frames > 0) {
             self.browser_launch_open_delay_frames -= 1;
             if (self.browser_launch_open_delay_frames == 0) {
@@ -12322,6 +12456,82 @@ pub const AppState = struct {
             needs_render = true;
         }
         return needs_render;
+    }
+
+    fn pollPendingBrowserDevServer(self: *AppState) bool {
+        const project_index = self.browser_dev_server_project_index orelse return false;
+        const process_index = self.browser_dev_server_process_index orelse return false;
+        const now = unixTimestampMs();
+        if (now < self.browser_dev_server_next_check_ms) return false;
+        self.browser_dev_server_next_check_ms = now + 250;
+        if (now >= self.browser_dev_server_deadline_ms) {
+            self.clearPendingBrowserDevServer();
+            self.setSidebarNotice("Dev server started, but no local URL was detected. Enter it above.");
+            return true;
+        }
+        if (project_index >= self.projects.items.len or process_index >= self.projects.items[project_index].managed_processes.items.len) {
+            self.clearPendingBrowserDevServer();
+            return false;
+        }
+        const process = &self.projects.items[project_index].managed_processes.items[process_index];
+        const dock_id = process.dock_id orelse return false;
+        const dock = self.projectTerminalDockMutable(project_index, dock_id) orelse return false;
+        const output = (dock.activeOutputTailAlloc(self.allocator, 32 * 1024) catch return false) orelse return false;
+        defer self.allocator.free(output);
+        const url = localDevServerUrl(output) orelse return false;
+        self.navigateBrowserToUrl(url) catch |err| {
+            log.warn("failed to open detected dev-server url: {s}", .{@errorName(err)});
+            return false;
+        };
+        self.clearPendingBrowserDevServer();
+        self.setSidebarNotice("Opened the detected dev server URL.");
+        return true;
+    }
+
+    fn clearPendingBrowserDevServer(self: *AppState) void {
+        self.browser_dev_server_project_index = null;
+        self.browser_dev_server_process_index = null;
+        self.browser_dev_server_next_check_ms = 0;
+        self.browser_dev_server_deadline_ms = 0;
+    }
+
+    fn localDevServerUrl(output: []const u8) ?[]const u8 {
+        var search_from: usize = 0;
+        while (search_from < output.len) {
+            const http = std.mem.indexOfPos(u8, output, search_from, "http://");
+            const https = std.mem.indexOfPos(u8, output, search_from, "https://");
+            const start = if (http) |http_start|
+                if (https) |https_start| @min(http_start, https_start) else http_start
+            else
+                https orelse return null;
+            const scheme_len: usize = if (std.mem.startsWith(u8, output[start..], "https://")) 8 else 7;
+            var end = start + scheme_len;
+            while (end < output.len and !std.ascii.isWhitespace(output[end]) and
+                std.mem.indexOfScalar(u8, "\"'<>`()", output[end]) == null) : (end += 1)
+            {}
+            while (end > start and (output[end - 1] == '.' or output[end - 1] == ',' or output[end - 1] == ';')) end -= 1;
+            const candidate = output[start..end];
+            const authority = candidate[scheme_len..];
+            const authority_end = std.mem.indexOfAny(u8, authority, "/?#") orelse authority.len;
+            const host_port = authority[0..authority_end];
+            if (isLoopbackAuthority(host_port)) {
+                return candidate;
+            }
+            search_from = @max(end, start + scheme_len);
+        }
+        return null;
+    }
+
+    fn isLoopbackAuthority(authority: []const u8) bool {
+        if (std.mem.startsWith(u8, authority, "[::1]")) {
+            const remainder = authority["[::1]".len..];
+            return remainder.len == 0 or remainder[0] == ':';
+        }
+        const host_end = std.mem.indexOfScalar(u8, authority, ':') orelse authority.len;
+        const host = authority[0..host_end];
+        return std.mem.eql(u8, host, "localhost") or
+            std.mem.eql(u8, host, "127.0.0.1") or
+            std.mem.eql(u8, host, "0.0.0.0");
     }
 
     // Adds an https scheme for bare hostnames so the browser control surface accepts normal typed URLs.
@@ -14716,6 +14926,7 @@ pub const AppState = struct {
                 self.browser_state.clearSuppressedEvalResults();
                 self.browser_surface_suspended_for_palette_overlay = false;
                 self.browser_surface_suspended_for_layout = false;
+                self.browser_surface_suspended_for_empty_state = false;
                 self.unfocusBrowserPane();
                 self.browser_pane_hovered = false;
                 self.browser_address_focused = false;
@@ -19472,6 +19683,20 @@ test "workspace layout grid placement follows pane hotkey order" {
     try std.testing.expectEqual(pane2, placement.pane_id);
     try std.testing.expectEqual(WorkspaceSplitAxis.horizontal, placement.axis);
     try std.testing.expect(placement.new_after);
+}
+
+test "dev server URL detection accepts loopback URLs only" {
+    try std.testing.expectEqualStrings(
+        "http://localhost:5173/app",
+        AppState.localDevServerUrl("ready at http://localhost:5173/app\n").?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://127.0.0.1:8443",
+        AppState.localDevServerUrl("Local: https://127.0.0.1:8443, press h for help").?,
+    );
+    try std.testing.expect(AppState.localDevServerUrl("docs: https://example.com") == null);
+    try std.testing.expect(AppState.localDevServerUrl("bad: http://localhost.example.com:5173") == null);
+    try std.testing.expect(AppState.localDevServerUrl("bad: http://127.0.0.11:5173") == null);
 }
 
 fn unixTimestampSeconds() i64 {

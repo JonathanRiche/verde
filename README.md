@@ -293,6 +293,7 @@ verde live browser status [--json]
 verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
 verde live browser navigate --url https://example.com [--json]
 verde live browser eval --script "document.title" [--json]
+verde live browser screenshot [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 verde live palette list [--json]
 verde live palette run --command pane.split_terminal_down [--json]
@@ -399,6 +400,7 @@ verde live browser status [--json]
 verde live browser open --url https://example.com [--project <id|index|path|current|self>] [--json]
 verde live browser navigate --url https://ziglang.org [--json]
 verde live browser eval --script "JSON.stringify({title:document.title,url:location.href})" [--json]
+verde live browser screenshot [--json]
 verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 ```
 
@@ -409,11 +411,20 @@ verde live browser post-json --json-payload '{"type":"ping"}' [--json]
 - `navigate` normalizes and loads a URL in the active singleton browser runtime.
 - `eval` queues JavaScript evaluation in the active browser runtime; inspect
   `verde live status --json` for `browser.last_eval_result`.
+- `screenshot` stores and returns the visible viewport as PNG data when the
+  active browser presentation exposes a CPU-side frame. Native child-view
+  backends currently return `unsupported`.
 - `post-json` sends a JSON payload through the host-to-page bridge.
 - Page-to-host bridge messages are processed only for app and loopback pages by
   default: `app://`, `localhost`, `127.0.0.1`, and `[::1]`. Set
   `VERDE_BROWSER_ALLOW_UNTRUSTED_BRIDGE=1` only for local diagnostics that need
   arbitrary pages or `data:` URLs to call back into Verde.
+
+Managed agents receive the browser through Verde's MCP bridge. Browser tools
+open and navigate the pane, inspect visible text and interactive elements,
+click or type by CSS selector, and return screenshots as MCP image content.
+Potentially sensitive clicks, password entry, and form submission require an
+explicit confirmed retry so the agent client can ask the user first.
 
 ### Workspace Control
 
