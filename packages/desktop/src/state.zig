@@ -304,7 +304,9 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // PNG is 26 CSS px, fast/access codicons 22 CSS px. Sum kept ≥ 38 so the
     // label doesn't kiss the glyph on a laptop screen at 1×.
     .pill_icon_gap = 12.0,
-    .pill_chevron_gap = 14.0,
+    // Kept tight: the chevron column already centers its ink with air on both
+    // sides, so a wide gap here reads as dead space after the trailing glyph.
+    .pill_chevron_gap = 8.0,
     .model_min_width = 112.0,
     // Long OpenCode labels include the provider, e.g. "GPT-5.4 (OpenAI)"; cap high enough for measured pill width.
     .model_max_width = 270.0,
@@ -323,7 +325,9 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
     // minus `pill_icon_gap`. Provider PNG slot is 26 CSS px; reserve + gap
     // gives label-start at icon-end + ~12 CSS px on the smallest screens.
     .pill_overlay_icon_reserve = 26.0,
-    .pill_label_width_fudge = 8.0,
+    // Toolbar labels measure with real shaped advances (paletteCachedGlyphAdvance),
+    // so this only needs to cover renderer rounding, not font-substitution error.
+    .pill_label_width_fudge = 3.0,
     .corner_radius = 18.0,
     .border_width = 1.0,
     .background_color = .{ .r = 0.11, .g = 0.15, .b = 0.16, .a = 0.98 },
@@ -372,10 +376,10 @@ pub const PaletteComposerPrompt = palette.composerPrompt(.{
 // (and every other geometry token) by `setUiScale` for HiDPI displays.
 /// Width reserved per host-drawn state glyph embedded in the run pill's
 /// summary, beside the segment it describes (brain / bolt / lock, ~22px
-/// drawn, centered). The ~10px spare splits into the word-side and
+/// drawn, centered). The ~8px spare splits into the word-side and
 /// separator-side gaps, so widening this spaces the glyph away from both
 /// neighbors; mirrors the sizing convention of `pill_overlay_icon_reserve`.
-pub const COMPOSER_RUN_PILL_ICON_CELL: f32 = 32.0;
+pub const COMPOSER_RUN_PILL_ICON_CELL: f32 = 30.0;
 const COMPOSER_MODEL_PICKER_WIDTH: f32 = 430.0;
 /// Width of the provider-icon rail on the picker's left edge; the popover's
 /// total width is body + rail.
@@ -15767,6 +15771,11 @@ pub const AppState = struct {
         // runtime metrics need to be the actual pixel size, otherwise the
         // placeholder + selectors render at fixed pixel sizes while everything
         // else in the UI scales with the display — looks tiny on HiDPI.
+        // Geometry must scale with the same factor as the font metrics below,
+        // otherwise pills keep CSS-sized padding/icon cells while their labels
+        // and the host-drawn glyphs grow — icons end up on top of the text on
+        // HiDPI displays (and worst in narrow split panes).
+        self.palette_composer.setUiScale(theme.uiScaleFactor());
         self.palette_composer.setFontMetrics(paletteComposerTextFontMetrics(theme.scaledUi(PALETTE_COMPOSER_FONT_SIZE)));
         self.palette_composer.setToolbarFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_TOOLBAR_FONT_SIZE)));
         self.palette_composer.setIconFontMetrics(paletteEstimatedFontMetrics(theme.scaledUi(PALETTE_COMPOSER_ICON_FONT_SIZE)));
