@@ -4535,6 +4535,7 @@ pub const AppState = struct {
     settings_theme_dropdown_open: bool,
     settings_theme_hover_index: ?usize,
     settings_theme_menu_scroll: usize,
+    settings_update_notes_expanded: bool,
     update_state: updater.State,
     update_installer_started: bool,
     update_exit_requested: bool,
@@ -4801,6 +4802,7 @@ pub const AppState = struct {
             .settings_theme_dropdown_open = false,
             .settings_theme_hover_index = null,
             .settings_theme_menu_scroll = 0,
+            .settings_update_notes_expanded = false,
             .update_state = .{},
             .update_installer_started = false,
             .update_exit_requested = false,
@@ -8697,6 +8699,7 @@ pub const AppState = struct {
         self.settings_theme_dropdown_open = false;
         self.settings_theme_hover_index = null;
         self.settings_theme_menu_scroll = 0;
+        self.settings_update_notes_expanded = false;
         self.settings_modal_closing = false;
         self.settings_modal_anim_progress = 0.0;
         self.settings_modal_anim_last_ms = 0;

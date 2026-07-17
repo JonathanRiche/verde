@@ -5,8 +5,10 @@ const build_options = @import("build_options");
 const palette = @import("palette");
 const sdl = @import("zsdl3");
 const app_config = @import("../config.zig");
+const updater = @import("../updater.zig");
 const theme = @import("theme.zig");
 const runtime = @import("runtime.zig");
+const text_measure = @import("text_measure.zig");
 
 pub const Control = enum(u8) {
     ui_font_dec,
@@ -30,6 +32,8 @@ pub const Control = enum(u8) {
     updates_check,
     updates_download,
     updates_automatic,
+    updates_notes_toggle,
+    updates_release_page,
     notifications_toggle,
 };
 
@@ -129,6 +133,8 @@ const SettingsLayout = struct {
     updates_automatic: palette.Rect,
     updates_status_y: f32,
     updates_notes_y: f32,
+    updates_notes_toggle: ?palette.Rect = null,
+    updates_release_page: palette.Rect,
     notifications_card: palette.Rect,
     notifications_toggle: palette.Rect,
     notifications_hint_y: f32,
@@ -164,11 +170,15 @@ fn metrics() Metrics {
     return Metrics.init();
 }
 
-fn layoutModal(width: f32, height: f32, modal_h: f32) palette.Rect {
+fn modalWidth(width: f32) f32 {
     // Scale with the window instead of pinning to a narrow strip; the margin
     // floor keeps small windows usable.
     const margin = theme.scaledUi(48.0);
-    const modal_w = @min(theme.clampf(width * 0.46, theme.scaledUi(600.0), theme.scaledUi(880.0)), @max(width - margin, theme.scaledUi(320.0)));
+    return @min(theme.clampf(width * 0.46, theme.scaledUi(600.0), theme.scaledUi(880.0)), @max(width - margin, theme.scaledUi(320.0)));
+}
+
+fn layoutModal(width: f32, height: f32, modal_h: f32) palette.Rect {
+    const modal_w = modalWidth(width);
     const max_h = height * 0.9;
     const h = @min(theme.clampf(modal_h, theme.scaledUi(560.0), max_h), max_h);
     return .{
@@ -212,8 +222,13 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const integrations_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
     // Same shape as the integrations card: title, field label, one toggle row, hint.
     const notifications_h = m.card_pad * 2.0 + m.title_h + m.row_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h;
-    // Version/status, action row, automatic-check preference, and a release-note preview.
-    const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + m.label_h * 2.0;
+    // The modal width depends only on the window, so the notes block can be
+    // measured before card heights are summed.
+    const updates_notes_w = modalWidth(width) - m.modal_pad * 2.0 - m.card_pad * 2.0;
+    const updates_notes_h = notesBlockHeight(state, updates_notes_w, m);
+    // Version/status, action row, automatic-check preference, release notes
+    // (preview or expanded), and the show-more / release-page links row.
+    const updates_h = m.card_pad * 2.0 + m.title_h + m.inner_gap + m.label_h + m.inner_gap + m.row_h + m.inner_gap + m.row_h + m.inner_gap + updates_notes_h + m.inner_gap + m.label_h;
 
     const body_h = appearance_h + m.card_gap + transcript_h + m.card_gap + terminal_h + m.card_gap + workspace_h + m.card_gap + integrations_h + m.card_gap + updates_h + m.card_gap + notifications_h;
     const modal_h = m.header_h + m.modal_pad + body_h + m.modal_pad + m.footer_h;
@@ -338,6 +353,23 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
     const updates_download: palette.Rect = .{ .x = updates_check.x + update_action_w + m.inner_gap, .y = updates_actions_y, .w = update_action_w, .h = m.row_h };
     const updates_automatic: palette.Rect = .{ .x = updates_check.x, .y = updates_actions_y + m.row_h + m.inner_gap, .w = content_w - m.card_pad * 2.0, .h = m.row_h };
     const updates_notes_y = updates_automatic.y + m.row_h + m.inner_gap;
+    const updates_links_y = updates_notes_y + updates_notes_h + m.inner_gap;
+    var updates_notes_toggle: ?palette.Rect = null;
+    if (state.update_state.release != null) {
+        updates_notes_toggle = .{
+            .x = updates_card.x + m.card_pad,
+            .y = updates_links_y,
+            .w = text_measure.textWidth(.ui, theme.scaledUi(NOTES_LINK_FONT_SIZE), notesToggleLabel(state)),
+            .h = m.label_h,
+        };
+    }
+    const release_page_x = if (updates_notes_toggle) |toggle| toggle.x + toggle.w + m.row_gap * 2.0 else updates_card.x + m.card_pad;
+    const updates_release_page: palette.Rect = .{
+        .x = release_page_x,
+        .y = updates_links_y,
+        .w = text_measure.textWidth(.ui, theme.scaledUi(NOTES_LINK_FONT_SIZE), RELEASE_PAGE_LABEL),
+        .h = m.label_h,
+    };
 
     y += updates_h + m.card_gap;
 
@@ -383,6 +415,8 @@ fn computeLayout(state: *runtime.AppState, width: f32, height: f32) SettingsLayo
         .updates_automatic = updates_automatic,
         .updates_status_y = updates_status_y,
         .updates_notes_y = updates_notes_y,
+        .updates_notes_toggle = updates_notes_toggle,
+        .updates_release_page = updates_release_page,
         .notifications_card = notifications_card,
         .notifications_toggle = notifications_toggle,
         .notifications_hint_y = notifications_hint_y,
@@ -495,6 +529,10 @@ pub fn registerHits(state: *runtime.AppState, width: f32, height: f32, queue_hit
         queueControlHit(state, layout.updates_download, layout.body_clip, .updates_download, queue_hit);
     }
     queueControlHit(state, layout.updates_automatic, layout.body_clip, .updates_automatic, queue_hit);
+    if (layout.updates_notes_toggle) |toggle| {
+        queueControlHit(state, toggle, layout.body_clip, .updates_notes_toggle, queue_hit);
+    }
+    queueControlHit(state, layout.updates_release_page, layout.body_clip, .updates_release_page, queue_hit);
     queueControlHit(state, layout.notifications_toggle, layout.body_clip, .notifications_toggle, queue_hit);
     registerThemeOptionHits(state, layout, queue_hit);
 }
@@ -616,13 +654,41 @@ pub fn render(state: *runtime.AppState, width: f32, height: f32) void {
         "No update available";
     drawActionButton(state, layout.updates_download, update_action_label, if (install_ready) .primary else .disabled, isControlHovered(state, .updates_download), layout.body_clip);
     drawSwitchRow(state, layout.updates_automatic, "Check automatically", state.settings_draft.check_for_updates_automatically, isControlHovered(state, .updates_automatic), layout.body_clip);
-    const notes = if (state.update_state.release) |release| releaseNotesPreview(release.notes) else "Release notes appear here when a release is found.";
-    queueText(state, .{
-        .x = layout.updates_card.x + m.card_pad,
-        .y = layout.updates_notes_y,
-        .w = layout.updates_card.w - m.card_pad * 2.0,
-        .h = m.label_h * 2.0,
-    }, notes, paletteColor(textHint()), theme.scaledUi(12.0), layout.body_clip);
+    const notes_x = layout.updates_card.x + m.card_pad;
+    const notes_w = layout.updates_card.w - m.card_pad * 2.0;
+    if (state.settings_update_notes_expanded and state.update_state.release != null) {
+        // Full (capped) release notes, one wrapped block per markdown line;
+        // heights mirror notesBlockHeight so the card fits the text.
+        var iter = NotesLineIterator.init(state.update_state.release.?.notes);
+        var line_y = layout.updates_notes_y;
+        while (iter.next()) |line| {
+            const line_h = wrappedNotesRows(line.text, notes_w) * notesLineHeight();
+            const line_rect: palette.Rect = .{ .x = notes_x, .y = line_y, .w = notes_w, .h = line_h };
+            if (intersectRect(line_rect, layout.body_clip)) |line_clip| {
+                const line_color = if (line.heading) textLabel() else textHint();
+                queueWrappedText(state, line_rect, line.text, paletteColor(line_color), theme.scaledUi(NOTES_FONT_SIZE), line_clip);
+            }
+            line_y += line_h;
+        }
+    } else {
+        const notes = if (state.update_state.release) |release| releaseNotesPreview(release.notes) else "Release notes appear here when a release is found.";
+        const notes_rect: palette.Rect = .{
+            .x = notes_x,
+            .y = layout.updates_notes_y,
+            .w = notes_w,
+            .h = m.label_h * 2.0,
+        };
+        // Clip to the reserved two-line area so long previews cannot bleed into the next card.
+        if (intersectRect(notes_rect, layout.body_clip)) |notes_clip| {
+            queueWrappedText(state, notes_rect, notes, paletteColor(textHint()), theme.scaledUi(NOTES_FONT_SIZE), notes_clip);
+        }
+    }
+    if (layout.updates_notes_toggle) |toggle_rect| {
+        const toggle_color = if (isControlHovered(state, .updates_notes_toggle)) theme.COLOR_WHITE else textLabel();
+        queueText(state, toggle_rect, notesToggleLabel(state), paletteColor(toggle_color), theme.scaledUi(NOTES_LINK_FONT_SIZE), layout.body_clip);
+    }
+    const release_page_color = if (isControlHovered(state, .updates_release_page)) theme.COLOR_WHITE else textLabel();
+    queueText(state, layout.updates_release_page, RELEASE_PAGE_LABEL, paletteColor(release_page_color), theme.scaledUi(NOTES_LINK_FONT_SIZE), layout.body_clip);
 
     // Notifications
     drawCardTitle(state, layout.notifications_card, "Notifications", layout.body_clip);
@@ -766,6 +832,13 @@ pub fn applyControl(state: *runtime.AppState, control_index: usize) void {
             return;
         },
         .updates_automatic => state.settings_draft.check_for_updates_automatically = !state.settings_draft.check_for_updates_automatically,
+        // View-only disclosure, not part of the Save/Cancel draft.
+        .updates_notes_toggle => state.settings_update_notes_expanded = !state.settings_update_notes_expanded,
+        .updates_release_page => {
+            const url = if (state.update_state.release) |release| release.page_url else updater.State.releasesUrl();
+            state.openConfiguredWebLink(url);
+            return;
+        },
         // Draft toggle: persisted to verde.json on Save, like the other fields.
         .notifications_toggle => state.settings_draft.notifications_enabled = !state.settings_draft.notifications_enabled,
     }
@@ -816,6 +889,72 @@ fn ensureThemeChoiceVisible(state: *runtime.AppState, choice_index: usize) void 
         }
     }
     state.settings_theme_menu_scroll = @min(state.settings_theme_menu_scroll, themeMenuMaxScroll(state));
+}
+
+const NOTES_FONT_SIZE = 12.0;
+const NOTES_LINK_FONT_SIZE = 12.5;
+const RELEASE_PAGE_LABEL = "Open release page";
+// Keeps a pathological release body from producing an unbounded card; the
+// release-page link below the notes covers the tail.
+const MAX_EXPANDED_NOTES_LINES: usize = 60;
+
+const NotesLine = struct {
+    text: []const u8,
+    heading: bool,
+};
+
+/// Yields trimmed, non-empty release-note lines with markdown heading
+/// markers stripped, capped at MAX_EXPANDED_NOTES_LINES.
+const NotesLineIterator = struct {
+    remaining: []const u8,
+    emitted: usize = 0,
+
+    fn init(notes: []const u8) NotesLineIterator {
+        return .{ .remaining = std.mem.trim(u8, notes, &std.ascii.whitespace) };
+    }
+
+    fn next(self: *NotesLineIterator) ?NotesLine {
+        while (self.remaining.len > 0 and self.emitted < MAX_EXPANDED_NOTES_LINES) {
+            const line_end = std.mem.indexOfAny(u8, self.remaining, "\r\n") orelse self.remaining.len;
+            var line = std.mem.trim(u8, self.remaining[0..line_end], &std.ascii.whitespace);
+            self.remaining = std.mem.trimStart(u8, self.remaining[line_end..], &std.ascii.whitespace);
+            const heading = line.len > 0 and line[0] == '#';
+            line = std.mem.trimStart(u8, std.mem.trimStart(u8, line, "#"), " ");
+            if (line.len == 0) continue;
+            self.emitted += 1;
+            return .{ .text = line, .heading = heading };
+        }
+        return null;
+    }
+};
+
+fn notesLineHeight() f32 {
+    return theme.scaledUi(NOTES_FONT_SIZE * 1.25);
+}
+
+/// Estimated wrapped-row count for one note line. The width bias reserves
+/// slack for ragged word-wrap edges so estimates err toward an extra row
+/// instead of clipping the last one.
+fn wrappedNotesRows(line: []const u8, usable_w: f32) f32 {
+    const width = text_measure.textWidth(.ui, theme.scaledUi(NOTES_FONT_SIZE), line);
+    const rows = @ceil(width / @max(usable_w * 0.94, 1.0));
+    return theme.clampf(rows, 1.0, 6.0);
+}
+
+/// Height of the release-notes block inside the Updates card: a two-line
+/// preview when collapsed, the full (capped) note lines when expanded.
+fn notesBlockHeight(state: *const runtime.AppState, usable_w: f32, m: Metrics) f32 {
+    const collapsed_h = m.label_h * 2.0;
+    if (!state.settings_update_notes_expanded) return collapsed_h;
+    const release = state.update_state.release orelse return collapsed_h;
+    var iter = NotesLineIterator.init(release.notes);
+    var total: f32 = 0.0;
+    while (iter.next()) |line| total += wrappedNotesRows(line.text, usable_w) * notesLineHeight();
+    return @max(total, collapsed_h);
+}
+
+fn notesToggleLabel(state: *const runtime.AppState) []const u8 {
+    return if (state.settings_update_notes_expanded) "Show less" else "Show full notes";
 }
 
 fn releaseNotesPreview(notes: []const u8) []const u8 {
@@ -1275,6 +1414,28 @@ fn queueText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, co
         font_size * 0.55,
         font_size * 1.25,
         false,
+    ) catch |err| {
+        log.warn("failed to queue settings text: {s}", .{@errorName(err)});
+    };
+}
+
+// Same as `queueText` but wraps at the rect width for multi-line hint copy.
+fn queueWrappedText(state: *runtime.AppState, rect: palette.Rect, value: []const u8, color: palette.Color, font_size: f32, clip: ?palette.Rect) void {
+    const stable_value = state.palette_frame_text_arena.allocator().dupe(u8, value) catch |err| {
+        log.warn("failed to retain settings text: {s}", .{@errorName(err)});
+        return;
+    };
+    state.palette_overlay_batch.fixedText(
+        state.allocator,
+        rect,
+        stable_value,
+        color,
+        font_size,
+        clip,
+        .{},
+        font_size * 0.55,
+        font_size * 1.25,
+        true,
     ) catch |err| {
         log.warn("failed to queue settings text: {s}", .{@errorName(err)});
     };
