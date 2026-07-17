@@ -12,6 +12,10 @@ const log = std.log.scoped(.native_opencode);
 
 const MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_HEALTH_WAIT_ATTEMPTS = 30;
+/// SO_RCVTIMEO for health probes: long enough for a healthy local server
+/// under load, short enough that a wedged server cannot hang startup or
+/// shutdown (see checkHealth).
+const HEALTH_PROBE_RECV_TIMEOUT_MS = 2_000;
 const DEFAULT_BASE_URL = "http://127.0.0.1:4096";
 const MESSAGE_POLL_LIMIT = 12;
 const IMPORT_MESSAGE_LIMIT = 100_000;
@@ -339,14 +343,92 @@ pub const Client = struct {
         return error.OpencodeServerUnavailable;
     }
 
+    // Health probes must complete in bounded time. A wedged server that
+    // accepts TCP but never answers (observed live 2026-07-15) previously
+    // blocked forever inside std.http.Client.fetch — which has no read
+    // timeout — hanging ensureServer, the provider-readiness worker, and app
+    // shutdown, which joins that worker. So the probe speaks minimal HTTP/1.1
+    // over a raw socket with SO_RCVTIMEO instead of using requestJson.
     fn checkHealth(self: *Client) bool {
-        const result = self.requestJson(.GET, "/global/health", null);
-        if (result) |response| {
-            defer self.allocator.free(response.body);
-            return response.status == .ok;
-        } else |_| {
+        return self.probeHealthBounded() catch |err| {
+            log.debug("opencode health probe failed: {s}", .{@errorName(err)});
             return false;
+        };
+    }
+
+    fn probeHealthBounded(self: *Client) !bool {
+        const uri = try std.Uri.parse(self.config.base_url);
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = try uri.getHost(&host_buffer);
+        const port: u16 = uri.port orelse 4096;
+
+        // The server is only ever launched on a literal loopback address, so
+        // a non-literal hostname (which would need DNS) is a config we never
+        // spawn against; report unhealthy rather than fall back to an
+        // unbounded fetch.
+        const address = try std.Io.net.IpAddress.parse(host.bytes, port);
+
+        var threaded = std.Io.Threaded.init_single_threaded;
+        const io = threaded.io();
+
+        // Threaded Io has no connect-timeout support yet (it panics on a
+        // non-none timeout option). Loopback connects resolve immediately
+        // (accept or ECONNREFUSED), so the receive timeout below is the
+        // guard that matters for a live-but-stuck server.
+        var stream = try address.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+
+        const receive_timeout: std.c.timeval = .{
+            .sec = HEALTH_PROBE_RECV_TIMEOUT_MS / 1000,
+            .usec = (HEALTH_PROBE_RECV_TIMEOUT_MS % 1000) * 1000,
+        };
+        try std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&receive_timeout),
+        );
+
+        const auth_header = try self.makeAuthorizationHeader();
+        defer if (auth_header) |header| self.allocator.free(header.value);
+        const request = if (auth_header) |header|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "GET /global/health HTTP/1.1\r\nHost: {s}:{d}\r\n{s}: {s}\r\nConnection: close\r\n\r\n",
+                .{ host.bytes, port, header.name, header.value },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "GET /global/health HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
+                .{ host.bytes, port },
+            );
+        defer self.allocator.free(request);
+
+        try writeAllRaw(stream.socket.handle, request);
+
+        // Only the status line matters; 128 bytes is ample for
+        // "HTTP/1.1 200 OK\r\n" plus slack for unusual reason phrases.
+        var response_buffer: [128]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < response_buffer.len) {
+            const read_raw = std.c.read(
+                stream.socket.handle,
+                response_buffer[filled..].ptr,
+                response_buffer.len - filled,
+            );
+            if (read_raw == 0) break;
+            if (read_raw < 0) {
+                const errno = std.c._errno().*;
+                if (errno == @intFromEnum(std.c.E.INTR)) continue;
+                // EAGAIN here is SO_RCVTIMEO expiring: the wedged-server case.
+                if (errno == @intFromEnum(std.c.E.AGAIN)) return false;
+                return error.HealthProbeReadFailed;
+            }
+            filled += @intCast(read_raw);
+            if (std.mem.indexOf(u8, response_buffer[0..filled], "\r\n") != null) break;
         }
+        return statusLineIsOk(response_buffer[0..filled]);
     }
 
     fn waitForHealth(self: *Client, attempts: usize) bool {
@@ -1048,6 +1130,27 @@ fn encodeBase64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, size);
     _ = std.base64.standard.Encoder.encode(out, bytes);
     return out;
+}
+
+fn writeAllRaw(fd: std.c.fd_t, bytes: []const u8) !void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const written = std.c.write(fd, remaining.ptr, remaining.len);
+        if (written < 0) {
+            const errno = std.c._errno().*;
+            if (errno == @intFromEnum(std.c.E.INTR)) continue;
+            return error.HealthProbeWriteFailed;
+        }
+        remaining = remaining[@intCast(written)..];
+    }
+}
+
+// Accepts any HTTP version ("HTTP/1.1 200 OK", "HTTP/1.0 200 ...").
+fn statusLineIsOk(line: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, "HTTP/")) return false;
+    const space = std.mem.indexOfScalar(u8, line, ' ') orelse return false;
+    if (line.len < space + 4) return false;
+    return std.mem.eql(u8, line[space + 1 .. space + 4], "200");
 }
 
 fn makeAuthorizationHeaderAlloc(allocator: std.mem.Allocator, config: Config) !?std.http.Header {
@@ -2298,4 +2401,42 @@ test "buildPromptBody prefers explicit opencode variant over reasoning effort" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"variant\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "minimal") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "high") == null);
+}
+
+test "checkHealth times out against a server that accepts but never responds" {
+    // Wedge listener: bound and listening but never accepting or answering.
+    // The kernel completes the TCP handshake via the backlog, so the probe
+    // connects fine and then gets no bytes — the exact failure observed live
+    // 2026-07-15, where the old fetch-based probe blocked forever.
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0);
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+
+    var bind_addr: std.c.sockaddr.in = .{
+        .family = std.c.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+    };
+    try std.testing.expectEqual(0, std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in)));
+    try std.testing.expectEqual(0, std.c.listen(fd, 1));
+
+    var bound_addr: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expectEqual(0, std.c.getsockname(fd, @ptrCast(&bound_addr), &bound_len));
+    const port = std.mem.bigToNative(u16, bound_addr.port);
+
+    const base_url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    defer std.testing.allocator.free(base_url);
+
+    var client: Client = .{
+        .allocator = std.testing.allocator,
+        .config = .{ .allocator = std.testing.allocator, .base_url = base_url },
+    };
+    const started_ms = platform_runtime.unixTimestampMs();
+    try std.testing.expect(!client.checkHealth());
+    const elapsed_ms = platform_runtime.unixTimestampMs() - started_ms;
+    // Must fail via the receive timeout (~2s), not block unboundedly; the
+    // upper bound is loose to tolerate slow CI machines.
+    try std.testing.expect(elapsed_ms >= 1_000);
+    try std.testing.expect(elapsed_ms < 8_000);
 }
