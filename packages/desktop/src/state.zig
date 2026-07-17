@@ -1280,16 +1280,20 @@ pub const CURSOR_MODEL_OPTIONS = [_]ModelOption{
     .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5" },
 };
 
+/// Conservative fallback when a dynamic model row does not report its effort tiers.
 const CLAUDE_STANDARD_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high" };
-const CLAUDE_OPUS_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh", "max" };
+/// Full effort range reported by the Claude Agent SDK for current reasoning models.
+const CLAUDE_FULL_EFFORT_VALUES = [_][:0]const u8{ "low", "medium", "high", "xhigh", "max" };
 
+/// Static fallback shown until the async bridge `list_models` response replaces it.
+/// Keep this mirroring the Agent SDK's `supportedModels()` output (labels + ids)
+/// so the picker doesn't flash stale model names while the bridge loads.
 pub const CLAUDE_MODEL_OPTIONS = [_]ModelOption{
-    .{ .label = "Default (Sonnet)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
-    .{ .label = "Claude Opus 4.7", .value = "claude-opus-4-7", .reasoning_supported = true, .claude_effort_values = CLAUDE_OPUS_EFFORT_VALUES[0..] },
-    .{ .label = "Claude Sonnet 4.5", .value = "claude-sonnet-4-5", .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
-    .{ .label = "Sonnet (1M context)", .value = "sonnet[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_STANDARD_EFFORT_VALUES[0..] },
-    .{ .label = "Opus", .value = "opus", .reasoning_supported = true, .claude_effort_values = CLAUDE_OPUS_EFFORT_VALUES[0..] },
-    .{ .label = "Haiku", .value = "haiku", .reasoning_supported = false },
+    .{ .label = "Default (Opus 4.8)", .value = DEFAULT_CLAUDE_MODEL, .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Opus 4.8", .value = "opus[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Fable", .value = "claude-fable-5[1m]", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Sonnet 5", .value = "sonnet", .reasoning_supported = true, .claude_effort_values = CLAUDE_FULL_EFFORT_VALUES[0..] },
+    .{ .label = "Haiku 4.5", .value = "haiku", .reasoning_supported = false },
 };
 
 pub const CODEX_REASONING_OPTIONS = [_]ReasoningOption{
