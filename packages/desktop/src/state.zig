@@ -7985,6 +7985,15 @@ pub const AppState = struct {
         const cursor_model_params_json = if (thread.provider == .cursor) try self.cursorModelParamsJsonAlloc(page_alloc, thread) else null;
         defer if (cursor_model_params_json) |params| page_alloc.free(params);
 
+        // Readiness checks and other short GUI operations may have launched
+        // the shared Codex app-server in this process. Stop it before the
+        // daemon worker connects so closing Verde cannot kill the server that
+        // owns the durable turn.
+        if (thread.provider == .codex) {
+            self.finishProviderReadinessThread();
+            ai_harness.releaseOwnedCodexServer();
+        }
+
         // The daemon response is owned by self.allocator (startDaemonChatTurn ->
         // sessionizer.requestAlloc); freeing it with page_alloc trips
         // PageAllocator's alignment safety check and crashes the send.
